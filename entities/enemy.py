@@ -315,7 +315,7 @@ class Enemy:
         
         return False
     
-    def draw(self, screen, camera):
+    def draw(self, screen, camera, colors):
         if not self.active:
             return
         
