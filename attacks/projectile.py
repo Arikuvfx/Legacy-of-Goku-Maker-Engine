@@ -1,5 +1,4 @@
 import pygame
-from config.settings import WORLD_WIDTH, WORLD_HEIGHT, CYAN, YELLOW
 
 class Projectile:
     def __init__(self, x, y, direction):
@@ -24,9 +23,9 @@ class Projectile:
         if self.x < 0 or self.x > world_width or self.y < 0 or self.y > world_height:
             self.active = False
     
-    def draw(self, screen, camera):
+    def draw(self, screen, camera, colors):
         if self.active:
             screen_x = self.x - camera.x
             screen_y = self.y - camera.y
-            pygame.draw.circle(screen, CYAN, (int(screen_x), int(screen_y)), self.radius)
-            pygame.draw.circle(screen, YELLOW, (int(screen_x), int(screen_y)), self.radius - 3)
+            pygame.draw.circle(screen, colors['CYAN'], (int(screen_x), int(screen_y)), self.radius)
+            pygame.draw.circle(screen, colors['YELLOW'], (int(screen_x), int(screen_y)), self.radius - 3)
