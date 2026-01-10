@@ -10,7 +10,7 @@ class Projectile:
         self.radius = 8
         self.active = True
         
-        def update(self, world_width, world_height):
+    def update(self, world_width, world_height):
         if self.direction == 'up':
             self.y -= self.speed
         elif self.direction == 'down':
