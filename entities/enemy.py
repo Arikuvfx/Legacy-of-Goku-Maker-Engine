@@ -118,15 +118,17 @@ class Enemy:
             elif self.state == 'chase':
                 self.chase_behavior(dt, player, obstacles)
     
-    def idle_behavior(self, dt):
+    def idle_behavior(self, dt, world_width, world_height):
         if self.is_idle_moving:
+            # Continue current movement
             self.idle_move_timer -= dt
             
             self.x += self.move_velocity_x * dt
             self.y += self.move_velocity_y * dt
             
-            self.x = max(0, min(self.x, WORLD_WIDTH))
-            self.y = max(0, min(self.y, WORLD_HEIGHT))
+            # Keep in world bounds
+            self.x = max(0, min(self.x, world_width))
+            self.y = max(0, min(self.y, world_height))
             
             if self.idle_move_timer <= 0:
                 self.is_idle_moving = False
@@ -134,12 +136,15 @@ class Enemy:
                 self.move_velocity_y = 0
                 self.idle_timer = self.idle_wait_time
         else:
+            # Wait before next movement
             self.idle_timer -= dt
             
             if self.idle_timer <= 0:
+                # Choose random direction
                 directions = ['up', 'down', 'left', 'right']
-                valid_directions = []
                 
+                # Try to find a valid direction
+                valid_directions = []
                 for direction in directions:
                     move_distance = self.speed * self.idle_move_duration * 60
                     test_x = self.x
@@ -154,14 +159,17 @@ class Enemy:
                     elif direction == 'right':
                         test_x += move_distance
                     
+                    # Check if still within idle range and world bounds
                     if (self.distance_to_spawn(test_x, test_y) < self.max_idle_distance and
-                        test_x > 0 and test_x < WORLD_WIDTH and
-                        test_y > 0 and test_y < WORLD_HEIGHT):
+                        test_x > 0 and test_x < world_width and
+                        test_y > 0 and test_y < world_height):
                         valid_directions.append(direction)
                 
                 if valid_directions:
+                    import random
                     self.idle_direction = random.choice(valid_directions)
                     
+                    # Set velocity for smooth movement
                     if self.idle_direction == 'up':
                         self.move_velocity_x = 0
                         self.move_velocity_y = -self.speed * 25
@@ -178,6 +186,7 @@ class Enemy:
                     self.is_idle_moving = True
                     self.idle_move_timer = self.idle_move_duration
                 else:
+                    # No valid direction, just wait
                     self.idle_timer = self.idle_wait_time
     
     def distance_to_spawn(self, x, y):
