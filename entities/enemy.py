@@ -55,10 +55,11 @@ class Enemy:
         dy = self.y - y
         return (dx * dx + dy * dy) ** 0.5
     
-    def update(self, dt, player, obstacles=None):
+    def update(self, dt, player, world_width, world_height, obstacles=None):
         if not self.active:
             return
         
+        # Update attack cooldown
         if self.attack_cooldown > 0:
             self.attack_cooldown -= dt
         
@@ -66,12 +67,15 @@ class Enemy:
         if self.is_knocked_back:
             self.knockback_timer -= dt
             
+            # Apply knockback movement
             self.x += self.knockback_velocity_x * dt
             self.y += self.knockback_velocity_y * dt
             
-            self.x = max(0, min(self.x, WORLD_WIDTH))
-            self.y = max(0, min(self.y, WORLD_HEIGHT))
+            # Keep in bounds
+            self.x = max(0, min(self.x, world_width))
+            self.y = max(0, min(self.y, world_height))
             
+            # Reduce velocity
             self.knockback_velocity_x *= 0.9
             self.knockback_velocity_y *= 0.9
             
@@ -87,6 +91,7 @@ class Enemy:
             if self.attack_timer <= 0:
                 self.is_attacking = False
             else:
+                # Deal damage at the start of attack
                 if self.attack_timer > (self.attack_duration - 0.1):
                     self.perform_attack(player)
             return
@@ -102,12 +107,14 @@ class Enemy:
                 self.state = 'idle'
                 self.idle_timer = 0
         
+        # Try to attack if close enough
         if self.state == 'chase':
             self.try_attack(player)
         
+        # Behavior based on state (only if not attacking)
         if not self.is_attacking:
             if self.state == 'idle':
-                self.idle_behavior(dt)
+                self.idle_behavior(dt, world_width, world_height)
             elif self.state == 'chase':
                 self.chase_behavior(dt, player, obstacles)
     
