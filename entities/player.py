@@ -64,7 +64,7 @@ class Player:
         self.invulnerable_timer = 0
         self.invulnerable_duration = 0.5
         
-    def move(self, dx, dy, is_running):
+    def move(self, dx, dy, is_running, world_width, world_height):
         if self.is_attacking or self.is_charging_beam or self.is_firing_beam or self.is_knocked_back:
             return
         
@@ -72,9 +72,11 @@ class Player:
         self.x += dx * current_speed
         self.y += dy * current_speed
         
-        self.x = max(self.width // 2, min(self.x, WORLD_WIDTH - self.width // 2))
-        self.y = max(self.height // 2, min(self.y, WORLD_HEIGHT - self.height // 2))
+        # Keep player within world bounds
+        self.x = max(self.width // 2, min(self.x, world_width - self.width // 2))
+        self.y = max(self.height // 2, min(self.y, world_height - self.height // 2))
         
+        # Update direction
         if dx > 0:
             self.direction = 'right'
         elif dx < 0:
