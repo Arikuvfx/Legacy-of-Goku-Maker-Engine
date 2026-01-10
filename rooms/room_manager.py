@@ -1,3 +1,5 @@
+from .room import Room
+
 class RoomManager:
     """Manages all rooms and groups"""
     def __init__(self):
