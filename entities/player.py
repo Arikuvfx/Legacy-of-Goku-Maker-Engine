@@ -256,23 +256,26 @@ class Player:
         self.speed = base_speed * speed_multiplier
         self.run_speed = base_run * speed_multiplier
     
-    def draw(self, screen, camera):
+    def draw(self, screen, camera, colors):
         screen_x = self.x - camera.x
         screen_y = self.y - camera.y
         
         # Character body
         if self.invulnerable and int(self.invulnerable_timer * 10) % 2 == 0:
-            body_color = WHITE
+            body_color = colors['WHITE']
         elif self.is_knocked_back:
-            body_color = GRAY
+            body_color = colors['GRAY']
         elif self.is_charging_beam or self.is_firing_beam:
-            body_color = PURPLE
+            body_color = colors['PURPLE']
         else:
-            body_color = BLUE
-        pygame.draw.rect(screen, body_color, (screen_x - self.width // 2, screen_y - self.height // 2, self.width, self.height))
+            body_color = colors['BLUE']
+            
+        pygame.draw.rect(screen, body_color, 
+                        (screen_x - self.width // 2, screen_y - self.height // 2, 
+                         self.width, self.height))
         
         # Direction indicator
-        indicator_color = RED if (self.is_attacking or self.is_charging_beam or self.is_firing_beam) else YELLOW
+        indicator_color = colors['RED'] if (self.is_attacking or self.is_charging_beam or self.is_firing_beam) else colors['YELLOW']
         if self.direction == 'up':
             pygame.draw.circle(screen, indicator_color, (int(screen_x), int(screen_y - self.height // 2 + 5)), 4)
         elif self.direction == 'down':
@@ -284,7 +287,7 @@ class Player:
         
         # Running indicator
         if self.is_running:
-            pygame.draw.circle(screen, WHITE, (int(screen_x), int(screen_y - self.height // 2 - 10)), 3)
+            pygame.draw.circle(screen, colors['WHITE'], (int(screen_x), int(screen_y - self.height // 2 - 10)), 3)
         
         # Charging indicator
         if self.is_charging_beam:
@@ -294,6 +297,6 @@ class Player:
             bar_x = screen_x - bar_width // 2
             bar_y = screen_y - self.height // 2 - 20
             
-            pygame.draw.rect(screen, BLACK, (bar_x, bar_y, bar_width, bar_height))
-            pygame.draw.rect(screen, YELLOW, (bar_x, bar_y, int(bar_width * charge_progress), bar_height))
-            pygame.draw.rect(screen, WHITE, (bar_x, bar_y, bar_width, bar_height), 1)
+            pygame.draw.rect(screen, colors['BLACK'], (bar_x, bar_y, bar_width, bar_height))
+            pygame.draw.rect(screen, colors['YELLOW'], (bar_x, bar_y, int(bar_width * charge_progress), bar_height))
+            pygame.draw.rect(screen, colors['WHITE'], (bar_x, bar_y, bar_width, bar_height), 1)
