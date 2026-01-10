@@ -1,4 +1,22 @@
-    def draw(self, screen, camera, colors):
+import pygame
+from config.settings import WHITE
+
+class MeleeAttack:
+    def __init__(self, x, y, direction):
+        self.x = x
+        self.y = y
+        self.direction = direction
+        self.duration = 0.2  # seconds
+        self.timer = 0
+        self.active = True
+        self.size = 40
+        
+    def update(self, dt):
+        self.timer += dt
+        if self.timer >= self.duration:
+            self.active = False
+    
+    def draw(self, screen, camera):
         if self.active:
             screen_x = self.x - camera.x
             screen_y = self.y - camera.y
@@ -26,13 +44,11 @@
                 end_x = screen_x + offset + self.size
                 end_y = screen_y + self.size // 2
             
-            # Draw swish effect (arc)
+            # Draw swish effect
             progress = self.timer / self.duration
-            alpha = int(255 * (1 - progress))
             
             # Draw multiple lines for swish effect
             for i in range(5):
-                color = (255, 255, 255, alpha) if i == 2 else (200, 200, 200, alpha // 2)
                 offset_ratio = (i - 2) * 0.15
                 
                 if self.direction in ['up', 'down']:
@@ -46,4 +62,4 @@
                     sy = start_y + offset_ratio * self.size
                     ey = end_y + offset_ratio * self.size
                 
-                pygame.draw.line(screen, colors['WHITE'], (int(sx), int(sy)), (int(ex), int(ey)), 3)
+                pygame.draw.line(screen, WHITE, (int(sx), int(sy)), (int(ex), int(ey)), 3)
