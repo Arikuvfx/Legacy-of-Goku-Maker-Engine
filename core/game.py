@@ -1,27 +1,26 @@
-import pygame
+import sys
 import sys
 import time
+
 from config.settings import *
-from core.game_config import GameConfig
 from core.camera import Camera
-from entities.player import Player
-from entities.enemy import Enemy
-from entities.npc import NPC
-from attacks.projectile import Projectile
-from attacks.beam import BeamAttack
-from attacks.melee import MeleeAttack
-from ui.hud import UI
-from ui.dialogue import DialogueBox
-from ui.notifications import LevelUpNotification
-from rooms.room_manager import RoomManager
-from rooms.room import Room
-from dev_tools.spawn_menu import SpawnMenu
+from core.game_config import GameConfig
+from core.transition_controller import TransitionController
 from dev_tools.dev_menu import DevMenu
 from dev_tools.npc_config import NPCConfigMenu
 from dev_tools.room_editor import RoomEditorMenu
-from objects.room_transition import RoomTransition
-from core.transition_controller import TransitionController
+from dev_tools.spawn_menu import SpawnMenu
 from dev_tools.transition_config import TransitionConfigMenu
+from entities.enemy import Enemy
+from entities.npc import NPC
+from entities.player import Player
+from objects.room_transition import RoomTransition
+from rooms.room_manager import RoomManager
+from ui.dialogue import DialogueBox
+from ui.hud import UI
+from ui.notifications import LevelUpNotification
+from core.sound_engine import SoundEngine, SoundManager, AudioAssetLoader
+
 
 class Game:
     def __init__(self):
@@ -74,6 +73,20 @@ class Game:
         self.transition_controller = TransitionController(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.transition_config_menu = TransitionConfigMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.pending_transition_position = None
+
+        # Sound System
+        self.sound_engine = SoundEngine()
+        self.sound_manager = SoundManager(self.sound_engine)
+
+        # Load audio assets (automatically loads from assets/audio)
+        AudioAssetLoader.load_from_directory(self.sound_engine)
+
+        # Manually load specific tracks if not using auto-loader
+        # self.sound_engine.load_music('exploration_theme', 'assets/audio/music/exploration.ogg')
+        # self.sound_engine.load_sound_effect('blast', 'assets/audio/sfx/blast.wav')
+
+        # Start exploration music
+        self.sound_manager.set_context('exploration')
     
     def _create_default_room(self):
         """Create and set the default room"""
@@ -174,6 +187,7 @@ class Game:
                                 projectile = self.player.shoot_blast()
                                 if projectile:
                                     self.projectiles.append(projectile)
+                                    self.sound_manager.play_sfx('blast')  # SOUND EFFECT
                             elif self.player.ki_attack_mode == 'beam':
                                 self.player.start_charging_beam()
                         elif event.key == pygame.K_e:
@@ -203,6 +217,8 @@ class Game:
                                 melee = self.player.melee_attack()
                                 if melee:
                                     self.melee_attacks.append(melee)
+                                    self.sound_manager.play_sfx('punch')  # SOUND EFFECT
+
                         elif event.key == pygame.K_TAB:
                             # Switch ki attack mode
                             if self.player.ki_attack_mode == 'blast':
@@ -216,8 +232,10 @@ class Game:
                 elif self.ui.current_screen == 'main_menu':
                     if event.key == pygame.K_UP:
                         self.ui.selected_menu_item = (self.ui.selected_menu_item - 1) % len(self.ui.menu_items)
+                        self.sound_manager.play_sfx('menu_select')  # SOUND EFFECT
                     elif event.key == pygame.K_DOWN:
                         self.ui.selected_menu_item = (self.ui.selected_menu_item + 1) % len(self.ui.menu_items)
+                        self.sound_manager.play_sfx('menu_select')  # SOUND EFFECT
                     elif event.key == pygame.K_RETURN:
                         selected = self.ui.menu_items[self.ui.selected_menu_item]
                         if selected == 'Continue':
@@ -245,6 +263,7 @@ class Game:
                             beam = self.player.fire_beam()
                             if beam:
                                 self.player.current_beam = beam
+                                self.sound_manager.play_sfx('beam')  # SOUND EFFECT
         
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if self.spawn_menu.active and event.button == 1:  # Left click
@@ -366,6 +385,7 @@ class Game:
                 for melee in self.melee_attacks:
                     if melee.active:
                         enemy.check_collision_with_attack(melee, 'melee')
+                        self.sound_manager.play_sfx('enemy_hit')  # SOUND EFFECT
                 
                 for projectile in self.projectiles:
                     if projectile.active and enemy.check_collision_with_attack(projectile, 'projectile'):
@@ -395,6 +415,9 @@ class Game:
                 # Check if player is near this NPC
                 if npc.can_interact(self.player):
                     self.nearby_npc = npc
+
+            # Update battle music based on enemy count
+            self.sound_manager.update_battle_state(dt, len(self.enemies) > 0)
     
     def draw(self):
         # Background

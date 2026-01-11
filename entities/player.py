@@ -104,7 +104,7 @@ class Player:
                 spawn_x -= self.width // 2
             elif self.direction == 'right':
                 spawn_x += self.width // 2
-            
+            # self.sound_engine.play_sound('blast')
             return Projectile(spawn_x, spawn_y, self.direction)
         return None
     
