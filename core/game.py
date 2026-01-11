@@ -68,6 +68,12 @@ class Game:
         
         # Create default room
         self._create_default_room()
+
+        # room transition 
+        self.room_transitions = []
+        self.transition_controller = TransitionController(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.transition_config_menu = TransitionConfigMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.pending_transition_position = None
     
     def _create_default_room(self):
         """Create and set the default room"""
