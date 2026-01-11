@@ -19,6 +19,9 @@ from dev_tools.spawn_menu import SpawnMenu
 from dev_tools.dev_menu import DevMenu
 from dev_tools.npc_config import NPCConfigMenu
 from dev_tools.room_editor import RoomEditorMenu
+from objects.room_transition import RoomTransition
+from core.transition_controller import TransitionController
+from dev_tools.transition_config import TransitionConfigMenu
 
 class Game:
     def __init__(self):
