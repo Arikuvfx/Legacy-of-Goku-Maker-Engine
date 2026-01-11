@@ -15,6 +15,7 @@ class SpawnMenu:
             'Enemies': ['Basic Enemy', 'Strong Enemy', 'Boss Enemy'],
             'Objects': ['Tree', 'Rock', 'Chest'],
             'NPCs': ['Villager', 'Merchant', 'Quest Giver']
+            'Room Transitions': ['Room Transition']  # Add this line
         }
         self.selected_item = 0
     
