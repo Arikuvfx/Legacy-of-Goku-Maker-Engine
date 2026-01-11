@@ -21,6 +21,19 @@ class RoomManager:
     def get_rooms_in_group(self, group):
         return [r for r in self.rooms if r.group == group]
     
+    
+    def get_room_names(self):
+        """Get list of all room names"""
+        return [room.name for room in self.rooms]
+    
+   
+    def get_room_by_name(self, name):
+        """Get room by name"""
+        for room in self.rooms:
+            if room.name == name:
+                return room
+        return None
+    
     def create_group(self, group_name):
         if group_name not in self.groups:
             self.groups.append(group_name)
