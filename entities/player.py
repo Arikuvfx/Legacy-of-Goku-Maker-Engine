@@ -2,13 +2,14 @@ import pygame
 import time
 from config.settings import WORLD_WIDTH, WORLD_HEIGHT, WHITE, GRAY, PURPLE, BLUE, RED, YELLOW, BLACK
 from attacks import Projectile, BeamAttack, MeleeAttack
+from core.sprite_system import create_character_sprite
 
 class Player:
-    def __init__(self, x, y):
+    def __init__(self, x, y, character='goku', costume='base'):
         self.x = x
         self.y = y
-        self.width = 32
-        self.height = 32
+        self.width = 128
+        self.height = 128
         self.speed = 3
         self.run_speed = 6
         self.hp = 100
@@ -36,6 +37,12 @@ class Player:
             'speed': 1,
             'defense': 1
         }
+
+        # Sprite system - Much simpler now!
+        self.sprite = create_character_sprite(character, costume, 32, 32)
+
+        # Animation state
+        self.current_animation_state = 'idle'
         
         # Ki attack modes
         self.ki_attack_mode = 'blast'
@@ -85,6 +92,11 @@ class Player:
             self.direction = 'down'
         elif dy < 0:
             self.direction = 'up'
+
+        # Set animation based on running state
+        anim = 'run' if is_running else 'walk'
+        self.sprite.set_animation(anim, self.direction)
+        self.current_animation_state = anim
     
     def shoot_blast(self):
         if self.ki >= self.blast_ki_cost and not self.is_attacking and self.attack_cooldown <= 0:
@@ -149,6 +161,11 @@ class Player:
             self.is_attacking = True
             self.attack_timer = self.melee_duration
             self.attack_cooldown = 0.4
+
+            # Set attack animation
+            self.sprite.set_animation('melee', self.direction)
+            self.current_animation_state = 'melee'
+
             return MeleeAttack(self.x, self.y, self.direction)
         return None
     
@@ -182,6 +199,26 @@ class Player:
             if self.attack_timer <= 0:
                 self.is_attacking = False
         
+        if self.attack_cooldown > 0:
+            self.attack_cooldown -= dt
+
+        # Update sprite animation
+        self.sprite.update(dt)
+
+        # Check if attack animation finished
+        if self.current_animation_state == 'melee':
+            if self.sprite.is_animation_finished():
+                self.sprite.set_animation('idle', self.direction)
+                self.current_animation_state = 'idle'
+
+        # If not moving and not attacking, show idle
+        # (This is handled in game.py when dx/dy == 0)
+
+        if self.is_attacking:
+            self.attack_timer -= dt
+            if self.attack_timer <= 0:
+                self.is_attacking = False
+
         if self.attack_cooldown > 0:
             self.attack_cooldown -= dt
         
@@ -259,23 +296,14 @@ class Player:
         self.run_speed = base_run * speed_multiplier
     
     def draw(self, screen, camera, colors):
+
+        # Draw sprite instead of rectangle
+        self.sprite.draw(screen, self.x, self.y, camera, scale=2.0)
+
+        # Still draw indicators (running, charging, etc.)
         screen_x = self.x - camera.x
         screen_y = self.y - camera.y
-        
-        # Character body
-        if self.invulnerable and int(self.invulnerable_timer * 10) % 2 == 0:
-            body_color = colors['WHITE']
-        elif self.is_knocked_back:
-            body_color = colors['GRAY']
-        elif self.is_charging_beam or self.is_firing_beam:
-            body_color = colors['PURPLE']
-        else:
-            body_color = colors['BLUE']
-            
-        pygame.draw.rect(screen, body_color, 
-                        (screen_x - self.width // 2, screen_y - self.height // 2, 
-                         self.width, self.height))
-        
+
         # Direction indicator
         indicator_color = colors['RED'] if (self.is_attacking or self.is_charging_beam or self.is_firing_beam) else colors['YELLOW']
         if self.direction == 'up':
@@ -286,11 +314,12 @@ class Player:
             pygame.draw.circle(screen, indicator_color, (int(screen_x - self.width // 2 + 5), int(screen_y)), 4)
         elif self.direction == 'right':
             pygame.draw.circle(screen, indicator_color, (int(screen_x + self.width // 2 - 5), int(screen_y)), 4)
-        
+
         # Running indicator
         if self.is_running:
-            pygame.draw.circle(screen, colors['WHITE'], (int(screen_x), int(screen_y - self.height // 2 - 10)), 3)
-        
+            pygame.draw.circle(screen, colors['WHITE'],
+                               (int(screen_x), int(screen_y - self.height // 2 - 10)), 3)
+
         # Charging indicator
         if self.is_charging_beam:
             charge_progress = min(self.beam_charge_time / self.beam_charge_required, 1.0)
@@ -298,7 +327,8 @@ class Player:
             bar_height = 5
             bar_x = screen_x - bar_width // 2
             bar_y = screen_y - self.height // 2 - 20
-            
+
             pygame.draw.rect(screen, colors['BLACK'], (bar_x, bar_y, bar_width, bar_height))
-            pygame.draw.rect(screen, colors['YELLOW'], (bar_x, bar_y, int(bar_width * charge_progress), bar_height))
+            pygame.draw.rect(screen, colors['YELLOW'],
+                             (bar_x, bar_y, int(bar_width * charge_progress), bar_height))
             pygame.draw.rect(screen, colors['WHITE'], (bar_x, bar_y, bar_width, bar_height), 1)
