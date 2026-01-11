@@ -307,6 +307,31 @@ class Game:
             # Update player
             self.player.update(dt)
             
+            # Update transition controller
+            if self.transition_controller.is_transitioning():
+                self.transition_controller.update(dt, self.player)
+            
+            # Check for room transitions
+            if not self.transition_controller.is_transitioning():
+                for transition in self.room_transitions:
+                    if transition.active and transition.check_collision(self.player):
+                        # Start the transition animation
+                        def complete_transition(target_room_name, spawn_x, spawn_y):
+                            # Switch to the target room
+                            target_room = self.room_manager.get_room_by_name(target_room_name)
+                            if target_room:
+                                self.room_manager.current_room = target_room
+                                self.current_room = target_room
+                                # Player position is already set by transition controller
+                        
+                        # Start the transition
+                        self.transition_controller.start_transition(
+                            self.player, 
+                            transition, 
+                            complete_transition
+                        )
+                        break  # Only trigger one transition at a time
+            
             # Update level up notification
             self.level_up_notification.update(dt)
             
@@ -447,6 +472,20 @@ class Game:
         
         # Draw room editor menu
         self.room_editor_menu.draw(self.screen, self.colors)
+        
+        # Draw room editor menu
+        self.room_editor_menu.draw(self.screen, self.colors)
+        
+        # Draw room transitions (nur im dev mode sichtbar)
+        dev_mode = self.spawn_menu.active or self.dev_menu.active
+        for transition in self.room_transitions:
+            transition.draw(self.screen, self.camera, dev_mode)
+        
+        # Draw transition config menu  
+        self.transition_config_menu.draw(self.screen)
+        
+        # Draw transition fade overlay 
+        self.transition_controller.draw(self.screen)
         
         # Draw UI
         self.ui.draw_hud(self.screen, self.player, self.colors)
