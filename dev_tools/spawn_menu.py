@@ -13,9 +13,8 @@ class SpawnMenu:
         # Define spawn options for each category
         self.spawn_options = {
             'Enemies': ['Basic Enemy', 'Strong Enemy', 'Boss Enemy'],
-            'Objects': ['Tree', 'Rock', 'Chest'],
+            'Objects': ['Room Transition'],
             'NPCs': ['Villager', 'Merchant', 'Quest Giver']
-            'Room Transitions': ['Room Transition']  # Add this line
         }
         self.selected_item = 0
     
