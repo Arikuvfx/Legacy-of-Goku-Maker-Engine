@@ -31,7 +31,7 @@ class RoomTransition:
                                   player.y - player.height // 2,
                                   player.width, player.height)
         return self.get_rect().colliderect(player_rect)
-    
+
     def draw(self, screen, camera, dev_mode=False):
         """Draw transition zone (only visible in dev mode)"""
         if not self.active:
