@@ -12,7 +12,7 @@ latest change:
 
 
 
-```
+
 Download the repo as a zip file
 
 Unpack the zip file
@@ -20,4 +20,3 @@ Unpack the zip file
 Launch CMD in the current location
 
 Type in "python main.py"
-```
