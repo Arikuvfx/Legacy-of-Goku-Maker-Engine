@@ -261,8 +261,15 @@ class Game:
                         if category == 'Enemies':
                             self.enemies.append(Enemy(world_x, world_y))
                         elif category == 'Objects':
-                            # TODO: Add object spawning
-                            pass
+                            if item == 'Room Transition':
+                                # Open transition configuration menu
+                                self.pending_transition_position = (world_x, world_y)
+                                available_rooms = self.room_manager.get_room_names() if hasattr(self, 'room_manager') else []
+                                self.transition_config_menu.toggle(available_rooms)
+                                self.spawn_menu.toggle()  # Close spawn menu
+                            else:
+                                # TODO: Add other object spawning (Tree, Rock, Chest)
+                                pass
                         elif category == 'NPCs':
                             # Open NPC configuration menu
                             self.pending_npc_position = (world_x, world_y)
