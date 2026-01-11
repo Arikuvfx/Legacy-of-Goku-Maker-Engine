@@ -99,6 +99,26 @@ class Game:
                 elif result == 'cancel':
                     self.pending_npc_position = None
                 continue
+
+            # Handle Transition config menu input
+            if self.transition_config_menu.active:
+                # Get available rooms from room manager
+                available_rooms = self.room_manager.get_room_names() if hasattr(self, 'room_manager') else []
+                result = self.transition_config_menu.handle_input(event)
+                if result and result != 'cancel' and self.pending_transition_position:
+                    # Create room transition with configuration
+                    x, y = self.pending_transition_position
+                    transition = RoomTransition(x, y, result['width'], result['height'])
+                    transition.target_room = result['target_room']
+                    transition.exit_direction = result['exit_direction']
+                    transition.entry_direction = result['entry_direction']
+                    transition.spawn_x = result['spawn_x']
+                    transition.spawn_y = result['spawn_y']
+                    self.room_transitions.append(transition)
+                    self.pending_transition_position = None
+                elif result == 'cancel':
+                    self.pending_transition_position = None
+                continue
                     
             # Handle Dev Menu input
             if self.dev_menu.active:
