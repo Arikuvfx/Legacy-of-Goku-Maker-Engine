@@ -34,7 +34,7 @@ class RoomTransition:
     
     def draw(self, screen, camera, dev_mode=False):
         """Draw transition zone (only visible in dev mode)"""
-        if not self.active or not dev_mode:
+        if not self.active:
             return
         
         screen_x = self.x - camera.x
