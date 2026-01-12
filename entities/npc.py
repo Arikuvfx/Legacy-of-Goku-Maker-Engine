@@ -1,5 +1,6 @@
 import pygame
 import random
+from core.draw_layers import DrawLayer
 
 class NPC:
     def __init__(self, x, y, dialogue_config=None):
@@ -40,6 +41,12 @@ class NPC:
         
         # Interaction
         self.interaction_range = 50
+
+        self.draw_layer = DrawLayer.NPCS
+        self.y_sort = True  # NPCs use Y-sorting for depth
+
+    def get_sort_key(self):
+        return (self.draw_layer, self.y)
         
     def distance_to(self, x, y):
         dx = self.x - x

@@ -1,5 +1,6 @@
 import pygame
 from config.settings import WHITE
+from core.draw_layers import DrawLayer
 
 class MeleeAttack:
     def __init__(self, x, y, direction):
@@ -10,6 +11,12 @@ class MeleeAttack:
         self.timer = 0
         self.active = True
         self.size = 40
+
+        self.draw_layer = DrawLayer.EFFECTS_FRONT
+        self.y_sort = False
+
+    def get_sort_key(self):
+        return (self.draw_layer, 0)
         
     def update(self, dt):
         self.timer += dt

@@ -3,9 +3,11 @@ import time
 from config.settings import WORLD_WIDTH, WORLD_HEIGHT, WHITE, GRAY, PURPLE, BLUE, RED, YELLOW, BLACK
 from attacks import Projectile, BeamAttack, MeleeAttack
 from core.sprite_system import create_character_sprite
+from core.draw_layers import DrawLayer
+
 
 class Player:
-    def __init__(self, x, y, character='goku', costume='base'):
+    def __init__(self, x, y, character='goku', costume='base', game_config=None):
         self.x = x
         self.y = y
         self.width = 128
@@ -27,7 +29,17 @@ class Player:
         self.exp_to_next_level = 100
         self.stat_points = 0
         self.pending_level_up = False
-        
+
+        # Add layer properties
+        self.draw_layer = DrawLayer.PLAYER
+        self.y_sort = False
+
+        # Transformation system (will be initialized after game_config is set)
+        self.transformation = None
+        if game_config:
+            from core.transformation_system import TransformationSystem
+            self.transformation = TransformationSystem(self, game_config)
+
         # Player Stats
         self.stats = {
             'strength': 1,
@@ -38,12 +50,12 @@ class Player:
             'defense': 1
         }
 
-        # Sprite system - Much simpler now!
+        # Sprite system
         self.sprite = create_character_sprite(character, costume, 32, 32)
 
         # Animation state
         self.current_animation_state = 'idle'
-        
+
         # Ki attack modes
         self.ki_attack_mode = 'blast'
         self.is_charging_beam = False
@@ -51,16 +63,19 @@ class Player:
         self.beam_charge_required = 1.5
         self.is_firing_beam = False
         self.current_beam = None
-        
+
         # Attack costs and settings
         self.blast_ki_cost = 10
         self.beam_ki_drain = 20
         self.melee_duration = 0.3
-        
+
+        # Pending blast projectile (spawns after animation)
+        self.pending_blast = None
+
         # For double tap detection
         self.last_key_press = {}
         self.double_tap_window = 0.3
-        
+
         # Damage and knockback
         self.is_knocked_back = False
         self.knockback_timer = 0
@@ -70,166 +85,245 @@ class Player:
         self.invulnerable = False
         self.invulnerable_timer = 0
         self.invulnerable_duration = 0.5
-        
+
+        # Input tracking
+        self.is_q_pressed = False
+
+    def get_sort_key(self):
+        return (self.draw_layer, 0)
+
+    def can_act(self):
+        """Check if player can perform actions (not locked in animation)"""
+        return not (self.is_attacking or self.is_charging_beam or self.is_firing_beam or self.is_knocked_back)
+
+    def can_move(self):
+        """Check if player can move"""
+        return self.can_act()
+
     def move(self, dx, dy, is_running, world_width, world_height):
-        if self.is_attacking or self.is_charging_beam or self.is_firing_beam or self.is_knocked_back:
+        if not self.can_move():
             return
-        
+
+        if dx != 0 and dy == 0:
+            if dx > 0:
+                self.direction = 'right'
+            else:
+                self.direction = 'left'
+        elif dy != 0 and dx == 0:
+            if dy > 0:
+                self.direction = 'down'
+            else:
+                self.direction = 'up'
+
         current_speed = self.run_speed if is_running else self.speed
         self.x += dx * current_speed
         self.y += dy * current_speed
-        
-        # Keep player within world bounds
+
         self.x = max(self.width // 2, min(self.x, world_width - self.width // 2))
         self.y = max(self.height // 2, min(self.y, world_height - self.height // 2))
-        
-        # Update direction
-        if dx > 0:
-            self.direction = 'right'
-        elif dx < 0:
-            self.direction = 'left'
-        elif dy > 0:
-            self.direction = 'down'
-        elif dy < 0:
-            self.direction = 'up'
 
-        # Set animation based on running state
         anim = 'run' if is_running else 'walk'
         self.sprite.set_animation(anim, self.direction)
         self.current_animation_state = anim
-    
+
     def shoot_blast(self):
-        if self.ki >= self.blast_ki_cost and not self.is_attacking and self.attack_cooldown <= 0:
+        """Start blast animation - projectile spawns when animation finishes"""
+        if not self.can_act() or self.attack_cooldown > 0:
+            return
+
+        if self.ki >= self.blast_ki_cost:
             self.ki -= self.blast_ki_cost
             self.is_attacking = True
-            self.attack_timer = 0.3
             self.attack_cooldown = 0.5
-            
-            spawn_x = self.x
-            spawn_y = self.y
-            
-            if self.direction == 'up':
-                spawn_y -= self.height // 2
-            elif self.direction == 'down':
-                spawn_y += self.height // 2
-            elif self.direction == 'left':
-                spawn_x -= self.width // 2
-            elif self.direction == 'right':
-                spawn_x += self.width // 2
-            # self.sound_engine.play_sound('blast')
-            return Projectile(spawn_x, spawn_y, self.direction)
-        return None
-    
+
+            # Set blast animation
+            self.sprite.set_animation('kiblast', self.direction)
+            self.current_animation_state = 'kiblast'
+
+            # Mark that we need to spawn blast when animation ends
+            self.pending_blast = True
+
+    def get_blast_spawn_position(self):
+        """Calculate where the blast should spawn based on direction"""
+        spawn_x = self.x
+        spawn_y = self.y
+
+        if self.direction == 'up':
+            spawn_y -= self.height // 2
+        elif self.direction == 'down':
+            spawn_y += self.height // 2
+        elif self.direction == 'left':
+            spawn_x -= self.width // 2
+        elif self.direction == 'right':
+            spawn_x += self.width // 2
+
+        return spawn_x, spawn_y
+
     def start_charging_beam(self):
-        if self.ki > 0 and not self.is_attacking and not self.is_charging_beam and not self.is_firing_beam:
+        if not self.can_act():
+            return False
+
+        if self.ki > 0:
             self.is_charging_beam = True
             self.beam_charge_time = 0
-    
+            self.sprite.set_animation('charge', self.direction)
+            self.current_animation_state = 'charge'
+            self.is_q_pressed = True
+            return True
+        return False
+
     def update_beam_charge(self, dt):
         if self.is_charging_beam:
             self.beam_charge_time += dt
-    
-    def fire_beam(self):
+
+            # Check if charge is complete and auto-fire
+            if self.beam_charge_time >= self.beam_charge_required and not self.is_firing_beam:
+                self.fire_beam_auto()
+
+    def fire_beam_auto(self):
+        """Fire beam automatically when charge is complete"""
         if self.is_charging_beam and self.beam_charge_time >= self.beam_charge_required:
             self.is_charging_beam = False
             self.is_firing_beam = True
             self.beam_charge_time = 0
-            
+
+            # Switch to firing animation
+            self.sprite.set_animation('firebeam', self.direction)
+            self.current_animation_state = 'firebeam'
+
             spawn_x = self.x
             spawn_y = self.y
-            
+
             if self.direction == 'up':
-                spawn_y -= self.height // 2
+                spawn_y -= 15
             elif self.direction == 'down':
-                spawn_y += self.height // 2
+                spawn_y += 15
             elif self.direction == 'left':
-                spawn_x -= self.width // 2
+                spawn_x -= 15
+                spawn_y += 5
             elif self.direction == 'right':
-                spawn_x += self.width // 2
-            
-            return BeamAttack(spawn_x, spawn_y, self.direction)
+                spawn_x += 15
+                spawn_y += 5
+
+            self.current_beam = BeamAttack(spawn_x, spawn_y, self.direction, scale=2.0)
+            return self.current_beam
         return None
-    
+
     def stop_beam(self):
+        """Stop beam charging or firing and return to idle"""
         self.is_charging_beam = False
         self.is_firing_beam = False
         self.beam_charge_time = 0
+        self.is_q_pressed = False
         self.current_beam = None
-    
+
+        # Return to idle animation
+        if self.current_animation_state in ['charge', 'kiblast', 'firebeam']:
+            self.sprite.set_animation('idle', self.direction)
+            self.current_animation_state = 'idle'
+
     def melee_attack(self):
-        if not self.is_attacking and self.attack_cooldown <= 0:
-            self.is_attacking = True
-            self.attack_timer = self.melee_duration
-            self.attack_cooldown = 0.4
+        if not self.can_act() or self.attack_cooldown > 0:
+            return None
 
-            # Set attack animation
-            self.sprite.set_animation('melee', self.direction)
-            self.current_animation_state = 'melee'
+        self.is_attacking = True
+        self.attack_cooldown = 0.4
 
-            return MeleeAttack(self.x, self.y, self.direction)
-        return None
-    
+        self.sprite.set_animation('melee', self.direction)
+        self.current_animation_state = 'melee'
+
+        return MeleeAttack(self.x, self.y, self.direction)
+
     def update(self, dt):
         # Handle knockback
         if self.is_knocked_back:
             self.knockback_timer -= dt
-            
+
             self.x += self.knockback_velocity_x * dt
             self.y += self.knockback_velocity_y * dt
-            
+
             self.x = max(self.width // 2, min(self.x, WORLD_WIDTH - self.width // 2))
             self.y = max(self.height // 2, min(self.y, WORLD_HEIGHT - self.height // 2))
-            
+
             self.knockback_velocity_x *= 0.85
             self.knockback_velocity_y *= 0.85
-            
+
             if self.knockback_timer <= 0:
                 self.is_knocked_back = False
                 self.knockback_velocity_x = 0
                 self.knockback_velocity_y = 0
-        
+
         # Handle invulnerability
         if self.invulnerable:
             self.invulnerable_timer -= dt
             if self.invulnerable_timer <= 0:
                 self.invulnerable = False
-        
-        if self.is_attacking:
-            self.attack_timer -= dt
-            if self.attack_timer <= 0:
-                self.is_attacking = False
-        
+
+        # Handle attack cooldown
         if self.attack_cooldown > 0:
             self.attack_cooldown -= dt
 
-        # Update sprite animation
+        # Update sprite animation FIRST
         self.sprite.update(dt)
 
-        # Check if attack animation finished
+        # THEN check if animations finished
+        # Check if melee animation finished
         if self.current_animation_state == 'melee':
             if self.sprite.is_animation_finished():
+                self.is_attacking = False
                 self.sprite.set_animation('idle', self.direction)
                 self.current_animation_state = 'idle'
 
-        # If not moving and not attacking, show idle
-        # (This is handled in game.py when dx/dy == 0)
-
-        if self.is_attacking:
-            self.attack_timer -= dt
-            if self.attack_timer <= 0:
+        # Check if blast animation finished
+        elif self.current_animation_state == 'kiblast':
+            if self.sprite.is_animation_finished():
                 self.is_attacking = False
 
-        if self.attack_cooldown > 0:
-            self.attack_cooldown -= dt
-        
-        # Drain ki while firing beam
-        if self.is_firing_beam:
+                # Signal that blast is ready to spawn NOW
+                if self.pending_blast:
+                    self.pending_blast = 'ready'
+
+                self.sprite.set_animation('idle', self.direction)
+                self.current_animation_state = 'idle'
+
+        # Check if charge animation should continue
+        elif self.current_animation_state == 'charge':
+            # If we're charging but Q is no longer pressed, stop charging
+            if self.is_charging_beam and not self.is_q_pressed:
+                self.stop_beam()
+            # Continue charging animation while charging
+            elif self.is_charging_beam:
+                # Update beam charge
+                self.update_beam_charge(dt)
+
+        # Handle firing beam animation
+        elif self.current_animation_state == 'firebeam':
+            # Keep playing the firing animation while beam is active
+            if self.is_firing_beam:
+                # Drain ki while firing beam
+                ki_drain = self.beam_ki_drain * dt
+                self.ki -= ki_drain
+                if self.ki <= 0:
+                    self.ki = 0
+                    self.stop_beam()
+                # If Q is released while firing, stop the beam
+                elif not self.is_q_pressed:
+                    self.stop_beam()
+            else:
+                # If not firing anymore, return to idle
+                self.sprite.set_animation('idle', self.direction)
+                self.current_animation_state = 'idle'
+
+        # Legacy ki drain code (kept for compatibility)
+        if self.is_firing_beam and self.current_animation_state != 'firebeam':
             ki_drain = self.beam_ki_drain * dt
             self.ki -= ki_drain
             if self.ki <= 0:
                 self.ki = 0
                 self.stop_beam()
-    
+            elif not self.is_q_pressed:
+                self.stop_beam()
+
     def check_double_tap(self, key):
         current_time = time.time()
         if key in self.last_key_press:
@@ -238,42 +332,46 @@ class Player:
                 return True
         self.last_key_press[key] = current_time
         return False
-    
+
     def take_damage(self, damage, knockback_x, knockback_y):
         if self.invulnerable:
             return
-        
+
         self.hp -= damage
         if self.hp < 0:
             self.hp = 0
-        
+
         self.is_knocked_back = True
         self.knockback_timer = self.knockback_duration
         self.knockback_velocity_x = knockback_x * 300
         self.knockback_velocity_y = knockback_y * 300
-        
+
         self.invulnerable = True
         self.invulnerable_timer = self.invulnerable_duration
-        
+
+        # Cancel any ongoing attacks
+        self.is_attacking = False
         self.is_charging_beam = False
         self.is_firing_beam = False
+        self.pending_blast = None  # Cancel pending blast
+        self.is_q_pressed = False
         if self.current_beam:
             self.current_beam = None
-            
+
+        self.sprite.set_animation('hurt', self.direction)
+        self.current_animation_state = 'hurt'
+
     def gain_exp(self, amount, game_config):
         self.exp += amount
-        
         while self.exp >= self.exp_to_next_level and self.level < game_config.max_level:
             self.level_up(game_config)
-    
+
     def level_up(self, game_config):
         self.exp -= self.exp_to_next_level
         self.level += 1
         self.stat_points += game_config.stat_points_per_level
         self.pending_level_up = True
-        
         self.exp_to_next_level = game_config.get_xp_for_level(self.level)
-        
         self.hp = self.max_hp
         self.ki = self.max_ki
 
@@ -288,24 +386,20 @@ class Player:
     def update_derived_stats(self):
         self.max_hp = 100 + (self.stats['vitality'] - 1) * 10
         self.max_ki = 100 + (self.stats['energy'] - 1) * 5
-        
         base_speed = 3
         base_run = 6
         speed_multiplier = 1 + (self.stats['speed'] - 1) * 0.05
         self.speed = base_speed * speed_multiplier
         self.run_speed = base_run * speed_multiplier
-    
-    def draw(self, screen, camera, colors):
 
-        # Draw sprite instead of rectangle
+    def draw(self, screen, camera, colors):
         self.sprite.draw(screen, self.x, self.y, camera, scale=2.0)
 
-        # Still draw indicators (running, charging, etc.)
         screen_x = self.x - camera.x
         screen_y = self.y - camera.y
 
-        # Direction indicator
-        indicator_color = colors['RED'] if (self.is_attacking or self.is_charging_beam or self.is_firing_beam) else colors['YELLOW']
+        indicator_color = colors['RED'] if (self.is_attacking or self.is_charging_beam or self.is_firing_beam) else \
+            colors['YELLOW']
         if self.direction == 'up':
             pygame.draw.circle(screen, indicator_color, (int(screen_x), int(screen_y - self.height // 2 + 5)), 4)
         elif self.direction == 'down':
@@ -315,20 +409,15 @@ class Player:
         elif self.direction == 'right':
             pygame.draw.circle(screen, indicator_color, (int(screen_x + self.width // 2 - 5), int(screen_y)), 4)
 
-        # Running indicator
         if self.is_running:
-            pygame.draw.circle(screen, colors['WHITE'],
-                               (int(screen_x), int(screen_y - self.height // 2 - 10)), 3)
+            pygame.draw.circle(screen, colors['WHITE'], (int(screen_x), int(screen_y - self.height // 2 - 10)), 3)
 
-        # Charging indicator
         if self.is_charging_beam:
             charge_progress = min(self.beam_charge_time / self.beam_charge_required, 1.0)
             bar_width = 40
             bar_height = 5
             bar_x = screen_x - bar_width // 2
             bar_y = screen_y - self.height // 2 - 20
-
             pygame.draw.rect(screen, colors['BLACK'], (bar_x, bar_y, bar_width, bar_height))
-            pygame.draw.rect(screen, colors['YELLOW'],
-                             (bar_x, bar_y, int(bar_width * charge_progress), bar_height))
+            pygame.draw.rect(screen, colors['YELLOW'], (bar_x, bar_y, int(bar_width * charge_progress), bar_height))
             pygame.draw.rect(screen, colors['WHITE'], (bar_x, bar_y, bar_width, bar_height), 1)
