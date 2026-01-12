@@ -323,9 +323,10 @@ class CharacterSpriteLoader:
             ('idle', 0.3, True, 1),
             ('walk', 0.1, True, 1),
             ('run', 0.08, True, 1),
-            ('melee', 0.1, False, 3),  # 3 variants for punch!
+            ('melee', 0.1, False, 3),  # 3 variants for punch
             ('melee2', 0.1, False, 2),  # 2 variants for kick
-            ('melee3', 0.1, False, 1),  # 1 variant for heavy melee
+            ('melee3', 0.1, False, 1),  # 1 variant for punch
+            ('kiblast', 0.3, False, 1),
             ('hurt', 0.1, False, 1),
             ('death', 0.15, False, 1),
             ('charge', 0.1, True, 1),

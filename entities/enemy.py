@@ -1,6 +1,7 @@
 import pygame
 import random
 from config.settings import WORLD_WIDTH, WORLD_HEIGHT, RED, ORANGE, BLACK, GREEN, WHITE, YELLOW
+from core.draw_layers import DrawLayer
 
 
 class Enemy:
@@ -50,6 +51,12 @@ class Enemy:
         self.knockback_duration = 0.3
         self.knockback_velocity_x = 0
         self.knockback_velocity_y = 0
+
+        self.draw_layer = DrawLayer.ENEMIES
+        self.y_sort = True  # Enemies use Y-sorting for depth
+
+    def get_sort_key(self):
+        return (self.draw_layer, self.y)
 
     def distance_to(self, x, y):
         dx = self.x - x
@@ -289,6 +296,37 @@ class Enemy:
                 self.apply_knockback(dx, dy, 150)
                 return True
 
+        elif attack_type == 'projectile':
+            # Create projectile collision rectangle
+            projectile_radius = attack.radius
+            projectile_rect = pygame.Rect(
+                attack.x - projectile_radius,
+                attack.y - projectile_radius,
+                projectile_radius * 2,
+                projectile_radius * 2
+            )
+
+            # Create enemy rectangle
+            enemy_rect = pygame.Rect(
+                self.x - self.width // 2,
+                self.y - self.height // 2,
+                self.width,
+                self.height
+            )
+
+            if projectile_rect.colliderect(enemy_rect):
+                # Calculate knockback direction from projectile to enemy
+                dx = self.x - attack.x
+                dy = self.y - attack.y
+                dist = (dx * dx + dy * dy) ** 0.5
+                if dist > 0:
+                    dx /= dist
+                    dy /= dist
+
+                self.take_damage(20)
+                self.apply_knockback(dx, dy, 250)
+                return True
+
         elif attack_type == 'beam':
             if attack.length > 0:
                 if attack.direction == 'up':
@@ -353,3 +391,5 @@ class Enemy:
 
         if self.state == 'chase' and not self.is_attacking:
             pygame.draw.circle(screen, YELLOW, (int(screen_x), int(screen_y)), 5)
+
+

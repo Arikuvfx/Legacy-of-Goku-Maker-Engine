@@ -1,10 +1,10 @@
 import sys
-import sys
 import time
-
+from attacks import Projectile
 from config.settings import *
 from core.camera import Camera
 from core.game_config import GameConfig
+from core.transformation_system import TransformationSystem
 from core.transition_controller import TransitionController
 from dev_tools.dev_menu import DevMenu
 from dev_tools.npc_config import NPCConfigMenu
@@ -20,6 +20,13 @@ from ui.dialogue import DialogueBox
 from ui.hud import UI
 from ui.notifications import LevelUpNotification
 from core.sound_engine import SoundEngine, SoundManager, AudioAssetLoader
+from ui.sprite_hud import SpriteHUD
+from core.draw_layers import (
+    LayerManager,
+    DrawLayer,
+    LayerIntegrationHelper,
+    get_beam_layer
+)
 
 
 class Game:
@@ -31,16 +38,24 @@ class Game:
         self.running = True
         self.colors = get_colors()
 
-        # Game configuration
+        #Draw Layers
+        self.layer_manager = LayerManager()
+
+        # Game configuration (create first)
         self.game_config = GameConfig()
 
-        # Player and camera
-        self.player = Player(WORLD_WIDTH // 2, WORLD_HEIGHT // 2)
+        # Player and camera (pass game_config to player)
+        self.player = Player(WORLD_WIDTH // 2, WORLD_HEIGHT // 2, game_config=self.game_config)
         self.player.update_derived_stats()
+
+        # Initialize transformation system for player
+        self.player.transformation = TransformationSystem(self.player, self.game_config)
+
         self.camera = Camera(SCREEN_WIDTH, SCREEN_HEIGHT)
 
         # UI components
         self.ui = UI(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.sprite_hud = SpriteHUD(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.dialogue_box = DialogueBox(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.level_up_notification = LevelUpNotification(SCREEN_WIDTH, SCREEN_HEIGHT)
 
@@ -78,12 +93,8 @@ class Game:
         self.sound_engine = SoundEngine()
         self.sound_manager = SoundManager(self.sound_engine)
 
-        # Load audio assets (automatically loads from assets/audio)
+        # Load audio assets
         AudioAssetLoader.load_from_directory(self.sound_engine)
-
-        # Manually load specific tracks if not using auto-loader
-        # self.sound_engine.load_music('exploration_theme', 'assets/audio/music/exploration.ogg')
-        # self.sound_engine.load_sound_effect('blast', 'assets/audio/sfx/blast.wav')
 
         # Start exploration music
         self.sound_manager.set_context('exploration')
@@ -103,7 +114,6 @@ class Game:
             if self.npc_config_menu.active:
                 result = self.npc_config_menu.handle_input(event)
                 if result and result != 'cancel' and self.pending_npc_position:
-                    # Create NPC with configuration
                     x, y = self.pending_npc_position
                     npc = NPC(x, y, result)
                     npc.npc_type = result['npc_type']
@@ -115,11 +125,9 @@ class Game:
 
             # Handle Transition config menu input
             if self.transition_config_menu.active:
-                # Get available rooms from room manager
                 available_rooms = self.room_manager.get_room_names() if hasattr(self, 'room_manager') else []
                 result = self.transition_config_menu.handle_input(event)
                 if result and result != 'cancel' and self.pending_transition_position:
-                    # Create room transition with configuration
                     x, y = self.pending_transition_position
                     transition = RoomTransition(x, y, result['width'], result['height'])
                     transition.target_room = result['target_room']
@@ -149,15 +157,12 @@ class Game:
                 result = self.room_editor_menu.handle_input(event)
                 if result and isinstance(result, dict):
                     if result['action'] == 'enter_room':
-                        # Enter/view the room
                         room = result['room']
                         self.room_manager.current_room = room
                         self.current_room = room
-                        # Update world size to room size
                         self.player.x, self.player.y = room.spawn_point
                         self.room_editor_menu.active = False
                     elif result['action'] == 'room_created':
-                        # Room was created successfully
                         pass
                 continue
 
@@ -184,29 +189,24 @@ class Game:
                             self.ui.selected_menu_item = 0
                         elif event.key == pygame.K_q:
                             if self.player.ki_attack_mode == 'blast':
-                                projectile = self.player.shoot_blast()
-                                if projectile:
-                                    self.projectiles.append(projectile)
-                                    self.sound_manager.play_sfx('blast')  # SOUND EFFECT
+                                self.player.shoot_blast()
                             elif self.player.ki_attack_mode == 'beam':
                                 self.player.start_charging_beam()
+                                self.player.is_q_pressed = True
                         elif event.key == pygame.K_e:
                             # Check if near NPC first
                             if self.nearby_npc and not self.dialogue_box.active:
-                                # Start dialogue
                                 text, is_final, item = self.nearby_npc.start_dialogue()
                                 if text:
                                     self.dialogue_box.show(text, "NPC", is_final, item)
                                     if item:
                                         self.player.inventory.append(item)
                             elif self.dialogue_box.active:
-                                # Continue or close dialogue
                                 if self.dialogue_box.is_final:
                                     self.dialogue_box.hide()
                                     if self.nearby_npc:
                                         self.nearby_npc.end_dialogue()
                                 else:
-                                    # Get next dialogue
                                     text, is_final, item = self.nearby_npc.start_dialogue()
                                     if text:
                                         self.dialogue_box.show(text, "NPC", is_final, item)
@@ -217,7 +217,7 @@ class Game:
                                 melee = self.player.melee_attack()
                                 if melee:
                                     self.melee_attacks.append(melee)
-                                    self.sound_manager.play_sfx('punch')  # SOUND EFFECT
+                                    self.sound_manager.play_sfx('punch')
 
                         elif event.key == pygame.K_TAB:
                             # Switch ki attack mode
@@ -225,6 +225,14 @@ class Game:
                                 self.player.ki_attack_mode = 'beam'
                             else:
                                 self.player.ki_attack_mode = 'blast'
+
+                        elif event.key == pygame.K_t:
+                            # Activate transformation (T key)
+                            if self.player.transformation and self.player.transformation.is_ready:
+                                if self.player.transformation.activate_transformation():
+                                    print("Transformation activated!")
+                                    # TODO: Implement actual transformation effects
+
                         elif event.key in [pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN]:
                             if self.player.check_double_tap(event.key):
                                 self.player.is_running = True
@@ -232,10 +240,10 @@ class Game:
                 elif self.ui.current_screen == 'main_menu':
                     if event.key == pygame.K_UP:
                         self.ui.selected_menu_item = (self.ui.selected_menu_item - 1) % len(self.ui.menu_items)
-                        self.sound_manager.play_sfx('menu_select')  # SOUND EFFECT
+                        self.sound_manager.play_sfx('menu_select')
                     elif event.key == pygame.K_DOWN:
                         self.ui.selected_menu_item = (self.ui.selected_menu_item + 1) % len(self.ui.menu_items)
-                        self.sound_manager.play_sfx('menu_select')  # SOUND EFFECT
+                        self.sound_manager.play_sfx('menu_select')
                     elif event.key == pygame.K_RETURN:
                         selected = self.ui.menu_items[self.ui.selected_menu_item]
                         if selected == 'Continue':
@@ -257,55 +265,48 @@ class Game:
 
             elif event.type == pygame.KEYUP:
                 if self.ui.current_screen == 'game':
-                    if event.key == pygame.K_q and self.player.ki_attack_mode == 'beam':
-                        # Release beam
-                        if self.player.is_charging_beam:
-                            beam = self.player.fire_beam()
-                            if beam:
-                                self.player.current_beam = beam
-                                self.sound_manager.play_sfx('beam')  # SOUND EFFECT
+                    if event.key == pygame.K_q:
+                        self.player.is_q_pressed = False
+                        if self.player.is_charging_beam and not self.player.is_firing_beam:
+                            self.player.stop_beam()
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
-                if self.spawn_menu.active and event.button == 1:  # Left click
-                    # Convert screen coordinates to world coordinates
+                if self.spawn_menu.active and event.button == 1:
                     mouse_x, mouse_y = event.pos
                     world_x = mouse_x + self.camera.x
                     world_y = mouse_y + self.camera.y
 
-                    # Get selected spawn type
                     category, item = self.spawn_menu.get_selected_spawn()
 
-                    # Spawn based on category and item
                     if world_x > 0 and world_x < self.current_room.width and world_y > 0 and world_y < self.current_room.height:
                         if category == 'Enemies':
                             self.enemies.append(Enemy(world_x, world_y))
                         elif category == 'Objects':
                             if item == 'Room Transition':
-                                # Open transition configuration menu
                                 self.pending_transition_position = (world_x, world_y)
                                 available_rooms = self.room_manager.get_room_names() if hasattr(self,
                                                                                                 'room_manager') else []
                                 self.transition_config_menu.toggle(available_rooms)
-                                self.spawn_menu.toggle()  # Close spawn menu
+                                self.spawn_menu.toggle()
                             else:
-                                # TODO: Add other object spawning (Tree, Rock, Chest)
                                 pass
                         elif category == 'NPCs':
-                            # Open NPC configuration menu
                             self.pending_npc_position = (world_x, world_y)
                             self.npc_config_menu.toggle()
-                            self.spawn_menu.toggle()  # Close spawn menu
+                            self.spawn_menu.toggle()
 
     def update(self):
         current_time = time.time()
         dt = current_time - self.last_time
         self.last_time = current_time
 
+        # Track enemies defeated this frame
+        enemies_defeated_this_frame = 0
+
         if self.ui.current_screen == 'game':
             keys = pygame.key.get_pressed()
             dx = dy = 0
 
-            # Check for Shift + direction for running
             is_running = keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] or self.player.is_running
 
             if keys[pygame.K_LEFT]:
@@ -317,10 +318,8 @@ class Game:
             if keys[pygame.K_DOWN]:
                 dy = 1
 
-            # Stop running if no direction key is pressed
             if dx == 0 and dy == 0:
                 self.player.is_running = False
-
                 if self.player.current_animation_state == 'walk' or self.player.current_animation_state == 'run':
                     self.player.sprite.set_animation('idle', self.player.direction)
                     self.player.current_animation_state = 'idle'
@@ -331,6 +330,14 @@ class Game:
             # Update player
             self.player.update(dt)
 
+            # Check if blast is ready to spawn after animation
+            if self.player.pending_blast == 'ready':
+                spawn_x, spawn_y = self.player.get_blast_spawn_position()
+                projectile = Projectile(spawn_x, spawn_y, self.player.direction)
+                self.projectiles.append(projectile)
+                self.sound_manager.play_sfx('blast')
+                self.player.pending_blast = None
+
             # Update transition controller
             if self.transition_controller.is_transitioning():
                 self.transition_controller.update(dt, self.player)
@@ -339,22 +346,18 @@ class Game:
             if not self.transition_controller.is_transitioning():
                 for transition in self.room_transitions:
                     if transition.active and transition.check_collision(self.player):
-                        # Start the transition animation
                         def complete_transition(target_room_name, spawn_x, spawn_y):
-                            # Switch to the target room
                             target_room = self.room_manager.get_room_by_name(target_room_name)
                             if target_room:
                                 self.room_manager.current_room = target_room
                                 self.current_room = target_room
-                                # Player position is already set by transition controller
 
-                        # Start the transition
                         self.transition_controller.start_transition(
                             self.player,
                             transition,
                             complete_transition
                         )
-                        break  # Only trigger one transition at a time
+                        break
 
             # Update level up notification
             self.level_up_notification.update(dt)
@@ -363,16 +366,25 @@ class Game:
             if self.player.is_charging_beam:
                 self.player.update_beam_charge(dt)
 
+            # Check if beam should auto-fire
+            if not self.player.is_firing_beam and self.player.beam_charge_time >= self.player.beam_charge_required:
+                beam = self.player.fire_beam_auto()
+                if beam:
+                    self.player.current_beam = beam
+                    self.sound_manager.play_sfx('beam')
+
             # Update beam if firing
             if self.player.current_beam:
                 self.player.current_beam.update(dt)
+                if not self.player.is_firing_beam:
+                    self.player.current_beam = None
 
             # Update camera
             self.camera.update(self.player, self.current_room.width, self.current_room.height)
 
             # Update projectiles
             for projectile in self.projectiles[:]:
-                projectile.update(self.current_room.width, self.current_room.height)
+                projectile.update(self.current_room.width, self.current_room.height, dt)
                 if not projectile.active:
                     self.projectiles.remove(projectile)
 
@@ -390,7 +402,7 @@ class Game:
                 for melee in self.melee_attacks:
                     if melee.active:
                         enemy.check_collision_with_attack(melee, 'melee')
-                        self.sound_manager.play_sfx('enemy_hit')  # SOUND EFFECT
+                        self.sound_manager.play_sfx('enemy_hit')
 
                 for projectile in self.projectiles:
                     if projectile.active and enemy.check_collision_with_attack(projectile, 'projectile'):
@@ -401,6 +413,9 @@ class Game:
 
                 # Remove dead enemies
                 if not enemy.active:
+                    # Count defeated enemy for transformation
+                    enemies_defeated_this_frame += 1
+
                     # Award XP
                     xp_reward = enemy.get_xp_reward(self.game_config)
                     self.player.gain_exp(xp_reward, self.game_config)
@@ -417,9 +432,12 @@ class Game:
             for npc in self.npcs[:]:
                 npc.update(dt, self.player, self.current_room.width, self.current_room.height)
 
-                # Check if player is near this NPC
                 if npc.can_interact(self.player):
                     self.nearby_npc = npc
+
+            # Update transformation system
+            if self.player.transformation:
+                self.player.transformation.update(dt, enemies_defeated_this_frame)
 
             # Update battle music based on enemy count
             self.sound_manager.update_battle_state(dt, len(self.enemies) > 0)
@@ -446,28 +464,36 @@ class Game:
         pygame.draw.rect(self.screen, self.colors['RED'],
                          (world_rect_x, world_rect_y, self.current_room.width, self.current_room.height), 3)
 
-        # Draw projectiles
+        # Clear previous frame's objects
+        self.layer_manager.clear()
+
+        # Add all objects to layer manager
+        # Projectiles
         for projectile in self.projectiles:
-            projectile.draw(self.screen, self.camera, self.colors)
+            self.layer_manager.add_object(projectile)
 
-        # Draw beam
+        # Beam
         if self.player.current_beam:
-            self.player.current_beam.draw(self.screen, self.camera, self.colors)
+            self.layer_manager.add_object(self.player.current_beam)
 
-        # Draw melee attacks
+        # Melee attacks
         for melee in self.melee_attacks:
-            melee.draw(self.screen, self.camera, self.colors)
+            self.layer_manager.add_object(melee)
 
-        # Draw player
-        self.player.draw(self.screen, self.camera, self.colors)
+        # Player
+        self.layer_manager.add_object(self.player)
 
-        # Draw enemies
+        # Enemies
         for enemy in self.enemies:
-            enemy.draw(self.screen, self.camera, self.colors)
+            self.layer_manager.add_object(enemy)
 
-        # Draw NPCs
+        # NPCs
         for npc in self.npcs:
-            npc.draw(self.screen, self.camera, self.colors)
+            self.layer_manager.add_object(npc)
+
+        # Draw everything in correct order
+        self.layer_manager.draw_all(self.screen, self.camera, self.colors)
+
 
         # Draw interaction indicator for nearby NPC
         if self.nearby_npc and not self.dialogue_box.active:
@@ -501,10 +527,7 @@ class Game:
         # Draw room editor menu
         self.room_editor_menu.draw(self.screen, self.colors)
 
-        # Draw room editor menu
-        self.room_editor_menu.draw(self.screen, self.colors)
-
-        # Draw room transitions (nur im dev mode sichtbar)
+        # Draw room transitions
         dev_mode = self.spawn_menu.active or self.dev_menu.active
         for transition in self.room_transitions:
             transition.draw(self.screen, self.camera, dev_mode)
@@ -515,8 +538,9 @@ class Game:
         # Draw transition fade overlay
         self.transition_controller.draw(self.screen)
 
-        # Draw UI
-        self.ui.draw_hud(self.screen, self.player, self.colors)
+        # Draw HUD
+        if self.ui.current_screen == 'game':
+            self.sprite_hud.draw(self.screen, self.player)
 
         # Draw appropriate screen
         if self.ui.current_screen == 'main_menu':
