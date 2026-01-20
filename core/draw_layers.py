@@ -81,7 +81,7 @@ class LayerManager:
         """Clear all objects from render queue"""
         self.drawable_objects.clear()
 
-    def draw_all(self, screen: pygame.Surface, camera, colors: dict):
+    def draw_all(self, screen, camera, colors, render_scale=1):
         """
         Draw all objects in correct layer order
 

@@ -5,14 +5,17 @@ import pygame
 pygame.init()
 
 # Screen constants
-SCREEN_WIDTH = 800
-SCREEN_HEIGHT = 600
+SCREEN_WIDTH = 1920
+SCREEN_HEIGHT = 1080
 FPS = 60
-TILE_SIZE = 32
 
 # Default world size (can be changed by rooms)
-WORLD_WIDTH = 2400
-WORLD_HEIGHT = 1800
+TILE_SIZE = 16
+WORLD_WIDTH = 1808
+WORLD_HEIGHT = 1792
+
+#Render
+RENDER_SCALE = 2
 
 # Colors
 WHITE = (255, 255, 255)

@@ -1,47 +1,38 @@
 from .room import Room
+from .room_persistence import RoomManagerWithPersistence
 
-class RoomManager:
-    """Manages all rooms and groups"""
+
+class RoomManager(RoomManagerWithPersistence):
+    """
+    RoomManager now inherits from RoomManagerWithPersistence
+    This gives it automatic save/load capabilities
+
+    IMPORTANT: We override __init__ to call the parent's __init__
+    """
+
     def __init__(self):
-        self.rooms = []
-        self.groups = ["Default"]
-        self.current_room = None
-        
-    def create_room(self, name, width, height, group):
-        room = Room(name, width, height, group)
-        self.rooms.append(room)
-        return room
-    
-    def delete_room(self, room):
-        if room in self.rooms:
-            self.rooms.remove(room)
-            if self.current_room == room:
-                self.current_room = None
-    
-    def get_rooms_in_group(self, group):
-        return [r for r in self.rooms if r.group == group]
-    
-    
-    def get_room_names(self):
-        """Get list of all room names"""
-        return [room.name for room in self.rooms]
-    
-   
-    def get_room_by_name(self, name):
-        """Get room by name"""
-        for room in self.rooms:
-            if room.name == name:
-                return room
-        return None
-    
-    def create_group(self, group_name):
-        if group_name not in self.groups:
-            self.groups.append(group_name)
-    
-    def delete_group(self, group_name):
-        if group_name != "Default" and group_name in self.groups:
-            # Move rooms to Default group
-            for room in self.rooms:
-                if room.group == group_name:
-                    room.group = "Default"
-            self.groups.remove(group_name)
+        # Call parent class __init__ to set up persistence
+        super().__init__()
+
+        # Parent already initialized these, but we can override if needed:
+        # self.rooms = []
+        # self.groups = ["Default"]
+        # self.current_room = None
+        # self.persistence = RoomPersistence()
+
+        print("✓ RoomManager initialized with persistence enabled")
+
+    # All other methods are inherited from RoomManagerWithPersistence
+    # But we can override them if we need custom behavior
+
+    # The parent class already has these methods:
+    # - create_room(name, width, height, group)
+    # - delete_room(room)
+    # - save_room(room)
+    # - save_all_rooms()
+    # - load_room(room_name)
+    # - get_rooms_in_group(group)
+    # - get_room_names()
+    # - get_room_by_name(room_name)
+    # - create_group(group_name)
+    # - delete_group(group_name)
