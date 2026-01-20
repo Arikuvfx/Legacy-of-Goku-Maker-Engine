@@ -17,16 +17,23 @@ class HUDSprite:
         else:
             print(f"✗ Not found: {filepath}")
 
-    def draw(self, screen, x, y, width=None, height=None):
-        """Draw the sprite at position with optional scaling"""
+    def draw(self, screen, x, y, width=None, height=None, opacity=255):
+        """Draw the sprite at position with optional scaling and opacity"""
         if not self.sprite:
             return False
 
+        sprite_to_draw = self.sprite
+
+        # Scale if needed
         if width and height:
-            scaled = pygame.transform.scale(self.sprite, (width, height))
-            screen.blit(scaled, (x, y))
-        else:
-            screen.blit(self.sprite, (x, y))
+            sprite_to_draw = pygame.transform.scale(self.sprite, (width, height))
+
+        # Apply opacity if needed
+        if opacity < 255:
+            sprite_to_draw = sprite_to_draw.copy()
+            sprite_to_draw.set_alpha(opacity)
+
+        screen.blit(sprite_to_draw, (x, y))
         return True
 
 
@@ -70,10 +77,12 @@ class SpriteHUD:
             'frame': HUDSprite(os.path.join(self.base_path, "frame.png")),
             'hp_bar': HUDSprite(os.path.join(self.base_path, "hp_bar.png")),
             'ki_bar': HUDSprite(os.path.join(self.base_path, "ki_bar.png")),
+            'transformed_ki_bar': HUDSprite(os.path.join(self.base_path, "transformed_ki_bar.png")),
             'exp_bar': HUDSprite(os.path.join(self.base_path, "exp_bar.png")),
             'transform_bar': HUDSprite(os.path.join(self.base_path, "transform_bar.png")),
             'attack_icon_blast': HUDSprite(os.path.join(self.base_path, "attack_icon_blast.png")),
             'attack_icon_beam': HUDSprite(os.path.join(self.base_path, "attack_icon_beam.png")),
+            'transformation_icon': HUDSprite(os.path.join(self.base_path, "transformation_icon.png")),
             'attack_icon': HUDSprite(os.path.join(self.base_path, "attack_icon.png")),
         }
 
@@ -85,6 +94,7 @@ class SpriteHUD:
             'attack_icon': {'x': 0, 'y': 0, 'w': 338, 'h': 100},
             'hp_bar': {'x': 0, 'y': 0, 'w': 338, 'h': 100},
             'ki_bar': {'x': 0, 'y': 0, 'w': 338, 'h': 100},
+            'transformed_ki_bar': {'x': 0, 'y': 0, 'w': 338, 'h': 100},
             'exp_bar': {'x': 0, 'y': 0, 'w': 338, 'h': 100},
             'transform_bar': {'x': 0, 'y': 0, 'w': 338, 'h': 100},
         }
@@ -134,18 +144,11 @@ class SpriteHUD:
                 filled_portion = temp_surface.subsurface((0, 0, fill_width, height))
                 screen.blit(filled_portion, (x, y))
 
-            # Add shine effect when ready
-            if is_ready and shine_alpha > 0:
-                # Create shine overlay
-                shine_surface = pygame.Surface((width, height), pygame.SRCALPHA)
-                shine_surface.fill((255, 255, 255, shine_alpha))
-                screen.blit(shine_surface, (x, y))
-
-                # Add extra glow effect
-                glow_surface = pygame.Surface((width + 10, height + 10), pygame.SRCALPHA)
-                pygame.draw.rect(glow_surface, (255, 255, 0, shine_alpha // 2),
-                                 (0, 0, width + 10, height + 10), 5)
-                screen.blit(glow_surface, (x - 5, y - 5))
+    def get_transform_animation_progress(self, player):
+        """Get the animation progress for the transformed ki bar during transformation"""
+        if hasattr(player, 'transformation') and player.transformation:
+            return player.transformation.transform_animation_progress
+        return 0.0
 
     def draw(self, screen, player):
         """Draw the complete HUD using only sprites"""
@@ -173,10 +176,22 @@ class SpriteHUD:
 
         attack_mode = player.ki_attack_mode if hasattr(player, 'ki_attack_mode') else 'blast'
 
+        # Determine opacity for transformation icon
+        transform_opacity = 255
+        if hasattr(player, 'transformation') and player.transformation:
+            if not player.transformation.is_ready:
+                transform_opacity = 128  # 50% opacity when not ready
+
         if attack_mode == 'beam' and self.sprites['attack_icon_beam'].sprite:
             self.sprites['attack_icon_beam'].draw(
                 screen, icon_x, icon_y,
                 scaled(icon_cfg['w']), scaled(icon_cfg['h'])
+            )
+        elif attack_mode == 'transform' and self.sprites['transformation_icon'].sprite:
+            self.sprites['transformation_icon'].draw(
+                screen, icon_x, icon_y,
+                scaled(icon_cfg['w']), scaled(icon_cfg['h']),
+                opacity=transform_opacity
             )
         elif attack_mode == 'blast' and self.sprites['attack_icon_blast'].sprite:
             self.sprites['attack_icon_blast'].draw(
@@ -200,16 +215,51 @@ class SpriteHUD:
             self.sprites['hp_bar']
         )
 
-        # 4. Draw Ki Bar
+        # 4. Draw Ki Bar (always draw normal Ki bar as base)
         ki_cfg = self.config['ki_bar']
         ki_x = base_x + scaled(ki_cfg['x'])
         ki_y = base_y + scaled(ki_cfg['y'])
 
+        # Always draw normal Ki bar first
         self.draw_bar_simple(
             screen, ki_x, ki_y, scaled(ki_cfg['w']), scaled(ki_cfg['h']),
             player.ki, player.max_ki,
             self.sprites['ki_bar']
         )
+
+        # Check transformation states
+        is_transforming = hasattr(player, 'transformation') and player.transformation and player.transformation.is_transforming
+        is_transformed = hasattr(player, 'transformation') and player.transformation and player.transformation.is_transformed
+
+        # During transformation animation: show transformed bar filling up
+        if is_transforming:
+            transformed_ki_cfg = self.config['transformed_ki_bar']
+            transformed_ki_x = base_x + scaled(transformed_ki_cfg['x'])
+            transformed_ki_y = base_y + scaled(transformed_ki_cfg['y'])
+
+            # Get animation progress (0.0 to 1.0)
+            anim_progress = self.get_transform_animation_progress(player)
+
+            # Draw transformed bar filling during animation
+            self.draw_bar_simple(
+                screen, transformed_ki_x, transformed_ki_y,
+                scaled(transformed_ki_cfg['w']), scaled(transformed_ki_cfg['h']),
+                anim_progress, 1.0,  # Progress as current/max
+                self.sprites['transformed_ki_bar']
+            )
+
+        # After transformation: show actual transformed Ki
+        elif is_transformed:
+            transformed_ki_cfg = self.config['transformed_ki_bar']
+            transformed_ki_x = base_x + scaled(transformed_ki_cfg['x'])
+            transformed_ki_y = base_y + scaled(transformed_ki_cfg['y'])
+
+            self.draw_bar_simple(
+                screen, transformed_ki_x, transformed_ki_y,
+                scaled(transformed_ki_cfg['w']), scaled(transformed_ki_cfg['h']),
+                player.transformation.transformed_ki, player.transformation.max_transformed_ki,
+                self.sprites['transformed_ki_bar']
+            )
 
         # 5. Draw EXP Bar
         exp_cfg = self.config['exp_bar']

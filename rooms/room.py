@@ -1,11 +1,14 @@
 class Room:
-    """Represents a game room/map"""
-    def __init__(self, name, width=2400, height=1800, group="Default"):
+    def __init__(self, name, width, height, group="Default"):
         self.name = name
         self.width = width
         self.height = height
         self.group = group
-        self.enemies = []
-        self.npcs = []
-        self.objects = []
-        self.spawn_point = (width // 2, height // 2)
+
+
+        # Initialize all data containers
+        self.tiles = []
+        self.collision_objects = []
+        self.destructible_stones = []
+        self.room_transitions = []
+        self.spawn_point = []

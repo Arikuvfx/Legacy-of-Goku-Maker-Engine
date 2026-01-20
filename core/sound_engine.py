@@ -163,7 +163,7 @@ class SoundManager:
             'battle': 'battle_theme',
             'boss': 'boss_theme',
             'safe_zone': 'safe_zone_theme',
-            'tension': 'tension_theme',
+            'menu': 'dev_menu',  # Changed from 'dev_menu' to 'menu'
             'victory': 'victory_theme'
         }
 
@@ -177,18 +177,52 @@ class SoundManager:
         Change music context
         force: play immediately even if same context
         """
+        # If trying to switch to same context without force, return
         if context == self.current_context and not force:
             return
 
+        # Store previous context
         self.previous_context = self.current_context
         self.current_context = context
 
+        print(f"🎵 Switching music context: {self.previous_context} -> {context}")
+
+        # Always stop current music before switching
+        self.sound_engine.stop_music(fade_out=True)
+
+        # Small delay to ensure fade out completes
+        pygame.time.delay(100)
+
         if context in self.context_music:
             music_name = self.context_music[context]
-            self.sound_engine.play_music(music_name)
+            print(f"🎵 Playing music: {music_name}")
+            self.sound_engine.play_music(music_name, fade_in=True)
+        else:
+            print(f"⚠️ No music mapped for context: {context}")
+
+    def set_context_immediate(self, context):
+        """Change music context immediately without fade"""
+        self.previous_context = self.current_context
+        self.current_context = context
+
+        print(f"🎵 Immediate context switch to: {context}")
+
+        # Stop music immediately
+        self.sound_engine.stop_music(fade_out=False)
+
+        if context in self.context_music:
+            music_name = self.context_music[context]
+            print(f"🎵 Playing music: {music_name}")
+            self.sound_engine.play_music(music_name, fade_in=False)
+        else:
+            print(f"⚠️ No music mapped for context: {context}")
 
     def update_battle_state(self, dt, has_enemies):
         """Update battle music based on enemy presence"""
+        # Don't update battle state if in menu context
+        if self.current_context == 'menu':
+            return
+
         if has_enemies and not self.in_battle:
             # Enemies appeared
             self.battle_music_timer += dt
@@ -211,6 +245,18 @@ class SoundManager:
         """Reset the battle music timer"""
         self.battle_music_timer = 0
 
+    def get_current_context(self):
+        """Get current music context"""
+        return self.current_context
+
+    def restore_previous_context(self):
+        """Restore the previous music context"""
+        if self.previous_context:
+            print(f"🎵 Restoring previous context: {self.previous_context}")
+            self.set_context(self.previous_context, force=True)
+            return True
+        return False
+
 
 # Audio asset loader helper
 class AudioAssetLoader:
@@ -225,6 +271,7 @@ class AudioAssetLoader:
                 exploration.ogg
                 battle.ogg
                 boss.ogg
+                dev_menu.ogg
             sfx/
                 blast.wav
                 hit.wav
@@ -240,6 +287,7 @@ class AudioAssetLoader:
                     name = os.path.splitext(filename)[0]
                     filepath = os.path.join(music_path, filename)
                     sound_engine.load_music(name, filepath)
+                    print(f" Loaded music: {name}")
 
         # Load sound effects
         if os.path.exists(sfx_path):
@@ -248,3 +296,5 @@ class AudioAssetLoader:
                     name = os.path.splitext(filename)[0]
                     filepath = os.path.join(sfx_path, filename)
                     sound_engine.load_sound_effect(name, filepath)
+                    print(f" Loaded SFX: {name}")
+

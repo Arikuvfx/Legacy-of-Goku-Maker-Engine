@@ -7,27 +7,24 @@ class Projectile:
         self.x = x
         self.y = y
         self.direction = direction
-        self.speed = 4
-        self.radius = 8  # Keep for collision detection
+        self.speed = 4  # Keep original speed
+        self.radius = 8
         self.active = True
 
         # Animation
         self.frames = []
         self.current_frame = 0
         self.frame_timer = 0
-        self.frame_duration = 0.5  # Time per frame in seconds
-        self.frame_width = 24  # Width of each frame in the spritesheet
-        self.frame_height = 8  # Height of each frame in the spritesheet
+        self.frame_duration = 0.5
+        self.frame_width = 24
+        self.frame_height = 8
 
         # Load spritesheet
         try:
             spritesheet = pygame.image.load('assets/sprites/attacks/ki_blast/ki_blast.png').convert_alpha()
-
-            # Calculate number of frames (assumes horizontal spritesheet)
             sheet_width = spritesheet.get_width()
             num_frames = sheet_width // self.frame_width
 
-            # Extract frames from spritesheet
             for i in range(num_frames):
                 frame = spritesheet.subsurface(
                     pygame.Rect(i * self.frame_width, 0, self.frame_width, self.frame_height)
@@ -37,7 +34,6 @@ class Projectile:
             if not self.frames:
                 raise FileNotFoundError("No frames extracted")
         except:
-            # Fallback if spritesheet not found
             self.frames = []
 
         self.draw_layer = DrawLayer.EFFECTS_FRONT
@@ -54,7 +50,7 @@ class Projectile:
                 self.frame_timer = 0
                 self.current_frame = (self.current_frame + 1) % len(self.frames)
 
-        # Update position
+        # Update position (keep original speed)
         if self.direction == 'up':
             self.y -= self.speed
         elif self.direction == 'down':
@@ -70,13 +66,15 @@ class Projectile:
 
     def draw(self, screen, camera, colors):
         if self.active:
-            screen_x = self.x - camera.x
-            screen_y = self.y - camera.y
+            # ONLY FIX: Convert WORLD coordinates to SCREEN coordinates like player
+            from config.settings import RENDER_SCALE
+            screen_x = (self.x * RENDER_SCALE) - camera.x
+            screen_y = (self.y * RENDER_SCALE) - camera.y
 
             if self.frames:
                 current_sprite = self.frames[self.current_frame]
 
-                # Rotate sprite based on direction
+                # Rotate sprite based on direction (keep original size)
                 if self.direction == 'up':
                     rotated_sprite = pygame.transform.rotate(current_sprite, 0)
                 elif self.direction == 'down':
@@ -88,10 +86,9 @@ class Projectile:
                 else:
                     rotated_sprite = current_sprite
 
-                # Center the sprite on the position
                 sprite_rect = rotated_sprite.get_rect(center=(int(screen_x), int(screen_y)))
                 screen.blit(rotated_sprite, sprite_rect)
             else:
-                # Fallback drawing
+                # Fallback drawing (keep original size)
                 pygame.draw.circle(screen, colors['CYAN'], (int(screen_x), int(screen_y)), self.radius)
                 pygame.draw.circle(screen, colors['YELLOW'], (int(screen_x), int(screen_y)), self.radius - 3)

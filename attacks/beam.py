@@ -256,8 +256,26 @@ class BeamAttack:
         if not self.active or self.length <= 0:
             return
 
-        screen_x = self.x - camera.x
-        screen_y = self.y - camera.y
+        from config.settings import RENDER_SCALE
+
+        # Base position (convert world to screen coordinates)
+        base_screen_x = (self.x * RENDER_SCALE) - camera.x
+        base_screen_y = (self.y * RENDER_SCALE) - camera.y
+
+        # Direction-dependent offsets (adjust as needed for your sprites)
+        if self.direction == 'right':
+            screen_x = base_screen_x - 15  # Offset to the right from center
+            screen_y = base_screen_y - 5  # Offset upward from center
+        elif self.direction == 'left':
+            screen_x = base_screen_x + 15  # Offset to the left from center
+            screen_y = base_screen_y - 5  # Offset upward from center
+        elif self.direction == 'down':
+            screen_x = base_screen_x   # Offset left from center
+            screen_y = base_screen_y - 25  # Offset downward from center
+        elif self.direction == 'up':
+            screen_x = base_screen_x  # Offset left from center
+            screen_y = base_screen_y + 12  # Offset upward from center
+
 
         if self.use_sprites:
             self._draw_with_sprites(screen, screen_x, screen_y)
