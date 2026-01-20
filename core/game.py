@@ -336,6 +336,14 @@ class Game:
         self.room_manager.current_room = room
         self.current_room = room
 
+        # Sync tiles to tileset editor so they render properly
+        if self.room_editor.tileset_editor:
+            if room_name not in self.room_editor.tileset_editor.room_tiles or not self.room_editor.tileset_editor.room_tiles[room_name]:
+                if hasattr(room, 'tiles') and room.tiles:
+                    self.room_editor.tileset_editor.room_tiles[room_name] = room.tiles[:]
+                else:
+                    self.room_editor.tileset_editor.room_tiles[room_name] = []
+
         # Create COPIES of collision objects so changes don't affect the originals
         self.collision_objects = []
         if hasattr(room, 'collision_objects') and room.collision_objects:
