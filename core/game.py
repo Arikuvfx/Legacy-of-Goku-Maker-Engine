@@ -336,13 +336,14 @@ class Game:
         self.room_manager.current_room = room
         self.current_room = room
 
-        # Sync tiles to tileset editor so they render properly
-        if self.room_editor.tileset_editor:
-            if room_name not in self.room_editor.tileset_editor.room_tiles or not self.room_editor.tileset_editor.room_tiles[room_name]:
-                if hasattr(room, 'tiles') and room.tiles:
-                    self.room_editor.tileset_editor.room_tiles[room_name] = room.tiles[:]
-                else:
-                    self.room_editor.tileset_editor.room_tiles[room_name] = []
+        # === CRITICAL FIX: Sync tiles from editor to room BEFORE testing ===
+        if self.room_editor.tileset_editor and room_name in self.room_editor.tileset_editor.room_tiles:
+            # Copy tiles from editor to the room object so they render during test
+            room.tiles = self.room_editor.tileset_editor.room_tiles[room_name][:]
+        else:
+            # Make sure room has a tiles list even if empty
+            if not hasattr(room, 'tiles'):
+                room.tiles = []
 
         # Create COPIES of collision objects so changes don't affect the originals
         self.collision_objects = []
@@ -747,8 +748,10 @@ class Game:
                     sprite_y = int(screen_y - scaled_height // 2)
                     self.screen.blit(scaled_sprite, (sprite_x, sprite_y))
 
-        # Render background tiles
-        if self.current_room and self.room_editor.tileset_editor:
+        # === BACKGROUND TILES RENDERING ===
+        # FIXED: Check if room editor is active to decide which tile source to use
+        if self.room_editor.active and self.room_editor.tileset_editor:
+            # When room editor is active, ONLY use tileset editor's tiles
             self.room_editor.tileset_editor.draw_tiles(
                 self.screen,
                 int(self.camera.x),
@@ -756,8 +759,8 @@ class Game:
                 self.current_room.name,
                 layer='background'
             )
-
-        if hasattr(self.current_room, 'tiles') and self.current_room.tiles:
+        elif hasattr(self.current_room, 'tiles') and self.current_room.tiles:
+            # When room editor is NOT active, use room's tiles directly
             for tile in self.current_room.tiles:
                 if tile.layer < 0:
                     tileset = self.room_editor.tileset_editor.tileset_manager.get_tileset(tile.tileset_name)
@@ -804,8 +807,19 @@ class Game:
         # Draw all game objects in correct depth order
         self.layer_manager.draw_all(self.screen, self.camera, self.colors, RENDER_SCALE)
 
-        # Render foreground tiles
-        if hasattr(self.current_room, 'tiles') and self.current_room.tiles:
+        # === FOREGROUND TILES RENDERING ===
+        # FIXED: Same logic as background tiles
+        if self.room_editor.active and self.room_editor.tileset_editor:
+            # When room editor is active, ONLY use tileset editor's tiles
+            self.room_editor.tileset_editor.draw_tiles(
+                self.screen,
+                int(self.camera.x),
+                int(self.camera.y),
+                self.current_room.name,
+                layer='foreground'
+            )
+        elif hasattr(self.current_room, 'tiles') and self.current_room.tiles:
+            # When room editor is NOT active, use room's tiles directly
             for tile in self.current_room.tiles:
                 if tile.layer >= 0:
                     tileset = self.room_editor.tileset_editor.tileset_manager.get_tileset(tile.tileset_name)
