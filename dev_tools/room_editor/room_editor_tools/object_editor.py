@@ -1,8 +1,13 @@
 import pygame
 import pygame.gfxdraw
-from config.settings import RENDER_SCALE, TILE_SIZE
+from config.settings import RENDER_SCALE, TILE_SIZE, WORLD_WIDTH, WORLD_HEIGHT
 from objects.spawn_object import SpawnObject, SpawnObjectManager
 from objects.collision_object import CollisionObject, CollisionObjectManager, draw_collision_object
+from objects.level_gate import LevelGate, LevelGateManager
+from objects.room_transition import RoomTransition, RoomTransitionManager, TransitionConfigDialog
+from objects.flying_pad import FlyingPad, FlyingPadManager
+from objects.save_point import SavePoint, SavePointManager
+from dev_tools.room_editor.room_editor_tools.flying_pad_path_editor import FlyingPadPathEditor
 
 
 class ObjectEditor:
@@ -36,10 +41,14 @@ class ObjectEditor:
             'snap_guide': (255, 215, 0, 150),
             'disabled': (100, 100, 100),
             'delete': (255, 50, 50),
-            'delete_hover': (255, 100, 100)
+            'delete_hover': (255, 100, 100),
+            'input_bg': (60, 60, 75),
+            'input_active': (80, 80, 100),
+            'variant_bg': (25, 25, 40),
+            'variant_selected': (50, 150, 255)
         }
 
-        # Palette layout (matches tileset editor)
+        # Palette layout
         self.palette_width = 600
         self.palette_x = screen_width - self.palette_width
         self.palette_y = 100
@@ -53,6 +62,12 @@ class ObjectEditor:
         # Object managers
         self.spawn_manager = SpawnObjectManager()
         self.collision_manager = CollisionObjectManager()
+        self.gate_manager = LevelGateManager()
+        self.transition_manager = RoomTransitionManager()
+
+        # Transition configuration dialog
+        self.transition_config = TransitionConfigDialog(screen_width, screen_height)
+        self.pending_transition = None
 
         # Collision placement tracking
         self.placing_collision = False
@@ -60,23 +75,137 @@ class ObjectEditor:
         self.collision_start_y = 0
         self.preview_collision = None
 
-        # Callbacks for game sync
+        # Transition placement tracking
+        self.placing_transition = False
+        self.transition_start_x = 0
+        self.transition_start_y = 0
+        self.preview_transition = None
+
+        # Transition spawn placement tracking
+        self.placing_transition_spawn = False
+        self.transition_spawn_source_room = None
+        self.pending_transition_for_spawn = None
+        self.transition_spawn_preview_x = 0
+        self.transition_spawn_preview_y = 0
+
+        self.on_gate_deleted = None
+        self.on_transition_deleted = None
+        self.on_transition_placed = None
         self.on_stone_placed = None
+
+        # flyingpad init
+        self.flying_pad_manager = FlyingPadManager()
+        self.flying_pad_path_editor = FlyingPadPathEditor(screen_width, screen_height)
+
+        # Flying pad placement state
+        self.placing_flying_pad = False
+        self.pending_flying_pad = None
+
+        # Add callbacks
+        self.on_flying_pad_placed = None
+        self.on_flying_pad_deleted = None
+
+        # Save point manager
+        self.save_point_manager = SavePointManager()
+        self.on_save_point_placed = None
+        self.on_save_point_deleted = None
 
         # Object under cursor (for deletion)
         self.hovered_object = None
         self.hovered_object_type = None
 
-        # Available objects organized by category
+        # Gate level requirement input
+        self.gate_required_level = 1
+        self.gate_level_input_active = False
+        self.gate_level_text = "1"
+
+        # Variant selection system
+        self.selected_variant = None  # Currently selected variant for multi-variant objects
+        self.hover_variant_index = -1
+        self.showing_variants_for = None  # Which object is showing variants
+
+        # Define stone variants
+        self.stone_variants = [
+            {'type': 'small', 'name': 'Small', 'width': 16, 'height': 16},
+            {'type': 'medium', 'name': 'Medium', 'width': 24, 'height': 24},
+            {'type': 'big', 'name': 'Big', 'width': 32, 'height': 32}
+        ]
+
+        # Define gate variants
+        self.gate_variants = [
+            {'type': 'stone', 'name': 'Stone'},
+            {'type': 'wood', 'name': 'Wood'},
+            {'type': 'makeshift wood', 'name': 'Makeshift'},
+            {'type': 'stone formation', 'name': 'Formation'},
+            {'type': 'metal', 'name': 'Metal'}
+        ]
+
+        # Flying pad variants
+        self.flying_pad_variants = [
+            {'type': 'stone1', 'name': 'Stone1'},
+            {'type': 'stone2', 'name': 'Stone2'},
+            {'type': 'gras', 'name': 'Gras'},
+            {'type': 'cracked', 'name': 'Cracked'},
+            {'type': 'trunk', 'name': 'Trunk'},
+            {'type': 'kami', 'name': 'Kami'},
+            {'type': 'ice', 'name': 'Ice'},
+            {'type': 'buu', 'name': 'Buu'}
+        ]
+
+        # Available objects organized by category (simplified)
         self.categories = {
             'System': [],
             'Decorations': [
-                {'id': 'stone_small', 'name': 'Small Stone', 'sprite': None, 'width': 16, 'height': 16,
-                 'object_type': 'destructible_stone', 'stone_type': 'small'},
-                {'id': 'stone_medium', 'name': 'Medium Stone', 'sprite': None, 'width': 24, 'height': 24,
-                 'object_type': 'destructible_stone', 'stone_type': 'medium'},
-                {'id': 'stone_big', 'name': 'Big Stone', 'sprite': None, 'width': 32, 'height': 32,
-                 'object_type': 'destructible_stone', 'stone_type': 'big'},
+                {
+                    'id': 'destructible_stone',
+                    'name': 'Destructible Stone',
+                    'sprite': None,
+                    'width': 24,
+                    'height': 24,
+                    'object_type': 'destructible_stone',
+                    'has_variants': True,
+                    'variants': self.stone_variants,
+                    'default_variant': 'medium'
+                },
+                {
+                    'id': 'level_gate',
+                    'name': 'Level Gate',
+                    'sprite': None,
+                    'width': 32,
+                    'height': 32,
+                    'object_type': 'level_gate',
+                    'has_variants': True,
+                    'variants': self.gate_variants,
+                    'default_variant': 'stone',
+                    'required_level': 1
+                },
+                {
+                    'id': 'flying_pad',
+                    'name': 'Flying Pad',
+                    'sprite': None,
+                    'width': 32,
+                    'height': 32,
+                    'object_type': 'flying_pad',
+                    'has_variants': True,
+                    'variants': self.flying_pad_variants,
+                    'default_variant': 'stone'
+                }
+                # Add save point to Decorations category
+                ,
+                {
+                    'id': 'save_point',
+                    'name': 'Save Point',
+                    'sprite': None,
+                    'width': 32,
+                    'height': 32,
+                    'object_type': 'save_point',
+                    'has_variants': True,
+                    'variants': [
+                        {'type': 'big', 'name': 'Big Save Point', 'width': 64, 'height': 52},
+                        {'type': 'small', 'name': 'Small Save Point', 'width': 32, 'height': 27}
+                    ],
+                    'default_variant': 'big'
+                }
             ],
             'Structures': [
                 {'id': 'house_1', 'name': 'Small House', 'sprite': None, 'width': 64, 'height': 64},
@@ -103,23 +232,40 @@ class ObjectEditor:
         })
 
         # Add collision wall to System category
-        collision_sprite = pygame.Surface((32, 32), pygame.SRCALPHA)
+        collision_sprite = pygame.Surface((16, 16), pygame.SRCALPHA)
         collision_sprite.fill((255, 0, 0, 100))
-        pygame.draw.rect(collision_sprite, (255, 0, 0), (0, 0, 32, 32), 2)
+        pygame.draw.rect(collision_sprite, (255, 0, 0), (0, 0, 16, 16), 2)
         for i in range(0, 48, 8):
-            pygame.draw.line(collision_sprite, (200, 0, 0, 120), (i, 0), (i - 32, 32), 1)
+            pygame.draw.line(collision_sprite, (200, 0, 0, 120), (i, 0), (i - 16, 16), 1)
 
         self.categories['System'].append({
             'id': 'collision_wall',
             'name': 'Collision Wall',
             'sprite': collision_sprite,
-            'width': 32,
-            'height': 32,
+            'width': 16,
+            'height': 16,
             'is_collision': True
         })
 
-        # Create sprites for objects that don't have them
+        # Add room transition to System category
+        transition_sprite = pygame.Surface((16, 16), pygame.SRCALPHA)
+        transition_sprite.fill((0, 100, 255, 100))
+        pygame.draw.rect(transition_sprite, (0, 150, 255), (0, 0, 16, 16), 2)
+        for i in range(0, 96, 8):
+            pygame.draw.line(transition_sprite, (0, 120, 200, 120), (i, 0), (i - 16, 16), 1)
+
+        self.categories['System'].append({
+            'id': 'room_transition',
+            'name': 'Room Transition',
+            'sprite': transition_sprite,
+            'width': 16,
+            'height': 16,
+            'is_transition': True
+        })
+
+        # Generate sprites and variant sprites
         self._generate_placeholder_sprites()
+        self._generate_variant_sprites()
 
         # Editor state
         self.current_category = list(self.categories.keys())[0]
@@ -145,6 +291,127 @@ class ObjectEditor:
         # UI click detection
         self.ui_rects = {}
 
+    def set_toolbar(self, toolbar):
+        """Set the toolbar reference and pass it to sub-editors that need to hide it"""
+        self.toolbar = toolbar
+        # Pass toolbar to flying pad path editor so it can hide it during editing
+        self.flying_pad_path_editor.set_toolbar(toolbar)
+
+    def _generate_variant_sprites(self):
+        """Load or generate sprites for every object variant.
+
+        For each object that declares ``has_variants``, this method attempts to
+        load the real asset from disk and falls back to a programmatic placeholder
+        when the file is not yet available.  The object's ``sprite`` field is also
+        set to a copy of its default-variant sprite so the palette thumbnail is
+        correct before the player selects a variant.
+        """
+        for category, objects in self.categories.items():
+            for obj in objects:
+                if not obj.get('has_variants', False):
+                    continue
+
+                variants = obj.get('variants', [])
+                for variant in variants:
+                    # Generate sprite for this variant
+                    if obj['object_type'] == 'destructible_stone':
+                        try:
+                            stone_type = variant['type']
+                            sprite_path = f'assets/objects/stones/{stone_type}_stone.png'
+                            sprite = pygame.image.load(sprite_path).convert_alpha()
+                            sprite = pygame.transform.scale(sprite, (variant['width'], variant['height']))
+                            variant['sprite'] = sprite
+                        except:
+                            # Fallback placeholder
+                            sprite = pygame.Surface((variant['width'], variant['height']), pygame.SRCALPHA)
+                            sprite.fill((139, 69, 19))
+                            pygame.draw.rect(sprite, (0, 0, 0), (0, 0, variant['width'], variant['height']), 2)
+                            variant['sprite'] = sprite
+
+                    elif obj['object_type'] == 'level_gate':
+                        gate = LevelGate(0, 0, variant['type'], 1)
+                        if gate.sprite:
+                            variant['sprite'] = gate.sprite.copy()
+                        else:
+                            # Fallback placeholder
+                            sprite = pygame.Surface((32, 32), pygame.SRCALPHA)
+                            sprite.fill((100, 100, 100))
+                            pygame.draw.rect(sprite, (0, 0, 0), (0, 0, 32, 32), 2)
+                            variant['sprite'] = sprite
+
+                    elif obj['object_type'] == 'flying_pad':
+                        try:
+                            pad_type = variant['type']
+                            sprite_path = f'assets/objects/flying_pads/{pad_type}_flyingpad.png'
+                            sprite = pygame.image.load(sprite_path).convert_alpha()
+                            sprite = pygame.transform.scale(sprite, (32, 32))
+                            variant['sprite'] = sprite
+                        except:
+                            # Fallback placeholder
+                            sprite = pygame.Surface((32, 32), pygame.SRCALPHA)
+                            sprite.fill((100, 200, 255))
+                            pygame.draw.rect(sprite, (0, 0, 0), (0, 0, 32, 32), 2)
+                            # Draw arrow pattern
+                            center_x = 16
+                            center_y = 16
+                            points = [
+                                (center_x, center_y - 10),
+                                (center_x - 8, center_y + 5),
+                                (center_x + 8, center_y + 5)
+                            ]
+                            pygame.draw.polygon(sprite, (255, 255, 255), points)
+                            variant['sprite'] = sprite
+
+                    elif obj['object_type'] == 'save_point':
+                        # Try to load custom sprite first
+                        variant_type = variant['type']
+                        sprite_loaded = False
+
+                        try:
+                            sprite_path = f'assets/objects/save_points/{variant_type}_save_point.png'
+                            sprite = pygame.image.load(sprite_path).convert_alpha()
+                            variant['sprite'] = sprite
+                            sprite_loaded = True
+                        except Exception:
+                            pass
+
+                        if not sprite_loaded:
+                            # Generate placeholder with correct dimensions
+                            width = variant.get('width', 64 if variant_type == 'big' else 32)
+                            height = variant.get('height', 52 if variant_type == 'big' else 27)
+                            color = (255, 215, 0)  # Gold
+                            sprite = pygame.Surface((width, height), pygame.SRCALPHA)
+
+                            if variant_type == 'big':
+                                # Diamond shape for big save point
+                                center_x = width // 2
+                                center_y = height // 2
+                                points = [
+                                    (center_x, 2),          # Top
+                                    (width - 2, center_y),  # Right
+                                    (center_x, height - 2), # Bottom
+                                    (2, center_y)           # Left
+                                ]
+                                pygame.draw.polygon(sprite, color, points)
+                                pygame.draw.polygon(sprite, (255, 255, 200), points, 2)
+                            else:
+                                # Circle shape for small save point
+                                center_x = width // 2
+                                center_y = height // 2
+                                radius = min(width, height) // 2 - 2
+                                pygame.draw.circle(sprite, color, (center_x, center_y), radius)
+                                pygame.draw.circle(sprite, (255, 255, 200), (center_x, center_y), radius, 2)
+
+                            variant['sprite'] = sprite
+
+                # Set the main object sprite to the default variant
+                default_variant_type = obj.get('default_variant')
+                if default_variant_type:
+                    for variant in variants:
+                        if variant['type'] == default_variant_type:
+                            obj['sprite'] = variant['sprite'].copy()
+                            break
+
     def _generate_placeholder_sprites(self):
         """Create visual sprites for objects that don't have real art yet"""
         for category, objects in self.categories.items():
@@ -152,20 +419,12 @@ class ObjectEditor:
                 if obj.get('sprite') is not None:
                     continue
 
-                if obj.get('is_spawn', False) or obj.get('is_collision', False):
+                if obj.get('is_spawn', False) or obj.get('is_collision', False) or obj.get('is_transition', False):
                     continue
 
-                # Try loading real stone sprites
-                if obj.get('object_type') == 'destructible_stone':
-                    try:
-                        stone_type = obj.get('stone_type', 'small')
-                        sprite_path = f'assets/objects/{stone_type}_stone.png'
-                        sprite = pygame.image.load(sprite_path).convert_alpha()
-                        sprite = pygame.transform.scale(sprite, (obj['width'], obj['height']))
-                        obj['sprite'] = sprite
-                        continue
-                    except:
-                        pass
+                # Skip variant objects - they get sprites from _generate_variant_sprites
+                if obj.get('has_variants', False):
+                    continue
 
                 # Make a simple placeholder
                 sprite = pygame.Surface((obj['width'], obj['height']), pygame.SRCALPHA)
@@ -183,24 +442,6 @@ class ObjectEditor:
                 pygame.draw.rect(sprite, base_color, (0, 0, obj['width'], obj['height']))
                 pygame.draw.rect(sprite, (0, 0, 0), (0, 0, obj['width'], obj['height']), 2)
 
-                # Add simple icons based on object type
-                if 'tree' in obj['id']:
-                    pygame.draw.rect(sprite, (101, 67, 33),
-                                     (obj['width'] // 2 - 2, obj['height'] // 2, 4, obj['height'] // 2))
-                    pygame.draw.circle(sprite, (34, 139, 34),
-                                       (obj['width'] // 2, obj['height'] // 3), obj['width'] // 3)
-                elif 'rock' in obj['id']:
-                    pygame.draw.circle(sprite, (100, 100, 100),
-                                       (obj['width'] // 2, obj['height'] // 2), min(obj['width'], obj['height']) // 2)
-                elif 'house' in obj['id']:
-                    pygame.draw.rect(sprite, (160, 82, 45),
-                                     (4, obj['height'] // 2, obj['width'] - 8, obj['height'] // 2 - 4))
-                    points = [(obj['width'] // 2, 4), (4, obj['height'] // 2), (obj['width'] - 4, obj['height'] // 2)]
-                    pygame.draw.polygon(sprite, (139, 0, 0), points)
-                elif 'chest' in obj['id']:
-                    pygame.draw.rect(sprite, (139, 69, 19), (2, 6, obj['width'] - 4, obj['height'] - 8))
-                    pygame.draw.rect(sprite, (255, 215, 0), (obj['width'] // 2 - 2, 8, 4, 4))
-
                 obj['sprite'] = sprite
 
     def toggle(self):
@@ -208,9 +449,45 @@ class ObjectEditor:
         self.active = not self.active
         if self.active:
             self.selected_object = None
+            self.selected_variant = None
+            self.showing_variants_for = None
             self.scroll_offset = 0
             self.placing_collision = False
             self.preview_collision = None
+            self.gate_level_input_active = False
+            self.transition_config.close()
+            self.pending_transition = None
+            self.placing_transition = False
+            self.preview_transition = None
+            self.placing_transition_spawn = False
+            self.flying_pad_path_editor.close()
+            self.pending_flying_pad = None
+            self.placing_flying_pad = False
+
+    def _get_current_variant(self, obj):
+        """Get the currently selected variant for an object"""
+        if not obj or not isinstance(obj, dict):
+            return None
+
+        if not obj.get('has_variants', False):
+            return None
+
+        # If this object is selected and has a variant chosen
+        if self.selected_object == obj and self.selected_variant:
+            return self.selected_variant
+
+        # Otherwise return default
+        default_type = obj.get('default_variant')
+        variants = obj.get('variants', [])
+
+        if not variants:
+            return None
+
+        for variant in variants:
+            if variant['type'] == default_type:
+                return variant
+
+        return variants[0] if variants else None
 
     def _check_object_at_position(self, world_x, world_y):
         """See if there's an object at this position (for deletion)"""
@@ -228,6 +505,12 @@ class ObjectEditor:
                     collision_obj.y <= world_y <= collision_obj.y + collision_obj.height):
                 return collision_obj, 'collision'
 
+        # Check room transitions
+        transitions = self.transition_manager.get_transitions(self.current_room_name)
+        for transition in transitions:
+            if transition.check_collision_with_point(int(world_x), int(world_y)):
+                return transition, 'transition'
+
         # Check destructible stones
         if self.room_manager:
             room = self.room_manager.get_room_by_name(self.current_room_name)
@@ -236,6 +519,27 @@ class ObjectEditor:
                     distance = ((stone.x - world_x) ** 2 + (stone.y - world_y) ** 2) ** 0.5
                     if distance < max(stone.width, stone.height) / 2:
                         return stone, 'stone'
+
+        # Check flying pads
+        pads = self.flying_pad_manager.get_pads(self.current_room_name)
+        for pad in pads:
+            distance = ((pad.x - world_x) ** 2 + (pad.y - world_y) ** 2) ** 0.5
+            if distance < max(pad.width, pad.height) / 2:
+                return pad, 'flying_pad'
+
+        # Check level gates
+        gates = self.gate_manager.get_gates(self.current_room_name)
+        for gate in gates:
+            distance = ((gate.x - world_x) ** 2 + (gate.y - world_y) ** 2) ** 0.5
+            if distance < max(gate.width, gate.height) / 2:
+                return gate, 'gate'
+
+        # Check save points
+        save_points = self.save_point_manager.get_save_points(self.current_room_name)
+        for save_point in save_points:
+            distance = ((save_point.x - world_x) ** 2 + (save_point.y - world_y) ** 2) ** 0.5
+            if distance < max(save_point.width, save_point.height) / 2:
+                return save_point, 'save_point'
 
         return None, None
 
@@ -258,9 +562,30 @@ class ObjectEditor:
                     if obj in room.collision_objects:
                         room.collision_objects.remove(obj)
 
-            # Let the game know this was deleted
             if hasattr(self, 'on_collision_deleted') and self.on_collision_deleted:
                 self.on_collision_deleted(obj, self.current_room_name)
+
+        elif obj_type == 'flying_pad':
+            self.flying_pad_manager.remove_pad(self.current_room_name, obj)
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(self.current_room_name)
+                if room and hasattr(room, 'flying_pads'):
+                    if obj in room.flying_pads:
+                        room.flying_pads.remove(obj)
+
+            if hasattr(self, 'on_flying_pad_deleted') and self.on_flying_pad_deleted:
+                self.on_flying_pad_deleted(obj, self.current_room_name)
+
+        elif obj_type == 'transition':
+            self.transition_manager.remove_transition(self.current_room_name, obj)
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(self.current_room_name)
+                if room and hasattr(room, 'room_transitions'):
+                    if obj in room.room_transitions:
+                        room.room_transitions.remove(obj)
+
+            if hasattr(self, 'on_transition_deleted') and self.on_transition_deleted:
+                self.on_transition_deleted(obj, self.current_room_name)
 
         elif obj_type == 'stone':
             if self.room_manager:
@@ -269,15 +594,369 @@ class ObjectEditor:
                     if obj in room.destructible_stones:
                         room.destructible_stones.remove(obj)
 
-            # Let the game know this was deleted
             if hasattr(self, 'on_stone_deleted') and self.on_stone_deleted:
                 self.on_stone_deleted(obj, self.current_room_name)
 
+        elif obj_type == 'gate':
+            self.gate_manager.remove_gate(self.current_room_name, obj)
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(self.current_room_name)
+                if room and hasattr(room, 'level_gates'):
+                    if obj in room.level_gates:
+                        room.level_gates.remove(obj)
+
+            if hasattr(self, 'on_gate_deleted') and self.on_gate_deleted:
+                self.on_gate_deleted(obj, self.current_room_name)
+
+        # Save point deletion
+        elif obj_type == 'save_point':
+            self.save_point_manager.remove_save_point(self.current_room_name, obj)
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(self.current_room_name)
+                if room and hasattr(room, 'save_points'):
+                    if obj in room.save_points:
+                        room.save_points.remove(obj)
+
+            if hasattr(self, 'on_save_point_deleted') and self.on_save_point_deleted:
+                self.on_save_point_deleted(obj)
+
     def _is_object_disabled(self, obj) -> bool:
         """Check if we can't place this object (e.g. spawn already exists)"""
+        if not obj or not isinstance(obj, dict):
+            return True
+
         if obj.get('is_spawn', False):
             return self.spawn_manager.has_spawn_point(self.current_room_name)
         return False
+
+    def _is_level_input_clicked(self, mouse_pos):
+        """Check if the level input box was clicked"""
+        if not self.selected_object or not isinstance(self.selected_object, dict):
+            return False
+
+        if self.selected_object.get('object_type') != 'level_gate':
+            return False
+
+        input_x = self.palette_x + self.palette_padding + 135
+        input_y = self.palette_y + self.palette_height - 105
+        input_width = 60
+        input_height = 25
+
+        input_rect = pygame.Rect(input_x, input_y, input_width, input_height)
+        return input_rect.collidepoint(mouse_pos)
+
+    def _is_variant_selector_clicked(self, mouse_pos):
+        """Check if clicking on variant selector and handle selection"""
+        if not self.selected_object or not isinstance(self.selected_object, dict):
+            return False
+
+        if not self.selected_object.get('has_variants', False):
+            return False
+
+        # Check variant selector rects
+        for i, rect_data in enumerate(self.ui_rects.get('variant_rects', [])):
+            if rect_data['rect'].collidepoint(mouse_pos):
+                # Select this variant
+                self.selected_variant = rect_data['variant']
+                self.showing_variants_for = self.selected_object
+                return True
+
+        return False
+
+    def _is_in_palette(self, mouse_x, mouse_y):
+        """Check if the mouse is hovering over the palette"""
+        return (mouse_x >= self.palette_x and
+                mouse_y >= self.palette_y and
+                mouse_y <= self.palette_y + self.palette_height)
+
+    def _handle_palette_click(self, mouse_pos):
+        """Handle clicks inside the palette"""
+        category_start_y = self.palette_y + 45
+
+        for i, category in enumerate(self.categories.keys()):
+            category_rect = pygame.Rect(
+                self.palette_x + self.palette_padding,
+                category_start_y + i * 40,
+                self.palette_width - self.palette_padding * 2,
+                30
+            )
+            if category_rect.collidepoint(mouse_pos):
+                self.current_category = category
+                self.scroll_offset = 0
+                return
+
+        objects = self.categories[self.current_category]
+        objects_start_y = category_start_y + len(self.categories) * 40 + 20 - self.scroll_offset
+
+        for i, obj in enumerate(objects):
+            row = i // self.items_per_row
+            col = i % self.items_per_row
+
+            item_x = self.palette_x + self.palette_padding + col * (self.item_size + 10)
+            item_y = objects_start_y + row * (self.item_size + 10)
+
+            item_rect = pygame.Rect(item_x, item_y, self.item_size, self.item_size)
+            if item_rect.collidepoint(mouse_pos):
+                if not self._is_object_disabled(obj):
+                    self.selected_object = obj
+                    # Reset variant selection when selecting new object
+                    if obj.get('has_variants', False):
+                        self.showing_variants_for = obj
+                        self.selected_variant = self._get_current_variant(obj)
+                    else:
+                        self.showing_variants_for = None
+                        self.selected_variant = None
+                return
+
+    def _place_object(self, camera_x, camera_y, room_name):
+        """Actually place the selected object in the world"""
+        if not self.selected_object or not isinstance(self.selected_object, dict):
+            return
+
+        if self.selected_object.get('is_spawn', False):
+            spawn_obj = self.spawn_manager.place_spawn_point(
+                int(self.preview_x),
+                int(self.preview_y),
+                room_name
+            )
+
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(room_name)
+                if room:
+                    room.spawn_point = (int(self.preview_x), int(self.preview_y))
+
+        elif self.selected_object.get('object_type') == 'destructible_stone':
+            from objects.destructible_stone import DestructibleStone
+
+            # Get selected variant or default
+            variant = self.selected_variant or self._get_current_variant(self.selected_object)
+            stone_type = variant['type'] if variant else 'medium'
+
+            stone = DestructibleStone(
+                int(self.preview_x),
+                int(self.preview_y),
+                stone_type
+            )
+
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(room_name)
+                if room:
+                    if not hasattr(room, 'destructible_stones'):
+                        room.destructible_stones = []
+                    room.destructible_stones.append(stone)
+
+                    if hasattr(self, 'on_stone_placed') and self.on_stone_placed:
+                        self.on_stone_placed(stone, room_name)
+
+
+        elif self.selected_object.get('object_type') == 'flying_pad':
+
+            # Get selected variant
+            variant = self.selected_variant or self._get_current_variant(self.selected_object)
+            pad_type = variant['type'] if variant and 'type' in variant else 'stone'
+
+            # Create flying pad
+            pad = FlyingPad(int(self.preview_x), int(self.preview_y), pad_type)
+
+            # Add the first waypoint at the pad's position automatically
+            from objects.flying_pad import FlyingPadWaypoint
+            initial_waypoint = FlyingPadWaypoint(int(self.preview_x), int(self.preview_y), is_boundary=False)
+            pad.waypoints = [initial_waypoint]
+
+            # Store pad temporarily
+            self.pending_flying_pad = pad
+            self.placing_flying_pad = True
+
+            # Get available rooms list
+            available_rooms = []
+            if self.room_manager:
+                available_rooms = self.room_manager.get_room_names()
+
+            # Get current room dimensions
+            room_width = 2400  # default
+            room_height = 1800  # default
+
+            if self.room_manager:
+                current_room = self.room_manager.get_room_by_name(room_name)
+                if current_room:
+                    room_width = current_room.width
+                    room_height = current_room.height
+
+            # Open path editor WITH ROOM DIMENSIONS
+            self.flying_pad_path_editor.open(
+                pad,
+                room_name,
+                available_rooms,
+                room_width,
+                room_height
+            )
+
+            # Save point placement
+        elif self.selected_object.get('object_type') == 'save_point':
+            # Get selected variant
+            variant = self.selected_variant or self._get_current_variant(self.selected_object)
+            sp_variant = variant['type'] if variant and 'type' in variant else 'big'
+
+            # Create save point
+            save_point = SavePoint(int(self.preview_x), int(self.preview_y), sp_variant)
+
+            # Add to manager
+            self.save_point_manager.add_save_point(room_name, save_point)
+
+            # CRITICAL: Add to room so it persists and can be drawn
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(room_name)
+                if room:
+                    if not hasattr(room, 'save_points'):
+                        room.save_points = []
+                    room.save_points.append(save_point)
+
+            # Notify game
+            if self.on_save_point_placed:
+                self.on_save_point_placed(save_point)
+
+        elif self.selected_object.get('object_type') == 'level_gate':
+            # Get selected variant or default
+            variant = self.selected_variant or self._get_current_variant(self.selected_object)
+            gate_type = variant['type'] if variant and 'type' in variant else 'stone'
+
+            gate = LevelGate(
+                int(self.preview_x),
+                int(self.preview_y),
+                gate_type,
+                self.gate_required_level
+            )
+
+            self.gate_manager.add_gate(room_name, gate)
+
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(room_name)
+                if room:
+                    if not hasattr(room, 'level_gates'):
+                        room.level_gates = []
+                    room.level_gates.append(gate)
+
+    def _draw_delete_highlight(self, screen, camera_x, camera_y):
+        """Draw red outline around object that's about to be deleted"""
+        obj = self.hovered_object
+        obj_type = self.hovered_object_type
+
+        if obj_type == 'spawn':
+            screen_x = (obj.x * RENDER_SCALE) - camera_x
+            screen_y = (obj.y * RENDER_SCALE) - camera_y
+            scaled_width = int(obj.width * RENDER_SCALE)
+
+            pulse = int(20 + 10 * abs(pygame.time.get_ticks() % 1000 - 500) / 500)
+            pygame.draw.circle(screen, self.colors['delete'],
+                               (int(screen_x), int(screen_y)),
+                               scaled_width // 2 + pulse, 3)
+
+        elif obj_type in ['collision', 'gate']:
+            screen_x = (obj.x * RENDER_SCALE) - camera_x
+            screen_y = (obj.y * RENDER_SCALE) - camera_y
+            scaled_width = int(obj.width * RENDER_SCALE)
+            scaled_height = int(obj.height * RENDER_SCALE)
+
+            pulse = int(3 + 2 * abs(pygame.time.get_ticks() % 1000 - 500) / 500)
+            pygame.draw.rect(screen, self.colors['delete'],
+                             (int(screen_x), int(screen_y), int(scaled_width), int(scaled_height)),
+                             pulse)
+
+        elif obj_type in ['stone', 'transition']:
+            screen_x = (obj.x * RENDER_SCALE) - camera_x
+            screen_y = (obj.y * RENDER_SCALE) - camera_y
+            scaled_width = int(obj.width * RENDER_SCALE)
+
+            pulse = int(20 + 10 * abs(pygame.time.get_ticks() % 1000 - 500) / 500)
+            pygame.draw.circle(screen, self.colors['delete'],
+                               (int(screen_x), int(screen_y)),
+                               scaled_width // 2 + pulse, 3)
+
+        mouse_pos = pygame.mouse.get_pos()
+        pygame.draw.line(screen, self.colors['delete'],
+                         (mouse_pos[0] - 10, mouse_pos[1] - 10),
+                         (mouse_pos[0] + 10, mouse_pos[1] + 10), 3)
+        pygame.draw.line(screen, self.colors['delete'],
+                         (mouse_pos[0] + 10, mouse_pos[1] - 10),
+                         (mouse_pos[0] - 10, mouse_pos[1] + 10), 3)
+
+    def _finalize_collision_placement(self, room_name):
+        """Finish placing a collision wall after dragging"""
+        if not self.preview_collision:
+            return
+
+        collision_obj = CollisionObject(
+            int(self.preview_collision.x),
+            int(self.preview_collision.y),
+            int(self.preview_collision.width),
+            int(self.preview_collision.height),
+            room_name
+        )
+
+        if self.room_manager:
+            room = self.room_manager.get_room_by_name(room_name)
+            if room:
+                if not hasattr(room, 'collision_objects'):
+                    room.collision_objects = []
+
+                room.collision_objects.append(collision_obj)
+                self.collision_manager.collision_objects[room_name] = room.collision_objects
+
+        self.preview_collision = None
+
+    def _finalize_transition_placement(self, room_name):
+        """Finish placing a room transition after dragging"""
+        if not self.preview_transition:
+            return
+
+        self.pending_transition = self.preview_transition
+        self.preview_transition = None
+
+        available_rooms = self.room_manager.get_room_names() if self.room_manager else []
+        self.transition_config.open(self.pending_transition, available_rooms, room_name)
+
+    def _finalize_transition_spawn_placement(self):
+        """Finalize the spawn point placement and return to source room"""
+        if not self.pending_transition_for_spawn:
+            return
+
+        # Get the spawn dimensions
+        spawn_width = getattr(self.pending_transition_for_spawn, 'spawn_width',
+                              self.pending_transition_for_spawn.width)
+        spawn_height = getattr(self.pending_transition_for_spawn, 'spawn_height',
+                               self.pending_transition_for_spawn.height)
+
+        # Convert from center to top-left coordinates
+        spawn_x = int(self.transition_spawn_preview_x) - spawn_width // 2
+        spawn_y = int(self.transition_spawn_preview_y) - spawn_height // 2
+
+        self.pending_transition_for_spawn.spawn_x = spawn_x
+        self.pending_transition_for_spawn.spawn_y = spawn_y
+
+        # NEW: Store the size of the transition object (from source room)
+        # This ensures destination spawn transition matches source transition size
+        if hasattr(self.pending_transition_for_spawn, 'width'):
+            self.pending_transition_for_spawn.spawn_width = self.pending_transition_for_spawn.width
+            self.pending_transition_for_spawn.spawn_height = self.pending_transition_for_spawn.height
+
+        source_room_name = self.transition_spawn_source_room
+        if source_room_name:
+            self.transition_manager.add_transition(source_room_name, self.pending_transition_for_spawn)
+
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(source_room_name)
+                if room:
+                    if not hasattr(room, 'room_transitions'):
+                        room.room_transitions = []
+                    room.room_transitions.append(self.pending_transition_for_spawn)
+
+            if hasattr(self, 'on_transition_placed') and self.on_transition_placed:
+                self.on_transition_placed(self.pending_transition_for_spawn, source_room_name)
+
+        self.placing_transition_spawn = False
+        self.transition_spawn_source_room = None
+        self.pending_transition_for_spawn = None
+        self.return_to_source_room = source_room_name
 
     def handle_input(self, event, camera_x, camera_y, room_name):
         """Process input events"""
@@ -286,6 +965,125 @@ class ObjectEditor:
 
         self.current_room_name = room_name
         mouse_pos = pygame.mouse.get_pos()
+
+        # Handle transition config dialog
+        if self.transition_config.active:
+            result = self.transition_config.handle_input(event)
+            if result == 'save' and self.pending_transition:
+                # Enter spawn placement mode for target room
+                target_room_name = self.pending_transition.target_room
+
+                if target_room_name and self.room_manager:
+                    target_room = self.room_manager.get_room_by_name(target_room_name)
+                    if target_room:
+                        # Store the transition and source room info
+                        self.placing_transition_spawn = True
+                        self.transition_spawn_source_room = room_name
+                        self.pending_transition_for_spawn = self.pending_transition
+                        return
+
+                self.pending_transition = None
+            elif result == 'cancel':
+                self.pending_transition = None
+            return
+
+        # Handle flying pad path editor
+        if self.flying_pad_path_editor.active:
+            result = self.flying_pad_path_editor.handle_input(
+                event,
+                int(self.mouse_world_x),
+                int(self.mouse_world_y),
+                self.room_manager.current_room.width if self.room_manager.current_room else WORLD_WIDTH,
+                self.room_manager.current_room.height if self.room_manager.current_room else WORLD_HEIGHT
+            )
+
+            # NEW: Handle save with return room
+            if result and result.startswith('save:'):
+                parts = result.split(':')
+                return_room_name = parts[1] if len(parts) > 1 else ""
+                should_create_return_pad = parts[2] == "return_pad" if len(parts) > 2 else False
+
+                # Add flying pad to room
+                if self.pending_flying_pad:
+                    # Determine which room the pad actually belongs to
+                    # (it should be the initial room where it was placed)
+                    pad_room_name = return_room_name
+
+                    self.flying_pad_manager.add_pad(pad_room_name, self.pending_flying_pad)
+
+                    if self.room_manager:
+                        room = self.room_manager.get_room_by_name(pad_room_name)
+                        if room:
+                            if not hasattr(room, 'flying_pads'):
+                                room.flying_pads = []
+                            room.flying_pads.append(self.pending_flying_pad)
+
+                    if hasattr(self, 'on_flying_pad_placed') and self.on_flying_pad_placed:
+                        self.on_flying_pad_placed(self.pending_flying_pad, pad_room_name)
+
+                    # NEW: Create return pad if checkbox was checked
+                    if should_create_return_pad and len(self.pending_flying_pad.waypoints) > 0:
+                        # Get the last waypoint position (path end)
+                        last_wp = self.pending_flying_pad.waypoints[-1]
+
+                        # Always use the last waypoint's actual position
+                        return_pad_x = last_wp.x
+                        return_pad_y = last_wp.y
+
+                        # Determine which room the last waypoint is in
+                        # by finding the last boundary waypoint before it
+                        return_pad_room = pad_room_name  # Default to original room
+
+                        for i in range(len(self.pending_flying_pad.waypoints) - 1, -1, -1):
+                            wp = self.pending_flying_pad.waypoints[i]
+                            if wp.is_boundary and wp.target_room:
+                                # Found a boundary waypoint, so we're in its target room
+                                return_pad_room = wp.target_room
+                                break
+
+                        # Create the return pad
+                        from objects.flying_pad import FlyingPad
+                        return_pad = FlyingPad(return_pad_x, return_pad_y, self.pending_flying_pad.pad_type)
+                        return_pad.waypoints = self.pending_flying_pad.waypoints.copy()
+                        return_pad.is_return_pad = True
+                        return_pad.source_room = pad_room_name  # Set the source room for return flight
+
+                        # Link the pads together
+                        # Use memory id as a simple linking mechanism
+                        original_id = id(self.pending_flying_pad)
+                        return_id = id(return_pad)
+                        self.pending_flying_pad.linked_pad_id = return_id
+                        return_pad.linked_pad_id = original_id
+
+                        # Add return pad to its room
+                        self.flying_pad_manager.add_pad(return_pad_room, return_pad)
+
+                        if self.room_manager:
+                            ret_room = self.room_manager.get_room_by_name(return_pad_room)
+                            if ret_room:
+                                if not hasattr(ret_room, 'flying_pads'):
+                                    ret_room.flying_pads = []
+                                ret_room.flying_pads.append(return_pad)
+
+                self.pending_flying_pad = None
+                self.placing_flying_pad = False
+
+                # Return command to switch back to initial room
+                return f'return_to_room:{return_room_name}'
+
+            # NEW: Handle cancel with return room
+            elif result and result.startswith('cancel:'):
+                return_room_name = result.split(':', 1)[1]
+                self.pending_flying_pad = None
+                self.placing_flying_pad = False
+                # Return command to switch back to initial room
+                return f'return_to_room:{return_room_name}'
+
+            elif result and result.startswith('transition:'):
+                # Room transition during path editing
+                return result
+
+            return
 
         # Scroll through palette
         if event.type == pygame.MOUSEWHEEL and self._is_in_palette(mouse_pos[0], mouse_pos[1]):
@@ -302,30 +1100,77 @@ class ObjectEditor:
                         self.hovered_object_type = None
                 return
 
-        # Left-click to place or select
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            # Finish placing collision wall if we're in the middle of it
-            if self.placing_collision:
-                self._finalize_collision_placement(room_name)
-                self.placing_collision = False
-                return
+            # Left-click to place or select
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                # Handle transition spawn placement mode
+                if self.placing_transition_spawn:
+                    self._finalize_transition_spawn_placement()
+                    return
 
-            # Click in palette to select object
-            if self._is_in_palette(mouse_pos[0], mouse_pos[1]):
-                self._handle_palette_click(mouse_pos)
-            else:
-                # Click in world to place object
-                if self.selected_object and not self._is_object_disabled(self.selected_object):
-                    if self.selected_object.get('is_collision', False):
-                        # Start dragging out a collision wall
-                        self.placing_collision = True
-                        self.collision_start_x = self.preview_x
-                        self.collision_start_y = self.preview_y
-                    else:
-                        self._place_object(camera_x, camera_y, room_name)
+                # Check if clicking on level input box
+                if self._is_level_input_clicked(mouse_pos):
+                    self.gate_level_input_active = True
+                    return
+
+                # Check if clicking on variant selector
+                if self._is_variant_selector_clicked(mouse_pos):
+                    return
+
+                # Deactivate input if clicking elsewhere
+                if self.gate_level_input_active:
+                    self.gate_level_input_active = False
+
+                # Finish placing collision wall if we're in the middle of it
+                if self.placing_collision:
+                    self._finalize_collision_placement(room_name)
+                    self.placing_collision = False
+                    return
+
+                # Finish placing transition if we're in the middle of it
+                if self.placing_transition:
+                    self._finalize_transition_placement(room_name)
+                    self.placing_transition = False
+                    return
+
+                # Click in palette to select object
+                if self._is_in_palette(mouse_pos[0], mouse_pos[1]):
+                    self._handle_palette_click(mouse_pos)
+                else:
+                    # Click in world to place object
+                    if self.selected_object and not self._is_object_disabled(self.selected_object):
+                        if self.selected_object.get('is_collision', False):
+                            self.placing_collision = True
+                            self.collision_start_x = self.preview_x
+                            self.collision_start_y = self.preview_y
+                        elif self.selected_object.get('is_transition', False):
+                            self.placing_transition = True
+                            self.transition_start_x = self.preview_x
+                            self.transition_start_y = self.preview_y
+                        else:
+                            self._place_object(camera_x, camera_y, room_name)
 
         # Keyboard shortcuts
         if event.type == pygame.KEYDOWN:
+            if self.gate_level_input_active:
+                if event.key == pygame.K_BACKSPACE:
+                    self.gate_level_text = self.gate_level_text[:-1]
+                    if not self.gate_level_text:
+                        self.gate_level_text = "0"
+                elif event.key == pygame.K_RETURN or event.key == pygame.K_ESCAPE:
+                    self.gate_level_input_active = False
+                    try:
+                        level = int(self.gate_level_text)
+                        self.gate_required_level = max(1, min(999, level))
+                        self.gate_level_text = str(self.gate_required_level)
+                    except ValueError:
+                        self.gate_level_text = str(self.gate_required_level)
+                elif event.unicode.isdigit():
+                    if len(self.gate_level_text) < 3:
+                        self.gate_level_text += event.unicode
+                    else:
+                        self.gate_level_text = event.unicode
+                return
+
             if event.key == pygame.K_g:
                 self.grid_snap = not self.grid_snap
             elif event.key == pygame.K_h:
@@ -334,166 +1179,11 @@ class ObjectEditor:
                 if self.placing_collision:
                     self.placing_collision = False
                     self.preview_collision = None
+                elif self.placing_transition:
+                    self.placing_transition = False
+                    self.preview_transition = None
                 else:
                     self.active = False
-
-    def _is_in_palette(self, mouse_x, mouse_y):
-        """Check if the mouse is hovering over the palette"""
-        return (mouse_x >= self.palette_x and
-                mouse_y >= self.palette_y and
-                mouse_y <= self.palette_y + self.palette_height)
-
-    def _handle_palette_click(self, mouse_pos):
-        """Handle clicks inside the palette"""
-        category_start_y = self.palette_y + 45
-
-        # Check if we clicked a category tab
-        for i, category in enumerate(self.categories.keys()):
-            category_rect = pygame.Rect(
-                self.palette_x + self.palette_padding,
-                category_start_y + i * 40,
-                self.palette_width - self.palette_padding * 2,
-                30
-            )
-            if category_rect.collidepoint(mouse_pos):
-                self.current_category = category
-                self.scroll_offset = 0
-                return
-
-        # Check if we clicked an object
-        objects = self.categories[self.current_category]
-        objects_start_y = category_start_y + len(self.categories) * 40 + 20 - self.scroll_offset
-
-        for i, obj in enumerate(objects):
-            row = i // self.items_per_row
-            col = i % self.items_per_row
-
-            item_x = self.palette_x + self.palette_padding + col * (self.item_size + 10)
-            item_y = objects_start_y + row * (self.item_size + 10)
-
-            item_rect = pygame.Rect(item_x, item_y, self.item_size, self.item_size)
-            if item_rect.collidepoint(mouse_pos):
-                if not self._is_object_disabled(obj):
-                    self.selected_object = obj
-                return
-
-    def _place_object(self, camera_x, camera_y, room_name):
-        """Actually place the selected object in the world"""
-        if self.selected_object.get('is_spawn', False):
-            # Place spawn point
-            spawn_obj = self.spawn_manager.place_spawn_point(
-                int(self.preview_x),
-                int(self.preview_y),
-                room_name
-            )
-
-            # Sync with the room object too
-            if self.room_manager:
-                room = self.room_manager.get_room_by_name(room_name)
-                if room:
-                    room.spawn_point = (int(self.preview_x), int(self.preview_y))
-
-        elif self.selected_object.get('is_collision', False):
-            # Collision walls use the drag system
-            pass
-
-        elif self.selected_object.get('object_type') == 'destructible_stone':
-            # Create a destructible stone
-            from objects.destructible_stone import DestructibleStone
-            stone_type = self.selected_object.get('stone_type', 'small')
-            stone = DestructibleStone(
-                int(self.preview_x),
-                int(self.preview_y),
-                stone_type
-            )
-
-            # Add to room
-            if self.room_manager:
-                room = self.room_manager.get_room_by_name(room_name)
-                if room:
-                    if not hasattr(room, 'destructible_stones'):
-                        room.destructible_stones = []
-                    room.destructible_stones.append(stone)
-
-                    # Let the game know we placed a stone
-                    if hasattr(self, 'on_stone_placed') and self.on_stone_placed:
-                        self.on_stone_placed(stone, room_name)
-
-    def _draw_delete_highlight(self, screen, camera_x, camera_y):
-        """Draw red outline around object that's about to be deleted"""
-        obj = self.hovered_object
-        obj_type = self.hovered_object_type
-
-        if obj_type == 'spawn':
-            screen_x = (obj.x * RENDER_SCALE) - camera_x
-            screen_y = (obj.y * RENDER_SCALE) - camera_y
-            scaled_width = int(obj.width * RENDER_SCALE)
-
-            # Pulsing red circle
-            pulse = int(20 + 10 * abs(pygame.time.get_ticks() % 1000 - 500) / 500)
-            pygame.draw.circle(screen, self.colors['delete'],
-                               (int(screen_x), int(screen_y)),
-                               scaled_width // 2 + pulse, 3)
-
-        elif obj_type == 'collision':
-            screen_x = (obj.x * RENDER_SCALE) - camera_x
-            screen_y = (obj.y * RENDER_SCALE) - camera_y
-            scaled_width = int(obj.width * RENDER_SCALE)
-            scaled_height = int(obj.height * RENDER_SCALE)
-
-            # Pulsing red rectangle
-            pulse = int(3 + 2 * abs(pygame.time.get_ticks() % 1000 - 500) / 500)
-            pygame.draw.rect(screen, self.colors['delete'],
-                             (int(screen_x), int(screen_y), int(scaled_width), int(scaled_height)),
-                             pulse)
-
-        elif obj_type == 'stone':
-            screen_x = (obj.x * RENDER_SCALE) - camera_x
-            screen_y = (obj.y * RENDER_SCALE) - camera_y
-            scaled_width = int(obj.width * RENDER_SCALE)
-
-            # Pulsing red circle
-            pulse = int(20 + 10 * abs(pygame.time.get_ticks() % 1000 - 500) / 500)
-            pygame.draw.circle(screen, self.colors['delete'],
-                               (int(screen_x), int(screen_y)),
-                               scaled_width // 2 + pulse, 3)
-
-        # Draw X over cursor
-        mouse_pos = pygame.mouse.get_pos()
-        pygame.draw.line(screen, self.colors['delete'],
-                         (mouse_pos[0] - 10, mouse_pos[1] - 10),
-                         (mouse_pos[0] + 10, mouse_pos[1] + 10), 3)
-        pygame.draw.line(screen, self.colors['delete'],
-                         (mouse_pos[0] + 10, mouse_pos[1] - 10),
-                         (mouse_pos[0] - 10, mouse_pos[1] + 10), 3)
-
-    def _finalize_collision_placement(self, room_name):
-        """Finish placing a collision wall after dragging"""
-        if not self.preview_collision:
-            return
-
-        # Create the collision object
-        collision_obj = CollisionObject(
-            int(self.preview_collision.x),
-            int(self.preview_collision.y),
-            int(self.preview_collision.width),
-            int(self.preview_collision.height),
-            room_name
-        )
-
-        # Add to room (this is the source of truth)
-        if self.room_manager:
-            room = self.room_manager.get_room_by_name(room_name)
-            if room:
-                if not hasattr(room, 'collision_objects'):
-                    room.collision_objects = []
-
-                room.collision_objects.append(collision_obj)
-
-                # Make sure manager points to the room's list (not a copy)
-                self.collision_manager.collision_objects[room_name] = room.collision_objects
-
-        self.preview_collision = None
 
     def update(self, dt, mouse_pos, camera_x, camera_y):
         """Update animations and preview positions"""
@@ -502,46 +1192,69 @@ class ObjectEditor:
 
         self.anim_timer += dt
 
-        # Smooth category hover animations
         for category in self.categories.keys():
             target = 1.0 if category == self.current_category else 0.0
             self.category_hover[category] += (target - self.category_hover[category]) * dt * 10
 
-        # Convert mouse to world coordinates
         self.mouse_world_x = (mouse_pos[0] + camera_x) / RENDER_SCALE
         self.mouse_world_y = (mouse_pos[1] + camera_y) / RENDER_SCALE
 
-        # Check if cursor is over an object (for deletion)
+        if self.placing_transition_spawn:
+            if self.grid_snap:
+                grid_x = int(self.mouse_world_x / TILE_SIZE) * TILE_SIZE + TILE_SIZE // 2
+                grid_y = int(self.mouse_world_y / TILE_SIZE) * TILE_SIZE + TILE_SIZE // 2
+                self.transition_spawn_preview_x = grid_x
+                self.transition_spawn_preview_y = grid_y
+            else:
+                self.transition_spawn_preview_x = self.mouse_world_x
+                self.transition_spawn_preview_y = self.mouse_world_y
+            return
+
         if not self._is_in_palette(mouse_pos[0], mouse_pos[1]):
             self.hovered_object, self.hovered_object_type = self._check_object_at_position(
                 self.mouse_world_x, self.mouse_world_y
             )
 
-        # Calculate where the preview should show
-        if self.selected_object:
+        # FIX: Add safety check for selected_object
+        if self.selected_object and isinstance(self.selected_object, dict):
             if self.grid_snap:
-                # Snap to grid center
                 grid_x = int(self.mouse_world_x / TILE_SIZE) * TILE_SIZE + TILE_SIZE // 2
                 grid_y = int(self.mouse_world_y / TILE_SIZE) * TILE_SIZE + TILE_SIZE // 2
                 self.preview_x = grid_x
                 self.preview_y = grid_y
             else:
-                # Free placement
                 self.preview_x = self.mouse_world_x
                 self.preview_y = self.mouse_world_y
+        else:
+            # Reset preview position if no valid object is selected
+            self.preview_x = 0
+            self.preview_y = 0
 
-        # Update collision wall preview while dragging
         if self.placing_collision:
-            end_x = self.mouse_world_x
-            end_y = self.mouse_world_y
+            if self.grid_snap:
+                snap_start_x = int(self.collision_start_x / TILE_SIZE) * TILE_SIZE
+                snap_start_y = int(self.collision_start_y / TILE_SIZE) * TILE_SIZE
+                snap_end_x = int(self.mouse_world_x / TILE_SIZE) * TILE_SIZE
+                snap_end_y = int(self.mouse_world_y / TILE_SIZE) * TILE_SIZE
 
-            min_x = min(self.collision_start_x, end_x)
-            min_y = min(self.collision_start_y, end_y)
-            max_x = max(self.collision_start_x, end_x)
-            max_y = max(self.collision_start_y, end_y)
+                min_x = min(snap_start_x, snap_end_x)
+                min_y = min(snap_start_y, snap_end_y)
+                max_x = max(snap_start_x, snap_end_x)
+                max_y = max(snap_start_y, snap_end_y)
 
-            width = max(16, max_x - min_x)
-            height = max(16, max_y - min_y)
+                width = max(TILE_SIZE, max_x - min_x + TILE_SIZE)
+                height = max(TILE_SIZE, max_y - min_y + TILE_SIZE)
+            else:
+                end_x = self.mouse_world_x
+                end_y = self.mouse_world_y
+
+                min_x = min(self.collision_start_x, end_x)
+                min_y = min(self.collision_start_y, end_y)
+                max_x = max(self.collision_start_x, end_x)
+                max_y = max(self.collision_start_y, end_y)
+
+                width = max(16, max_x - min_x)
+                height = max(16, max_y - min_y)
 
             self.preview_collision = CollisionObject(
                 int(min_x),
@@ -551,8 +1264,50 @@ class ObjectEditor:
                 self.current_room_name
             )
 
-        # Check what object we're hovering in palette
+        if self.placing_transition:
+            if self.grid_snap:
+                snap_start_x = int(self.transition_start_x / TILE_SIZE) * TILE_SIZE
+                snap_start_y = int(self.transition_start_y / TILE_SIZE) * TILE_SIZE
+                snap_end_x = int(self.mouse_world_x / TILE_SIZE) * TILE_SIZE
+                snap_end_y = int(self.mouse_world_y / TILE_SIZE) * TILE_SIZE
+
+                min_x = min(snap_start_x, snap_end_x)
+                min_y = min(snap_start_y, snap_end_y)
+                max_x = max(snap_start_x, snap_end_x)
+                max_y = max(snap_start_y, snap_end_y)
+
+                width = max(TILE_SIZE, max_x - min_x + TILE_SIZE)
+                height = max(TILE_SIZE, max_y - min_y + TILE_SIZE)
+            else:
+                end_x = self.mouse_world_x
+                end_y = self.mouse_world_y
+
+                min_x = min(self.transition_start_x, end_x)
+                min_y = min(self.transition_start_y, end_y)
+                max_x = max(self.transition_start_x, end_x)
+                max_y = max(self.transition_start_y, end_y)
+
+                width = max(32, max_x - min_x)
+                height = max(32, max_y - min_y)
+
+            self.preview_transition = RoomTransition(
+                int(min_x),
+                int(min_y),
+                int(width),
+                int(height)
+            )
+
         self.hover_object = None
+        self.hover_variant_index = -1
+
+        # Update flying pad path editor
+        if self.flying_pad_path_editor.active:
+            self.flying_pad_path_editor.update(
+                dt,
+                int(self.mouse_world_x),
+                int(self.mouse_world_y)
+            )
+
         if self._is_in_palette(mouse_pos[0], mouse_pos[1]):
             objects = self.categories[self.current_category]
             category_start_y = self.palette_y + 45
@@ -570,12 +1325,17 @@ class ObjectEditor:
                     self.hover_object = obj
                     break
 
-        # Calculate scrollable area
+            # Check variant selector hover
+            for i, rect_data in enumerate(self.ui_rects.get('variant_rects', [])):
+                if rect_data['rect'].collidepoint(mouse_pos):
+                    self.hover_variant_index = i
+                    break
+
         objects = self.categories[self.current_category]
         rows = (len(objects) + self.items_per_row - 1) // self.items_per_row
         total_height = rows * (self.item_size + 10)
         category_section_height = len(self.categories) * 40 + 20
-        available_height = self.palette_height - (45 + category_section_height + 140)
+        available_height = self.palette_height - (45 + category_section_height + 200)  # Increased for variant selector
         self.max_scroll = max(0, total_height - available_height)
 
     def draw_preview(self, screen, camera_x, camera_y):
@@ -583,18 +1343,111 @@ class ObjectEditor:
         if not self.active:
             return
 
-        # Show collision wall being dragged
+        # Don't show object preview when path editor is active
+        if self.flying_pad_path_editor.active:
+            self.flying_pad_path_editor.draw(
+                screen,
+                type('Camera', (), {'x': camera_x, 'y': camera_y})(),
+                RENDER_SCALE
+            )
+            return
+
+        if self.placing_transition_spawn:
+            # Get transition dimensions from the pending transition
+            if self.pending_transition_for_spawn:
+                spawn_width = getattr(self.pending_transition_for_spawn, 'spawn_width',
+                                      getattr(self.pending_transition_for_spawn, 'width', 32))
+                spawn_height = getattr(self.pending_transition_for_spawn, 'spawn_height',
+                                       getattr(self.pending_transition_for_spawn, 'height', 32))
+            else:
+                spawn_width = 32
+                spawn_height = 32
+
+            # Calculate the top-left position (preview_x/y is the center)
+            preview_left = self.transition_spawn_preview_x - spawn_width // 2
+            preview_top = self.transition_spawn_preview_y - spawn_height // 2
+
+            screen_x = (preview_left * RENDER_SCALE) - camera_x
+            screen_y = (preview_top * RENDER_SCALE) - camera_y
+            screen_width = spawn_width * RENDER_SCALE
+            screen_height = spawn_height * RENDER_SCALE
+
+            font = pygame.font.Font(None, 32)
+            text = font.render("Click to place transition spawn area", True, (255, 255, 0))
+            text_bg = pygame.Surface((text.get_width() + 20, text.get_height() + 10), pygame.SRCALPHA)
+            text_bg.fill((0, 0, 0, 180))
+            bg_x = (screen.get_width() - text.get_width()) // 2 - 10
+            screen.blit(text_bg, (bg_x, 10))
+            screen.blit(text, ((screen.get_width() - text.get_width()) // 2, 15))
+
+            # Draw the rectangular transition spawn area
+            rect = pygame.Rect(int(screen_x), int(screen_y),
+                               int(screen_width), int(screen_height))
+
+            # Semi-transparent blue fill
+            fill_surface = pygame.Surface((int(screen_width), int(screen_height)), pygame.SRCALPHA)
+            fill_surface.fill((100, 200, 255, 100))
+            screen.blit(fill_surface, (int(screen_x), int(screen_y)))
+
+            # Border
+            pygame.draw.rect(screen, (0, 150, 255), rect, 3)
+
+            # Diagonal lines pattern (like the transition object)
+            line_surface = pygame.Surface((int(screen_width), int(screen_height)), pygame.SRCALPHA)
+            spacing = 16 * RENDER_SCALE
+            for i in range(int(-screen_height), int(screen_width + screen_height), int(spacing)):
+                start_x = i
+                start_y = 0
+                end_x = i + screen_height
+                end_y = screen_height
+                pygame.draw.line(line_surface, (0, 120, 200, 120),
+                                 (start_x, start_y), (end_x, end_y), 1)
+            screen.blit(line_surface, (int(screen_x), int(screen_y)))
+
+            # Center crosshair
+            center_x = screen_x + screen_width // 2
+            center_y = screen_y + screen_height // 2
+
+            pygame.draw.line(screen, (255, 255, 0),
+                             (center_x - 15, center_y),
+                             (center_x + 15, center_y), 2)
+            pygame.draw.line(screen, (255, 255, 0),
+                             (center_x, center_y - 15),
+                             (center_x, center_y + 15), 2)
+
+            # Draw dimensions text
+            if screen_width > 50 and screen_height > 30:
+                dims_font = pygame.font.Font(None, 18)
+                dims_text = f"{spawn_width} x {spawn_height}"
+                dims_surface = dims_font.render(dims_text, True, (255, 255, 255))
+                dims_rect = dims_surface.get_rect(center=(center_x, center_y))
+
+                # Text background
+                bg_rect = dims_rect.inflate(8, 4)
+                bg_surface = pygame.Surface((bg_rect.width, bg_rect.height), pygame.SRCALPHA)
+                bg_surface.fill((0, 0, 0, 180))
+                screen.blit(bg_surface, bg_rect.topleft)
+                screen.blit(dims_surface, dims_rect)
+
+            return
+
         if self.placing_collision and self.preview_collision:
             draw_collision_object(screen, self.preview_collision, camera_x, camera_y,
                                   RENDER_SCALE, dev_mode=True, selected=True)
             return
 
-        # Show delete highlight if hovering over object
+        if self.placing_transition and self.preview_transition:
+            self.preview_transition.draw(screen,
+                                         type('Camera', (), {'x': camera_x, 'y': camera_y})(),
+                                         RENDER_SCALE, dev_mode=True, selected=True)
+            return
+
         if self.hovered_object and self.hovered_object_type and not self.selected_object:
             self._draw_delete_highlight(screen, camera_x, camera_y)
             return
 
-        if not self.selected_object:
+        # FIX: Add safety check
+        if not self.selected_object or not isinstance(self.selected_object, dict):
             return
 
         if self._is_object_disabled(self.selected_object):
@@ -607,7 +1460,6 @@ class ObjectEditor:
         screen_x = (self.preview_x * RENDER_SCALE) - camera_x
         screen_y = (self.preview_y * RENDER_SCALE) - camera_y
 
-        # Draw grid snap guide
         if self.grid_snap:
             grid_screen_x = int(self.mouse_world_x / TILE_SIZE) * TILE_SIZE * RENDER_SCALE - camera_x
             grid_screen_y = int(self.mouse_world_y / TILE_SIZE) * TILE_SIZE * RENDER_SCALE - camera_y
@@ -616,7 +1468,6 @@ class ObjectEditor:
             pygame.draw.rect(guide_surf, self.colors['snap_guide'],
                              (0, 0, TILE_SIZE * RENDER_SCALE, TILE_SIZE * RENDER_SCALE), 2)
 
-            # Crosshair at center
             center_x = TILE_SIZE * RENDER_SCALE // 2
             center_y = TILE_SIZE * RENDER_SCALE // 2
             pygame.draw.line(guide_surf, self.colors['snap_guide'],
@@ -625,11 +1476,24 @@ class ObjectEditor:
                              (center_x, center_y - 5), (center_x, center_y + 5), 2)
             screen.blit(guide_surf, (int(grid_screen_x), int(grid_screen_y)))
 
-        # Draw semi-transparent object preview
-        obj_sprite = self.selected_object['sprite']
+        # Get the sprite to preview (from selected variant or default)
+        if self.selected_object.get('has_variants', False):
+            variant = self.selected_variant or self._get_current_variant(self.selected_object)
+            if variant:
+                obj_sprite = variant.get('sprite')
+                scaled_width = int(variant.get('width', 32) * RENDER_SCALE)
+                scaled_height = int(variant.get('height', 32) * RENDER_SCALE)
+            else:
+                # Fallback if variant is None
+                obj_sprite = self.selected_object.get('sprite')
+                scaled_width = int(self.selected_object.get('width', 32) * RENDER_SCALE)
+                scaled_height = int(self.selected_object.get('height', 32) * RENDER_SCALE)
+        else:
+            obj_sprite = self.selected_object.get('sprite')
+            scaled_width = int(self.selected_object.get('width', 32) * RENDER_SCALE)
+            scaled_height = int(self.selected_object.get('height', 32) * RENDER_SCALE)
+
         if obj_sprite:
-            scaled_width = int(self.selected_object['width'] * RENDER_SCALE)
-            scaled_height = int(self.selected_object['height'] * RENDER_SCALE)
             scaled_sprite = pygame.transform.scale(obj_sprite, (scaled_width, scaled_height))
 
             preview_surf = scaled_sprite.copy()
@@ -640,7 +1504,6 @@ class ObjectEditor:
 
             screen.blit(preview_surf, (preview_x, preview_y))
 
-            # Position marker
             pygame.draw.circle(screen, self.colors['accent'], (int(screen_x), int(screen_y)), 3)
             pygame.draw.circle(screen, self.colors['text'], (int(screen_x), int(screen_y)), 1)
 
@@ -654,6 +1517,42 @@ class ObjectEditor:
         for collision_obj in collision_objs:
             draw_collision_object(screen, collision_obj, camera_x, camera_y,
                                   RENDER_SCALE, dev_mode=True, selected=False)
+
+    def draw_room_transitions(self, screen, camera_x, camera_y):
+        """Draw all room transitions in the current room"""
+        if not self.current_room_name:
+            return
+
+        transitions = self.transition_manager.get_transitions(self.current_room_name)
+
+        class TempCamera:
+            def __init__(self, x, y):
+                self.x = x
+                self.y = y
+
+        temp_camera = TempCamera(camera_x, camera_y)
+
+        for transition in transitions:
+            if transition.active:
+                transition.draw(screen, temp_camera, RENDER_SCALE, dev_mode=True, selected=False)
+
+    def draw_level_gates(self, screen, camera_x, camera_y, colors):
+        """Draw level gates in the current room"""
+        if not self.current_room_name:
+            return
+
+        gates = self.gate_manager.get_gates(self.current_room_name)
+
+        class TempCamera:
+            def __init__(self, x, y):
+                self.x = x
+                self.y = y
+
+        temp_camera = TempCamera(camera_x, camera_y)
+
+        for gate in gates:
+            if gate.active:
+                gate.draw(screen, temp_camera, colors)
 
     def draw_spawn_points(self, screen, camera_x, camera_y):
         """Draw spawn points in the current room"""
@@ -679,7 +1578,10 @@ class ObjectEditor:
         if not self.active:
             return
 
-        # Background panel
+        # Don't show palette when path editor is active
+        if self.flying_pad_path_editor.active:
+            return
+
         palette_rect = pygame.Rect(self.palette_x, self.palette_y, self.palette_width, self.palette_height)
         palette_bg = pygame.Surface((self.palette_width, self.palette_height), pygame.SRCALPHA)
         palette_bg.fill(self.colors['bg_transparent'])
@@ -688,12 +1590,10 @@ class ObjectEditor:
 
         y_pos = self.palette_y + 10
 
-        # Title
         title = self.font_medium.render("Object Palette", True, self.colors['text'])
         screen.blit(title, (self.palette_x + 20, y_pos))
         y_pos += 35
 
-        # Category tabs
         for i, category in enumerate(self.categories.keys()):
             is_selected = category == self.current_category
             hover = self.category_hover[category]
@@ -705,7 +1605,6 @@ class ObjectEditor:
                 30
             )
 
-            # Hover glow effect
             bg_color = self.colors['panel_light'] if is_selected else self.colors['panel']
             if hover > 0:
                 glow_surf = pygame.Surface((category_rect.width + 4, category_rect.height + 4), pygame.SRCALPHA)
@@ -725,15 +1624,13 @@ class ObjectEditor:
 
             y_pos += 40
 
-        # Divider line
         pygame.draw.line(screen, self.colors['accent'],
                          (self.palette_x + self.palette_padding, y_pos),
                          (self.palette_x + self.palette_width - self.palette_padding, y_pos), 1)
         y_pos += 10
 
-        # Object grid with scrolling
         objects_start_y = y_pos
-        objects_content_height = self.palette_height - (y_pos - self.palette_y) - 140
+        objects_content_height = self.palette_height - (y_pos - self.palette_y) - 200
 
         clip_rect = pygame.Rect(self.palette_x, objects_start_y, self.palette_width, objects_content_height)
         screen.set_clip(clip_rect)
@@ -748,7 +1645,6 @@ class ObjectEditor:
             item_x = self.palette_x + self.palette_padding + col * (self.item_size + 10)
             item_y = current_y + row * (self.item_size + 10)
 
-            # Skip if not visible
             if item_y + self.item_size < objects_start_y or item_y > objects_start_y + objects_content_height:
                 continue
 
@@ -756,8 +1652,9 @@ class ObjectEditor:
 
         screen.set_clip(None)
 
-        # Settings at bottom
+        self._draw_variant_selector(screen)
         self._draw_settings_panel(screen)
+        self.transition_config.draw(screen)
 
     def _draw_object_item(self, screen, obj, x, y):
         """Draw a single object in the palette"""
@@ -767,7 +1664,6 @@ class ObjectEditor:
         is_hover = self.hover_object == obj
         is_disabled = self._is_object_disabled(obj)
 
-        # Glow for selected/hover
         if is_selected or is_hover:
             if not is_disabled:
                 glow_surf = pygame.Surface((self.item_size + 4, self.item_size + 4), pygame.SRCALPHA)
@@ -783,24 +1679,20 @@ class ObjectEditor:
         border_width = 2 if is_selected else 1
         pygame.draw.rect(screen, border_color, item_rect, border_width, border_radius=5)
 
-        # Object sprite
         if obj['sprite']:
             sprite = obj['sprite'].copy()
 
-            # Grey out if disabled
             if is_disabled:
                 sprite.fill((100, 100, 100, 150), special_flags=pygame.BLEND_RGBA_MULT)
 
             sprite_rect = sprite.get_rect(center=item_rect.center)
             screen.blit(sprite, sprite_rect)
 
-        # Object name
         name_color = self.colors['disabled'] if is_disabled else self.colors['text_dim']
         name_text = self.font_small.render(obj['name'], True, name_color)
         name_rect = name_text.get_rect(centerx=item_rect.centerx, top=item_rect.bottom + 2)
         screen.blit(name_text, name_rect)
 
-        # "PLACED" indicator for disabled spawn
         if is_disabled and obj.get('is_spawn', False):
             placed_text = self.font_small.render("PLACED", True, self.colors['disabled'])
             placed_rect = placed_text.get_rect(centerx=item_rect.centerx, centery=item_rect.centery)
@@ -811,9 +1703,135 @@ class ObjectEditor:
 
             screen.blit(placed_text, placed_rect)
 
+        # Show variant indicator
+        if obj.get('has_variants', False) and is_hover:
+            variant_text = self.font_small.render("Click to select variant", True, self.colors['accent'])
+            variant_rect = variant_text.get_rect(centerx=item_rect.centerx, top=item_rect.bottom + 18)
+
+            bg_surf = pygame.Surface((variant_rect.width + 6, variant_rect.height + 2), pygame.SRCALPHA)
+            bg_surf.fill((0, 0, 0, 180))
+            screen.blit(bg_surf, (variant_rect.x - 3, variant_rect.y - 1))
+
+            screen.blit(variant_text, variant_rect)
+
+    def _draw_variant_selector(self, screen):
+        """Draw variant selection row when an object with variants is selected"""
+        if not self.selected_object or not isinstance(self.selected_object, dict):
+            return
+
+        if not self.selected_object.get('has_variants', False):
+            return
+
+        variants = self.selected_object.get('variants', [])
+        if not variants:
+            return
+
+        # Position above settings panel
+        selector_height = 100
+        selector_y = self.palette_y + self.palette_height - 250
+        selector_x = self.palette_x
+
+        # Background
+        selector_rect = pygame.Rect(selector_x, selector_y, self.palette_width, selector_height)
+        pygame.draw.rect(screen, self.colors['variant_bg'], selector_rect)
+        pygame.draw.line(screen, self.colors['accent'],
+                         (selector_x, selector_y),
+                         (selector_x + self.palette_width, selector_y), 2)
+
+        # Title
+        title_text = self.font_small.render("Select Variant:", True, self.colors['text_dim'])
+        screen.blit(title_text, (selector_x + self.palette_padding, selector_y + 5))
+
+        # Draw variant options
+        variant_size = 50
+        variant_spacing = 10
+        start_x = selector_x + self.palette_padding
+        start_y = selector_y + 25
+
+        current_variant = self.selected_variant or self._get_current_variant(self.selected_object)
+
+        self.ui_rects['variant_rects'] = []
+
+        for i, variant in enumerate(variants):
+            variant_x = start_x + i * (variant_size + variant_spacing)
+            variant_rect = pygame.Rect(variant_x, start_y, variant_size, variant_size)
+
+            is_selected = (current_variant == variant)
+            is_hover = (self.hover_variant_index == i)
+
+            # Background
+            if is_selected:
+                bg_color = self.colors['variant_selected']
+            elif is_hover:
+                bg_color = self.colors['panel_light']
+            else:
+                bg_color = self.colors['panel']
+
+            pygame.draw.rect(screen, bg_color, variant_rect, border_radius=3)
+
+            # Border
+            border_color = self.colors['accent'] if is_selected else self.colors['grid']
+            border_width = 2 if is_selected else 1
+            pygame.draw.rect(screen, border_color, variant_rect, border_width, border_radius=3)
+
+            # Sprite
+            if variant.get('sprite'):
+                sprite = variant['sprite'].copy()
+                sprite_rect = sprite.get_rect(center=variant_rect.center)
+                screen.blit(sprite, sprite_rect)
+
+            # Label
+            label_text = self.font_small.render(variant['name'], True, self.colors['text_dim'])
+            label_rect = label_text.get_rect(centerx=variant_rect.centerx, top=variant_rect.bottom + 2)
+            screen.blit(label_text, label_rect)
+
+            # Store rect for click detection
+            self.ui_rects['variant_rects'].append({
+                'rect': variant_rect,
+                'variant': variant
+            })
+
+    def draw_flying_pads(self, screen, camera_x, camera_y, colors):
+        """Draw flying pads in the current room"""
+        if not self.current_room_name:
+            return
+
+        pads = self.flying_pad_manager.get_pads(self.current_room_name)
+
+        class TempCamera:
+            def __init__(self, x, y):
+                self.x = x
+                self.y = y
+
+        temp_camera = TempCamera(camera_x, camera_y)
+
+        for pad in pads:
+            if pad.active:
+                pad.draw(screen, temp_camera, colors, RENDER_SCALE)
+                # Draw path preview in editor
+                pad.draw_path_preview(screen, temp_camera, RENDER_SCALE)
+
+    def draw_save_points(self, screen, camera_x, camera_y, colors):
+        """Draw save points in the current room"""
+        if not self.current_room_name:
+            return
+
+        save_points = self.save_point_manager.get_save_points(self.current_room_name)
+
+        class TempCamera:
+            def __init__(self, x, y):
+                self.x = x
+                self.y = y
+
+        temp_camera = TempCamera(camera_x, camera_y)
+
+        for save_point in save_points:
+            if save_point.active:
+                save_point.draw(screen, temp_camera, colors)
+
     def _draw_settings_panel(self, screen):
         """Draw controls and settings at the bottom of the palette"""
-        panel_height = 140
+        panel_height = 160
         panel_y = self.palette_y + self.palette_height - panel_height
 
         panel_rect = pygame.Rect(self.palette_x, panel_y, self.palette_width, panel_height)
@@ -824,7 +1842,6 @@ class ObjectEditor:
 
         y_pos = panel_y + 10
 
-        # Grid snap toggle
         snap_text = f"Grid Snap: {'ON' if self.grid_snap else 'OFF'}"
         snap_color = self.colors['success'] if self.grid_snap else self.colors['text_dim']
         snap_surf = self.font_medium.render(snap_text, True, snap_color)
@@ -834,7 +1851,6 @@ class ObjectEditor:
         screen.blit(hint, (self.palette_x + self.palette_padding + 120, y_pos + 3))
         y_pos += 25
 
-        # Grid visibility toggle
         grid_text = f"Show Grid: {'ON' if self.show_grid else 'OFF'}"
         grid_color = self.colors['success'] if self.show_grid else self.colors['text_dim']
         grid_surf = self.font_medium.render(grid_text, True, grid_color)
@@ -842,9 +1858,39 @@ class ObjectEditor:
 
         hint = self.font_small.render("(Press H)", True, self.colors['text_dim'])
         screen.blit(hint, (self.palette_x + self.palette_padding + 120, y_pos + 3))
-        y_pos += 30
+        y_pos += 25
 
-        # Control hints
+        if self.selected_object and isinstance(self.selected_object, dict) and self.selected_object.get(
+                'object_type') == 'level_gate':
+            level_label = self.font_medium.render("Gate Level Req:", True, self.colors['text'])
+            screen.blit(level_label, (self.palette_x + self.palette_padding, y_pos))
+
+            input_x = self.palette_x + self.palette_padding + 135
+            input_y = y_pos - 3
+            input_width = 60
+            input_height = 25
+
+            input_rect = pygame.Rect(input_x, input_y, input_width, input_height)
+            input_bg_color = self.colors['input_active'] if self.gate_level_input_active else self.colors['input_bg']
+            pygame.draw.rect(screen, input_bg_color, input_rect)
+            pygame.draw.rect(screen, self.colors['accent'] if self.gate_level_input_active else self.colors['grid'],
+                             input_rect, 2)
+
+            display_text = self.gate_level_text if self.gate_level_input_active else str(self.gate_required_level)
+            text_surf = self.font_medium.render(display_text, True, self.colors['text'])
+            text_rect = text_surf.get_rect(center=input_rect.center)
+            screen.blit(text_surf, text_rect)
+
+            if self.gate_level_input_active:
+                if int(pygame.time.get_ticks() / 500) % 2 == 0:
+                    cursor_x = text_rect.right + 3
+                    cursor_y = input_rect.centery
+                    pygame.draw.line(screen, self.colors['text'],
+                                     (cursor_x, cursor_y - 10),
+                                     (cursor_x, cursor_y + 10), 2)
+
+            y_pos += 30
+
         instructions = [
             "Click: Select Object",
             "Click World: Place",

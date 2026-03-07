@@ -8,11 +8,14 @@ class SpriteSheet:
     """Handles loading and extracting sprites from a sprite sheet"""
 
     def __init__(self, filepath):
+        """Load the sprite sheet from *filepath*, or leave sheet as None if not found.
+
+        Args:
+            filepath: Path to the sprite sheet PNG file.
+        """
         self.sheet = None
         if os.path.exists(filepath):
             self.sheet = pygame.image.load(filepath).convert_alpha()
-        else:
-            print(f"Warning: Sprite sheet not found: {filepath}")
 
     def get_sprite(self, x, y, width, height):
         """Extract a single sprite from the sheet"""
@@ -107,33 +110,75 @@ class AnimatedSprite:
         self.offset_x = sprite_width // 2
         self.offset_y = sprite_height // 2
 
-    def load_animation(self, animation_name, direction, frame_duration=0.1, loop=True, num_variants=1):
+    def load_animation(self, animation_name, direction, frame_duration=0.1, loop=True, num_variants=1,
+                       use_8_directions=False):
+        """Load a single directional animation from a sprite sheet file.
+
+        The file is expected at ``{base_path}/{animation_name}.png``.
+        Rows in the sheet correspond to directions; multiple variant blocks
+        can be stacked vertically (each block occupies num_directions rows).
+
+        Args:
+            animation_name: Base name of the animation (e.g. 'idle', 'walk').
+            direction: Direction string ('down', 'left', 'right', 'up', or
+                       the 8-dir equivalents).
+            frame_duration: Seconds per frame.
+            loop: Whether the animation should loop.
+            num_variants: Number of variant blocks to load from the sheet.
+            use_8_directions: If True use the 8-dir layout; otherwise 4-dir.
+
+        Returns:
+            True on success, False if the file is missing or no frames load.
+        """
         filepath = f"{self.base_path}/{animation_name}.png"
 
         if not os.path.exists(filepath):
-            print(f"Warning: Animation file not found: {filepath}")
             return False
 
         sprite_sheet = SpriteSheet(filepath)
-        direction_map = {'down': 0, 'left': 1, 'right': 2, 'up': 3}
+
+        # Support both 4-directional and 8-directional sprite sheets
+        # 8-directional: down, down_left, left, up_left, up, up_right, right, down_right
+        # 4-directional: down, left, right, up (legacy support)
+        if use_8_directions:
+            direction_map = {
+                'down': 0,
+                'down_left': 1,
+                'left': 2,
+                'up_left': 3,
+                'up': 4,
+                'up_right': 5,
+                'right': 6,
+                'down_right': 7
+            }
+            num_directions = 8
+        else:
+            direction_map = {
+                'down': 0,
+                'left': 1,
+                'right': 2,
+                'up': 3
+            }
+            num_directions = 4
+
         direction_offset = direction_map.get(direction, 0)
+        if direction not in direction_map:
+            pass  # Unknown direction falls back to row 0
 
         key = f"{animation_name}_{direction}"
         variants = []
 
         for variant_index in range(num_variants):
-            row = (variant_index * 4) + direction_offset
+            row = (variant_index * num_directions) + direction_offset
             frames = sprite_sheet.get_all_frames(self.sprite_width, self.sprite_height, row)
 
             if not frames:
-                print(f"Warning: No frames loaded from {filepath} row {row}")
                 continue
 
             animation = Animation(frames, frame_duration, loop)
             variants.append(animation)
 
         if not variants:
-            print(f"Warning: No variants loaded for {animation_name}_{direction}")
             return False
 
         if len(variants) == 1:
@@ -143,53 +188,125 @@ class AnimatedSprite:
 
         return True
 
-    def load_animation_all_directions(self, animation_name, frame_duration=0.1, loop=True, num_variants=1):
-        for direction in ['down', 'left', 'right', 'up']:
-            self.load_animation(animation_name, direction, frame_duration, loop, num_variants)
+    def load_animation_all_directions(self, animation_name, frame_duration=0.1, loop=True, num_variants=1,
+                                      use_8_directions=False):
+        """
+        Load animation for all directions
+        use_8_directions: If True, loads for 8 directions (down, down_left, left, up_left, up, up_right, right, down_right)
+                         If False, loads for 4 directions (down, left, right, up) - legacy
+        """
+        if use_8_directions:
+            directions = ['down', 'down_left', 'left', 'up_left', 'up', 'up_right', 'right', 'down_right']
+        else:
+            directions = ['down', 'left', 'right', 'up']
 
-    def set_animation(self, name, direction=None):
-        if direction:
+        for direction in directions:
+            self.load_animation(animation_name, direction, frame_duration, loop, num_variants, use_8_directions)
+
+    def append_animation_variants(self, animation_name, source_filename, frame_duration=0.1, loop=True, num_variants=1,
+                                  use_8_directions=False):
+        """
+        Append additional variants to an existing animation from a different spritesheet file.
+        Useful for loading extra variants from separate files (e.g., melee_extra.png)
+        """
+        filepath = f"{self.base_path}/{source_filename}"
+
+        if not os.path.exists(filepath):
+            return False
+
+        sprite_sheet = SpriteSheet(filepath)
+
+        if use_8_directions:
+            direction_map = {
+                'down': 0,
+                'down_left': 1,
+                'left': 2,
+                'up_left': 3,
+                'up': 4,
+                'up_right': 5,
+                'right': 6,
+                'down_right': 7
+            }
+            num_directions = 8
+            directions = ['down', 'down_left', 'left', 'up_left', 'up', 'up_right', 'right', 'down_right']
+        else:
+            direction_map = {
+                'down': 0,
+                'left': 1,
+                'right': 2,
+                'up': 3
+            }
+            num_directions = 4
+            directions = ['down', 'left', 'right', 'up']
+
+        for direction in directions:
+            direction_offset = direction_map.get(direction, 0)
+            key = f"{animation_name}_{direction}"
+
+            existing_anim = self.animations.get(key)
+            if not existing_anim:
+                continue
+
+            # Convert single animation to list if needed
+            if not isinstance(existing_anim, list):
+                self.animations[key] = [existing_anim]
+
+            # Load and append new variants
+            for variant_index in range(num_variants):
+                row = (variant_index * num_directions) + direction_offset
+                frames = sprite_sheet.get_all_frames(self.sprite_width, self.sprite_height, row)
+
+                if frames:
+                    animation = Animation(frames, frame_duration, loop)
+                    self.animations[key].append(animation)
+
+        return True
+
+    def set_animation(self, animation_name, direction):
+        """Switch to a different animation, resetting it if the key has changed.
+
+        Args:
+            animation_name: Base name of the animation (e.g. 'idle', 'walk').
+            direction: Direction string matching a loaded animation key.
+        """
+        key = f"{animation_name}_{direction}"
+
+        if key not in self.animations:
+            return
+
+        # Only reset if this is actually a different animation
+        if self.current_animation != key:
+            self.current_animation = key
             self.current_direction = direction
 
-        key = f"{name}_{self.current_direction}"
-
-        if key in self.animations:
-            if self.current_animation == key:
-                return
-
-            self.current_animation = key
-
-            if isinstance(self.animations[key], list):
-                selected_variant = random.choice(self.animations[key])
-                selected_variant.reset()
-            else:
-                self.animations[key].reset()
-        else:
-            if self.load_animation(name, self.current_direction):
-                self.current_animation = key
-            else:
-                print(f"Warning: Animation '{key}' not found")
-
-    def update(self, dt):
-        """Update current animation"""
-        if self.current_animation and self.current_animation in self.animations:
-            anim = self.animations[self.current_animation]
-
+            # Reset the animation(s)
+            anim = self.animations[key]
             if isinstance(anim, list):
                 for variant in anim:
-                    variant.update(dt)
+                    variant.reset()
             else:
-                anim.update(dt)
+                anim.reset()
 
-    def draw(self, screen, x, y, camera=None, scale=RENDER_SCALE):
-        """
-        Draw the sprite
-        x, y: WORLD coordinates of entity center
-        camera: Camera object (camera.x and camera.y are in SCREEN coordinates)
-        scale: RENDER_SCALE value for consistent scaling
-        """
+    def update(self, dt):
+        """Advance the current animation by *dt* seconds."""
         if not self.current_animation or self.current_animation not in self.animations:
-            # Convert to screen coordinates: (world_pos * scale) - camera_screen_pos
+            return
+
+        anim = self.animations[self.current_animation]
+
+        # Handle both single animation and variant lists
+        if isinstance(anim, list):
+            for variant in anim:
+                variant.update(dt)
+        else:
+            anim.update(dt)
+
+    def draw(self, screen, x, y, camera=None, scale=1.0, hurt_tint=0.0):
+        """Draw the current animation frame, optionally with a red hurt tint (0.0-1.0).
+        BLEND_RGB_ADD adds red to each pixel's RGB values while leaving alpha untouched,
+        so transparent pixels remain transparent — no bounding-box square artifact."""
+        if not self.current_animation or self.current_animation not in self.animations:
+            # Draw placeholder if no animation
             if camera:
                 screen_x = (x * RENDER_SCALE) - camera.x
                 screen_y = (y * RENDER_SCALE) - camera.y
@@ -233,6 +350,12 @@ class AnimatedSprite:
             scaled_height = int(self.sprite_height * RENDER_SCALE)
             frame = pygame.transform.scale(frame, (scaled_width, scaled_height))
 
+            # Hurt tint: add red to each pixel's RGB, alpha untouched → no square artifact
+            if hurt_tint > 0:
+                frame = frame.copy()
+                red_amount = int(hurt_tint * 180)
+                frame.fill((red_amount, 0, 0), special_flags=pygame.BLEND_RGB_ADD)
+
             offset_x = scaled_width // 2
             offset_y = scaled_height // 2
 
@@ -258,11 +381,12 @@ class CharacterSpriteLoader:
     def load_character(character_name, costume_name, sprite_width, sprite_height):
         sprite = AnimatedSprite(character_name, costume_name, sprite_width, sprite_height)
 
-        animations = [
+        # Standard 4-directional animations
+        animations_4dir = [
             ('idle', 0.3, True, 1),
             ('walk', 0.1, True, 1),
             ('run', 0.08, True, 1),
-            ('melee', 0.1, False, 3),
+            ('melee', 0.1, False, 2),  # Load first 2 variants from melee.png
             ('melee2', 0.1, False, 2),
             ('melee3', 0.1, False, 1),
             ('kiblast', 0.3, False, 1),
@@ -274,8 +398,20 @@ class CharacterSpriteLoader:
             ('untransform', 0.15, False, 1),
         ]
 
-        for anim_name, duration, loop, num_variants in animations:
-            sprite.load_animation_all_directions(anim_name, duration, loop, num_variants)
+        for anim_name, duration, loop, num_variants in animations_4dir:
+            sprite.load_animation_all_directions(anim_name, duration, loop, num_variants, use_8_directions=False)
+
+        # Load third melee variant from melee_extra.png (optional)
+        sprite.append_animation_variants('melee', 'melee_extra.png', frame_duration=0.1, loop=False, num_variants=1,
+                                         use_8_directions=False)
+
+        # 8-directional animations (like flying)
+        animations_8dir = [
+            ('flying', 0.1, True, 1),
+        ]
+
+        for anim_name, duration, loop, num_variants in animations_8dir:
+            sprite.load_animation_all_directions(anim_name, duration, loop, num_variants, use_8_directions=True)
 
         sprite.set_animation('idle', 'down')
 
@@ -290,7 +426,7 @@ class CharacterSpriteLoader:
         characters = []
         for item in os.listdir(sprites_path):
             char_path = os.path.join(sprites_path, item)
-            if os.path.isdir(char_path):
+            if os.path.isdir(char_path) and item != 'enemies':  # Skip enemies folder
                 characters.append(item)
         return characters
 
@@ -308,6 +444,156 @@ class CharacterSpriteLoader:
         return costumes
 
 
+class EnemySpriteLoader:
+    """Helper to load all animations for an enemy"""
+
+    @staticmethod
+    def load_enemy(enemy_type, variant='default', sprite_width=32, sprite_height=32):
+        """
+        Load enemy sprites with support for two folder structures:
+
+        1. NEW STRUCTURE (direct): assets/sprites/enemies/{enemy_type}/
+           - For enemies like tiger_bandit where sprites are directly in the enemy folder
+           - Files: idle.png, walk.png, attack.png, hurt.png, death.png
+
+        2. OLD STRUCTURE (variants): assets/sprites/enemies/{enemy_type}/variants/{variant}/
+           - For enemies with multiple variants
+           - Each variant folder contains: idle.png, walk.png, attack.png, hurt.png, death.png
+
+        Args:
+            enemy_type: Enemy ID like 'tiger_bandit', 'wolf', 'goblin', etc.
+            variant: Variant name like 'default', 'fire', 'ice', 'elite', etc. (used for old structure)
+            sprite_width: Width of each sprite frame
+            sprite_height: Height of each sprite frame
+        """
+        direct_path = f"assets/sprites/enemies/{enemy_type}"
+
+        if not os.path.exists(direct_path):
+            return None
+
+        # PRIORITY 1: variant subfolder  assets/sprites/enemies/{type}/variants/{variant}/
+        # This lets each variant carry its own spriteset (e.g. shooter/variants/gunner/).
+        variant_path = f"{direct_path}/variants/{variant}"
+        if os.path.exists(variant_path) and any(
+            f.endswith('.png') for f in os.listdir(variant_path)
+            if os.path.isfile(os.path.join(variant_path, f))
+        ):
+            base_path = variant_path
+
+        # PRIORITY 2: sprites placed directly in the enemy folder (no variant subfolders)
+        elif any(
+            f.endswith('.png') for f in os.listdir(direct_path)
+            if os.path.isfile(os.path.join(direct_path, f))
+        ):
+            base_path = direct_path
+
+        else:
+            return None
+
+        # Create sprite with custom base path
+        sprite = AnimatedSprite.__new__(AnimatedSprite)
+        sprite.character_name = enemy_type
+        sprite.costume_name = variant
+        sprite.sprite_width = sprite_width
+        sprite.sprite_height = sprite_height
+        sprite.base_path = base_path
+        sprite.animations = {}
+        sprite.current_animation = None
+        sprite.current_direction = 'down'
+        sprite.offset_x = sprite_width // 2
+        sprite.offset_y = sprite_height // 2
+
+        # Enemy animations (4-directional)
+        animations = [
+            ('idle', 0.3, True, 1),
+            ('walk', 0.15, True, 1),
+            ('attack', 0.1, False, 1),  # Ranged/generic attack animation
+            ('melee', 0.1, False, 1),   # Melee swing animation (melee.png)
+            ('hurt', 0.1, False, 1),
+            ('death', 0.15, False, 1),
+        ]
+
+        for anim_name, duration, loop, num_variants in animations:
+            sprite.load_animation_all_directions(anim_name, duration, loop, num_variants, use_8_directions=False)
+
+        sprite.set_animation('idle', 'down')
+
+        return sprite
+
+    @staticmethod
+    def list_available_enemies():
+        """List all available enemy types"""
+        enemies_path = "assets/sprites/enemies"
+        if not os.path.exists(enemies_path):
+            return []
+
+        enemies = []
+        for item in os.listdir(enemies_path):
+            enemy_path = os.path.join(enemies_path, item)
+            if os.path.isdir(enemy_path):
+                enemies.append(item)
+        return enemies
+
+    @staticmethod
+    def list_available_variants(enemy_type):
+        """List all available variants for an enemy type"""
+        variants_path = f"assets/sprites/enemies/{enemy_type}/variants"
+        if not os.path.exists(variants_path):
+            return []
+
+        variants = []
+        for item in os.listdir(variants_path):
+            variant_path = os.path.join(variants_path, item)
+            if os.path.isdir(variant_path):
+                variants.append(item)
+        return variants
+
+
 def create_character_sprite(character, costume='base', width=32, height=32):
     """Quick function to create a character sprite"""
     return CharacterSpriteLoader.load_character(character, costume, width, height)
+
+
+def create_enemy_sprite(enemy_type, variant='default', width=32, height=32):
+    """Quick function to create an enemy sprite"""
+    return EnemySpriteLoader.load_enemy(enemy_type, variant, width, height)
+
+
+def create_boss_sprite(boss_id, variant='default', width=48, height=48):
+    """
+    Load a boss sprite from assets/sprites/enemies/boss/{boss_id}/.
+
+    Falls back gracefully to a placeholder if the folder doesn't exist yet.
+    """
+    boss_path = f"assets/sprites/enemies/boss/{boss_id}"
+
+    if not os.path.exists(boss_path):
+        return None
+
+    # Reuse AnimatedSprite machinery — just point base_path at the boss folder
+    sprite = AnimatedSprite.__new__(AnimatedSprite)
+    sprite.character_name = boss_id
+    sprite.costume_name = variant
+    sprite.sprite_width = width
+    sprite.sprite_height = height
+    sprite.base_path = boss_path
+    sprite.animations = {}
+    sprite.current_animation = None
+    sprite.current_direction = 'down'
+    sprite.offset_x = width // 2
+    sprite.offset_y = height // 2
+
+    animations = [
+        ('idle',   0.3,  True,  1),
+        ('walk',   0.15, True,  1),
+        ('attack', 0.1,  False, 1),
+        ('melee',  0.1,  False, 1),
+        ('hurt',   0.1,  False, 1),
+        ('death',  0.15, False, 1),
+    ]
+
+    for anim_name, duration, loop, num_variants in animations:
+        sprite.load_animation_all_directions(anim_name, duration, loop, num_variants, use_8_directions=False)
+
+    sprite.set_animation('idle', 'down')
+    return sprite

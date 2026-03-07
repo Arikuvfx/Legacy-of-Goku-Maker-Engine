@@ -9,6 +9,15 @@ from config.settings import RENDER_SCALE
 
 class Player:
     def __init__(self, x, y, character='goku', costume='base', game_config=None):
+        """Create the player at world position (*x*, *y*).
+
+        Args:
+            x, y: Starting world coordinates.
+            character: Character ID used to load the sprite sheet (e.g. 'goku').
+            costume: Costume/variant string passed to the sprite loader.
+            game_config: Optional GameConfig used to initialise the
+                         TransformationSystem and derive stat scaling.
+        """
         self.x = x
         self.y = y
         self.width = 32
@@ -20,7 +29,7 @@ class Player:
         self.max_hp = 100
         self.ki = 100
         self.max_ki = 100
-        self.level = 1
+        self.level = 5
         self.exp = 0
         self.direction = 'down'
         self.inventory = []
@@ -55,6 +64,10 @@ class Player:
         # Sprite system
         self.sprite = create_character_sprite(character, costume, 32, 32)
 
+        # Store character ID and costume for character switching
+        self.character = character
+        self.costume = costume
+
         # Animation state
         self.current_animation_state = 'idle'
 
@@ -78,6 +91,19 @@ class Player:
         self.last_key_press = {}
         self.double_tap_window = 0.3
 
+        # Collision hitbox configuration
+        self.hitbox_width = 10  # Smaller than sprite width (32)
+        self.hitbox_height = 1  # Smaller than sprite height (32)
+
+        # Directional hitbox offsets (relative to center)
+        # These shift the hitbox position based on direction
+        self.hitbox_offsets = {
+            'up': {'x': 0, 'y': 14},  # Shift up slightly when facing up
+            'down': {'x': 0, 'y': 14},  # Shift down slightly when facing down
+            'left': {'x': -2, 'y': 14},  # Shift left slightly when facing left
+            'right': {'x': 2, 'y': 14}  # Shift right slightly when facing right
+        }
+
         # Damage and knockback
         self.is_knocked_back = False
         self.knockback_timer = 0
@@ -100,12 +126,30 @@ class Player:
         # Input tracking
         self.is_q_pressed = False
 
+        # Transition state
+        self.is_transitioning = False
+
+        # Store reference to obstacles for collision checking during knockback
+        self.obstacles = []
+
+        # Store current room dimensions for knockback bounds checking
+        self.current_room_width = WORLD_WIDTH
+        self.current_room_height = WORLD_HEIGHT
+
+        # Boundary knockback tracking for horizontal attacks
+        self.horizontal_boundary_hits = 0  # Counter for collision hits from left/right attacks
+        self.last_knockback_hit_boundary = False  # Track if last knockback hit any collision (boundary or obstacle)
+
     def get_sort_key(self):
-        # Return Y position for proper depth sorting
-        return (self.draw_layer, self.y)
+        """Return draw-layer sort key using feet position for correct depth ordering."""
+        return (self.draw_layer, self.y + self.height // 2)
 
     def can_act(self):
         """Check if player can perform actions (not locked in animation)"""
+        # Can't act during room transitions
+        if hasattr(self, 'is_transitioning') and self.is_transitioning:
+            return False
+
         # Can't act during transformation states
         if self.transformation and not self.transformation.can_player_act():
             return False
@@ -114,9 +158,31 @@ class Player:
 
     def can_move(self):
         """Check if player can move"""
+        # Can't move during room transitions
+        if hasattr(self, 'is_transitioning') and self.is_transitioning:
+            return False
+
         if self.is_collision_knockback:
             return False
         return self.can_act()
+
+    def get_collision_rect(self):
+        """
+        Get the player's collision rectangle with directional offset applied.
+        Returns: pygame.Rect in world coordinates
+        """
+        # Get directional offset
+        offset = self.hitbox_offsets.get(self.direction, {'x': 0, 'y': 0})
+
+        # Calculate hitbox position (centered on player with offset)
+        hitbox_x = self.x + offset['x']
+        hitbox_y = self.y + offset['y']
+
+        # Create rectangle (top-left corner based)
+        left = hitbox_x - self.hitbox_width // 2
+        top = hitbox_y - self.hitbox_height // 2
+
+        return pygame.Rect(left, top, self.hitbox_width, self.hitbox_height)
 
     def start_collision_knockback(self, collision_direction_x, collision_direction_y):
         """
@@ -142,24 +208,39 @@ class Player:
         if not self.can_move():
             return
 
+        # Store current room dimensions for knockback bounds checking
+        self.current_room_width = world_width
+        self.current_room_height = world_height
+
         # Store movement direction for collision detection
         self.last_move_direction['dx'] = dx
         self.last_move_direction['dy'] = dy
 
-        # UPDATE DIRECTION BASED ON MOVEMENT - FIXED VERSION
+        # UPDATE DIRECTION BASED ON MOVEMENT
         if dx != 0 or dy != 0:
-            # Priority: If there's horizontal movement, use horizontal direction
-            if dx != 0:
-                if dx > 0:
-                    self.direction = 'right'
+            if dx != 0 and dy == 0:
+                # Pure horizontal — always update direction
+                self.direction = 'right' if dx > 0 else 'left'
+            elif dy != 0 and dx == 0:
+                # Pure vertical — always update direction
+                self.direction = 'down' if dy > 0 else 'up'
+            elif is_running:
+                # Running diagonally: keep whichever direction is already set so
+                # that adding a perpendicular key doesn't rotate the sprite.
+                pass
+            else:
+                # Walking diagonally (or transitioning from run to walk with a
+                # perpendicular key held): update to the dominant axis so that
+                # e.g. releasing UP while pressing RIGHT correctly faces right,
+                # matching the behaviour of running down→up and running right→left.
+                if abs(dx) >= abs(dy):
+                    self.direction = 'right' if dx > 0 else 'left'
                 else:
-                    self.direction = 'left'
-            # Otherwise use vertical direction
-            elif dy != 0:
-                if dy > 0:
-                    self.direction = 'down'
-                else:
-                    self.direction = 'up'
+                    self.direction = 'down' if dy > 0 else 'up'
+
+        # Keep the attribute in sync so external systems and the next frame
+        # can rely on self.is_running being accurate.
+        self.is_running = is_running
 
         current_speed = self.run_speed if is_running else self.speed
         self.x += dx * current_speed
@@ -171,7 +252,6 @@ class Player:
         anim = 'run' if is_running else 'walk'
         self.sprite.set_animation(anim, self.direction)
         self.current_animation_state = anim
-
 
     def get_current_ki_cost(self):
         """Get Ki cost for attacks (0 if transformed)"""
@@ -286,21 +366,57 @@ class Player:
         self.sprite.set_animation('melee', self.direction)
         self.current_animation_state = 'melee'
 
-        return MeleeAttack(self.x, self.y, self.direction)
+        melee = MeleeAttack(self.x, self.y, self.direction)
+        melee.owner = self
+        return melee
+
+    def check_collision_with_obstacles(self, new_x, new_y):
+        """
+        Check if a position collides with any obstacles.
+        Returns True if collision detected, False otherwise.
+        """
+        # Create temporary rect at new position
+        temp_rect = pygame.Rect(
+            new_x - self.hitbox_width // 2,
+            new_y - self.hitbox_height // 2,
+            self.hitbox_width,
+            self.hitbox_height
+        )
+
+        # Check against all obstacles
+        for obstacle in self.obstacles:
+            if hasattr(obstacle, 'get_collision_rect'):
+                if temp_rect.colliderect(obstacle.get_collision_rect()):
+                    return True
+
+        return False
 
     def update(self, dt):
 
-        # Handle collision knockback
+        # Handle collision knockback WITH COLLISION CHECKING
         if self.is_collision_knockback:
             self.collision_knockback_timer -= dt
 
-            # Apply knockback velocity
-            self.x += self.collision_knockback_velocity_x * dt
-            self.y += self.collision_knockback_velocity_y * dt
+            # Calculate new position
+            new_x = self.x + self.collision_knockback_velocity_x * dt
+            new_y = self.y + self.collision_knockback_velocity_y * dt
 
-            # Clamp to world bounds
-            self.x = max(self.width // 2, min(self.x, WORLD_WIDTH - self.width // 2))
-            self.y = max(self.height // 2, min(self.y, WORLD_HEIGHT - self.height // 2))
+            # Check for collisions and only move if no collision
+            if not self.check_collision_with_obstacles(new_x, self.y):
+                self.x = new_x
+            else:
+                # Stop horizontal knockback if collision detected
+                self.collision_knockback_velocity_x = 0
+
+            if not self.check_collision_with_obstacles(self.x, new_y):
+                self.y = new_y
+            else:
+                # Stop vertical knockback if collision detected
+                self.collision_knockback_velocity_y = 0
+
+            # Clamp to ROOM bounds (not global WORLD bounds)
+            self.x = max(self.width // 2, min(self.x, self.current_room_width - self.width // 2))
+            self.y = max(self.height // 2, min(self.y, self.current_room_height - self.height // 2))
 
             # Reduce velocity over time (friction)
             self.collision_knockback_velocity_x *= 0.85
@@ -316,33 +432,50 @@ class Player:
                 self.current_animation_state = 'idle'
                 return  # Skip rest of update during transition
 
-        # Handle regular knockback (damage-based)
+        # Handle regular knockback (damage-based) WITH COLLISION CHECKING
         if self.is_knocked_back:
             self.knockback_timer -= dt
 
-            self.x += self.knockback_velocity_x * dt
-            self.y += self.knockback_velocity_y * dt
+            # Store old position to check if we hit a boundary or obstacle
+            old_x = self.x
+            old_y = self.y
 
-            self.x = max(self.width // 2, min(self.x, WORLD_WIDTH - self.width // 2))
-            self.y = max(self.height // 2, min(self.y, WORLD_HEIGHT - self.height // 2))
+            # Calculate new position
+            new_x = self.x + self.knockback_velocity_x * dt
+            new_y = self.y + self.knockback_velocity_y * dt
 
-            self.knockback_velocity_x *= 0.85
-            self.knockback_velocity_y *= 0.85
+            # Track if we hit any collision (obstacle or boundary)
+            hit_collision = False
 
-            if self.knockback_timer <= 0:
-                self.is_knocked_back = False
+            # Check for collisions and only move if no collision
+            if not self.check_collision_with_obstacles(new_x, self.y):
+                self.x = new_x
+            else:
+                # Stop horizontal knockback if collision detected
                 self.knockback_velocity_x = 0
+                hit_collision = True
+
+            if not self.check_collision_with_obstacles(self.x, new_y):
+                self.y = new_y
+            else:
+                # Stop vertical knockback if collision detected
                 self.knockback_velocity_y = 0
+                hit_collision = True
 
-        # Handle knockback
-        if self.is_knocked_back:
-            self.knockback_timer -= dt
+            # Clamp to ROOM bounds (not global WORLD bounds)
+            new_x_clamped = max(self.width // 2, min(self.x, self.current_room_width - self.width // 2))
+            new_y_clamped = max(self.height // 2, min(self.y, self.current_room_height - self.height // 2))
 
-            self.x += self.knockback_velocity_x * dt
-            self.y += self.knockback_velocity_y * dt
+            # Check if we hit a boundary (position was clamped)
+            if (new_x_clamped != self.x) or (new_y_clamped != self.y):
+                hit_collision = True
 
-            self.x = max(self.width // 2, min(self.x, WORLD_WIDTH - self.width // 2))
-            self.y = max(self.height // 2, min(self.y, WORLD_HEIGHT - self.height // 2))
+            # Apply clamped position
+            self.x = new_x_clamped
+            self.y = new_y_clamped
+
+            # Track if this knockback hit any collision (boundary or obstacle)
+            self.last_knockback_hit_boundary = hit_collision
 
             self.knockback_velocity_x *= 0.85
             self.knockback_velocity_y *= 0.85
@@ -395,6 +528,14 @@ class Player:
 
                 self.sprite.set_animation('idle', self.direction)
                 self.current_animation_state = 'idle'
+
+        # Check if hurt animation finished
+        elif self.current_animation_state == 'hurt':
+            if self.sprite.is_animation_finished():
+                # Only transition to idle if not knocked back anymore
+                if not self.is_knocked_back and not self.is_collision_knockback:
+                    self.sprite.set_animation('idle', self.direction)
+                    self.current_animation_state = 'idle'
 
         # Check if charge animation should continue
         elif self.current_animation_state == 'charge':
@@ -450,8 +591,8 @@ class Player:
         self.last_key_press[key] = current_time
         return False
 
-    def take_damage(self, damage, knockback_x, knockback_y):
-        if self.invulnerable:
+    def take_damage(self, damage, knockback_x, knockback_y, ignore_invulnerability=False, no_knockback=False):
+        if self.invulnerable and not ignore_invulnerability:
             return
 
         # If transforming or untransforming, interrupt the animation
@@ -467,13 +608,49 @@ class Player:
         if self.hp < 0:
             self.hp = 0
 
+        if no_knockback:
+            # No physical displacement, no animation interrupt — only the red tint
+            # (set by the caller) signals the hit. Just apply invulnerability frames.
+            self.invulnerable = True
+            self.invulnerable_timer = self.invulnerable_duration
+            return
+
+        # Determine if this is a horizontal attack (left/right dominant)
+        is_horizontal_attack = abs(knockback_x) > abs(knockback_y)
+
+        # Track boundary hits from horizontal attacks
+        if is_horizontal_attack and hasattr(self, 'last_knockback_hit_boundary'):
+            if self.last_knockback_hit_boundary:
+                self.horizontal_boundary_hits += 1
+
+            # After 4 boundary hits from horizontal attacks, convert the 5th to vertical
+            if self.horizontal_boundary_hits >= 3:
+                # Convert horizontal knockback to vertical (from above)
+                knockback_x = 0.0
+                knockback_y = 1.0  # Push downward (as if attacked from above)
+                # Reset counter after applying the special attack
+                self.horizontal_boundary_hits = 0
+        else:
+            # Reset counter if hit from vertical direction
+            if not is_horizontal_attack:
+                self.horizontal_boundary_hits = 0
+
         self.is_knocked_back = True
         self.knockback_timer = self.knockback_duration
-        self.knockback_velocity_x = knockback_x * 300
-        self.knockback_velocity_y = knockback_y * 300
+        self.knockback_velocity_x = knockback_x * 190
+        self.knockback_velocity_y = knockback_y * 190
 
         self.invulnerable = True
         self.invulnerable_timer = self.invulnerable_duration
+
+        # Update direction to face opposite of knockback (toward the enemy)
+        # Since knockback pushes away from enemy, we face opposite to knockback direction
+        if abs(knockback_x) > abs(knockback_y):
+            # Horizontal knockback is dominant
+            self.direction = 'right' if knockback_x < 0 else 'left'
+        else:
+            # Vertical knockback is dominant
+            self.direction = 'down' if knockback_y < 0 else 'up'
 
         # Cancel any ongoing attacks
         self.is_attacking = False
@@ -526,7 +703,7 @@ class Player:
         screen_y = (self.y * RENDER_SCALE) - camera.y
 
         indicator_color = colors['RED'] if (self.is_attacking or self.is_charging_beam or self.is_firing_beam) else \
-        colors['YELLOW']
+            colors['YELLOW']
 
         # Direction indicator positions (scaled)
         offset = (self.height // 2) * RENDER_SCALE

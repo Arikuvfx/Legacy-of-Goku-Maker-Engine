@@ -30,12 +30,12 @@ class DevMenu:
         self._load_assets()
 
         # Menu state
-        self.current_menu = 'main'  # main, spawn, config, xp_config, room_editor
-        self.selected_index = 0
+        self.current_menu = 'main'  # main, config, xp_config, room_editor
+        self.selected_index = -1  # Start with nothing selected (mouse or keyboard will set this)
+        self.hover_index = -1  # Track which item mouse is hovering over
 
         # Main menu options - ADDED SPRITE EDITOR
         self.main_options = [
-            {'id': 'spawn_menu', 'label': 'SPAWN MENU', 'icon': 'spawn'},
             {'id': 'room_editor', 'label': 'ROOM EDITOR', 'icon': 'room'},
             {'id': 'sprite_editor', 'label': 'SPRITE EDITOR', 'icon': 'sprite'},
             {'id': 'config', 'label': 'CONFIGURATION', 'icon': 'config'},
@@ -67,6 +67,9 @@ class DevMenu:
         self.anim_timer = 0
         self.cursor_blink = 0
         self.icon_bob_offset = [0.0] * 10  # Bob offsets for each menu option
+
+        # Mouse interaction - store clickable rectangles
+        self.clickable_rects = []
 
     def _load_assets(self):
         """Load all sprite assets and fonts"""
@@ -103,9 +106,6 @@ class DevMenu:
         # Load or create UI elements
         self._load_ui_elements()
 
-        print(f"✓ Dev Menu assets loaded from: {self.assets_path}")
-        print(f"✓ Icons loaded from: {self.icons_path}")
-
     def _create_gradient_background(self):
         """Create a default gradient background if sprite not found"""
         bg = pygame.Surface((self.screen_width, self.screen_height))
@@ -136,13 +136,13 @@ class DevMenu:
             # Create wider versions for longer text
             self.selection_box_medium = pygame.transform.scale(self.selection_box, (500, 60))
             self.selection_box_wide = pygame.transform.scale(self.selection_box, (550, 60))
-            self.selection_box_xwide = pygame.transform.scale(self.selection_box, (600, 60))  # NEW: Extra wide
+            self.selection_box_xwide = pygame.transform.scale(self.selection_box, (600, 60))
         else:
             # Create default selection boxes of different widths
-            self.selection_box = self._create_selection_box(450)  # Increased from 400
+            self.selection_box = self._create_selection_box(450)
             self.selection_box_medium = self._create_selection_box(500)
             self.selection_box_wide = self._create_selection_box(550)
-            self.selection_box_xwide = self._create_selection_box(600)  # NEW: Extra wide
+            self.selection_box_xwide = self._create_selection_box(600)
 
         # Load icons from PNG files
         self._load_icons()
@@ -167,11 +167,10 @@ class DevMenu:
         self.icons = {}
 
         # All icon types used in the menus
-        icon_types = ['spawn', 'room', 'sprite', 'config', 'close', 'xp', 'transform', 'back']
+        icon_types = ['room', 'sprite', 'config', 'close', 'xp', 'transform', 'back']
 
         # Fallback colors if PNG files are not found
         icon_colors = {
-            'spawn': (255, 100, 100),
             'room': (100, 255, 100),
             'sprite': (100, 200, 255),
             'config': (100, 100, 255),
@@ -183,14 +182,10 @@ class DevMenu:
 
         # Create icons directory if it doesn't exist
         if not os.path.exists(self.icons_path):
-            print(f"⚠ Icons directory not found: {self.icons_path}")
-            print("Creating directory for custom icons...")
             try:
                 os.makedirs(self.icons_path, exist_ok=True)
-                print(f"✓ Created icons directory: {self.icons_path}")
-                print("Please add your custom PNG icons to this directory.")
-            except:
-                print("✗ Failed to create icons directory")
+            except Exception:
+                pass
 
         # Load or create each icon
         for icon_type in icon_types:
@@ -210,23 +205,20 @@ class DevMenu:
                         icon = pygame.image.load(icon_path).convert_alpha()
                         # Scale to standard size (32x32)
                         self.icons[icon_type] = pygame.transform.scale(icon, (32, 32))
-                        print(f"  ✓ Loaded icon: {filename}")
                         icon_loaded = True
                         break
-                    except Exception as e:
-                        print(f"  ✗ Failed to load icon {filename}: {e}")
+                    except Exception:
+                        pass
 
             # Create simple colored circle as fallback
             if not icon_loaded:
-                print(f"  ⚠ No PNG found for '{icon_type}', using fallback circle")
                 self.icons[icon_type] = self._create_icon(icon_colors.get(icon_type, (255, 255, 255)))
 
                 # Save the fallback icon as PNG for future use
                 try:
                     fallback_path = os.path.join(self.icons_path, f"{icon_type}_fallback.png")
                     pygame.image.save(self.icons[icon_type], fallback_path)
-                    print(f"  💾 Saved fallback icon: {fallback_path}")
-                except:
+                except Exception:
                     pass
 
     def _create_icon(self, color):
@@ -241,19 +233,18 @@ class DevMenu:
         self.active = not self.active
         if self.active:
             self.current_menu = 'main'
-            self.selected_index = 0
+            self.selected_index = -1  # Start with nothing selected (only mouse hover will highlight)
+            self.hover_index = -1
             self.editing_text = False
             self.icon_bob_offset = [0.0] * 10  # Reset bob animation
 
-            # Switch to menu music IMMEDIATELY (stop other music)
+            # Switch to menu music immediately (stop other music)
             if self.sound_manager:
                 self.previous_context = self.sound_manager.get_current_context()
-                print(f"🎵 Opening dev menu, previous context was: {self.previous_context}")
                 self.sound_manager.set_context_immediate('menu')
         else:
             # Restore previous music context
             if self.sound_manager:
-                print(f"🎵 Closing dev menu, restoring to: {self.previous_context}")
                 if self.previous_context:
                     self.sound_manager.set_context(self.previous_context, force=True)
                 else:
@@ -287,7 +278,25 @@ class DevMenu:
                         self.text_input += event.unicode
             return None
 
-        # Handle menu navigation
+        # Handle mouse clicks
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            mouse_pos = event.pos
+            for clickable in self.clickable_rects:
+                if clickable['rect'].collidepoint(mouse_pos):
+                    # Click on menu item - select and execute
+                    self.selected_index = clickable['index']
+                    return self._handle_selection()
+
+        # Handle mouse motion for hover effects
+        if event.type == pygame.MOUSEMOTION:
+            mouse_pos = event.pos
+            self.hover_index = -1
+            for clickable in self.clickable_rects:
+                if clickable['rect'].collidepoint(mouse_pos):
+                    self.hover_index = clickable['index']
+                    break
+
+        # Handle menu navigation (keyboard)
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
                 if self.current_menu == 'main':
@@ -299,11 +308,21 @@ class DevMenu:
             options = self._get_current_options()
 
             if event.key == pygame.K_UP or event.key == pygame.K_w:
-                self.selected_index = (self.selected_index - 1) % len(options)
+                # If nothing selected yet, start at the last item
+                if self.selected_index == -1:
+                    self.selected_index = len(options) - 1
+                else:
+                    self.selected_index = (self.selected_index - 1) % len(options)
             elif event.key == pygame.K_DOWN or event.key == pygame.K_s:
-                self.selected_index = (self.selected_index + 1) % len(options)
+                # If nothing selected yet, start at the first item
+                if self.selected_index == -1:
+                    self.selected_index = 0
+                else:
+                    self.selected_index = (self.selected_index + 1) % len(options)
             elif event.key == pygame.K_RETURN or event.key == pygame.K_SPACE:
-                return self._handle_selection()
+                # Only handle selection if something is actually selected
+                if self.selected_index != -1:
+                    return self._handle_selection()
 
         return None
 
@@ -320,29 +339,29 @@ class DevMenu:
     def _handle_selection(self):
         """Handle menu item selection"""
         options = self._get_current_options()
-        if self.selected_index >= len(options):
+        if self.selected_index >= len(options) or self.selected_index < 0:
             return None
 
         selected = options[self.selected_index]
         option_id = selected['id']
 
         if self.current_menu == 'main':
-            if option_id == 'spawn_menu':
-                return 'open_spawn_menu'
-            elif option_id == 'room_editor':
+            if option_id == 'room_editor':
                 return 'open_room_editor'
             elif option_id == 'sprite_editor':
                 return 'open_sprite_editor'
             elif option_id == 'config':
                 self.current_menu = 'config'
-                self.selected_index = 0
+                self.selected_index = -1  # Reset to no selection
+                self.hover_index = -1
             elif option_id == 'close':
                 self.active = False
 
         elif self.current_menu == 'config':
             if option_id == 'xp_config':
                 self.current_menu = 'xp_config'
-                self.selected_index = 0
+                self.selected_index = -1  # Reset to no selection
+                self.hover_index = -1
             elif option_id == 'transformation_config':
                 pass
             elif option_id == 'back':
@@ -364,7 +383,8 @@ class DevMenu:
             self.current_menu = 'config'
         elif self.current_menu == 'config':
             self.current_menu = 'main'
-        self.selected_index = 0
+        self.selected_index = -1  # Reset to no selection
+        self.hover_index = -1
 
     def update(self, dt):
         """Update animations"""
@@ -374,11 +394,11 @@ class DevMenu:
         self.anim_timer += dt
         self.cursor_blink += dt
 
-        # Update icon bobbing animation for selected item
+        # Update icon bobbing animation for selected or hovered item
         options = self._get_current_options()
         for i in range(len(options)):
-            if i == self.selected_index:
-                # Bob selected icon with smooth sine wave
+            if i == self.selected_index or i == self.hover_index:
+                # Bob selected/hovered icon with smooth sine wave
                 self.icon_bob_offset[i] = math.sin(self.anim_timer * 3) * 5
             else:
                 # Reset unselected icons
@@ -394,6 +414,9 @@ class DevMenu:
         """Draw the dev menu"""
         if not self.active:
             return
+
+        # Clear clickable rects at start of each frame
+        self.clickable_rects = []
 
         # Draw semi-transparent overlay
         overlay = pygame.Surface((self.screen_width, self.screen_height), pygame.SRCALPHA)
@@ -425,9 +448,13 @@ class DevMenu:
         for i, option in enumerate(options):
             y_pos = start_y + i * spacing
             is_selected = (i == self.selected_index)
+            is_hovered = (i == self.hover_index)
 
-            # Draw selection box if selected
-            if is_selected:
+            # Highlight if selected OR hovered
+            is_highlighted = is_selected or is_hovered
+
+            # Draw selection box if highlighted
+            if is_highlighted:
                 # Determine which selection box to use based on label length
                 label = option['label']
                 if 'value_key' in option:
@@ -457,10 +484,21 @@ class DevMenu:
                 pulse = abs(int((self.anim_timer * 2) % 2 - 1) * 10)
                 screen.blit(selection_box, (box_x - pulse, y_pos - pulse // 2))
 
-            # Draw icon with bobbing animation for selected item
+                # Store clickable rectangle for mouse interaction
+                clickable_rect = pygame.Rect(box_x, y_pos, box_width, 60)
+                self.clickable_rects.append({'rect': clickable_rect, 'index': i})
+            else:
+                # Even non-highlighted items should be clickable
+                # Calculate approximate box size
+                box_width = 450
+                box_x = (self.screen_width - box_width) // 2
+                clickable_rect = pygame.Rect(box_x, y_pos, box_width, 60)
+                self.clickable_rects.append({'rect': clickable_rect, 'index': i})
+
+            # Draw icon with bobbing animation for highlighted item
             if 'icon' in option and option['icon'] in self.icons:
                 # Use appropriate x position based on selected box width
-                if is_selected:
+                if is_highlighted:
                     label = option['label']
                     if 'value_key' in option:
                         value = getattr(self.config, option['value_key'], '?')
@@ -484,8 +522,8 @@ class DevMenu:
                 icon_x = (self.screen_width - box_width) // 2 + 20
                 icon_y = y_pos + 10 + int(self.icon_bob_offset[i])
 
-                # Add glow effect to selected icon
-                if is_selected:
+                # Add glow effect to highlighted icon
+                if is_highlighted:
                     glow_size = 40
                     glow_surface = pygame.Surface((glow_size, glow_size), pygame.SRCALPHA)
                     glow_alpha = int(100 + 50 * math.sin(self.anim_timer * 4))
@@ -504,15 +542,15 @@ class DevMenu:
                 value = getattr(self.config, option['value_key'], '?')
                 label = f"{label}: {value}"
 
-            color = (255, 255, 255) if is_selected else (180, 180, 180)
-            font = self.font_large if is_selected else self.font_medium
+            color = (255, 255, 255) if is_highlighted else (180, 180, 180)
+            font = self.font_large if is_highlighted else self.font_medium
 
             # Render label text
             label_surf = font.render(label, True, color)
             label_shadow = font.render(label, True, (0, 0, 0))
 
             # Calculate position based on current box width
-            if is_selected:
+            if is_highlighted:
                 # Recalculate box width for positioning
                 test_label = option['label']
                 if 'value_key' in option:
@@ -553,8 +591,8 @@ class DevMenu:
                 # Draw main text
                 screen.blit(scaled_surf, (label_x, label_y))
 
-                # Add subtle text glow effect for selected item
-                if is_selected:
+                # Add subtle text glow effect for highlighted item
+                if is_highlighted:
                     glow_surf = font.render(label, True, (255, 215, 0, 50))
                     scaled_glow = pygame.transform.scale(glow_surf, (scaled_width, scaled_height))
                     screen.blit(scaled_glow, (label_x, label_y))
@@ -564,8 +602,8 @@ class DevMenu:
                 # Draw main text
                 screen.blit(label_surf, (label_x, label_y))
 
-                # Add subtle text glow effect for selected item
-                if is_selected:
+                # Add subtle text glow effect for highlighted item
+                if is_highlighted:
                     glow_surf = font.render(label, True, (255, 215, 0, 50))
                     screen.blit(glow_surf, (label_x, label_y))
 
@@ -581,7 +619,7 @@ class DevMenu:
         screen.blit(overlay, (0, 0))
 
         # Input box
-        box_width = 600  # Made even wider for better fit
+        box_width = 600
         box_height = 120
         box_x = (self.screen_width - box_width) // 2
         box_y = (self.screen_height - box_height) // 2
@@ -623,5 +661,3 @@ class DevMenu:
             'room_editor': 'ROOM EDITOR'
         }
         return titles.get(self.current_menu, 'DEV MENU')
-
-

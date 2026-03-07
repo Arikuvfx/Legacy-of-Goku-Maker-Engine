@@ -22,23 +22,14 @@ class CollisionObject:
 
     def check_collision_with_player(self, player) -> bool:
         """Check if player collides with this collision wall"""
-        # Player collision box
-        player_left = player.x - player.width // 2
-        player_right = player.x + player.width // 2
-        player_top = player.y - player.height // 2
-        player_bottom = player.y + player.height // 2
+        # Get player's directional hitbox
+        player_rect = player.get_collision_rect()
 
         # Collision wall box
-        wall_left = self.x
-        wall_right = self.x + self.width
-        wall_top = self.y
-        wall_bottom = self.y + self.height
+        wall_rect = pygame.Rect(self.x, self.y, self.width, self.height)
 
         # AABB collision detection
-        return (player_right > wall_left and
-                player_left < wall_right and
-                player_bottom > wall_top and
-                player_top < wall_bottom)
+        return player_rect.colliderect(wall_rect)
 
     def get_rect(self) -> pygame.Rect:
         """Get pygame Rect for this collision object"""

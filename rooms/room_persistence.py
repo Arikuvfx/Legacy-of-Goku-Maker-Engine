@@ -32,7 +32,9 @@ class RoomPersistence:
                 'tiles': self._serialize_tiles(room),
                 'collision_objects': self._serialize_collision_objects(room),
                 'destructible_stones': self._serialize_destructible_stones(room),
-                'room_transitions': self._serialize_room_transitions(room)
+                'room_transitions': self._serialize_room_transitions(room),
+                'level_gates': self._serialize_level_gates(room),
+                'entities': self._serialize_entities(room)  # ADD THIS LINE
             }
 
             filepath = self._get_room_filepath(room.name)
@@ -41,7 +43,8 @@ class RoomPersistence:
 
             return True
 
-        except Exception:
+        except Exception as e:
+            print(f"Error saving room {room.name}: {e}")
             return False
 
     def load_room(self, room_name):
@@ -110,6 +113,24 @@ class RoomPersistence:
             'collision_type': getattr(obj, 'collision_type', 'wall')
         } for obj in room.collision_objects]
 
+    def _serialize_level_gates(self, room):
+        """Convert level gates to JSON-friendly format"""
+        if not hasattr(room, 'level_gates') or not room.level_gates:
+            return []
+
+        return [{
+            'x': gate.x,
+            'y': gate.y,
+            'gate_type': gate.gate_type,
+            'required_level': gate.required_level,
+            'max_health': gate.max_health,
+            'health': gate.health,
+            'width': gate.width,
+            'height': gate.height,
+            'active': gate.active,
+            'is_unlocked': getattr(gate, 'is_unlocked', False)  # Save unlocked state for metal gates
+        } for gate in room.level_gates]
+
     def _serialize_spawn_points(self, room):
         """Convert spawn points to JSON-friendly format
 
@@ -174,6 +195,41 @@ class RoomPersistence:
             'spawn_y': transition.spawn_y
         } for transition in room.room_transitions]
 
+    def _serialize_entities(self, room):
+        """Convert entities (NPCs, Enemies, Bosses) to JSON-friendly format"""
+        if not hasattr(room, 'entities') or not room.entities:
+            return []
+
+        serialized = []
+        for entity in room.entities:
+            # Entity data is already a dict from the entity editor
+            # Just ensure we have all required fields
+            entity_dict = {
+                'id': entity.get('id', 'unknown'),
+                'name': entity.get('name', 'Unknown Entity'),
+                'entity_type': entity.get('entity_type', 'enemy'),
+                'x': entity.get('x', 0),
+                'y': entity.get('y', 0),
+                'width': entity.get('width', 32),
+                'height': entity.get('height', 32),
+            }
+
+            # Include variant information if present
+            if entity.get('variant_type'):
+                entity_dict['variant_type'] = entity['variant_type']
+            if entity.get('variant_name'):
+                entity_dict['variant_name'] = entity['variant_name']
+            if entity.get('variant_color'):
+                entity_dict['variant_color'] = list(entity['variant_color'])  # JSON needs list not tuple
+            if entity.get('ai_type'):
+                entity_dict['ai_type'] = entity['ai_type']
+            if entity.get('enemy_category'):
+                entity_dict['enemy_category'] = entity['enemy_category']
+
+            serialized.append(entity_dict)
+
+        return serialized
+
     # Deserialization helpers - convert dicts back to objects
 
     def deserialize_tiles(self, tiles_data):
@@ -206,6 +262,29 @@ class RoomPersistence:
             collision_objects.append(obj)
 
         return collision_objects
+
+    def deserialize_level_gates(self, gates_data):
+        """Rebuild level gate objects from JSON data"""
+        from objects.level_gate import LevelGate
+
+        gates = []
+        for gate_dict in gates_data:
+            gate = LevelGate(
+                x=gate_dict['x'],
+                y=gate_dict['y'],
+                gate_type=gate_dict['gate_type'],
+                required_level=gate_dict.get('required_level', 1)
+            )
+            # Restore saved health values
+            if 'max_health' in gate_dict:
+                gate.max_health = gate_dict['max_health']
+                gate.health = gate_dict.get('health', gate_dict['max_health'])
+            # Restore unlocked state for metal gates
+            if 'is_unlocked' in gate_dict:
+                gate.is_unlocked = gate_dict['is_unlocked']
+            gates.append(gate)
+
+        return gates
 
     def deserialize_spawn_points(self, spawn_data):
         """Rebuild spawn point objects from JSON data"""
@@ -266,6 +345,19 @@ class RoomPersistence:
             transitions.append(transition)
 
         return transitions
+
+    def deserialize_entities(self, entities_data):
+        """Rebuild entity data from JSON
+
+        Note: This returns entity data dicts, not actual Enemy/NPC instances.
+        The game is responsible for creating the actual instances from this data.
+        """
+        if not entities_data:
+            return []
+
+        # Entity data is already in dict format, just return it
+        # This preserves all the metadata from the entity editor
+        return entities_data
 
 
 class RoomManagerWithPersistence:
@@ -364,6 +456,18 @@ class RoomManagerWithPersistence:
         room.room_transitions = (
             self.persistence.deserialize_room_transitions(room_data['room_transitions'])
             if room_data.get('room_transitions') else []
+        )
+
+        # Restore level gates
+        room.level_gates = (
+            self.persistence.deserialize_level_gates(room_data['level_gates'])
+            if room_data.get('level_gates') else []
+        )
+
+        # Restore entities (NPCs, Enemies, Bosses)
+        room.entities = (
+            self.persistence.deserialize_entities(room_data['entities'])
+            if room_data.get('entities') else []
         )
 
         # Add to our room list or update existing

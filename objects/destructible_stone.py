@@ -17,17 +17,17 @@ class DestructibleStone:
             self.max_health = 1
             self.width = 16
             self.height = 16
-            self.sprite_path = 'assets/objects/small_stone.png'
+            self.sprite_path = 'assets/objects/stones/small_stone.png'
         elif stone_type == 'medium':
             self.max_health = 2
             self.width = 24
             self.height = 24
-            self.sprite_path = 'assets/objects/medium_stone.png'
+            self.sprite_path = 'assets/objects/stones/medium_stone.png'
         elif stone_type == 'big':
             self.max_health = 3
             self.width = 32
             self.height = 32
-            self.sprite_path = 'assets/objects/big_stone.png'
+            self.sprite_path = 'assets/objects/stones/big_stone.png'
 
         self.health = self.max_health
 
@@ -92,7 +92,6 @@ class DestructibleStone:
                 self.destruction_frames.append(frame_surface)
 
         except:
-            print(f"Warning: Could not load destruction animation, creating placeholder")
             # Create placeholder destruction animation (simple fade frames)
             for i in range(6):  # 6 frame animation
                 frame = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
@@ -350,10 +349,15 @@ class DestructibleStone:
         if not self.active or not self.solid:
             return False
 
-        # Simple circle collision (in world coordinates)
-        dx = player.x - self.x
-        dy = player.y - self.y
-        distance = math.sqrt(dx * dx + dy * dy)
+        # Get player's hitbox
+        player_rect = player.get_collision_rect()
 
-        collision_radius = (self.width + player.width) // 3
-        return distance < collision_radius
+        # Stone hitbox (centered circle approximated as rect)
+        stone_rect = pygame.Rect(
+            self.x - self.width // 2,
+            self.y - self.height // 2,
+            self.width,
+            self.height
+        )
+
+        return player_rect.colliderect(stone_rect)
