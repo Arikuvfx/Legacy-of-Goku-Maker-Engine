@@ -279,8 +279,12 @@ class Enemy:
                     self.direction = 'down' if dy > 0 else 'up'
 
     def get_sort_key(self):
-        """Return the draw-layer sort key used by the layer manager."""
-        return (self.draw_layer, self.y)
+        """Return draw-layer sort key using feet position for correct depth ordering.
+
+        Sorts by self.y + height//2 (bottom edge of sprite) so depth ordering
+        is consistent with the player, which also sorts by feet.
+        """
+        return (self.draw_layer, self.y + self.height // 2)
 
     def distance_to(self, x, y):
         """Return Euclidean distance from this enemy's centre to (*x*, *y*)."""
