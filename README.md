@@ -5,12 +5,14 @@ Version 0.0.6 - Hotfix
 
 ```
 Changes/Additions:
-
+- QoL additions for the room editor menu.
 
 
 
 Major Bugfixes:
-- Hotfixes.
+- Crash when using flying pads fixed.
+- resolution scaling fixed.
+- enemies spawned in objects results in them being stuck fixed.
 ```
 
 Version 0.0.6
