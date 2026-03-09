@@ -157,8 +157,26 @@ class Game:
     # ── Initialisation helpers ────────────────────────────────────────────────
 
     def _create_default_room(self):
-        """Create and activate the initial room when the game starts."""
-        room = self.room_manager.create_room("Default Room", WORLD_WIDTH, WORLD_HEIGHT, "Default")
+        """Activate the initial room when the game starts.
+
+        If rooms were already loaded from disk, use the first one so no data
+        is overwritten.  Only create a fresh room when there is nothing saved
+        yet, and mark it transient so it is never persisted or shown in the
+        editor.
+        """
+        if self.room_manager.rooms:
+            # Prefer the first real (non-transient) room loaded from disk.
+            room = next(
+                (r for r in self.room_manager.rooms
+                 if not getattr(r, 'is_transient', False)),
+                self.room_manager.rooms[0]
+            )
+        else:
+            # No saved rooms yet — create a temporary fallback.
+            room = self.room_manager.create_transient_room(
+                "Default Room", WORLD_WIDTH, WORLD_HEIGHT, "Default"
+            )
+
         self.room_manager.current_room = room
         self.current_room = room
 
@@ -329,6 +347,10 @@ class Game:
           3. Flying pad — begin the flying sequence.
           4. Default — perform a melee attack.
         """
+        # Ignore all E-key interactions while the flying sequence is in progress.
+        if self.flying_controller.is_active():
+            return
+
         if self.nearby_save_point and not self.dialogue_box.active and not self.save_point_menu.active:
             if self.nearby_save_point.variant == 'big':
                 self.save_point_menu.open()
@@ -758,6 +780,64 @@ class Game:
             wall.is_room_boundary  = True
             self.collision_objects.append(wall)
 
+    def _push_out_of_obstacles(self, entity, obstacles, max_iterations=20):
+        """
+        Fail-safe 2: If *entity* is spawned inside a solid obstacle, nudge it
+        outward until it no longer overlaps.  Tries up to *max_iterations*
+        directions/distances so it always resolves even in tight corners.
+        Does nothing if there is no overlap.
+        """
+        import pygame
+
+        def get_entity_rect(e):
+            return pygame.Rect(e.x - e.width // 2, e.y - e.height // 2, e.width, e.height)
+
+        def get_obstacle_rect(obs):
+            if not getattr(obs, 'active', True):
+                return None
+            if hasattr(obs, 'id') and obs.id == 'collision_wall':
+                return pygame.Rect(obs.x, obs.y, obs.width, obs.height)
+            if hasattr(obs, 'solid') and not obs.solid:
+                return None
+            if hasattr(obs, 'get_rect'):
+                return obs.get_rect()
+            if hasattr(obs, 'x') and hasattr(obs, 'width'):
+                return pygame.Rect(
+                    obs.x - obs.width // 2,
+                    obs.y - obs.height // 2,
+                    obs.width, obs.height,
+                )
+            return None
+
+        for _ in range(max_iterations):
+            ent_rect = get_entity_rect(entity)
+            pushed = False
+            for obs in obstacles:
+                obs_rect = get_obstacle_rect(obs)
+                if obs_rect is None or not ent_rect.colliderect(obs_rect):
+                    continue
+                # Calculate overlap on each axis and push along the smallest one
+                overlap_left  = ent_rect.right  - obs_rect.left
+                overlap_right = obs_rect.right  - ent_rect.left
+                overlap_up    = ent_rect.bottom - obs_rect.top
+                overlap_down  = obs_rect.bottom - ent_rect.top
+
+                min_overlap = min(overlap_left, overlap_right, overlap_up, overlap_down)
+                if min_overlap == overlap_left:
+                    entity.x -= overlap_left + 1
+                elif min_overlap == overlap_right:
+                    entity.x += overlap_right + 1
+                elif min_overlap == overlap_up:
+                    entity.y -= overlap_up + 1
+                else:
+                    entity.y += overlap_down + 1
+
+                pushed = True
+                break  # re-check all obstacles after each nudge
+
+            if not pushed:
+                break  # fully clear
+
     def _spawn_room_entities(self, room):
         """
         Instantiate enemies and NPCs from the room's entity data.
@@ -775,6 +855,14 @@ class Game:
         from entities.boss_enemy import BossEnemy
         from entities.npc import NPC
 
+        # Build obstacle list for spawn-time collision resolution (Fail-safe 2)
+        spawn_obstacles = (
+            self.collision_objects
+            + self.destructible_stones
+            + self.level_gates
+            + self.room_transitions
+        )
+
         for data in room.entities:
             entity_type  = data.get('entity_type', 'enemy')
             x            = data.get('x', 0)
@@ -790,6 +878,7 @@ class Game:
             elif entity_type == 'boss':
                 boss        = BossEnemy(x, y, boss_id=enemy_id, variant=variant_type)
                 boss.active = True
+                self._push_out_of_obstacles(boss, spawn_obstacles)
                 self.enemies.append(boss)
 
             elif entity_type == 'enemy':
@@ -807,6 +896,7 @@ class Game:
                                      ai_type=ai_type, enemy_category=enemy_category,
                                      shooter_style=shooter_style)
                 enemy.active = True
+                self._push_out_of_obstacles(enemy, spawn_obstacles)
                 self.enemies.append(enemy)
 
     def _assign_obstacles(self):

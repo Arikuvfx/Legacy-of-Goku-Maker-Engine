@@ -393,13 +393,29 @@ class RoomManagerWithPersistence:
         self.persistence.save_room(room)
         return room
 
+    def create_transient_room(self, name, width, height, group="Default"):
+        """Create a room that is never saved to disk and hidden from the editor.
+
+        Used as a startup fallback so there is always an active room when no
+        saved rooms exist yet.  The room will not appear in the room editor
+        list and will not be written to disk on cleanup.
+        """
+        from rooms.room import Room
+
+        room = Room(name, width, height, group)
+        room.is_transient = True
+        self.rooms.append(room)
+        return room
+
     def save_room(self, room):
         """Save a single room to disk"""
         return self.persistence.save_room(room)
 
     def save_all_rooms(self):
-        """Save every room we have loaded"""
-        return sum(1 for room in self.rooms if self.persistence.save_room(room))
+        """Save every non-transient room we have loaded"""
+        return sum(1 for room in self.rooms
+                   if not getattr(room, 'is_transient', False)
+                   and self.persistence.save_room(room))
 
     def load_room(self, room_name, spawn_manager=None):
         """Load a room from disk and sync it with the spawn manager if needed"""
@@ -493,8 +509,9 @@ class RoomManagerWithPersistence:
                 self.current_room = None
 
     def get_rooms_in_group(self, group):
-        """Find all rooms that belong to a specific group"""
-        return [r for r in self.rooms if r.group == group]
+        """Find all non-transient rooms that belong to a specific group"""
+        return [r for r in self.rooms
+                if r.group == group and not getattr(r, 'is_transient', False)]
 
     def get_room_names(self):
         """Get a list of all room names"""

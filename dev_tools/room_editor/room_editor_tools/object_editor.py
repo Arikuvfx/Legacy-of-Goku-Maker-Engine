@@ -188,7 +188,7 @@ class ObjectEditor:
                     'object_type': 'flying_pad',
                     'has_variants': True,
                     'variants': self.flying_pad_variants,
-                    'default_variant': 'stone'
+                    'default_variant': 'stone1'
                 }
                 # Add save point to Decorations category
                 ,
@@ -698,6 +698,7 @@ class ObjectEditor:
             item_rect = pygame.Rect(item_x, item_y, self.item_size, self.item_size)
             if item_rect.collidepoint(mouse_pos):
                 if not self._is_object_disabled(obj):
+                    self.selected_variant = None  # clear old variant before switching object
                     self.selected_object = obj
                     # Reset variant selection when selecting new object
                     if obj.get('has_variants', False):

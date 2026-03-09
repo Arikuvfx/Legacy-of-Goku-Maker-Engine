@@ -118,6 +118,11 @@ class EntityEditor:
         # Signature: on_entity_placed(entity_dict, variant_dict | None, ai_type, world_x, world_y)
         self.on_entity_placed = None
 
+        # ── obstacle list (set by room_editor so placement can validate) ────
+        # Populated with the same list that game._assign_obstacles uses:
+        # collision_objects + destructible_stones + level_gates + room_transitions
+        self.placement_obstacles = []
+
     # =========================================================================
     # Entity catalogue
     # =========================================================================
@@ -409,6 +414,7 @@ class EntityEditor:
             # ── entity item click ──────────────────────────────────────────
             for entry in self.ui_rects.get('entity_rects', []):
                 if entry['rect'].collidepoint(mouse_pos):
+                    self.selected_variant = None  # clear old variant before switching entity
                     self.selected_entity = entry['entity']
                     self.selected_variant = self._get_current_variant(entry['entity'])
                     return True
@@ -433,6 +439,39 @@ class EntityEditor:
     # Placement
     # =========================================================================
 
+    def _placement_blocked(self, world_x, world_y, entity):
+        """
+        Fail-safe 1: Return True if placing *entity* centred at (world_x, world_y)
+        would overlap any solid obstacle (collision wall, stone, gate, transition).
+        """
+        import pygame
+        w = entity.get('width', 32)
+        h = entity.get('height', 32)
+        entity_rect = pygame.Rect(world_x - w // 2, world_y - h // 2, w, h)
+
+        for obs in self.placement_obstacles:
+            if not getattr(obs, 'active', True):
+                continue
+            # Collision walls are top-left anchored; everything else is centred
+            if hasattr(obs, 'id') and obs.id == 'collision_wall':
+                obs_rect = pygame.Rect(obs.x, obs.y, obs.width, obs.height)
+            elif hasattr(obs, 'solid') and not obs.solid:
+                continue  # destroyed stone
+            elif hasattr(obs, 'get_rect'):
+                obs_rect = obs.get_rect()
+            elif hasattr(obs, 'x') and hasattr(obs, 'width'):
+                obs_rect = pygame.Rect(
+                    obs.x - obs.width // 2,
+                    obs.y - obs.height // 2,
+                    obs.width,
+                    obs.height,
+                )
+            else:
+                continue
+            if entity_rect.colliderect(obs_rect):
+                return True
+        return False
+
     def _place_entity(self, mouse_pos, camera_x, camera_y):
         """Convert screen click → world coords, snap if needed, fire callback."""
         from config.settings import RENDER_SCALE, TILE_SIZE
@@ -444,6 +483,10 @@ class EntityEditor:
         if self.grid_snap:
             world_x = round(world_x / TILE_SIZE) * TILE_SIZE
             world_y = round(world_y / TILE_SIZE) * TILE_SIZE
+
+        # ── Fail-safe 1: refuse to place inside a solid obstacle ────────────
+        if self.selected_entity and self._placement_blocked(world_x, world_y, self.selected_entity):
+            return  # silently block; the ghost preview already shows the position
 
         variant = self.selected_variant or self._get_current_variant(self.selected_entity)
 
@@ -878,12 +921,20 @@ class EntityEditor:
             ew = self.selected_entity['width'] * RENDER_SCALE
             eh = self.selected_entity['height'] * RENDER_SCALE
             sprite = pygame.transform.scale(sprite, (ew, eh))
+
+            # Red tint when placement is blocked by an obstacle
+            blocked = self._placement_blocked(world_x, world_y, self.selected_entity)
+            if blocked:
+                tint = pygame.Surface((ew, eh), pygame.SRCALPHA)
+                tint.fill((200, 0, 0, 100))
+                sprite.blit(tint, (0, 0))
+
             screen.blit(sprite, (int(sx - ew // 2), int(sy - eh // 2)))
 
-            # thin outline around ghost
-            outline_color = self.COLORS['accent']
+            # outline: red when blocked, gold when clear
+            outline_color = (220, 50, 50) if blocked else self.COLORS['accent']
             pygame.draw.rect(screen, outline_color,
-                             (int(sx - ew // 2), int(sy - eh // 2), ew, eh), 1)
+                             (int(sx - ew // 2), int(sy - eh // 2), ew, eh), 2)
 
     # =========================================================================
     # Internal helpers

@@ -67,6 +67,17 @@ class RoomEditor:
         # Currently editing room
         self.editing_room = None
 
+        # Track where to return after editing room properties
+        # ('rooms' when coming from the room list, 'view_room' when coming from toolbar)
+        self.edit_return_view = 'rooms'
+
+        # --- Select / drag state (active when no editor panel is open) ---
+        self.drag_target = None        # the entity dict or object being dragged
+        self.drag_target_type = None   # 'entity' | object-type string from _check_object_at_position
+        self.drag_offset_x = 0.0       # cursor → object-centre offset in world units
+        self.drag_offset_y = 0.0
+        self.is_dragging = False       # True once mouse has moved after mousedown
+
         # Animation timers
         self.anim_timer = 0
         self.hover_anim = [0.0] * 20
@@ -94,6 +105,21 @@ class RoomEditor:
         self.header_height = 80
         self.item_height = 60
         self.padding = 20
+
+        # UI icons
+        self._view_icon = self._load_icon('assets/ui/room_editor/view.png', 28, 28)
+
+    @staticmethod
+    def _load_icon(path, w, h):
+        """Load and scale an icon, returning None if the file is missing."""
+        import os
+        if not os.path.exists(path):
+            return None
+        try:
+            img = pygame.image.load(path).convert_alpha()
+            return pygame.transform.smoothscale(img, (w, h))
+        except Exception:
+            return None
 
     def toggle(self):
         """Open or close the room editor"""
@@ -134,6 +160,27 @@ class RoomEditor:
                 # Wire placement callback so placed entities land on the room
                 self.entity_editor.on_entity_placed = self._on_entity_placed
 
+    def _refresh_placement_obstacles(self):
+        """
+        Build the obstacle list for entity-placement collision validation and
+        push it to entity_editor.placement_obstacles.
+        Called every time the entity editor is opened or the room changes.
+        """
+        if not self.entity_editor or not self.viewing_room or not self.object_editor:
+            return
+        room_name = self.viewing_room.name
+        obstacles = []
+        # Collision walls
+        obstacles += self.object_editor.collision_manager.get_collision_objects(room_name)
+        # Destructible stones
+        if hasattr(self.viewing_room, 'destructible_stones'):
+            obstacles += [s for s in self.viewing_room.destructible_stones if s.active and s.solid]
+        # Level gates
+        obstacles += self.object_editor.gate_manager.get_gates(room_name)
+        # Room transitions
+        obstacles += self.object_editor.transition_manager.get_transitions(room_name)
+        self.entity_editor.placement_obstacles = obstacles
+
     def handle_input(self, event):
         """Process input events"""
         if not self.active:
@@ -167,42 +214,41 @@ class RoomEditor:
             for clickable in self.clickable_rects:
                 if clickable['rect'].collidepoint(mouse_pos):
                     clicked_index = clickable['index']
-                    current_time = time.time()
+                    click_type = clickable.get('type', 'item')
 
-                    # ONLY use double-click detection for room items in 'rooms' view
+                    # View button on a room row
+                    if click_type == 'view_room':
+                        self._enter_view_room(clicked_index)
+                        return None
+
+                    # Settings button on a room row
+                    if click_type == 'edit_room':
+                        rooms_in_group = self.room_manager.get_rooms_in_group(
+                            self.selected_group) if self.selected_group else []
+                        if 0 <= clicked_index < len(rooms_in_group):
+                            self.editing_room = rooms_in_group[clicked_index]
+                            self.current_view = 'edit'
+                            self.edit_return_view = 'rooms'
+                            self.selected_index = 0
+                            self.hover_index = -1
+                        return None
+
                     if self.current_view == 'rooms':
                         rooms_in_group = self.room_manager.get_rooms_in_group(
                             self.selected_group) if self.selected_group else []
 
-                        # Check if clicking on an actual room (not buttons)
                         if clicked_index < len(rooms_in_group):
-                            # This is a room - use double-click to edit
-                            is_double_click = (
-                                    clicked_index == self.last_click_index and
-                                    clicked_index == self.selected_index and
-                                    (current_time - self.last_click_time) < self.double_click_threshold
-                            )
-
-                            if is_double_click:
-                                # Double-click on room - open edit view
-                                self.editing_room = rooms_in_group[clicked_index]
-                                self.current_view = 'edit'
-                                self.selected_index = 0
-                                self.hover_index = -1
-                            else:
-                                # Single click - just select
-                                self.selected_index = clicked_index
-                                self.last_click_index = clicked_index
-                                self.last_click_time = current_time
-                            break
+                            # Single click on room row — just select it
+                            self.selected_index = clicked_index
                         else:
-                            # This is a button - single click performs action
+                            # Bottom buttons (Create / Back)
                             self.selected_index = clicked_index
                             return self._handle_item_action()
                     else:
-                        # All other views - single click performs action
+                        # All other views — single click performs action
                         self.selected_index = clicked_index
                         return self._handle_item_action()
+                    break
 
         # Handle mouse motion for hover effects
         if event.type == pygame.MOUSEMOTION:
@@ -224,7 +270,10 @@ class RoomEditor:
                     self.selected_index = 0
                     self.selected_group = None
                 else:
-                    if self.selected_group:
+                    if self.edit_return_view == 'view_room':
+                        self.current_view = 'view_room'
+                        self.edit_return_view = 'rooms'
+                    elif self.selected_group:
                         self.current_view = 'rooms'
                     else:
                         self.current_view = 'groups'
@@ -268,6 +317,7 @@ class RoomEditor:
                 # Keyboard Enter on room - open edit view (double-click handled separately in mouse code)
                 self.editing_room = rooms_in_group[self.selected_index]
                 self.current_view = 'edit'
+                self.edit_return_view = 'rooms'
                 self.selected_index = 0
                 self.hover_index = -1
             elif self.selected_index == len(rooms_in_group):
@@ -309,16 +359,19 @@ class RoomEditor:
             field = edit_fields[self.selected_index]
 
             if field == 'save':
-                self.current_view = 'rooms'
+                self.current_view = self.edit_return_view
+                self.edit_return_view = 'rooms'
                 self.selected_index = 0
                 self.hover_index = -1
             elif field == 'delete':
                 self.room_manager.delete_room(self.editing_room)
-                self.current_view = 'rooms'
+                self.current_view = 'rooms'  # always go to rooms list after delete
+                self.edit_return_view = 'rooms'
                 self.selected_index = 0
                 self.hover_index = -1
             elif field == 'cancel':
-                self.current_view = 'rooms'
+                self.current_view = self.edit_return_view
+                self.edit_return_view = 'rooms'
                 self.selected_index = 0
                 self.hover_index = -1
             elif field == 'group':
@@ -356,6 +409,34 @@ class RoomEditor:
 
         return None
 
+    def _enter_view_room(self, room_index):
+        """Open the room viewer for the room at *room_index* in the current group."""
+        rooms_in_group = self.room_manager.get_rooms_in_group(self.selected_group) if self.selected_group else []
+        if not (0 <= room_index < len(rooms_in_group)):
+            return
+        self.viewing_room = rooms_in_group[room_index]
+        self.selected_index = room_index
+        room_name = self.viewing_room.name
+
+        if self.tileset_editor:
+            if room_name not in self.tileset_editor.room_tiles or not self.tileset_editor.room_tiles[room_name]:
+                self.tileset_editor.room_tiles[room_name] = self.viewing_room.tiles[:]
+
+        if self.object_editor and hasattr(self.object_editor, 'collision_manager'):
+            self.object_editor.collision_manager.collision_objects[room_name] = []
+            if not hasattr(self.viewing_room, 'collision_objects'):
+                self.viewing_room.collision_objects = []
+            self.object_editor.collision_manager.collision_objects[room_name] = self.viewing_room.collision_objects
+
+        if not hasattr(self.viewing_room, 'destructible_stones'):
+            self.viewing_room.destructible_stones = []
+
+        center_x = (self.viewing_room.width * RENDER_SCALE - self.screen_width) // 2
+        center_y = (self.viewing_room.height * RENDER_SCALE - self.screen_height) // 2
+        self.camera.x = center_x
+        self.camera.y = center_y
+        self.current_view = 'view_room'
+
     def _handle_rooms_input(self, event):
         """Navigate through rooms in the selected group"""
         if not self.selected_group:
@@ -371,36 +452,7 @@ class RoomEditor:
         elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
             return self._handle_item_action()
         elif event.key == pygame.K_v:
-            # Enter the room viewer
-            if 0 <= self.selected_index < len(rooms_in_group):
-                self.viewing_room = rooms_in_group[self.selected_index]
-                room_name = self.viewing_room.name
-
-                # Load tiles from the room if the editor doesn't have them yet
-                if self.tileset_editor:
-                    if room_name not in self.tileset_editor.room_tiles or not self.tileset_editor.room_tiles[room_name]:
-                        self.tileset_editor.room_tiles[room_name] = self.viewing_room.tiles[:]
-
-                # Sync collision objects from room data
-                if self.object_editor and hasattr(self.object_editor, 'collision_manager'):
-                    self.object_editor.collision_manager.collision_objects[room_name] = []
-
-                    if not hasattr(self.viewing_room, 'collision_objects'):
-                        self.viewing_room.collision_objects = []
-
-                    self.object_editor.collision_manager.collision_objects[
-                        room_name] = self.viewing_room.collision_objects
-
-                # Make sure destructible stones list exists
-                if not hasattr(self.viewing_room, 'destructible_stones'):
-                    self.viewing_room.destructible_stones = []
-
-                # Center the camera (room is always centered on screen regardless of size)
-                center_x = (self.viewing_room.width * RENDER_SCALE - self.screen_width) // 2
-                center_y = (self.viewing_room.height * RENDER_SCALE - self.screen_height) // 2
-                self.camera.x = center_x
-                self.camera.y = center_y
-                self.current_view = 'view_room'
+            self._enter_view_room(self.selected_index)
         elif event.key == pygame.K_DELETE:
             if 0 <= self.selected_index < len(rooms_in_group):
                 room_to_delete = rooms_in_group[self.selected_index]
@@ -463,6 +515,7 @@ class RoomEditor:
                             self.object_editor.toggle()
                         if self.entity_editor and self.entity_editor.active:
                             self.entity_editor.toggle()
+                        self.drag_target = None; self.drag_target_type = None; self.is_dragging = False
                 elif result == 'objects':
                     if self.object_editor:
                         self.object_editor.toggle()
@@ -470,6 +523,7 @@ class RoomEditor:
                             self.tileset_editor.toggle()
                         if self.entity_editor and self.entity_editor.active:
                             self.entity_editor.toggle()
+                        self.drag_target = None; self.drag_target_type = None; self.is_dragging = False
                 elif result == 'entities':
                     if self.entity_editor:
                         self.entity_editor.toggle()
@@ -477,9 +531,13 @@ class RoomEditor:
                             self.tileset_editor.toggle()
                         if self.object_editor and self.object_editor.active:
                             self.object_editor.toggle()
+                        self.drag_target = None; self.drag_target_type = None; self.is_dragging = False
+                        if self.entity_editor.active:
+                            self._refresh_placement_obstacles()
                 elif result == 'settings':
                     self.editing_room = self.viewing_room
                     self.current_view = 'edit'
+                    self.edit_return_view = 'view_room'
                     self.selected_index = 0
                     self.hover_index = -1
                 elif result == 'action_test':
@@ -515,6 +573,8 @@ class RoomEditor:
                     self.tileset_editor.toggle()
                 if self.object_editor and self.object_editor.active:
                     self.object_editor.toggle()
+                if self.entity_editor.active:
+                    self._refresh_placement_obstacles()
             return None
 
         # Pass input to active editor
@@ -600,8 +660,18 @@ class RoomEditor:
                 self.viewing_room = None
                 self.selected_index = 0
                 self.hover_index = -1
+                self.drag_target = None
+                self.drag_target_type = None
+                self.is_dragging = False
 
             return None
+
+        # Select / drag / right-click-delete when no panel is open
+        if self._no_editor_active():
+            if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEMOTION, pygame.MOUSEBUTTONUP):
+                self._handle_select_drag_event(event)
+
+        return None
 
     def _return_to_initial_room(self, initial_room_name: str):
         """Return to the initial room after finishing flying pad path"""
@@ -962,7 +1032,149 @@ class RoomEditor:
         if best_idx >= 0:
             self.viewing_room.entities.pop(best_idx)
 
+    # =========================================================================
+    # Select / drag / delete  (no-editor-panel mode)
+    # =========================================================================
+
+    def _no_editor_active(self):
+        """True when all editor panels are closed – the mode that allows drag/select."""
+        return (
+            not (self.tileset_editor and self.tileset_editor.active) and
+            not (self.object_editor and self.object_editor.active) and
+            not (self.entity_editor and self.entity_editor.active)
+        )
+
+    def _find_entity_at(self, world_x, world_y):
+        """Return the entity dict under world_x/y, or None."""
+        if not self.viewing_room or not hasattr(self.viewing_room, 'entities'):
+            return None
+        for ent in reversed(self.viewing_room.entities):  # top-most first
+            hw = ent['width'] / 2
+            hh = ent['height'] / 2
+            if (abs(ent['x'] - world_x) <= hw and abs(ent['y'] - world_y) <= hh):
+                return ent
+        return None
+
+    def _find_object_at(self, world_x, world_y):
+        """Return (obj, obj_type) for the placed object under the cursor, or (None, None)."""
+        if not self.object_editor:
+            return None, None
+        self.object_editor.current_room_name = self.viewing_room.name
+        return self.object_editor._check_object_at_position(world_x, world_y)
+
+    def _screen_to_world(self, sx, sy):
+        return (sx + self.camera.x) / RENDER_SCALE, (sy + self.camera.y) / RENDER_SCALE
+
+    def _handle_select_drag_event(self, event):
+        """Handle click-select, drag, and right-click-delete when no editor panel is open."""
+        if not self._no_editor_active():
+            return False
+
+        # Ignore toolbar area (top 80px)
+        mx, my = event.pos
+        if my < self.toolbar.height:
+            return False
+
+        world_x, world_y = self._screen_to_world(mx, my)
+
+        # ── right-click: delete ───────────────────────────────────────────
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+            # Try entity first
+            ent = self._find_entity_at(world_x, world_y)
+            if ent:
+                self.viewing_room.entities.remove(ent)
+                if self.drag_target is ent:
+                    self.drag_target = None
+                    self.drag_target_type = None
+                    self.is_dragging = False
+                return True
+            # Try object
+            obj, obj_type = self._find_object_at(world_x, world_y)
+            if obj and obj_type:
+                self.object_editor._delete_object(obj, obj_type)
+                if self.drag_target is obj:
+                    self.drag_target = None
+                    self.drag_target_type = None
+                    self.is_dragging = False
+                return True
+            return False
+
+        # ── left mouse down: begin select/drag ────────────────────────────
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            # Try entity
+            ent = self._find_entity_at(world_x, world_y)
+            if ent:
+                self.drag_target = ent
+                self.drag_target_type = 'entity'
+                self.drag_offset_x = ent['x'] - world_x
+                self.drag_offset_y = ent['y'] - world_y
+                self.is_dragging = False
+                return True
+            # Try object
+            obj, obj_type = self._find_object_at(world_x, world_y)
+            if obj and obj_type:
+                self.drag_target = obj
+                self.drag_target_type = obj_type
+                self.drag_offset_x = obj.x - world_x
+                self.drag_offset_y = obj.y - world_y
+                self.is_dragging = False
+                return True
+            # Clicked empty space – deselect
+            self.drag_target = None
+            self.drag_target_type = None
+            self.is_dragging = False
+            return False
+
+        # ── mouse motion while held: drag ─────────────────────────────────
+        if event.type == pygame.MOUSEMOTION and self.drag_target is not None:
+            if pygame.mouse.get_pressed()[0]:
+                self.is_dragging = True
+                new_x = world_x + self.drag_offset_x
+                new_y = world_y + self.drag_offset_y
+                if self.drag_target_type == 'entity':
+                    self.drag_target['x'] = new_x
+                    self.drag_target['y'] = new_y
+                else:
+                    self.drag_target.x = new_x
+                    self.drag_target.y = new_y
+                return True
+
+        # ── left mouse up: end drag ───────────────────────────────────────
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            if self.drag_target is not None:
+                self.is_dragging = False
+                # Keep drag_target selected so it stays highlighted; clear on next click elsewhere
+                return True
+
+        return False
+
+    def _draw_drag_highlight(self, screen, camera_x, camera_y):
+        """Draw a highlight border around the currently selected/dragged item."""
+        if self.drag_target is None or not self._no_editor_active():
+            return
+        if self.drag_target_type == 'entity':
+            ent = self.drag_target
+            sw = ent['width'] * RENDER_SCALE
+            sh = ent['height'] * RENDER_SCALE
+            sx = int(ent['x'] * RENDER_SCALE - camera_x) - sw // 2
+            sy = int(ent['y'] * RENDER_SCALE - camera_y) - sh // 2
+            color = (255, 255, 0) if self.is_dragging else (255, 200, 0)
+            pygame.draw.rect(screen, color, (sx - 2, sy - 2, sw + 4, sh + 4), 2)
+        else:
+            obj = self.drag_target
+            if hasattr(obj, 'x') and hasattr(obj, 'width'):
+                sx = int(obj.x * RENDER_SCALE - camera_x)
+                sy = int(obj.y * RENDER_SCALE - camera_y)
+                sw = int(getattr(obj, 'width', 32) * RENDER_SCALE)
+                sh = int(getattr(obj, 'height', 32) * RENDER_SCALE)
+                # Some objects are centred, others are top-left — use a generous outline
+                pygame.draw.rect(screen, (255, 200, 0),
+                                 (sx - sw // 2 - 2, sy - sh // 2 - 2, sw + 4, sh + 4), 2)
+
+    # =========================================================================
     # Cache for loaded idle-down sprites keyed by (entity_id, variant_type)
+    # =========================================================================
+
     _placed_sprite_cache = {}
 
     @staticmethod
@@ -1294,6 +1506,9 @@ class RoomEditor:
         # Draw placed entities (NPCs / enemies / bosses)
         self._draw_placed_entities(screen, int(self.camera.x), int(self.camera.y))
 
+        # Highlight selected/dragged item (no-panel mode)
+        self._draw_drag_highlight(screen, int(self.camera.x), int(self.camera.y))
+
         # Foreground tiles on top
         if self.tileset_editor:
             self.tileset_editor.draw_tiles(
@@ -1528,11 +1743,17 @@ class RoomEditor:
             y_pos += self.item_height + 10
 
     def _draw_room_item(self, screen, room, x, y, width, selected, index):
-        """Draw a single room in the list - returns the clickable rect"""
+        """Draw a single room in the list with View (👁) and Settings (⚙) buttons."""
+        # Reserve space on the right for the two buttons
+        btn_w = 44
+        btn_h = 36
+        btn_gap = 8
+        buttons_total = (btn_w + btn_gap) * 2
+        row_width = width - buttons_total - self.padding
+
         panel_rect = pygame.Rect(x, y, width, self.item_height)
 
         if selected:
-            # Pulsing glow effect
             glow_alpha = int(50 + 30 * math.sin(self.anim_timer * 3))
             glow_surf = pygame.Surface((width + 10, self.item_height + 10), pygame.SRCALPHA)
             pygame.draw.rect(glow_surf, (*self.colors['accent'], glow_alpha),
@@ -1544,14 +1765,12 @@ class RoomEditor:
         pygame.draw.rect(screen, self.colors['accent'] if selected else self.colors['grid'],
                          panel_rect, 2, border_radius=8)
 
-        # Little colored circle for the group
+        # Group colour circle
         icon_x = x + 20
         icon_y = y + self.item_height // 2
         icon_radius = 12
-
         group_hash = hash(room.group) % 360
         icon_color = self._hue_to_rgb(group_hash)
-
         pygame.gfxdraw.filled_circle(screen, icon_x, icon_y, icon_radius, icon_color)
         pygame.gfxdraw.aacircle(screen, icon_x, icon_y, icon_radius, self.colors['text'])
 
@@ -1563,15 +1782,42 @@ class RoomEditor:
         details_surf = self.font_small.render(details, True, self.colors['text_dim'])
         screen.blit(details_surf, (x + 50, y + 35))
 
-        # Show if this is the current room
+        # "CURRENT" indicator
         if self.room_manager.current_room == room:
             indicator = self.font_small.render("● CURRENT", True, self.colors['success'])
-            screen.blit(indicator, (x + width - 100, y + 20))
+            screen.blit(indicator, (x + row_width - 90, y + 20))
 
-        # Hint for selected item
-        if selected:
-            hint = self.font_small.render("V to View | Double-Click to Edit", True, self.colors['accent'])
-            screen.blit(hint, (x + width - 270, y + 40))
+        # ── View button (👁) ────────────────────────────────────────────────
+        btn_right_edge = x + width - self.padding
+        settings_btn_rect = pygame.Rect(btn_right_edge - btn_w, y + (self.item_height - btn_h) // 2, btn_w, btn_h)
+        view_btn_rect     = pygame.Rect(settings_btn_rect.x - btn_gap - btn_w,
+                                        y + (self.item_height - btn_h) // 2, btn_w, btn_h)
+
+        view_hovered     = view_btn_rect.collidepoint(pygame.mouse.get_pos())
+        settings_hovered = settings_btn_rect.collidepoint(pygame.mouse.get_pos())
+
+        # View button
+        view_bg = (60, 120, 200) if view_hovered else (40, 80, 140)
+        pygame.draw.rect(screen, view_bg, view_btn_rect, border_radius=6)
+        pygame.draw.rect(screen, (100, 160, 255) if view_hovered else (70, 120, 200),
+                         view_btn_rect, 2, border_radius=6)
+        if self._view_icon:
+            screen.blit(self._view_icon, self._view_icon.get_rect(center=view_btn_rect.center))
+        else:
+            eye_surf = self.font_large.render("👁", True, self.colors['text'])
+            screen.blit(eye_surf, eye_surf.get_rect(center=view_btn_rect.center))
+
+        # Settings button
+        settings_bg = (80, 60, 160) if settings_hovered else (50, 40, 110)
+        pygame.draw.rect(screen, settings_bg, settings_btn_rect, border_radius=6)
+        pygame.draw.rect(screen, (140, 100, 255) if settings_hovered else (100, 70, 200),
+                         settings_btn_rect, 2, border_radius=6)
+        gear_surf = self.font_large.render("⚙", True, self.colors['text'])
+        screen.blit(gear_surf, gear_surf.get_rect(center=settings_btn_rect.center))
+
+        # Register the two action buttons as separate clickable entries
+        self.clickable_rects.append({'rect': view_btn_rect,     'index': index, 'type': 'view_room'})
+        self.clickable_rects.append({'rect': settings_btn_rect, 'index': index, 'type': 'edit_room'})
 
         return panel_rect
 
