@@ -1281,7 +1281,7 @@ class RoomEditor:
             screen.blit(label_surf,
                         label_surf.get_rect(centerx=rect.centerx, bottom=rect.top - 2))
 
-    def update(self, dt):
+    def update(self, dt, mouse_pos=None):
         """Update animations and camera"""
         if not self.active:
             return
@@ -1317,7 +1317,8 @@ class RoomEditor:
 
         # Update toolbar in room view
         if self.current_view == 'view_room':
-            mouse_pos = pygame.mouse.get_pos()
+            mouse_pos = mouse_pos if mouse_pos is not None else pygame.mouse.get_pos()
+            self._logical_mouse_pos = mouse_pos  # cache for draw() hover checks
             self.toolbar.update(dt, mouse_pos)
 
             if self.object_editor and self.object_editor.active:
@@ -1333,7 +1334,7 @@ class RoomEditor:
 
         # Handle camera movement
         if self.current_view == 'view_room' and self.viewing_room:
-            mouse_pos = pygame.mouse.get_pos()
+            mouse_pos = getattr(self, '_logical_mouse_pos', None) or pygame.mouse.get_pos()
             mouse_over_palette = False
 
             # Check if mouse is hovering over an editor palette
@@ -1793,8 +1794,9 @@ class RoomEditor:
         view_btn_rect     = pygame.Rect(settings_btn_rect.x - btn_gap - btn_w,
                                         y + (self.item_height - btn_h) // 2, btn_w, btn_h)
 
-        view_hovered     = view_btn_rect.collidepoint(pygame.mouse.get_pos())
-        settings_hovered = settings_btn_rect.collidepoint(pygame.mouse.get_pos())
+        _lm = getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos())
+        view_hovered     = view_btn_rect.collidepoint(_lm)
+        settings_hovered = settings_btn_rect.collidepoint(_lm)
 
         # View button
         view_bg = (60, 120, 200) if view_hovered else (40, 80, 140)

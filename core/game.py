@@ -34,6 +34,20 @@ from objects.save_point import SavePoint, SavePointMenu, SavePointManager
 from ui.character_switch_menu import CharacterSwitchMenu
 
 
+# Tell Windows this process is DPI-aware so it reports the true resolution.
+# Must run before pygame.init().
+import sys as _sys
+if _sys.platform == 'win32':
+    try:
+        import ctypes as _ctypes
+        _ctypes.windll.shcore.SetProcessDpiAwareness(2)
+    except Exception:
+        try:
+            _ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+
+
 class Game:
     """
     Top-level game controller.
@@ -44,8 +58,11 @@ class Game:
 
     def __init__(self):
         pygame.init()
-        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.RESIZABLE)
         pygame.display.set_caption("Legacy of Goku Style Engine")
+        # Logical surface — all rendering targets this fixed-size surface,
+        # which is then scaled to the actual (possibly resized) window.
+        self.logical_surface = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
         self.clock   = pygame.time.Clock()
         self.running = True
         self.colors  = get_colors()
@@ -182,6 +199,34 @@ class Game:
 
     # ── Event handling ────────────────────────────────────────────────────────
 
+    def _get_logical_mouse_pos(self):
+        """Translate the real window mouse position to logical resolution coords."""
+        mx, my = pygame.mouse.get_pos()
+        wx, wy = self.screen.get_size()
+        return (int(mx * SCREEN_WIDTH / wx), int(my * SCREEN_HEIGHT / wy))
+
+    def _rescale_event(self, event):
+        """Return a mouse event with its pos scaled to logical resolution.
+
+        All subsystems operate in logical (SCREEN_WIDTH x SCREEN_HEIGHT) space,
+        so mouse events from the real window must be scaled before dispatch.
+        """
+        if event.type not in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP,
+                               pygame.MOUSEMOTION):
+            return event
+        wx, wy = self.screen.get_size()
+        ox, oy = event.pos
+        new_pos = (int(ox * SCREEN_WIDTH / wx), int(oy * SCREEN_HEIGHT / wy))
+        if event.type == pygame.MOUSEMOTION:
+            return pygame.event.Event(event.type,
+                                      pos=new_pos,
+                                      rel=event.rel,
+                                      buttons=event.buttons)
+        d = {'pos': new_pos, 'button': event.button}
+        if hasattr(event, 'buttons'):
+            d['buttons'] = event.buttons
+        return pygame.event.Event(event.type, **d)
+
     def handle_events(self):
         """
         Process all pending pygame events for the current frame.
@@ -197,6 +242,7 @@ class Game:
           8. Normal gameplay input
         """
         for event in pygame.event.get():
+            event = self._rescale_event(event)
             if event.type == pygame.QUIT:
                 self.running = False
 
@@ -1178,7 +1224,7 @@ class Game:
                 self.sprite_editor.update(dt)
                 return
             if self.room_editor.active:
-                self.room_editor.update(dt)
+                self.room_editor.update(dt, self._get_logical_mouse_pos())
                 return
 
     # ── Update sub-routines ───────────────────────────────────────────────────
@@ -1520,7 +1566,7 @@ class Game:
           7. Foreground tiles
           8. UI overlays (HUD, dialogue, menus, dev tools)
         """
-        self.screen.fill((34, 139, 34))
+        self.logical_surface.fill((34, 139, 34))
 
         visible_x_start = self.camera.x // RENDER_SCALE
         visible_y_start = self.camera.y // RENDER_SCALE
@@ -1535,7 +1581,7 @@ class Game:
         while x <= visible_x_end:
             screen_x = (x * RENDER_SCALE) - self.camera.x
             if -50 <= screen_x <= SCREEN_WIDTH + 50:
-                pygame.draw.line(self.screen, (44, 149, 44),
+                pygame.draw.line(self.logical_surface, (44, 149, 44),
                                  (int(screen_x), 0), (int(screen_x), SCREEN_HEIGHT), 1)
             x += TILE_SIZE
 
@@ -1543,12 +1589,12 @@ class Game:
         while y <= visible_y_end:
             screen_y = (y * RENDER_SCALE) - self.camera.y
             if -50 <= screen_y <= SCREEN_HEIGHT + 50:
-                pygame.draw.line(self.screen, (44, 149, 44),
+                pygame.draw.line(self.logical_surface, (44, 149, 44),
                                  (0, int(screen_y)), (SCREEN_WIDTH, int(screen_y)), 1)
             y += TILE_SIZE
 
         # Room boundary outline
-        pygame.draw.rect(self.screen, self.colors['RED'], (
+        pygame.draw.rect(self.logical_surface, self.colors['RED'], (
             (0 * RENDER_SCALE) - self.camera.x,
             (0 * RENDER_SCALE) - self.camera.y,
             self.current_room.width  * RENDER_SCALE,
@@ -1562,8 +1608,8 @@ class Game:
             test_bg   = pygame.Surface((test_text.get_width() + 20, test_text.get_height() + 10), pygame.SRCALPHA)
             test_bg.fill((0, 0, 0, 180))
             bg_x = (SCREEN_WIDTH - test_text.get_width()) // 2 - 10
-            self.screen.blit(test_bg,   (bg_x, 10))
-            self.screen.blit(test_text, ((SCREEN_WIDTH - test_text.get_width()) // 2, 15))
+            self.logical_surface.blit(test_bg,   (bg_x, 10))
+            self.logical_surface.blit(test_text, ((SCREEN_WIDTH - test_text.get_width()) // 2, 15))
 
         # Spawn point sprite
         if hasattr(self, 'room_editor') and self.room_editor and self.room_editor.object_editor:
@@ -1575,14 +1621,14 @@ class Game:
                     sw = int(spawn_obj.width  * RENDER_SCALE)
                     sh = int(spawn_obj.height * RENDER_SCALE)
                     scaled = pygame.transform.scale(spawn_obj.sprite, (sw, sh))
-                    self.screen.blit(scaled, (int(sx - sw // 2), int(sy - sh // 2)))
+                    self.logical_surface.blit(scaled, (int(sx - sw // 2), int(sy - sh // 2)))
 
         # Flying pads
         for pad in self.flying_pads:
             if pad.active:
-                pad.draw(self.screen, self.camera, self.colors, RENDER_SCALE)
+                pad.draw(self.logical_surface, self.camera, self.colors, RENDER_SCALE)
                 if self.dev_menu.active or self.room_editor.active:
-                    pad.draw_path_preview(self.screen, self.camera, RENDER_SCALE)
+                    pad.draw_path_preview(self.logical_surface, self.camera, RENDER_SCALE)
 
         # "E to Fly" indicator when player stands on a pad
         if not self.flying_controller.is_active():
@@ -1600,18 +1646,18 @@ class Game:
                 trect = text.get_rect(center=(px, py))
                 bg    = pygame.Surface((trect.width + 10, trect.height + 5), pygame.SRCALPHA)
                 bg.fill((0, 0, 0, 180))
-                self.screen.blit(bg,   trect.inflate(10, 5).topleft)
-                self.screen.blit(text, trect)
+                self.logical_surface.blit(bg,   trect.inflate(10, 5).topleft)
+                self.logical_surface.blit(text, trect)
 
         # Save points
         for sp in self.save_points:
             if sp.active:
-                sp.draw(self.screen, self.camera, self.colors, RENDER_SCALE)
+                sp.draw(self.logical_surface, self.camera, self.colors, RENDER_SCALE)
 
         # Background tile layer
         if self.room_editor.active and self.room_editor.tileset_editor:
             self.room_editor.tileset_editor.draw_tiles(
-                self.screen, int(self.camera.x), int(self.camera.y),
+                self.logical_surface, int(self.camera.x), int(self.camera.y),
                 self.current_room.name, layer='background'
             )
         elif hasattr(self.current_room, 'tiles') and self.current_room.tiles:
@@ -1633,26 +1679,26 @@ class Game:
         if self.dev_menu.active or self.room_editor.active:
             from objects.collision_object import draw_collision_object
             for obj in self.collision_objects:
-                draw_collision_object(self.screen, obj, self.camera.x, self.camera.y,
+                draw_collision_object(self.logical_surface, obj, self.camera.x, self.camera.y,
                                       RENDER_SCALE, dev_mode=True, selected=False)
 
         # Enemy bullets and rockets (not y-sorted)
         for bullet in self.enemy_bullets:
-            bullet.draw(self.screen, self.camera, self.colors)
+            bullet.draw(self.logical_surface, self.camera, self.colors)
         for rocket in self.enemy_rockets:
-            rocket.draw(self.screen, self.camera, self.colors)
+            rocket.draw(self.logical_surface, self.camera, self.colors)
 
-        self.layer_manager.draw_all(self.screen, self.camera, self.colors, RENDER_SCALE)
+        self.layer_manager.draw_all(self.logical_surface, self.camera, self.colors, RENDER_SCALE)
 
         # Player hurt tint — redraw player sprite with a red overlay
         if self.player.hurt_tint > 0 and hasattr(self.player, 'sprite') and self.player.sprite:
-            self.player.sprite.draw(self.screen, self.player.x, self.player.y,
+            self.player.sprite.draw(self.logical_surface, self.player.x, self.player.y,
                                     self.camera, RENDER_SCALE, self.player.hurt_tint)
 
         # Foreground tile layer
         if self.room_editor.active and self.room_editor.tileset_editor:
             self.room_editor.tileset_editor.draw_tiles(
-                self.screen, int(self.camera.x), int(self.camera.y),
+                self.logical_surface, int(self.camera.x), int(self.camera.y),
                 self.current_room.name, layer='foreground'
             )
         elif hasattr(self.current_room, 'tiles') and self.current_room.tiles:
@@ -1664,10 +1710,13 @@ class Game:
         if not self.dev_menu.active:
             self._draw_ui()
 
-        self.sprite_editor.draw(self.screen)
-        self.room_editor.draw(self.screen)
-        self.dev_menu.draw(self.screen)
+        self.sprite_editor.draw(self.logical_surface)
+        self.room_editor.draw(self.logical_surface)
+        self.dev_menu.draw(self.logical_surface)
 
+        # Scale the logical surface to the actual window size and present.
+        scaled = pygame.transform.scale(self.logical_surface, self.screen.get_size())
+        self.screen.blit(scaled, (0, 0))
         pygame.display.flip()
 
     def _draw_tile(self, tile):
@@ -1689,7 +1738,7 @@ class Game:
             tile_surface,
             (tileset.tile_width * RENDER_SCALE, tileset.tile_height * RENDER_SCALE)
         )
-        self.screen.blit(scaled, (int(screen_x), int(screen_y)))
+        self.logical_surface.blit(scaled, (int(screen_x), int(screen_y)))
 
     def _draw_ui(self):
         """Draw all UI elements that appear on top of the game world."""
@@ -1698,43 +1747,43 @@ class Game:
             sx = (self.nearby_npc.x * RENDER_SCALE) - self.camera.x
             sy = ((self.nearby_npc.y - 20) * RENDER_SCALE) - self.camera.y
             r  = 6 * RENDER_SCALE
-            pygame.draw.circle(self.screen, self.colors['YELLOW'], (int(sx), int(sy)), r)
-            pygame.draw.circle(self.screen, self.colors['WHITE'],  (int(sx), int(sy)), r, 1)
+            pygame.draw.circle(self.logical_surface, self.colors['YELLOW'], (int(sx), int(sy)), r)
+            pygame.draw.circle(self.logical_surface, self.colors['WHITE'],  (int(sx), int(sy)), r, 1)
 
         # Save-point interaction indicator
         if self.nearby_save_point and not self.save_point_menu.active and not self.character_switch_menu.active:
             sx = (self.nearby_save_point.x * RENDER_SCALE) - self.camera.x
             sy = ((self.nearby_save_point.y - 25) * RENDER_SCALE) - self.camera.y
             r  = 6 * RENDER_SCALE
-            pygame.draw.circle(self.screen, self.colors['YELLOW'], (int(sx), int(sy)), r)
-            pygame.draw.circle(self.screen, self.colors['WHITE'],  (int(sx), int(sy)), r, 1)
+            pygame.draw.circle(self.logical_surface, self.colors['YELLOW'], (int(sx), int(sy)), r)
+            pygame.draw.circle(self.logical_surface, self.colors['WHITE'],  (int(sx), int(sy)), r, 1)
 
-        self.npc_config_menu.draw(self.screen, self.colors)
-        self.dialogue_box.draw(self.screen, self.colors)
-        self.save_point_menu.draw(self.screen)
-        self.character_switch_menu.draw(self.screen)
-        self.level_up_notification.draw(self.screen, self.colors)
+        self.npc_config_menu.draw(self.logical_surface, self.colors)
+        self.dialogue_box.draw(self.logical_surface, self.colors)
+        self.save_point_menu.draw(self.logical_surface)
+        self.character_switch_menu.draw(self.logical_surface)
+        self.level_up_notification.draw(self.logical_surface, self.colors)
 
         # Room-transition zone outlines (hidden in test mode)
         if not self.is_test_mode:
             for transition in self.room_transitions:
-                transition.draw(self.screen, self.camera, RENDER_SCALE,
+                transition.draw(self.logical_surface, self.camera, RENDER_SCALE,
                                 dev_mode=self.dev_menu.active, selected=False)
 
-        self.transition_config_menu.draw(self.screen)
-        self.transition_controller.draw(self.screen)
+        self.transition_config_menu.draw(self.logical_surface)
+        self.transition_controller.draw(self.logical_surface)
 
         if self.ui.current_screen == 'game' and not self.character_switch_menu.active:
-            self.sprite_hud.draw(self.screen, self.player)
+            self.sprite_hud.draw(self.logical_surface, self.player)
 
         if self.ui.current_screen == 'main_menu':
-            self.ui.draw_main_menu(self.screen, self.colors)
+            self.ui.draw_main_menu(self.logical_surface, self.colors)
         elif self.ui.current_screen == 'status':
-            self.ui.draw_status_screen(self.screen, self.player, self.game_config, self.colors)
+            self.ui.draw_status_screen(self.logical_surface, self.player, self.game_config, self.colors)
         elif self.ui.current_screen == 'inventory':
-            self.ui.draw_inventory_screen(self.screen, self.player, self.colors)
+            self.ui.draw_inventory_screen(self.logical_surface, self.player, self.colors)
         elif self.ui.current_screen == 'options':
-            self.ui.draw_options_screen(self.screen, self.colors)
+            self.ui.draw_options_screen(self.logical_surface, self.colors)
 
     # ── Editor / room sync ────────────────────────────────────────────────────
 
