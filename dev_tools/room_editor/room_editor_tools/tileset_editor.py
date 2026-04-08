@@ -23,7 +23,7 @@ class TileDef:
 
 
 def detect_tile_size(image: pygame.Surface) -> int:
-    """Detect tile size from image dimensions"""
+    """Infer tile size from image dimensions — tries 16px first, then 8px."""
     w, h = image.get_size()
     for size in (16, 8):
         if w % size == 0 and h % size == 0:
@@ -32,7 +32,7 @@ def detect_tile_size(image: pygame.Surface) -> int:
 
 
 class Tile:
-    """Represents a single placed tile in the room"""
+    """A single placed tile — tracks position, tileset source, and render layer."""
 
     def __init__(self, x: int, y: int, tileset_name: str, tile_x: int, tile_y: int,
                  layer: int = -100, foreground: bool = False):
@@ -46,7 +46,7 @@ class Tile:
         self.draw_layer = layer
 
     def to_dict(self):
-        """Serialize tile for saving"""
+        """Pack tile data into a dict for JSON serialization."""
         return {
             'x': self.x,
             'y': self.y,
@@ -59,7 +59,7 @@ class Tile:
 
     @staticmethod
     def from_dict(data):
-        """Deserialize tile from save data"""
+        """Reconstruct a Tile from saved dict data."""
         layer = data.get('layer', 75 if data.get('foreground', False) else -100)
         return Tile(
             data['x'],
@@ -81,6 +81,7 @@ class Tileset:
         self.cols = 0
         self.rows = 0
         self._tile_transparency_cache = {}
+        self._scaled_cache = {}  # key: (tile_x, tile_y, scale) → pre-scaled Surface
 
         try:
             self.image = pygame.image.load(image_path).convert_alpha()
@@ -94,7 +95,7 @@ class Tileset:
             print(f"Error loading tileset {name}: {e}")
 
     def _build_transparency_cache(self):
-        """Build a cache of which tiles are completely transparent"""
+        """Pre-scan every tile and note which ones are fully transparent — skips empty blits at draw time."""
         if not self.image:
             return
 
@@ -105,7 +106,7 @@ class Tileset:
                     self._tile_transparency_cache[(tx, ty)] = self._is_tile_transparent(tile_surface)
 
     def _is_tile_transparent(self, surface: pygame.Surface) -> bool:
-        """Check if a tile contains only transparent pixels"""
+        """Returns True if every pixel has alpha == 0."""
         if not (surface.get_flags() & pygame.SRCALPHA):
             return False
 
@@ -119,11 +120,11 @@ class Tileset:
         return True
 
     def is_tile_empty(self, tile_x: int, tile_y: int) -> bool:
-        """Check if a tile at grid position is completely transparent"""
+        """Returns True if the tile at (tile_x, tile_y) was fully transparent when the cache was built."""
         return self._tile_transparency_cache.get((tile_x, tile_y), False)
 
     def get_tile_surface(self, tile_x: int, tile_y: int) -> Optional[pygame.Surface]:
-        """Get a tile surface at grid position"""
+        """Extract and return a copy of the tile surface at grid coords (tile_x, tile_y)."""
         if not self.image or tile_x >= self.cols or tile_y >= self.rows or tile_x < 0 or tile_y < 0:
             return None
 
@@ -135,16 +136,37 @@ class Tileset:
         )
         return self.image.subsurface(rect).copy()
 
+    def get_scaled_tile_surface(self, tile_x: int, tile_y: int, scale: int) -> Optional[pygame.Surface]:
+        """Return a pre-scaled tile surface, creating and caching it on first call.
+
+        This avoids calling pygame.transform.scale() and subsurface().copy() on
+        every tile every frame — the heavy work happens once and is reused.
+        """
+        key = (tile_x, tile_y, scale)
+        if key not in self._scaled_cache:
+            raw = self.get_tile_surface(tile_x, tile_y)
+            if raw is None:
+                self._scaled_cache[key] = None
+            else:
+                self._scaled_cache[key] = pygame.transform.scale(
+                    raw, (self.tile_width * scale, self.tile_height * scale)
+                )
+        return self._scaled_cache[key]
+
+    def invalidate_scaled_cache(self):
+        """Clear the scaled surface cache (call if the tileset image is replaced at runtime)."""
+        self._scaled_cache.clear()
+
 
 class TilesetManager:
-    """Manages all available tilesets"""
+    """Holds every loaded tileset and hands them out by name."""
 
     def __init__(self):
         self.tilesets: dict[str, Tileset] = {}
         self.tileset_names: List[str] = []
 
     def load_tilesets_from_folder(self, folder_path: str):
-        """Load all PNG files from a folder as tilesets"""
+        """Scan a folder and load every .png file as a tileset."""
         if not os.path.exists(folder_path):
             print(f"Tileset folder not found: {folder_path}")
             return
@@ -156,7 +178,7 @@ class TilesetManager:
                 self.load_tileset(name, path)
 
     def load_default_tilesets(self):
-        """Load default tilesets"""
+        """Load tilesets from the default assets/tilesets/ folder. Falls back to a placeholder if none are found."""
         default_path = "assets/tilesets/"
         self.load_tilesets_from_folder(default_path)
 
@@ -166,19 +188,19 @@ class TilesetManager:
             self.tileset_names.append("placeholder")
 
     def load_tileset(self, name: str, image_path: str):
-        """Load a tileset from file"""
+        """Load a single tileset by name and file path."""
         tileset = Tileset(name, image_path)
         self.tilesets[name] = tileset
         if name not in self.tileset_names:
             self.tileset_names.append(name)
 
     def get_tileset(self, name: str) -> Optional[Tileset]:
-        """Get a tileset by name"""
+        """Return the named tileset, or None if it hasn't been loaded."""
         return self.tilesets.get(name)
 
 
 class TilesetEditor:
-    """Main tileset editing interface with layer controls"""
+    """Tileset palette and tile-painting editor."""
 
     LAYER_PRESETS = [
         ("Ground", -100),
@@ -195,28 +217,24 @@ class TilesetEditor:
         self.screen_width = screen_width
         self.screen_height = screen_height
 
-        # Tileset management
         self.tileset_manager = TilesetManager()
         self.tileset_manager.load_default_tilesets()
 
-        # Palette scrolling
         self.palette_scroll_x = 0
         self.palette_scroll_y = 0
 
-        # UI State
         self.active = False
         self.current_tileset_index = 0
         self.selected_tile_x = 0
         self.selected_tile_y = 0
 
-        # Multi-selection
         self.selection_start_x = 0
         self.selection_start_y = 0
         self.selection_end_x = 0
         self.selection_end_y = 0
         self.is_multi_selecting = False
 
-        # Layer controls
+        # ── Layer state ──────────────────────────────────────────────────────
         self.current_layer_preset_index = 0
         self.current_layer = -100
         self.custom_layer_value = -100
@@ -228,23 +246,20 @@ class TilesetEditor:
 
         self.foreground_mode = False
 
-        # Palette UI
+        # ── Palette geometry ─────────────────────────────────────────────────
         self.palette_width = 600
         self.palette_x = screen_width - self.palette_width
         self.palette_y = 100
         self.palette_content_height = 500
         self.tileset_area_y_offset = 35
 
-        # Grid display settings
         self.grid_cell_size = 32
         self.show_grid = True
 
-        # Fonts
         self.font_large = pygame.font.Font(None, 32)
         self.font_medium = pygame.font.Font(None, 24)
         self.font_small = pygame.font.Font(None, 18)
 
-        # Colors
         self.colors = {
             'bg': (20, 20, 30),
             'panel': (30, 30, 45),
@@ -262,31 +277,28 @@ class TilesetEditor:
             'checkbox': (100, 100, 120)
         }
 
-        # Placement
         self.grid_size = 16
         self.room_tiles: dict[str, List[Tile]] = {}
 
-        # Drag state
         self.is_dragging = False
+        self.is_erasing = False
         self.drag_start_pos = None
         self.is_palette_dragging = False
 
-        # UI element rects
         self.ui_rects = {}
 
     def toggle(self):
-        """Toggle editor on/off"""
-        self.active = not self.active
+            self.active = not self.active
 
     def get_current_tileset(self) -> Optional[Tileset]:
-        """Get the currently selected tileset"""
+        """Return the active tileset object, or None if the list is empty."""
         names = self.tileset_manager.tileset_names
         if names and 0 <= self.current_tileset_index < len(names):
             return self.tileset_manager.get_tileset(names[self.current_tileset_index])
         return None
 
     def _get_selection_bounds(self):
-        """Get the bounding box of current selection"""
+        """Normalize selection coords into (min_x, max_x, min_y, max_y)."""
         min_x = min(self.selection_start_x, self.selection_end_x)
         max_x = max(self.selection_start_x, self.selection_end_x)
         min_y = min(self.selection_start_y, self.selection_end_y)
@@ -294,18 +306,18 @@ class TilesetEditor:
         return min_x, max_x, min_y, max_y
 
     def _is_in_palette(self, mouse_x: int, mouse_y: int) -> bool:
-        """Check if mouse is in palette area"""
+        """Returns True when the mouse is over the palette panel."""
         return mouse_x >= self.palette_x and mouse_y >= self.palette_y
 
     def _is_in_ui_rect(self, mouse_x: int, mouse_y: int, rect_name: str) -> bool:
-        """Check if mouse is in a specific UI element"""
+        """Returns True when the mouse is inside a named UI rect."""
         if rect_name in self.ui_rects:
             rect = self.ui_rects[rect_name]
             return rect.collidepoint(mouse_x, mouse_y)
         return False
 
     def handle_input(self, event, camera_x: int, camera_y: int, current_room_name: str):
-        """Handle input events for tileset editor"""
+        """Route keyboard and mouse events while the editor is active."""
         if not self.active:
             return
 
@@ -334,7 +346,6 @@ class TilesetEditor:
                     self.layer_input_text += event.unicode
                 return
 
-            # Switch tileset
             if event.key == pygame.K_TAB:
                 names = self.tileset_manager.tileset_names
                 if names:
@@ -348,21 +359,18 @@ class TilesetEditor:
                     self.palette_scroll_x = 0
                     self.palette_scroll_y = 0
 
-            # Toggle grid
             elif event.key == pygame.K_g:
                 self.show_grid = not self.show_grid
 
-            # Cycle through layer presets
+            # Cycle through layer presets (skip Custom...)
             elif event.key == pygame.K_l:
-                self.current_layer_preset_index = (self.current_layer_preset_index + 1) % len(self.LAYER_PRESETS)
-                preset_name, preset_value = self.LAYER_PRESETS[self.current_layer_preset_index]
-                if preset_value is not None:
-                    self.current_layer = preset_value
-                else:
-                    self.layer_input_active = True
-                    self.layer_input_text = str(self.current_layer)
-
-            # Navigate tile selection
+                next_index = (self.current_layer_preset_index + 1) % len(self.LAYER_PRESETS)
+                # Skip any preset with no fixed value (i.e. Custom...)
+                while self.LAYER_PRESETS[next_index][1] is None:
+                    next_index = (next_index + 1) % len(self.LAYER_PRESETS)
+                self.current_layer_preset_index = next_index
+                _, preset_value = self.LAYER_PRESETS[self.current_layer_preset_index]
+                self.current_layer = preset_value
             elif event.key == pygame.K_LEFT:
                 if not shift_pressed:
                     self.selected_tile_x = max(0, self.selected_tile_x - 1)
@@ -411,7 +419,6 @@ class TilesetEditor:
                     else:
                         self.selection_end_y = min(tileset.rows - 1, self.selection_end_y + 1)
 
-            # Delete tile
             elif event.key == pygame.K_DELETE or event.key == pygame.K_x:
                 mouse_x, mouse_y = pygame.mouse.get_pos()
                 world_x = (mouse_x + camera_x) // RENDER_SCALE
@@ -421,7 +428,6 @@ class TilesetEditor:
         elif event.type == pygame.MOUSEBUTTONDOWN:
             mouse_x, mouse_y = event.pos
 
-            # Check UI interactions
             if self._is_in_ui_rect(mouse_x, mouse_y, 'layer_dropdown'):
                 self.layer_dropdown_open = not self.layer_dropdown_open
                 return
@@ -476,15 +482,19 @@ class TilesetEditor:
                     self._place_tiles(world_x, world_y, current_room_name)
 
             elif event.button == 3:
-                world_x = (mouse_x + camera_x) // RENDER_SCALE
-                world_y = (mouse_y + camera_y) // RENDER_SCALE
-                self._delete_tile_at_position(world_x, world_y, current_room_name)
+                if not self._is_in_palette(mouse_x, mouse_y):
+                    self.is_erasing = True
+                    world_x = (mouse_x + camera_x) // RENDER_SCALE
+                    world_y = (mouse_y + camera_y) // RENDER_SCALE
+                    self._delete_tile_at_position(world_x, world_y, current_room_name)
 
         elif event.type == pygame.MOUSEBUTTONUP:
             if event.button == 1:
                 self.is_dragging = False
                 self.drag_start_pos = None
                 self.is_palette_dragging = False
+            elif event.button == 3:
+                self.is_erasing = False
 
         elif event.type == pygame.MOUSEMOTION:
             if self.is_dragging and not self._is_in_palette(event.pos[0], event.pos[1]):
@@ -492,6 +502,11 @@ class TilesetEditor:
                 world_x = (mouse_x + camera_x) // RENDER_SCALE
                 world_y = (mouse_y + camera_y) // RENDER_SCALE
                 self._place_tiles(world_x, world_y, current_room_name)
+            elif self.is_erasing and not self._is_in_palette(event.pos[0], event.pos[1]):
+                mouse_x, mouse_y = event.pos
+                world_x = (mouse_x + camera_x) // RENDER_SCALE
+                world_y = (mouse_y + camera_y) // RENDER_SCALE
+                self._delete_tile_at_position(world_x, world_y, current_room_name)
             elif self.is_palette_dragging:
                 mouse_x, mouse_y = event.pos
                 if self._is_in_palette(mouse_x, mouse_y):

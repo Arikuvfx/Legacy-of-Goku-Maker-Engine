@@ -1,17 +1,14 @@
 import pygame
 import pygame.gfxdraw
-from typing import Optional, List, Tuple
+from typing import List
 
 
 class CollisionObject:
-    """
-    Invisible wall object that prevents player movement
-    Can be stretched to any size during placement
-    """
+    """Invisible wall placed in the editor to block player movement."""
 
     def __init__(self, x: int, y: int, width: int = 32, height: int = 32, room_name: str = ""):
-        self.x = x  # Top-left corner x
-        self.y = y  # Top-left corner y
+        self.x = x
+        self.y = y
         self.width = width
         self.height = height
         self.room_name = room_name
@@ -21,22 +18,16 @@ class CollisionObject:
         self.active = True
 
     def check_collision_with_player(self, player) -> bool:
-        """Check if player collides with this collision wall"""
-        # Get player's directional hitbox
-        player_rect = player.get_collision_rect()
-
-        # Collision wall box
-        wall_rect = pygame.Rect(self.x, self.y, self.width, self.height)
-
-        # AABB collision detection
-        return player_rect.colliderect(wall_rect)
+        return player.get_collision_rect().colliderect(self.get_rect())
 
     def get_rect(self) -> pygame.Rect:
-        """Get pygame Rect for this collision object"""
         return pygame.Rect(self.x, self.y, self.width, self.height)
 
+    # Alias so this works anywhere player.get_collision_rect() is expected
+    def get_collision_rect(self) -> pygame.Rect:
+        return self.get_rect()
+
     def to_dict(self):
-        """Serialize collision object for saving"""
         return {
             'type': 'collision_wall',
             'x': self.x,
@@ -48,7 +39,6 @@ class CollisionObject:
 
     @staticmethod
     def from_dict(data: dict, room_name: str) -> 'CollisionObject':
-        """Deserialize collision object from save data"""
         return CollisionObject(
             data.get('x', 0),
             data.get('y', 0),
@@ -59,139 +49,92 @@ class CollisionObject:
 
 
 class CollisionObjectManager:
-    """
-    Manages collision objects for all rooms
-    """
+    """Tracks collision walls across all rooms."""
 
     def __init__(self):
-        # Dictionary mapping room names to lists of collision objects
         self.collision_objects: dict[str, List[CollisionObject]] = {}
 
     def get_collision_objects(self, room_name: str) -> List[CollisionObject]:
-        """Get all collision objects for a room"""
         return self.collision_objects.get(room_name, [])
 
     def add_collision_object(self, collision_obj: CollisionObject) -> CollisionObject:
-        """Add a collision object to a room"""
-        if collision_obj.room_name not in self.collision_objects:
-            self.collision_objects[collision_obj.room_name] = []
-
-        self.collision_objects[collision_obj.room_name].append(collision_obj)
+        self.collision_objects.setdefault(collision_obj.room_name, []).append(collision_obj)
         return collision_obj
 
     def remove_collision_object(self, collision_obj: CollisionObject):
-        """Remove a collision object from a room"""
-        if collision_obj.room_name in self.collision_objects:
-            if collision_obj in self.collision_objects[collision_obj.room_name]:
-                self.collision_objects[collision_obj.room_name].remove(collision_obj)
+        room = self.collision_objects.get(collision_obj.room_name, [])
+        if collision_obj in room:
+            room.remove(collision_obj)
 
     def clear_room(self, room_name: str):
-        """Clear all collision objects from a room"""
-        if room_name in self.collision_objects:
-            self.collision_objects[room_name] = []
+        self.collision_objects[room_name] = []
 
     def save_to_dict(self) -> dict:
-        """Save all collision objects to dictionary"""
         return {
-            room_name: [obj.to_dict() for obj in objects]
-            for room_name, objects in self.collision_objects.items()
+            room: [obj.to_dict() for obj in objs]
+            for room, objs in self.collision_objects.items()
         }
 
     def load_from_dict(self, data: dict):
-        """Load collision objects from dictionary"""
-        self.collision_objects = {}
-        for room_name, objects_data in data.items():
-            self.collision_objects[room_name] = [
-                CollisionObject.from_dict(obj_data, room_name)
-                for obj_data in objects_data
-            ]
+        self.collision_objects = {
+            room: [CollisionObject.from_dict(obj, room) for obj in objs]
+            for room, objs in data.items()
+        }
 
 
 def draw_collision_object(screen, collision_obj: CollisionObject, camera_x: int, camera_y: int,
                           render_scale: int, dev_mode: bool = True, selected: bool = False):
-    """
-    Draw a collision object on screen
-
-    Args:
-        screen: Pygame screen surface
-        collision_obj: The collision object to draw
-        camera_x: Camera X position
-        camera_y: Camera Y position
-        render_scale: Rendering scale factor
-        dev_mode: Whether to show collision objects (only visible in dev mode)
-        selected: Whether this object is currently selected
-    """
+    """Only visible in dev mode — draws the red hatched overlay with corner handles."""
     if not dev_mode:
         return
 
-    # Calculate screen position
-    screen_x = (collision_obj.x * render_scale) - camera_x
-    screen_y = (collision_obj.y * render_scale) - camera_y
-    screen_width = collision_obj.width * render_scale
-    screen_height = collision_obj.height * render_scale
+    sx = (collision_obj.x * render_scale) - camera_x
+    sy = (collision_obj.y * render_scale) - camera_y
+    sw = collision_obj.width  * render_scale
+    sh = collision_obj.height * render_scale
 
-    rect = pygame.Rect(int(screen_x), int(screen_y), int(screen_width), int(screen_height))
+    rect = pygame.Rect(int(sx), int(sy), int(sw), int(sh))
 
-    # Draw semi-transparent fill
-    alpha = 100 if not selected else 150
-    fill_color = (255, 0, 0, alpha) if not selected else (255, 100, 0, alpha)
-    fill_surface = pygame.Surface((int(screen_width), int(screen_height)), pygame.SRCALPHA)
-    fill_surface.fill(fill_color)
-    screen.blit(fill_surface, (int(screen_x), int(screen_y)))
+    # Semi-transparent fill
+    alpha = 150 if selected else 100
+    fill_color = (255, 100, 0, alpha) if selected else (255, 0, 0, alpha)
+    fill_surf = pygame.Surface((int(sw), int(sh)), pygame.SRCALPHA)
+    fill_surf.fill(fill_color)
+    screen.blit(fill_surf, (int(sx), int(sy)))
 
-    # Draw border
-    border_color = (255, 0, 0) if not selected else (255, 165, 0)
-    border_width = 2 if not selected else 3
+    border_color = (255, 165, 0) if selected else (255, 0, 0)
+    border_width = 3 if selected else 2
     pygame.draw.rect(screen, border_color, rect, border_width)
 
-    # Draw diagonal lines pattern
-    line_color = (200, 0, 0, 100) if not selected else (255, 140, 0, 150)
-    line_surface = pygame.Surface((int(screen_width), int(screen_height)), pygame.SRCALPHA)
-
+    # Diagonal hatch lines
+    line_color = (255, 140, 0, 150) if selected else (200, 0, 0, 100)
+    line_surf = pygame.Surface((int(sw), int(sh)), pygame.SRCALPHA)
     spacing = 16 * render_scale
-    # Draw diagonal lines from top-left to bottom-right
-    for i in range(int(-screen_height), int(screen_width + screen_height), int(spacing)):
-        start_x = i
-        start_y = 0
-        end_x = i + screen_height
-        end_y = screen_height
-        pygame.draw.line(line_surface, line_color, (start_x, start_y), (end_x, end_y), 1)
+    for i in range(int(-sh), int(sw + sh), int(spacing)):
+        pygame.draw.line(line_surf, line_color, (i, 0), (i + sh, sh), 1)
+    screen.blit(line_surf, (int(sx), int(sy)))
 
-    screen.blit(line_surface, (int(screen_x), int(screen_y)))
-
-    # Draw corner handles
-    handle_size = 6 * render_scale
+    # Corner drag handles
+    handle = 6 * render_scale
     handle_color = (255, 255, 0) if selected else (255, 200, 0)
-
     corners = [
-        (screen_x, screen_y),  # Top-left
-        (screen_x + screen_width, screen_y),  # Top-right
-        (screen_x, screen_y + screen_height),  # Bottom-left
-        (screen_x + screen_width, screen_y + screen_height)  # Bottom-right
+        (sx,      sy),
+        (sx + sw, sy),
+        (sx,      sy + sh),
+        (sx + sw, sy + sh),
     ]
+    for cx, cy in corners:
+        hx = int(cx - handle // 2)
+        hy = int(cy - handle // 2)
+        pygame.draw.rect(screen, handle_color, (hx, hy, int(handle), int(handle)))
+        pygame.draw.rect(screen, (0, 0, 0),    (hx, hy, int(handle), int(handle)), 1)
 
-    for corner_x, corner_y in corners:
-        pygame.draw.rect(screen, handle_color,
-                         (int(corner_x - handle_size // 2),
-                          int(corner_y - handle_size // 2),
-                          int(handle_size), int(handle_size)))
-        pygame.draw.rect(screen, (0, 0, 0),
-                         (int(corner_x - handle_size // 2),
-                          int(corner_y - handle_size // 2),
-                          int(handle_size), int(handle_size)), 1)
-
-    # Draw dimensions text if object is large enough
-    if screen_width > 50 and screen_height > 30:
+    # Dimension label — skip if the box is too small to fit text
+    if sw > 50 and sh > 30:
         font = pygame.font.Font(None, 18)
-        dims_text = f"{collision_obj.width} x {collision_obj.height}"
-        text_surface = font.render(dims_text, True, (255, 255, 255))
-        text_rect = text_surface.get_rect(center=(screen_x + screen_width // 2,
-                                                  screen_y + screen_height // 2))
-
-        # Draw text background
-        bg_rect = text_rect.inflate(8, 4)
-        bg_surface = pygame.Surface((bg_rect.width, bg_rect.height), pygame.SRCALPHA)
-        bg_surface.fill((0, 0, 0, 180))
-        screen.blit(bg_surface, bg_rect.topleft)
-
-        screen.blit(text_surface, text_rect)
+        label = font.render(f"{collision_obj.width} x {collision_obj.height}", True, (255, 255, 255))
+        label_rect = label.get_rect(center=(sx + sw // 2, sy + sh // 2))
+        bg = pygame.Surface((label_rect.width + 8, label_rect.height + 4), pygame.SRCALPHA)
+        bg.fill((0, 0, 0, 180))
+        screen.blit(bg, (label_rect.x - 4, label_rect.y - 2))
+        screen.blit(label, label_rect)

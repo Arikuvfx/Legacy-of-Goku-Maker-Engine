@@ -24,6 +24,7 @@ class Enemy:
         self.y = y
         self.width = 32
         self.height = 32
+        self.shadow_size = 'small'  # 'small' or 'big' — override per enemy type if needed
         self.speed = 1
         self.hp = 50
         self.max_hp = 50
@@ -33,12 +34,8 @@ class Enemy:
         self.enemy_type = enemy_type
         self.variant = variant
 
-        # AI TYPE SYSTEM - Different AI behaviors can be selected
-        # 'easy' = basic movement, 'advanced' = retreats, feints, etc.
-        self.ai_type = ai_type  # 'easy', 'advanced', etc.
+        self.ai_type = ai_type  # 'easy' = basic movement, 'advanced' = retreats/feints/etc.
 
-        # ENEMY CATEGORY SYSTEM - Different combat styles
-        # 'melee' = close-range attacks, 'shooter' = ranged projectile attacks
         self.enemy_category = enemy_category
 
         # Load sprite (will fall back to placeholder if not found)
@@ -75,11 +72,10 @@ class Enemy:
         self.attack_cooldown = 0
 
         if self.enemy_category == 'shooter':
-            # SHOOTER CONFIGURATION - shared across all shooter styles
             self.shooter_style = shooter_style  # 'bomb' = parabolic throw, 'bullet' = straight shot
 
             if self.shooter_style == 'bullet':
-                # GUNNER CONFIGURATION - faster, longer range, lighter damage per shot
+                # bullet: fast shots, longer range, lower damage-per-hit
                 self.attack_duration = 0.35       # Snappy fire animation
                 self.attack_cooldown_time = 1.2   # Fires more frequently than bomb thrower
                 self.attack_range = 200           # Longer effective range
@@ -87,7 +83,7 @@ class Enemy:
                 self.attack_damage = 10           # Lower per-shot damage (compensated by fire rate)
                 self.projectile_speed = 350       # Fast bullet
             elif self.shooter_style == 'rocket':
-                # ROCKET LAUNCHER CONFIGURATION - slow fire rate, high damage, moderate speed
+                # rocket: slow reload, high damage, moderate projectile speed
                 self.attack_duration = 0.5        # Slightly longer fire animation
                 self.attack_cooldown_time = 3.5   # Slow reload
                 self.attack_range = 220           # Long range
@@ -95,7 +91,7 @@ class Enemy:
                 self.attack_damage = 30           # High damage per shot
                 self.projectile_speed = 220       # Slower than bullet
             else:
-                # BOMB THROWER CONFIGURATION (original)
+                # bomb (default): parabolic throw, medium stats
                 self.attack_duration = 0.6
                 self.attack_cooldown_time = 2.0
                 self.attack_range = 150
@@ -105,7 +101,7 @@ class Enemy:
 
             self.projectiles = []  # List of active projectiles
 
-            # ADVANCED AI: Shooter melee rush properties
+            # shooter melee rush — charges in for a close hit occasionally
             self.is_doing_melee_rush = False          # Shooter is closing in for melee
             self.is_shooter_melee_attack = False       # Current attack is a melee (not ranged)
             self.shooter_melee_range = 18             # Close-range threshold for melee hit
@@ -119,7 +115,7 @@ class Enemy:
             self.melee_rush_max_duration = 3.0        # Abort rush after 3 seconds if no hit
             self.melee_rush_swung = False             # Has already swung in this rush
 
-            # Bomb spawning flags (bomb thrower)
+            # bomb spawning flags
             self.should_spawn_bomb = False
             self.bomb_spawned_this_attack = False
             self.bomb_target_x = 0
@@ -131,19 +127,19 @@ class Enemy:
             # y-sorted draw list each frame so bombs depth-sort with the player.
             self.active_bombs = []
 
-            # Bullet spawning flags (gunner)
+            # bullet spawning flags
             self.should_spawn_bullet = False
             self.bullet_spawned_this_attack = False
             self.bullet_dx = 0.0
             self.bullet_dy = 0.0
 
-            # Rocket spawning flags (rocketlauncher)
+            # rocket spawning flags
             self.should_spawn_rocket = False
             self.rocket_spawned_this_attack = False
             self.rocket_dx = 0.0
             self.rocket_dy = 0.0
         else:
-            # MELEE CONFIGURATION (default)
+            # melee defaults
             self.attack_duration = 0.4
             self.attack_cooldown_time = 1.1
             self.attack_range = 15  # Close range
@@ -187,12 +183,11 @@ class Enemy:
         self.min_separation_distance = 16  # Minimum horizontal distance
         self.min_vertical_separation = 16  # Minimum vertical distance
 
-        # PATHFINDING FIX: Store current pathfinding direction and commitment timer
-        self.pathfind_direction = None  # Stores (dx, dy) when navigating around obstacle
-        self.pathfind_commit_timer = 0  # How long to commit to current path
-        self.pathfind_commit_duration = 1  # Commit to a path for at least this long
+        self.pathfind_direction = None  # current alt direction when going around something
+        self.pathfind_commit_timer = 0  # how long to stick with it
+        self.pathfind_commit_duration = 1
 
-        # ADVANCED AI: Retreat and breather mechanics
+        # retreat / breather mechanics (advanced AI only)
         self.low_health_threshold = 0.3  # Retreat when below 30% HP
         self.consecutive_hits = 0  # Track hits received in quick succession
         self.last_hit_time = 0  # When last hit occurred
@@ -221,19 +216,19 @@ class Enemy:
         self.breather_timer = 0
         self.breather_duration = 1.5  # Take a breather for 1.5 seconds
 
-        # ADVANCED AI: Feinting behavior - backing away while facing player
+        # feinting — backs away while still facing the player
         self.is_feinting = False
         self.feint_timer = 0
         self.feint_duration = random.uniform(0.6, 1.2)  # Feint for 0.6-1.2 seconds (shorter)
         self.feint_distance = 18  # Distance to move during feints (closer)
 
-        # Pause after feinting (sometimes wait after backing away)
+        # optional pause after a feint
         self.is_pausing_after_feint = False
         self.pause_after_feint_timer = 0
         self.pause_after_feint_chance = 0.5  # 50% chance to pause after feinting
         self.pause_after_feint_duration = random.uniform(0.4, 0.8)  # Short pause
 
-        # Feint chance and cooldown - only triggers after attacking
+        # feint is only eligible right after an attack
         self.feint_chance = 0.20  # 20% chance to feint after attacking
         self.last_feint_attempt = 0
         self.feint_check_cooldown = 0.5  # Check shortly after attack
@@ -440,8 +435,7 @@ class Enemy:
                 # Calculate force strength based on how close they are
                 force = (min_distance - distance) / min_distance
 
-                # STANDING ENEMY FIX: Increase separation force if other enemy is standing still
-                # This makes moving enemies avoid standing ones more strongly
+                # standing enemies exert more push so movers go around them
                 if other_enemy.is_standing_still():
                     force *= 2.0  # Double the force to push away from standing enemies
 
@@ -609,15 +603,12 @@ class Enemy:
         if self.wait_after_attack > 0:
             self.wait_after_attack -= dt
 
-        # ADVANCED AI: Update retreat cooldown
         if self.retreat_cooldown > 0:
             self.retreat_cooldown -= dt
 
-        # ADVANCED AI: Update feint cooldown
         if self.feint_cooldown > 0:
             self.feint_cooldown -= dt
 
-        # ADVANCED AI: Update shooter melee rush cooldown
         if self.enemy_category == 'shooter' and self.melee_rush_cooldown > 0:
             self.melee_rush_cooldown -= dt
 
@@ -628,7 +619,7 @@ class Enemy:
         # Update stuck detection
         self.update_stuck_detection(dt)
 
-        # PATHFINDING FIX: Update pathfinding commitment timer
+        # tick down the pathfinding commitment
         if self.pathfind_commit_timer > 0:
             self.pathfind_commit_timer -= dt
             if self.pathfind_commit_timer <= 0:
@@ -718,7 +709,7 @@ class Enemy:
                 if self.has_sprite:
                     self.sprite.set_animation('idle', self.direction)
 
-        # ADVANCED AI: Check for retreat conditions (only for advanced AI)
+        # check retreat conditions (advanced AI)
         if self.ai_type == 'advanced' and not self.is_attacking and self.state == 'chase':
             current_time = time.time()
             health_percent = self.hp / self.max_hp
@@ -752,7 +743,7 @@ class Enemy:
                         self.pathfind_direction = None
                         self.pathfind_commit_timer = 0
 
-        # ADVANCED AI: Check for shooter melee rush (only advanced AI shooters, not already rushing)
+        # periodically decide whether to rush in for a melee hit (advanced shooters)
         if self.ai_type == 'advanced' and self.enemy_category == 'shooter' and not self.is_attacking and self.state == 'chase':
             if not self.is_doing_melee_rush and self.melee_rush_cooldown <= 0 and self.wait_after_attack <= 0:
                 current_time = time.time()
@@ -766,8 +757,7 @@ class Enemy:
                         self.pathfind_direction = None
                         self.pathfind_commit_timer = 0
 
-        # ADVANCED AI: Check for feinting conditions (only for advanced AI and MELEE enemies)
-        # ONLY feint right after attacking during the wait_after_attack period
+        # feinting only eligible right after an attack (advanced melee)
         if self.ai_type == 'advanced' and self.enemy_category == 'melee' and not self.is_attacking and self.state == 'chase':
             # Only check if we're in the wait period after an attack
             if self.wait_after_attack > 0:
@@ -775,7 +765,7 @@ class Enemy:
                 if not self.is_retreating and not self.is_breathing and not self.is_feinting and not self.is_pausing_after_feint:
                     current_time = time.time()
 
-                    # Check periodically (short interval since we're already in wait period)
+                    # short interval — we're already inside the post-attack window
                     time_since_last_check = current_time - self.last_feint_attempt
                     can_check_feint = time_since_last_check >= self.feint_check_cooldown
 
@@ -799,16 +789,16 @@ class Enemy:
 
         # Behavior based on state
         if not self.is_attacking:
-            # ADVANCED AI: Handle retreat/breather behavior
+            # retreat / breather
             if self.is_retreating or self.is_breathing:
                 self.retreat_behavior(dt, player, world_width, world_height)
-            # ADVANCED AI: Handle shooter melee rush (shooter enemies only)
+            # shooter closing in for a melee hit
             elif self.enemy_category == 'shooter' and getattr(self, 'is_doing_melee_rush', False):
                 self.shooter_melee_rush_behavior(dt, player, world_width, world_height)
-            # ADVANCED AI: Handle feinting behavior
+            # feinting
             elif self.is_feinting:
                 self.feint_behavior(dt, player, world_width, world_height)
-            # ADVANCED AI: Handle pause after feint
+            # brief pause after a feint
             elif self.is_pausing_after_feint:
                 self.pause_after_feint_behavior(dt, player)
             elif self.state == 'idle':
@@ -818,9 +808,8 @@ class Enemy:
 
     def apply_separation_force(self, dt):
         """
-        Apply separation force to avoid overlapping with other enemies.
-        STANDING ENEMY FIX: Enemies that are standing still (attacking or waiting)
-        do NOT move due to separation force. Only moving enemies get pushed away.
+        Push enemies apart so they don't pile on top of each other.
+        Enemies that are attacking or waiting hold their ground; only moving ones drift away.
         """
         # Don't apply separation if we're standing still (attacking or waiting after attack)
         # or if we're knocked back
@@ -846,9 +835,8 @@ class Enemy:
 
     def shooter_melee_rush_behavior(self, dt, player, world_width, world_height):
         """
-        ADVANCED AI: Shooter closes in on the player to land a melee hit.
-        Charges like a melee enemy; once in range, swings with the 'melee' animation.
-        After the hit completes the rush ends and the shooter backs off to normal range.
+        Charges straight at the player and lands one melee hit before retreating
+        back to normal shooting range. Rush aborts automatically on timeout.
         """
         # Advance the rush timeout - abort if it takes too long
         self.melee_rush_timer += dt
@@ -1110,7 +1098,7 @@ class Enemy:
         new_y = self.y + dy * move_speed
         is_blocked = self.check_collision_with_obstacles(new_x, new_y)
 
-        # PATHFINDING FIX: Use committed direction if still valid, or find new one if needed
+        # stick with the current alt direction or find a new one if stuck
         if self.pathfind_commit_timer > 0 and self.pathfind_direction is not None:
             # We're committed to a pathfinding direction, use it
             dx, dy = self.pathfind_direction
@@ -1158,7 +1146,7 @@ class Enemy:
 
     def retreat_behavior(self, dt, player, world_width, world_height):
         """
-        ADVANCED AI: Retreat from player to gain distance and take a breather.
+        Back away from the player, then hold still for a moment before re-engaging.
         Used when low on health or after taking many consecutive hits.
         """
         # Handle breather state (resting after reaching safe distance)
@@ -1252,7 +1240,7 @@ class Enemy:
 
     def feint_behavior(self, dt, player, world_width, world_height):
         """
-        ADVANCED AI: Feint behavior - back away from player while keeping eyes on them.
+        Step away from the player while still facing them — sells the idea of backing off.
         Creates tactical spacing after attacking.
         """
         # Update timer
@@ -1342,7 +1330,7 @@ class Enemy:
 
     def pause_after_feint_behavior(self, dt, player):
         """
-        ADVANCED AI: Pause after feinting - stand still and watch player briefly.
+        Brief stand-and-stare after a feint — keeps the player guessing.
         Creates a moment of tension before re-engaging.
         """
         # Update timer
@@ -1513,7 +1501,7 @@ class Enemy:
         distance = self.distance_to(player.x, player.y)
 
         if self.enemy_category == 'shooter':
-            # ADVANCED AI: Shooter performing a melee hit instead of ranged
+            # shooter landed a melee rush — use melee damage instead of projectile
             if getattr(self, 'is_shooter_melee_attack', False):
                 if distance < self.shooter_melee_range:
                     if self.direction == 'up':
@@ -1741,7 +1729,7 @@ class Enemy:
         self.hp -= damage
         self.hurt_tint = 1.0
 
-        # ADVANCED AI: Track consecutive hits for combo detection
+        # track back-to-back hits so the enemy can decide to retreat
         if self.ai_type == 'advanced':
             current_time = time.time()
 

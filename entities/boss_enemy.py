@@ -23,6 +23,9 @@ BOSS_REGISTRY = {
         'ai_type':       'advanced',
         'enemy_category': 'melee',
         'display_name':  'Pui Pui',
+        'shadow_size':   'small',  # 'small' or 'big'
+        'shadow_width':  32,       # shadow width in world units (matches player)
+        'shadow_y_offset': 13.5,     # extra pixels downward to align with actual feet
     },
 }
 
@@ -56,7 +59,6 @@ class BossEnemy(Enemy):
             enemy_category=cfg['enemy_category'],
         )
 
-        # ── Override stats from registry ────────────────────────────────────
         self.boss_id      = boss_id
         self.display_name = cfg['display_name']
 
@@ -69,21 +71,23 @@ class BossEnemy(Enemy):
         self.width        = cfg['hitbox_width']
         self.height       = cfg['hitbox_height']
 
-        # Keep frame dimensions for sprite loading
+        # full frame size — needed for slicing the spritesheet correctly
         self._frame_width  = cfg['width']
         self._frame_height = cfg['height']
 
-        # Patch the attack stats that Enemy.__init__ already set
+        # overwrite whatever Enemy.__init__ defaulted to
         self.attack_damage = cfg['attack_damage']
         self.attack_range  = cfg['attack_range']
 
-        # Bosses are always "advanced" — bump awareness so they notice the
-        # player from farther away.
+        # bosses spot the player from further away than regular enemies
         self.awareness_range = 280
         self.forget_range    = 450
 
         # Mark as boss so game systems can react (XP, death events, etc.)
         self.is_boss = True
+        self.shadow_size     = cfg.get('shadow_size', 'small')
+        self.shadow_width    = cfg.get('shadow_width', self.width)
+        self.shadow_y_offset = cfg.get('shadow_y_offset', 0)
 
         # Load boss-specific sprite from assets/sprites/enemies/boss/{boss_id}/
         # Pass full frame size so the sheet is sliced correctly.
@@ -92,9 +96,6 @@ class BossEnemy(Enemy):
             self.sprite = boss_sprite
             self.has_sprite = True
 
-    # ------------------------------------------------------------------
-    # Hitbox uses the real character size, not the spritesheet frame size
-    # ------------------------------------------------------------------
     def get_sort_key(self):
         """Sort by visual feet position using the full sprite frame height.
 
@@ -135,8 +136,5 @@ class BossEnemy(Enemy):
                     return True
         return False
 
-    # ------------------------------------------------------------------
-    # Override XP reward so bosses give more XP than normal enemies
-    # ------------------------------------------------------------------
     def get_xp_reward(self, game_config):
         return getattr(game_config, 'boss_enemy_xp', game_config.basic_enemy_xp * 5)

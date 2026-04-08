@@ -8,10 +8,7 @@ import pygame.gfxdraw
 
 
 class SpriteEditor:
-    """
-    Paint.NET-inspired sprite/pixel art editor with import, drawing tools, and export
-    Compact and optimized version
-    """
+    """Sprite/pixel art editor with Paint.NET-style tools: draw, import, export."""
 
     def __init__(self, screen_width, screen_height):
         self.screen_width = screen_width
@@ -158,12 +155,10 @@ class SpriteEditor:
         self.dragging_color_wheel = False
         self.dragging_value_slider = False
 
-        # New: Hex color input
         self.show_hex_input = False
         self.hex_input_text = ""
         self.hex_input_active = False
 
-        # New: HSV sliders state
         self.dragging_h_slider = False
         self.dragging_s_slider = False
         self.dragging_v_slider = False
@@ -1180,6 +1175,10 @@ class SpriteEditor:
         if self.active:
             print("🎨 Sprite Editor opened")
             self._center_canvas()
+        else:
+            pygame.mouse.set_visible(True)
+            pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_ARROW)
+            self.show_custom_cursor = False
 
     def handle_input(self, event):
         """Handle input events"""
@@ -1206,7 +1205,6 @@ class SpriteEditor:
         if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION):
             return self._handle_mouse_input(event)
 
-        # Mouse wheel - REMOVED tolerance control from here
         if event.type == pygame.MOUSEWHEEL:
             return self._handle_mouse_wheel(event)
 
@@ -1553,6 +1551,9 @@ class SpriteEditor:
 
         if event.key == pygame.K_ESCAPE:
             self.active = False
+            pygame.mouse.set_visible(True)
+            pygame.mouse.set_cursor(pygame.SYSTEM_CURSOR_ARROW)
+            self.show_custom_cursor = False
             return 'close'
 
         elif event.key == pygame.K_z and mods & pygame.KMOD_CTRL:
@@ -1950,7 +1951,6 @@ class SpriteEditor:
             self.canvas_offset_y += pan_amount
             return None
         else:
-            # Zoom only - NO TOLERANCE CONTROL
             return self._handle_zoom_wheel(event)
 
     def _handle_zoom_wheel(self, event):
@@ -2100,7 +2100,6 @@ class SpriteEditor:
 
     def _handle_ui_click(self, mouse_x, mouse_y, is_left_click):
         """Handle clicks on UI elements"""
-        # Menu buttons - MOVED TO THE LEFT
         button_y, button_height = 10, 30
         buttons = [
             {'id': 'new', 'label': 'New', 'x': 20, 'w': 80},
@@ -2154,7 +2153,6 @@ class SpriteEditor:
                     self.prompt_canvas_size()
                 return True
 
-        # Tab buttons - MOVED TO THE LEFT
         tab_y, tab_height, tab_width = 10, 30, 100
         tabs = [
             {'id': 'canvas_tab', 'label': 'Canvas', 'x': 310},
@@ -2787,7 +2785,6 @@ class SpriteEditor:
         pygame.draw.rect(screen, (35, 35, 42), (0, 0, self.screen_width, 50))
         pygame.draw.line(screen, (60, 60, 70), (0, 49), (self.screen_width, 49), 1)
 
-        # Menu buttons - MOVED TO THE LEFT
         buttons = [
             {'id': 'new', 'label': 'New', 'x': 20, 'w': 80},
             {'id': 'import', 'label': 'Import', 'x': 110, 'w': 90},
@@ -2803,7 +2800,6 @@ class SpriteEditor:
             text_rect = text.get_rect(center=(btn['x'] + btn['w'] // 2, 25))
             screen.blit(text, text_rect)
 
-        # Tab buttons - MOVED TO THE LEFT
         tab_width = 100
         tabs = [
             {'id': 'canvas_tab', 'label': 'Sprite Editor', 'x': 310},
@@ -3465,4 +3461,3 @@ class SpriteEditor:
         shadow_surface.fill((0, 0, 0, 128), special_flags=pygame.BLEND_RGBA_MULT)
         screen.blit(shadow_surface, (mouse_x - 11, mouse_y - 11))
         screen.blit(cursor_surface, (mouse_x - 12, mouse_y - 12))
-

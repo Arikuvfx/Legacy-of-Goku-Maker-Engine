@@ -22,14 +22,15 @@ class Player:
         self.y = y
         self.width = 32
         self.height = 32
-        # Adjust base speeds to account for RENDER_SCALE
+        self.shadow_size = 'small'  # 'small' or 'big'
+        # divide by RENDER_SCALE so the world-unit speed stays consistent
         self.speed = 3 / RENDER_SCALE
         self.run_speed = 6 / RENDER_SCALE
         self.hp = 100
         self.max_hp = 100
         self.ki = 100
         self.max_ki = 100
-        self.level = 5
+        self.level = 60
         self.exp = 0
         self.direction = 'down'
         self.inventory = []
@@ -41,9 +42,8 @@ class Player:
         self.stat_points = 0
         self.pending_level_up = False
 
-        # Add layer properties - ENABLE Y-SORTING for depth with objects
         self.draw_layer = DrawLayer.PLAYER
-        self.y_sort = True  # Changed to True for Y-based depth sorting
+        self.y_sort = True
 
         # Transformation system (will be initialized after game_config is set)
         self.transformation = None
@@ -216,7 +216,6 @@ class Player:
         self.last_move_direction['dx'] = dx
         self.last_move_direction['dy'] = dy
 
-        # UPDATE DIRECTION BASED ON MOVEMENT
         if dx != 0 or dy != 0:
             if dx != 0 and dy == 0:
                 # Pure horizontal — always update direction
@@ -224,19 +223,11 @@ class Player:
             elif dy != 0 and dx == 0:
                 # Pure vertical — always update direction
                 self.direction = 'down' if dy > 0 else 'up'
-            elif is_running:
-                # Running diagonally: keep whichever direction is already set so
-                # that adding a perpendicular key doesn't rotate the sprite.
-                pass
             else:
-                # Walking diagonally (or transitioning from run to walk with a
-                # perpendicular key held): update to the dominant axis so that
-                # e.g. releasing UP while pressing RIGHT correctly faces right,
-                # matching the behaviour of running down→up and running right→left.
-                if abs(dx) >= abs(dy):
-                    self.direction = 'right' if dx > 0 else 'left'
-                else:
-                    self.direction = 'down' if dy > 0 else 'up'
+                # Diagonal (walking or running): keep whichever direction is
+                # already set so that adding a perpendicular key doesn't
+                # rotate the sprite.
+                pass
 
         # Keep the attribute in sync so external systems and the next frame
         # can rely on self.is_running being accurate.
@@ -569,7 +560,7 @@ class Player:
                 self.sprite.set_animation('idle', self.direction)
                 self.current_animation_state = 'idle'
 
-        # Legacy ki drain code (kept for compatibility)
+        # fallback ki drain if state somehow doesn't match
         if self.is_firing_beam and self.current_animation_state != 'firebeam':
             if not self.is_transformed():
                 ki_drain = self.beam_ki_drain * dt
@@ -609,26 +600,21 @@ class Player:
             self.hp = 0
 
         if no_knockback:
-            # No physical displacement, no animation interrupt — only the red tint
-            # (set by the caller) signals the hit. Just apply invulnerability frames.
+            # just grant i-frames; the caller handles the visual tint
             self.invulnerable = True
             self.invulnerable_timer = self.invulnerable_duration
             return
 
-        # Determine if this is a horizontal attack (left/right dominant)
         is_horizontal_attack = abs(knockback_x) > abs(knockback_y)
 
-        # Track boundary hits from horizontal attacks
         if is_horizontal_attack and hasattr(self, 'last_knockback_hit_boundary'):
             if self.last_knockback_hit_boundary:
                 self.horizontal_boundary_hits += 1
 
-            # After 4 boundary hits from horizontal attacks, convert the 5th to vertical
+            # after enough horizontal wall bounces, redirect the next hit downward
             if self.horizontal_boundary_hits >= 3:
-                # Convert horizontal knockback to vertical (from above)
                 knockback_x = 0.0
-                knockback_y = 1.0  # Push downward (as if attacked from above)
-                # Reset counter after applying the special attack
+                knockback_y = 1.0
                 self.horizontal_boundary_hits = 0
         else:
             # Reset counter if hit from vertical direction
@@ -643,13 +629,10 @@ class Player:
         self.invulnerable = True
         self.invulnerable_timer = self.invulnerable_duration
 
-        # Update direction to face opposite of knockback (toward the enemy)
-        # Since knockback pushes away from enemy, we face opposite to knockback direction
+        # face toward the enemy that hit us (opposite of knockback direction)
         if abs(knockback_x) > abs(knockback_y):
-            # Horizontal knockback is dominant
             self.direction = 'right' if knockback_x < 0 else 'left'
         else:
-            # Vertical knockback is dominant
             self.direction = 'down' if knockback_y < 0 else 'up'
 
         # Cancel any ongoing attacks
@@ -696,39 +679,5 @@ class Player:
         self.run_speed = base_run * speed_multiplier
 
     def draw(self, screen, camera, colors):
-        self.sprite.draw(screen, self.x, self.y, camera, scale=RENDER_SCALE)
-
-        # Convert WORLD coordinates to SCREEN coordinates for indicators
-        screen_x = (self.x * RENDER_SCALE) - camera.x
-        screen_y = (self.y * RENDER_SCALE) - camera.y
-
-        indicator_color = colors['RED'] if (self.is_attacking or self.is_charging_beam or self.is_firing_beam) else \
-            colors['YELLOW']
-
-        # Direction indicator positions (scaled)
-        offset = (self.height // 2) * RENDER_SCALE
-        indicator_radius = 4
-
-        if self.direction == 'up':
-            pygame.draw.circle(screen, indicator_color, (int(screen_x), int(screen_y - offset + 5)), indicator_radius)
-        elif self.direction == 'down':
-            pygame.draw.circle(screen, indicator_color, (int(screen_x), int(screen_y + offset - 5)), indicator_radius)
-        elif self.direction == 'left':
-            pygame.draw.circle(screen, indicator_color, (int(screen_x - offset + 5), int(screen_y)), indicator_radius)
-        elif self.direction == 'right':
-            pygame.draw.circle(screen, indicator_color, (int(screen_x + offset - 5), int(screen_y)), indicator_radius)
-
-        # Running indicator
-        if self.is_running:
-            pygame.draw.circle(screen, colors['WHITE'], (int(screen_x), int(screen_y - offset - 10)), 3)
-
-        # Beam charge bar
-        if self.is_charging_beam:
-            charge_progress = min(self.beam_charge_time / self.beam_charge_required, 1.0)
-            bar_width = 40
-            bar_height = 5
-            bar_x = screen_x - bar_width // 2
-            bar_y = screen_y - offset - 20
-            pygame.draw.rect(screen, colors['BLACK'], (bar_x, bar_y, bar_width, bar_height))
-            pygame.draw.rect(screen, colors['YELLOW'], (bar_x, bar_y, int(bar_width * charge_progress), bar_height))
-            pygame.draw.rect(screen, colors['WHITE'], (bar_x, bar_y, bar_width, bar_height), 1)
+        tint = getattr(self, 'hurt_tint', 0.0)
+        self.sprite.draw(screen, self.x, self.y, camera, scale=RENDER_SCALE, hurt_tint=tint)

@@ -19,12 +19,10 @@ class ObjectEditor:
         self.active = False
         self.room_manager = room_manager
 
-        # Set up fonts
         self.font_small = pygame.font.Font(None, 16)
         self.font_medium = pygame.font.Font(None, 20)
         self.font_large = pygame.font.Font(None, 24)
 
-        # Color scheme
         self.colors = {
             'bg': (20, 20, 30),
             'bg_transparent': (20, 20, 30, 230),
@@ -48,7 +46,7 @@ class ObjectEditor:
             'variant_selected': (50, 150, 255)
         }
 
-        # Palette layout
+        # ── Palette geometry ─────────────────────────────────────────────────
         self.palette_width = 600
         self.palette_x = screen_width - self.palette_width
         self.palette_y = 100
@@ -59,7 +57,7 @@ class ObjectEditor:
         self.scroll_offset = 0
         self.max_scroll = 0
 
-        # Object managers
+        # ── Object managers ───────────────────────────────────────────────────
         self.spawn_manager = SpawnObjectManager()
         self.collision_manager = CollisionObjectManager()
         self.gate_manager = LevelGateManager()
@@ -69,19 +67,17 @@ class ObjectEditor:
         self.transition_config = TransitionConfigDialog(screen_width, screen_height)
         self.pending_transition = None
 
-        # Collision placement tracking
+        # ── Placement tracking ────────────────────────────────────────────────
         self.placing_collision = False
         self.collision_start_x = 0
         self.collision_start_y = 0
         self.preview_collision = None
 
-        # Transition placement tracking
         self.placing_transition = False
         self.transition_start_x = 0
         self.transition_start_y = 0
         self.preview_transition = None
 
-        # Transition spawn placement tracking
         self.placing_transition_spawn = False
         self.transition_spawn_source_room = None
         self.pending_transition_for_spawn = None
@@ -93,45 +89,39 @@ class ObjectEditor:
         self.on_transition_placed = None
         self.on_stone_placed = None
 
-        # flyingpad init
+        # ── Flying pad ────────────────────────────────────────────────────────
         self.flying_pad_manager = FlyingPadManager()
         self.flying_pad_path_editor = FlyingPadPathEditor(screen_width, screen_height)
-
-        # Flying pad placement state
         self.placing_flying_pad = False
         self.pending_flying_pad = None
-
-        # Add callbacks
         self.on_flying_pad_placed = None
         self.on_flying_pad_deleted = None
 
-        # Save point manager
+        # ── Save points ───────────────────────────────────────────────────────
         self.save_point_manager = SavePointManager()
         self.on_save_point_placed = None
         self.on_save_point_deleted = None
 
-        # Object under cursor (for deletion)
-        self.hovered_object = None
+        self.hovered_object = None        # object under the cursor (for deletion highlight)
         self.hovered_object_type = None
 
-        # Gate level requirement input
+        # ── Gate level input ──────────────────────────────────────────────────
         self.gate_required_level = 1
         self.gate_level_input_active = False
         self.gate_level_text = "1"
 
-        # Variant selection system
-        self.selected_variant = None  # Currently selected variant for multi-variant objects
+        # ── Variant selection ─────────────────────────────────────────────────
+        self.selected_variant = None
         self.hover_variant_index = -1
-        self.showing_variants_for = None  # Which object is showing variants
+        self.showing_variants_for = None
 
-        # Define stone variants
+        # ── Variant definitions ───────────────────────────────────────────────
         self.stone_variants = [
             {'type': 'small', 'name': 'Small', 'width': 16, 'height': 16},
             {'type': 'medium', 'name': 'Medium', 'width': 24, 'height': 24},
             {'type': 'big', 'name': 'Big', 'width': 32, 'height': 32}
         ]
 
-        # Define gate variants
         self.gate_variants = [
             {'type': 'stone', 'name': 'Stone'},
             {'type': 'wood', 'name': 'Wood'},
@@ -140,7 +130,6 @@ class ObjectEditor:
             {'type': 'metal', 'name': 'Metal'}
         ]
 
-        # Flying pad variants
         self.flying_pad_variants = [
             {'type': 'stone1', 'name': 'Stone1'},
             {'type': 'stone2', 'name': 'Stone2'},
@@ -152,7 +141,6 @@ class ObjectEditor:
             {'type': 'buu', 'name': 'Buu'}
         ]
 
-        # Available objects organized by category (simplified)
         self.categories = {
             'System': [],
             'Decorations': [
@@ -554,6 +542,9 @@ class ObjectEditor:
                     room.spawn_points = []
                     self.room_manager.save_room(room)
 
+            if hasattr(self, 'on_spawn_deleted') and self.on_spawn_deleted:
+                self.on_spawn_deleted(obj, self.current_room_name)
+
         elif obj_type == 'collision':
             self.collision_manager.remove_collision_object(obj)
             if self.room_manager:
@@ -561,6 +552,7 @@ class ObjectEditor:
                 if room and hasattr(room, 'collision_objects'):
                     if obj in room.collision_objects:
                         room.collision_objects.remove(obj)
+                    self.room_manager.save_room(room)
 
             if hasattr(self, 'on_collision_deleted') and self.on_collision_deleted:
                 self.on_collision_deleted(obj, self.current_room_name)
@@ -726,6 +718,9 @@ class ObjectEditor:
                 if room:
                     room.spawn_point = (int(self.preview_x), int(self.preview_y))
 
+            if hasattr(self, 'on_spawn_placed') and self.on_spawn_placed and spawn_obj:
+                self.on_spawn_placed(spawn_obj, room_name)
+
         elif self.selected_object.get('object_type') == 'destructible_stone':
             from objects.destructible_stone import DestructibleStone
 
@@ -837,6 +832,9 @@ class ObjectEditor:
                         room.level_gates = []
                     room.level_gates.append(gate)
 
+            if hasattr(self, 'on_gate_placed') and self.on_gate_placed:
+                self.on_gate_placed(gate, room_name)
+
     def _draw_delete_highlight(self, screen, camera_x, camera_y):
         """Draw red outline around object that's about to be deleted"""
         obj = self.hovered_object
@@ -904,6 +902,9 @@ class ObjectEditor:
                 self.collision_manager.collision_objects[room_name] = room.collision_objects
 
         self.preview_collision = None
+
+        if hasattr(self, 'on_collision_placed') and self.on_collision_placed:
+            self.on_collision_placed(collision_obj, room_name)
 
     def _finalize_transition_placement(self, room_name):
         """Finish placing a room transition after dragging"""
@@ -1166,7 +1167,9 @@ class ObjectEditor:
                     except ValueError:
                         self.gate_level_text = str(self.gate_required_level)
                 elif event.unicode.isdigit():
-                    if len(self.gate_level_text) < 3:
+                    if self.gate_level_text == "0":
+                        self.gate_level_text = event.unicode
+                    elif len(self.gate_level_text) < 3:
                         self.gate_level_text += event.unicode
                     else:
                         self.gate_level_text = event.unicode

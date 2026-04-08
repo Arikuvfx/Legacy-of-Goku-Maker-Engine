@@ -1,13 +1,16 @@
 import pygame
 import os
+import sys
+import time
+from config.settings import RENDER_SCALE
 
 
 class HUDSprite:
-    """Loads and manages HUD sprite elements"""
+    """Wraps a single sprite file with a draw helper that handles scaling and opacity."""
 
     def __init__(self, filepath):
-        self.sprite = None
         self.filepath = filepath
+        self.sprite   = None
         if os.path.exists(filepath):
             try:
                 self.sprite = pygame.image.load(filepath).convert_alpha()
@@ -18,305 +21,230 @@ class HUDSprite:
             print(f"✗ Not found: {filepath}")
 
     def draw(self, screen, x, y, width=None, height=None, opacity=255):
-        """Draw the sprite at position with optional scaling and opacity"""
         if not self.sprite:
             return False
-
-        sprite_to_draw = self.sprite
-
-        # Scale if needed
-        if width and height:
-            sprite_to_draw = pygame.transform.scale(self.sprite, (width, height))
-
-        # Apply opacity if needed
+        surf = pygame.transform.scale(self.sprite, (width, height)) if (width and height) else self.sprite
         if opacity < 255:
-            sprite_to_draw = sprite_to_draw.copy()
-            sprite_to_draw.set_alpha(opacity)
-
-        screen.blit(sprite_to_draw, (x, y))
+            surf = surf.copy()
+            surf.set_alpha(opacity)
+        screen.blit(surf, (x, y))
         return True
 
 
 class SpriteHUD:
     """
-    Legacy of Goku style HUD system using ONLY sprites
+    Legacy-of-Goku style HUD — everything is a sprite, no vector drawing.
 
-    Adjust self.scale to resize the entire HUD:
-    - 0.5 = 50% size (compact)
-    - 1.0 = 100% size (normal)
-    - 1.5 = 150% size (large)
+    Tweak self.scale to resize the whole HUD at once:
+      0.5 = compact, 1.0 = normal, 1.5 = large
     """
 
     def __init__(self, screen_width, screen_height):
-        self.screen_width = screen_width
+        self.screen_width  = screen_width
         self.screen_height = screen_height
         self.visible = True
 
-        # HUD positioning (top-left corner)
         self.hud_x = 10
         self.hud_y = 10
 
-        # HUD scaling factor - CHANGE THIS TO RESIZE THE ENTIRE HUD
-        self.scale = 0.7  # 1.0 = 100%, 0.5 = 50%, 1.5 = 150%, etc.
+        # Change this one value to resize everything
+        self.scale = 0.7 * 2
 
-        # Build absolute path to assets
-        import sys
         if getattr(sys, 'frozen', False):
-            application_path = os.path.dirname(sys.executable)
+            app_path = os.path.dirname(sys.executable)
         else:
-            application_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-        self.base_path = os.path.join(application_path, "assets", "ui", "hud")
+            app_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.base_path = os.path.join(app_path, "assets", "ui", "hud")
 
         print(f"\n=== Loading HUD Sprites ===")
         print(f"Looking in: {self.base_path}")
-        print(f"HUD Scale: {self.scale * 100:.0f}%\n")
+        print(f"HUD Scale:  {self.scale * 100:.0f}%\n")
 
-        # Load all sprites
         self.sprites = {
-            'frame': HUDSprite(os.path.join(self.base_path, "frame.png")),
-            'hp_bar': HUDSprite(os.path.join(self.base_path, "hp_bar.png")),
-            'ki_bar': HUDSprite(os.path.join(self.base_path, "ki_bar.png")),
-            'transformed_ki_bar': HUDSprite(os.path.join(self.base_path, "transformed_ki_bar.png")),
-            'exp_bar': HUDSprite(os.path.join(self.base_path, "exp_bar.png")),
-            'transform_bar': HUDSprite(os.path.join(self.base_path, "transform_bar.png")),
-            'attack_icon_blast': HUDSprite(os.path.join(self.base_path, "attack_icon_blast.png")),
-            'attack_icon_beam': HUDSprite(os.path.join(self.base_path, "attack_icon_beam.png")),
+            'frame':               HUDSprite(os.path.join(self.base_path, "frame.png")),
+            'hp_bar':              HUDSprite(os.path.join(self.base_path, "hp_bar.png")),
+            'ki_bar':              HUDSprite(os.path.join(self.base_path, "ki_bar.png")),
+            'transformed_ki_bar':  HUDSprite(os.path.join(self.base_path, "transformed_ki_bar.png")),
+            'exp_bar':             HUDSprite(os.path.join(self.base_path, "exp_bar.png")),
+            'transform_bar':       HUDSprite(os.path.join(self.base_path, "transform_bar.png")),
+            'attack_icon_blast':   HUDSprite(os.path.join(self.base_path, "attack_icon_blast.png")),
+            'attack_icon_beam':    HUDSprite(os.path.join(self.base_path, "attack_icon_beam.png")),
             'transformation_icon': HUDSprite(os.path.join(self.base_path, "transformation_icon.png")),
-            'attack_icon': HUDSprite(os.path.join(self.base_path, "attack_icon.png")),
+            'attack_icon':         HUDSprite(os.path.join(self.base_path, "attack_icon.png")),
         }
 
-        print(f"\n=== HUD Loading Complete ===\n")
+        print("=== HUD Loading Complete ===\n")
 
-        # HUD layout configuration (base dimensions before scaling)
+        # Base dimensions of each element at scale 1.0 (pixels)
         self.config = {
-            'frame': {'x': 0, 'y': 0, 'w': 338, 'h': 100},
-            'attack_icon': {'x': 0, 'y': 0, 'w': 338, 'h': 100},
-            'hp_bar': {'x': 0, 'y': 0, 'w': 338, 'h': 100},
-            'ki_bar': {'x': 0, 'y': 0, 'w': 338, 'h': 100},
-            'transformed_ki_bar': {'x': 0, 'y': 0, 'w': 338, 'h': 100},
-            'exp_bar': {'x': 0, 'y': 0, 'w': 338, 'h': 100},
-            'transform_bar': {'x': 0, 'y': 0, 'w': 338, 'h': 100},
+            'frame':              {'x': 0, 'y': 0, 'w': 338, 'h': 100},
+            'attack_icon':        {'x': 0, 'y': 0, 'w': 338, 'h': 100},
+            'hp_bar':             {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 123, 'bar_end': 294},
+            'ki_bar':             {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 123, 'bar_end': 294},
+            'transformed_ki_bar': {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 123, 'bar_end': 294},
+            'exp_bar':            {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start':  19, 'bar_end': 310},
+            'transform_bar':      {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start':  13, 'bar_end':  40},
         }
 
-        # Fonts for text overlay
         pygame.font.init()
-        self.font_small = pygame.font.Font(None, 18)
+        self.font_small  = pygame.font.Font(None, 18)
         self.font_medium = pygame.font.Font(None, 22)
-        self.font_large = pygame.font.Font(None, 26)
+        self.font_large  = pygame.font.Font(None, 26)
 
-        # Colors for text
         self.colors = {
-            'text': (255, 255, 255),
-            'shadow': (0, 0, 0),
-            'stat_points': (255, 215, 0),  # Gold
-            'transform_ready': (255, 255, 255),  # White
-            'transform_fill': (255, 215, 0),  # Gold
+            'text':             (255, 255, 255),
+            'shadow':           (0,   0,   0),
+            'stat_points':      (255, 215, 0),   # gold — unspent stat points indicator
+            'transform_ready':  (255, 255, 255),
+            'transform_fill':   (255, 215, 0),
         }
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
     def draw_text_with_shadow(self, screen, text, x, y, font, color, shadow_offset=2):
-        """Draw text with a shadow for better readability"""
-        scaled_offset = max(1, int(shadow_offset * self.scale))
-        shadow_surf = font.render(text, True, self.colors['shadow'])
-        screen.blit(shadow_surf, (x + scaled_offset, y + scaled_offset))
-        text_surf = font.render(text, True, color)
-        screen.blit(text_surf, (x, y))
+        off = max(1, int(shadow_offset * self.scale))
+        screen.blit(font.render(text, True, self.colors['shadow']), (x + off, y + off))
+        screen.blit(font.render(text, True, color),                  (x,       y))
 
-    def draw_bar_simple(self, screen, x, y, width, height, current, maximum, bar_sprite):
-        """Draw a bar by cropping the sprite based on current/max ratio"""
-        if maximum > 0 and bar_sprite.sprite:
-            fill_percentage = current / maximum
-            fill_width = int(width * fill_percentage)
+    def draw_bar_simple(self, screen, x, y, width, height, current, maximum,
+                        bar_sprite, bar_start_x=0, bar_end_x=None):
+        """
+        Crops the bar sprite to represent the fill amount.
+        bar_start_x / bar_end_x mark the pixel region of the actual bar graphic
+        within the scaled sprite — everything outside that region is frame art.
+        """
+        if maximum <= 0 or not bar_sprite.sprite:
+            return
+        if bar_end_x is None:
+            bar_end_x = width
 
-            if fill_width > 0:
-                temp_surface = pygame.transform.scale(bar_sprite.sprite, (width, height))
-                filled_portion = temp_surface.subsurface((0, 0, fill_width, height))
-                screen.blit(filled_portion, (x, y))
+        region_w  = bar_end_x - bar_start_x
+        fill_w    = int(region_w * (current / maximum))
+        scaled    = pygame.transform.scale(bar_sprite.sprite, (width, height))
+        if fill_w > 0:
+            screen.blit(scaled.subsurface((bar_start_x, 0, fill_w, height)),
+                        (x + bar_start_x, y))
 
-    def draw_transform_bar_with_shine(self, screen, x, y, width, height, progress, is_ready, shine_alpha, bar_sprite):
-        """Draw transformation bar with special shine effect when ready"""
-        if bar_sprite.sprite:
-            fill_width = int(width * progress)
-
-            if fill_width > 0:
-                # Draw the filled portion
-                temp_surface = pygame.transform.scale(bar_sprite.sprite, (width, height))
-                filled_portion = temp_surface.subsurface((0, 0, fill_width, height))
-                screen.blit(filled_portion, (x, y))
+    def draw_transform_bar_with_shine(self, screen, x, y, width, height,
+                                       progress, is_ready, shine_alpha, bar_sprite):
+        if not bar_sprite.sprite:
+            return
+        fill_w = int(width * progress)
+        if fill_w > 0:
+            scaled = pygame.transform.scale(bar_sprite.sprite, (width, height))
+            screen.blit(scaled.subsurface((0, 0, fill_w, height)), (x, y))
 
     def get_transform_animation_progress(self, player):
-        """Get the animation progress for the transformed ki bar during transformation"""
         if hasattr(player, 'transformation') and player.transformation:
             return player.transformation.transform_animation_progress
         return 0.0
 
+    # ── Main draw ─────────────────────────────────────────────────────────────
+
     def draw(self, screen, player):
-        """Draw the complete HUD using only sprites"""
         if not self.visible:
             return
 
-        base_x = self.hud_x
-        base_y = self.hud_y
+        bx = self.hud_x
+        by = self.hud_y
 
-        def scaled(value):
-            return int(value * self.scale)
+        def sc(v):
+            return int(v * self.scale)
 
-        # 1. Draw main frame
-        frame_cfg = self.config['frame']
-        if self.sprites['frame'].sprite:
-            self.sprites['frame'].draw(
-                screen, base_x, base_y,
-                scaled(frame_cfg['w']), scaled(frame_cfg['h'])
-            )
+        # 1. Frame
+        cfg = self.config['frame']
+        self.sprites['frame'].draw(screen, bx, by, sc(cfg['w']), sc(cfg['h']))
 
-        # 2. Draw attack_icon based on player's current attack mode
-        icon_cfg = self.config['attack_icon']
-        icon_x = base_x + scaled(icon_cfg['x'])
-        icon_y = base_y + scaled(icon_cfg['y'])
+        # 2. Attack mode icon
+        icfg  = self.config['attack_icon']
+        ix, iy = bx + sc(icfg['x']), by + sc(icfg['y'])
+        iw, ih = sc(icfg['w']),       sc(icfg['h'])
+        mode  = getattr(player, 'ki_attack_mode', 'blast')
 
-        attack_mode = player.ki_attack_mode if hasattr(player, 'ki_attack_mode') else 'blast'
-
-        # Determine opacity for transformation icon
-        transform_opacity = 255
+        xform_opacity = 255
         if hasattr(player, 'transformation') and player.transformation:
             if not player.transformation.is_ready:
-                transform_opacity = 128  # 50% opacity when not ready
+                xform_opacity = 128  # dim the icon when transform isn't charged
 
-        if attack_mode == 'beam' and self.sprites['attack_icon_beam'].sprite:
-            self.sprites['attack_icon_beam'].draw(
-                screen, icon_x, icon_y,
-                scaled(icon_cfg['w']), scaled(icon_cfg['h'])
-            )
-        elif attack_mode == 'transform' and self.sprites['transformation_icon'].sprite:
-            self.sprites['transformation_icon'].draw(
-                screen, icon_x, icon_y,
-                scaled(icon_cfg['w']), scaled(icon_cfg['h']),
-                opacity=transform_opacity
-            )
-        elif attack_mode == 'blast' and self.sprites['attack_icon_blast'].sprite:
-            self.sprites['attack_icon_blast'].draw(
-                screen, icon_x, icon_y,
-                scaled(icon_cfg['w']), scaled(icon_cfg['h'])
-            )
-        elif self.sprites['attack_icon'].sprite:
-            self.sprites['attack_icon'].draw(
-                screen, icon_x, icon_y,
-                scaled(icon_cfg['w']), scaled(icon_cfg['h'])
-            )
+        if mode == 'beam' and self.sprites['attack_icon_beam'].sprite:
+            self.sprites['attack_icon_beam'].draw(screen, ix, iy, iw, ih)
+        elif mode == 'transform' and self.sprites['transformation_icon'].sprite:
+            self.sprites['transformation_icon'].draw(screen, ix, iy, iw, ih, opacity=xform_opacity)
+        elif mode == 'blast' and self.sprites['attack_icon_blast'].sprite:
+            self.sprites['attack_icon_blast'].draw(screen, ix, iy, iw, ih)
+        else:
+            self.sprites['attack_icon'].draw(screen, ix, iy, iw, ih)
 
-        # 3. Draw HP Bar
-        hp_cfg = self.config['hp_bar']
-        hp_x = base_x + scaled(hp_cfg['x'])
-        hp_y = base_y + scaled(hp_cfg['y'])
+        # 3. HP bar
+        hp = self.config['hp_bar']
+        self.draw_bar_simple(screen, bx + sc(hp['x']), by + sc(hp['y']),
+                             sc(hp['w']), sc(hp['h']),
+                             player.hp, player.max_hp, self.sprites['hp_bar'])
 
-        self.draw_bar_simple(
-            screen, hp_x, hp_y, scaled(hp_cfg['w']), scaled(hp_cfg['h']),
-            player.hp, player.max_hp,
-            self.sprites['hp_bar']
-        )
+        # 4. Ki bar (always draw the base bar, then overlay transformed bar if needed)
+        ki = self.config['ki_bar']
+        self.draw_bar_simple(screen, bx + sc(ki['x']), by + sc(ki['y']),
+                             sc(ki['w']), sc(ki['h']),
+                             player.ki, player.max_ki, self.sprites['ki_bar'],
+                             bar_start_x=sc(ki.get('bar_start', 0)),
+                             bar_end_x=sc(ki.get('bar_end', ki['w'])))
 
-        # 4. Draw Ki Bar (always draw normal Ki bar as base)
-        ki_cfg = self.config['ki_bar']
-        ki_x = base_x + scaled(ki_cfg['x'])
-        ki_y = base_y + scaled(ki_cfg['y'])
-
-        # Always draw normal Ki bar first
-        self.draw_bar_simple(
-            screen, ki_x, ki_y, scaled(ki_cfg['w']), scaled(ki_cfg['h']),
-            player.ki, player.max_ki,
-            self.sprites['ki_bar']
-        )
-
-        # Check transformation states
         is_transforming = hasattr(player, 'transformation') and player.transformation and player.transformation.is_transforming
-        is_transformed = hasattr(player, 'transformation') and player.transformation and player.transformation.is_transformed
+        is_transformed  = hasattr(player, 'transformation') and player.transformation and player.transformation.is_transformed
+        tki_cfg = self.config['transformed_ki_bar']
+        tkx, tky = bx + sc(tki_cfg['x']), by + sc(tki_cfg['y'])
+        tkw, tkh = sc(tki_cfg['w']),       sc(tki_cfg['h'])
 
-        # During transformation animation: show transformed bar filling up
         if is_transforming:
-            transformed_ki_cfg = self.config['transformed_ki_bar']
-            transformed_ki_x = base_x + scaled(transformed_ki_cfg['x'])
-            transformed_ki_y = base_y + scaled(transformed_ki_cfg['y'])
-
-            # Get animation progress (0.0 to 1.0)
-            anim_progress = self.get_transform_animation_progress(player)
-
-            # Draw transformed bar filling during animation
-            self.draw_bar_simple(
-                screen, transformed_ki_x, transformed_ki_y,
-                scaled(transformed_ki_cfg['w']), scaled(transformed_ki_cfg['h']),
-                anim_progress, 1.0,  # Progress as current/max
-                self.sprites['transformed_ki_bar']
-            )
-
-        # After transformation: show actual transformed Ki
+            # Show the bar filling up during the animation
+            anim = self.get_transform_animation_progress(player)
+            self.draw_bar_simple(screen, tkx, tky, tkw, tkh,
+                                 anim, 1.0, self.sprites['transformed_ki_bar'])
         elif is_transformed:
-            transformed_ki_cfg = self.config['transformed_ki_bar']
-            transformed_ki_x = base_x + scaled(transformed_ki_cfg['x'])
-            transformed_ki_y = base_y + scaled(transformed_ki_cfg['y'])
+            t = player.transformation
+            self.draw_bar_simple(screen, tkx, tky, tkw, tkh,
+                                 t.transformed_ki, t.max_transformed_ki,
+                                 self.sprites['transformed_ki_bar'])
 
-            self.draw_bar_simple(
-                screen, transformed_ki_x, transformed_ki_y,
-                scaled(transformed_ki_cfg['w']), scaled(transformed_ki_cfg['h']),
-                player.transformation.transformed_ki, player.transformation.max_transformed_ki,
-                self.sprites['transformed_ki_bar']
-            )
+        # 5. EXP bar
+        exp = self.config['exp_bar']
+        self.draw_bar_simple(screen, bx + sc(exp['x']), by + sc(exp['y']),
+                             sc(exp['w']), sc(exp['h']),
+                             player.exp, player.exp_to_next_level, self.sprites['exp_bar'])
 
-        # 5. Draw EXP Bar
-        exp_cfg = self.config['exp_bar']
-        exp_x = base_x + scaled(exp_cfg['x'])
-        exp_y = base_y + scaled(exp_cfg['y'])
-
-        self.draw_bar_simple(
-            screen, exp_x, exp_y, scaled(exp_cfg['w']), scaled(exp_cfg['h']),
-            player.exp, player.exp_to_next_level,
-            self.sprites['exp_bar']
-        )
-
-        # 6. Draw Transformation Bar (if enabled and player has transformation system)
+        # 6. Transformation charge bar
         if hasattr(player, 'transformation') and player.transformation:
-            transform_cfg = self.config['transform_bar']
-            transform_x = base_x + scaled(transform_cfg['x'])
-            transform_y = base_y + scaled(transform_cfg['y'])
-
-            shine_alpha = player.transformation.get_shine_alpha()
-
+            tcfg = self.config['transform_bar']
             self.draw_transform_bar_with_shine(
-                screen, transform_x, transform_y,
-                scaled(transform_cfg['w']), scaled(transform_cfg['h']),
+                screen, bx + sc(tcfg['x']), by + sc(tcfg['y']),
+                sc(tcfg['w']), sc(tcfg['h']),
                 player.transformation.progress,
                 player.transformation.is_ready,
-                shine_alpha,
+                player.transformation.get_shine_alpha(),
                 self.sprites['transform_bar']
             )
 
-        # 7. Stat points indicator (if unspent points exist)
+        # 7. Unspent stat points — pulsing gold circle in the corner
         if player.stat_points > 0:
-            import time
             pulse = abs(int((time.time() * 3) % 2 - 1) * 80) + 175
             pulse_color = (pulse, pulse, 0)
 
-            stat_x = base_x + scaled(self.config['frame']['w']) - scaled(30)
-            stat_y = base_y + scaled(self.config['frame']['h']) - scaled(25)
+            sx = bx + sc(self.config['frame']['w']) - sc(30)
+            sy = by + sc(self.config['frame']['h']) - sc(25)
 
-            # Glow effect
-            base_radius = scaled(12)
-            for radius in range(scaled(18), base_radius, max(1, -scaled(2))):
-                alpha = 50 - (scaled(18) - radius) * 8
-                s = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
-                pygame.draw.circle(s, (*pulse_color, alpha), (radius, radius), radius)
-                screen.blit(s, (stat_x - radius, stat_y - radius))
+            base_r = sc(12)
+            for r in range(sc(18), base_r, max(1, -sc(2))):
+                alpha = 50 - (sc(18) - r) * 8
+                glow = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
+                pygame.draw.circle(glow, (*pulse_color, alpha), (r, r), r)
+                screen.blit(glow, (sx - r, sy - r))
 
-            # Main circle
-            pygame.draw.circle(screen, pulse_color, (stat_x, stat_y), base_radius)
-            pygame.draw.circle(screen, self.colors['stat_points'], (stat_x, stat_y), base_radius, max(1, scaled(2)))
-            pygame.draw.circle(screen, self.colors['shadow'], (stat_x, stat_y), scaled(10), 1)
+            pygame.draw.circle(screen, pulse_color,           (sx, sy), base_r)
+            pygame.draw.circle(screen, self.colors['stat_points'], (sx, sy), base_r, max(1, sc(2)))
+            pygame.draw.circle(screen, self.colors['shadow'], (sx, sy), sc(10), 1)
 
-            # Number
-            stat_text = str(player.stat_points)
-            text_width = self.font_large.size(stat_text)[0]
-            self.draw_text_with_shadow(
-                screen, stat_text,
-                stat_x - text_width // 2,
-                stat_y - scaled(8),
-                self.font_large, (255, 255, 255)
-            )
+            label = str(player.stat_points)
+            tw    = self.font_large.size(label)[0]
+            self.draw_text_with_shadow(screen, label,
+                                       sx - tw // 2, sy - sc(8),
+                                       self.font_large, (255, 255, 255))
