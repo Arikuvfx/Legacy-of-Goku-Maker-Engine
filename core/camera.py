@@ -23,6 +23,10 @@ class Camera:
         self.x = 0
         self.y = 0
 
+        # Post-cutscene lerp blend state
+        self._lerp_active  = False
+        self._lerp_speed   = 5.0   # higher = faster blend (good range: 3–8)
+
         # Camera shake state
         self.shake_intensity = 0
         self.shake_duration  = 0
@@ -59,7 +63,7 @@ class Camera:
         # Update the shake offset, decaying intensity over time.
         if self.shake_timer > 0:
             self.shake_timer -= dt
-            shake_amount    = self.shake_intensity * (self.shake_timer / self.shake_duration)
+            shake_amount = self.shake_intensity * (self.shake_timer / self.shake_duration) if self.shake_duration > 0 else 0.0
             self.shake_offset_x = random.uniform(-shake_amount, shake_amount)
             self.shake_offset_y = random.uniform(-shake_amount, shake_amount)
         else:
@@ -70,8 +74,21 @@ class Camera:
         target_screen_x = target.x * RENDER_SCALE
         target_screen_y = target.y * RENDER_SCALE
 
-        self.x = target_screen_x - self.screen_width  // 2 + self.shake_offset_x
-        self.y = target_screen_y - self.screen_height // 2 + self.shake_offset_y
+        desired_x = target_screen_x - self.screen_width  // 2
+        desired_y = target_screen_y - self.screen_height // 2
+
+        if self._lerp_active and dt > 0:
+            t = 1.0 - (1.0 / (1.0 + self._lerp_speed * dt))
+            new_x = self.x + (desired_x - self.x) * t
+            new_y = self.y + (desired_y - self.y) * t
+            # Stop lerping once we're close enough
+            if abs(desired_x - new_x) < 0.5 and abs(desired_y - new_y) < 0.5:
+                self._lerp_active = False
+            self.x = new_x + self.shake_offset_x
+            self.y = new_y + self.shake_offset_y
+        else:
+            self.x = desired_x + self.shake_offset_x
+            self.y = desired_y + self.shake_offset_y
 
         # Clamp to room bounds, or centre for rooms smaller than the screen.
         world_screen_width  = world_width  * RENDER_SCALE

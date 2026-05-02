@@ -1,3 +1,15 @@
+from __future__ import annotations
+
+# ---------------------------------------------------------------------------
+# room_editor.py
+#
+# Top-level dev tool that lets designers browse room groups, create/edit rooms,
+# and open an in-engine room viewer where tiles, objects, and entities can all
+# be painted live.  Spawns three sub-editors (tileset / object / entity) that
+# are toggled via toolbar buttons or F2/F3/F4, and wires them all together so
+# undo/redo works across every editor type.
+# ---------------------------------------------------------------------------
+
 import copy
 import pygame
 import pygame.gfxdraw
@@ -11,12 +23,15 @@ from dev_tools.room_editor.room_editor_tools.entity_editor import EntityEditor
 from entities.boss_enemy import BOSS_REGISTRY
 
 
-_MAX_UNDO = 50  # maximum undo/redo depth
+# How many actions we keep in each undo/redo stack before the oldest entry
+# gets silently dropped.  50 is plenty without eating much memory.
+_MAX_UNDO = 50
 
 
 class _HistoryEntry:
     """
     A single undoable action recorded in the room editor.
+    Stored in the undo/redo deques and replayed by _apply_entry().
 
     action values
     -------------
@@ -28,6 +43,7 @@ class _HistoryEntry:
     'object_move'   – a game-object was dragged       (data: {'obj', 'obj_type', 'old_x', 'old_y', 'new_x', 'new_y'})
     'tiles_stroke'  – one paint/erase stroke on tiles (data: {'room', 'before': list[dict], 'after': list[dict]})
     """
+    # __slots__ keeps each entry lean — we store thousands of these over a session
     __slots__ = ('action', 'data')
 
     def __init__(self, action: str, data):
@@ -62,11 +78,18 @@ class RoomEditor:
 
         self.viewing_room = None
         self.camera = Camera(screen_width, screen_height)
-        self.camera_speed = 300
-        self.camera_fast_speed = 600
+        # Scale speeds by RENDER_SCALE so the camera covers the same visual
+        # distance per second regardless of how large the room is rendered.
+        self.camera_speed = 300 * RENDER_SCALE
+        self.camera_fast_speed = 600 * RENDER_SCALE
 
         # ── Sub-editors ───────────────────────────────────────────────────────
-        self.tileset_editor = None
+        # tileset_editor is initialised eagerly so the baked tile-surface cache
+        # in game.py is never populated with a blank surface before the editor
+        # has had a chance to load its tilesets.  Lazy init (inside toggle())
+        # caused the cache to be poisoned on the very first frame of gameplay.
+        from dev_tools.room_editor.room_editor_tools.tileset_editor import TilesetEditor
+        self.tileset_editor = TilesetEditor(screen_width, screen_height)
         self.object_editor = None
         self.entity_editor = None
 
@@ -110,6 +133,12 @@ class RoomEditor:
         self._tile_stroke_before = None
         self._applying_history = False
 
+        self.zoom_active = False  # True when zoomed out to fit entire room
+        self._zoom_cache: pygame.Surface | None = None  # cached scaled surface
+        self._zoom_offset = (0, 0)   # (ox, oy) blit position on screen
+        self._zoom_scale  = 1.0      # fit scale factor used for coord conversion
+        self._zoom_dirty  = True     # when True the cache must be rebuilt
+
         self.anim_timer = 0
         self.hover_anim = [0.0] * 20
 
@@ -137,6 +166,11 @@ class RoomEditor:
 
         self._view_icon = self._load_icon('assets/ui/room_editor/view.png', 28, 28)
 
+        # Wired by game.py to game.blit_room_tiles — lets the editor use the
+        # same baked-surface path as gameplay instead of scaling every tile
+        # every frame.  Falls back to the per-tile loop when None.
+        self.blit_tiles_callback = None
+
     @staticmethod
     def _load_icon(path, w, h):
         """Load and scale an icon from disk. Returns None quietly if the file isn't there."""
@@ -150,11 +184,16 @@ class RoomEditor:
             return None
 
     def deactivate(self):
-        """Close the room editor and always restore key-repeat to default."""
+        """Close the room editor and always restore key-repeat to default.
+        Called both explicitly and as a fallback so we never leave the game
+        stuck in the editor's 400 ms / 50 ms repeat mode."""
         self.active = False
         pygame.key.set_repeat(0, 0)
 
     def toggle(self):
+        """Open or close the editor.  Sub-editors are initialised on first open
+        and reused on subsequent visits — lazy init for object/entity editor,
+        but tileset_editor is always eager (see __init__ comment above)."""
         self.active = not self.active
         if self.active:
             # Enable key-repeat so held keys produce repeated KEYDOWN events
@@ -169,12 +208,7 @@ class RoomEditor:
             self.last_click_index = -1
             self.last_click_time = 0
 
-            # Load up the tileset editor if we haven't yet
-            if self.tileset_editor is None:
-                from dev_tools.room_editor.room_editor_tools.tileset_editor import TilesetEditor
-                self.tileset_editor = TilesetEditor(self.screen_width, self.screen_height)
-
-            # Same for object editor
+            # Lazy-init the object editor on first open — skip if already created
             if self.object_editor is None:
                 self.object_editor = ObjectEditor(
                     self.screen_width,
@@ -182,25 +216,26 @@ class RoomEditor:
                     self.room_manager
                 )
 
-                # Pass toolbar reference to object editor
+                # Give the object editor a reference to our shared toolbar
+                # so it can read the active tool without duplicating state
                 if self.object_editor:
                     self.object_editor.set_toolbar(self.toolbar)
 
                 # Wire object-editor placement / deletion callbacks for undo
                 self._wire_undo_callbacks()
 
-            # Same for entity editor
+            # Lazy-init the entity editor on first open
             if self.entity_editor is None:
                 self.entity_editor = EntityEditor(
                     self.screen_width,
                     self.screen_height
                 )
-                # Wire placement callback so placed entities land on the room
+                # This callback fires when the user clicks to place an entity in the world
                 self.entity_editor.on_entity_placed = self._on_entity_placed
-                # Give entity_editor access to room data for mission dropdowns
+                # Let the entity editor read room data for mission/dialogue dropdowns
                 self.entity_editor.room_manager = self.room_manager
         else:
-            # Restore no-repeat for normal gameplay
+            # Closing the editor — restore the game's normal key-repeat settings
             pygame.key.set_repeat(0, 0)
 
     def _refresh_placement_obstacles(self):
@@ -225,11 +260,12 @@ class RoomEditor:
         self.entity_editor.placement_obstacles = obstacles
 
     def handle_input(self, event):
-        """Process input events"""
+        """Route a pygame event to whichever sub-system owns it right now.
+        Priority order: text-field capture → room-viewer → menu navigation."""
         if not self.active:
             return None
 
-        # Handle typing into text fields
+        # Text-field modal is open — swallow all input until confirmed/cancelled
         if self.editing_field is not None:
             if event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_RETURN:
@@ -240,9 +276,11 @@ class RoomEditor:
                 elif event.key == pygame.K_BACKSPACE:
                     self.text_input = self.text_input[:-1]
                 elif event.key == pygame.K_TAB:
+                    # Tab commits the current field and advances to the next one
                     self._finish_text_input()
                     self._next_form_field()
                 else:
+                    # Cap at 50 chars; reject non-printable codes (e.g. arrow keys)
                     if len(self.text_input) < 50 and event.unicode.isprintable():
                         self.text_input += event.unicode
             return None
@@ -305,6 +343,8 @@ class RoomEditor:
         # Regular navigation (keyboard only)
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
+                # ESC walks back up the view hierarchy:
+                # groups → close editor | rooms → groups | edit → wherever we came from
                 if self.current_view == 'groups':
                     self.deactivate()
                     return 'close'
@@ -314,8 +354,10 @@ class RoomEditor:
                     self.selected_group = None
                 else:
                     if self.edit_return_view == 'view_room':
+                        # We came from the room viewer — go back to it
                         self.current_view = 'view_room'
                         self.edit_return_view = 'rooms'
+                        pygame.key.set_repeat(0, 0)
                     elif self.selected_group:
                         self.current_view = 'rooms'
                     else:
@@ -403,6 +445,8 @@ class RoomEditor:
 
             if field == 'save':
                 self.current_view = self.edit_return_view
+                if self.edit_return_view == 'view_room':
+                    pygame.key.set_repeat(0, 0)
                 self.edit_return_view = 'rooms'
                 self.selected_index = 0
                 self.hover_index = -1
@@ -414,6 +458,8 @@ class RoomEditor:
                 self.hover_index = -1
             elif field == 'cancel':
                 self.current_view = self.edit_return_view
+                if self.edit_return_view == 'view_room':
+                    pygame.key.set_repeat(0, 0)
                 self.edit_return_view = 'rooms'
                 self.selected_index = 0
                 self.hover_index = -1
@@ -463,7 +509,12 @@ class RoomEditor:
 
         if self.tileset_editor:
             if room_name not in self.tileset_editor.room_tiles or not self.tileset_editor.room_tiles[room_name]:
-                self.tileset_editor.room_tiles[room_name] = self.viewing_room.tiles[:]
+                from dev_tools.room_editor.room_editor_tools.tileset_editor import Tile
+                raw = self.viewing_room.tiles
+                self.tileset_editor.room_tiles[room_name] = [
+                    Tile.from_dict(t) if isinstance(t, dict) else t
+                    for t in raw
+                ]
 
         if self.object_editor and hasattr(self.object_editor, 'collision_manager'):
             self.object_editor.collision_manager.collision_objects[room_name] = []
@@ -474,11 +525,22 @@ class RoomEditor:
         if not hasattr(self.viewing_room, 'destructible_stones'):
             self.viewing_room.destructible_stones = []
 
+        # Sync cutscene triggers so the manager works with the room's live list.
+        # Without this the manager starts empty for the room and any existing
+        # triggers are invisible / overwritten on save.
+        if self.object_editor and hasattr(self.object_editor, 'cutscene_trigger_manager'):
+            if not hasattr(self.viewing_room, 'cutscene_triggers'):
+                self.viewing_room.cutscene_triggers = []
+            self.object_editor.cutscene_trigger_manager._triggers[room_name] = (
+                self.viewing_room.cutscene_triggers
+            )
+
         center_x = (self.viewing_room.width * RENDER_SCALE - self.screen_width) // 2
         center_y = (self.viewing_room.height * RENDER_SCALE - self.screen_height) // 2
         self.camera.x = center_x
         self.camera.y = center_y
         self.current_view = 'view_room'
+        pygame.key.set_repeat(0, 0)
 
         # Fresh undo/redo history per room visit
         self._undo_stack.clear()
@@ -588,6 +650,8 @@ class RoomEditor:
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             result = self.toolbar.handle_click(event.pos)
             if result:
+                # Each editor panel is mutually exclusive — toggling one always
+                # closes the others so we never end up with two panels open.
                 if result == 'tiles':
                     if self.tileset_editor:
                         self.tileset_editor.toggle()
@@ -595,7 +659,10 @@ class RoomEditor:
                             self.object_editor.toggle()
                         if self.entity_editor and self.entity_editor.active:
                             self.entity_editor.toggle()
-                        self.drag_target = None; self.drag_target_type = None; self.is_dragging = False
+                        # Clear any in-progress drag so it doesn't ghost across panels
+                        self.drag_target = None
+                        self.drag_target_type = None
+                        self.is_dragging = False
                 elif result == 'objects':
                     if self.object_editor:
                         self.object_editor.toggle()
@@ -603,7 +670,9 @@ class RoomEditor:
                             self.tileset_editor.toggle()
                         if self.entity_editor and self.entity_editor.active:
                             self.entity_editor.toggle()
-                        self.drag_target = None; self.drag_target_type = None; self.is_dragging = False
+                        self.drag_target = None
+                        self.drag_target_type = None
+                        self.is_dragging = False
                 elif result == 'entities':
                     if self.entity_editor:
                         self.entity_editor.toggle()
@@ -611,7 +680,10 @@ class RoomEditor:
                             self.tileset_editor.toggle()
                         if self.object_editor and self.object_editor.active:
                             self.object_editor.toggle()
-                        self.drag_target = None; self.drag_target_type = None; self.is_dragging = False
+                        self.drag_target = None
+                        self.drag_target_type = None
+                        self.is_dragging = False
+                        # Rebuild obstacles so entity placement collision checks are fresh
                         if self.entity_editor.active:
                             self._refresh_placement_obstacles()
                 elif result == 'settings':
@@ -620,6 +692,11 @@ class RoomEditor:
                     self.edit_return_view = 'view_room'
                     self.selected_index = 0
                     self.hover_index = -1
+                elif result == 'action_zoom':
+                    self.zoom_active = not self.zoom_active
+                    if self.zoom_active:
+                        # Mark cache dirty so the next draw rebuilds the overview surface
+                        self._zoom_dirty = True
                 elif result == 'action_test':
                     self.deactivate()
                     return f'test_room:{self.viewing_room.name}'
@@ -627,8 +704,9 @@ class RoomEditor:
                     self._save_current_room()
                 return None
 
-        # Toggle editors with function keys
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_F2:
+        # F2/F3/F4 are keyboard shortcuts for the same toolbar buttons above.
+        # Same mutual-exclusion logic applies — toggling one closes the others.
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_F2:  # Tile editor
             if self.tileset_editor:
                 self.tileset_editor.toggle()
                 if self.object_editor and self.object_editor.active:
@@ -637,7 +715,7 @@ class RoomEditor:
                     self.entity_editor.toggle()
             return None
 
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_F3:
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_F3:  # Object editor
             if self.object_editor:
                 self.object_editor.toggle()
                 if self.tileset_editor and self.tileset_editor.active:
@@ -646,7 +724,7 @@ class RoomEditor:
                     self.entity_editor.toggle()
             return None
 
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_F4:
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_F4:  # Entity editor
             if self.entity_editor:
                 self.entity_editor.toggle()
                 if self.tileset_editor and self.tileset_editor.active:
@@ -713,6 +791,56 @@ class RoomEditor:
             return None
 
         if self.object_editor and self.object_editor.active:
+            # ── Cutscene-trigger drag intercept ───────────────────────────────
+            # When the object editor is active its placement handler fires on
+            # every left-click, which would create a second trigger instead of
+            # moving the existing one.  We intercept mouse events here — before
+            # they reach handle_input — whenever the cursor is on an existing
+            # trigger so that we own the drag and the object editor never sees
+            # the click that would cause the duplication.
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                mx, my = event.pos
+                if not self.object_editor._is_in_palette(mx, my):
+                    world_x, world_y = self._screen_to_world(mx, my)
+                    hit_trigger = self._find_cutscene_trigger_at(world_x, world_y)
+                    if hit_trigger is not None:
+                        self.drag_target = hit_trigger
+                        self.drag_target_type = 'cutscene_trigger'
+                        self.drag_offset_x = hit_trigger.x - world_x
+                        self.drag_offset_y = hit_trigger.y - world_y
+                        self.is_dragging = False
+                        self._drag_start_world_x = hit_trigger.x
+                        self._drag_start_world_y = hit_trigger.y
+                        return None  # consumed — object editor must not see this click
+
+            if event.type == pygame.MOUSEMOTION and self.drag_target_type == 'cutscene_trigger':
+                if self.drag_target is not None and pygame.mouse.get_pressed()[0]:
+                    mx, my = event.pos
+                    world_x, world_y = self._screen_to_world(mx, my)
+                    self.is_dragging = True
+                    self.drag_target.x = world_x + self.drag_offset_x
+                    self.drag_target.y = world_y + self.drag_offset_y
+                    return None
+
+            if event.type == pygame.MOUSEBUTTONUP and event.button == 1 \
+                    and self.drag_target_type == 'cutscene_trigger':
+                if self.drag_target is not None and self.is_dragging:
+                    new_x, new_y = self.drag_target.x, self.drag_target.y
+                    if (new_x, new_y) != (self._drag_start_world_x, self._drag_start_world_y):
+                        self._push_undo(_HistoryEntry('object_move', {
+                            'obj':      self.drag_target,
+                            'obj_type': 'cutscene_trigger',
+                            'old_x':    self._drag_start_world_x,
+                            'old_y':    self._drag_start_world_y,
+                            'new_x':    new_x,
+                            'new_y':    new_y,
+                        }))
+                self.drag_target = None
+                self.drag_target_type = None
+                self.is_dragging = False
+                return None
+            # ── end cutscene-trigger drag intercept ───────────────────────────
+
             result = self.object_editor.handle_input(
                 event,
                 int(self.camera.x),
@@ -796,6 +924,7 @@ class RoomEditor:
                 self.drag_target = None
                 self.drag_target_type = None
                 self.is_dragging = False
+                pygame.key.set_repeat(400, 50)
 
             return None
 
@@ -977,6 +1106,18 @@ class RoomEditor:
         if not hasattr(self.viewing_room, 'entities'):
             self.viewing_room.entities = []
 
+        # Move cutscene triggers from editor to room before writing to disk.
+        # The manager holds the live list (shared by reference after _enter_view_room),
+        # but we re-assign here to be safe in case the manager replaced its list.
+        if self.object_editor and hasattr(self.object_editor, 'cutscene_trigger_manager'):
+            triggers = self.object_editor.cutscene_trigger_manager._triggers.get(
+                self.viewing_room.name, []
+            )
+            self.viewing_room.cutscene_triggers = triggers if triggers is not None else []
+        else:
+            if not hasattr(self.viewing_room, 'cutscene_triggers'):
+                self.viewing_room.cutscene_triggers = []
+
         # Write everything to disk
         self.room_manager.save_room(self.viewing_room)
 
@@ -1043,6 +1184,16 @@ class RoomEditor:
                         room.level_gates = gates
                         transferred_count += 1
 
+            # Cutscene triggers
+            if hasattr(self.object_editor, 'cutscene_trigger_manager'):
+                for room in self.room_manager.rooms:
+                    triggers = self.object_editor.cutscene_trigger_manager._triggers.get(
+                        room.name, []
+                    )
+                    if triggers:
+                        room.cutscene_triggers = triggers
+                        transferred_count += 1
+
         return transferred_count
 
     def _sync_room_to_editor(self, room):
@@ -1055,7 +1206,11 @@ class RoomEditor:
         # Sync tiles
         if self.tileset_editor:
             if room_name not in self.tileset_editor.room_tiles or not self.tileset_editor.room_tiles[room_name]:
-                self.tileset_editor.room_tiles[room_name] = room.tiles[:]
+                from dev_tools.room_editor.room_editor_tools.tileset_editor import Tile
+                self.tileset_editor.room_tiles[room_name] = [
+                    Tile.from_dict(t) if isinstance(t, dict) else t
+                    for t in room.tiles
+                ]
 
         # Sync collision objects
         if self.object_editor and hasattr(self.object_editor, 'collision_manager'):
@@ -1095,13 +1250,25 @@ class RoomEditor:
                 room.level_gates = []
             self.object_editor.gate_manager.gates[room_name] = room.level_gates
 
+        # Sync cutscene triggers
+        if self.object_editor and hasattr(self.object_editor, 'cutscene_trigger_manager'):
+            if not hasattr(room, 'cutscene_triggers'):
+                room.cutscene_triggers = []
+            self.object_editor.cutscene_trigger_manager._triggers[room_name] = room.cutscene_triggers
+
     # =========================================================================
     # Undo / Redo  (Ctrl-Z / Ctrl-Y)
     # =========================================================================
 
     def _wire_undo_callbacks(self):
         """Attach placement/deletion callbacks to the object editor so every
-        object mutation can be recorded in the undo history."""
+        object mutation can be recorded in the undo history.
+
+        We use closures rather than methods so each callback captures the exact
+        obj_type string it needs without us having to pass it at call-site.
+        The object editor just calls e.g. on_collision_placed(obj, room) and we
+        handle the undo book-keeping here.
+        """
         oe = self.object_editor
         if not oe:
             return
@@ -1174,8 +1341,10 @@ class RoomEditor:
             return
         self._undo_stack.append(entry)
         self._redo_stack.clear()
+        self._zoom_dirty = True
 
     def _apply_undo(self):
+        """Pop the top undo entry, reverse it, and push it onto the redo stack."""
         if not self._undo_stack:
             return
         entry = self._undo_stack.pop()
@@ -1185,8 +1354,10 @@ class RoomEditor:
         finally:
             self._applying_history = False
         self._redo_stack.append(entry)
+        self._zoom_dirty = True
 
     def _apply_redo(self):
+        """Pop the top redo entry, replay it, and push it back onto the undo stack."""
         if not self._redo_stack:
             return
         entry = self._redo_stack.pop()
@@ -1196,6 +1367,7 @@ class RoomEditor:
         finally:
             self._applying_history = False
         self._undo_stack.append(entry)
+        self._zoom_dirty = True
 
     def _apply_entry(self, entry: _HistoryEntry, forward: bool):
         """Apply or reverse a history entry.
@@ -1205,6 +1377,9 @@ class RoomEditor:
         action = entry.action
         data   = entry.data
 
+        # Resolve the "effective" operation from action + direction.
+        # e.g. undoing an entity_add is the same as removing the entity,
+        # and redoing an entity_remove is also removing it.
         adding    = (action == 'entity_add'    and forward) or (action == 'entity_remove' and not forward)
         removing  = (action == 'entity_remove' and forward) or (action == 'entity_add'    and not forward)
         obj_add   = (action == 'object_add'    and forward) or (action == 'object_remove' and not forward)
@@ -1337,9 +1512,13 @@ class RoomEditor:
         if entity.get('entity_type') in ['enemy', 'boss'] and not ai_type:
             ai_type = 'easy'
 
-        # Extract enemy category (melee vs shooter)
-        enemy_category = entity.get('enemy_category', 'melee') if entity.get('entity_type') in ['enemy',
-                                                                                                'boss'] else None
+        # Extract enemy category (melee vs shooter) — only relevant for enemies/bosses
+        entity_type = entity.get('entity_type')
+        enemy_category = (
+            entity.get('enemy_category', 'melee')
+            if entity_type in ('enemy', 'boss')
+            else None
+        )
 
         # Generate a stable short instance ID for this entity
         import uuid
@@ -1449,6 +1628,30 @@ class RoomEditor:
             return None, None
         self.object_editor.current_room_name = self.viewing_room.name
         return self.object_editor._check_object_at_position(world_x, world_y)
+
+    def _find_cutscene_trigger_at(self, world_x, world_y):
+        """Return the CutsceneTrigger object whose rect contains (world_x, world_y), or None.
+
+        Used to intercept clicks on existing triggers so the object editor's
+        placement handler never fires and duplicates the trigger.
+        """
+        if not self.viewing_room or not self.object_editor:
+            return None
+        if not hasattr(self.object_editor, 'cutscene_trigger_manager'):
+            return None
+        room_name = self.viewing_room.name
+        triggers = self.object_editor.cutscene_trigger_manager._triggers.get(room_name, [])
+        for trigger in reversed(triggers):  # top-most first
+            tx = getattr(trigger, 'x', None)
+            ty = getattr(trigger, 'y', None)
+            tw = getattr(trigger, 'width',  64)
+            th = getattr(trigger, 'height', 64)
+            if tx is None or ty is None:
+                continue
+            # Triggers are axis-aligned rects; treat (x, y) as centre.
+            if (abs(tx - world_x) <= tw / 2 and abs(ty - world_y) <= th / 2):
+                return trigger
+        return None
 
     def _screen_to_world(self, sx, sy):
         return (sx + self.camera.x) / RENDER_SCALE, (sy + self.camera.y) / RENDER_SCALE
@@ -1635,12 +1838,18 @@ class RoomEditor:
 
     @staticmethod
     def _load_placed_sprite(entity_id, variant_type, w, h):
-        """Load idle-down first frame for a placed entity, scaled to w*RENDER_SCALE x h*RENDER_SCALE."""
+        """Load and cache the idle-down first frame for a placed entity.
+
+        Sprite sheets are assumed to be laid out with 4 rows (down/left/right/up)
+        so row 0, column 0 gives the standing-down frame.  Falls back to None
+        if the file doesn't exist — callers should handle that gracefully.
+        """
         import os
         key = (entity_id, variant_type, w, h)
         if key in RoomEditor._placed_sprite_cache:
             return RoomEditor._placed_sprite_cache[key]
         base = f"assets/sprites/enemies/{entity_id}"
+        # Try paths in priority order: variant-specific first, then generic fallbacks
         candidates = [
             # NPC paths
             f"assets/sprites/npc/{entity_id}/variants/{variant_type}/idle.png",
@@ -1707,7 +1916,9 @@ class RoomEditor:
             else:
                 # ── fallback shape ──────────────────────────────────────
                 color = ent.get('variant_color') or (128, 128, 128)
-                if isinstance(color, list): color = tuple(color)
+                # variant_color is stored as a list when it comes from JSON, so normalise it
+                if isinstance(color, list):
+                    color = tuple(color)
                 dark = tuple(max(0, c - 60) for c in color)
                 light = tuple(min(255, c + 50) for c in color)
                 if entity_type == 'npc':
@@ -1888,16 +2099,46 @@ class RoomEditor:
         if not self.viewing_room:
             return
 
+        # ── Zoom-to-fit overview ──────────────────────────────────────────────
+        if self.zoom_active:
+            self._render_zoom_overview(screen)
+            # Draw toolbar and mouse coords on top, then return
+            is_placing_spawn = (self.object_editor and
+                                hasattr(self.object_editor, 'placing_transition_spawn') and
+                                self.object_editor.placing_transition_spawn)
+            is_editing_flying_pad_path = (self.object_editor and
+                                          hasattr(self.object_editor, 'flying_pad_path_editor') and
+                                          self.object_editor.flying_pad_path_editor.active)
+            if not is_placing_spawn and not is_editing_flying_pad_path:
+                self.toolbar.draw(screen)
+            # Mouse coords (converted for zoom space)
+            mouse_sx, mouse_sy = pygame.mouse.get_pos()
+            world_x = int((mouse_sx - self._zoom_offset[0]) / (RENDER_SCALE * self._zoom_scale))
+            world_y = int((mouse_sy - self._zoom_offset[1]) / (RENDER_SCALE * self._zoom_scale))
+            coord_text = f"X: {world_x}  Y: {world_y}"
+            coord_surf = self.font_medium.render(coord_text, True, self.colors['text'])
+            coord_bg_w = coord_surf.get_width() + 16
+            coord_bg_h = coord_surf.get_height() + 10
+            coord_bg = pygame.Surface((coord_bg_w, coord_bg_h), pygame.SRCALPHA)
+            coord_bg.fill((0, 0, 0, 160))
+            margin = 10
+            screen.blit(coord_bg, (margin, self.screen_height - coord_bg_h - margin))
+            screen.blit(coord_surf, (margin + 8, self.screen_height - coord_bg_h - margin + 5))
+            return
+
         screen.fill((34, 139, 34))
 
-        # Background tiles first
-        if self.tileset_editor:
+        # Background tiles — use baked surface if available (O(1) blit),
+        # fall back to per-tile loop only when the callback isn't wired.
+        if self.blit_tiles_callback:
+            self.blit_tiles_callback(
+                screen, self.viewing_room.name,
+                int(self.camera.x), int(self.camera.y), True
+            )
+        elif self.tileset_editor:
             self.tileset_editor.draw_tiles(
-                screen,
-                int(self.camera.x),
-                int(self.camera.y),
-                self.viewing_room.name,
-                layer='background'
+                screen, int(self.camera.x), int(self.camera.y),
+                self.viewing_room.name, layer='background'
             )
 
         # Draw the grid
@@ -1944,14 +2185,16 @@ class RoomEditor:
         # Draw placed entities (NPCs / enemies / bosses)
         self._draw_placed_entities(screen, int(self.camera.x), int(self.camera.y))
 
-        # Foreground tiles on top of world objects
-        if self.tileset_editor:
+        # Foreground tiles — same baked path as background.
+        if self.blit_tiles_callback:
+            self.blit_tiles_callback(
+                screen, self.viewing_room.name,
+                int(self.camera.x), int(self.camera.y), False
+            )
+        elif self.tileset_editor:
             self.tileset_editor.draw_tiles(
-                screen,
-                int(self.camera.x),
-                int(self.camera.y),
-                self.viewing_room.name,
-                layer='foreground'
+                screen, int(self.camera.x), int(self.camera.y),
+                self.viewing_room.name, layer='foreground'
             )
 
         # --- Editor overlays always drawn above ALL tile layers ---
@@ -1995,6 +2238,14 @@ class RoomEditor:
         # Draw room transitions
         if self.object_editor:
             self.object_editor.draw_room_transitions(
+                screen,
+                int(self.camera.x),
+                int(self.camera.y)
+            )
+
+        # Draw cutscene triggers
+        if self.object_editor:
+            self.object_editor.draw_cutscene_triggers(
                 screen,
                 int(self.camera.x),
                 int(self.camera.y)
@@ -2045,6 +2296,107 @@ class RoomEditor:
             if self.entity_editor and self.entity_editor.active:
                 self.entity_editor.draw(screen)
 
+        # ── Mouse coordinates overlay (bottom-left) ───────────────────────────
+        mouse_sx, mouse_sy = pygame.mouse.get_pos()
+        world_x = int((mouse_sx + self.camera.x) / RENDER_SCALE)
+        world_y = int((mouse_sy + self.camera.y) / RENDER_SCALE)
+        coord_text = f"X: {world_x}  Y: {world_y}"
+        coord_surf = self.font_medium.render(coord_text, True, self.colors['text'])
+        coord_bg_w = coord_surf.get_width() + 16
+        coord_bg_h = coord_surf.get_height() + 10
+        coord_bg = pygame.Surface((coord_bg_w, coord_bg_h), pygame.SRCALPHA)
+        coord_bg.fill((0, 0, 0, 160))
+        margin = 10
+        screen.blit(coord_bg, (margin, self.screen_height - coord_bg_h - margin))
+        screen.blit(coord_surf, (margin + 8, self.screen_height - coord_bg_h - margin + 5))
+
+    def _render_zoom_overview(self, screen):
+        """Render the entire room scaled to fit the screen for the zoom-out view.
+        The scaled surface is cached and only rebuilt when _zoom_dirty is True."""
+        room = self.viewing_room
+
+        if not self._zoom_dirty and self._zoom_cache is not None:
+            # Fast path — just blit the pre-built cache
+            screen.fill((15, 15, 25))
+            screen.blit(self._zoom_cache, self._zoom_offset)
+            return
+
+        # ── Build the cache ───────────────────────────────────────────────────
+        room_pw = room.width * RENDER_SCALE
+        room_ph = room.height * RENDER_SCALE
+
+        # Offscreen surface covering the full room in pixels
+        zoom_surf = pygame.Surface((room_pw, room_ph))
+        zoom_surf.fill((34, 139, 34))
+
+        # Temporarily widen the viewport on sub-editors so their tile-culling
+        # covers the whole room rather than just screen_width × screen_height.
+        sub_editors = [e for e in [self.tileset_editor, self.object_editor, self.entity_editor] if e]
+        orig_dims = {}
+        for ed in sub_editors:
+            orig_dims[id(ed)] = (
+                getattr(ed, 'screen_width',  None),
+                getattr(ed, 'screen_height', None),
+            )
+            if hasattr(ed, 'screen_width'):  ed.screen_width  = room_pw
+            if hasattr(ed, 'screen_height'): ed.screen_height = room_ph
+
+        orig_sw, orig_sh = self.screen_width, self.screen_height
+        self.screen_width  = room_pw
+        self.screen_height = room_ph
+
+        cam_x, cam_y = 0, 0
+        room_name = room.name
+
+        if self.tileset_editor:
+            self.tileset_editor.draw_tiles(zoom_surf, cam_x, cam_y, room_name, layer='background')
+
+        pygame.draw.rect(zoom_surf, self.colors['accent'], (0, 0, room_pw, room_ph), 3)
+
+        if self.object_editor:
+            self.object_editor.draw_spawn_points(zoom_surf, cam_x, cam_y)
+
+        if hasattr(room, 'destructible_stones'):
+            for stone in room.destructible_stones:
+                if stone.active:
+                    stone.draw(zoom_surf, type('_Cam', (), {'x': 0, 'y': 0})(), self.colors)
+
+        self._draw_placed_entities(zoom_surf, cam_x, cam_y)
+
+        if self.tileset_editor:
+            self.tileset_editor.draw_tiles(zoom_surf, cam_x, cam_y, room_name, layer='foreground')
+
+        if self.object_editor:
+            self.object_editor.current_room_name = room_name
+            self.object_editor.draw_collision_objects(zoom_surf, cam_x, cam_y)
+            self.object_editor.draw_flying_pads(zoom_surf, cam_x, cam_y, self.colors)
+            self.object_editor.draw_save_points(zoom_surf, cam_x, cam_y, self.colors)
+            self.object_editor.draw_level_gates(zoom_surf, cam_x, cam_y, self.colors)
+            self.object_editor.draw_room_transitions(zoom_surf, cam_x, cam_y)
+
+        # Restore sub-editor and self dimensions
+        for ed in sub_editors:
+            sw, sh = orig_dims[id(ed)]
+            if sw is not None and hasattr(ed, 'screen_width'):  ed.screen_width  = sw
+            if sh is not None and hasattr(ed, 'screen_height'): ed.screen_height = sh
+        self.screen_width  = orig_sw
+        self.screen_height = orig_sh
+
+        # Scale to fit screen (scale is faster than smoothscale for large surfaces)
+        fit_scale = min(orig_sw / room_pw, orig_sh / room_ph)
+        scaled_w = max(1, int(room_pw * fit_scale))
+        scaled_h = max(1, int(room_ph * fit_scale))
+        self._zoom_cache  = pygame.transform.scale(zoom_surf, (scaled_w, scaled_h))
+        ox = (orig_sw - scaled_w) // 2
+        oy = (orig_sh - scaled_h) // 2
+        self._zoom_offset = (ox, oy)
+        self._zoom_scale  = fit_scale
+        self._zoom_dirty  = False
+
+        # Blit the freshly built cache
+        screen.fill((15, 15, 25))
+        screen.blit(self._zoom_cache, self._zoom_offset)
+
     def _draw_default_grid(self, screen):
         """Draw a basic grid when no editor is active"""
         visible_x_start = self.camera.x // RENDER_SCALE
@@ -2073,7 +2425,11 @@ class RoomEditor:
                                  (self.screen_width, int(screen_y)), 1)
 
     def _draw_background(self, screen):
-        """Draw the menu background with gradient and animated grid"""
+        """Draw the menu background with gradient and animated grid.
+
+        The gradient is drawn one horizontal line at a time which is fine for
+        the menu screen — it only runs when we're NOT in view_room mode.
+        """
         # Smooth gradient from top to bottom
         for y in range(self.screen_height):
             progress = y / self.screen_height
@@ -2493,11 +2849,17 @@ class RoomEditor:
         screen.blit(inst, (inst_x, box_y + box_height - 25))
 
     def _hue_to_rgb(self, hue):
-        """Turn a hue value into RGB color"""
+        """Convert a hue angle (0–360) to an RGB tuple.
+
+        This is a simplified HSV→RGB conversion with fixed saturation (0.7)
+        and value (0.9) so group icons always look vivid without needing a
+        full colorsys import.  The 'c', 'x', 'm' variables follow the standard
+        HSV chroma/intermediate/match formulas.
+        """
         h = hue / 60.0
-        c = 0.7 * 0.9
+        c = 0.7 * 0.9  # chroma = saturation * value
         x = c * (1 - abs(h % 2 - 1))
-        m = 0.9 - c
+        m = 0.9 - c    # value minus chroma gives the minimum RGB component
 
         if 0 <= h < 1:
             r, g, b = c, x, 0

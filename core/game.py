@@ -21,6 +21,7 @@ from rooms.room_manager import RoomManager
 from ui.dialogue import DialogueBox
 from ui.hud import UI
 from ui.notifications import LevelUpNotification
+from ui.damage_number import DamageNumberManager
 from core.sound_engine import SoundEngine, SoundManager, AudioAssetLoader
 from ui.sprite_hud import SpriteHUD
 from core.draw_layers import LayerManager
@@ -34,20 +35,21 @@ from objects.save_point import SavePoint, SavePointMenu, SavePointManager
 from ui.character_switch_menu import CharacterSwitchMenu
 from ui.pause_menu import PauseMenu
 from dev_tools.room_editor.room_editor_tools.mission_manager import MissionManager
+from dev_tools.cutscene_editor import CutsceneEditor
 
 
-# Tell Windows this process is DPI-aware so it reports the true resolution.
-# Must run before pygame.init().
-import sys as _sys
-if _sys.platform == 'win32':
+# Tell Windows this process is DPI-aware so it reports the true screen resolution.
+# Must run before pygame.init() or the window will render at the wrong scale on
+# high-DPI displays (e.g. Surface devices, 4K monitors with 150 % scaling).
+if sys.platform == 'win32':
     try:
         import ctypes as _ctypes
-        _ctypes.windll.shcore.SetProcessDpiAwareness(1)  # Per-Monitor statt Per-Monitor v2
+        _ctypes.windll.shcore.SetProcessDpiAwareness(1)   # Per-Monitor DPI awareness
     except Exception:
         try:
-            _ctypes.windll.user32.SetProcessDPIAware()
+            _ctypes.windll.user32.SetProcessDPIAware()    # Legacy fallback
         except Exception:
-            pass
+            pass   # If both calls fail, just carry on — it's cosmetic only
 
 
 class Game:
@@ -59,7 +61,9 @@ class Game:
     def __init__(self):
         pygame.init()
 
-
+        # Whitelist only the events we actually handle.
+        # All other event types are blocked so pygame's queue never fills up
+        # with noise (joystick axis spam, timer ticks we never requested, etc.).
         ALLOWED = [
             pygame.QUIT,
             pygame.KEYDOWN, pygame.KEYUP,
@@ -81,128 +85,164 @@ class Game:
             (SCREEN_WIDTH, SCREEN_HEIGHT), pygame.RESIZABLE | pygame.SCALED
         )
         pygame.display.set_caption("Legacy of Goku Style Engine")
+
         # With SCALED mode the screen IS the logical surface — no extra blit needed.
         self.logical_surface = self.screen
         self.clock   = pygame.time.Clock()
         self.running = True
         self.colors  = get_colors()
 
-        # Rendering
+        # ── Rendering ─────────────────────────────────────────────────────────
         self.layer_manager = LayerManager()
+        self.dmg_numbers   = DamageNumberManager()  # Floating hit-number popups
 
-        # Core systems
+        # ── Core systems ──────────────────────────────────────────────────────
         self.game_config   = GameConfig()
         self.sound_engine  = SoundEngine()
         self.sound_manager = SoundManager(self.sound_engine)
         AudioAssetLoader.load_from_directory(self.sound_engine)
 
-        # Player
+        # ── Player ────────────────────────────────────────────────────────────
         self.player = Player(WORLD_WIDTH // 2, WORLD_HEIGHT // 2, game_config=self.game_config)
         self.player.update_derived_stats()
         self.player.transformation = TransformationSystem(self.player, self.game_config)
         self.player.in_transition  = False
+
+        # Defensive defaults — some older save files may not have these attributes.
         if not hasattr(self.player, 'hurt_tint'):
             self.player.hurt_tint = 0.0
         if not hasattr(self.player, 'hurt_tint_duration'):
             self.player.hurt_tint_duration = 0.45
 
-        # Camera and UI
-        self.camera                 = Camera(SCREEN_WIDTH, SCREEN_HEIGHT)
-        self.ui                     = UI(SCREEN_WIDTH, SCREEN_HEIGHT)
-        self.sprite_hud             = SpriteHUD(SCREEN_WIDTH, SCREEN_HEIGHT)
-        self.dialogue_box           = DialogueBox(SCREEN_WIDTH, SCREEN_HEIGHT)
-        self.level_up_notification  = LevelUpNotification(SCREEN_WIDTH, SCREEN_HEIGHT)
-        self.flying_controller      = FlyingController(SCREEN_WIDTH, SCREEN_HEIGHT)
+        # ── Camera and UI ─────────────────────────────────────────────────────
+        self.camera                = Camera(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.ui                    = UI(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.sprite_hud            = SpriteHUD(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.dialogue_box          = DialogueBox(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.level_up_notification = LevelUpNotification(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.flying_controller     = FlyingController(SCREEN_WIDTH, SCREEN_HEIGHT)
 
-        # Room system
-        self.room_manager  = RoomManager()
-        self.current_room  = None
-        self.room_editor   = RoomEditor(self.room_manager, SCREEN_WIDTH, SCREEN_HEIGHT)
+        # ── Room system ───────────────────────────────────────────────────────
+        self.room_manager = RoomManager()
+        self.current_room = None
+        self.room_editor  = RoomEditor(self.room_manager, SCREEN_WIDTH, SCREEN_HEIGHT)
+        # Let the editor share the game's baked-tile blitting path.
+        self.room_editor.blit_tiles_callback = self.blit_room_tiles
 
-        # Dev tools
-        self.dev_menu              = DevMenu(self.game_config, SCREEN_WIDTH, SCREEN_HEIGHT, self.sound_manager)
-        self.npc_config_menu       = NPCConfigMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
-        self.sprite_editor         = SpriteEditor(SCREEN_WIDTH, SCREEN_HEIGHT)
+        # ── Dev tools ─────────────────────────────────────────────────────────
+        self.dev_menu             = DevMenu(self.game_config, SCREEN_WIDTH, SCREEN_HEIGHT, self.sound_manager)
+        self.npc_config_menu      = NPCConfigMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.sprite_editor        = SpriteEditor(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.transition_config_menu = TransitionConfigMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.cutscene_editor = CutsceneEditor(
+            self.room_manager,
+            self.room_editor,
+            SCREEN_WIDTH,
+            SCREEN_HEIGHT,
+            dialogue_box=self.dialogue_box,
+        )
 
-        # Active game-object lists
-        self.projectiles        = []
-        self.melee_attacks      = []
-        self.bombs              = []   # BombProjectiles from Shooter enemies.
-        self.enemy_bullets      = []   # bullet_projectiles from Gunner enemies.
-        self.enemy_rockets      = []   # rocket_projectiles from RocketLauncher enemies.
-        self.explosions         = []   # Active ExplosionEffect instances.
-        self.enemies            = []
-        self.npcs               = []
-        self.destructible_stones = []
-        self.collision_objects  = []
-        self.room_transitions   = []
-        self.level_gates        = []
-        self.flying_pads        = []
+        # ── Active cutscene runtime ───────────────────────────────────────────
+        # Set when a CutsceneTrigger fires; None the rest of the time.
+        self.active_cutscene_runtime = None
+        self.dt = 0.0
 
-        # Performance caches
+        # Cutscene transition fade state machine.
+        #   _csf_state:   None | 'fade_out' | 'start' | 'fade_in'
+        #   _csf_alpha:   current overlay alpha (0 = transparent, 255 = full black)
+        #   _csf_pending: cutscene data dict waiting to launch after fade-out
+        _FADE_DUR         = 0.4                    # seconds for each half of the fade
+        self._csf_state   = None
+        self._csf_alpha   = 0.0
+        self._csf_speed   = 255.0 / _FADE_DUR      # alpha units per second
+        self._csf_pending = None
+
+        # ── Active game-object lists ──────────────────────────────────────────
+        self.projectiles          = []
+        self.melee_attacks        = []
+        self.bombs                = []   # BombProjectiles from Shooter enemies
+        self.enemy_bullets        = []   # bullet_projectiles from Gunner enemies
+        self.enemy_rockets        = []   # rocket_projectiles from RocketLauncher enemies
+        self.explosions           = []   # Active ExplosionEffect instances
+        self.enemies              = []
+        self.npcs                 = []
+        self.destructible_stones  = []
+        self.collision_objects    = []
+        self.room_transitions     = []
+        self.level_gates          = []
+        self.flying_pads          = []
+
+        # ── Performance caches ────────────────────────────────────────────────
         # key: (room_name, is_background) → pre-baked tile Surface
         self._room_tile_surfaces: dict = {}
         # key: font_size → pygame.Font  (avoids allocating a Font every frame)
         self._font_cache: dict = {}
 
-        # Save point system
-        self.save_points          = []
-        self.save_point_manager   = SavePointManager()
-        self.save_point_menu      = SavePointMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
+        # ── Save point system ─────────────────────────────────────────────────
+        self.save_points           = []
+        self.save_point_manager    = SavePointManager()
+        self.save_point_menu       = SavePointMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.character_switch_menu = CharacterSwitchMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.pause_menu            = PauseMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
-        self.play_time             = 0.0   # total seconds in gameplay
-        self.nearby_save_point    = None
+        self.play_time             = 0.0   # total seconds spent in gameplay
+        self.nearby_save_point     = None
 
-        # Test mode — prevents save operations while a room is being previewed.
-        self.is_test_mode            = False
-        self.test_room_backup        = None
-        self._test_mission_snapshot  = None
+        # ── Test mode ─────────────────────────────────────────────────────────
+        # Prevents save operations while a room is being previewed live.
+        self.is_test_mode           = False
+        self.test_room_backup       = None
+        self._test_mission_snapshot = None
 
-        # Ensure the object editor exists before hooking up callbacks.
+        # ── Editor callbacks ──────────────────────────────────────────────────
+        # Ensure the object editor exists before we try to hook into it.
         if self.room_editor.object_editor is None:
             from dev_tools.room_editor.room_editor_tools.object_editor import ObjectEditor
             self.room_editor.object_editor = ObjectEditor(
                 SCREEN_WIDTH, SCREEN_HEIGHT, self.room_manager
             )
 
-        # Editor callbacks — keep game lists in sync with editor changes.
-        self.room_editor.object_editor.on_collision_deleted  = self._on_collision_deleted
-        self.room_editor.object_editor.on_stone_deleted      = self._on_stone_deleted
-        self.room_editor.object_editor.on_gate_deleted       = self._on_gate_deleted
-        self.room_editor.object_editor.on_transition_placed  = self._on_transition_placed
-        self.room_editor.object_editor.on_transition_deleted = self._on_transition_deleted
-        self.room_editor.object_editor.on_flying_pad_deleted = self._on_flying_pad_deleted
-        self.room_editor.object_editor.on_flying_pad_placed  = self._on_flying_pad_placed
-        self.room_editor.object_editor.on_save_point_placed  = self._on_save_point_placed
-        self.room_editor.object_editor.on_save_point_deleted = self._on_save_point_deleted
+        # Wire callbacks so the active game lists stay in sync with editor changes.
+        oe = self.room_editor.object_editor
+        oe.on_collision_deleted        = self._on_collision_deleted
+        oe.on_stone_deleted            = self._on_stone_deleted
+        oe.on_gate_deleted             = self._on_gate_deleted
+        oe.on_transition_placed        = self._on_transition_placed
+        oe.on_transition_deleted       = self._on_transition_deleted
+        oe.on_flying_pad_deleted       = self._on_flying_pad_deleted
+        oe.on_flying_pad_placed        = self._on_flying_pad_placed
+        oe.on_save_point_placed        = self._on_save_point_placed
+        oe.on_save_point_deleted       = self._on_save_point_deleted
+        oe.on_cutscene_trigger_placed  = self._on_cutscene_trigger_placed
+        oe.on_cutscene_trigger_deleted = self._on_cutscene_trigger_deleted
 
-        # Sync editor managers with any rooms already loaded from disk.
+        # Tile-change hook is installed lazily in draw() once tileset_editor exists.
+        self._tile_change_hook_installed = False
+
+        # Sync editor manager dicts with any rooms already loaded from disk.
         self._sync_spawn_manager_with_rooms()
 
-        # Miscellaneous game state
+        # ── Miscellaneous game state ──────────────────────────────────────────
         self.pending_npc_position        = None
         self.nearby_npc                  = None
         self.pending_transition_position = None
         self.last_time                   = time.time()
 
-        # Mission system
-        self.mission_manager             = MissionManager()
-        self._active_mission_dialogue    = None  # tracks current mission convo state
+        # ── Mission system ────────────────────────────────────────────────────
+        self.mission_manager          = MissionManager()
+        self._active_mission_dialogue = None   # tracks current mission convo state
         self.pause_menu.set_mission_manager(self.mission_manager)
 
-        # Create the default starting room.
+        # Create the default starting room (a fresh transient "green dev" room).
         self._create_default_room()
 
-        # Scan rooms for any missions defined in placed NPCs
+        # Scan all rooms for missions defined on placed NPCs.
         self.mission_manager.scan_rooms_for_missions(self.room_manager)
 
-        # Wire up the flying controller callbacks.
+        # ── Flying controller callbacks ───────────────────────────────────────
         self.flying_controller.on_room_transition = self._handle_flying_room_transition
         self.flying_controller.on_flight_complete = self._handle_flying_complete
 
-        # Transition / fade system.
+        # ── Transition / fade system ──────────────────────────────────────────
         self.transition_controller = TransitionController(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.flying_controller.set_transition_controller(self.transition_controller)
 
@@ -213,23 +253,14 @@ class Game:
     def _create_default_room(self):
         """Pick the starting room on boot.
 
-        If rooms were already loaded from disk, use the first non-transient one.
-        Only create a fresh room when nothing was saved yet, and mark it transient
-        so it never gets persisted or shown in the editor.
+        Always starts the player in a fresh transient room (the green dev room).
+        Saved rooms are loaded into the room manager for the editor but are never
+        auto-selected as the player's starting location — that would render their
+        tiles into the dev room on startup.
         """
-        if self.room_manager.rooms:
-            # Prefer the first real (non-transient) room loaded from disk.
-            room = next(
-                (r for r in self.room_manager.rooms
-                 if not getattr(r, 'is_transient', False)),
-                self.room_manager.rooms[0]
-            )
-        else:
-            # No saved rooms yet — create a temporary fallback.
-            room = self.room_manager.create_transient_room(
-                "Default Room", WORLD_WIDTH, WORLD_HEIGHT, "Default"
-            )
-
+        room = self.room_manager.create_transient_room(
+            "Default Room", WORLD_WIDTH, WORLD_HEIGHT, "Default"
+        )
         self.room_manager.current_room = room
         self.current_room = room
 
@@ -247,17 +278,19 @@ class Game:
         Everything runs in logical space (SCREEN_WIDTH × SCREEN_HEIGHT), so raw
         window mouse positions need to be mapped before they reach any subsystem.
         """
-        if event.type not in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP,
-                               pygame.MOUSEMOTION):
+        if event.type not in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION):
             return event
-        wx, wy = self.screen.get_size()
-        ox, oy = event.pos
+
+        wx, wy  = self.screen.get_size()
+        ox, oy  = event.pos
         new_pos = (int(ox * SCREEN_WIDTH / wx), int(oy * SCREEN_HEIGHT / wy))
+
         if event.type == pygame.MOUSEMOTION:
             return pygame.event.Event(event.type,
                                       pos=new_pos,
                                       rel=event.rel,
                                       buttons=event.buttons)
+
         d = {'pos': new_pos, 'button': event.button}
         if hasattr(event, 'buttons'):
             d['buttons'] = event.buttons
@@ -267,7 +300,7 @@ class Game:
         """
         Process all pending pygame events for the current frame.
 
-        Priority order for overlays:
+        Priority order for overlays (highest to lowest):
           1. Character-switch menu
           2. Save-point menu
           3. NPC config menu
@@ -281,28 +314,30 @@ class Game:
             try:
                 event = pygame.event.poll()
             except (KeyError, SystemError):
-                continue                    # skip only the broken event, keep going
+                continue   # skip only the broken event, keep going
             if event.type == pygame.NOEVENT:
-                break                       # queue is empty, done
+                break      # queue is empty, done for this frame
 
             event = self._rescale_event(event)
+
             if event.type == pygame.QUIT:
                 self.running = False
 
-            # Character-switch menu (highest overlay priority).
+            # ── Overlay priority pass ─────────────────────────────────────────
+            # Each active overlay grabs the event and issues continue so nothing
+            # below it processes the same input.
+
             if self.character_switch_menu.active:
                 result = self.character_switch_menu.handle_input(event)
                 if result and result != 'close':
                     self._switch_character(result)
                 continue
 
-            # Pause menu.
             if self.pause_menu.active:
-                result = self.pause_menu.handle_input(event)
-                # 'open_skills' stub – wire up when skills menu is ready
+                self.pause_menu.handle_input(event)
+                # 'open_skills' stub — wire up when the skills menu is ready
                 continue
 
-            # Save-point menu.
             if self.save_point_menu.active:
                 result = self.save_point_menu.handle_input(event)
                 if result == 'save':
@@ -314,11 +349,10 @@ class Game:
                     self.character_switch_menu.open(current_character)
                 continue
 
-            # NPC config menu.
             if self.npc_config_menu.active:
                 result = self.npc_config_menu.handle_input(event)
                 if result and result != 'cancel' and self.pending_npc_position:
-                    x, y = self.pending_npc_position
+                    x, y         = self.pending_npc_position
                     npc          = NPC(x, y, result)
                     npc.npc_type = result['npc_type']
                     self.npcs.append(npc)
@@ -327,39 +361,39 @@ class Game:
                     self.pending_npc_position = None
                 continue
 
-            # Room-transition placement config.
             if self.transition_config_menu.active:
                 result = self.transition_config_menu.handle_input(event)
                 if result and result != 'cancel' and self.pending_transition_position:
-                    x, y = self.pending_transition_position
-                    transition                = RoomTransition(x, y, result['width'], result['height'])
-                    transition.target_room    = result['target_room']
-                    transition.exit_direction = result['exit_direction']
+                    x, y                       = self.pending_transition_position
+                    transition                 = RoomTransition(x, y, result['width'], result['height'])
+                    transition.target_room     = result['target_room']
+                    transition.exit_direction  = result['exit_direction']
                     transition.entry_direction = result['entry_direction']
-                    transition.spawn_x        = result['spawn_x']
-                    transition.spawn_y        = result['spawn_y']
+                    transition.spawn_x         = result['spawn_x']
+                    transition.spawn_y         = result['spawn_y']
                     self.room_transitions.append(transition)
                     self.pending_transition_position = None
                 elif result == 'cancel':
                     self.pending_transition_position = None
                 continue
 
-            # Sprite editor.
             if self.sprite_editor.active:
                 self.sprite_editor.handle_input(event)
                 continue
 
-            # Room editor.
+            if self.cutscene_editor.active:
+                self.cutscene_editor.handle_input(event)
+                continue
+
             if self.room_editor.active:
                 result = self.room_editor.handle_input(event)
                 if result and result.startswith('test_room:'):
                     self._handle_test_room(result)
-                # Rescan missions whenever the editor closes (NPCs may have changed)
+                # Rescan missions whenever the editor closes (NPCs may have changed).
                 if not self.room_editor.active:
                     self.mission_manager.scan_rooms_for_missions(self.room_manager)
                 continue
 
-            # Dev menu.
             if self.dev_menu.active:
                 result = self.dev_menu.handle_input(event)
                 if result == 'open_room_editor':
@@ -370,9 +404,13 @@ class Game:
                 elif result == 'open_sprite_editor':
                     self.dev_menu.active = False
                     self.sprite_editor.toggle()
+                elif result == 'open_cutscene_editor':
+                    self.dev_menu.active = False
+                    self.cutscene_editor.toggle()
                 continue
 
-            # Normal gameplay key events.
+            # ── Normal gameplay input ─────────────────────────────────────────
+            # Only reached when no overlay is active.
             elif event.type == pygame.KEYDOWN:
                 if self.ui.current_screen == 'game':
                     self._handle_game_keydown(event)
@@ -384,6 +422,7 @@ class Game:
 
             elif event.type == pygame.KEYUP:
                 if self.ui.current_screen == 'game':
+                    # Release the beam charge when Q is lifted without having fired.
                     if event.key == pygame.K_q:
                         self.player.is_q_pressed = False
                         if self.player.is_charging_beam and not self.player.is_firing_beam:
@@ -395,6 +434,7 @@ class Game:
             self.dev_menu.toggle()
 
         elif event.key == pygame.K_F2:
+            # F2 exits test mode and drops back into the room editor.
             if self.is_test_mode:
                 self._exit_test_mode()
                 self.room_editor.active       = True
@@ -404,6 +444,7 @@ class Game:
             self.pause_menu.open(self.player)
 
         elif event.key == pygame.K_q:
+            # Q fires a ki blast or begins charging a beam, depending on the current mode.
             if self.player.ki_attack_mode == 'blast':
                 self.player.shoot_blast()
             elif self.player.ki_attack_mode == 'beam':
@@ -414,18 +455,20 @@ class Game:
             self._handle_interact()
 
         elif event.key == pygame.K_TAB:
-            # Cycle through ki attack modes.
+            # Cycle through ki attack modes: blast → beam → transform → blast …
             modes = ('blast', 'beam', 'transform')
             idx = modes.index(self.player.ki_attack_mode) if self.player.ki_attack_mode in modes else 0
             self.player.ki_attack_mode = modes[(idx + 1) % len(modes)]
 
         elif event.key == pygame.K_x:
+            # X triggers a transformation when the system is charged and ready.
             if (self.player.ki_attack_mode == 'transform'
                     and self.player.transformation
                     and self.player.transformation.is_ready):
                 self.player.transformation.start_transform()
 
         elif event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN):
+            # Double-tapping a direction key starts a run.
             if self.player.check_double_tap(event.key):
                 self.player.is_running = True
 
@@ -439,23 +482,27 @@ class Game:
           3. Flying pad.
           4. Default melee attack.
         """
+        # Don't allow interact while a flying sequence is in progress.
         if self.flying_controller.is_active():
             return
 
+        # Save point takes top priority.
         if self.nearby_save_point and not self.dialogue_box.active and not self.save_point_menu.active:
             if self.nearby_save_point.variant == 'big':
                 self.save_point_menu.open()
             return
 
+        # Begin talking to a nearby NPC.
         if self.nearby_npc and not self.dialogue_box.active:
             self._start_npc_dialogue(self.nearby_npc)
             return
 
+        # Advance an already-open dialogue box.
         if self.dialogue_box.active and self.dialogue_box._state != 'closing':
             self._advance_npc_dialogue()
             return
 
-        # Flying pad
+        # Check if the player is standing on a flying pad with waypoints.
         nearby_pad = next(
             (pad for pad in self.flying_pads
              if pad.active and pad.check_collision_with_player(self.player)),
@@ -464,6 +511,7 @@ class Game:
         if nearby_pad and len(nearby_pad.waypoints) > 0:
             self.flying_controller.start_flight(self.player, nearby_pad)
         else:
+            # Default: throw a melee punch.
             melee = self.player.melee_attack()
             if melee:
                 self.melee_attacks.append(melee)
@@ -471,7 +519,8 @@ class Game:
 
     def _start_npc_dialogue(self, npc):
         """Begin a conversation with an NPC, routing through the mission system."""
-        npc.is_talking = True   # hide the NPC's own indicator the moment dialogue starts
+        # Hide the NPC's own indicator the moment dialogue starts.
+        npc.is_talking = True
         iid   = getattr(npc, 'instance_id', '')
         state = self.mission_manager.get_npc_dialogue_state(iid) if iid else None
 
@@ -491,47 +540,59 @@ class Game:
             self._show_mission_line()
 
         elif state == 'active':
-            # Fire talk_to_npc hook, show "still working" line
+            # Fire the talk_to_npc hook so mission tracking stays up to date.
             self.mission_manager.on_npc_talked(iid)
             mission = self.mission_manager.get_mission_for_npc(iid)
             lines   = mission.get('dialogues', {}).get('active', []) if mission else []
-            if isinstance(lines, str): lines = [lines]
+            if isinstance(lines, str):
+                lines = [lines]
             lines = lines or ["Come back when you're done."]
             self._active_mission_dialogue = {
-                'npc': npc, 'lines': lines, 'index': 0,
-                'phase': 'active', 'mission': mission,
+                'npc':     npc,
+                'lines':   lines,
+                'index':   0,
+                'phase':   'active',
+                'mission': mission,
             }
             self._show_mission_line()
 
         elif state == 'completed':
-            # All objectives done — offer reward
+            # All objectives done — fire the hook then offer the reward dialogue.
             self.mission_manager.on_npc_talked(iid)
             mission = self.mission_manager.get_mission_for_npc(iid)
-            # Check bring_item before finalising
+            # Check bring_item objective before finalising the mission.
             if mission:
                 self.mission_manager.check_bring_item(mission['id'], getattr(self.player, 'inventory', []))
-            lines   = mission.get('dialogues', {}).get('completed', []) if mission else []
-            if isinstance(lines, str): lines = [lines]
+            lines = mission.get('dialogues', {}).get('completed', []) if mission else []
+            if isinstance(lines, str):
+                lines = [lines]
             lines = lines or ["Well done! Here is your reward."]
             self._active_mission_dialogue = {
-                'npc': npc, 'lines': lines, 'index': 0,
-                'phase': 'claim_reward', 'mission': mission,
+                'npc':     npc,
+                'lines':   lines,
+                'index':   0,
+                'phase':   'claim_reward',
+                'mission': mission,
             }
             self._show_mission_line()
 
         elif state == 'rewarded':
             mission = self.mission_manager.get_mission_for_npc(iid)
             lines   = mission.get('dialogues', {}).get('rewarded', []) if mission else []
-            if isinstance(lines, str): lines = [lines]
+            if isinstance(lines, str):
+                lines = [lines]
             lines = lines or ["Thanks again."]
             self._active_mission_dialogue = {
-                'npc': npc, 'lines': lines, 'index': 0,
-                'phase': 'rewarded', 'mission': mission,
+                'npc':     npc,
+                'lines':   lines,
+                'index':   0,
+                'phase':   'rewarded',
+                'mission': mission,
             }
             self._show_mission_line()
 
         else:
-            # Plain NPC — use existing dialogue system
+            # Plain NPC — use the standard dialogue system with no mission routing.
             self._active_mission_dialogue = None
             text, is_final, item = npc.start_dialogue()
             if text:
@@ -541,13 +602,14 @@ class Game:
                     self.player.inventory.append(item)
 
     def _advance_npc_dialogue(self):
-        # If text is still typing out, snap it to fully visible on first press.
+        """Advance or close the active NPC dialogue box on player input."""
+        # If text is still typing out, snap it to fully visible on the first press.
         if self.dialogue_box._chars_shown < len(self.dialogue_box.current_text):
             self.dialogue_box._chars_shown = len(self.dialogue_box.current_text)
             return
 
+        # ── Plain NPC flow (no mission) ───────────────────────────────────────
         if self._active_mission_dialogue is None:
-            # Plain NPC flow
             if not self.nearby_npc:
                 self.dialogue_box.hide()
                 return
@@ -563,15 +625,17 @@ class Game:
                         self.player.inventory.append(item)
             return
 
-        md    = self._active_mission_dialogue
+        # ── Mission dialogue flow ─────────────────────────────────────────────
+        md = self._active_mission_dialogue
         md['index'] += 1
 
         if md['index'] < len(md['lines']):
+            # More lines remain in this phase — just advance.
             self._show_mission_line()
         else:
-            # All lines shown — finalise the phase
+            # All lines shown — resolve the current dialogue phase.
             npc = md['npc']
-            npc.is_talking = False
+            npc.is_talking             = False
             npc.current_dialogue_index = 0
 
             phase   = md.get('phase', '')
@@ -579,39 +643,40 @@ class Game:
 
             if phase == 'offer' and mission:
                 self.mission_manager.accept_mission(mission['id'])
-                # Show 'accepted' dialogue lines if configured
+                # Show 'accepted' confirmation lines if the designer configured any.
                 accepted_lines = mission.get('dialogues', {}).get('accepted', '')
                 if isinstance(accepted_lines, str):
                     accepted_lines = [accepted_lines] if accepted_lines.strip() else []
                 if accepted_lines:
                     # Don't hide first — transition directly so the box stays open
-                    # and show() can restart cleanly from 'open' state.
+                    # and show() can restart cleanly from the 'open' state.
                     self._active_mission_dialogue = {
-                        'npc': npc, 'lines': accepted_lines, 'index': 0,
-                        'phase': 'accepted', 'mission': mission,
+                        'npc':     npc,
+                        'lines':   accepted_lines,
+                        'index':   0,
+                        'phase':   'accepted',
+                        'mission': mission,
                     }
                     self._show_mission_line()
-                    return  # don't clear yet — player advances through accepted lines
+                    return   # don't clear yet — player still has lines to advance
                 self.dialogue_box.hide()
                 self._active_mission_dialogue = None
-
 
             elif phase == 'claim_reward' and mission:
                 rewards = self.mission_manager.claim_reward(mission['id'])
                 self._apply_mission_rewards(rewards)
-                self.dialogue_box.hide()  # ← add this
+                self.dialogue_box.hide()
                 self._active_mission_dialogue = None
 
-
             else:
-                self.dialogue_box.hide()  # ← add this
+                self.dialogue_box.hide()
                 self._active_mission_dialogue = None
 
     def _show_mission_line(self):
         """Show the current line from the active mission dialogue."""
-        md   = self._active_mission_dialogue
-        line = md['lines'][md['index']]
-        npc  = md['npc']
+        md       = self._active_mission_dialogue
+        line     = md['lines'][md['index']]
+        npc      = md['npc']
         is_final = (md['index'] >= len(md['lines']) - 1)
         npc.is_talking = True
         portrait_key   = self._npc_portrait_key(npc)
@@ -672,7 +737,7 @@ class Game:
         # Clear all active entities and projectiles before entering test mode.
         self._clear_active_entities()
 
-        self.is_test_mode = True
+        self.is_test_mode                = True
         self._create_comprehensive_test_backup()
         self._test_mission_snapshot      = self.mission_manager.snapshot()
         self.mission_manager.block_saves = True   # prevent test progress reaching disk
@@ -680,7 +745,7 @@ class Game:
         self.room_manager.current_room = room
         self.current_room              = room
 
-        # Sync tiles from the editor into the room before testing.
+        # Sync tiles from the editor into the room object before testing starts.
         if self.room_editor.tileset_editor and room_name in self.room_editor.tileset_editor.room_tiles:
             room.tiles = self.room_editor.tileset_editor.room_tiles[room_name][:]
         elif not hasattr(room, 'tiles'):
@@ -688,7 +753,7 @@ class Game:
 
         self._load_room_objects_as_copies(room)
 
-        # Place the player at the room's spawn point.
+        # Determine where to place the player — prefer the room's spawn point.
         if hasattr(room, 'spawn_points') and room.spawn_points:
             spawn_pos = (room.spawn_points[0].x, room.spawn_points[0].y)
         elif room.spawn_point:
@@ -699,6 +764,7 @@ class Game:
         self.player.x = spawn_pos[0]
         self.player.y = spawn_pos[1]
 
+        # Centre the camera on the spawn position.
         self.camera.x = max(0, self.player.x - self.camera.screen_width  // 2)
         self.camera.y = max(0, self.player.y - self.camera.screen_height // 2)
 
@@ -713,11 +779,11 @@ class Game:
 
         for room in self.room_manager.rooms:
             room_backup = {
-                'room_name':          room.name,
-                'collision_objects':  [],
+                'room_name':           room.name,
+                'collision_objects':   [],
                 'destructible_stones': [],
-                'level_gates':        [],
-                'flying_pads':        [],
+                'level_gates':         [],
+                'flying_pads':         [],
             }
 
             if hasattr(room, 'collision_objects'):
@@ -725,25 +791,27 @@ class Game:
                     room_backup['collision_objects'].append({
                         'x': obj.x, 'y': obj.y,
                         'width': obj.width, 'height': obj.height,
-                        'collision_type': getattr(obj, 'collision_type', 'wall')
+                        'collision_type': getattr(obj, 'collision_type', 'wall'),
                     })
 
             if hasattr(room, 'flying_pads'):
                 for pad in room.flying_pads:
                     room_backup['flying_pads'].append({
-                        'x': pad.x, 'y': pad.y,
-                        'pad_type':       pad.pad_type,
-                        'waypoints':      [wp.to_dict() for wp in pad.waypoints],
-                        'is_return_pad':  pad.is_return_pad,
-                        'linked_pad_id':  pad.linked_pad_id,
-                        'width':          pad.width,
-                        'height':         pad.height,
+                        'x':             pad.x,
+                        'y':             pad.y,
+                        'pad_type':      pad.pad_type,
+                        'waypoints':     [wp.to_dict() for wp in pad.waypoints],
+                        'is_return_pad': pad.is_return_pad,
+                        'linked_pad_id': pad.linked_pad_id,
+                        'width':         pad.width,
+                        'height':        pad.height,
                     })
 
             if hasattr(room, 'destructible_stones'):
                 for stone in room.destructible_stones:
                     room_backup['destructible_stones'].append({
-                        'x': stone.x, 'y': stone.y,
+                        'x':          stone.x,
+                        'y':          stone.y,
                         'stone_type': stone.stone_type,
                         'max_health': stone.max_health,
                         'health':     stone.health,
@@ -754,7 +822,8 @@ class Game:
             if hasattr(room, 'level_gates'):
                 for gate in room.level_gates:
                     room_backup['level_gates'].append({
-                        'x': gate.x, 'y': gate.y,
+                        'x':              gate.x,
+                        'y':              gate.y,
                         'gate_type':      gate.gate_type,
                         'required_level': gate.required_level,
                         'max_health':     gate.max_health,
@@ -778,20 +847,20 @@ class Game:
         # Discard any baked tile surface for this room so it is rebuilt fresh.
         self.invalidate_tile_cache(room.name)
 
-        # Flying pads
+        # Flying pads — deep-copy so test-mode flights don't touch the editor data.
         self.flying_pads = []
         if hasattr(room, 'flying_pads') and room.flying_pads:
             from objects.flying_pad import FlyingPad, FlyingPadWaypoint
             for pad in room.flying_pads:
-                copy_pad              = FlyingPad(pad.x, pad.y, pad.pad_type)
-                copy_pad.waypoints    = [FlyingPadWaypoint.from_dict(wp.to_dict()) for wp in pad.waypoints]
+                copy_pad               = FlyingPad(pad.x, pad.y, pad.pad_type)
+                copy_pad.waypoints     = [FlyingPadWaypoint.from_dict(wp.to_dict()) for wp in pad.waypoints]
                 copy_pad.is_return_pad = pad.is_return_pad
                 copy_pad.linked_pad_id = pad.linked_pad_id
-                copy_pad.source_room  = pad.source_room
-                copy_pad.current_room = room.name
-                copy_pad.width        = pad.width
-                copy_pad.height       = pad.height
-                copy_pad.active       = True
+                copy_pad.source_room   = pad.source_room
+                copy_pad.current_room  = room.name
+                copy_pad.width         = pad.width
+                copy_pad.height        = pad.height
+                copy_pad.active        = True
                 self.flying_pads.append(copy_pad)
 
         # Collision objects
@@ -799,7 +868,7 @@ class Game:
         if hasattr(room, 'collision_objects') and room.collision_objects:
             from objects.collision_object import CollisionObject
             for obj in room.collision_objects:
-                copy_obj = CollisionObject(obj.x, obj.y, obj.width, obj.height)
+                copy_obj                = CollisionObject(obj.x, obj.y, obj.width, obj.height)
                 copy_obj.collision_type = getattr(obj, 'collision_type', 'wall')
                 self.collision_objects.append(copy_obj)
 
@@ -837,14 +906,14 @@ class Game:
         if hasattr(room, 'room_transitions') and room.room_transitions:
             from objects.room_transition import RoomTransition
             for transition in room.room_transitions:
-                copy_t                  = RoomTransition(transition.x, transition.y,
-                                                         transition.width, transition.height)
-                copy_t.target_room      = transition.target_room
-                copy_t.exit_direction   = transition.exit_direction
-                copy_t.entry_direction  = transition.entry_direction
-                copy_t.spawn_x          = transition.spawn_x
-                copy_t.spawn_y          = transition.spawn_y
-                copy_t.active           = True
+                copy_t                 = RoomTransition(transition.x, transition.y,
+                                                        transition.width, transition.height)
+                copy_t.target_room     = transition.target_room
+                copy_t.exit_direction  = transition.exit_direction
+                copy_t.entry_direction = transition.entry_direction
+                copy_t.spawn_x         = transition.spawn_x
+                copy_t.spawn_y         = transition.spawn_y
+                copy_t.active          = True
                 self.room_transitions.append(copy_t)
 
         # Save points
@@ -877,22 +946,22 @@ class Game:
             if not room:
                 continue
 
-            # Rebuild collision objects.
+            # Rebuild collision objects from the snapshot.
             from objects.collision_object import CollisionObject
             room.collision_objects = []
             for d in backup['collision_objects']:
-                obj = CollisionObject(d['x'], d['y'], d['width'], d['height'])
+                obj                = CollisionObject(d['x'], d['y'], d['width'], d['height'])
                 obj.collision_type = d['collision_type']
                 room.collision_objects.append(obj)
 
-            # Rebuild flying pads.
+            # Rebuild flying pads from the snapshot.
             from objects.flying_pad import FlyingPad, FlyingPadWaypoint
             room.flying_pads = []
             for d in backup.get('flying_pads', []):
-                pad            = FlyingPad(d['x'], d['y'], d['pad_type'])
-                pad.width      = d['width']
-                pad.height     = d['height']
-                pad.waypoints  = [FlyingPadWaypoint.from_dict(wp) for wp in d['waypoints']]
+                pad               = FlyingPad(d['x'], d['y'], d['pad_type'])
+                pad.width         = d['width']
+                pad.height        = d['height']
+                pad.waypoints     = [FlyingPadWaypoint.from_dict(wp) for wp in d['waypoints']]
                 pad.is_return_pad = d['is_return_pad']
                 pad.linked_pad_id = d['linked_pad_id']
                 room.flying_pads.append(pad)
@@ -900,7 +969,7 @@ class Game:
             if self.room_editor.object_editor:
                 self.room_editor.object_editor.flying_pad_manager.flying_pads[room.name] = room.flying_pads
 
-            # Rebuild destructible stones.
+            # Rebuild destructible stones from the snapshot.
             from objects.destructible_stone import DestructibleStone
             room.destructible_stones = []
             for d in backup['destructible_stones']:
@@ -911,7 +980,7 @@ class Game:
                 stone.height     = d['height']
                 room.destructible_stones.append(stone)
 
-            # Rebuild level gates.
+            # Rebuild level gates from the snapshot.
             from objects.level_gate import LevelGate
             room.level_gates = []
             for d in backup['level_gates']:
@@ -928,12 +997,12 @@ class Game:
         self.is_test_mode     = False
         self.test_room_backup = None
 
-        # Restore mission progress to pre-test state and rewrite the save file
-        # so test-mode progress never survives a game restart
+        # Restore mission progress to pre-test state and overwrite the save file
+        # so test-mode progress never survives a game restart.
         self.mission_manager.block_saves = False
         if self._test_mission_snapshot is not None:
             self.mission_manager.restore(self._test_mission_snapshot)
-            self.mission_manager.save()   # overwrite file with clean pre-test state
+            self.mission_manager.save()
             self._test_mission_snapshot = None
 
         self._clear_active_entities()
@@ -953,14 +1022,14 @@ class Game:
         # Discard any baked tile surface for this room so it is rebuilt fresh.
         self.invalidate_tile_cache(room.name)
 
-        # Flying pads
+        # Flying pads — shallow copy; current_room is set on each pad.
         self.flying_pads = []
         if hasattr(room, 'flying_pads') and room.flying_pads:
             self.flying_pads = room.flying_pads[:]
             for pad in self.flying_pads:
                 pad.current_room = room.name
 
-        # Collision objects
+        # Collision objects — shallow copy.
         self.collision_objects = []
         if hasattr(room, 'collision_objects') and room.collision_objects:
             self.collision_objects = room.collision_objects[:]
@@ -968,7 +1037,7 @@ class Game:
         # Invisible boundary walls to contain knockback inside the room.
         self._add_room_boundary_walls(room)
 
-        # Destructible stones, gates, transitions, save points.
+        # One-liner copies for the rest of the room object types.
         self.destructible_stones = room.destructible_stones[:] if hasattr(room, 'destructible_stones') and room.destructible_stones else []
         self.level_gates         = room.level_gates[:]         if hasattr(room, 'level_gates')         and room.level_gates         else []
         self.room_transitions    = room.room_transitions[:]    if hasattr(room, 'room_transitions')    and room.room_transitions    else []
@@ -979,10 +1048,10 @@ class Game:
         self.npcs    = []
         self._spawn_room_entities(room)
 
-        # Clear in-flight projectiles from the previous room.
+        # Clear in-flight projectiles left over from the previous room.
         self._clear_projectiles()
 
-        # Rebuild obstacle lists.
+        # Rebuild obstacle lists so knockback resolves against the new room's geometry.
         self._assign_obstacles()
 
     # ── Private room-loading utilities ────────────────────────────────────────
@@ -996,15 +1065,16 @@ class Game:
 
         thickness = 10  # Wall thickness in world units.
 
+        # Build one wall per edge: top, bottom, left, right.
         walls = [
-            CollisionObject(room.width // 2,              -thickness // 2,              room.width, thickness),  # Top
-            CollisionObject(room.width // 2,               room.height + thickness // 2, room.width, thickness),  # Bottom
-            CollisionObject(-thickness // 2,               room.height // 2,             thickness,  room.height), # Left
-            CollisionObject(room.width + thickness // 2,   room.height // 2,             thickness,  room.height), # Right
+            CollisionObject(room.width // 2,             -thickness // 2,               room.width, thickness),   # Top
+            CollisionObject(room.width // 2,              room.height + thickness // 2,  room.width, thickness),   # Bottom
+            CollisionObject(-thickness // 2,              room.height // 2,              thickness,  room.height),  # Left
+            CollisionObject(room.width + thickness // 2,  room.height // 2,              thickness,  room.height),  # Right
         ]
         for wall in walls:
-            wall.collision_type    = 'wall'
-            wall.is_room_boundary  = True
+            wall.collision_type   = 'wall'
+            wall.is_room_boundary = True
             self.collision_objects.append(wall)
 
     def _push_out_of_obstacles(self, entity, obstacles, max_iterations=20):
@@ -1019,6 +1089,7 @@ class Game:
             return pygame.Rect(e.x - e.width // 2, e.y - e.height // 2, e.width, e.height)
 
         def get_obstacle_rect(obs):
+            """Return a pygame.Rect for the obstacle, or None if it's non-solid."""
             if not getattr(obs, 'active', True):
                 return None
             if hasattr(obs, 'id') and obs.id == 'collision_wall':
@@ -1029,7 +1100,7 @@ class Game:
                 return obs.get_rect()
             if hasattr(obs, 'x') and hasattr(obs, 'width'):
                 return pygame.Rect(
-                    obs.x - obs.width // 2,
+                    obs.x - obs.width  // 2,
                     obs.y - obs.height // 2,
                     obs.width, obs.height,
                 )
@@ -1037,12 +1108,13 @@ class Game:
 
         for _ in range(max_iterations):
             ent_rect = get_entity_rect(entity)
-            pushed = False
+            pushed   = False
             for obs in obstacles:
                 obs_rect = get_obstacle_rect(obs)
                 if obs_rect is None or not ent_rect.colliderect(obs_rect):
                     continue
-                # Calculate overlap on each axis and push along the smallest one
+
+                # Push along the axis with the smallest overlap.
                 overlap_left  = ent_rect.right  - obs_rect.left
                 overlap_right = obs_rect.right  - ent_rect.left
                 overlap_up    = ent_rect.bottom - obs_rect.top
@@ -1050,25 +1122,25 @@ class Game:
 
                 min_overlap = min(overlap_left, overlap_right, overlap_up, overlap_down)
                 if min_overlap == overlap_left:
-                    entity.x -= overlap_left + 1
+                    entity.x -= overlap_left  + 1
                 elif min_overlap == overlap_right:
                     entity.x += overlap_right + 1
                 elif min_overlap == overlap_up:
-                    entity.y -= overlap_up + 1
+                    entity.y -= overlap_up    + 1
                 else:
-                    entity.y += overlap_down + 1
+                    entity.y += overlap_down  + 1
 
                 pushed = True
-                break  # re-check all obstacles after each nudge
+                break   # Re-check all obstacles after each nudge.
 
             if not pushed:
-                break  # fully clear
+                break   # Entity is fully clear of all obstacles.
 
     def _spawn_room_entities(self, room):
         """Instantiate enemies and NPCs from the room's entity data.
 
         Reads variant_type to determine AI category and shooter style
-        so the correct projectile system fires for each enemy.
+        so the correct projectile system fires for each enemy type.
         """
         if not hasattr(room, 'entities') or not room.entities:
             return
@@ -1077,7 +1149,7 @@ class Game:
         from entities.boss_enemy import BossEnemy
         from entities.npc import NPC
 
-        # Build obstacle list for spawn-time collision resolution (Fail-safe 2)
+        # Build the obstacle list used to resolve spawn-time collisions (Fail-safe 2).
         spawn_obstacles = (
             self.collision_objects
             + self.destructible_stones
@@ -1093,17 +1165,19 @@ class Game:
             variant_type = data.get('variant_type', 'default')
 
             if entity_type == 'npc':
-                npc                   = NPC(x, y, data.get('dialogue_config', None))
-                npc.active            = True
-                npc.npc_type          = data.get('npc_mode',   'static')
-                npc.facing_direction  = data.get('npc_facing', 'down')
-                npc.variant           = data.get('variant_type', 'default')
-                npc.npc_id            = data.get('id', 'generic')
-                npc.instance_id       = data.get('instance_id', '')
-                # Register mission if this NPC has one defined
+                npc                  = NPC(x, y, data.get('dialogue_config', None))
+                npc.active           = True
+                npc.npc_type         = data.get('npc_mode',   'static')
+                npc.facing_direction = data.get('npc_facing', 'down')
+                npc.variant          = data.get('variant_type', 'default')
+                npc.npc_id           = data.get('id', 'generic')
+                npc.instance_id      = data.get('instance_id', '')
+
+                # Register the mission if this NPC has one defined inline.
                 if data.get('mission') and npc.instance_id:
                     self.mission_manager.register_mission(data['mission'])
-                # Load sprite via the NPC sprite loader
+
+                # Load the NPC sprite via the sprite system.
                 import os
                 npc_id       = data.get('id', 'generic')
                 variant_type = data.get('variant_type', 'default')
@@ -1125,6 +1199,7 @@ class Game:
                 ai_type        = data.get('ai_type', 'easy')
                 enemy_category = data.get('enemy_category', 'melee')
 
+                # Map variant to the correct projectile type for shooter enemies.
                 if variant_type == 'gunner':
                     shooter_style = 'bullet'
                 elif variant_type == 'rocketlauncher':
@@ -1158,8 +1233,8 @@ class Game:
 
     def _clear_active_entities(self):
         """Clear enemies, NPCs, and all projectile/attack lists."""
-        self.enemies    = []
-        self.npcs       = []
+        self.enemies = []
+        self.npcs    = []
         self._clear_projectiles()
 
     def _clear_projectiles(self):
@@ -1170,8 +1245,11 @@ class Game:
         self.enemy_bullets = []
         self.enemy_rockets = []
         self.explosions    = []
+        self.dmg_numbers.clear()  # Wipe leftover popups on room transition
 
     # ── Editor callbacks ──────────────────────────────────────────────────────
+    # These keep the live game lists in sync when the designer places or removes
+    # objects in the room editor without leaving play mode.
 
     def _on_collision_deleted(self, collision_obj, room_name):
         """Sync game list when a collision object is removed in the editor."""
@@ -1239,18 +1317,242 @@ class Game:
         if save_point in self.save_points:
             self.save_points.remove(save_point)
 
+    def _on_cutscene_trigger_placed(self, trigger, room_name):
+        """Persist the room whenever a cutscene trigger is placed in the editor."""
+        room = self.room_manager.get_room_by_name(room_name)
+        if room:
+            self.room_manager.save_room(room)
+
+    def _on_cutscene_trigger_deleted(self, trigger, room_name):
+        """Persist the room whenever a cutscene trigger is deleted in the editor."""
+        room = self.room_manager.get_room_by_name(room_name)
+        if room:
+            self.room_manager.save_room(room)
+
+    def _sync_player_from_cutscene(self, runtime):
+        """After a cutscene ends, move the player to the final position and
+        direction of the actor that shares the same character as the current player.
+
+        Matching priority:
+          1. type == 'player'  AND  character == self.player.character  (exact match)
+          2. type == 'player'  with no 'character' field set            (untagged fallback)
+        The first exact match wins; if none is found, the first untagged player
+        actor is used so cutscenes that don't specify a character still work.
+        """
+        player_character = getattr(self.player, 'character', None)
+        exact_match    = None   # actor_def with matching character field
+        fallback_match = None   # first player actor with no character field
+
+        for actor_def in runtime.data.get('actors', []):
+            if actor_def.get('type') != 'player':
+                continue
+            actor_character = actor_def.get('character')
+            if actor_character is not None:
+                if actor_character == player_character and exact_match is None:
+                    exact_match = actor_def
+            else:
+                if fallback_match is None:
+                    fallback_match = actor_def
+
+        chosen = exact_match or fallback_match
+        if chosen is None:
+            return   # no player actor in this cutscene — nothing to sync
+
+        actor_id   = chosen.get('id')
+        live_actor = runtime.actors.get(actor_id)
+        if live_actor and hasattr(live_actor, 'entity'):
+            entity         = live_actor.entity
+            self.player.x  = entity.x
+            self.player.y  = entity.y
+
+            # Mirror the actor's final facing direction onto the real player so
+            # they don't snap back to their pre-cutscene direction on resume.
+            final_direction = getattr(entity, 'direction', None)
+            if final_direction:
+                self.player.direction = final_direction
+                # Also push the direction into the sprite so the idle frame shown
+                # immediately after the cutscene matches the new direction.
+                if hasattr(self.player, 'sprite') and self.player.sprite:
+                    current_anim = getattr(self.player, 'current_animation_state', 'idle')
+                    if hasattr(self.player.sprite, 'set_animation'):
+                        self.player.sprite.set_animation(current_anim, final_direction)
+
+    def _update_cutscene_triggers(self, dt):
+        """Tick the active cutscene runtime, or check for new trigger fires.
+
+        Fade state machine
+        ──────────────────
+        'fade_out' → alpha rises to 255 (screen goes black)
+                   → on reaching 255, instantiate the runtime and switch to 'start'
+        'start'    → one frame at full black so the first cutscene frame is hidden
+                   → immediately enter 'fade_in'
+        'fade_in'  → alpha falls to 0 (screen becomes clear)
+                   → on reaching 0, clear _csf_state; cutscene runs normally
+        None       → normal cutscene playback, or no cutscene active
+
+        When the cutscene finishes we kick off the fade-in leg.
+        """
+        # ── Start frame: launch runtime immediately (no fade) ─────────────────
+        if self._csf_state == 'start':
+            data              = self._csf_pending
+            self._csf_pending = None
+            self._csf_state   = None
+            self._csf_alpha   = 0.0
+            if data is not None:
+                try:
+                    from core.cutscene_runtime import CutsceneRuntime
+                    self.active_cutscene_runtime = CutsceneRuntime(
+                        data,
+                        self.camera,
+                        self.cutscene_editor._entity_factory,
+                        dialogue_box=self.dialogue_box,
+                    )
+                    self.active_cutscene_runtime.seek(0.0)
+
+                    # After seek() resets actor positions to their scripted spawn,
+                    # snap the player actor to the real player's world position so
+                    # any move_to tweens start from where the player actually is.
+                    _pc = getattr(self.player, 'character', None)
+                    for _adef in data.get('actors', []):
+                        if _adef.get('type') != 'player':
+                            continue
+                        _ac = _adef.get('character')
+                        if _ac is not None and _ac != _pc:
+                            continue
+                        _live = self.active_cutscene_runtime.actors.get(_adef['id'])
+                        if _live and hasattr(_live, 'entity'):
+                            _live.entity.x = self.player.x
+                            _live.entity.y = self.player.y
+                            # Also fix the tween's baked start position so it
+                            # smoothly moves FROM the real player position.
+                            if _live._tween is not None:
+                                _live._tween.start_x = self.player.x
+                                _live._tween.start_y = self.player.y
+                        break
+
+                    # Rebase camera_target so the camera travels from the player's
+                    # current world position directly to each tween's destination.
+                    #
+                    # seek(0.0) may have fired snap_to or pan_to(start_x=…) which
+                    # placed _base_x/y at the scripted start position.  Without this
+                    # fixup the physical camera would first lerp to that scripted
+                    # start then follow the tween — a double movement the player sees.
+                    #
+                    # Each tween stores a delta (not an absolute position), so we
+                    # compute the absolute destination, reset the base to the player's
+                    # world position, then rewrite the delta to preserve the destination.
+                    _ct     = self.active_cutscene_runtime.camera_target
+                    _px, _py = self.player.x, self.player.y
+                    if _ct._tweens:
+                        for _tw in _ct._tweens:
+                            _abs_x         = _ct._base_x + _tw['delta_x']
+                            _abs_y         = _ct._base_y + _tw['delta_y']
+                            _tw['delta_x'] = _abs_x - _px
+                            _tw['delta_y'] = _abs_y - _py
+                        _ct._base_x = _px
+                        _ct._base_y = _py
+                        _ct._recompute_xy()
+                        self.camera._lerp_active = True
+                    elif (_ct.x != _px or _ct.y != _py):
+                        # snap_to with no subsequent pan — lerp the physical camera
+                        # to the snapped position (camera_target is already there).
+                        self.camera._lerp_active = True
+
+                    self.sprite_hud._hud_slide_out = True
+                    self.sprite_hud._hud_slide_in  = False
+                except Exception as e:
+                    print(f'[Game] failed to start cutscene: {e}')
+                    import traceback; traceback.print_exc()
+                    self.active_cutscene_runtime = None
+            return
+
+        # ── Normal cutscene playback ──────────────────────────────────────────
+        if self.active_cutscene_runtime:
+            # Freeze the cutscene while the pause menu is open; don't tick time
+            # or animations so the scene resumes exactly where it was paused.
+            if self.pause_menu.active:
+                return
+            w = self.current_room.width  if self.current_room else 10000
+            h = self.current_room.height if self.current_room else 10000
+            self.active_cutscene_runtime.update(dt, w, h)
+            if self.dialogue_box:
+                self.dialogue_box.update(dt)
+            if self.active_cutscene_runtime.finished:
+                self._sync_player_from_cutscene(self.active_cutscene_runtime)
+                self.active_cutscene_runtime       = None
+                self.sprite_hud._hud_slide_out     = False
+                self.sprite_hud._hud_slide_in      = True
+                self.camera._lerp_active           = True
+            return
+
+        # ── No cutscene running — check trigger zones ─────────────────────────
+        oe = getattr(self.room_editor, 'object_editor', None)
+        if not oe or not self.current_room:
+            return
+
+        trigger_mgr = getattr(oe, 'cutscene_trigger_manager', None)
+        if not trigger_mgr:
+            return
+
+        # Tick per-trigger cooldowns so a fired trigger can't re-fire immediately.
+        trigger_mgr.update(self.current_room.name, dt)
+
+        # Check whether the player is standing in any trigger zone.
+        fired_id = trigger_mgr.check_player(self.current_room.name, self.player)
+        if not fired_id:
+            return
+
+        # Load the cutscene JSON from disk and queue it to launch immediately.
+        import os, json
+        cutscene_path = os.path.join('data', 'cutscenes', f'{fired_id}.json')
+        if not os.path.exists(cutscene_path):
+            print(f'[Game] cutscene file not found: {cutscene_path}')
+            return
+        try:
+            with open(cutscene_path) as f:
+                cutscene_data = json.load(f)
+        except Exception as e:
+            print(f'[Game] failed to load cutscene "{fired_id}": {e}')
+            import traceback; traceback.print_exc()
+            return
+
+        # Start the cutscene on the next frame (no fade-out, direct launch).
+        self._csf_pending = cutscene_data
+        self._csf_alpha   = 0.0
+        self._csf_state   = 'start'
+
+    def _draw_cutscene_fade(self, surface):
+        """Draw the cutscene black-fade overlay if a fade is in progress.
+
+        Called from draw() after transition_controller.draw() so it sits on top
+        of the whole scene (including any room-transition wipes) but under dev
+        tools.  When _csf_state is None and _csf_alpha is 0 this is a no-op.
+        """
+        alpha = int(self._csf_alpha)
+        if alpha <= 0:
+            return
+        w, h = surface.get_size()
+        # Lazily create / resize the overlay surface as needed.
+        if (not hasattr(self, '_csf_surf') or self._csf_surf.get_size() != (w, h)):
+            self._csf_surf = pygame.Surface((w, h))
+            self._csf_surf.fill((0, 0, 0))
+        self._csf_surf.set_alpha(min(255, alpha))
+        surface.blit(self._csf_surf, (0, 0))
+
     # ── Character switching ───────────────────────────────────────────────────
 
     def _switch_character(self, character_id):
         """Swap the player's sprite to character_id while keeping all gameplay state intact."""
         from core.sprite_system import create_character_sprite
 
-        # Snapshot current state.
+        # Snapshot current state before the swap.
         state = {
-            'x': self.player.x, 'y': self.player.y,
-            'hp': self.player.hp, 'ki': self.player.ki,
-            'level': self.player.level,
-            'stats': self.player.stats.copy(),
+            'x':         self.player.x,
+            'y':         self.player.y,
+            'hp':        self.player.hp,
+            'ki':        self.player.ki,
+            'level':     self.player.level,
+            'stats':     self.player.stats.copy(),
             'inventory': self.player.inventory.copy(),
             'direction': self.player.direction,
         }
@@ -1258,7 +1560,7 @@ class Game:
         self.player.character = character_id
         self.player.sprite    = create_character_sprite(character_id, 'base', 32, 32)
 
-        # Restore state so the swap is seamless.
+        # Restore state so the swap is completely seamless to the player.
         for key, value in state.items():
             setattr(self.player, key, value)
 
@@ -1282,7 +1584,7 @@ class Game:
         else:
             self._load_room_objects(target_room)
 
-        # Reposition camera at the new spawn location and clamp to room bounds.
+        # Reposition and clamp the camera to the new room's spawn location.
         self.camera.x = max(0, (spawn_x * RENDER_SCALE) - self.camera.screen_width  // 2)
         self.camera.y = max(0, (spawn_y * RENDER_SCALE) - self.camera.screen_height // 2)
         self.camera.x = max(0, min(self.camera.x, target_room.width  * RENDER_SCALE - SCREEN_WIDTH))
@@ -1290,8 +1592,7 @@ class Game:
         self.mission_manager.on_room_entered(target_room_name)
 
     def _handle_flying_complete(self):
-        """
-        Called when the flying sequence ends.
+        """Called when the flying sequence ends.
         Player control is already restored by FlyingController.
         """
         pass
@@ -1302,29 +1603,45 @@ class Game:
         """Advance all systems by one frame: input, movement, collision, projectiles,
         enemy AI, item pickups, save points, UI notifications, and dev overlays.
         """
-        current_time = time.time()
-        dt           = current_time - self.last_time
+        current_time   = time.time()
+        dt             = current_time - self.last_time
         self.last_time = current_time
+        self.dt        = dt
+
+        # When the room editor is open, skip all game simulation — only tick the editor.
+        if self.room_editor.active:
+            self.room_editor.update(dt, self._get_logical_mouse_pos())
+            return
 
         enemies_defeated_this_frame = 0
 
+        # Always tick UI overlays even when gameplay is paused.
         self.character_switch_menu.update(dt)
         self.save_point_menu.update(dt)
         self.pause_menu.update(dt)
 
         if self.ui.current_screen == 'game':
+            # Accumulate play time only while unpaused and no overlay is blocking.
             if not self.save_point_menu.active and not self.character_switch_menu.active \
                     and not self.pause_menu.active:
                 self.play_time += dt
+
+            # Player movement is also suppressed during cutscenes.
             if not self.save_point_menu.active and not self.character_switch_menu.active \
-                    and not self.pause_menu.active:
+                    and not self.pause_menu.active and not self.active_cutscene_runtime:
                 self._update_player_movement(dt)
 
             self.player.update(dt)
+
+            # Fade the damage tint back to neutral each frame.
             if self.player.hurt_tint > 0:
                 self.player.hurt_tint = max(0.0, self.player.hurt_tint - dt / self.player.hurt_tint_duration)
 
-            self.camera.update(self.player, self.current_room.width, self.current_room.height, dt)
+            # Only follow the player when no cutscene is driving the camera.
+            # During a cutscene the runtime calls camera.update() itself; calling it
+            # again here with the player as target would yank the camera away.
+            if not self.active_cutscene_runtime:
+                self.camera.update(self.player, self.current_room.width, self.current_room.height, dt)
 
             # Spawn the player's blast projectile when the throw animation completes.
             if self.player.pending_blast == 'ready':
@@ -1340,17 +1657,21 @@ class Game:
             # Flying controller update.
             if self.flying_controller.is_active():
                 self.flying_controller.update(dt)
-                if not self.flying_controller.is_transitioning_rooms:
+                # Tick the camera here too unless we're mid-room-swap or in a cutscene.
+                if not self.flying_controller.is_transitioning_rooms and not self.active_cutscene_runtime:
                     self.camera.update(self.player, self.current_room.width,
                                        self.current_room.height, dt)
 
-            # Walk-based room transition detection.
+            # Cutscene trigger detection and runtime tick.
+            self._update_cutscene_triggers(dt)
+
+            # Walk-based room transition detection (skip during fade).
             if not self.transition_controller.is_transitioning():
                 self._check_room_transitions()
 
             self.level_up_notification.update(dt)
 
-            # Beam mechanics.
+            # Beam charge and auto-fire mechanics.
             self._update_beam(dt)
 
             # Player projectiles.
@@ -1365,13 +1686,16 @@ class Game:
                 if not melee.active:
                     self.melee_attacks.remove(melee)
 
-            # Enemy AI, combat, and defeat handling.
+            # Enemy AI, combat resolution, and defeat handling.
             enemies_defeated_this_frame = self._update_enemies(dt)
 
             # Enemy projectile systems.
             self._update_bombs(dt)
             self._update_enemy_bullets(dt)
             self._update_enemy_rockets(dt)
+
+            # Tick damage number popups.
+            self.dmg_numbers.update(dt)
 
             # Explosion visuals.
             for explosion in self.explosions[:]:
@@ -1394,14 +1718,17 @@ class Game:
             # Level gates.
             self._update_gates(dt)
 
-            # Transformation system.
+            # Transformation system (tracks energy and applies power-up state).
             if self.player.transformation:
                 self.player.transformation.update(dt, enemies_defeated_this_frame)
 
-            # Adaptive music.
+            # Adaptive music — switch between exploration and battle tracks.
             self.sound_manager.update_battle_state(dt, len(self.enemies) > 0)
 
-            # Dev-tool overlays pause simulation when active.
+            # Dev-tool overlays pause simulation when active — bail out early.
+            if self.cutscene_editor.active:
+                self.cutscene_editor.update(dt)
+                return
             if self.dev_menu.active:
                 self.dev_menu.update(dt)
                 return
@@ -1411,6 +1738,10 @@ class Game:
             if self.room_editor.active:
                 self.room_editor.update(dt, self._get_logical_mouse_pos())
                 return
+
+        if self.cutscene_editor.active:
+            self.cutscene_editor.update(dt)
+            return
 
     # ── Update sub-routines ───────────────────────────────────────────────────
 
@@ -1424,12 +1755,14 @@ class Game:
         dx = dy    = 0
         is_running = keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] or self.player.is_running
 
+        # Build a movement direction vector from the arrow keys.
         if keys[pygame.K_LEFT]  and not keys[pygame.K_RIGHT]: dx = -1
         elif keys[pygame.K_RIGHT] and not keys[pygame.K_LEFT]: dx = 1
         if keys[pygame.K_UP]    and not keys[pygame.K_DOWN]:  dy = -1
         elif keys[pygame.K_DOWN] and not keys[pygame.K_UP]:   dy = 1
 
         if dx == 0 and dy == 0:
+            # No directional input — snap back to idle.
             self.player.is_running = False
             if not self.player.is_transitioning:
                 if self.player.current_animation_state in ('walk', 'run'):
@@ -1441,8 +1774,10 @@ class Game:
             old_y = self.player.y
             self.player.move(dx, dy, is_running, self.current_room.width, self.current_room.height)
 
-            # Resolve collisions (stones → gates → walls).
+            # Resolve collisions in priority order: stones → gates → walls → NPCs.
+            # On a hit we restore the pre-move position; running causes knockback.
             collision = False
+
             for stone in self.destructible_stones:
                 if stone.check_collision_with_player(self.player):
                     self.player.x = old_x
@@ -1472,16 +1807,18 @@ class Game:
                         if is_running:
                             self.player.start_collision_knockback(dx, dy)
                             self.camera.start_shake(intensity=15, duration=0.3)
+                        collision = True
                         break
 
             if not collision:
+                # NPC collision — use a slim hitbox at the NPC's feet to feel natural.
                 import pygame as _pg
                 player_rect = self.player.get_collision_rect()
                 for npc in self.npcs:
                     if not npc.active or npc.is_moving:
                         continue
-                    npc_hw = npc.width  // 4
-                    npc_hh = max(2, npc.height // 8)
+                    npc_hw   = npc.width  // 4
+                    npc_hh   = max(2, npc.height // 8)
                     npc_rect = _pg.Rect(
                         npc.x - npc_hw,
                         npc.y + npc.height // 2 - npc_hh,
@@ -1493,14 +1830,14 @@ class Game:
                         break
 
     def _check_room_transitions(self):
-        """
-        Detect when the player walks into a room-transition zone and start
+        """Detect when the player walks into a room-transition zone and start
         the fade/teleport sequence.
         """
         for transition in self.room_transitions:
             if transition.active and transition.check_collision(self.player):
 
                 def complete_transition(target_room_name, spawn_x, spawn_y):
+                    """Swap rooms and load objects when the transition fade completes."""
                     target_room = self.room_manager.get_room_by_name(target_room_name)
                     if target_room:
                         self.room_manager.current_room = target_room
@@ -1530,6 +1867,7 @@ class Game:
                 self.player.current_beam = beam
                 self.sound_manager.play_sfx('beam')
 
+        # Expire the beam when the player stops firing.
         if self.player.current_beam:
             self.player.current_beam.update(dt)
             if not self.player.is_firing_beam:
@@ -1543,30 +1881,50 @@ class Game:
         defeated = 0
 
         for enemy in self.enemies[:]:
+            # Reset before update so we can detect a fresh player hit this frame
+            self.player.last_damage_taken = 0
             enemy.update(dt, self.player, self.current_room.width, self.current_room.height)
 
+            # If the enemy's AI called player.take_damage() during update, spawn a popup
+            if self.player.last_damage_taken > 0:
+                self.dmg_numbers.spawn(
+                    self.player.x, self.player.y - self.player.height // 2,
+                    self.player.last_damage_taken, variant='player',
+                )
+
             for melee in self.melee_attacks:
-                if melee.active:
-                    enemy.check_collision_with_attack(melee, 'melee')
+                if melee.active and enemy.check_collision_with_attack(melee, 'melee'):
                     self.sound_manager.play_sfx('enemy_hit')
+                    self.dmg_numbers.spawn(
+                        enemy.x, enemy.y - enemy.height // 2,
+                        enemy.last_damage_dealt, variant='enemy',
+                    )
 
             for projectile in self.projectiles:
                 if projectile.active and enemy.check_collision_with_attack(projectile, 'projectile'):
                     projectile.active = False
+                    self.dmg_numbers.spawn(
+                        enemy.x, enemy.y - enemy.height // 2,
+                        enemy.last_damage_dealt, variant='enemy',
+                    )
 
             if self.player.current_beam:
-                enemy.check_collision_with_attack(self.player.current_beam, 'beam')
+                if enemy.check_collision_with_attack(self.player.current_beam, 'beam'):
+                    self.dmg_numbers.spawn(
+                        enemy.x, enemy.y - enemy.height // 2,
+                        enemy.last_damage_dealt, variant='enemy',
+                    )
 
             if not enemy.active:
-                defeated  += 1
-                xp_reward  = enemy.get_xp_reward(self.game_config)
+                defeated   += 1
+                xp_reward   = enemy.get_xp_reward(self.game_config)
                 self.player.gain_exp(xp_reward, self.game_config)
 
                 if self.player.pending_level_up:
                     self.level_up_notification.show(self.player.level, self.player.stat_points)
                     self.player.pending_level_up = False
 
-                # Mission hook — notify kill with enemy type and current room
+                # Notify the mission manager of the kill with enemy type and room.
                 enemy_id  = getattr(enemy, 'enemy_type', getattr(enemy, 'boss_id', ''))
                 room_name = self.current_room.name if self.current_room else ''
                 self.mission_manager.on_enemy_killed(enemy_id, room_name)
@@ -1583,36 +1941,40 @@ class Game:
             if not (hasattr(enemy, 'enemy_category') and enemy.enemy_category == 'shooter'):
                 continue
 
+            # Bombs
             bomb_data = enemy.get_bomb_spawn_data()
             if bomb_data:
                 self.bombs.append(BombProjectile(
-                    start_x=bomb_data['start_x'], start_y=bomb_data['start_y'],
+                    start_x=bomb_data['start_x'],   start_y=bomb_data['start_y'],
                     target_x=bomb_data['target_x'], target_y=bomb_data['target_y'],
-                    damage=bomb_data['damage'], flight_time=bomb_data['flight_time'],
-                    player=self.player
+                    damage=bomb_data['damage'],      flight_time=bomb_data['flight_time'],
+                    player=self.player,
                 ))
 
+            # Bullets
             bullet_data = enemy.get_bullet_spawn_data()
             if bullet_data:
                 self.enemy_bullets.append(bullet_projectile(
-                    x=bullet_data['x'], y=bullet_data['y'],
+                    x=bullet_data['x'],   y=bullet_data['y'],
                     dx=bullet_data['dx'], dy=bullet_data['dy'],
                     speed=bullet_data['speed'], damage=bullet_data['damage'],
-                    direction=bullet_data['direction']
+                    direction=bullet_data['direction'],
                 ))
 
+            # Rockets
             rocket_data = enemy.get_rocket_spawn_data()
             if rocket_data:
                 self.enemy_rockets.append(rocket_projectile(
-                    x=rocket_data['x'], y=rocket_data['y'],
+                    x=rocket_data['x'],   y=rocket_data['y'],
                     dx=rocket_data['dx'], dy=rocket_data['dy'],
                     speed=rocket_data['speed'], damage=rocket_data['damage'],
-                    direction=rocket_data['direction']
+                    direction=rocket_data['direction'],
                 ))
 
         for bomb in self.bombs[:]:
             bomb.update(dt, self.player)
 
+            # If the bomb has queued an explosion effect, add it to the live list.
             if bomb.pending_explosion is not None and bomb.pending_explosion not in self.explosions:
                 self.explosions.append(bomb.pending_explosion)
 
@@ -1625,7 +1987,7 @@ class Game:
             bullet.update(self.current_room.width, self.current_room.height, dt)
 
             if bullet.check_collision_with_player(self.player):
-                # Compute knock direction away from the bullet.
+                # Compute knock direction away from the bullet's origin.
                 dx   = self.player.x - bullet.x
                 dy   = self.player.y - bullet.y
                 dist = math.sqrt(dx * dx + dy * dy)
@@ -1637,7 +1999,11 @@ class Game:
 
                 self.player.take_damage(bullet.damage, dx, dy)
                 self.player.hurt_tint = 1.0
-                bullet.active = False
+                bullet.active         = False
+                self.dmg_numbers.spawn(
+                    self.player.x, self.player.y - self.player.height // 2,
+                    self.player.last_damage_taken, variant='player',
+                )
 
             if not bullet.active:
                 self.enemy_bullets.remove(bullet)
@@ -1664,14 +2030,13 @@ class Game:
         npc_id  = getattr(npc, 'npc_id',  'generic')
         variant = getattr(npc, 'variant', 'default')
 
-        # Map variant to portrait index:  default=1, others incremented by name order
+        # Assign numeric suffix based on variant name.
+        # 'default' (or empty) gets no suffix; others get an incremented digit.
         if variant in (None, '', 'default'):
             suffix = ''
         else:
-            # Assign numeric suffix based on alphabetical variant order
-            # simple fallback: try to parse a trailing digit from variant name
             import re
-            m = re.search(r'(\d+)$', variant)
+            m      = re.search(r'(\d+)$', variant)
             suffix = str(int(m.group(1)) + 1) if m else '2'
 
         return f"npc_{npc_id}{suffix}"
@@ -1709,7 +2074,7 @@ class Game:
         for gate in self.level_gates[:]:
             gate.update(dt)
 
-            # Push the player back if they don't meet the level requirement.
+            # Push the player back if they don't meet the gate's level requirement.
             if gate.active and gate.check_collision_with_player(self.player):
                 if not gate.can_be_destroyed_by(self.player):
                     dx       = self.player.x - gate.x
@@ -1746,14 +2111,22 @@ class Game:
           7. Foreground tile layer
           8. UI overlays (HUD, dialogue, menus, dev tools)
         """
+        # Hand off completely to the room editor when it's the active view.
+        if self.room_editor.active and self.room_editor.current_view == 'view_room':
+            self.room_editor.draw(self.logical_surface)
+            pygame.display.flip()
+            return
+
+        # Fill with the default "green dev room" background colour.
         self.logical_surface.fill((34, 139, 34))
 
+        # Compute the world-space tile range that is currently on screen.
         visible_x_start = self.camera.x // RENDER_SCALE
         visible_y_start = self.camera.y // RENDER_SCALE
         visible_x_end   = (self.camera.x + SCREEN_WIDTH)  // RENDER_SCALE
         visible_y_end   = (self.camera.y + SCREEN_HEIGHT) // RENDER_SCALE
 
-        # Grid lines
+        # Draw a subtle tile grid so the designer can see the grid while editing.
         first_grid_x = (visible_x_start // TILE_SIZE) * TILE_SIZE
         first_grid_y = (visible_y_start // TILE_SIZE) * TILE_SIZE
 
@@ -1773,44 +2146,30 @@ class Game:
                                  (0, int(screen_y)), (SCREEN_WIDTH, int(screen_y)), 1)
             y += TILE_SIZE
 
-        # Room boundary outline
+        # Red outline marks the hard boundary of the current room.
         pygame.draw.rect(self.logical_surface, self.colors['RED'], (
             (0 * RENDER_SCALE) - self.camera.x,
             (0 * RENDER_SCALE) - self.camera.y,
             self.current_room.width  * RENDER_SCALE,
-            self.current_room.height * RENDER_SCALE
+            self.current_room.height * RENDER_SCALE,
         ), 3)
 
-        # Test-mode indicator banner
-        if self.is_test_mode:
-            test_font = self._get_font(32)
-            test_text = test_font.render("TEST MODE — Press ESC to return to editor", True, (255, 255, 0))
-            test_bg   = pygame.Surface((test_text.get_width() + 20, test_text.get_height() + 10), pygame.SRCALPHA)
-            test_bg.fill((0, 0, 0, 180))
-            bg_x = (SCREEN_WIDTH - test_text.get_width()) // 2 - 10
-            self.logical_surface.blit(test_bg,   (bg_x, 10))
-            self.logical_surface.blit(test_text, ((SCREEN_WIDTH - test_text.get_width()) // 2, 15))
-
-        # Spawn point sprite
+        # Draw the spawn-point sprite if one has been placed in the editor.
         if hasattr(self, 'room_editor') and self.room_editor and self.room_editor.object_editor:
             spawn_obj = self.room_editor.object_editor.spawn_manager.get_spawn_point(self.current_room.name)
             if spawn_obj:
                 sx = (spawn_obj.x * RENDER_SCALE) - self.camera.x
                 sy = (spawn_obj.y * RENDER_SCALE) - self.camera.y
                 if spawn_obj.sprite:
-                    sw = int(spawn_obj.width  * RENDER_SCALE)
-                    sh = int(spawn_obj.height * RENDER_SCALE)
+                    sw     = int(spawn_obj.width  * RENDER_SCALE)
+                    sh     = int(spawn_obj.height * RENDER_SCALE)
                     scaled = pygame.transform.scale(spawn_obj.sprite, (sw, sh))
                     self.logical_surface.blit(scaled, (int(sx - sw // 2), int(sy - sh // 2)))
 
-        # Flying pads
-        for pad in self.flying_pads:
-            if pad.active:
-                pad.draw(self.logical_surface, self.camera, self.colors, RENDER_SCALE)
-                if self.dev_menu.active or self.room_editor.active:
-                    pad.draw_path_preview(self.logical_surface, self.camera, RENDER_SCALE)
+        # Flying pads are registered with the layer manager so they y-sort correctly
+        # alongside the player, NPCs, and enemies.  Path previews are drawn separately.
 
-        # "E to Fly" indicator when player stands on a pad
+        # "E to Fly" indicator when the player stands on an active pad.
         if not self.flying_controller.is_active():
             nearby_pad = next(
                 (pad for pad in self.flying_pads
@@ -1818,9 +2177,8 @@ class Game:
                 None
             )
             if nearby_pad:
-                px = (nearby_pad.x * RENDER_SCALE) - self.camera.x
-                py = ((nearby_pad.y - 25) * RENDER_SCALE) - self.camera.y
-
+                px    = (nearby_pad.x * RENDER_SCALE) - self.camera.x
+                py    = ((nearby_pad.y - 25) * RENDER_SCALE) - self.camera.y
                 font  = self._get_font(20)
                 text  = font.render("E to Fly", True, self.colors['YELLOW'])
                 trect = text.get_rect(center=(px, py))
@@ -1834,66 +2192,93 @@ class Game:
             if sp.active:
                 sp.draw(self.logical_surface, self.camera, self.colors, RENDER_SCALE)
 
-        # Background tile layer
-        if self.room_editor.active and self.room_editor.tileset_editor:
-            self.room_editor.tileset_editor.draw_tiles(
-                self.logical_surface, int(self.camera.x), int(self.camera.y),
-                self.current_room.name, layer='background'
-            )
-        else:
-            self._draw_room_tiles(bg=True)
+        # Wire the tile-change hook lazily (tileset_editor may not exist yet in __init__).
+        self._install_tile_change_hook()
 
-        # Layered game objects (y-sorted)
-        self.layer_manager.clear()
-        for obj in self.projectiles + [self.player] + self.enemies + self.npcs \
-                + self.destructible_stones + self.level_gates + self.bombs + self.explosions:
-            self.layer_manager.add_object(obj)
-        for melee in self.melee_attacks:
-            self.layer_manager.add_object(melee)
-        if self.player.current_beam:
-            self.layer_manager.add_object(self.player.current_beam)
+        # Background tile layer — both editor and game mode go through the baked-surface
+        # path so the per-tile loop only runs when the cache is cold (after a tile edit or
+        # room load), not on every frame.
+        self._draw_room_tiles(bg=True)
 
-        # Enemy bullets and rockets (not y-sorted)
-        for bullet in self.enemy_bullets:
-            bullet.draw(self.logical_surface, self.camera, self.colors)
-        for rocket in self.enemy_rockets:
-            rocket.draw(self.logical_surface, self.camera, self.colors)
+        # Layered game objects (y-sorted) — hidden while a cutscene is running (it draws
+        # its own actor layer separately).
+        if not self.active_cutscene_runtime:
+            self.layer_manager.clear()
+            for obj in (self.projectiles + [self.player] + self.enemies + self.npcs
+                        + self.destructible_stones + self.level_gates
+                        + self.bombs + self.explosions + self.flying_pads):
+                self.layer_manager.add_object(obj)
+            for melee in self.melee_attacks:
+                self.layer_manager.add_object(melee)
+            if self.player.current_beam:
+                self.layer_manager.add_object(self.player.current_beam)
 
-        self.layer_manager.draw_all(self.logical_surface, self.camera, self.colors, RENDER_SCALE)
+            # Enemy bullets and rockets are not y-sorted — draw them directly.
+            for bullet in self.enemy_bullets:
+                bullet.draw(self.logical_surface, self.camera, self.colors)
+            for rocket in self.enemy_rockets:
+                rocket.draw(self.logical_surface, self.camera, self.colors)
 
-        # Foreground tile layer
-        if self.room_editor.active and self.room_editor.tileset_editor:
-            self.room_editor.tileset_editor.draw_tiles(
-                self.logical_surface, int(self.camera.x), int(self.camera.y),
-                self.current_room.name, layer='foreground'
-            )
-        else:
-            self._draw_room_tiles(bg=False)
+            self.layer_manager.draw_all(self.logical_surface, self.camera, self.colors, RENDER_SCALE)
 
-        # HUD, menus, and dev overlays
+            # Damage number popups — drawn on top of sprites but below the HUD
+            self.dmg_numbers.draw(self.logical_surface, self.camera, RENDER_SCALE)
+
+        # Flying pad path previews — editor-only overlay drawn after the layer pass.
+        if self.dev_menu.active or self.room_editor.active:
+            for pad in self.flying_pads:
+                if pad.active:
+                    pad.draw_path_preview(self.logical_surface, self.camera, RENDER_SCALE)
+
+        # Foreground tile layer (same baked path as background).
+        self._draw_room_tiles(bg=False)
+
+        # Test-mode indicator banner — drawn after foreground tiles so it's always on top.
+        if self.is_test_mode:
+            test_font = self._get_font(32)
+            test_text = test_font.render("TEST MODE — Press F2 to return to editor", True, (255, 255, 0))
+            test_bg   = pygame.Surface((test_text.get_width() + 20, test_text.get_height() + 10), pygame.SRCALPHA)
+            test_bg.fill((0, 0, 0, 180))
+            bg_x = (SCREEN_WIDTH - test_text.get_width()) // 2 - 10
+            self.logical_surface.blit(test_bg,   (bg_x, 10))
+            self.logical_surface.blit(test_text, ((SCREEN_WIDTH - test_text.get_width()) // 2, 15))
+
+        # HUD, menus, and dev overlays.
+        # Weather is drawn first (below the dialogue box), then the UI layer which
+        # includes the dialogue box, then the colour/invert overlay on top of everything.
+        if self.active_cutscene_runtime and not self.pause_menu.active:
+            w, h = self.logical_surface.get_size()
+            self.active_cutscene_runtime.draw_weather(self.logical_surface, w, h)
+
         if not self.dev_menu.active:
-            self._draw_ui()
+            self._draw_ui(self.dt)
 
+        # Active in-game cutscene overlay — drawn over the world but under dev tools.
+        # Suppressed while the pause menu is open so it never bleeds through.
+        if self.active_cutscene_runtime and not self.pause_menu.active:
+            colors = {'WHITE': (255, 255, 255), 'RED': (220, 60, 60)}
+            self.active_cutscene_runtime.draw_actors(self.logical_surface, self.camera, colors)
+            w, h = self.logical_surface.get_size()
+            self.active_cutscene_runtime.draw_overlay(self.logical_surface, w, h)
+
+        # Dev tools — always drawn last so they sit on top of everything.
         self.sprite_editor.draw(self.logical_surface)
         self.room_editor.draw(self.logical_surface)
         self.dev_menu.draw(self.logical_surface)
+        self.cutscene_editor.draw(self.logical_surface)
 
-        # Dev overlays drawn LAST so they always appear on top of foreground
-        # tiles and the room editor's own canvas — never buried under graphics.
-        if self.dev_menu.active or self.room_editor.active:
-            # Collision wall outlines
+        # Collision and transition outlines in editor view mode.
+        if self.room_editor.active and self.room_editor.current_view == 'view_room':
             from objects.collision_object import draw_collision_object
             for obj in self.collision_objects:
                 draw_collision_object(self.logical_surface, obj, self.camera.x, self.camera.y,
                                       RENDER_SCALE, dev_mode=True, selected=False)
-            # Room-transition zone outlines
-            if not self.is_test_mode:
-                for transition in self.room_transitions:
-                    transition.draw(self.logical_surface, self.camera, RENDER_SCALE,
-                                    dev_mode=True, selected=False)
+            for transition in self.room_transitions:
+                transition.draw(self.logical_surface, self.camera, RENDER_SCALE,
+                                dev_mode=True, selected=False)
 
-        # With pygame.SCALED the display handles window-resize scaling in hardware.
-        # No manual surface scale needed — just flip.
+        # With pygame.SCALED the display handles window-resize scaling in hardware —
+        # just flip; no manual surface scale needed.
         pygame.display.flip()
 
     def _get_font(self, size: int) -> pygame.font.Font:
@@ -1902,10 +2287,28 @@ class Game:
             self._font_cache[size] = pygame.font.Font(None, size)
         return self._font_cache[size]
 
+    def _install_tile_change_hook(self):
+        """Wire on_tile_changed onto tileset_editor once it has been created.
+
+        tileset_editor is instantiated lazily inside RoomEditor, so this hook
+        can't be set in __init__. Called from draw() every frame; the flag
+        makes it a no-op after the first successful install.
+
+        The callback simply invalidates the baked tile surface for the affected
+        room so _draw_room_tiles() rebuilds it on the next frame.
+        """
+        if self._tile_change_hook_installed:
+            return
+        te = getattr(self.room_editor, 'tileset_editor', None)
+        if te is None:
+            return
+        te.on_tile_changed             = lambda room_name=None: self.invalidate_tile_cache(room_name)
+        self._tile_change_hook_installed = True
+
     def invalidate_tile_cache(self, room_name: str = None):
         """Drop baked tile surfaces so they rebuild on the next draw call.
 
-        Pass room_name=None to flush everything at once.
+        Pass room_name=None to flush everything at once (e.g. after a full reload).
         """
         if room_name is None:
             self._room_tile_surfaces.clear()
@@ -1921,21 +2324,40 @@ class Game:
 
         The resulting surface is in scaled-world-space (world_units × RENDER_SCALE),
         so each frame only needs a single camera-offset blit — no per-tile work.
+
+        Tile source priority
+        ────────────────────
+        1. tileset_editor.room_tiles[room_name]  — editor's live list (always up-to-date;
+           used in both editor and game mode so freshly painted tiles appear immediately
+           after an invalidate).
+        2. room.tiles                            — fallback when the editor has not loaded
+           this room yet (e.g. game mode before any editor was opened).
         """
         room = self.room_manager.get_room_by_name(room_name)
-        if not room or not getattr(room, 'tiles', None):
+        if not room:
             return pygame.Surface((1, 1), pygame.SRCALPHA)
-
-        surf = pygame.Surface(
-            (int(room.width * RENDER_SCALE), int(room.height * RENDER_SCALE)),
-            pygame.SRCALPHA
-        )
 
         if not self.room_editor.tileset_editor:
             return pygame.Surface((1, 1), pygame.SRCALPHA)
 
-        tileset_mgr = self.room_editor.tileset_editor.tileset_manager
-        for tile in room.tiles:
+        # Prefer the editor's live tile list so painted tiles appear immediately.
+        te = self.room_editor.tileset_editor
+        if room_name in getattr(te, 'room_tiles', {}):
+            tiles = te.room_tiles[room_name]
+        else:
+            tiles = getattr(room, 'tiles', None) or []
+
+        if not tiles:
+            return pygame.Surface((1, 1), pygame.SRCALPHA)
+
+        # Allocate a surface the size of the whole room in render-scale space.
+        surf = pygame.Surface(
+            (int(room.width * RENDER_SCALE), int(room.height * RENDER_SCALE)),
+            pygame.SRCALPHA,
+        )
+
+        tileset_mgr = te.tileset_manager
+        for tile in tiles:
             is_bg_tile = tile.layer < 0
             if bg != is_bg_tile:
                 continue
@@ -1953,18 +2375,52 @@ class Game:
 
         Builds and caches on first call per room/layer combo. After that it's
         a single blit per frame — O(1) regardless of tile count.
+
+        Works in both game mode and editor mode: the baked surface is rebuilt
+        from tileset_editor.room_tiles (live editor list) when available, so
+        freshly painted tiles appear on the very next frame after invalidation.
         """
-        if not self.current_room or not getattr(self.current_room, 'tiles', None):
+        if not self.current_room:
             return
-        key = (self.current_room.name, bg)
-        if key not in self._room_tile_surfaces:
-            self._room_tile_surfaces[key] = self._build_room_tile_surface(
-                self.current_room.name, bg
-            )
-        self.logical_surface.blit(
-            self._room_tile_surfaces[key],
-            (-int(self.camera.x), -int(self.camera.y))
+
+        room_name = self.current_room.name
+
+        # Accept the room as drawable if either room.tiles or the editor's live
+        # tile list has content for this room.
+        te       = getattr(self.room_editor, 'tileset_editor', None)
+        has_tiles = (
+            getattr(self.current_room, 'tiles', None)
+            or (te and room_name in getattr(te, 'room_tiles', {}))
         )
+        if not has_tiles:
+            return
+
+        key = (room_name, bg)
+        if key not in self._room_tile_surfaces:
+            self._room_tile_surfaces[key] = self._build_room_tile_surface(room_name, bg)
+        surf = self._room_tile_surfaces[key]
+
+        self.logical_surface.blit(surf, (-int(self.camera.x), -int(self.camera.y)))
+
+    def blit_room_tiles(self, screen: 'pygame.Surface', room_name: str,
+                        camera_x: int, camera_y: int, bg: bool):
+        """Public helper used by the room editor to blit the baked tile surface
+        onto an arbitrary surface with an arbitrary camera offset.
+
+        Lets the editor share the same O(1) baked-surface path instead of
+        calling pygame.transform.scale() on every tile every frame.
+        """
+        # Don't attempt to build until the tileset_editor is fully initialised.
+        # If we cached a blank surface here it would persist and tiles would
+        # never appear for the rest of the session.
+        if not getattr(self.room_editor, 'tileset_editor', None):
+            return
+        key = (room_name, bg)
+        if key not in self._room_tile_surfaces:
+            self._room_tile_surfaces[key] = self._build_room_tile_surface(room_name, bg)
+        surf = self._room_tile_surfaces.get(key)
+        if surf:
+            screen.blit(surf, (-camera_x, -camera_y))
 
     def _draw_tile(self, tile):
         """Blit a single tile at its world position. Mostly used for one-off debug draws."""
@@ -1974,17 +2430,16 @@ class Game:
         tile_surface = tileset.get_tile_surface(tile.tile_x, tile.tile_y)
         if not tile_surface:
             return
-        screen_x    = (tile.x * RENDER_SCALE) - self.camera.x
-        screen_y    = (tile.y * RENDER_SCALE) - self.camera.y
-        scaled      = pygame.transform.scale(
+        screen_x = (tile.x * RENDER_SCALE) - self.camera.x
+        screen_y = (tile.y * RENDER_SCALE) - self.camera.y
+        scaled   = pygame.transform.scale(
             tile_surface,
-            (tileset.tile_width * RENDER_SCALE, tileset.tile_height * RENDER_SCALE)
+            (tileset.tile_width * RENDER_SCALE, tileset.tile_height * RENDER_SCALE),
         )
         self.logical_surface.blit(scaled, (int(screen_x), int(screen_y)))
 
-    def _draw_ui(self):
+    def _draw_ui(self, dt):
         """Draw all UI elements that appear on top of the game world."""
-
         self.npc_config_menu.draw(self.logical_surface, self.colors)
         self.dialogue_box.draw(self.logical_surface, self.colors)
         self.save_point_menu.draw(self.logical_surface)
@@ -1994,11 +2449,28 @@ class Game:
 
         self.transition_config_menu.draw(self.logical_surface)
         self.transition_controller.draw(self.logical_surface)
+        self._draw_cutscene_fade(self.logical_surface)
 
+        # HUD slide animation — slides in/out when entering/leaving game mode.
         if self.ui.current_screen == 'game' and not self.character_switch_menu.active \
                 and not self.pause_menu.active:
+            _HUD_SLIDE_SPEED = 400
+            _hud_hidden_y    = -(self.sprite_hud.hud_y + 120)
+            if self.sprite_hud._hud_slide_out:
+                self.sprite_hud.hud_offset_y = max(
+                    _hud_hidden_y,
+                    self.sprite_hud.hud_offset_y - _HUD_SLIDE_SPEED * dt,
+                )
+            elif self.sprite_hud._hud_slide_in:
+                self.sprite_hud.hud_offset_y = min(
+                    0.0,
+                    self.sprite_hud.hud_offset_y + _HUD_SLIDE_SPEED * dt,
+                )
+                if self.sprite_hud.hud_offset_y >= 0.0:
+                    self.sprite_hud._hud_slide_in = False
             self.sprite_hud.draw(self.logical_surface, self.player)
 
+        # Full-screen overlays for main menu and sub-screens.
         if self.ui.current_screen == 'main_menu':
             self.ui.draw_main_menu(self.logical_surface, self.colors)
         elif self.ui.current_screen == 'status':
@@ -2019,7 +2491,7 @@ class Game:
         if not hasattr(self.room_editor, 'object_editor') or not self.room_editor.object_editor:
             return
 
-        oe = self.room_editor.object_editor
+        oe                 = self.room_editor.object_editor
         spawn_manager      = oe.spawn_manager
         collision_manager  = oe.collision_manager
         transition_manager = oe.transition_manager
@@ -2061,6 +2533,15 @@ class Game:
         if self.is_test_mode:
             self._exit_test_mode()
 
+        # Flush the cutscene editor — catches crashes and abrupt window closes.
+        if hasattr(self, 'cutscene_editor') and self.cutscene_editor:
+            ce = self.cutscene_editor
+            if ce.view == 'edit' and ce.cutscene_data:
+                if ce.unsaved:
+                    ce._save_cutscene()
+                else:
+                    ce._save_viewport_state()
+
         if hasattr(self, 'room_editor') and self.room_editor:
             self.room_editor.save_all_editor_data_to_rooms()
 
@@ -2068,6 +2549,7 @@ class Game:
             self.room_manager.save_all_rooms()
 
     def run(self):
+        """Main loop — runs until self.running is False or an unhandled exception occurs."""
         self.last_time = time.time()
         try:
             while self.running:
@@ -2077,8 +2559,8 @@ class Game:
                 self.clock.tick(FPS)
         except Exception:
             import traceback
-            traceback.print_exc()  # prints the real crash reason
-            raise  # re-raise so exit code becomes 1
+            traceback.print_exc()   # print the real crash reason before exiting
+            raise                   # re-raise so the OS exit code becomes 1
         finally:
             self.cleanup()
             pygame.quit()

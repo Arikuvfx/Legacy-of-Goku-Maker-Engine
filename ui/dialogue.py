@@ -103,9 +103,10 @@ class DialogueBox:
         self._load_sheet()
 
         font_scale = 5
-        self._font_upper = _BitmapFont('assets/ui/fonts/uppercase', scale=font_scale)
-        self._font_lower = _BitmapFont('assets/ui/fonts/lowercase', scale=font_scale)
-        self._fallback   = pygame.font.Font(None, max(14, int(20 / _S)))
+        self._font_upper   = _BitmapFont('assets/ui/fonts/uppercase', scale=font_scale)
+        self._font_lower   = _BitmapFont('assets/ui/fonts/lowercase', scale=font_scale)
+        self._font_numbers = _BitmapFont('assets/ui/fonts/numbers',   scale=font_scale)
+        self._fallback     = pygame.font.Font(None, max(14, int(20 / _S)))
 
     def _load_sheet(self):
         path = 'assets/ui/textbox/textbox.png'
@@ -139,22 +140,22 @@ class DialogueBox:
         return surf
 
     def _has_bitmap_font(self):
-        return bool(self._font_upper.glyphs or self._font_lower.glyphs)
+        return bool(self._font_upper.glyphs or self._font_lower.glyphs or self._font_numbers.glyphs)
 
     # Descender glyphs (p, q, g) need a downward nudge so they sit on the baseline
-    _DESCENDER_OFFSETS = {'p': 10, 'q': 10, 'g': 10}
+    _DESCENDER_OFFSETS = {'p': 10, 'q': 10, 'g': 10, 'y': 15}
 
     def _render_text_line(self, screen, text, x, y, color=(255, 255, 255), spacing=1):
         """Blit a mixed-case line bottom-aligned to a shared baseline."""
         max_h = 0
         for ch in text:
-            font = self._font_upper if (ch.isupper() or not ch.isalpha()) else self._font_lower
+            font = (self._font_numbers if ch.isdigit() else self._font_upper if (ch.isupper() or not ch.isalpha()) else self._font_lower)
             if ch in font.glyphs:
                 max_h = max(max_h, font.glyphs[ch].get_height())
 
         cx = x
         for ch in text:
-            font = self._font_upper if (ch.isupper() or not ch.isalpha()) else self._font_lower
+            font = (self._font_numbers if ch.isdigit() else self._font_upper if (ch.isupper() or not ch.isalpha()) else self._font_lower)
             if ch in font.glyphs:
                 g = font.glyphs[ch].copy()
                 g.fill(color, special_flags=pygame.BLEND_RGBA_MULT)
@@ -165,13 +166,13 @@ class DialogueBox:
                 cx += int(6 * max(1, _S))
 
     def _line_height(self):
-        lh = max(self._font_upper.line_height(), self._font_lower.line_height())
+        lh = max(self._font_upper.line_height(), self._font_lower.line_height(), self._font_numbers.line_height())
         return lh if lh > 0 else self._fallback.get_linesize()
 
     def _text_width(self, text, spacing=1):
         w = 0
         for ch in text:
-            font = self._font_upper if (ch.isupper() or not ch.isalpha()) else self._font_lower
+            font = (self._font_numbers if ch.isdigit() else self._font_upper if (ch.isupper() or not ch.isalpha()) else self._font_lower)
             if ch in font.glyphs:
                 w += font.glyphs[ch].get_width() + spacing
             elif ch == ' ':

@@ -30,6 +30,8 @@ class RoomPersistence:
                 'room_transitions':     self._serialize_room_transitions(room),
                 'level_gates':          self._serialize_level_gates(room),
                 'entities':             self._serialize_entities(room),
+                'flying_pads':          self._serialize_flying_pads(room),
+                'cutscene_triggers':     self._serialize_cutscene_triggers(room),
             }
             with open(self._get_room_filepath(room.name), 'w') as f:
                 json.dump(data, f, indent=2)
@@ -161,6 +163,37 @@ class RoomPersistence:
             out.append(d)
         return out
 
+    def _serialize_flying_pads(self, room):
+        if not getattr(room, 'flying_pads', None):
+            return []
+        out = []
+        for pad in room.flying_pads:
+            waypoints = []
+            for wp in getattr(pad, 'waypoints', []):
+                waypoints.append({
+                    'x':           wp.x,
+                    'y':           wp.y,
+                    'is_boundary': getattr(wp, 'is_boundary', False),
+                    'target_room': getattr(wp, 'target_room', None),
+                })
+            out.append({
+                'x':             pad.x,
+                'y':             pad.y,
+                'pad_type':      getattr(pad, 'pad_type', 'stone'),
+                'linked_pad_id': getattr(pad, 'linked_pad_id', None),
+                'waypoints':     waypoints,
+            })
+        return out
+
+    def _serialize_cutscene_triggers(self, room):
+        if not getattr(room, 'cutscene_triggers', None):
+            return []
+        return [t.to_dict() for t in room.cutscene_triggers]
+
+    def deserialize_cutscene_triggers(self, data, room_name):
+        from objects.cutscene_trigger import CutsceneTrigger
+        return [CutsceneTrigger.from_dict(d, room_name) for d in data]
+
     # ── Deserializers ─────────────────────────────────────────────────────────
 
     def deserialize_tiles(self, tiles_data):
@@ -252,6 +285,26 @@ class RoomPersistence:
         return out
 
 
+    def deserialize_flying_pads(self, pads_data):
+        from objects.flying_pad import FlyingPad, FlyingPadWaypoint
+        out = []
+        for d in pads_data:
+            pad = FlyingPad(x=d['x'], y=d['y'], pad_type=d.get('pad_type', 'stone'))
+            if d.get('linked_pad_id') is not None:
+                pad.linked_pad_id = d['linked_pad_id']
+            pad.waypoints = []
+            for wp_d in d.get('waypoints', []):
+                wp = FlyingPadWaypoint(
+                    x=wp_d['x'],
+                    y=wp_d['y'],
+                    is_boundary=wp_d.get('is_boundary', False),
+                )
+                wp.target_room = wp_d.get('target_room', None)
+                pad.waypoints.append(wp)
+            out.append(pad)
+        return out
+
+
 class RoomManagerWithPersistence:
     """Room manager that auto-saves and auto-loads from disk."""
 
@@ -323,6 +376,8 @@ class RoomManagerWithPersistence:
         room.room_transitions    = self.persistence.deserialize_room_transitions(data['room_transitions'])    if data.get('room_transitions')    else []
         room.level_gates         = self.persistence.deserialize_level_gates(data['level_gates'])         if data.get('level_gates')         else []
         room.entities            = self.persistence.deserialize_entities(data['entities'])            if data.get('entities')            else []
+        room.flying_pads         = self.persistence.deserialize_flying_pads(data['flying_pads'])      if data.get('flying_pads')         else []
+        room.cutscene_triggers   = self.persistence.deserialize_cutscene_triggers(data['cutscene_triggers'], room_name) if data.get('cutscene_triggers') else []
 
         existing = self.get_room_by_name(room_name)
         if existing:

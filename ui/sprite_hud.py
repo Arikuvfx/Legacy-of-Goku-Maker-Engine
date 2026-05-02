@@ -46,6 +46,9 @@ class SpriteHUD:
 
         self.hud_x = 10
         self.hud_y = 10
+        self.hud_offset_y = 0.0  # animated by cutscene start/stop
+        self._hud_slide_out = False
+        self._hud_slide_in  = False
 
         # Change this one value to resize everything
         self.scale = 0.7 * 2
@@ -146,7 +149,7 @@ class SpriteHUD:
             return
 
         bx = self.hud_x
-        by = self.hud_y
+        by = self.hud_y + int(self.hud_offset_y)
 
         def sc(v):
             return int(v * self.scale)

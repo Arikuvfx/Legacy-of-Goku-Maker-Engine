@@ -19,7 +19,7 @@ class MeleeAttack:
         self.duration  = 0.2        # Seconds the attack remains active.
         self.timer     = 0
         self.active    = True
-        self.size      = 40         # Length of the swish arc in screen pixels.
+        self.size      = 10         # Length of the swish arc in screen pixels.
         self.owner     = None       # Set by the player when the attack is created.
 
         self.draw_layer = DrawLayer.EFFECTS_FRONT
@@ -60,7 +60,7 @@ class MeleeAttack:
         screen_x = (self.x * RENDER_SCALE) - camera.x
         screen_y = (self.y * RENDER_SCALE) - camera.y
 
-        offset = 35  # Distance from the player centre to the start of the arc.
+        offset = 15  # Distance from the player centre to the start of the arc.
 
         # Determine the start and end points of the swish based on direction.
         if self.direction == 'up':
@@ -84,20 +84,3 @@ class MeleeAttack:
             end_x   = screen_x + offset + self.size
             end_y   = screen_y + self.size // 2
 
-        # Draw five parallel lines spread across the swing arc.
-        for i in range(5):
-            offset_ratio = (i - 2) * 0.15
-
-            if self.direction in ['up', 'down']:
-                sx = start_x + offset_ratio * self.size
-                ex = end_x   + offset_ratio * self.size
-                sy = start_y
-                ey = end_y
-            else:
-                sx = start_x
-                ex = end_x
-                sy = start_y + offset_ratio * self.size
-                ey = end_y   + offset_ratio * self.size
-
-            pygame.draw.line(screen, colors['WHITE'],
-                             (int(sx), int(sy)), (int(ex), int(ey)), 3)

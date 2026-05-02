@@ -35,6 +35,7 @@ class Room:
         self.spawn_point = []
         self.level_gates = []
         self.entities = []
+        self.cutscene_triggers = []
 
         # Transient rooms are never saved to disk and hidden from the editor.
         # Used for the startup fallback room created by Game._create_default_room.

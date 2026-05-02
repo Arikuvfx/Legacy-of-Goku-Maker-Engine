@@ -7,309 +7,408 @@ from core.draw_layers import DrawLayer
 from core.sprite_system import create_enemy_sprite
 
 
+# ---------------------------------------------------------------------------
+# Shooter stat presets — each key maps to (attack_duration, cooldown_time,
+# attack_range, preferred_distance, attack_damage, projectile_speed).
+# Add new shooter types here without touching __init__.
+# ---------------------------------------------------------------------------
+_SHOOTER_PRESETS = {
+    'bullet': (
+        0.35,   # attack_duration  — snappy fire animation
+        1.2,    # attack_cooldown_time — fires frequently
+        200,    # attack_range
+        160,    # preferred_distance — keeps its distance
+        10,     # attack_damage — lower per-shot, compensated by fire rate
+        350,    # projectile_speed — fast bullet
+    ),
+    'rocket': (
+        0.5,    # attack_duration  — slightly longer fire animation
+        3.5,    # attack_cooldown_time — slow reload
+        220,    # attack_range
+        170,    # preferred_distance
+        30,     # attack_damage — high damage per shot
+        220,    # projectile_speed — slower than bullet
+    ),
+    'bomb': (
+        0.6,    # attack_duration
+        2.0,    # attack_cooldown_time
+        150,    # attack_range
+        120,    # preferred_distance
+        15,     # attack_damage
+        200,    # projectile_speed
+    ),
+}
+
+# Cardinal knockback vectors keyed by facing direction
+_KNOCKBACK_VECTORS = {
+    'up':    (0.0, -1.0),
+    'down':  (0.0,  1.0),
+    'left':  (-1.0, 0.0),
+    'right': (1.0,  0.0),
+}
+
+
 class Enemy:
-    def __init__(self, x, y, enemy_type='tiger_bandit', variant='default', ai_type='easy', enemy_category='melee', shooter_style='bomb'):
+    def __init__(self, x, y, enemy_type='tiger_bandit', variant='default',
+                 ai_type='easy', enemy_category='melee', shooter_style='bomb'):
         """Create an enemy at world position (*x*, *y*).
 
         Args:
-            x, y: Starting world coordinates.
-            enemy_type: Sprite folder key (e.g. 'tiger_bandit').
-            variant: Colour/skin variant used by the sprite loader.
-            ai_type: 'easy' for basic movement or 'advanced' for retreat/feint/rush.
-            enemy_category: 'melee' for close-range or 'shooter' for ranged attacks.
-            shooter_style: 'bomb', 'bullet', or 'rocket' — only used when
-                           enemy_category is 'shooter'.
+            x, y:            Starting world coordinates.
+            enemy_type:      Sprite folder key (e.g. 'tiger_bandit').
+            variant:         Colour/skin variant used by the sprite loader.
+            ai_type:         'easy' for basic movement, 'advanced' for retreat/feint/rush.
+            enemy_category:  'melee' for close-range or 'shooter' for ranged attacks.
+            shooter_style:   'bomb', 'bullet', or 'rocket' — only used for 'shooter' category.
         """
         self.x = x
         self.y = y
         self.width = 32
         self.height = 32
-        self.shadow_size = 'small'  # 'small' or 'big' — override per enemy type if needed
+        self.shadow_size = 'small'  # 'small' or 'big' — override per enemy subclass if needed
         self.speed = 1
-        self.hp = 50
-        self.max_hp = 50
+        self.hp = 150
+        self.max_hp = 150
         self.active = True
 
-        # Enemy type and variant for sprite loading
         self.enemy_type = enemy_type
         self.variant = variant
-
-        self.ai_type = ai_type  # 'easy' = basic movement, 'advanced' = retreats/feints/etc.
-
+        self.ai_type = ai_type          # 'easy' = basic movement, 'advanced' = retreats/feints/etc.
         self.enemy_category = enemy_category
 
-        # Load sprite (will fall back to placeholder if not found)
+        # Load sprite — falls back to a colored placeholder rect if file is missing
         self.sprite = create_enemy_sprite(enemy_type, variant, self.width, self.height)
         self.has_sprite = self.sprite is not None
 
-        # AI States
+        # -----------------------------------------------------------------
+        # AI state machine — starts idle, switches to 'chase' on awareness
+        # -----------------------------------------------------------------
         self.state = 'idle'
-        self.awareness_range = 200
-        self.forget_range = 350
+        self.awareness_range = 100   # Distance at which enemy notices the player
+        self.forget_range = 210      # Distance at which enemy gives up chasing
 
-        # Track facing direction for directional attacks and sprites
-        self.direction = 'down'  # 'up', 'down', 'left', 'right'
+        self.direction = 'down'      # Facing direction: 'up' | 'down' | 'left' | 'right'
 
-        # Idle movement
+        # Idle wandering state
         self.idle_timer = 0
-        self.idle_wait_time = 1.5
+        self.idle_wait_time = 1.5           # Seconds to stand still between wanders
         self.idle_move_timer = 0
-        self.idle_move_duration = 1.5
+        self.idle_move_duration = 1.5       # Seconds to walk before stopping again
         self.idle_direction = None
         self.spawn_x = x
         self.spawn_y = y
-        self.max_idle_distance = 100
+        self.max_idle_distance = 100        # Won't wander further than this from spawn
         self.is_idle_moving = False
         self.move_velocity_x = 0
         self.move_velocity_y = 0
-
         self.target_x = x
         self.target_y = y
 
-        # Combat system - configure based on category
+        # -----------------------------------------------------------------
+        # Combat — configure stats based on enemy category
+        # -----------------------------------------------------------------
         self.is_attacking = False
         self.attack_timer = 0
         self.attack_cooldown = 0
 
         if self.enemy_category == 'shooter':
-            self.shooter_style = shooter_style  # 'bomb' = parabolic throw, 'bullet' = straight shot
+            self.shooter_style = shooter_style  # 'bomb' = parabolic throw, 'bullet'/'rocket' = straight
 
-            if self.shooter_style == 'bullet':
-                # bullet: fast shots, longer range, lower damage-per-hit
-                self.attack_duration = 0.35       # Snappy fire animation
-                self.attack_cooldown_time = 1.2   # Fires more frequently than bomb thrower
-                self.attack_range = 200           # Longer effective range
-                self.preferred_distance = 160     # Keep more distance
-                self.attack_damage = 10           # Lower per-shot damage (compensated by fire rate)
-                self.projectile_speed = 350       # Fast bullet
-            elif self.shooter_style == 'rocket':
-                # rocket: slow reload, high damage, moderate projectile speed
-                self.attack_duration = 0.5        # Slightly longer fire animation
-                self.attack_cooldown_time = 3.5   # Slow reload
-                self.attack_range = 220           # Long range
-                self.preferred_distance = 170     # Keep distance
-                self.attack_damage = 30           # High damage per shot
-                self.projectile_speed = 220       # Slower than bullet
-            else:
-                # bomb (default): parabolic throw, medium stats
-                self.attack_duration = 0.6
-                self.attack_cooldown_time = 2.0
-                self.attack_range = 150
-                self.preferred_distance = 120
-                self.attack_damage = 15
-                self.projectile_speed = 200
+            # Pull stat block from preset dict; fall back to 'bomb' if style is unrecognised
+            preset = _SHOOTER_PRESETS.get(shooter_style, _SHOOTER_PRESETS['bomb'])
+            (self.attack_duration,
+             self.attack_cooldown_time,
+             self.attack_range,
+             self.preferred_distance,
+             self.attack_damage,
+             self.projectile_speed) = preset
 
-            self.projectiles = []  # List of active projectiles
+            self.projectiles = []  # Active projectiles owned by this enemy
 
-            # shooter melee rush — charges in for a close hit occasionally
-            self.is_doing_melee_rush = False          # Shooter is closing in for melee
-            self.is_shooter_melee_attack = False       # Current attack is a melee (not ranged)
-            self.shooter_melee_range = 18             # Close-range threshold for melee hit
-            self.shooter_melee_damage = 12            # Damage for shooter melee strike
-            self.melee_rush_chance = 0.55             # 55% chance to rush when eligible
+            # Shooter melee rush — occasionally closes in for a close-range hit
+            self.is_doing_melee_rush = False       # Currently charging the player
+            self.is_shooter_melee_attack = False   # Current attack is a melee swing (not ranged)
+            self.shooter_melee_range = 18          # Distance threshold to trigger the swing
+            self.shooter_melee_damage = 12         # Damage dealt on a successful rush hit
+            self.melee_rush_chance = 0.55          # 55% chance to rush when eligible
             self.last_melee_rush_attempt = 0
             self.melee_rush_check_interval = random.uniform(4.0, 7.0)
             self.melee_rush_cooldown = 0
             self.melee_rush_cooldown_time = random.uniform(5.0, 9.0)
-            self.melee_rush_timer = 0                 # Timeout so the rush doesn't last forever
-            self.melee_rush_max_duration = 3.0        # Abort rush after 3 seconds if no hit
-            self.melee_rush_swung = False             # Has already swung in this rush
+            self.melee_rush_timer = 0              # Running duration — abort if too long
+            self.melee_rush_max_duration = 3.0     # Abort rush after 3 seconds if no hit lands
+            self.melee_rush_swung = False          # Prevents multiple swings per rush
 
-            # bomb spawning flags
+            # Bomb spawning flags — game loop polls should_spawn_bomb each frame
             self.should_spawn_bomb = False
             self.bomb_spawned_this_attack = False
             self.bomb_target_x = 0
             self.bomb_target_y = 0
-            self._pending_bomb_player = None  # player ref saved at throw time
+            self._pending_bomb_player = None       # Player ref saved at throw time for detonation
 
-            # Live bomb / explosion objects owned by this enemy.
-            # The game loop should include enemy.get_bomb_drawables() in its
-            # y-sorted draw list each frame so bombs depth-sort with the player.
+            # Active bombs/explosions owned by this enemy.
+            # Include enemy.get_bomb_drawables() in your y-sorted draw list each frame.
             self.active_bombs = []
 
-            # bullet spawning flags
+            # Bullet spawning flags
             self.should_spawn_bullet = False
             self.bullet_spawned_this_attack = False
             self.bullet_dx = 0.0
             self.bullet_dy = 0.0
 
-            # rocket spawning flags
+            # Rocket spawning flags
             self.should_spawn_rocket = False
             self.rocket_spawned_this_attack = False
             self.rocket_dx = 0.0
             self.rocket_dy = 0.0
         else:
-            # melee defaults
+            # Melee defaults
             self.attack_duration = 0.4
             self.attack_cooldown_time = 1.1
-            self.attack_range = 15  # Close range
-            self.preferred_distance = 0  # Get close to player
+            self.attack_range = 15       # Very close range
+            self.preferred_distance = 0  # Get as close as possible
             self.attack_damage = 10
 
-        # Wait after attack before approaching again
+        # Brief pause after completing an attack before moving again
         self.wait_after_attack = 0
         self.wait_after_attack_duration = 0.4
 
-        # Knockback - animation-based
+        # Knockback — driven by the hurt animation length
         self.is_knocked_back = False
         self.knockback_velocity_x = 0
         self.knockback_velocity_y = 0
 
-        # Hurt tint - red flash that fades after taking damage
+        # Hurt tint — red flash that fades after taking damage
         self.hurt_tint = 0.0            # 1.0 = full red, 0.0 = no tint
-        self.hurt_tint_duration = 0.45  # seconds to fully fade
+        self.hurt_tint_duration = 0.45  # Seconds to fully fade back to normal
+
+        # Tracks the most recent damage value applied so game.py can spawn a
+        # damage number popup without needing to change take_damage's return type
+        self.last_damage_dealt = 0
 
         self.draw_layer = DrawLayer.ENEMIES
-        self.y_sort = True
+        self.y_sort = True              # Participates in depth-sorted rendering
 
-        # Store reference to obstacles for collision checking during knockback
-        self.obstacles = []
+        # Injected by the room/game system after construction
+        self.obstacles = []      # For collision checking during movement and knockback
+        self.other_enemies = []  # For separation force and path-blocking checks
 
-        # Store reference to other enemies for collision avoidance
-        self.other_enemies = []
-
-        # Stuck detection
+        # Stuck detection — if we haven't moved enough, increment stuck_timer
         self.stuck_timer = 0
         self.last_x = x
         self.last_y = y
         self.movement_threshold = 0.5
 
-        # Preferred angle around player for positioning
+        # Each enemy takes a slightly different angle so they don't all stack on the same side
         self.preferred_angle = random.uniform(0, math.pi * 2)
 
-        # Separation force for enemy avoidance
+        # Separation force — pushes overlapping enemies apart
         self.separation_force = 0
         self.separation_strength = 0.7
-        self.min_separation_distance = 16  # Minimum horizontal distance
-        self.min_vertical_separation = 16  # Minimum vertical distance
+        self.min_separation_distance = 16   # Minimum horizontal clearance
+        self.min_vertical_separation = 16   # Minimum vertical clearance
 
-        self.pathfind_direction = None  # current alt direction when going around something
-        self.pathfind_commit_timer = 0  # how long to stick with it
-        self.pathfind_commit_duration = 1
+        # Pathfinding around obstacles — holds an alternate direction for a short commit window
+        self.pathfind_direction = None
+        self.pathfind_commit_timer = 0
+        self.pathfind_commit_duration = 1   # Seconds to stick with the alternate route
 
-        # retreat / breather mechanics (advanced AI only)
-        self.low_health_threshold = 0.3  # Retreat when below 30% HP
-        self.consecutive_hits = 0  # Track hits received in quick succession
-        self.last_hit_time = 0  # When last hit occurred
-        self.hit_combo_window = 2.0  # Reset combo if no hit for 2 seconds
-        self.hit_combo_threshold = 3  # Retreat after 3 consecutive hits
+        # -----------------------------------------------------------------
+        # Advanced AI only — retreat / breather mechanics
+        # -----------------------------------------------------------------
+        self.low_health_threshold = 0.3     # Retreat when HP drops below 30%
+        self.consecutive_hits = 0           # Hits received in quick succession
+        self.last_hit_time = 0
+        self.hit_combo_window = 2.0         # Reset combo counter after 2 seconds without a hit
+        self.hit_combo_threshold = 3        # Trigger retreat after 3 back-to-back hits
 
-        # Retreat chance and cooldown
-        self.retreat_chance = 0.35  # 35% chance to retreat when conditions met
-        self.last_retreat_attempt = 0  # Last time we checked for retreat
-        # Randomize initial check cooldown so enemies don't all check at once
-        self.retreat_check_cooldown = random.uniform(1.5, 3.0)  # Check every 1.5-3 seconds
-        self.retreat_check_interval = random.uniform(1.5, 3.0)  # Store the interval for this enemy
-        self.retreat_cooldown = 0  # Cooldown after finishing a retreat cycle
-        self.retreat_cooldown_time = random.uniform(3.0, 5.0)  # Can't retreat again for 3-5 seconds
+        # Retreat chance and cooldown — staggered per instance so enemies don't all retreat at once
+        self.retreat_chance = 0.35
+        self.last_retreat_attempt = 0
+        self.retreat_check_cooldown = random.uniform(1.5, 3.0)
+        self.retreat_check_interval = random.uniform(1.5, 3.0)
+        self.retreat_cooldown = 0
+        self.retreat_cooldown_time = random.uniform(3.0, 5.0)
 
-        # Retreat state
+        # Retreat movement state
         self.is_retreating = False
         self.retreat_timer = 0
-        self.retreat_duration = 2.0  # Retreat for 2 seconds
-        self.retreat_distance = 150  # Try to get this far from player
+        self.retreat_duration = 2.0         # Seconds to actively back away
+        self.retreat_distance = 150         # Target distance from player before switching to breather
         self.retreat_target_x = 0
         self.retreat_target_y = 0
 
-        # Breather state (rest after retreat)
+        # Breather — brief rest after successfully retreating
         self.is_breathing = False
         self.breather_timer = 0
-        self.breather_duration = 1.5  # Take a breather for 1.5 seconds
+        self.breather_duration = 1.5        # Seconds to stand and recover
 
-        # feinting — backs away while still facing the player
+        # Feinting — backs away while still facing the player after an attack
         self.is_feinting = False
         self.feint_timer = 0
-        self.feint_duration = random.uniform(0.6, 1.2)  # Feint for 0.6-1.2 seconds (shorter)
-        self.feint_distance = 18  # Distance to move during feints (closer)
+        self.feint_duration = random.uniform(0.6, 1.2)
+        self.feint_distance = 18            # World units to drift back during the feint
+        self.feint_chance = 0.20            # 20% chance to feint right after an attack
+        self.last_feint_attempt = 0
+        self.feint_check_cooldown = 0.5     # How soon after an attack to check for a feint
+        self.feint_cooldown = 0
+        self.feint_cooldown_time = random.uniform(5.0, 7.0)
 
-        # optional pause after a feint
+        # Optional pause after a feint — keeps the player guessing
         self.is_pausing_after_feint = False
         self.pause_after_feint_timer = 0
-        self.pause_after_feint_chance = 0.5  # 50% chance to pause after feinting
-        self.pause_after_feint_duration = random.uniform(0.4, 0.8)  # Short pause
+        self.pause_after_feint_chance = 0.5
+        self.pause_after_feint_duration = random.uniform(0.4, 0.8)
 
-        # feint is only eligible right after an attack
-        self.feint_chance = 0.20  # 20% chance to feint after attacking
-        self.last_feint_attempt = 0
-        self.feint_check_cooldown = 0.5  # Check shortly after attack
-        self.feint_cooldown = 0
-        self.feint_cooldown_time = random.uniform(5.0, 7.0)  # Can't feint again for 5-7 seconds (shorter)
+        # Death animation — plays the brown_destruction spritesheet before
+        # self.active is set to False (which signals game.py to award XP / remove)
+        self.is_dying = False
+        self.death_frames = []
+        self.death_frame_index = 0
+        self.death_frame_duration = 0.08   # seconds per frame
+        self.death_frame_timer = 0.0
+        self._load_death_animation()
+
+    # =========================================================================
+    # Utility helpers
+    # =========================================================================
+
+    def _load_death_animation(self):
+        """Load brown_destruction.png spritesheet as a sequence of 32×32 frames."""
+        try:
+            sheet = pygame.image.load('assets/objects/brown_destruction.png').convert_alpha()
+            frame_w = 32
+            frame_h = 32
+            num_frames = sheet.get_width() // frame_w
+            for i in range(num_frames):
+                frame = pygame.Surface((frame_w, frame_h), pygame.SRCALPHA)
+                frame.blit(sheet, (0, 0), (i * frame_w, 0, frame_w, frame_h))
+                self.death_frames.append(frame)
+        except Exception:
+            # Fallback: simple shrinking-circle animation
+            for i in range(6):
+                frame = pygame.Surface((32, 32), pygame.SRCALPHA)
+                alpha = int(255 * (1.0 - i / 6))
+                radius = int(16 * (1.0 - i / 6 * 0.5))
+                pygame.draw.circle(frame, (180, 80, 40, alpha), (16, 16), max(1, radius))
+                self.death_frames.append(frame)
 
     def is_standing_still(self):
-        """Check if this enemy is standing still (attacking, waiting after attack, breathing, feinting, or pausing after feint)"""
-        return self.is_attacking or self.wait_after_attack > 0 or self.is_breathing or self.is_feinting or self.is_pausing_after_feint
+        """True while the enemy is locked in an animation and not moving."""
+        return (self.is_attacking
+                or self.wait_after_attack > 0
+                or self.is_breathing
+                or self.is_feinting
+                or self.is_pausing_after_feint)
+
+    def distance_to(self, x, y):
+        """Euclidean distance from this enemy's centre to (*x*, *y*)."""
+        dx = self.x - x
+        dy = self.y - y
+        return math.sqrt(dx * dx + dy * dy)
+
+    def distance_to_spawn(self, x, y):
+        """Euclidean distance from (*x*, *y*) to this enemy's spawn point."""
+        dx = x - self.spawn_x
+        dy = y - self.spawn_y
+        return math.sqrt(dx * dx + dy * dy)
+
+    def get_sort_key(self):
+        """Depth-sort key: draw_layer first, then feet position (y + height/2)."""
+        return (self.draw_layer, self.y + self.height // 2)
+
+    def get_collision_rect(self):
+        """Return a centred pygame.Rect for this enemy."""
+        return pygame.Rect(
+            self.x - self.width // 2,
+            self.y - self.height // 2,
+            self.width,
+            self.height,
+        )
+
+    def _direction_to_vector(self):
+        """Return the (dx, dy) unit vector for the current facing direction.
+
+        Used to derive knockback direction from the attacker's facing without
+        duplicating the lookup table all over perform_attack and check_collision.
+        """
+        return _KNOCKBACK_VECTORS.get(self.direction, (0.0, 1.0))
+
+    def _snap_to_cardinal(self, raw_dx, raw_dy):
+        """Snap (raw_dx, raw_dy) to the nearest cardinal axis and update self.direction.
+
+        Whichever offset is larger wins. Used by bullet and rocket spawning so
+        projectiles always travel in a clean horizontal or vertical line.
+        Returns the snapped (dx, dy) unit vector.
+        """
+        if abs(raw_dx) >= abs(raw_dy):
+            dx = 1.0 if raw_dx > 0 else -1.0
+            dy = 0.0
+            self.direction = 'right' if raw_dx > 0 else 'left'
+        else:
+            dx = 0.0
+            dy = 1.0 if raw_dy > 0 else -1.0
+            self.direction = 'down' if raw_dy > 0 else 'up'
+        return dx, dy
+
+    def _move_checked(self, dx, dy, speed, world_width, world_height):
+        """Apply (dx, dy)*speed with per-axis obstacle and bounds checking.
+
+        Each axis is tested independently so the enemy can slide along walls
+        instead of stopping dead when one axis is blocked.
+        """
+        new_x = self.x + dx * speed
+        new_y = self.y + dy * speed
+
+        if not self.check_collision_with_obstacles(new_x, self.y) and 0 < new_x < world_width:
+            self.x = new_x
+        if not self.check_collision_with_obstacles(self.x, new_y) and 0 < new_y < world_height:
+            self.y = new_y
 
     def set_direction_from_movement(self, dx, dy, threshold=0.2):
-        """
-        Set direction based on movement vector with hysteresis to prevent rapid switching.
-        threshold: How much larger one component must be to choose that direction.
+        """Set facing direction from a movement vector, with hysteresis.
+
+        The threshold prevents rapid direction-flipping on diagonal movement —
+        one component must be clearly larger to cause a direction change.
         """
         abs_dx = abs(dx)
         abs_dy = abs(dy)
 
-        # Check which component is dominant with a threshold
         if abs_dx > abs_dy + threshold:
-            # Horizontal movement is clearly dominant
             self.direction = 'right' if dx > 0 else 'left'
         elif abs_dy > abs_dx + threshold:
-            # Vertical movement is clearly dominant
             self.direction = 'down' if dy > 0 else 'up'
         else:
-            # Diagonal movement - maintain current direction if possible
-            # Only change if we're moving strongly in a new direction
+            # Diagonal movement — try to maintain the current axis to avoid jitter
             current_is_horizontal = self.direction in ('left', 'right')
             current_is_vertical = self.direction in ('up', 'down')
 
             if current_is_horizontal and abs_dx > 0.05:
-                # Keep horizontal if already moving horizontally and still have horizontal motion
                 self.direction = 'right' if dx > 0 else 'left'
             elif current_is_vertical and abs_dy > 0.05:
-                # Keep vertical if already moving vertically and still have vertical motion
                 self.direction = 'down' if dy > 0 else 'up'
             else:
-                # Default to the most dominant component
+                # No clear winner — fall back to the dominant raw component
                 if abs_dx >= abs_dy:
                     self.direction = 'right' if dx > 0 else 'left'
                 else:
                     self.direction = 'down' if dy > 0 else 'up'
 
-    def get_sort_key(self):
-        """Return draw-layer sort key using feet position for correct depth ordering.
-
-        Sorts by self.y + height//2 (bottom edge of sprite) so depth ordering
-        is consistent with the player, which also sorts by feet.
-        """
-        return (self.draw_layer, self.y + self.height // 2)
-
-    def distance_to(self, x, y):
-        """Return Euclidean distance from this enemy's centre to (*x*, *y*)."""
-        dx = self.x - x
-        dy = self.y - y
-        return (dx * dx + dy * dy) ** 0.5
-
-    def get_collision_rect(self):
-        """Get enemy collision rectangle"""
-        return pygame.Rect(
-            self.x - self.width // 2,
-            self.y - self.height // 2,
-            self.width,
-            self.height
-        )
+    # =========================================================================
+    # Collision detection
+    # =========================================================================
 
     def check_collision_with_obstacles(self, new_x, new_y):
-        """
-        Check if a position collides with any obstacles.
-        Returns True if collision detected, False otherwise.
-        """
+        """Return True if the given position overlaps any active obstacle."""
         temp_rect = pygame.Rect(
             new_x - self.width // 2,
             new_y - self.height // 2,
             self.width,
-            self.height
+            self.height,
         )
 
         for obstacle in self.obstacles:
-            # Check if it's a CollisionObject
+            # Collision wall (e.g. invisible wall object with an 'id' attribute)
             if hasattr(obstacle, 'id') and obstacle.id == 'collision_wall':
                 if hasattr(obstacle, 'active') and not obstacle.active:
                     continue
@@ -317,7 +416,7 @@ class Enemy:
                 if temp_rect.colliderect(obstacle_rect):
                     return True
 
-            # Check if it's a DestructibleStone
+            # DestructibleStone or similar — must be both active and solid
             elif hasattr(obstacle, 'solid') and hasattr(obstacle, 'active'):
                 if not obstacle.active or not obstacle.solid:
                     continue
@@ -325,12 +424,12 @@ class Enemy:
                     obstacle.x - obstacle.width // 2,
                     obstacle.y - obstacle.height // 2,
                     obstacle.width,
-                    obstacle.height
+                    obstacle.height,
                 )
                 if temp_rect.colliderect(stone_rect):
                     return True
 
-            # Fallback for objects with get_collision_rect method
+            # Generic fallback for anything with a get_collision_rect() method
             elif hasattr(obstacle, 'get_collision_rect'):
                 if temp_rect.colliderect(obstacle.get_collision_rect()):
                     return True
@@ -338,11 +437,11 @@ class Enemy:
         return False
 
     def is_path_blocked_by_enemy(self, target_x, target_y):
+        """Return True if another enemy is standing directly in the path to (target_x, target_y).
+
+        Uses a perpendicular-distance check rather than a full raycast —
+        fast enough for every-frame use and works well in practice.
         """
-        Check if the direct path to target is blocked by another enemy.
-        Returns True if blocked, False if clear.
-        """
-        # Calculate direction to target
         dx = target_x - self.x
         dy = target_y - self.y
         distance_to_target = math.sqrt(dx * dx + dy * dy)
@@ -350,207 +449,159 @@ class Enemy:
         if distance_to_target < 0.1:
             return False
 
-        # Normalize direction
+        # Unit vector toward target
         dx /= distance_to_target
         dy /= distance_to_target
 
-        # Check if any enemy is in our path
-        for other_enemy in self.other_enemies:
-            if other_enemy is self or not other_enemy.active:
+        blocking_distance = 40  # How close to the path line an enemy must be to count as blocking
+
+        for other in self.other_enemies:
+            if other is self or not other.active:
                 continue
 
-            # Vector from us to the other enemy
-            to_enemy_x = other_enemy.x - self.x
-            to_enemy_y = other_enemy.y - self.y
-            dist_to_enemy = math.sqrt(to_enemy_x * to_enemy_x + to_enemy_y * to_enemy_y)
+            to_x = other.x - self.x
+            to_y = other.y - self.y
+            dist_to_other = math.sqrt(to_x * to_x + to_y * to_y)
 
-            if dist_to_enemy < 0.1:
+            if dist_to_other < 0.1:
                 continue
 
-            # Check if enemy is roughly in our path to target
-            # Project the vector to the enemy onto our direction vector
-            dot_product = (to_enemy_x * dx + to_enemy_y * dy)
+            # Project the vector-to-other onto the direction-to-target
+            dot = to_x * dx + to_y * dy
 
-            # Enemy must be ahead of us (positive projection)
-            if dot_product <= 0:
+            # Only count enemies ahead of us and closer than the target
+            if dot <= 0 or dot > distance_to_target:
                 continue
 
-            # Enemy must be closer than target
-            if dot_product > distance_to_target:
-                continue
-
-            # Calculate perpendicular distance from our path to the enemy
-            proj_x = dx * dot_product
-            proj_y = dy * dot_product
-            perp_x = to_enemy_x - proj_x
-            perp_y = to_enemy_y - proj_y
-            perp_distance = math.sqrt(perp_x * perp_x + perp_y * perp_y)
-
-            # If enemy is close enough to our path, consider it blocking
-            blocking_distance = 40
-            if perp_distance < blocking_distance:
+            # Perpendicular distance from path line to the other enemy
+            perp_x = to_x - dx * dot
+            perp_y = to_y - dy * dot
+            if math.sqrt(perp_x * perp_x + perp_y * perp_y) < blocking_distance:
                 return True
 
         return False
 
     def calculate_separation_force(self):
+        """Return a (sep_x, sep_y) unit vector that pushes this enemy away from neighbours.
+
+        Standing enemies (attacking/waiting) exert extra force so moving enemies
+        naturally route around them instead of piling up.
         """
-        Calculate separation force to avoid overlapping with other enemies.
-        Standing enemies (attacking or waiting) should push moving enemies away more strongly.
-        """
-        separation_x = 0
-        separation_y = 0
+        separation_x = 0.0
+        separation_y = 0.0
         count = 0
 
-        for other_enemy in self.other_enemies:
-            if other_enemy is self or not other_enemy.active:
+        for other in self.other_enemies:
+            if other is self or not other.active:
                 continue
 
-            # Calculate distance to other enemy
-            dx = other_enemy.x - self.x
-            dy = other_enemy.y - self.y
+            dx = other.x - self.x
+            dy = other.y - self.y
             distance = math.sqrt(dx * dx + dy * dy)
 
             if distance < 0.1:
                 continue
 
-            # Calculate minimum separation based on direction
-            min_distance = self.min_separation_distance
+            # Use horizontal or vertical minimum distance based on relative position
+            min_distance = (self.min_separation_distance
+                            if abs(dx) > abs(dy)
+                            else self.min_vertical_separation)
 
-            # Adjust minimum distance based on relative positions
-            if abs(dx) > abs(dy):  # More horizontal than vertical
-                # For enemies in same row (horizontal alignment), use width
-                min_distance = self.min_separation_distance
-            else:  # More vertical than horizontal
-                # For enemies in same column (vertical alignment), use height/2
-                min_distance = self.min_vertical_separation
-
-            # If too close, apply separation force
             if distance < min_distance:
-                # Normalize direction away from other enemy
-                if distance > 0:
-                    dx /= distance
-                    dy /= distance
+                dx /= distance
+                dy /= distance
 
-                # Calculate force strength based on how close they are
+                # Proportional force — closer means stronger push
                 force = (min_distance - distance) / min_distance
 
-                # standing enemies exert more push so movers go around them
-                if other_enemy.is_standing_still():
-                    force *= 2.0  # Double the force to push away from standing enemies
+                # Standing enemies push harder to make movers go around them
+                if other.is_standing_still():
+                    force *= 2.0
 
-                # Apply force away from other enemy
                 separation_x -= dx * force
                 separation_y -= dy * force
                 count += 1
 
-        # Average the separation force
         if count > 0:
             separation_x /= count
             separation_y /= count
 
-            # Normalize and apply strength
-            sep_mag = math.sqrt(separation_x * separation_x + separation_y * separation_y)
-            if sep_mag > 0:
-                separation_x /= sep_mag
-                separation_y /= sep_mag
-
-            separation_x *= self.separation_strength
-            separation_y *= self.separation_strength
+            # Normalise and scale by separation_strength
+            mag = math.sqrt(separation_x ** 2 + separation_y ** 2)
+            if mag > 0:
+                separation_x = (separation_x / mag) * self.separation_strength
+                separation_y = (separation_y / mag) * self.separation_strength
 
         return separation_x, separation_y
 
     def find_open_angle_around_player(self, player):
-        """
-        Find an open angle around the player to approach from.
-        Divides the circle around the player into sectors and finds the least crowded one.
-        Returns (target_x, target_y) position to move toward.
+        """Find the least-crowded sector around the player and return a target position there.
+
+        Divides the circle into 8 sectors, counts enemies in each, then picks
+        the emptiest one closest to this enemy's current approach angle.
+        Returns (target_x, target_y).
         """
         num_sectors = 8
         sector_counts = [0] * num_sectors
 
-        # Count how many enemies are in each sector around the player
-        for other_enemy in self.other_enemies:
-            if other_enemy is self or not other_enemy.active:
+        for other in self.other_enemies:
+            if other is self or not other.active:
                 continue
+            if other.distance_to(player.x, player.y) > 80:
+                continue  # Only count enemies already near the player
 
-            # Only consider enemies near the player
-            dist_to_player = other_enemy.distance_to(player.x, player.y)
-            if dist_to_player > 80:  # Only count nearby enemies
-                continue
-
-            # Calculate which sector this enemy is in
-            angle = math.atan2(other_enemy.y - player.y, other_enemy.x - player.x)
+            angle = math.atan2(other.y - player.y, other.x - player.x)
             sector = int((angle + math.pi) / (2 * math.pi / num_sectors)) % num_sectors
             sector_counts[sector] += 1
 
-        # Find the least crowded sector
+        # Find the emptiest sector(s) and pick the one nearest to our current angle
         min_count = min(sector_counts)
-        open_sectors = [i for i, count in enumerate(sector_counts) if count == min_count]
+        open_sectors = [i for i, c in enumerate(sector_counts) if c == min_count]
 
-        # Choose the sector closest to our current angle
         current_angle = math.atan2(self.y - player.y, self.x - player.x)
         current_sector = int((current_angle + math.pi) / (2 * math.pi / num_sectors)) % num_sectors
 
-        # Find the closest open sector
-        best_sector = min(open_sectors,
-                          key=lambda s: min(abs(s - current_sector), num_sectors - abs(s - current_sector)))
+        best_sector = min(
+            open_sectors,
+            key=lambda s: min(abs(s - current_sector), num_sectors - abs(s - current_sector))
+        )
 
-        # Calculate target position at this angle around the player
         target_angle = (best_sector * 2 * math.pi / num_sectors) - math.pi
-        attack_distance = self.attack_range * 0.8  # Get close enough to attack
+        attack_distance = self.attack_range * 0.8  # Close enough to attack from this position
 
-        target_x = player.x + math.cos(target_angle) * attack_distance
-        target_y = player.y + math.sin(target_angle) * attack_distance
-
-        return target_x, target_y
+        return (player.x + math.cos(target_angle) * attack_distance,
+                player.y + math.sin(target_angle) * attack_distance)
 
     def find_clear_path_around_obstacle(self, target_x, target_y, move_speed):
-        """
-        Find a clear path around obstacles when stuck.
-        Samples 8 directions and chooses the clearest path toward target.
-        Returns (dx, dy) direction vector, or None if completely blocked.
+        """Sample 8 directions and return the one that makes the most progress toward the target.
+
+        Returns a (dx, dy) unit vector, or None if all directions are blocked.
         """
         num_samples = 8
         best_direction = None
         best_score = -999999
 
-        # Calculate direct angle to target
         target_dx = target_x - self.x
         target_dy = target_y - self.y
         target_angle = math.atan2(target_dy, target_dx)
 
         for i in range(num_samples):
-            # Calculate test angle
-            angle = (i * 2 * math.pi / num_samples)
-
-            # Calculate test direction
+            angle = i * 2 * math.pi / num_samples
             test_dx = math.cos(angle)
             test_dy = math.sin(angle)
 
-            # Calculate test position
-            test_distance = move_speed * 2
-            test_x = self.x + test_dx * test_distance
-            test_y = self.y + test_dy * test_distance
+            test_x = self.x + test_dx * move_speed * 2
+            test_y = self.y + test_dy * move_speed * 2
 
-            # Check if this direction is clear of obstacles
             if self.check_collision_with_obstacles(test_x, test_y):
-                continue
+                continue  # Skip blocked directions entirely
 
-            # Score this direction based on how close it is to target direction
-            angle_to_target = math.atan2(test_dy, test_dx)
-            angle_diff = abs(angle_to_target - target_angle)
-
-            # Normalize angle difference to [0, pi]
+            # Score by angular closeness to target, with a bonus for positive dot product
+            angle_diff = abs(math.atan2(test_dy, test_dx) - target_angle)
             if angle_diff > math.pi:
                 angle_diff = 2 * math.pi - angle_diff
 
-            # Score: prefer directions closer to target
-            score = -angle_diff
-
-            # Bonus for making progress toward target
-            dot_product = test_dx * target_dx + test_dy * target_dy
-            score += dot_product * 0.5
+            score = -angle_diff + (test_dx * target_dx + test_dy * target_dy) * 0.5
 
             if score > best_score:
                 best_score = score
@@ -559,16 +610,23 @@ class Enemy:
         return best_direction
 
     def update_stuck_detection(self, dt):
-        """Detect if enemy is stuck and not making progress"""
-        movement = math.sqrt((self.x - self.last_x) ** 2 + (self.y - self.last_y) ** 2)
+        """Increment stuck_timer when not making meaningful progress; decay it when moving.
 
-        if movement < self.movement_threshold:
+        stuck_timer > ~0.3 is used elsewhere to trigger pathfinding.
+        """
+        moved = math.sqrt((self.x - self.last_x) ** 2 + (self.y - self.last_y) ** 2)
+
+        if moved < self.movement_threshold:
             self.stuck_timer += dt
         else:
-            self.stuck_timer = max(0, self.stuck_timer - dt * 2)
+            self.stuck_timer = max(0, self.stuck_timer - dt * 2)  # Decay faster than it builds
 
         self.last_x = self.x
         self.last_y = self.y
+
+    # =========================================================================
+    # Main update loop
+    # =========================================================================
 
     def update(self, dt, player, world_width, world_height, obstacles=None):
         """Advance the enemy AI state machine by *dt* seconds.
@@ -580,63 +638,69 @@ class Enemy:
         if not self.active:
             return
 
-        # Update sprite animation
+        # While the death animation is playing, tick it and skip all AI/physics
+        if self.is_dying:
+            self.death_frame_timer += dt
+            if self.death_frame_timer >= self.death_frame_duration:
+                self.death_frame_timer = 0.0
+                self.death_frame_index += 1
+                if self.death_frame_index >= len(self.death_frames):
+                    # Animation complete — signal game.py to award XP and remove
+                    self.is_dying = False
+                    self.active = False
+            return
+
+        # Advance sprite animation frame
         if self.has_sprite:
             self.sprite.update(dt)
 
-        # Tick all owned bombs — passes player so detonation always has a reference
+        # Tick all owned bombs — pass player so detonation always has a reference
         if self.enemy_category == 'shooter' and self.active_bombs:
             for bomb in self.active_bombs:
                 bomb.update(dt, player)
             # Purge fully spent bombs (exploded AND explosion animation done)
             self.active_bombs = [
                 b for b in self.active_bombs
-                if not (b.state == b.STATE_EXPLODED and
-                        (b.pending_explosion is None or not b.pending_explosion.active))
+                if not (b.state == b.STATE_EXPLODED
+                        and (b.pending_explosion is None or not b.pending_explosion.active))
             ]
 
-        # Update attack cooldown
+        # Tick down all cooldown timers
         if self.attack_cooldown > 0:
             self.attack_cooldown -= dt
-
-        # Update wait timer
         if self.wait_after_attack > 0:
             self.wait_after_attack -= dt
-
         if self.retreat_cooldown > 0:
             self.retreat_cooldown -= dt
-
         if self.feint_cooldown > 0:
             self.feint_cooldown -= dt
-
         if self.enemy_category == 'shooter' and self.melee_rush_cooldown > 0:
             self.melee_rush_cooldown -= dt
 
-        # Fade out hurt tint each frame
+        # Fade out the hurt tint each frame
         if self.hurt_tint > 0:
             self.hurt_tint = max(0.0, self.hurt_tint - dt / self.hurt_tint_duration)
 
-        # Update stuck detection
         self.update_stuck_detection(dt)
 
-        # tick down the pathfinding commitment
+        # Let the committed pathfinding direction expire naturally
         if self.pathfind_commit_timer > 0:
             self.pathfind_commit_timer -= dt
             if self.pathfind_commit_timer <= 0:
                 self.pathfind_direction = None
 
-        # Handle knockback
+        # ------------------------------------------------------------------
+        # Knockback — runs physics and returns early; no AI while staggered
+        # ------------------------------------------------------------------
         if self.is_knocked_back:
             self.stuck_timer = 0
-            # Clear pathfinding when knocked back
             self.pathfind_direction = None
             self.pathfind_commit_timer = 0
 
-            # Calculate new position
             new_x = self.x + self.knockback_velocity_x * dt
             new_y = self.y + self.knockback_velocity_y * dt
 
-            # Check for collisions and only move if no collision
+            # Per-axis collision so the enemy slides along walls
             if not self.check_collision_with_obstacles(new_x, self.y):
                 self.x = new_x
             else:
@@ -651,154 +715,83 @@ class Enemy:
             self.x = max(0, min(self.x, world_width))
             self.y = max(0, min(self.y, world_height))
 
+            # Friction — velocity decays quickly
             self.knockback_velocity_x *= 0.9
             self.knockback_velocity_y *= 0.9
 
+            # End knockback when hurt animation finishes (or velocity is negligible)
             if self.has_sprite and self.sprite.is_animation_finished():
-                self.is_knocked_back = False
-                self.knockback_velocity_x = 0
-                self.knockback_velocity_y = 0
-                self.sprite.set_animation('idle', self.direction)
+                self._end_knockback()
             elif not self.has_sprite:
                 if abs(self.knockback_velocity_x) < 1 and abs(self.knockback_velocity_y) < 1:
-                    self.is_knocked_back = False
-                    self.knockback_velocity_x = 0
-                    self.knockback_velocity_y = 0
+                    self._end_knockback()
             return
 
-        # Handle attacking
+        # ------------------------------------------------------------------
+        # Attack animation — holds control until attack_timer expires
+        # ------------------------------------------------------------------
         if self.is_attacking:
             self.attack_timer -= dt
             if self.attack_timer <= 0:
                 self.is_attacking = False
                 self.wait_after_attack = self.wait_after_attack_duration
-                # End melee rush after the swing completes
+
+                # If this was a shooter melee rush swing, wrap it up
                 if getattr(self, 'is_shooter_melee_attack', False):
                     self.is_shooter_melee_attack = False
                     self.is_doing_melee_rush = False
                     self.melee_rush_timer = 0
                     self.melee_rush_swung = False
                     self.melee_rush_cooldown = self.melee_rush_cooldown_time
+
                 if self.has_sprite:
                     self.sprite.set_animation('idle', self.direction)
             else:
-                # Call perform_attack at the END of the animation (last 0.1 seconds)
-                # This is when the bomb should be thrown
+                # Trigger the actual hit/spawn during the last 0.4 s of the animation
                 if self.attack_timer <= 0.4:
                     self.perform_attack(player)
             return
 
+        # ------------------------------------------------------------------
+        # State transitions
+        # ------------------------------------------------------------------
         player_distance = self.distance_to(player.x, player.y)
 
-        # State management
-        if self.state == 'idle':
-            if player_distance < self.awareness_range:
-                self.state = 'chase'
-                self.stuck_timer = 0
-                # Clear pathfinding when entering chase
-                self.pathfind_direction = None
-                self.pathfind_commit_timer = 0
-        elif self.state == 'chase':
-            if player_distance > self.forget_range:
-                self.state = 'idle'
-                self.idle_timer = 0
-                self.stuck_timer = 0
-                # Clear pathfinding when leaving chase
-                self.pathfind_direction = None
-                self.pathfind_commit_timer = 0
-                if self.has_sprite:
-                    self.sprite.set_animation('idle', self.direction)
+        if self.state == 'idle' and player_distance < self.awareness_range:
+            self.state = 'chase'
+            self.stuck_timer = 0
+            self.pathfind_direction = None
+            self.pathfind_commit_timer = 0
 
-        # check retreat conditions (advanced AI)
+        elif self.state == 'chase' and player_distance > self.forget_range:
+            self.state = 'idle'
+            self.idle_timer = 0
+            self.stuck_timer = 0
+            self.pathfind_direction = None
+            self.pathfind_commit_timer = 0
+            if self.has_sprite:
+                self.sprite.set_animation('idle', self.direction)
+
+        # ------------------------------------------------------------------
+        # Advanced AI decision checks (retreat, melee rush, feint)
+        # ------------------------------------------------------------------
         if self.ai_type == 'advanced' and not self.is_attacking and self.state == 'chase':
-            current_time = time.time()
-            health_percent = self.hp / self.max_hp
+            self._check_retreat(player)
+            if self.enemy_category == 'shooter':
+                self._check_melee_rush()
+            if self.enemy_category == 'melee':
+                self._check_feint()
 
-            # Only check for retreat periodically to prevent spam
-            time_since_last_check = current_time - self.last_retreat_attempt
-            can_check_retreat = time_since_last_check >= self.retreat_check_cooldown
-
-            # Check if we're off cooldown from a previous retreat
-            can_retreat = self.retreat_cooldown <= 0
-
-            # Trigger retreat if low health OR too many consecutive hits
-            should_retreat = (
-                    (health_percent < self.low_health_threshold) or
-                    (self.consecutive_hits >= self.hit_combo_threshold)
-            )
-
-            # Attempt retreat with random chance when conditions are met
-            if should_retreat and can_check_retreat and can_retreat:
-                self.last_retreat_attempt = current_time
-                # Randomize the next check interval to stagger retreats among enemies
-                self.retreat_check_cooldown = random.uniform(1.5, 3.0)
-
-                # Roll for retreat chance
-                if random.random() < self.retreat_chance:
-                    # Start retreat if not already retreating/breathing
-                    if not self.is_retreating and not self.is_breathing:
-                        self.is_retreating = True
-                        self.retreat_timer = self.retreat_duration
-                        # Clear pathfinding when starting retreat
-                        self.pathfind_direction = None
-                        self.pathfind_commit_timer = 0
-
-        # periodically decide whether to rush in for a melee hit (advanced shooters)
-        if self.ai_type == 'advanced' and self.enemy_category == 'shooter' and not self.is_attacking and self.state == 'chase':
-            if not self.is_doing_melee_rush and self.melee_rush_cooldown <= 0 and self.wait_after_attack <= 0:
-                current_time = time.time()
-                if current_time - self.last_melee_rush_attempt >= self.melee_rush_check_interval:
-                    self.last_melee_rush_attempt = current_time
-                    self.melee_rush_check_interval = random.uniform(4.0, 7.0)
-                    if random.random() < self.melee_rush_chance:
-                        self.is_doing_melee_rush = True
-                        self.melee_rush_timer = 0
-                        self.melee_rush_swung = False
-                        self.pathfind_direction = None
-                        self.pathfind_commit_timer = 0
-
-        # feinting only eligible right after an attack (advanced melee)
-        if self.ai_type == 'advanced' and self.enemy_category == 'melee' and not self.is_attacking and self.state == 'chase':
-            # Only check if we're in the wait period after an attack
-            if self.wait_after_attack > 0:
-                # Don't feint if already retreating, breathing, feinting, or pausing after feint
-                if not self.is_retreating and not self.is_breathing and not self.is_feinting and not self.is_pausing_after_feint:
-                    current_time = time.time()
-
-                    # short interval — we're already inside the post-attack window
-                    time_since_last_check = current_time - self.last_feint_attempt
-                    can_check_feint = time_since_last_check >= self.feint_check_cooldown
-
-                    # Check if off cooldown
-                    can_feint = self.feint_cooldown <= 0
-
-                    # Attempt feint after attack
-                    if can_check_feint and can_feint:
-                        self.last_feint_attempt = current_time
-
-                        # Roll for feint chance
-                        if random.random() < self.feint_chance:
-                            # Start feinting
-                            self.is_feinting = True
-                            self.feint_timer = random.uniform(0.6, 1.2)
-                            # Clear wait_after_attack to start feinting immediately
-                            self.wait_after_attack = 0
-                            # Clear pathfinding when starting feint
-                            self.pathfind_direction = None
-                            self.pathfind_commit_timer = 0
-
-        # Behavior based on state
+        # ------------------------------------------------------------------
+        # Behaviour dispatch — priority order matters here
+        # ------------------------------------------------------------------
         if not self.is_attacking:
-            # retreat / breather
             if self.is_retreating or self.is_breathing:
                 self.retreat_behavior(dt, player, world_width, world_height)
-            # shooter closing in for a melee hit
             elif self.enemy_category == 'shooter' and getattr(self, 'is_doing_melee_rush', False):
                 self.shooter_melee_rush_behavior(dt, player, world_width, world_height)
-            # feinting
             elif self.is_feinting:
                 self.feint_behavior(dt, player, world_width, world_height)
-            # brief pause after a feint
             elif self.is_pausing_after_feint:
                 self.pause_after_feint_behavior(dt, player)
             elif self.state == 'idle':
@@ -806,40 +799,102 @@ class Enemy:
             elif self.state == 'chase':
                 self.chase_and_attack(dt, player, world_width, world_height)
 
+    # =========================================================================
+    # Advanced AI checks (called from update)
+    # =========================================================================
+
+    def _check_retreat(self, player):
+        """Decide whether to start retreating — called once per frame while chasing."""
+        current_time = time.time()
+        health_pct = self.hp / self.max_hp
+
+        can_check = (current_time - self.last_retreat_attempt) >= self.retreat_check_cooldown
+        can_retreat = self.retreat_cooldown <= 0
+        should_retreat = (
+            health_pct < self.low_health_threshold
+            or self.consecutive_hits >= self.hit_combo_threshold
+        )
+
+        if should_retreat and can_check and can_retreat:
+            self.last_retreat_attempt = current_time
+            self.retreat_check_cooldown = random.uniform(1.5, 3.0)  # Stagger future checks
+
+            if random.random() < self.retreat_chance:
+                if not self.is_retreating and not self.is_breathing:
+                    self.is_retreating = True
+                    self.retreat_timer = self.retreat_duration
+                    self.pathfind_direction = None
+                    self.pathfind_commit_timer = 0
+
+    def _check_melee_rush(self):
+        """Decide whether to start a melee rush — called for advanced shooters while chasing."""
+        if self.is_doing_melee_rush or self.melee_rush_cooldown > 0 or self.wait_after_attack > 0:
+            return
+
+        current_time = time.time()
+        if (current_time - self.last_melee_rush_attempt) >= self.melee_rush_check_interval:
+            self.last_melee_rush_attempt = current_time
+            self.melee_rush_check_interval = random.uniform(4.0, 7.0)
+
+            if random.random() < self.melee_rush_chance:
+                self.is_doing_melee_rush = True
+                self.melee_rush_timer = 0
+                self.melee_rush_swung = False
+                self.pathfind_direction = None
+                self.pathfind_commit_timer = 0
+
+    def _check_feint(self):
+        """Decide whether to start a feint — only valid in the wait window after an attack."""
+        if self.wait_after_attack <= 0:
+            return  # Feint is only eligible right after an attack
+        if self.is_retreating or self.is_breathing or self.is_feinting or self.is_pausing_after_feint:
+            return
+
+        current_time = time.time()
+        can_check = (current_time - self.last_feint_attempt) >= self.feint_check_cooldown
+        can_feint = self.feint_cooldown <= 0
+
+        if can_check and can_feint:
+            self.last_feint_attempt = current_time
+            if random.random() < self.feint_chance:
+                self.is_feinting = True
+                self.feint_timer = random.uniform(0.6, 1.2)
+                self.wait_after_attack = 0  # Start feinting immediately
+                self.pathfind_direction = None
+                self.pathfind_commit_timer = 0
+
+    # =========================================================================
+    # Behaviour methods
+    # =========================================================================
+
     def apply_separation_force(self, dt):
+        """Nudge this enemy away from neighbours to prevent piling.
+
+        Skipped while the enemy is frozen (attacking/waiting) or being knocked back.
         """
-        Push enemies apart so they don't pile on top of each other.
-        Enemies that are attacking or waiting hold their ground; only moving ones drift away.
-        """
-        # Don't apply separation if we're standing still (attacking or waiting after attack)
-        # or if we're knocked back
         if self.is_knocked_back or self.is_standing_still():
             return
 
         sep_x, sep_y = self.calculate_separation_force()
 
         if abs(sep_x) > 0.1 or abs(sep_y) > 0.1:
-            # Apply separation movement
             move_speed = self.speed * 30 * dt
-
-            # Calculate new position with separation
             new_x = self.x + sep_x * move_speed
             new_y = self.y + sep_y * move_speed
 
-            # Only move if not colliding with obstacles
             if not self.check_collision_with_obstacles(new_x, self.y):
                 self.x = new_x
-
             if not self.check_collision_with_obstacles(self.x, new_y):
                 self.y = new_y
 
     def shooter_melee_rush_behavior(self, dt, player, world_width, world_height):
+        """Charge the player and land one melee swing, then return to shooting range.
+
+        The rush aborts automatically if it takes longer than melee_rush_max_duration.
         """
-        Charges straight at the player and lands one melee hit before retreating
-        back to normal shooting range. Rush aborts automatically on timeout.
-        """
-        # Advance the rush timeout - abort if it takes too long
         self.melee_rush_timer += dt
+
+        # Safety valve — abort if the rush drags on too long
         if self.melee_rush_timer >= self.melee_rush_max_duration:
             self.is_doing_melee_rush = False
             self.melee_rush_timer = 0
@@ -849,15 +904,13 @@ class Enemy:
 
         distance = self.distance_to(player.x, player.y)
 
-        # If close enough and haven't swung yet, trigger the melee attack.
-        # Intentionally bypasses ranged attack_cooldown - the rush has its own cooldown.
+        # Close enough to swing — trigger melee attack and end the rush
         if distance < self.shooter_melee_range and not self.melee_rush_swung:
             self.melee_rush_swung = True
             self.is_shooter_melee_attack = True
             self.is_attacking = True
-            self.attack_timer = 0.4          # Melee swing duration
+            self.attack_timer = 0.4  # Melee swing lasts 0.4 s
 
-            # Face the player
             dx = player.x - self.x
             dy = player.y - self.y
             self.set_direction_from_movement(dx, dy)
@@ -866,7 +919,7 @@ class Enemy:
                 self.sprite.set_animation('melee', self.direction)
             return
 
-        # Not yet in range - charge toward the player
+        # Not yet in range — charge toward the player at a sprint
         dx = player.x - self.x
         dy = player.y - self.y
         dist = math.sqrt(dx * dx + dy * dy)
@@ -878,9 +931,9 @@ class Enemy:
         if self.has_sprite:
             self.sprite.set_animation('walk', self.direction)
 
-        move_speed = self.speed * 70 * dt   # Slightly faster than normal chase
+        move_speed = self.speed * 70 * dt  # Slightly faster than a normal chase
 
-        # Pathfinding around obstacles
+        # Obstacle pathfinding during the rush
         new_x = self.x + dx * move_speed
         new_y = self.y + dy * move_speed
         is_blocked = self.check_collision_with_obstacles(new_x, new_y)
@@ -894,77 +947,61 @@ class Enemy:
                 self.pathfind_commit_timer = self.pathfind_commit_duration
                 dx, dy = clear_path
 
-        final_x = self.x + dx * move_speed
-        final_y = self.y + dy * move_speed
-
-        if not self.check_collision_with_obstacles(final_x, self.y):
-            if 0 < final_x < world_width:
-                self.x = final_x
-        if not self.check_collision_with_obstacles(self.x, final_y):
-            if 0 < final_y < world_height:
-                self.y = final_y
+        self._move_checked(dx, dy, move_speed, world_width, world_height)
 
     def chase_and_attack(self, dt, player, world_width, world_height):
-        """
-        Chase player and attack. If direct path is blocked by another enemy,
-        find an open angle around the player to attack from instead.
-        SHOOTERS maintain their preferred distance instead of closing in.
+        """Main chase/attack behaviour — used for both melee and shooter enemies.
+
+        Shooters maintain preferred_distance and require cardinal alignment before
+        firing; melee enemies close in as fast as possible.
         """
         distance = self.distance_to(player.x, player.y)
 
-        # If waiting after attack, just face the player and don't move
+        # While in the post-attack wait, stand still and track the player's position
         if self.wait_after_attack > 0:
             if self.has_sprite:
                 self.sprite.set_animation('idle', self.direction)
-
-            dx = player.x - self.x
-            dy = player.y - self.y
-            # Use the stable direction setting here too
-            self.set_direction_from_movement(dx, dy)
+            self.set_direction_from_movement(player.x - self.x, player.y - self.y)
             return
 
-        # Attack if in range
+        # ------------------------------------------------------------------
+        # Attack opportunity check
+        # ------------------------------------------------------------------
         if distance < self.attack_range and self.attack_cooldown <= 0:
-            # SHOOTER: Attack when in a wide range
             if self.enemy_category == 'shooter':
-                min_attack_distance = 50  # Very permissive minimum
+                min_attack_distance = 50  # Very permissive minimum so close-in shots still fire
 
-                # GUNNER / ROCKETLAUNCHER: Only fire when player is cardinally aligned
                 if self.shooter_style in ('bullet', 'rocket'):
                     raw_dx = player.x - self.x
                     raw_dy = player.y - self.y
-                    alignment_tolerance = 20  # World units of leeway
-                    cardinally_aligned = abs(raw_dx) < alignment_tolerance or abs(raw_dy) < alignment_tolerance
-                    if not cardinally_aligned:
-                        # Not aligned - fall through to movement so gunner strafes into alignment
-                        pass
-                    elif distance >= min_attack_distance:
-                        # Snap direction BEFORE calling try_attack so the animation faces correctly
-                        if abs(raw_dx) >= abs(raw_dy):
-                            self.direction = 'right' if raw_dx > 0 else 'left'
-                        else:
-                            self.direction = 'down' if raw_dy > 0 else 'up'
+                    alignment_tolerance = 20  # World-unit leeway on cardinal alignment
+                    cardinally_aligned = (abs(raw_dx) < alignment_tolerance
+                                          or abs(raw_dy) < alignment_tolerance)
+
+                    if cardinally_aligned and distance >= min_attack_distance:
+                        # Snap facing direction before the animation so it looks correct
+                        self._snap_to_cardinal(raw_dx, raw_dy)
                         self.try_attack(player)
                         return
+                    # Not aligned — fall through to movement so the gunner strafes into line
                 elif distance >= min_attack_distance:
                     self.try_attack(player)
                     return
             else:
-                # MELEE: Attack whenever in range
+                # Melee: attack whenever in range
                 self.try_attack(player)
                 return
-        elif self.enemy_category == 'shooter':
-            pass  # Out of range or on cooldown — fall through to movement
 
-        # SHOOTER BEHAVIOR: Maintain preferred distance
+        # ------------------------------------------------------------------
+        # Shooter positioning — maintain preferred distance and alignment
+        # ------------------------------------------------------------------
         if self.enemy_category == 'shooter':
-            # Too close - advanced AI retaliates with a melee rush; easy AI backs away
             if distance < self.preferred_distance * 0.9:
+                # Player invaded personal space — advanced AI rushes back; easy AI backs off
                 if (self.ai_type == 'advanced'
                         and not self.is_doing_melee_rush
                         and self.melee_rush_cooldown <= 0
                         and not self.is_attacking):
-                    # Player invaded personal space - charge them
                     self.is_doing_melee_rush = True
                     self.melee_rush_timer = 0
                     self.melee_rush_swung = False
@@ -972,7 +1009,7 @@ class Enemy:
                     self.pathfind_commit_timer = 0
                     return
 
-                # Calculate direction AWAY from player
+                # Back away — face toward player while moving in reverse
                 dx = self.x - player.x
                 dy = self.y - player.y
                 dist = math.sqrt(dx * dx + dy * dy)
@@ -980,66 +1017,51 @@ class Enemy:
                     dx /= dist
                     dy /= dist
 
-                # Set walking animation
+                self.set_direction_from_movement(player.x - self.x, player.y - self.y)
                 if self.has_sprite:
                     self.sprite.set_animation('walk', self.direction)
 
-                # Update facing direction toward player (walk backward)
-                face_dx = player.x - self.x
-                face_dy = player.y - self.y
-                self.set_direction_from_movement(face_dx, face_dy)
-
-                # Move away
                 move_speed = self.speed * 50 * dt
 
-            # At good distance AND within attack range
-            elif distance <= self.preferred_distance * 1.3 and distance < self.attack_range:  # Wider zone for stability
-                # GUNNER: if not aligned, move toward the nearest alignment point
+            elif distance <= self.preferred_distance * 1.3 and distance < self.attack_range:
+                # In the sweet spot — strafe to a cardinal alignment if needed
                 if self.shooter_style in ('bullet', 'rocket'):
                     raw_dx = player.x - self.x
                     raw_dy = player.y - self.y
                     alignment_tolerance = 20
-                    cardinally_aligned = abs(raw_dx) < alignment_tolerance or abs(raw_dy) < alignment_tolerance
+                    cardinally_aligned = (abs(raw_dx) < alignment_tolerance
+                                          or abs(raw_dy) < alignment_tolerance)
+
                     if not cardinally_aligned:
-                        # Pick the alignment target that requires the least movement:
-                        # either slide to player.x (same column) or slide to player.y (same row)
+                        # Slide toward whichever axis requires the least movement
                         if abs(raw_dx) < abs(raw_dy):
-                            # Moving horizontally to share the player's column is shorter
-                            target_x = player.x
-                            target_y = self.y
+                            target_x, target_y = player.x, self.y   # Line up same column
                         else:
-                            # Moving vertically to share the player's row is shorter
-                            target_x = self.x
-                            target_y = player.y
+                            target_x, target_y = self.x, player.y   # Line up same row
+
                         move_dx = target_x - self.x
                         move_dy = target_y - self.y
-                        move_dist = math.sqrt(move_dx * move_dx + move_dy * move_dy)
+                        move_dist = math.sqrt(move_dx ** 2 + move_dy ** 2)
                         if move_dist > 0.1:
                             move_dx /= move_dist
                             move_dy /= move_dist
-                        self.set_direction_from_movement(move_dx, move_dy)  # Face the way we're actually walking
+
+                        self.set_direction_from_movement(move_dx, move_dy)
                         if self.has_sprite:
                             self.sprite.set_animation('walk', self.direction)
+
                         move_speed = self.speed * 60 * dt
-                        new_x = self.x + move_dx * move_speed
-                        new_y = self.y + move_dy * move_speed
-                        if not self.check_collision_with_obstacles(new_x, self.y):
-                            self.x = new_x
-                        if not self.check_collision_with_obstacles(self.x, new_y):
-                            self.y = new_y
+                        self._move_checked(move_dx, move_dy, move_speed, world_width, world_height)
                         return
 
-                # Aligned (or non-gunner shooter) - stand still and face player
+                # Already aligned (or bomb thrower) — stand still and face player
                 if self.has_sprite:
                     self.sprite.set_animation('idle', self.direction)
-
-                dx = player.x - self.x
-                dy = player.y - self.y
-                self.set_direction_from_movement(dx, dy)
+                self.set_direction_from_movement(player.x - self.x, player.y - self.y)
                 return
 
-            # Too far - move closer
             else:
+                # Too far — close the gap
                 dx = player.x - self.x
                 dy = player.y - self.y
                 dist = math.sqrt(dx * dx + dy * dy)
@@ -1047,30 +1069,26 @@ class Enemy:
                     dx /= dist
                     dy /= dist
 
-                # Set walking animation
+                self.set_direction_from_movement(dx, dy)
                 if self.has_sprite:
                     self.sprite.set_animation('walk', self.direction)
 
-                # Update facing direction
-                self.set_direction_from_movement(dx, dy)
-
-                # Move closer
                 move_speed = self.speed * 60 * dt
+
+        # ------------------------------------------------------------------
+        # Melee positioning — get as close as possible, route around allies
+        # ------------------------------------------------------------------
         else:
-            # MELEE BEHAVIOR: Get as close as possible
-            # Determine target position
             target_x = player.x
             target_y = player.y
 
-            # If direct path is blocked by another enemy, find an open angle
+            # If a teammate is directly in the way, find an open approach angle
             if self.is_path_blocked_by_enemy(player.x, player.y):
                 target_x, target_y = self.find_open_angle_around_player(player)
 
-            # Set walking animation
             if self.has_sprite:
                 self.sprite.set_animation('walk', self.direction)
 
-            # Calculate approach vector toward target
             dx = target_x - self.x
             dy = target_y - self.y
             approach_dist = math.sqrt(dx * dx + dy * dy)
@@ -1079,284 +1097,197 @@ class Enemy:
                 dx /= approach_dist
                 dy /= approach_dist
             else:
-                # We're at the target position, just face the player
+                # Already at the target spot — just face the player
                 dx = player.x - self.x
                 dy = player.y - self.y
-                dist_to_player = math.sqrt(dx * dx + dy * dy)
-                if dist_to_player > 0.1:
-                    dx /= dist_to_player
-                    dy /= dist_to_player
+                d = math.sqrt(dx * dx + dy * dy)
+                if d > 0.1:
+                    dx /= d
+                    dy /= d
 
-            # Calculate movement - reduce speed when very close to maintain spacing
             move_speed = self.speed * 60 * dt
+            # Slow down slightly when already very close — helps formation look less chaotic
             if distance < self.min_separation_distance * 2:
-                # Slow down when close to maintain better formation
                 move_speed *= 0.7
 
-        # First, check if we need pathfinding around obstacles
+        # ------------------------------------------------------------------
+        # Obstacle pathfinding + separation force, then apply movement
+        # ------------------------------------------------------------------
         new_x = self.x + dx * move_speed
         new_y = self.y + dy * move_speed
         is_blocked = self.check_collision_with_obstacles(new_x, new_y)
 
-        # stick with the current alt direction or find a new one if stuck
         if self.pathfind_commit_timer > 0 and self.pathfind_direction is not None:
-            # We're committed to a pathfinding direction, use it
             dx, dy = self.pathfind_direction
         elif is_blocked or self.stuck_timer > 0.3:
-            # Need to find a new path around obstacle
-            target_x = player.x if self.enemy_category == 'melee' else self.x + dx * self.preferred_distance
-            target_y = player.y if self.enemy_category == 'melee' else self.y + dy * self.preferred_distance
+            target_x = (player.x if self.enemy_category == 'melee'
+                        else self.x + dx * self.preferred_distance)
+            target_y = (player.y if self.enemy_category == 'melee'
+                        else self.y + dy * self.preferred_distance)
             clear_path = self.find_clear_path_around_obstacle(target_x, target_y, move_speed)
-
             if clear_path is not None:
-                # Found a clear path, commit to it for a duration
                 self.pathfind_direction = clear_path
                 self.pathfind_commit_timer = self.pathfind_commit_duration
                 dx, dy = clear_path
         else:
-            # Not blocked and not stuck - clear any previous pathfinding
+            # Clear path — drop any stale pathfinding state
             self.pathfind_direction = None
             self.pathfind_commit_timer = 0
 
-        # Update facing direction with stability (for melee, already done for shooters)
         if self.enemy_category == 'melee':
             self.set_direction_from_movement(dx, dy)
 
-        # NOW calculate final movement with separation force
-        # Start with base chase/pathfinding movement
-        final_dx = dx * move_speed
-        final_dy = dy * move_speed
-
-        # Add separation force to prevent overlapping
+        # Blend in separation force so enemies spread out naturally
         sep_x, sep_y = self.calculate_separation_force()
-        separation_strength = move_speed * 0.6  # Strong separation to maintain spacing
-        final_dx += sep_x * separation_strength
-        final_dy += sep_y * separation_strength
+        sep_strength = move_speed * 0.6
+        final_dx = dx * move_speed + sep_x * sep_strength
+        final_dy = dy * move_speed + sep_y * sep_strength
 
-        # Apply final movement with collision checking (only check obstacles, not other enemies)
+        # Apply axis-by-axis with obstacle and bounds check
         test_x = self.x + final_dx
-        if not self.check_collision_with_obstacles(test_x, self.y):
-            if 0 < test_x < world_width:
-                self.x = test_x
+        if not self.check_collision_with_obstacles(test_x, self.y) and 0 < test_x < world_width:
+            self.x = test_x
 
         test_y = self.y + final_dy
-        if not self.check_collision_with_obstacles(self.x, test_y):
-            if 0 < test_y < world_height:
-                self.y = test_y
+        if not self.check_collision_with_obstacles(self.x, test_y) and 0 < test_y < world_height:
+            self.y = test_y
 
     def retreat_behavior(self, dt, player, world_width, world_height):
-        """
-        Back away from the player, then hold still for a moment before re-engaging.
-        Used when low on health or after taking many consecutive hits.
-        """
-        # Handle breather state (resting after reaching safe distance)
-        if self.is_breathing:
-            self.breather_timer -= dt
+        """Back away from the player, then hold still briefly before re-engaging.
 
-            # Just stand and face the player during breather
+        Two-phase: 'retreating' (moving away) → 'breathing' (standing still to recover).
+        """
+        if self.is_breathing:
+            # Breather phase — stand still and watch the player
+            self.breather_timer -= dt
             if self.has_sprite:
                 self.sprite.set_animation('idle', self.direction)
+            self.set_direction_from_movement(player.x - self.x, player.y - self.y)
 
-            # Update direction to face player
-            dx = player.x - self.x
-            dy = player.y - self.y
-            self.set_direction_from_movement(dx, dy)
-
-            # End breather when timer expires
             if self.breather_timer <= 0:
+                # Recovery complete — reset combo counter and return to chase
                 self.is_breathing = False
                 self.is_retreating = False
-                self.consecutive_hits = 0  # Reset combo counter after recovery
-
-                # Return to chase state and start retreat cooldown with randomized time
+                self.consecutive_hits = 0
                 self.state = 'chase'
-                self.retreat_cooldown = random.uniform(3.0, 5.0)  # Randomize cooldown
-
-                # Clear pathfinding for fresh start
+                self.retreat_cooldown = random.uniform(3.0, 5.0)
                 self.pathfind_direction = None
                 self.pathfind_commit_timer = 0
             return
 
-        # Handle retreat movement
+        # Active retreat — move away from the player
         self.retreat_timer -= dt
 
-        # Calculate direction AWAY from player
         dx = self.x - player.x
         dy = self.y - player.y
-        dist_to_player = math.sqrt(dx * dx + dy * dy)
+        dist = math.sqrt(dx * dx + dy * dy)
+        if dist > 0.1:
+            dx /= dist
+            dy /= dist
 
-        # Normalize direction
-        if dist_to_player > 0.1:
-            dx /= dist_to_player
-            dy /= dist_to_player
-
-        # Set retreat animation
+        self.set_direction_from_movement(dx, dy)
         if self.has_sprite:
             self.sprite.set_animation('walk', self.direction)
 
-        # Update facing direction (still face away from player while retreating)
-        self.set_direction_from_movement(dx, dy)
+        move_speed = self.speed * 70 * dt  # Slightly faster than normal chase
 
-        # Move away from player
-        move_speed = self.speed * 70 * dt  # Slightly faster when retreating
-
-        # Calculate movement with pathfinding around obstacles
+        # Obstacle pathfinding while retreating
         new_x = self.x + dx * move_speed
         new_y = self.y + dy * move_speed
         is_blocked = self.check_collision_with_obstacles(new_x, new_y)
 
-        # Use pathfinding if blocked
         if self.pathfind_commit_timer > 0 and self.pathfind_direction is not None:
             dx, dy = self.pathfind_direction
         elif is_blocked or self.stuck_timer > 0.3:
-            # Calculate a retreat target position
             retreat_target_x = self.x + dx * self.retreat_distance
             retreat_target_y = self.y + dy * self.retreat_distance
-
             clear_path = self.find_clear_path_around_obstacle(retreat_target_x, retreat_target_y, move_speed)
             if clear_path is not None:
                 self.pathfind_direction = clear_path
                 self.pathfind_commit_timer = self.pathfind_commit_duration
                 dx, dy = clear_path
 
-        # Apply movement with collision checking
-        final_x = self.x + dx * move_speed
-        final_y = self.y + dy * move_speed
+        self._move_checked(dx, dy, move_speed, world_width, world_height)
 
-        if not self.check_collision_with_obstacles(final_x, self.y):
-            if 0 < final_x < world_width:
-                self.x = final_x
-
-        if not self.check_collision_with_obstacles(self.x, final_y):
-            if 0 < final_y < world_height:
-                self.y = final_y
-
-        # Check if we've retreated far enough or timer expired
-        if dist_to_player >= self.retreat_distance or self.retreat_timer <= 0:
-            # Start breather phase
+        # Transition to breather once far enough or time is up
+        if dist >= self.retreat_distance or self.retreat_timer <= 0:
             self.is_breathing = True
             self.breather_timer = self.breather_duration
-            return
 
     def feint_behavior(self, dt, player, world_width, world_height):
-        """
-        Step away from the player while still facing them — sells the idea of backing off.
-        Creates tactical spacing after attacking.
-        """
-        # Update timer
+        """Step backward while still facing the player — sells a fake retreat after attacking."""
         self.feint_timer -= dt
 
-        # Calculate distance to player
-        distance = self.distance_to(player.x, player.y)
-
-        # ALWAYS calculate direction TO player for facing
+        # Face toward the player the whole time
         face_dx = player.x - self.x
         face_dy = player.y - self.y
-        face_dist = math.sqrt(face_dx * face_dx + face_dy * face_dy)
+        face_dist = math.sqrt(face_dx ** 2 + face_dy ** 2)
         if face_dist > 0.1:
             face_dx /= face_dist
             face_dy /= face_dist
 
-        # ALWAYS move AWAY from player during feint
+        # Move away from the player
         move_dx = self.x - player.x
         move_dy = self.y - player.y
-        move_dist = math.sqrt(move_dx * move_dx + move_dy * move_dy)
-
-        # Normalize movement direction
+        move_dist = math.sqrt(move_dx ** 2 + move_dy ** 2)
         if move_dist > 0.1:
             move_dx /= move_dist
             move_dy /= move_dist
 
-        # Update facing direction - ALWAYS face toward player during feints
         self.set_direction_from_movement(face_dx, face_dy)
-
-        # Set walking animation
         if self.has_sprite:
             self.sprite.set_animation('walk', self.direction)
 
-        # Move with medium speed (backing away)
-        move_speed = self.speed * 55 * dt
+        move_speed = self.speed * 55 * dt  # Moderate backing-away speed
 
-        # Calculate movement with pathfinding around obstacles
+        # Obstacle pathfinding
         new_x = self.x + move_dx * move_speed
         new_y = self.y + move_dy * move_speed
         is_blocked = self.check_collision_with_obstacles(new_x, new_y)
 
-        # Use pathfinding if blocked
         if self.pathfind_commit_timer > 0 and self.pathfind_direction is not None:
             move_dx, move_dy = self.pathfind_direction
         elif is_blocked or self.stuck_timer > 0.3:
-            # Calculate a target position for pathfinding
             target_x = self.x + move_dx * self.feint_distance
             target_y = self.y + move_dy * self.feint_distance
-
             clear_path = self.find_clear_path_around_obstacle(target_x, target_y, move_speed)
             if clear_path is not None:
                 self.pathfind_direction = clear_path
                 self.pathfind_commit_timer = self.pathfind_commit_duration
                 move_dx, move_dy = clear_path
 
-        # Apply movement with collision checking
-        final_x = self.x + move_dx * move_speed
-        final_y = self.y + move_dy * move_speed
+        self._move_checked(move_dx, move_dy, move_speed, world_width, world_height)
 
-        if not self.check_collision_with_obstacles(final_x, self.y):
-            if 0 < final_x < world_width:
-                self.x = final_x
-
-        if not self.check_collision_with_obstacles(self.x, final_y):
-            if 0 < final_y < world_height:
-                self.y = final_y
-
-        # End feinting when timer expires
         if self.feint_timer <= 0:
             self.is_feinting = False
-            # Start feint cooldown with randomized time
             self.feint_cooldown = random.uniform(5.0, 7.0)
+            self.pathfind_direction = None
+            self.pathfind_commit_timer = 0
 
-            # Sometimes pause after feinting, sometimes return to chase immediately
+            # 50% chance to pause briefly after the feint before re-engaging
             if random.random() < self.pause_after_feint_chance:
-                # Start pause
                 self.is_pausing_after_feint = True
                 self.pause_after_feint_timer = random.uniform(0.4, 0.8)
             else:
-                # Return to chase state immediately
                 self.state = 'chase'
 
-            # Clear pathfinding for fresh start
-            self.pathfind_direction = None
-            self.pathfind_commit_timer = 0
-            return
-
     def pause_after_feint_behavior(self, dt, player):
-        """
-        Brief stand-and-stare after a feint — keeps the player guessing.
-        Creates a moment of tension before re-engaging.
-        """
-        # Update timer
+        """Stand and stare at the player for a beat after a feint — keeps them guessing."""
         self.pause_after_feint_timer -= dt
 
-        # Just stand and face the player during pause
         if self.has_sprite:
             self.sprite.set_animation('idle', self.direction)
+        self.set_direction_from_movement(player.x - self.x, player.y - self.y)
 
-        # Update direction to face player
-        dx = player.x - self.x
-        dy = player.y - self.y
-        self.set_direction_from_movement(dx, dy)
-
-        # End pause when timer expires
         if self.pause_after_feint_timer <= 0:
             self.is_pausing_after_feint = False
-            # Return to chase state
             self.state = 'chase'
-            return
 
     def idle_behavior(self, dt, world_width, world_height):
-        """Idle behavior: random wandering or return to spawn if too far"""
+        """Wander randomly near the spawn point, or return home if too far."""
         distance_from_spawn = self.distance_to_spawn(self.x, self.y)
 
-        # If too far from spawn, return to spawn point
+        # Too far from spawn — walk straight back
         if distance_from_spawn > self.max_idle_distance:
             dx = self.spawn_x - self.x
             dy = self.spawn_y - self.y
@@ -1365,41 +1296,26 @@ class Enemy:
             if dist > 0:
                 dx /= dist
                 dy /= dist
-
                 move_speed = self.speed * 60 * dt
+
+                # Route around anything in the way
                 new_x = self.x + dx * move_speed
                 new_y = self.y + dy * move_speed
-
-                # OBSTACLE AVOIDANCE
-                is_blocked = self.check_collision_with_obstacles(new_x, new_y)
-
-                if is_blocked or self.stuck_timer > 0.3:
-                    clear_path = self.find_clear_path_around_obstacle(self.spawn_x, self.spawn_y, move_speed)
-
+                if (self.check_collision_with_obstacles(new_x, new_y)
+                        or self.stuck_timer > 0.3):
+                    clear_path = self.find_clear_path_around_obstacle(
+                        self.spawn_x, self.spawn_y, move_speed
+                    )
                     if clear_path is not None:
                         dx, dy = clear_path
-                        new_x = self.x + dx * move_speed
-                        new_y = self.y + dy * move_speed
 
-                # Update facing direction
                 self.set_direction_from_movement(dx, dy)
-
-                # Set walking animation
                 if self.has_sprite:
                     self.sprite.set_animation('walk', self.direction)
-
-                # Move with collision checking
-                if not self.check_collision_with_obstacles(new_x, self.y):
-                    if 0 < new_x < world_width:
-                        self.x = new_x
-
-                if not self.check_collision_with_obstacles(self.x, new_y):
-                    if 0 < new_y < world_height:
-                        self.y = new_y
-
+                self._move_checked(dx, dy, move_speed, world_width, world_height)
             return
 
-        # Random wandering when not returning to spawn
+        # Random wandering within the spawn radius
         if not self.is_idle_moving:
             self.idle_timer += dt
             if self.idle_timer >= self.idle_wait_time:
@@ -1407,16 +1323,14 @@ class Enemy:
                 self.is_idle_moving = True
                 self.idle_move_timer = 0
 
-                # Choose random direction
+                # Pick a random direction and clamp the target to the spawn radius
                 angle = random.uniform(0, 2 * math.pi)
                 self.idle_direction = (math.cos(angle), math.sin(angle))
-
-                # Calculate new target position
                 move_distance = random.uniform(20, 60)
+
                 self.target_x = self.x + self.idle_direction[0] * move_distance
                 self.target_y = self.y + self.idle_direction[1] * move_distance
 
-                # Clamp to spawn radius
                 dx = self.target_x - self.spawn_x
                 dy = self.target_y - self.spawn_y
                 dist_from_spawn = math.sqrt(dx * dx + dy * dy)
@@ -1427,296 +1341,121 @@ class Enemy:
                     self.target_x = self.spawn_x + dx * self.max_idle_distance
                     self.target_y = self.spawn_y + dy * self.max_idle_distance
 
-                # Update facing direction
                 self.set_direction_from_movement(self.idle_direction[0], self.idle_direction[1])
-
-                # Set walking animation
                 if self.has_sprite:
                     self.sprite.set_animation('walk', self.direction)
         else:
             self.idle_move_timer += dt
-
-            # Check if reached target or timed out
             dist_to_target = math.sqrt((self.x - self.target_x) ** 2 + (self.y - self.target_y) ** 2)
 
+            # Stop when close enough or the move timer expires
             if dist_to_target < 5 or self.idle_move_timer >= self.idle_move_duration:
                 self.is_idle_moving = False
                 self.idle_timer = 0
                 if self.has_sprite:
                     self.sprite.set_animation('idle', self.direction)
             else:
-                # Move toward target
                 move_speed = self.speed * 20 * dt
-                new_x = self.x + self.idle_direction[0] * move_speed
-                new_y = self.y + self.idle_direction[1] * move_speed
+                self._move_checked(
+                    self.idle_direction[0], self.idle_direction[1],
+                    move_speed, world_width, world_height,
+                )
 
-                if not self.check_collision_with_obstacles(new_x, self.y):
-                    if 0 < new_x < world_width:
-                        self.x = new_x
-
-                if not self.check_collision_with_obstacles(self.x, new_y):
-                    if 0 < new_y < world_height:
-                        self.y = new_y
-
-    def distance_to_spawn(self, x, y):
-        dx = x - self.spawn_x
-        dy = y - self.spawn_y
-        return (dx * dx + dy * dy) ** 0.5
+    # =========================================================================
+    # Combat methods
+    # =========================================================================
 
     def try_attack(self, player):
-        """Attempt to start an attack animation.
+        """Start an attack animation if off cooldown and in range.
 
-        Returns True if the attack was started, False if blocked by cooldown,
-        knockback, or being out of range.
+        Returns True if the attack started, False otherwise.
         """
         if self.is_attacking or self.is_knocked_back or self.attack_cooldown > 0:
             return False
 
-        distance = self.distance_to(player.x, player.y)
-
-        if distance < self.attack_range:
+        if self.distance_to(player.x, player.y) < self.attack_range:
             self.is_attacking = True
             self.attack_timer = self.attack_duration
             self.attack_cooldown = self.attack_cooldown_time
 
-            # Reset spawn flags for new attack (shooters only)
+            # Reset per-attack spawn flags so each attack spawns exactly one projectile
             if self.enemy_category == 'shooter':
                 self.bomb_spawned_this_attack = False
                 self.bullet_spawned_this_attack = False
                 self.rocket_spawned_this_attack = False
 
             if self.has_sprite:
-                # Melee enemies use 'melee' animation; shooters use 'attack' for ranged
-                animation_name = 'melee' if self.enemy_category == 'melee' else 'attack'
-                self.sprite.set_animation(animation_name, self.direction)
+                anim = 'melee' if self.enemy_category == 'melee' else 'attack'
+                self.sprite.set_animation(anim, self.direction)
 
             return True
 
         return False
 
     def perform_attack(self, player):
+        """Apply hit effects or set projectile spawn flags during the attack window.
+
+        Called at attack_timer <= 0.4 s (the last part of the animation) so the
+        impact lands at the visual peak of the swing.
+        """
         if not self.is_attacking:
             return
 
         distance = self.distance_to(player.x, player.y)
 
         if self.enemy_category == 'shooter':
-            # shooter landed a melee rush — use melee damage instead of projectile
+            # Shooter landed a melee rush — use melee damage
             if getattr(self, 'is_shooter_melee_attack', False):
                 if distance < self.shooter_melee_range:
-                    if self.direction == 'up':
-                        knockback_x, knockback_y = 0.0, -1.0
-                    elif self.direction == 'down':
-                        knockback_x, knockback_y = 0.0, 1.0
-                    elif self.direction == 'left':
-                        knockback_x, knockback_y = -1.0, 0.0
-                    else:
-                        knockback_x, knockback_y = 1.0, 0.0
-                    player.take_damage(self.shooter_melee_damage, knockback_x, knockback_y)
+                    kx, ky = self._direction_to_vector()
+                    player.take_damage(self.shooter_melee_damage, kx, ky)
                     player.hurt_tint = 1.0
                 return
 
             if self.shooter_style == 'bullet':
-                # GUNNER: Fire a straight bullet (only once per attack)
+                # Snap to the nearest cardinal axis and set the bullet-spawn flag
                 if not self.bullet_spawned_this_attack:
                     raw_dx = player.x - self.x
                     raw_dy = player.y - self.y
-                    # Snap to cardinal axis (whichever offset is larger wins)
-                    if abs(raw_dx) >= abs(raw_dy):
-                        dx = 1.0 if raw_dx > 0 else -1.0
-                        dy = 0.0
-                        self.direction = 'right' if raw_dx > 0 else 'left'
-                    else:
-                        dx = 0.0
-                        dy = 1.0 if raw_dy > 0 else -1.0
-                        self.direction = 'down' if raw_dy > 0 else 'up'
+                    dx, dy = self._snap_to_cardinal(raw_dx, raw_dy)
                     self.should_spawn_bullet = True
                     self.bullet_dx = dx
                     self.bullet_dy = dy
                     self.bullet_spawned_this_attack = True
+
             elif self.shooter_style == 'rocket':
-                # ROCKET LAUNCHER: Fire a rocket (cardinal aligned, only once per attack)
+                # Identical axis-snap logic to bullet, different projectile type
                 if not self.rocket_spawned_this_attack:
                     raw_dx = player.x - self.x
                     raw_dy = player.y - self.y
-                    if abs(raw_dx) >= abs(raw_dy):
-                        dx = 1.0 if raw_dx > 0 else -1.0
-                        dy = 0.0
-                        self.direction = 'right' if raw_dx > 0 else 'left'
-                    else:
-                        dx = 0.0
-                        dy = 1.0 if raw_dy > 0 else -1.0
-                        self.direction = 'down' if raw_dy > 0 else 'up'
+                    dx, dy = self._snap_to_cardinal(raw_dx, raw_dy)
                     self.should_spawn_rocket = True
                     self.rocket_dx = dx
                     self.rocket_dy = dy
                     self.rocket_spawned_this_attack = True
+
             else:
-                # BOMB THROWER: Lob a bomb toward player's position (only once per attack)
+                # Bomb thrower — lob toward the player's current position
                 if not self.bomb_spawned_this_attack:
                     self.should_spawn_bomb = True
                     self.bomb_target_x = player.x
                     self.bomb_target_y = player.y
-                    self._pending_bomb_player = player   # saved so spawn data can carry it
+                    self._pending_bomb_player = player
                     self.bomb_spawned_this_attack = True
-        else:
-            # MELEE: Deal damage if in range
-            if distance < self.attack_range:
-                # KNOCKBACK BASED ON FACING DIRECTION
-                if self.direction == 'up':
-                    knockback_x = 0.0
-                    knockback_y = -1.0
-                elif self.direction == 'down':
-                    knockback_x = 0.0
-                    knockback_y = 1.0
-                elif self.direction == 'left':
-                    knockback_x = -1.0
-                    knockback_y = 0.0
-                elif self.direction == 'right':
-                    knockback_x = 1.0
-                    knockback_y = 0.0
-                else:
-                    knockback_x = 0.0
-                    knockback_y = 1.0
 
-                player.take_damage(self.attack_damage, knockback_x, knockback_y)
+        else:
+            # Melee — deal damage if the player is still in range
+            if distance < self.attack_range:
+                kx, ky = self._direction_to_vector()
+                player.take_damage(self.attack_damage, kx, ky)
                 player.hurt_tint = 1.0
 
-    def get_bomb_spawn_data(self):
-        """
-        Get data needed to spawn a bomb projectile for shooter enemies.
-        Returns a dictionary with bomb parameters, or None if not ready to spawn.
-        Called by the game system when should_spawn_bomb flag is True.
-        """
-        if not self.should_spawn_bomb:
-            return None
-
-        # Clear the flag so we don't spawn multiple bombs
-        self.should_spawn_bomb = False
-
-        # Return bomb spawn data
-        return {
-            'start_x': self.x,
-            'start_y': self.y,
-            'target_x': self.bomb_target_x,
-            'target_y': self.bomb_target_y,
-            'damage': self.attack_damage,
-            'flight_time': 1.0,  # Bomb takes 1 second to reach target
-            'player': self._pending_bomb_player,  # needed so bomb can deal damage on detonation
-            'owner': self
-        }
-
-    def register_bomb(self, bomb):
-        """
-        Call this immediately after creating a BombProjectile from get_bomb_spawn_data().
-        The enemy owns the bomb so it can update it with the player each frame and expose
-        it to the y-sorted draw list via get_bomb_drawables().
-
-        Example in your game loop:
-            data = enemy.get_bomb_spawn_data()
-            bomb = BombProjectile(data['start_x'], data['start_y'],
-                                  data['target_x'], data['target_y'],
-                                  data['damage'], data['flight_time'],
-                                  player=data['player'])
-            enemy.register_bomb(bomb)
-            # Do NOT add it to a separate bomb list — enemy manages it from here.
-        """
-        self.active_bombs.append(bomb)
-
-    def get_bomb_drawables(self):
-        """
-        Returns all drawable bomb/explosion objects owned by this enemy.
-        Add these to your y-sorted draw list each frame so they depth-sort
-        correctly with the player and other entities.
-
-        Example in your game loop (inside draw preparation):
-            for enemy in enemies:
-                drawables.extend(enemy.get_bomb_drawables())
-        """
-        result = []
-        for bomb in self.active_bombs:
-            # The bomb itself while flying/landed
-            if bomb.state != bomb.STATE_EXPLODED:
-                result.append(bomb)
-            # The explosion effect while it's still playing
-            if bomb.pending_explosion is not None and bomb.pending_explosion.active:
-                result.append(bomb.pending_explosion)
-        return result
-
-    def get_bullet_spawn_data(self):
-        """
-        Get data needed to spawn a straight bullet for gunner enemies.
-        Returns a dictionary with bullet parameters, or None if not ready to spawn.
-        Called by the game system when should_spawn_bullet flag is True.
-        """
-        if not self.should_spawn_bullet:
-            return None
-
-        # Clear the flag so we don't spawn multiple bullets
-        self.should_spawn_bullet = False
-
-        return {
-            'x': self.x,
-            'y': self.y,
-            'dx': self.bullet_dx,
-            'dy': self.bullet_dy,
-            'speed': self.projectile_speed,
-            'damage': self.attack_damage,
-            'direction': self.direction,
-            'owner': self
-        }
-
-    def get_rocket_spawn_data(self):
-        """
-        Get data needed to spawn a rocket for rocketlauncher enemies.
-        Returns a dictionary with rocket parameters, or None if not ready.
-        """
-        if not self.should_spawn_rocket:
-            return None
-        self.should_spawn_rocket = False
-        return {
-            'x': self.x,
-            'y': self.y,
-            'dx': self.rocket_dx,
-            'dy': self.rocket_dy,
-            'speed': self.projectile_speed,
-            'damage': self.attack_damage,
-            'direction': self.direction,
-            'owner': self
-        }
-
-    def get_projectile_spawn_data(self, player):
-        """
-        Get data needed to spawn a projectile for shooter enemies.
-        Returns a dictionary with projectile parameters, or None if not a shooter or not attacking.
-        Called by the game system during the attack animation.
-        """
-        if self.enemy_category != 'shooter' or not self.is_attacking:
-            return None
-
-        # Calculate direction toward player
-        dx = player.x - self.x
-        dy = player.y - self.y
-        dist = math.sqrt(dx * dx + dy * dy)
-
-        if dist > 0.1:
-            dx /= dist
-            dy /= dist
-
-        # Return projectile spawn data
-        return {
-            'x': self.x,
-            'y': self.y,
-            'dx': dx,
-            'dy': dy,
-            'speed': self.projectile_speed,
-            'damage': self.attack_damage,
-            'direction': self.direction,
-            'owner': self
-        }
+    # =========================================================================
+    # Damage / knockback
+    # =========================================================================
 
     def apply_knockback(self, dx, dy, force=200):
-        """Apply knockback that lasts for the duration of the hurt animation"""
+        """Launch the enemy in direction (dx, dy) with the given force and play the hurt animation."""
         self.is_knocked_back = True
         self.knockback_velocity_x = dx * force
         self.knockback_velocity_y = dy * force
@@ -1725,37 +1464,56 @@ class Enemy:
         if self.has_sprite:
             self.sprite.set_animation('hurt', self.direction)
 
+    def _end_knockback(self):
+        """Clear all knockback state and return to idle animation."""
+        self.is_knocked_back = False
+        self.knockback_velocity_x = 0
+        self.knockback_velocity_y = 0
+        if self.has_sprite:
+            self.sprite.set_animation('idle', self.direction)
+
     def take_damage(self, damage):
+        """Reduce HP and track hit combos for the advanced AI retreat decision."""
+        self.last_damage_dealt = damage  # Stored so game.py can spawn a popup
         self.hp -= damage
         self.hurt_tint = 1.0
 
-        # track back-to-back hits so the enemy can decide to retreat
         if self.ai_type == 'advanced':
             current_time = time.time()
-
-            # Check if this hit is part of a combo (within the combo window)
+            # Count consecutive hits within the combo window
             if current_time - self.last_hit_time < self.hit_combo_window:
                 self.consecutive_hits += 1
             else:
-                # Too much time passed, reset combo
-                self.consecutive_hits = 1
-
+                self.consecutive_hits = 1  # Too long since last hit — reset combo
             self.last_hit_time = current_time
 
         if self.hp <= 0:
             self.hp = 0
-            self.active = False
             if self.has_sprite:
                 self.sprite.set_animation('death', self.direction)
+            # Delay actual deactivation until the death animation finishes
+            self.is_dying = True
+            self.death_frame_index = 0
+            self.death_frame_timer = 0.0
 
     def get_xp_reward(self, game_config):
+        """Return XP granted to the player on kill."""
         return game_config.basic_enemy_xp
 
+    # =========================================================================
+    # Collision with player attacks
+    # =========================================================================
+
     def check_collision_with_attack(self, attack, attack_type):
+        """Test whether a player attack hits this enemy and apply damage/knockback.
+
+        Returns True if a hit was registered.
+        """
         if not self.active or self.is_knocked_back:
             return False
 
         if attack_type == 'melee':
+            # Offset the hit box in the direction of the swing
             offset = 25
             melee_x = attack.x
             melee_y = attack.y
@@ -1769,16 +1527,17 @@ class Enemy:
             elif attack.direction == 'right':
                 melee_x += offset + attack.size // 2
 
-            attack_rect = pygame.Rect(melee_x - attack.size // 2, melee_y - attack.size // 2,
-                                      attack.size, attack.size)
-            enemy_rect = pygame.Rect(self.x - self.width // 2, self.y - self.height // 2,
-                                     self.width, self.height)
-            if attack_rect.colliderect(enemy_rect):
+            attack_rect = pygame.Rect(
+                melee_x - attack.size // 2,
+                melee_y - attack.size // 2,
+                attack.size, attack.size,
+            )
+            if attack_rect.colliderect(self.get_collision_rect()):
                 self.take_damage(15)
 
                 dx = self.x - attack.x
                 dy = self.y - attack.y
-                dist = (dx * dx + dy * dy) ** 0.5
+                dist = math.sqrt(dx * dx + dy * dy)
                 if dist > 0:
                     dx /= dist
                     dy /= dist
@@ -1786,25 +1545,13 @@ class Enemy:
                 return True
 
         elif attack_type == 'projectile':
-            projectile_radius = attack.radius
-            projectile_rect = pygame.Rect(
-                attack.x - projectile_radius,
-                attack.y - projectile_radius,
-                projectile_radius * 2,
-                projectile_radius * 2
-            )
+            r = attack.radius
+            projectile_rect = pygame.Rect(attack.x - r, attack.y - r, r * 2, r * 2)
 
-            enemy_rect = pygame.Rect(
-                self.x - self.width // 2,
-                self.y - self.height // 2,
-                self.width,
-                self.height
-            )
-
-            if projectile_rect.colliderect(enemy_rect):
+            if projectile_rect.colliderect(self.get_collision_rect()):
                 dx = self.x - attack.x
                 dy = self.y - attack.y
-                dist = (dx * dx + dy * dy) ** 0.5
+                dist = math.sqrt(dx * dx + dy * dy)
                 if dist > 0:
                     dx /= dist
                     dy /= dist
@@ -1815,71 +1562,175 @@ class Enemy:
 
         elif attack_type == 'beam':
             if attack.length > 0:
+                # Build the beam rect based on firing direction
                 if attack.direction == 'up':
-                    beam_rect = pygame.Rect(attack.x - attack.width // 2,
-                                            attack.y - attack.length,
+                    beam_rect = pygame.Rect(attack.x - attack.width // 2, attack.y - attack.length,
                                             attack.width, attack.length)
                 elif attack.direction == 'down':
-                    beam_rect = pygame.Rect(attack.x - attack.width // 2,
-                                            attack.y,
+                    beam_rect = pygame.Rect(attack.x - attack.width // 2, attack.y,
                                             attack.width, attack.length)
                 elif attack.direction == 'left':
-                    beam_rect = pygame.Rect(attack.x - attack.length,
-                                            attack.y - attack.width // 2,
+                    beam_rect = pygame.Rect(attack.x - attack.length, attack.y - attack.width // 2,
                                             attack.length, attack.width)
                 elif attack.direction == 'right':
-                    beam_rect = pygame.Rect(attack.x,
-                                            attack.y - attack.width // 2,
+                    beam_rect = pygame.Rect(attack.x, attack.y - attack.width // 2,
                                             attack.length, attack.width)
 
-                enemy_rect = pygame.Rect(self.x - self.width // 2, self.y - self.height // 2,
-                                         self.width, self.height)
-                if beam_rect.colliderect(enemy_rect):
-                    self.take_damage(5)
+                if beam_rect.colliderect(self.get_collision_rect()):
+                    self.take_damage(5)  # Beam ticks low damage continuously
                     return True
 
         return False
 
+    # =========================================================================
+    # Projectile spawn data — polled by the game loop each frame
+    # =========================================================================
+
+    def get_bomb_spawn_data(self):
+        """Return bomb parameters and clear the spawn flag, or None if not ready.
+
+        Game loop pattern:
+            if enemy.should_spawn_bomb:
+                data = enemy.get_bomb_spawn_data()
+                bomb = BombProjectile(...)
+                enemy.register_bomb(bomb)
+        """
+        if not self.should_spawn_bomb:
+            return None
+
+        self.should_spawn_bomb = False  # One bomb per attack window
+        return {
+            'start_x':   self.x,
+            'start_y':   self.y,
+            'target_x':  self.bomb_target_x,
+            'target_y':  self.bomb_target_y,
+            'damage':    self.attack_damage,
+            'flight_time': 1.0,             # Seconds until detonation
+            'player':    self._pending_bomb_player,
+            'owner':     self,
+        }
+
+    def register_bomb(self, bomb):
+        """Hand a newly created BombProjectile to this enemy for ownership.
+
+        The enemy ticks and draws all owned bombs each frame.
+        Do NOT add the bomb to a separate global list — the enemy manages it.
+        """
+        self.active_bombs.append(bomb)
+
+    def get_bomb_drawables(self):
+        """Return all drawable bomb/explosion objects for inclusion in the y-sorted draw list.
+
+        Game loop pattern:
+            for enemy in enemies:
+                drawables.extend(enemy.get_bomb_drawables())
+        """
+        result = []
+        for bomb in self.active_bombs:
+            if bomb.state != bomb.STATE_EXPLODED:
+                result.append(bomb)
+            if bomb.pending_explosion is not None and bomb.pending_explosion.active:
+                result.append(bomb.pending_explosion)
+        return result
+
+    def get_bullet_spawn_data(self):
+        """Return bullet parameters and clear the spawn flag, or None if not ready."""
+        if not self.should_spawn_bullet:
+            return None
+
+        self.should_spawn_bullet = False  # One bullet per attack window
+        return {
+            'x':         self.x,
+            'y':         self.y,
+            'dx':        self.bullet_dx,
+            'dy':        self.bullet_dy,
+            'speed':     self.projectile_speed,
+            'damage':    self.attack_damage,
+            'direction': self.direction,
+            'owner':     self,
+        }
+
+    def get_rocket_spawn_data(self):
+        """Return rocket parameters and clear the spawn flag, or None if not ready."""
+        if not self.should_spawn_rocket:
+            return None
+
+        self.should_spawn_rocket = False  # One rocket per attack window
+        return {
+            'x':         self.x,
+            'y':         self.y,
+            'dx':        self.rocket_dx,
+            'dy':        self.rocket_dy,
+            'speed':     self.projectile_speed,
+            'damage':    self.attack_damage,
+            'direction': self.direction,
+            'owner':     self,
+        }
+
+    def get_projectile_spawn_data(self, player):
+        """Generic projectile spawn data for shooter enemies — aimed directly at the player.
+
+        Used for simple free-aim projectiles (not the snapped bullet/rocket types).
+        Returns None if this enemy is not a shooter or isn't currently attacking.
+        """
+        if self.enemy_category != 'shooter' or not self.is_attacking:
+            return None
+
+        dx = player.x - self.x
+        dy = player.y - self.y
+        dist = math.sqrt(dx * dx + dy * dy)
+        if dist > 0.1:
+            dx /= dist
+            dy /= dist
+
+        return {
+            'x':         self.x,
+            'y':         self.y,
+            'dx':        dx,
+            'dy':        dy,
+            'speed':     self.projectile_speed,
+            'damage':    self.attack_damage,
+            'direction': self.direction,
+            'owner':     self,
+        }
+
+    # =========================================================================
+    # Rendering
+    # =========================================================================
+
     def draw(self, screen, camera, colors):
+        """Draw the enemy sprite (or a debug placeholder rect) plus the HP bar."""
         if not self.active:
+            return
+
+        # Death animation — replaces the normal sprite while is_dying is True
+        if self.is_dying:
+            if self.death_frame_index < len(self.death_frames):
+                base_size = 32
+                render_size = int(base_size * RENDER_SCALE)
+                frame = self.death_frames[self.death_frame_index]
+                scaled_frame = pygame.transform.scale(frame, (render_size, render_size))
+                screen_x = int((self.x * RENDER_SCALE) - camera.x)
+                screen_y = int((self.y * RENDER_SCALE) - camera.y)
+                screen.blit(scaled_frame, (screen_x - render_size // 2, screen_y - render_size // 2))
             return
 
         if self.has_sprite:
             self.sprite.draw(screen, self.x, self.y, camera, RENDER_SCALE, self.hurt_tint)
         else:
+            # Debug placeholder — color encodes AI/combat state at a glance
             screen_x = (self.x * RENDER_SCALE) - camera.x
             screen_y = (self.y * RENDER_SCALE) - camera.y
 
             if self.is_attacking:
-                color = (255, 0, 255)
+                color = (255, 0, 255)           # Magenta while attacking
             elif self.is_knocked_back:
-                color = (100, 100, 100)
+                color = (100, 100, 100)         # Grey while staggered
             elif self.state == 'chase':
-                if self.stuck_timer > 1.0:
-                    color = YELLOW
-                else:
-                    color = RED
+                color = YELLOW if self.stuck_timer > 1.0 else RED  # Yellow = stuck
             else:
-                color = ORANGE
+                color = ORANGE                  # Idle / wandering
 
-            scaled_width = self.width * RENDER_SCALE
-            scaled_height = self.height * RENDER_SCALE
-
-            pygame.draw.rect(screen, color,
-                             (screen_x - scaled_width // 2, screen_y - scaled_height // 2,
-                              scaled_width, scaled_height))
-
-        # HP bar
-        screen_x = (self.x * RENDER_SCALE) - camera.x
-        screen_y = (self.y * RENDER_SCALE) - camera.y
-
-        bar_width = 32 * RENDER_SCALE
-        bar_height = 4 * RENDER_SCALE
-        scaled_height = self.height * RENDER_SCALE
-        bar_x = screen_x - bar_width // 2
-        bar_y = screen_y - scaled_height // 2 - (10 * RENDER_SCALE)
-
-        pygame.draw.rect(screen, BLACK, (bar_x, bar_y, bar_width, bar_height))
-        hp_width = int((self.hp / self.max_hp) * bar_width)
-        pygame.draw.rect(screen, GREEN, (bar_x, bar_y, hp_width, bar_height))
-        pygame.draw.rect(screen, WHITE, (bar_x, bar_y, bar_width, bar_height), 1)
+            sw = self.width * RENDER_SCALE
+            sh = self.height * RENDER_SCALE
+            pygame.draw.rect(screen, color, (screen_x - sw // 2, screen_y - sh // 2, sw, sh))

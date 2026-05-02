@@ -1,5 +1,8 @@
+import os
+
 import pygame
 import pygame.gfxdraw
+
 from config.settings import RENDER_SCALE, TILE_SIZE, WORLD_WIDTH, WORLD_HEIGHT
 from objects.spawn_object import SpawnObject, SpawnObjectManager
 from objects.collision_object import CollisionObject, CollisionObjectManager, draw_collision_object
@@ -7,6 +10,7 @@ from objects.level_gate import LevelGate, LevelGateManager
 from objects.room_transition import RoomTransition, RoomTransitionManager, TransitionConfigDialog
 from objects.flying_pad import FlyingPad, FlyingPadManager
 from objects.save_point import SavePoint, SavePointManager
+from objects.cutscene_trigger import CutsceneTrigger, CutsceneTriggerManager, draw_cutscene_trigger
 from dev_tools.room_editor.room_editor_tools.flying_pad_path_editor import FlyingPadPathEditor
 
 
@@ -102,6 +106,20 @@ class ObjectEditor:
         self.on_save_point_placed = None
         self.on_save_point_deleted = None
 
+        # ── Cutscene triggers ─────────────────────────────────────────────────
+        self.cutscene_trigger_manager = CutsceneTriggerManager()
+        self.on_cutscene_trigger_placed = None
+        self.on_cutscene_trigger_deleted = None
+        self.placing_cutscene_trigger = False
+        self.cutscene_trigger_start_x = 0
+        self.cutscene_trigger_start_y = 0
+        self.preview_cutscene_trigger = None
+        self.cutscene_id_text = ""
+        self.cutscene_id_input_active = False   # kept for compat; not used by dropdown
+        self.cutscene_one_shot = True
+        self.cutscene_dropdown_open = False     # whether the dropdown list is visible
+        self.cutscene_dropdown_names = []       # cached list of cutscene file names
+
         self.hovered_object = None        # object under the cursor (for deletion highlight)
         self.hovered_object_type = None
 
@@ -177,9 +195,7 @@ class ObjectEditor:
                     'has_variants': True,
                     'variants': self.flying_pad_variants,
                     'default_variant': 'stone1'
-                }
-                # Add save point to Decorations category
-                ,
+                },
                 {
                     'id': 'save_point',
                     'name': 'Save Point',
@@ -251,6 +267,22 @@ class ObjectEditor:
             'is_transition': True
         })
 
+        # Add cutscene trigger to System category
+        cutscene_sprite = pygame.Surface((16, 16), pygame.SRCALPHA)
+        cutscene_sprite.fill((180, 0, 255, 100))
+        pygame.draw.rect(cutscene_sprite, (200, 0, 255), (0, 0, 16, 16), 2)
+        for i in range(0, 96, 8):
+            pygame.draw.line(cutscene_sprite, (160, 0, 200, 120), (i, 0), (i - 16, 16), 1)
+
+        self.categories['System'].append({
+            'id': 'cutscene_trigger',
+            'name': 'Cutscene Trigger',
+            'sprite': cutscene_sprite,
+            'width': 16,
+            'height': 16,
+            'is_cutscene_trigger': True
+        })
+
         # Generate sprites and variant sprites
         self._generate_placeholder_sprites()
         self._generate_variant_sprites()
@@ -309,8 +341,8 @@ class ObjectEditor:
                             sprite = pygame.image.load(sprite_path).convert_alpha()
                             sprite = pygame.transform.scale(sprite, (variant['width'], variant['height']))
                             variant['sprite'] = sprite
-                        except:
-                            # Fallback placeholder
+                        except Exception:
+                            # Asset not on disk yet — use a brown placeholder rectangle
                             sprite = pygame.Surface((variant['width'], variant['height']), pygame.SRCALPHA)
                             sprite.fill((139, 69, 19))
                             pygame.draw.rect(sprite, (0, 0, 0), (0, 0, variant['width'], variant['height']), 2)
@@ -334,12 +366,11 @@ class ObjectEditor:
                             sprite = pygame.image.load(sprite_path).convert_alpha()
                             sprite = pygame.transform.scale(sprite, (32, 32))
                             variant['sprite'] = sprite
-                        except:
-                            # Fallback placeholder
+                        except Exception:
+                            # Asset not on disk yet — use a sky-blue placeholder with an arrow
                             sprite = pygame.Surface((32, 32), pygame.SRCALPHA)
                             sprite.fill((100, 200, 255))
                             pygame.draw.rect(sprite, (0, 0, 0), (0, 0, 32, 32), 2)
-                            # Draw arrow pattern
                             center_x = 16
                             center_y = 16
                             points = [
@@ -407,7 +438,9 @@ class ObjectEditor:
                 if obj.get('sprite') is not None:
                     continue
 
-                if obj.get('is_spawn', False) or obj.get('is_collision', False) or obj.get('is_transition', False):
+                # Skip objects that already have sprites (system objects are built manually above)
+                system_flags = ('is_spawn', 'is_collision', 'is_transition', 'is_cutscene_trigger')
+                if any(obj.get(flag, False) for flag in system_flags):
                     continue
 
                 # Skip variant objects - they get sprites from _generate_variant_sprites
@@ -451,6 +484,10 @@ class ObjectEditor:
             self.flying_pad_path_editor.close()
             self.pending_flying_pad = None
             self.placing_flying_pad = False
+            self.placing_cutscene_trigger = False
+            self.preview_cutscene_trigger = None
+            self.cutscene_id_input_active = False
+            self.cutscene_dropdown_open = False
 
     def _get_current_variant(self, obj):
         """Get the currently selected variant for an object"""
@@ -529,6 +566,13 @@ class ObjectEditor:
             if distance < max(save_point.width, save_point.height) / 2:
                 return save_point, 'save_point'
 
+        # Check cutscene triggers
+        triggers = self.cutscene_trigger_manager.get_triggers(self.current_room_name)
+        for trigger in triggers:
+            if (trigger.x <= world_x <= trigger.x + trigger.width and
+                    trigger.y <= world_y <= trigger.y + trigger.height):
+                return trigger, 'cutscene_trigger'
+
         return None, None
 
     def _delete_object(self, obj, obj_type):
@@ -600,7 +644,6 @@ class ObjectEditor:
             if hasattr(self, 'on_gate_deleted') and self.on_gate_deleted:
                 self.on_gate_deleted(obj, self.current_room_name)
 
-        # Save point deletion
         elif obj_type == 'save_point':
             self.save_point_manager.remove_save_point(self.current_room_name, obj)
             if self.room_manager:
@@ -611,6 +654,17 @@ class ObjectEditor:
 
             if hasattr(self, 'on_save_point_deleted') and self.on_save_point_deleted:
                 self.on_save_point_deleted(obj)
+
+        elif obj_type == 'cutscene_trigger':
+            self.cutscene_trigger_manager.remove_trigger(obj)
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(self.current_room_name)
+                if room and hasattr(room, 'cutscene_triggers'):
+                    if obj in room.cutscene_triggers:
+                        room.cutscene_triggers.remove(obj)
+
+            if hasattr(self, 'on_cutscene_trigger_deleted') and self.on_cutscene_trigger_deleted:
+                self.on_cutscene_trigger_deleted(obj, self.current_room_name)
 
     def _is_object_disabled(self, obj) -> bool:
         """Check if we can't place this object (e.g. spawn already exists)"""
@@ -769,8 +823,9 @@ class ObjectEditor:
                 available_rooms = self.room_manager.get_room_names()
 
             # Get current room dimensions
-            room_width = 2400  # default
-            room_height = 1800  # default
+            # Fallback room size used when the manager hasn't loaded a room yet
+            room_width = 2400
+            room_height = 1800
 
             if self.room_manager:
                 current_room = self.room_manager.get_room_by_name(room_name)
@@ -787,7 +842,6 @@ class ObjectEditor:
                 room_height
             )
 
-            # Save point placement
         elif self.selected_object.get('object_type') == 'save_point':
             # Get selected variant
             variant = self.selected_variant or self._get_current_variant(self.selected_object)
@@ -799,7 +853,7 @@ class ObjectEditor:
             # Add to manager
             self.save_point_manager.add_save_point(room_name, save_point)
 
-            # CRITICAL: Add to room so it persists and can be drawn
+            # Add to the live room so the save point is drawn and serialized immediately
             if self.room_manager:
                 room = self.room_manager.get_room_by_name(room_name)
                 if room:
@@ -861,7 +915,7 @@ class ObjectEditor:
                              (int(screen_x), int(screen_y), int(scaled_width), int(scaled_height)),
                              pulse)
 
-        elif obj_type in ['stone', 'transition']:
+        elif obj_type in ['stone', 'transition', 'cutscene_trigger']:
             screen_x = (obj.x * RENDER_SCALE) - camera_x
             screen_y = (obj.y * RENDER_SCALE) - camera_y
             scaled_width = int(obj.width * RENDER_SCALE)
@@ -928,15 +982,15 @@ class ObjectEditor:
         spawn_height = getattr(self.pending_transition_for_spawn, 'spawn_height',
                                self.pending_transition_for_spawn.height)
 
-        # Convert from center to top-left coordinates
+        # preview coords are world-center; the transition object stores top-left
         spawn_x = int(self.transition_spawn_preview_x) - spawn_width // 2
         spawn_y = int(self.transition_spawn_preview_y) - spawn_height // 2
 
         self.pending_transition_for_spawn.spawn_x = spawn_x
         self.pending_transition_for_spawn.spawn_y = spawn_y
 
-        # NEW: Store the size of the transition object (from source room)
-        # This ensures destination spawn transition matches source transition size
+        # Carry the source transition's dimensions so the destination spawn zone
+        # matches the transition's footprint exactly.
         if hasattr(self.pending_transition_for_spawn, 'width'):
             self.pending_transition_for_spawn.spawn_width = self.pending_transition_for_spawn.width
             self.pending_transition_for_spawn.spawn_height = self.pending_transition_for_spawn.height
@@ -960,8 +1014,67 @@ class ObjectEditor:
         self.pending_transition_for_spawn = None
         self.return_to_source_room = source_room_name
 
+    def _finalize_cutscene_trigger_placement(self, room_name):
+        """Finish placing a cutscene trigger zone after dragging."""
+        if not self.preview_cutscene_trigger:
+            return
+
+        trigger = CutsceneTrigger(
+            int(self.preview_cutscene_trigger.x),
+            int(self.preview_cutscene_trigger.y),
+            int(self.preview_cutscene_trigger.width),
+            int(self.preview_cutscene_trigger.height),
+            cutscene_id=self.cutscene_id_text,
+            one_shot=self.cutscene_one_shot,
+            room_name=room_name,
+        )
+
+        self.cutscene_trigger_manager.add_trigger(trigger)
+
+        if self.room_manager:
+            room = self.room_manager.get_room_by_name(room_name)
+            if room:
+                if not hasattr(room, 'cutscene_triggers'):
+                    room.cutscene_triggers = []
+                room.cutscene_triggers.append(trigger)
+
+        self.preview_cutscene_trigger = None
+
+        if self.on_cutscene_trigger_placed:
+            self.on_cutscene_trigger_placed(trigger, room_name)
+
+    def _get_cutscene_names(self):
+        """Return a sorted list of cutscene IDs from data/cutscenes/*.json."""
+        cutscene_dir = os.path.join('data', 'cutscenes')
+        try:
+            return sorted(
+                f[:-5] for f in os.listdir(cutscene_dir) if f.endswith('.json')
+            )
+        except FileNotFoundError:
+            return []
+
+    def _is_cutscene_id_input_clicked(self, mouse_pos):
+        """Check if the cutscene ID text box was clicked."""
+        if not self.selected_object or not isinstance(self.selected_object, dict):
+            return False
+        if not self.selected_object.get('is_cutscene_trigger', False):
+            return False
+        input_x = self.palette_x + self.palette_padding + 120
+        input_y = self.palette_y + self.palette_height - 105
+        input_rect = pygame.Rect(input_x, input_y, 150, 25)
+        return input_rect.collidepoint(mouse_pos)
+
     def handle_input(self, event, camera_x, camera_y, room_name):
-        """Process input events"""
+        """Route pygame events to the appropriate sub-system.
+
+        Priority order:
+          1. Transition config dialog (blocks everything else while open)
+          2. Flying-pad path editor (blocks everything else while open)
+          3. Mouse-wheel palette scroll
+          4. Right-click world deletion
+          5. Left-click palette / world interaction
+          6. Keyboard shortcuts (G = snap, H = grid, ESC / F3 = close)
+        """
         if not self.active:
             return
 
@@ -999,7 +1112,7 @@ class ObjectEditor:
                 self.room_manager.current_room.height if self.room_manager.current_room else WORLD_HEIGHT
             )
 
-            # NEW: Handle save with return room
+            # Path editor finished — commit the flying pad and return to the original room
             if result and result.startswith('save:'):
                 parts = result.split(':')
                 return_room_name = parts[1] if len(parts) > 1 else ""
@@ -1023,7 +1136,7 @@ class ObjectEditor:
                     if hasattr(self, 'on_flying_pad_placed') and self.on_flying_pad_placed:
                         self.on_flying_pad_placed(self.pending_flying_pad, pad_room_name)
 
-                    # NEW: Create return pad if checkbox was checked
+                    # If the user ticked "create return pad", mirror the pad at the path's end point
                     if should_create_return_pad and len(self.pending_flying_pad.waypoints) > 0:
                         # Get the last waypoint position (path end)
                         last_wp = self.pending_flying_pad.waypoints[-1]
@@ -1050,8 +1163,9 @@ class ObjectEditor:
                         return_pad.is_return_pad = True
                         return_pad.source_room = pad_room_name  # Set the source room for return flight
 
-                        # Link the pads together
-                        # Use memory id as a simple linking mechanism
+                        # Link the two pads by id so the game can reverse the flight path.
+                        # We use Python's built-in id() as a simple session-scoped token;
+                        # proper persistence should replace this with a stable UUID.
                         original_id = id(self.pending_flying_pad)
                         return_id = id(return_pad)
                         self.pending_flying_pad.linked_pad_id = return_id
@@ -1073,7 +1187,7 @@ class ObjectEditor:
                 # Return command to switch back to initial room
                 return f'return_to_room:{return_room_name}'
 
-            # NEW: Handle cancel with return room
+            # Path editor cancelled — discard the pending pad and return to the original room
             elif result and result.startswith('cancel:'):
                 return_room_name = result.split(':', 1)[1]
                 self.pending_flying_pad = None
@@ -1102,8 +1216,8 @@ class ObjectEditor:
                         self.hovered_object_type = None
                 return
 
-            # Left-click to place or select
-            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            # Left-click: place an object or interact with palette/UI
+            if event.button == 1:
                 # Handle transition spawn placement mode
                 if self.placing_transition_spawn:
                     self._finalize_transition_spawn_placement()
@@ -1114,6 +1228,40 @@ class ObjectEditor:
                     self.gate_level_input_active = True
                     return
 
+                # Check if clicking on cutscene ID input box
+                if self._is_cutscene_id_input_clicked(mouse_pos):
+                    self.cutscene_id_input_active = True
+                    return
+
+                # Handle cutscene dropdown clicks
+                if (self.selected_object and isinstance(self.selected_object, dict)
+                        and self.selected_object.get('is_cutscene_trigger', False)):
+
+                    # Dropdown button — toggle open/closed
+                    dd_btn = self.ui_rects.get('cutscene_dropdown_btn')
+                    if dd_btn and dd_btn.collidepoint(mouse_pos):
+                        self.cutscene_dropdown_open = not self.cutscene_dropdown_open
+                        if self.cutscene_dropdown_open:
+                            self.cutscene_dropdown_names = self._get_cutscene_names()
+                        return
+
+                    # Item inside open dropdown list
+                    if self.cutscene_dropdown_open:
+                        for item_rect, name in self.ui_rects.get('cutscene_dropdown_items', []):
+                            if item_rect.collidepoint(mouse_pos):
+                                self.cutscene_id_text = name
+                                self.cutscene_dropdown_open = False
+                                return
+                        # Click outside list — close without selecting
+                        self.cutscene_dropdown_open = False
+                        return
+
+                    # One-shot toggle
+                    oneshot_rect = self.ui_rects.get('cutscene_oneshot_rect')
+                    if oneshot_rect and oneshot_rect.collidepoint(mouse_pos):
+                        self.cutscene_one_shot = not self.cutscene_one_shot
+                        return
+
                 # Check if clicking on variant selector
                 if self._is_variant_selector_clicked(mouse_pos):
                     return
@@ -1121,11 +1269,19 @@ class ObjectEditor:
                 # Deactivate input if clicking elsewhere
                 if self.gate_level_input_active:
                     self.gate_level_input_active = False
+                if self.cutscene_id_input_active:
+                    self.cutscene_id_input_active = False
 
                 # Finish placing collision wall if we're in the middle of it
                 if self.placing_collision:
                     self._finalize_collision_placement(room_name)
                     self.placing_collision = False
+                    return
+
+                # Finish placing cutscene trigger if we're in the middle of it
+                if self.placing_cutscene_trigger:
+                    self._finalize_cutscene_trigger_placement(room_name)
+                    self.placing_cutscene_trigger = False
                     return
 
                 # Finish placing transition if we're in the middle of it
@@ -1144,6 +1300,10 @@ class ObjectEditor:
                             self.placing_collision = True
                             self.collision_start_x = self.preview_x
                             self.collision_start_y = self.preview_y
+                        elif self.selected_object.get('is_cutscene_trigger', False):
+                            self.placing_cutscene_trigger = True
+                            self.cutscene_trigger_start_x = self.preview_x
+                            self.cutscene_trigger_start_y = self.preview_y
                         elif self.selected_object.get('is_transition', False):
                             self.placing_transition = True
                             self.transition_start_x = self.preview_x
@@ -1183,6 +1343,9 @@ class ObjectEditor:
                 if self.placing_collision:
                     self.placing_collision = False
                     self.preview_collision = None
+                elif self.placing_cutscene_trigger:
+                    self.placing_cutscene_trigger = False
+                    self.preview_cutscene_trigger = None
                 elif self.placing_transition:
                     self.placing_transition = False
                     self.preview_transition = None
@@ -1190,7 +1353,8 @@ class ObjectEditor:
                     self.active = False
 
     def update(self, dt, mouse_pos, camera_x, camera_y):
-        """Update animations and preview positions"""
+        """Tick editor state: animate category tabs, update world-mouse coords,
+        rebuild drag-resize previews, and compute palette scroll limits."""
         if not self.active:
             return
 
@@ -1219,7 +1383,8 @@ class ObjectEditor:
                 self.mouse_world_x, self.mouse_world_y
             )
 
-        # FIX: Add safety check for selected_object
+        # Guard: selected_object is set to a raw dict — ensure it hasn't been
+        # replaced with a live game object before reading dict keys.
         if self.selected_object and isinstance(self.selected_object, dict):
             if self.grid_snap:
                 grid_x = int(self.mouse_world_x / TILE_SIZE) * TILE_SIZE + TILE_SIZE // 2
@@ -1234,6 +1399,8 @@ class ObjectEditor:
             self.preview_x = 0
             self.preview_y = 0
 
+        # Each draggable zone recalculates its preview rect every frame by
+        # snapping or free-dragging from the stored anchor to the current mouse pos.
         if self.placing_collision:
             if self.grid_snap:
                 snap_start_x = int(self.collision_start_x / TILE_SIZE) * TILE_SIZE
@@ -1266,6 +1433,39 @@ class ObjectEditor:
                 int(width),
                 int(height),
                 self.current_room_name
+            )
+
+        if self.placing_cutscene_trigger:
+            if self.grid_snap:
+                snap_start_x = int(self.cutscene_trigger_start_x / TILE_SIZE) * TILE_SIZE
+                snap_start_y = int(self.cutscene_trigger_start_y / TILE_SIZE) * TILE_SIZE
+                snap_end_x = int(self.mouse_world_x / TILE_SIZE) * TILE_SIZE
+                snap_end_y = int(self.mouse_world_y / TILE_SIZE) * TILE_SIZE
+
+                min_x = min(snap_start_x, snap_end_x)
+                min_y = min(snap_start_y, snap_end_y)
+                max_x = max(snap_start_x, snap_end_x)
+                max_y = max(snap_start_y, snap_end_y)
+
+                width = max(TILE_SIZE, max_x - min_x + TILE_SIZE)
+                height = max(TILE_SIZE, max_y - min_y + TILE_SIZE)
+            else:
+                end_x = self.mouse_world_x
+                end_y = self.mouse_world_y
+
+                min_x = min(self.cutscene_trigger_start_x, end_x)
+                min_y = min(self.cutscene_trigger_start_y, end_y)
+                max_x = max(self.cutscene_trigger_start_x, end_x)
+                max_y = max(self.cutscene_trigger_start_y, end_y)
+
+                width = max(16, max_x - min_x)
+                height = max(16, max_y - min_y)
+
+            self.preview_cutscene_trigger = CutsceneTrigger(
+                int(min_x), int(min_y), int(width), int(height),
+                cutscene_id=self.cutscene_id_text,
+                one_shot=self.cutscene_one_shot,
+                room_name=self.current_room_name,
             )
 
         if self.placing_transition:
@@ -1304,7 +1504,7 @@ class ObjectEditor:
         self.hover_object = None
         self.hover_variant_index = -1
 
-        # Update flying pad path editor
+        # Update flying pad path editor while it's open
         if self.flying_pad_path_editor.active:
             self.flying_pad_path_editor.update(
                 dt,
@@ -1343,7 +1543,16 @@ class ObjectEditor:
         self.max_scroll = max(0, total_height - available_height)
 
     def draw_preview(self, screen, camera_x, camera_y):
-        """Draw placement preview"""
+        """Draw the ghost preview of whatever is about to be placed.
+
+        Handles five distinct placement modes in order:
+          - Flying-pad path editor overlay
+          - Transition spawn-area placement
+          - Collision-wall drag preview
+          - Room-transition drag preview
+          - Cutscene-trigger drag preview
+          - Standard single-object ghost sprite
+        """
         if not self.active:
             return
 
@@ -1351,7 +1560,7 @@ class ObjectEditor:
         if self.flying_pad_path_editor.active:
             self.flying_pad_path_editor.draw(
                 screen,
-                type('Camera', (), {'x': camera_x, 'y': camera_y})(),
+                self._make_camera(camera_x, camera_y),
                 RENDER_SCALE
             )
             return
@@ -1442,15 +1651,21 @@ class ObjectEditor:
 
         if self.placing_transition and self.preview_transition:
             self.preview_transition.draw(screen,
-                                         type('Camera', (), {'x': camera_x, 'y': camera_y})(),
+                                         self._make_camera(camera_x, camera_y),
                                          RENDER_SCALE, dev_mode=True, selected=True)
+            return
+
+        if self.placing_cutscene_trigger and self.preview_cutscene_trigger:
+            draw_cutscene_trigger(screen, self.preview_cutscene_trigger,
+                                  camera_x, camera_y, RENDER_SCALE,
+                                  dev_mode=True, selected=True)
             return
 
         if self.hovered_object and self.hovered_object_type and not self.selected_object:
             self._draw_delete_highlight(screen, camera_x, camera_y)
             return
 
-        # FIX: Add safety check
+        # Guard: nothing to preview if no valid palette item is selected
         if not self.selected_object or not isinstance(self.selected_object, dict):
             return
 
@@ -1522,6 +1737,14 @@ class ObjectEditor:
             draw_collision_object(screen, collision_obj, camera_x, camera_y,
                                   RENDER_SCALE, dev_mode=True, selected=False)
 
+    def _make_camera(self, camera_x, camera_y):
+        """Lightweight camera-like object used by draw methods that expect a .x/.y camera."""
+        class _Camera:
+            def __init__(self, x, y):
+                self.x = x
+                self.y = y
+        return _Camera(camera_x, camera_y)
+
     def draw_room_transitions(self, screen, camera_x, camera_y):
         """Draw all room transitions in the current room"""
         if not self.current_room_name:
@@ -1529,12 +1752,7 @@ class ObjectEditor:
 
         transitions = self.transition_manager.get_transitions(self.current_room_name)
 
-        class TempCamera:
-            def __init__(self, x, y):
-                self.x = x
-                self.y = y
-
-        temp_camera = TempCamera(camera_x, camera_y)
+        temp_camera = self._make_camera(camera_x, camera_y)
 
         for transition in transitions:
             if transition.active:
@@ -1547,12 +1765,7 @@ class ObjectEditor:
 
         gates = self.gate_manager.get_gates(self.current_room_name)
 
-        class TempCamera:
-            def __init__(self, x, y):
-                self.x = x
-                self.y = y
-
-        temp_camera = TempCamera(camera_x, camera_y)
+        temp_camera = self._make_camera(camera_x, camera_y)
 
         for gate in gates:
             if gate.active:
@@ -1802,12 +2015,7 @@ class ObjectEditor:
 
         pads = self.flying_pad_manager.get_pads(self.current_room_name)
 
-        class TempCamera:
-            def __init__(self, x, y):
-                self.x = x
-                self.y = y
-
-        temp_camera = TempCamera(camera_x, camera_y)
+        temp_camera = self._make_camera(camera_x, camera_y)
 
         for pad in pads:
             if pad.active:
@@ -1822,16 +2030,23 @@ class ObjectEditor:
 
         save_points = self.save_point_manager.get_save_points(self.current_room_name)
 
-        class TempCamera:
-            def __init__(self, x, y):
-                self.x = x
-                self.y = y
-
-        temp_camera = TempCamera(camera_x, camera_y)
+        temp_camera = self._make_camera(camera_x, camera_y)
 
         for save_point in save_points:
             if save_point.active:
                 save_point.draw(screen, temp_camera, colors)
+
+    def draw_cutscene_triggers(self, screen, camera_x, camera_y):
+        """Draw all cutscene trigger zones in the current room (dev mode only)."""
+        if not self.current_room_name:
+            return
+
+        triggers = self.cutscene_trigger_manager.get_triggers(self.current_room_name)
+        for trigger in triggers:
+            draw_cutscene_trigger(
+                screen, trigger, camera_x, camera_y, RENDER_SCALE,
+                dev_mode=True, selected=False
+            )
 
     def _draw_settings_panel(self, screen):
         """Draw controls and settings at the bottom of the palette"""
@@ -1892,6 +2107,79 @@ class ObjectEditor:
                     pygame.draw.line(screen, self.colors['text'],
                                      (cursor_x, cursor_y - 10),
                                      (cursor_x, cursor_y + 10), 2)
+
+            y_pos += 30
+
+        if self.selected_object and isinstance(self.selected_object, dict) and self.selected_object.get(
+                'is_cutscene_trigger', False):
+            id_label = self.font_medium.render("Cutscene ID:", True, self.colors['text'])
+            screen.blit(id_label, (self.palette_x + self.palette_padding, y_pos))
+
+            # ── Dropdown button ───────────────────────────────────────────────
+            btn_x = self.palette_x + self.palette_padding + 120
+            btn_rect = pygame.Rect(btn_x, y_pos - 3, 200, 25)
+            btn_bg = self.colors['input_active'] if self.cutscene_dropdown_open else self.colors['input_bg']
+            pygame.draw.rect(screen, btn_bg, btn_rect)
+            pygame.draw.rect(screen,
+                             self.colors['accent'] if self.cutscene_dropdown_open else self.colors['grid'],
+                             btn_rect, 2)
+
+            display_label = self.cutscene_id_text if self.cutscene_id_text else '<select cutscene>'
+            label_surf = self.font_small.render(display_label, True, self.colors['text'])
+            label_clip = pygame.Rect(btn_rect.x + 4, btn_rect.y, btn_rect.w - 20, btn_rect.h)
+            screen.set_clip(label_clip)
+            screen.blit(label_surf, (btn_rect.x + 4, btn_rect.y + 6))
+            screen.set_clip(None)
+
+            # Small arrow indicator
+            arrow_x = btn_rect.right - 14
+            arrow_y = btn_rect.centery
+            arrow_pts = [(arrow_x, arrow_y - 4), (arrow_x + 8, arrow_y - 4), (arrow_x + 4, arrow_y + 4)]
+            pygame.draw.polygon(screen, self.colors['text_dim'], arrow_pts)
+
+            self.ui_rects['cutscene_dropdown_btn'] = btn_rect
+
+            # ── Open dropdown list ────────────────────────────────────────────
+            if self.cutscene_dropdown_open:
+                names = self.cutscene_dropdown_names
+                item_h = 22
+                list_h = max(item_h, len(names) * item_h)
+                list_rect = pygame.Rect(btn_rect.x, btn_rect.bottom, btn_rect.w, list_h)
+
+                list_bg = pygame.Surface((list_rect.w, list_rect.h), pygame.SRCALPHA)
+                list_bg.fill((30, 30, 45, 240))
+                screen.blit(list_bg, list_rect.topleft)
+                pygame.draw.rect(screen, self.colors['accent'], list_rect, 1)
+
+                self.ui_rects['cutscene_dropdown_items'] = []
+                if not names:
+                    empty_surf = self.font_small.render('<no cutscenes found>', True, self.colors['text_dark'])
+                    screen.blit(empty_surf, (list_rect.x + 4, list_rect.y + 4))
+                else:
+                    for i, name in enumerate(names):
+                        item_rect = pygame.Rect(list_rect.x, list_rect.y + i * item_h, list_rect.w, item_h)
+                        is_sel = name == self.cutscene_id_text
+                        if is_sel:
+                            pygame.draw.rect(screen, self.colors['variant_selected'], item_rect)
+                        item_surf = self.font_small.render(name, True,
+                                                           self.colors['text'] if is_sel else self.colors['text_dim'])
+                        screen.blit(item_surf, (item_rect.x + 6, item_rect.y + 4))
+                        self.ui_rects['cutscene_dropdown_items'].append((item_rect, name))
+
+            y_pos += 30
+
+            # One-shot toggle button
+            shot_label = self.font_medium.render("One-Shot:", True, self.colors['text'])
+            screen.blit(shot_label, (self.palette_x + self.palette_padding, y_pos))
+
+            btn_x = self.palette_x + self.palette_padding + 120
+            btn_rect = pygame.Rect(btn_x, y_pos - 3, 60, 22)
+            btn_color = self.colors['success'] if self.cutscene_one_shot else self.colors['panel']
+            pygame.draw.rect(screen, btn_color, btn_rect, border_radius=4)
+            pygame.draw.rect(screen, self.colors['accent'], btn_rect, 2, border_radius=4)
+            btn_text = self.font_small.render('ON' if self.cutscene_one_shot else 'OFF', True, self.colors['text'])
+            screen.blit(btn_text, btn_text.get_rect(center=btn_rect.center))
+            self.ui_rects['cutscene_oneshot_rect'] = btn_rect
 
             y_pos += 30
 

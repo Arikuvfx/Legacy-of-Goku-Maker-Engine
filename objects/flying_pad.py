@@ -1,5 +1,7 @@
 import pygame
 from typing import List, Tuple, Optional
+from config.settings import RENDER_SCALE
+from core.draw_layers import LayeredDrawMixin, DrawLayer
 
 
 class FlyingPadWaypoint:
@@ -34,10 +36,11 @@ class FlyingPadWaypoint:
         return wp
 
 
-class FlyingPad:
+class FlyingPad(LayeredDrawMixin):
     """Flying pad object that transports player along a predefined path"""
 
     def __init__(self, x: int, y: int, pad_type: str = 'stone'):
+        LayeredDrawMixin.__init__(self, layer=DrawLayer.PLAYER, y_sort=True)
         self.x = x
         self.y = y
         self.width = 32
@@ -228,10 +231,12 @@ class FlyingPad:
 
         return reversed_waypoints
 
-    def draw(self, screen: pygame.Surface, camera, colors, render_scale: int = 2):
+    def draw(self, screen: pygame.Surface, camera, colors=None, render_scale: int = None):
         """Draw the flying pad"""
         if not self.active:
             return
+        if render_scale is None:
+            render_scale = RENDER_SCALE
 
         screen_x = (self.x * render_scale) - camera.x
         screen_y = (self.y * render_scale) - camera.y
