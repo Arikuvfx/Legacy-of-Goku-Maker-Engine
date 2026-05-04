@@ -96,6 +96,14 @@ class SpriteHUD:
             'boss_bar':           {'w': 338, 'h': 42, 'bar_start': 0, 'bar_end': 338},
         }
 
+        # Scan the frame sprite to find the actual lowest non-transparent pixel
+        # row (at native resolution). The sprite may have empty padding below
+        # the visible art, so using the full h=100 would place the boss bar too low.
+        self._frame_visible_bottom = self._measure_visible_bottom(
+            self.sprites['frame'], self.config['frame']['h']
+        )
+        print(f"Frame visible bottom: {self._frame_visible_bottom}px (of {self.config['frame']['h']}px total)")
+
         # Boss bar HP tracking — we lock the total max HP the moment bosses are
         # first spotted so that killing one boss drains its portion of the bar
         # rather than reflating the remainder.
@@ -118,6 +126,23 @@ class SpriteHUD:
         }
 
     # ── Helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _measure_visible_bottom(hud_sprite, fallback_h):
+        """Return the y of the lowest non-transparent pixel row in the sprite
+        at native (unscaled) resolution.  Falls back to fallback_h if the
+        sprite isn't loaded or is fully transparent.
+        """
+        surf = getattr(hud_sprite, 'sprite', None)
+        if surf is None:
+            return fallback_h
+        w, h = surf.get_size()
+        # Scan rows from the bottom upward, stop at first row with any alpha > 0.
+        for row in range(h - 1, -1, -1):
+            for col in range(w):
+                if surf.get_at((col, row))[3] > 0:
+                    return row + 1   # +1 so it's an exclusive bottom (like a height)
+        return fallback_h
 
     def draw_text_with_shadow(self, screen, text, x, y, font, color, shadow_offset=2):
         off = max(1, int(shadow_offset * self.scale))
@@ -218,10 +243,10 @@ class SpriteHUD:
         bh   = sc(bcfg['h'])
 
         # Mirror the player HUD margin: same distance from the RIGHT edge.
-        # Bottom-align with the player HUD frame: boss bar bottom == player frame bottom.
-        frame_h = self.config['frame']['h']
+        # Align boss bar bottom with the lowest visible pixel row of the player
+        # frame sprite (not the full sprite height, which may have empty padding).
         bx = self.screen_width - self.hud_x - bw
-        by = self.hud_y + int(self.hud_offset_y) + sc(frame_h) - bh
+        by = self.hud_y + int(self.hud_offset_y) + int(self._frame_visible_bottom * self.scale) - bh
 
         # ── Draw background plate ──────────────────────────────────────────
         bg_sprite = self.sprites['boss_bar_bg']
