@@ -2578,7 +2578,10 @@ class Game:
         if self.ui.current_screen == 'game' and not self.character_switch_menu.active \
                 and not self.pause_menu.active:
             _HUD_SLIDE_SPEED = 400
-            _hud_hidden_y    = -(self.sprite_hud.hud_y + 120)
+            # Derive the hidden position from the actual scaled frame height so
+            # the entire HUD (including the boss bar) clears the top of the screen.
+            _scaled_frame_h  = int(self.sprite_hud.config['frame']['h'] * self.sprite_hud.scale)
+            _hud_hidden_y    = -(self.sprite_hud.hud_y + _scaled_frame_h + 10)
             if self.sprite_hud._hud_slide_out:
                 self.sprite_hud.hud_offset_y = max(
                     _hud_hidden_y,

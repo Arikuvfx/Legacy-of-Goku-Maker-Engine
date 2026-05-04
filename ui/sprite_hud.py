@@ -192,6 +192,11 @@ class SpriteHUD:
             return
 
         # Register any boss we haven't seen before and lock their max HP in.
+        # If none of the current bosses are known it's a fresh encounter
+        # (e.g. re-entering a test room), so reset before registering.
+        if not any(id(b) in self._seen_boss_ids for b in bosses):
+            self._seen_boss_ids = {}
+            self._locked_max_hp = 0
         for b in bosses:
             bid = id(b)
             if bid not in self._seen_boss_ids:
