@@ -245,11 +245,13 @@ class TilesetEditor:
         self.layer_input_text = ""
 
         self.foreground_mode = False
+        self._last_stroke_cell = None  # (grid_x, grid_y) of last placed/erased cell
 
         # ── Palette geometry ─────────────────────────────────────────────────
         self.palette_width = 600
         self.palette_x = screen_width - self.palette_width
         self.palette_y = 100
+        self.palette_height = 940
         self.palette_content_height = 500
         self.tileset_area_y_offset = 35
 
@@ -287,9 +289,40 @@ class TilesetEditor:
 
         self.ui_rects = {}
 
+        # Panel show/hide toggle (same pattern as EditorToolbar)
+        self.palette_visible = True
+        self._panel_tab_w = 18
+        self._panel_tab_h = 72
+        self._hover_panel_toggle = False
+
     def toggle(self):
         """Open or close the tileset editor."""
         self.active = not self.active
+
+    # -------------------------------------------------------------------------
+    # Panel show/hide tab
+    # -------------------------------------------------------------------------
+
+    def _panel_toggle_rect(self):
+        """Return the rect for the ◀/▶ tab that straddles the panel's left edge."""
+        gap = 6  # breathing room between tab and panel when panel is visible
+        tx = (self.palette_x - self._panel_tab_w - gap) if self.palette_visible else (self.screen_width - self._panel_tab_w)
+        ty = self.palette_y + (self.palette_height - self._panel_tab_h) // 2
+        return pygame.Rect(tx, ty, self._panel_tab_w, self._panel_tab_h)
+
+    def _draw_panel_toggle_tab(self, screen):
+        """Render the small ◀/▶ tab — always visible so the panel can be recalled."""
+        rect   = self._panel_toggle_rect()
+        bg     = self.colors['button_hover'] if self._hover_panel_toggle else self.colors['button']
+        border = self.colors['accent']       if self._hover_panel_toggle else (60, 60, 80)
+        pygame.draw.rect(screen, bg,     rect, border_radius=6)
+        pygame.draw.rect(screen, border, rect, 1, border_radius=6)
+        arrow = '◀' if self.palette_visible else '▶'
+        label = self.font_small.render(
+            arrow, True,
+            self.colors['accent'] if self._hover_panel_toggle else self.colors['text_dim']
+        )
+        screen.blit(label, label.get_rect(center=rect.center))
 
     def get_current_tileset(self) -> Optional[Tileset]:
         """Return the active tileset object, or None if the list is empty."""
@@ -308,6 +341,8 @@ class TilesetEditor:
 
     def _is_in_palette(self, mouse_x: int, mouse_y: int) -> bool:
         """Returns True when the mouse is over the palette panel."""
+        if not self.palette_visible:
+            return False
         return mouse_x >= self.palette_x and mouse_y >= self.palette_y
 
     def _is_in_ui_rect(self, mouse_x: int, mouse_y: int, rect_name: str) -> bool:
@@ -430,6 +465,11 @@ class TilesetEditor:
         elif event.type == pygame.MOUSEBUTTONDOWN:
             mouse_x, mouse_y = event.pos
 
+            # Panel show/hide toggle — checked first so it always fires
+            if event.button == 1 and self._panel_toggle_rect().collidepoint(mouse_x, mouse_y):
+                self.palette_visible = not self.palette_visible
+                return
+
             if self._is_in_ui_rect(mouse_x, mouse_y, 'layer_dropdown'):
                 self.layer_dropdown_open = not self.layer_dropdown_open
                 return
@@ -496,8 +536,10 @@ class TilesetEditor:
                 self.is_dragging = False
                 self.drag_start_pos = None
                 self.is_palette_dragging = False
+                self._last_stroke_cell = None
             elif event.button == 3:
                 self.is_erasing = False
+                self._last_stroke_cell = None
 
         elif event.type == pygame.MOUSEMOTION:
             if self.is_dragging and not self._is_in_palette(event.pos[0], event.pos[1]):
@@ -588,6 +630,12 @@ class TilesetEditor:
         grid_x = (world_x // self.grid_size) * self.grid_size
         grid_y = (world_y // self.grid_size) * self.grid_size
 
+        # Skip if the mouse hasn't moved to a new cell — avoids redundant
+        # cache rebuilds from rapid MOUSEMOTION events on the same tile
+        if (grid_x, grid_y) == self._last_stroke_cell:
+            return
+        self._last_stroke_cell = (grid_x, grid_y)
+
         if room_name not in self.room_tiles:
             self.room_tiles[room_name] = []
 
@@ -630,6 +678,11 @@ class TilesetEditor:
 
         grid_x = (world_x // self.grid_size) * self.grid_size
         grid_y = (world_y // self.grid_size) * self.grid_size
+
+        # Skip if still on the same cell as the last erase
+        if (grid_x, grid_y) == self._last_stroke_cell:
+            return
+        self._last_stroke_cell = (grid_x, grid_y)
 
         self.room_tiles[room_name] = [
             tile for tile in self.room_tiles[room_name]
@@ -736,6 +789,16 @@ class TilesetEditor:
     def draw_palette(self, screen: pygame.Surface):
         """Draw the tileset palette UI with layer controls"""
         if not self.active:
+            return
+
+        # Update hover state for the toggle tab
+        mx, my = pygame.mouse.get_pos()
+        self._hover_panel_toggle = self._panel_toggle_rect().collidepoint(mx, my)
+
+        # Always draw the toggle tab so the panel can be recalled when hidden
+        self._draw_panel_toggle_tab(screen)
+
+        if not self.palette_visible:
             return
 
         tileset = self.get_current_tileset()

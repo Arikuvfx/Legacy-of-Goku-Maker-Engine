@@ -154,6 +154,12 @@ class EntityEditor:
         # None when closed; dict with anchor/scroll state when open
         self._open_dropdown = None
 
+        # Panel show/hide toggle (same pattern as EditorToolbar)
+        self.palette_visible = True
+        self._panel_tab_w = 18
+        self._panel_tab_h = 72
+        self._hover_panel_toggle = False
+
     # =========================================================================
     # Entity catalogue
     # =========================================================================
@@ -233,6 +239,32 @@ class EntityEditor:
                 'has_variants': True,
                 'variants': [
                     {'type': 'default', 'name': 'Default', 'color': (180, 50, 180)},
+                ],
+                'default_variant': 'default',
+            },
+            {
+                'id': 'android_17',
+                'name': 'Android 17',
+                'sprite': None,
+                'width': 32, 'height': 32,
+                'entity_type': 'boss',
+                'enemy_category': 'shooter',
+                'has_variants': True,
+                'variants': [
+                    {'type': 'default', 'name': 'Default', 'color': (50, 180, 220)},
+                ],
+                'default_variant': 'default',
+            },
+            {
+                'id': 'android_18',
+                'name': 'Android 18',
+                'sprite': None,
+                'width': 32, 'height': 32,
+                'entity_type': 'boss',
+                'enemy_category': 'shooter',
+                'has_variants': True,
+                'variants': [
+                    {'type': 'default', 'name': 'Default', 'color': (220, 180, 50)},
                 ],
                 'default_variant': 'default',
             },
@@ -360,6 +392,30 @@ class EntityEditor:
             self.selected_variant = None
             self.scroll_offset = 0
 
+    # -------------------------------------------------------------------------
+    # Panel show/hide tab
+    # -------------------------------------------------------------------------
+
+    def _panel_toggle_rect(self):
+        """Return the rect for the ◀/▶ tab that straddles the panel's left edge."""
+        tx = (self.palette_x - self._panel_tab_w) if self.palette_visible else (self.screen_width - self._panel_tab_w)
+        ty = self.palette_y + 150
+        return pygame.Rect(tx, ty, self._panel_tab_w, self._panel_tab_h)
+
+    def _draw_panel_toggle_tab(self, screen):
+        """Render the small ◀/▶ tab — always visible so the panel can be recalled."""
+        rect   = self._panel_toggle_rect()
+        bg     = self.COLORS['panel_light'] if self._hover_panel_toggle else self.COLORS['panel']
+        border = self.COLORS['accent']      if self._hover_panel_toggle else self.COLORS['grid']
+        pygame.draw.rect(screen, bg,     rect, border_radius=6)
+        pygame.draw.rect(screen, border, rect, 1, border_radius=6)
+        arrow = '◀' if self.palette_visible else '▶'
+        label = self.font_small.render(
+            arrow, True,
+            self.COLORS['accent'] if self._hover_panel_toggle else self.COLORS['text_dim']
+        )
+        screen.blit(label, label.get_rect(center=rect.center))
+
     def set_current_category(self, key):
         """Programmatically switch category (e.g. from a hotkey)."""
         if key in self.categories:
@@ -450,6 +506,11 @@ class EntityEditor:
 
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             mouse_pos = event.pos
+
+            # Panel show/hide toggle — checked first so it always fires
+            if self._panel_toggle_rect().collidepoint(mouse_pos):
+                self.palette_visible = not self.palette_visible
+                return True
 
             # ── Dialogue popup mouse clicks (highest priority) ─────────────
             if self._dialogue_popup is not None:
@@ -1032,6 +1093,17 @@ class EntityEditor:
                 self._draw_dialogue_popup(screen)
             return
 
+        # Update hover state and always draw the toggle tab
+        mx, my = pygame.mouse.get_pos()
+        self._hover_panel_toggle = self._panel_toggle_rect().collidepoint(mx, my)
+        self._draw_panel_toggle_tab(screen)
+
+        if not self.palette_visible:
+            # Still draw the dialogue popup even when the palette is hidden
+            if self._dialogue_popup is not None:
+                self._draw_dialogue_popup(screen)
+            return
+
         # clear hit-rect cache each frame
         self.ui_rects = {'category_rects': [], 'entity_rects': [], 'variant_rects': [], 'ai_type_rects': [], 'npc_mode_rects': [], 'npc_facing_rects': [], 'npc_dialogue_rects': []}
 
@@ -1200,8 +1272,9 @@ class EntityEditor:
 
     def _draw_variant_selector(self, screen):
         """
-        Horizontal row of variant swatches – only visible when the selected
-        entity has variants.  Mirrors ObjectEditor._draw_variant_selector.
+        Grid of variant swatches – only visible when the selected entity has
+        variants.  Swatches wrap onto additional rows so nothing is clipped
+        when there are many variants.
         """
         if not self.selected_entity or not self.selected_entity.get('has_variants'):
             return
@@ -1210,9 +1283,25 @@ class EntityEditor:
         if not variants:
             return
 
-        strip_height = 90
-        strip_y = self.palette_y + self.palette_height - 250
-        strip_x = self.palette_x
+        swatch_size  = 48
+        swatch_gap   = 8
+        label_height = 20   # "Select Variant:" label
+        name_height  = 14   # variant name below each swatch
+        row_height   = swatch_size + name_height + swatch_gap
+        top_pad      = 8
+        bot_pad      = 6
+
+        # How many swatches fit in one row?
+        available_w  = self.palette_width - self.palette_padding * 2
+        per_row      = max(1, (available_w + swatch_gap) // (swatch_size + swatch_gap))
+        num_rows     = (len(variants) + per_row - 1) // per_row
+
+        strip_height = top_pad + label_height + num_rows * row_height + bot_pad
+
+        # Bottom of variant strip sits flush against the settings panel
+        strip_bottom = self.palette_y + self.palette_height - 160
+        strip_y      = strip_bottom - strip_height
+        strip_x      = self.palette_x
 
         # background
         strip_rect = pygame.Rect(strip_x, strip_y, self.palette_width, strip_height)
@@ -1223,19 +1312,20 @@ class EntityEditor:
 
         # label
         label = self.font_small.render("Select Variant:", True, self.COLORS['text_dim'])
-        screen.blit(label, (strip_x + self.palette_padding, strip_y + 5))
+        screen.blit(label, (strip_x + self.palette_padding, strip_y + top_pad))
 
-        # swatch row
-        swatch_size = 48
-        swatch_gap = 8
-        current_var = self.selected_variant or self._get_current_variant(self.selected_entity)
-        sx = strip_x + self.palette_padding
+        current_var  = self.selected_variant or self._get_current_variant(self.selected_entity)
+        sx           = strip_x + self.palette_padding
+        swatches_top = strip_y + top_pad + label_height
 
         for i, variant in enumerate(variants):
-            vx = sx + i * (swatch_size + swatch_gap)
-            rect = pygame.Rect(vx, strip_y + 24, swatch_size, swatch_size)
+            col  = i % per_row
+            row  = i // per_row
+            vx   = sx + col * (swatch_size + swatch_gap)
+            vy   = swatches_top + row * row_height
+            rect = pygame.Rect(vx, vy, swatch_size, swatch_size)
 
-            is_sel = (current_var is variant)
+            is_sel   = (current_var is variant)
             is_hover = (self.hover_variant_idx == i)
 
             # background
@@ -1253,9 +1343,7 @@ class EntityEditor:
 
             # variant sprite (or colour swatch fallback)
             if variant.get('sprite'):
-                # centre sprite inside swatch
                 spr = variant['sprite']
-                # scale down to fit if bigger than swatch
                 max_dim = swatch_size - 6
                 sw, sh = spr.get_size()
                 if sw > max_dim or sh > max_dim:
@@ -1263,7 +1351,6 @@ class EntityEditor:
                     spr = pygame.transform.scale(spr, (int(sw * scale), int(sh * scale)))
                 screen.blit(spr, spr.get_rect(center=rect.center))
             else:
-                # plain colour block
                 inner = rect.inflate(-6, -6)
                 pygame.draw.rect(screen, variant.get('color', (128, 128, 128)), inner, border_radius=2)
 
@@ -1910,6 +1997,8 @@ class EntityEditor:
         )
 
     def _mouse_in_palette(self, mx, my):
+        if not self.palette_visible:
+            return False
         return (self.palette_x <= mx <= self.palette_x + self.palette_width and
                 self.palette_y <= my <= self.palette_y + self.palette_height)
 

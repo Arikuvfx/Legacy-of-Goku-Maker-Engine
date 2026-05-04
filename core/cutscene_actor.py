@@ -110,12 +110,47 @@ class CutsceneActor:
     # ── Animation & movement API ──────────────────────────────────────────────
 
     def set_animation(self, state, direction='down'):
-        """Set animation state and facing direction immediately."""
+        """Set animation state and facing direction immediately.
+
+        If the sprite hasn't loaded this state yet (e.g. walk2.png added after
+        init), we call load_animation_all_directions first so the key exists
+        before set_animation looks it up.
+        """
         self.entity.direction = direction
-        if hasattr(self.entity, 'sprite') and self.entity.sprite:
-            self.entity.sprite.set_animation(state, direction)
+        sprite = getattr(self.entity, 'sprite', None)
+        if sprite:
+            key = f"{state}_{direction}"
+            if key not in sprite.animations:
+                self._hot_load_animation(sprite, state)
+            sprite.set_animation(state, direction)
         if hasattr(self.entity, 'current_animation_state'):
             self.entity.current_animation_state = state
+
+    @staticmethod
+    def _hot_load_animation(sprite, state):
+        """Load all directions of *state* from {sprite.base_path}/{state}.png.
+
+        Auto-detects 4-directional vs 8-directional by checking how many
+        sprite-height rows the sheet has.
+        """
+        import os, pygame
+
+        path = os.path.join(sprite.base_path, f"{state}.png")
+        if not os.path.isfile(path):
+            return
+
+        # Detect direction count from the sheet's row count.
+        try:
+            tmp = pygame.image.load(path)
+            rows = tmp.get_height() // sprite.sprite_height
+        except Exception:
+            return
+
+        use_8 = (rows >= 8)
+        sprite.load_animation_all_directions(
+            state, frame_duration=0.1, loop=True,
+            num_variants=1, use_8_directions=use_8,
+        )
 
     def face(self, direction):
         """Change facing direction without restarting the current animation."""

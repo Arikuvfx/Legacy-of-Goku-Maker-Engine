@@ -84,6 +84,7 @@ class DialogueBox:
 
         self._portrait_key   = None
         self._portrait_cache = {}
+        self._player_ref     = None   # set via set_player() after construction
 
         self._sheet   = None
         self._frame_w = 0
@@ -181,12 +182,40 @@ class DialogueBox:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
+    def set_player(self, player):
+        """Give the dialogue box a reference to the player so it can pick
+        transformation-aware portraits automatically (e.g. goku → goku_ssj)."""
+        self._player_ref = player
+
+    def _resolve_portrait_key(self, key):
+        """Return the best portrait key for the current player state.
+
+        If the requested portrait matches the player's character name AND the
+        player is currently transformed, this tries the ``<key>_ssj`` portrait
+        first.  If that file doesn't exist it falls back to the original key so
+        nothing breaks when the SSJ portrait hasn't been added yet.
+        """
+        if not key:
+            return key
+        player = getattr(self, '_player_ref', None)
+        if not player:
+            return key
+        character = getattr(player, 'character', None)
+        if not character or key != character:
+            return key
+        ts = getattr(player, 'transformation', None)
+        if not ts or not ts.is_transformed:
+            return key
+        ssj_key  = f'{key}_ssj'
+        ssj_path = os.path.join('assets', 'portraits', f'{ssj_key}.png')
+        return ssj_key if os.path.exists(ssj_path) else key
+
     def show(self, text, npc_name="NPC", is_final=False, item=None, portrait_key=None):
         self.current_text  = text
         self.npc_name      = npc_name
         self.is_final      = is_final
         self.received_item = item
-        self._portrait_key = portrait_key
+        self._portrait_key = self._resolve_portrait_key(portrait_key)
         if not self.active:
             self.active   = True
             self._state   = 'opening'

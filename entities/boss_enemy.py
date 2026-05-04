@@ -14,18 +14,52 @@ BOSS_REGISTRY = {
         'speed':         1.4,
         'attack_damage': 18,
         'attack_range':  17,
-        # Full spritesheet frame size (used for sprite loading)
         'width':         64,
         'height':        64,
-        # Actual visible character size within the frame (used for hitbox + render)
         'hitbox_width':  20,
         'hitbox_height': 38,
         'ai_type':       'advanced',
         'enemy_category': 'melee',
         'display_name':  'Pui Pui',
-        'shadow_size':   'small',  # 'small' or 'big'
-        'shadow_width':  32,       # shadow width in world units (matches player)
-        'shadow_y_offset': 13.5,     # extra pixels downward to align with actual feet
+        'shadow_size':   'small',
+        'shadow_width':  32,
+        'shadow_y_offset': 13.5,
+    },
+    'android_17': {
+        'hp':            350,
+        'speed':         1.6,
+        'attack_damage': 14,
+        'attack_range':  200,
+        'width':         32,
+        'height':        32,
+        'hitbox_width':  18,
+        'hitbox_height': 28,
+        'ai_type':       'advanced',
+        'enemy_category': 'shooter',
+        'shooter_style': 'kiblast',
+        'projectile_sprite': 'kiblast',
+        'display_name':  'Android 17',
+        'shadow_size':   'small',
+        'shadow_width':  24,
+        'shadow_y_offset': 10.0,
+    },
+    'android_18': {
+        'hp':            350,
+        'speed':         1.6,
+        'attack_damage': 14,
+        'attack_range':  200,
+        'width':         32,
+        'height':        32,
+        'hitbox_width':  18,
+        'hitbox_height': 28,
+        'ai_type':       'advanced',
+        'enemy_category': 'shooter',
+        'shooter_style': 'kiblast',
+        'projectile_sprite': 'kiblast',
+        'display_name':  'Android 18',
+        'shadow_size':   'small',
+        'shadow_width':  24,
+        'shadow_y_offset': 10.0,
     },
 }
 
@@ -57,7 +91,13 @@ class BossEnemy(Enemy):
             variant=variant,
             ai_type=cfg['ai_type'],
             enemy_category=cfg['enemy_category'],
+            shooter_style=cfg.get('shooter_style', 'bomb'),
         )
+
+        # FIX: override projectile_sprite after init so the base AI uses the
+        # correct sprite (e.g. 'kiblast') instead of whatever it defaulted to.
+        if cfg.get('projectile_sprite'):
+            self.projectile_sprite = cfg['projectile_sprite']
 
         self.boss_id      = boss_id
         self.display_name = cfg['display_name']
@@ -88,6 +128,11 @@ class BossEnemy(Enemy):
         self.shadow_size     = cfg.get('shadow_size', 'small')
         self.shadow_width    = cfg.get('shadow_width', self.width)
         self.shadow_y_offset = cfg.get('shadow_y_offset', 0)
+
+        # Pending ki blast — mirrors the player's pending_blast pattern.
+        # Set to True when the kiblast animation starts; the base Enemy AI
+        # reads 'ready' to know it should actually spawn the projectile.
+        self.pending_blast = None
 
         # Load boss-specific sprite from assets/sprites/enemies/boss/{boss_id}/
         # Pass full frame size so the sheet is sliced correctly.
@@ -138,3 +183,31 @@ class BossEnemy(Enemy):
 
     def get_xp_reward(self, game_config):
         return getattr(game_config, 'boss_enemy_xp', game_config.basic_enemy_xp * 5)
+
+    # ------------------------------------------------------------------
+    # Ki-blast animation gate — mirrors the player's pending_blast pattern.
+    # Called by the base Enemy AI instead of spawning a projectile directly
+    # when shooter_style == 'kiblast'.
+    # ------------------------------------------------------------------
+
+    def shoot_blast(self):
+        """Start the kiblast animation; the projectile spawns once it finishes."""
+        if self.has_sprite and self.sprite:
+            self.sprite.set_animation('kiblast', self.direction)
+        self.pending_blast = True
+
+    def update(self, dt, *args, **kwargs):
+        """Tick base Enemy logic, then advance the kiblast animation gate."""
+        super().update(dt, *args, **kwargs)
+
+        # Only bosses that use the kiblast shooter style need this gate.
+        if self.pending_blast is None:
+            return
+
+        # The base Enemy update() resets the sprite to 'idle' when the attack
+        # timer expires — so is_animation_finished() on the kiblast anim can
+        # never return True here.  Instead, fire as soon as the attack window
+        # has closed (is_attacking just became False in super().update()).
+        if self.pending_blast is True and not self.is_attacking:
+            self.pending_blast = None
+            self.should_spawn_kiblast = True

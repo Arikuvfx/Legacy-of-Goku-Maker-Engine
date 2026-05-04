@@ -37,6 +37,14 @@ _SHOOTER_PRESETS = {
         15,     # attack_damage
         200,    # projectile_speed
     ),
+    'kiblast': (
+        0.6,    # attack_duration  — time for the ki charge animation
+        2.5,    # attack_cooldown_time
+        200,    # attack_range
+        160,    # preferred_distance — keeps distance like a gunner
+        14,     # attack_damage
+        300,    # projectile_speed — fast cardinal shot
+    ),
 }
 
 # Cardinal knockback vectors keyed by facing direction
@@ -161,6 +169,13 @@ class Enemy:
             self.rocket_spawned_this_attack = False
             self.rocket_dx = 0.0
             self.rocket_dy = 0.0
+
+            # Ki-blast spawning flags — set by perform_attack (or BossEnemy.update for
+            # bosses that gate the shot behind an animation), polled by game.py each frame
+            self.should_spawn_kiblast = False
+            self.kiblast_spawned_this_attack = False
+            self.kiblast_dx = 0.0
+            self.kiblast_dy = 0.0
         else:
             # Melee defaults
             self.attack_duration = 0.4
@@ -971,7 +986,7 @@ class Enemy:
             if self.enemy_category == 'shooter':
                 min_attack_distance = 50  # Very permissive minimum so close-in shots still fire
 
-                if self.shooter_style in ('bullet', 'rocket'):
+                if self.shooter_style in ('bullet', 'rocket', 'kiblast'):
                     raw_dx = player.x - self.x
                     raw_dy = player.y - self.y
                     alignment_tolerance = 20  # World-unit leeway on cardinal alignment
@@ -1025,7 +1040,7 @@ class Enemy:
 
             elif distance <= self.preferred_distance * 1.3 and distance < self.attack_range:
                 # In the sweet spot — strafe to a cardinal alignment if needed
-                if self.shooter_style in ('bullet', 'rocket'):
+                if self.shooter_style in ('bullet', 'rocket', 'kiblast'):
                     raw_dx = player.x - self.x
                     raw_dy = player.y - self.y
                     alignment_tolerance = 20
@@ -1383,6 +1398,7 @@ class Enemy:
                 self.bomb_spawned_this_attack = False
                 self.bullet_spawned_this_attack = False
                 self.rocket_spawned_this_attack = False
+                self.kiblast_spawned_this_attack = False
 
             if self.has_sprite:
                 anim = 'melee' if self.enemy_category == 'melee' else 'attack'
@@ -1433,6 +1449,23 @@ class Enemy:
                     self.rocket_dx = dx
                     self.rocket_dy = dy
                     self.rocket_spawned_this_attack = True
+
+            elif self.shooter_style == 'kiblast':
+                # Snap direction, store it, then start the charge animation via
+                # shoot_blast() (defined on BossEnemy).  The projectile is spawned
+                # once BossEnemy.update() detects the animation has finished and
+                # sets should_spawn_kiblast = True.
+                if not self.kiblast_spawned_this_attack:
+                    raw_dx = player.x - self.x
+                    raw_dy = player.y - self.y
+                    dx, dy = self._snap_to_cardinal(raw_dx, raw_dy)
+                    self.kiblast_dx = dx
+                    self.kiblast_dy = dy
+                    if hasattr(self, 'shoot_blast'):
+                        self.shoot_blast()          # BossEnemy triggers the animation gate
+                    else:
+                        self.should_spawn_kiblast = True  # Fallback for non-boss kiblast enemies
+                    self.kiblast_spawned_this_attack = True
 
             else:
                 # Bomb thrower — lob toward the player's current position
@@ -1644,6 +1677,32 @@ class Enemy:
             'y':         self.y,
             'dx':        self.bullet_dx,
             'dy':        self.bullet_dy,
+            'speed':     self.projectile_speed,
+            'damage':    self.attack_damage,
+            'direction': self.direction,
+            'owner':     self,
+        }
+
+    def get_kiblast_spawn_data(self):
+        """Return ki-blast parameters and clear the spawn flag, or None if not ready.
+
+        For BossEnemy, this flag is set in update() once the charge animation finishes.
+        Game loop pattern (same as bullet/rocket)::
+
+            if enemy.should_spawn_kiblast:
+                data = enemy.get_kiblast_spawn_data()
+                blast = Projectile(data['x'], data['y'], data['direction'])
+                enemy.projectiles.append(blast)
+        """
+        if not self.should_spawn_kiblast:
+            return None
+
+        self.should_spawn_kiblast = False  # One blast per attack window
+        return {
+            'x':         self.x,
+            'y':         self.y,
+            'dx':        self.kiblast_dx,
+            'dy':        self.kiblast_dy,
             'speed':     self.projectile_speed,
             'damage':    self.attack_damage,
             'direction': self.direction,

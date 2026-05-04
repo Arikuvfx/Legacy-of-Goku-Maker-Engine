@@ -74,6 +74,9 @@ class SpriteHUD:
             'attack_icon_beam':    HUDSprite(os.path.join(self.base_path, "attack_icon_beam.png")),
             'transformation_icon': HUDSprite(os.path.join(self.base_path, "transformation_icon.png")),
             'attack_icon':         HUDSprite(os.path.join(self.base_path, "attack_icon.png")),
+            # Boss HP bar — background plate drawn first, fill bar cropped on top
+            'boss_bar_bg':         HUDSprite(os.path.join(self.base_path, "boss_bar_bg.png")),
+            'boss_bar':            HUDSprite(os.path.join(self.base_path, "boss_bar.png")),
         }
 
         print("=== HUD Loading Complete ===\n")
@@ -87,7 +90,19 @@ class SpriteHUD:
             'transformed_ki_bar': {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 123, 'bar_end': 294},
             'exp_bar':            {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start':  19, 'bar_end': 310},
             'transform_bar':      {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start':  13, 'bar_end':  40},
+            # Boss bar — sprites are 64×8 px native, scaled to match the player
+            # HUD width (338 config units → same sc() factor as everything else).
+            # Height is proportional: 338 * 8/64 = 42.
+            'boss_bar':           {'w': 338, 'h': 42, 'bar_start': 0, 'bar_end': 338},
         }
+
+        # Boss bar HP tracking — we lock the total max HP the moment bosses are
+        # first spotted so that killing one boss drains its portion of the bar
+        # rather than reflating the remainder.
+        # _seen_boss_ids: maps id(boss) -> max_hp for every boss we've registered.
+        # _locked_max_hp: sum of all registered max HPs; never decreases.
+        self._seen_boss_ids = {}   # {id(boss): max_hp}
+        self._locked_max_hp = 0
 
         pygame.font.init()
         self.font_small  = pygame.font.Font(None, 18)
@@ -142,9 +157,87 @@ class SpriteHUD:
             return player.transformation.transform_animation_progress
         return 0.0
 
+    # ── Boss bar ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _boss_is_aware(boss):
+        """Return True when a boss is actively noticing the player.
+
+        Checks the most common state-machine attributes used across the Enemy /
+        BossEnemy hierarchy.  Falls back to True so a boss without a state
+        attribute always shows its bar once it is alive.
+        """
+        # Prefer an explicit 'is_aware' / 'aware' flag if the AI exposes one.
+        if hasattr(boss, 'is_aware'):
+            return bool(boss.is_aware)
+        # State-machine check — idle / patrol / wander mean the boss hasn't
+        # spotted the player yet; anything else (chase, attack, …) means aware.
+        if hasattr(boss, 'state') and boss.state is not None:
+            return boss.state not in ('idle', 'patrol', 'wander')
+        # No state info at all — show the bar to be safe.
+        return True
+
+    def draw_boss_bar(self, screen, bosses):
+        """Draw the combined boss HP bar on the right side of the screen.
+
+        Uses a locked max HP so killing one boss drains its share of the bar
+        rather than reflating the remaining bosses' portion.
+
+        Parameters
+        ----------
+        screen : pygame.Surface
+        bosses : list — alive BossEnemy instances (hp > 0) that are noticing the player
+        """
+        if not bosses:
+            return
+
+        # Register any boss we haven't seen before and lock their max HP in.
+        for b in bosses:
+            bid = id(b)
+            if bid not in self._seen_boss_ids:
+                mhp = max(1, getattr(b, 'max_hp', 1))
+                self._seen_boss_ids[bid] = mhp
+                self._locked_max_hp += mhp
+
+        if self._locked_max_hp <= 0:
+            return
+
+        # Current HP = sum of alive bosses only; max stays locked forever.
+        total_hp = sum(max(0, getattr(b, 'hp', 0)) for b in bosses)
+
+        def sc(v):
+            return int(v * self.scale)
+
+        bcfg = self.config['boss_bar']
+        bw   = sc(bcfg['w'])
+        bh   = sc(bcfg['h'])
+
+        # Mirror the player HUD margin: same distance from the RIGHT edge.
+        # Bottom-align with the player HUD frame: boss bar bottom == player frame bottom.
+        frame_h = self.config['frame']['h']
+        bx = self.screen_width - self.hud_x - bw
+        by = self.hud_y + int(self.hud_offset_y) + sc(frame_h) - bh
+
+        # ── Draw background plate ──────────────────────────────────────────
+        bg_sprite = self.sprites['boss_bar_bg']
+        if bg_sprite.sprite:
+            screen.blit(pygame.transform.scale(bg_sprite.sprite, (bw, bh)), (bx, by))
+
+        # ── Draw HP fill (cropped) ─────────────────────────────────────────
+        fill_sprite = self.sprites['boss_bar']
+        if fill_sprite.sprite:
+            bar_start = sc(bcfg.get('bar_start', 0))
+            bar_end   = sc(bcfg.get('bar_end', bcfg['w']))
+            region_w  = bar_end - bar_start
+            fill_w    = int(region_w * (total_hp / self._locked_max_hp))
+            if fill_w > 0:
+                scaled = pygame.transform.scale(fill_sprite.sprite, (bw, bh))
+                screen.blit(scaled.subsurface((bar_start, 0, fill_w, bh)),
+                            (bx + bar_start, by))
+
     # ── Main draw ─────────────────────────────────────────────────────────────
 
-    def draw(self, screen, player):
+    def draw(self, screen, player, enemies=None, dt=0.0):
         if not self.visible:
             return
 
@@ -251,3 +344,16 @@ class SpriteHUD:
             self.draw_text_with_shadow(screen, label,
                                        sx - tw // 2, sy - sc(8),
                                        self.font_large, (255, 255, 255))
+
+        # 8. Boss HP bar — right side, bottom-aligned with player HUD.
+        # Show when any alive boss is aware. The locked max HP ensures killing
+        # one boss drains its share rather than reflating the others.
+        if enemies is not None:
+            alive_bosses = [e for e in enemies if getattr(e, 'is_boss', False)
+                            and getattr(e, 'hp', 0) > 0]
+            # Reset encounter tracking once all bosses are gone.
+            if not alive_bosses:
+                self._seen_boss_ids = {}
+                self._locked_max_hp = 0
+            elif any(self._boss_is_aware(b) for b in alive_bosses):
+                self.draw_boss_bar(screen, alive_bosses)

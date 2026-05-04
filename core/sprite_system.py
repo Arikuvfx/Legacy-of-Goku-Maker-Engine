@@ -354,11 +354,30 @@ class AnimatedSprite:
         return False
 
 
+def _load_sprite_size(folder, default_w=32, default_h=32):
+    """Read frame size from {folder}/sprite_size.txt if it exists.
+
+    Expected format — just one line like:  48x48
+    Falls back to default_w / default_h so every existing spritesheet
+    that has no config file keeps working at 32×32 without any changes.
+    """
+    path = os.path.join(folder, 'sprite_size.txt')
+    if os.path.isfile(path):
+        try:
+            text = open(path).read().strip().lower()
+            w, h = text.split('x')
+            return int(w), int(h)
+        except Exception:
+            pass
+    return default_w, default_h
+
 class CharacterSpriteLoader:
     """Loads all standard animations for a playable character."""
 
     @staticmethod
     def load_character(character_name, costume_name, sprite_width, sprite_height):
+        folder = f"assets/sprites/{character_name}/{costume_name}"
+        sprite_width, sprite_height = _load_sprite_size(folder, sprite_width, sprite_height)
         sprite = AnimatedSprite(character_name, costume_name, sprite_width, sprite_height)
 
         # Standard 4-directional animations
@@ -460,6 +479,8 @@ class EnemySpriteLoader:
         else:
             return None
 
+        sprite_width, sprite_height = _load_sprite_size(base_path, sprite_width, sprite_height)
+
         # Create sprite with custom base path
         sprite = AnimatedSprite.__new__(AnimatedSprite)
         sprite.character_name = enemy_type
@@ -479,6 +500,7 @@ class EnemySpriteLoader:
             ('walk', 0.15, True, 1),
             ('attack', 0.1, False, 1),  # Ranged/generic attack animation
             ('melee', 0.1, False, 1),   # Melee swing animation (melee.png)
+            ('kiblast', 0.3, False, 1), # Ki blast projectile animation (kiblast.png)
             ('hurt', 0.1, False, 1),
             ('death', 0.15, False, 1),
         ]
@@ -547,6 +569,8 @@ class NPCSpriteLoader:
         else:
             return None
 
+        sprite_width, sprite_height = _load_sprite_size(sprite_path, sprite_width, sprite_height)
+
         # Reuse AnimatedSprite machinery — bypass __init__ and set fields directly.
         sprite = AnimatedSprite.__new__(AnimatedSprite)
         sprite.character_name    = npc_type
@@ -611,6 +635,8 @@ def create_boss_sprite(boss_id, variant='default', width=48, height=48):
     if not os.path.exists(boss_path):
         return None
 
+    width, height = _load_sprite_size(boss_path, width, height)
+
     # Reuse AnimatedSprite machinery — just point base_path at the boss folder
     sprite = AnimatedSprite.__new__(AnimatedSprite)
     sprite.character_name = boss_id
@@ -625,12 +651,13 @@ def create_boss_sprite(boss_id, variant='default', width=48, height=48):
     sprite.offset_y = height // 2
 
     animations = [
-        ('idle',   0.3,  True,  1),
-        ('walk',   0.15, True,  1),
-        ('attack', 0.1,  False, 1),
-        ('melee',  0.1,  False, 1),
-        ('hurt',   0.1,  False, 1),
-        ('death',  0.15, False, 1),
+        ('idle',    0.3,  True,  1),
+        ('walk',    0.15, True,  1),
+        ('attack',  0.1,  False, 1),
+        ('melee',   0.1,  False, 1),
+        ('kiblast', 0.3,  False, 1), # Ki blast projectile animation (kiblast.png)
+        ('hurt',    0.1,  False, 1),
+        ('death',   0.15, False, 1),
     ]
 
     for anim_name, duration, loop, num_variants in animations:

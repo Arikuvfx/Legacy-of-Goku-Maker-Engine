@@ -100,6 +100,7 @@ _ACTION_PARAMS = {
     'scroll':        [('direction', 'Direction', 'scroll_dir'),
                       ('speed',     'Speed (wu/s)', 'float')],
     'scroll_stop':   [],
+    'change_room':   [('room_name', 'Room Name', 'room')],
     'fade_in':       [('duration', 'Duration (s)', 'float')],
     'fade_out':      [('duration', 'Duration (s)', 'float')],
     'flash':         [('duration', 'Duration (s)', 'float')],
@@ -126,7 +127,7 @@ _ACTION_PARAMS = {
 _CAMERA_ACTIONS = ['pan_to', 'snap_to', 'shake']
 _SCREEN_ACTIONS = ['fade_in', 'fade_out', 'flash', 'invert', 'dialogue',
                    'weather_start', 'weather_stop']
-_ROOM_ACTIONS   = []
+_ROOM_ACTIONS   = ['change_room']
 _ACTOR_ACTIONS  = ['set_animation', 'move_to', 'face', 'teleport', 'fly_to']
 _INVERT_MODES   = ['full', 'red', 'green', 'blue', 'greyscale']
 
@@ -250,8 +251,10 @@ class CutsceneEditor:
         self._form_time_buf  = '0.0'
         self._form_params    = {}
         self._form_focus     = None
-        self._form_target_idx = 0
-        self._form_type_idx   = 0
+        self._form_target_idx  = 0
+        self._form_type_idx    = 0
+        # Tracks the active group filter when browsing rooms for a change_room action.
+        self._form_room_group  = ''
 
         # ── Portrait dropdown overlay ────────────────────────────────────────────
         self._portrait_dropdown_open   = False
@@ -312,6 +315,14 @@ class CutsceneEditor:
 
         # ── Mouse tracking (for ghost previews) ───────────────────────────────
         self._mouse_pos      = (0, 0)
+
+        # ── Actor initial-position drag ────────────────────────────────────────
+        # Index into cutscene_data['actors'] of the actor being dragged (-1=idle).
+        # Sub-pixel grab offsets keep the actor from snapping its centre to the
+        # cursor on drag start — same technique as the keyframe drag.
+        self._actor_drag_idx      = -1
+        self._actor_drag_offset_x = 0.0
+        self._actor_drag_offset_y = 0.0
 
         # ── Pre-baked tile surfaces ───────────────────────────────────────────
         # Keyed (room_name, is_foreground) → Surface, same approach as
@@ -381,6 +392,10 @@ class CutsceneEditor:
                     self._tl_sel = actions.index(moved_act)
                 self._kf_drag_idx = -1
                 self._runtime     = None   # stale; rebuild on next scrub/play
+            # Finish an actor initial-position drag.
+            if self._actor_drag_idx >= 0:
+                self._actor_drag_idx = -1
+                self._runtime = None  # actor start pos changed; force rebuild
 
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
             if self.view == 'edit' and self._vp_rect.collidepoint(event.pos):
@@ -766,6 +781,20 @@ class CutsceneEditor:
             self._tl_auto_scroll = self._calc_tl_auto_scroll(pos[0])
             return
 
+        # ── Actor initial-position drag ───────────────────────────────────────
+        if self._actor_drag_idx >= 0 and self.cutscene_data:
+            actors = self.cutscene_data.get('actors', [])
+            if self._actor_drag_idx < len(actors):
+                vp = self._vp_rect
+                vx = pos[0] - vp.x
+                vy = pos[1] - vp.y
+                wx = vx / (RENDER_SCALE * self._vp_zoom) + self.camera.x / RENDER_SCALE
+                wy = vy / (RENDER_SCALE * self._vp_zoom) + self.camera.y / RENDER_SCALE
+                actors[self._actor_drag_idx]['x'] = round(wx + self._actor_drag_offset_x, 1)
+                actors[self._actor_drag_idx]['y'] = round(wy + self._actor_drag_offset_y, 1)
+                self.unsaved = True
+            return
+
         if not self._tl_play_drag:
             self._tl_auto_scroll = 0.0
             return
@@ -867,6 +896,24 @@ class CutsceneEditor:
             self._actor_form = False
             self._runtime    = None  # runtime.actors is stale; force full rebuild
             return None
+
+        # ── Actor drag: hit-test each actor's initial position ────────────────
+        # Only when not playing and the runtime is idle (showing the static
+        # actor markers drawn by _draw_actor_marker).
+        if not self._playing and not self._runtime and self.cutscene_data:
+            actors = self.cutscene_data.get('actors', [])
+            hit_radius = 20.0  # world-unit tolerance (≈ one sprite body)
+            for i, actor in enumerate(actors):
+                ax = float(actor.get('x', 0))
+                ay = float(actor.get('y', 0))
+                if abs(wx - ax) <= hit_radius and abs(wy - ay) <= hit_radius:
+                    self._push_undo()
+                    self._actor_drag_idx      = i
+                    self._actor_drag_offset_x = ax - wx
+                    self._actor_drag_offset_y = ay - wy
+                    self._actor_sel           = i
+                    return None
+
         return None
 
     def _on_tl_click(self, mx, my, tl):
@@ -1195,6 +1242,13 @@ class CutsceneEditor:
             self._cycle_dropdown(name)
             return None
 
+        if name in ('room_group_prev', 'room_group_next'):
+            self._cycle_room_group(-1 if name.endswith('prev') else 1)
+            return None
+        if name in ('room_name_prev', 'room_name_next'):
+            self._cycle_room_in_group(-1 if name.endswith('prev') else 1)
+            return None
+
         # ── Timeline zoom buttons ──────────────────────────────────────────────
         if name == 'tl_zoom_in':
             self._tl_time_zoom = min(self._tl_zoom_max, self._tl_time_zoom * 1.25)
@@ -1234,6 +1288,11 @@ class CutsceneEditor:
         for key, _label, _hint in _ACTION_PARAMS.get(self._form_type, []):
             val = a.get('params', {}).get(key, '')
             self._form_params[key] = str(val) if val != '' else self._default_param(key)
+        # Sync the room-group browser to whichever group the saved room belongs to.
+        if self._form_type == 'change_room':
+            rname = self._form_params.get('room_name', '')
+            room  = self.room_manager.get_room_by_name(rname) if rname else None
+            self._form_room_group = room.group if room else ''
 
     def _set_form_target(self, target):
         self._form_target = target
@@ -1256,7 +1315,7 @@ class CutsceneEditor:
         elif self._form_target == 'screen':
             self._set_form_type('fade_in')
         elif self._form_target == 'room':
-            self._set_form_type('pan_to')
+            self._set_form_type('change_room')
         else:
             self._set_form_type('set_animation')
 
@@ -1290,17 +1349,69 @@ class CutsceneEditor:
                 btn_rect.x, btn_rect.bottom + 2, pop_w, pop_h)
         self._portrait_dropdown_open = True
 
+    def _get_actor_anim_states(self, actor_def):
+        """Return a sorted list of animation state names for *actor_def*.
+
+        Gets or creates the live entity, asks its sprite object which folder
+        it loaded from, then returns every .png stem in that folder — so any
+        file you drop in (walk2.png, kiblast3.png, …) is instantly available.
+        Falls back to the hardcoded lists only if the entity can't be created.
+        """
+        import os, glob as _glob
+
+        entity = None
+        if actor_def is not None:
+            entity = self._actor_entities.get(actor_def.get('id', ''))
+            if entity is None:
+                try:
+                    entity = self._entity_factory(actor_def)
+                    if entity:
+                        self._actor_entities[actor_def['id']] = entity
+                except Exception:
+                    pass
+
+        folder = self._actor_sprite_folder(entity)
+        if folder and os.path.isdir(folder):
+            states = sorted(
+                os.path.splitext(os.path.basename(f))[0]
+                for f in _glob.glob(os.path.join(folder, '*.png'))
+            )
+            if states:
+                return states
+
+        # Fallback when the entity or its sprite folder can't be found.
+        actor_type = actor_def.get('type', 'enemy') if actor_def else 'player'
+        return list(_PLAYER_STATES) if actor_type == 'player' else list(_ENEMY_STATES)
+
+    def _actor_sprite_folder(self, entity):
+        """Return the sprite sheet folder by reading it directly from the sprite object.
+
+        Tries every attribute name sprite systems commonly use to store their
+        base directory. Returns None if the folder can't be determined.
+        """
+        if entity is None:
+            return None
+        sprite = getattr(entity, 'sprite', None)
+        if sprite is None:
+            return None
+        for attr in ('sprite_dir', 'folder', 'base_path', 'base_dir',
+                     'sheet_dir', '_sprite_dir', '_folder', '_base_path'):
+            val = getattr(sprite, attr, None)
+            if isinstance(val, str) and val:
+                return val
+        return None
+
     def _cycle_dropdown(self, name):
         field = name[len('cycle_'):]
         buf   = self._form_params.get(field, '')
         if field in ('state', 'anim_state'):
-            actor_type = 'player'
-            if self._form_target not in ('camera', 'screen'):
-                actors = self.cutscene_data.get('actors', [])
-                for a in actors:
+            actor_def = None
+            if self._form_target not in ('camera', 'screen', 'room'):
+                for a in (self.cutscene_data or {}).get('actors', []):
                     if a['id'] == self._form_target:
-                        actor_type = a.get('type', 'enemy')
-            pool = _PLAYER_STATES if actor_type == 'player' else _ENEMY_STATES
+                        actor_def = a
+                        break
+            pool = self._get_actor_anim_states(actor_def)
         elif field == 'direction' and self._form_type == 'scroll':
             pool = ['right', 'left', 'down', 'up',
                     'down_right', 'down_left', 'up_right', 'up_left']
@@ -1385,6 +1496,7 @@ class CutsceneEditor:
             'intensity': '8', 'state': 'idle', 'direction': 'down',
             'anim_state': 'walk', 'portrait': '', 'text': '',
             'weather_type': 'rain', 'speed': '120.0', 'alpha': '-1',
+            'room_name': '',
         }
         # scroll uses a much slower default speed than weather
         return base.get(key, '')
@@ -1399,8 +1511,8 @@ class CutsceneEditor:
         for key, _label, hint in _ACTION_PARAMS.get(self._form_type, []):
             raw = self._form_params.get(key, '')
             if raw == '':
-                # Empty optional fields (e.g. start_x/start_y on pan_to) are
-                # omitted so the runtime treats them as unset via .get(key, None).
+                # Empty optional fields are omitted so the runtime treats them
+                # as unset via .get(key, None).
                 continue
             try:
                 if hint == 'float':   params[key] = float(raw)
@@ -1506,6 +1618,7 @@ class CutsceneEditor:
         self._undo_stack.clear()
         self._redo_stack.clear()
         self.view           = 'edit'
+        self._new_name_focus = False
         self._duration_buf   = str(data.get('duration', 10.0))
         self._duration_focus = False
         # Centre the viewport on the room
@@ -1534,6 +1647,7 @@ class CutsceneEditor:
         self._undo_stack.clear()
         self._redo_stack.clear()
         self.view           = 'edit'
+        self._new_name_focus = False
         self._runtime       = None   # force fresh runtime for new cutscene
         self._stop_preview()
         self._duration_buf   = str(data.get('duration', 10.0))
@@ -1734,10 +1848,22 @@ class CutsceneEditor:
             self.camera.y = _clamp(self.camera.y, 0, rh - win_h)
 
     def _get_current_room(self):
-        """Return the Room object for the cutscene's room field, or None."""
+        """Return the Room object that should be visible at the current playhead.
+
+        Starts with the cutscene's base room, then applies any change_room
+        actions whose time is at or before the playhead — so scrubbing the
+        timeline shows the correct background, just like the runtime would.
+        """
         if not self.cutscene_data:
             return None
-        return self.room_manager.get_room_by_name(self.cutscene_data.get('room', ''))
+        room_name = self.cutscene_data.get('room', '')
+        t = self._tl_playhead_t
+        for action in self.cutscene_data.get('actions', []):
+            if action.get('type') == 'change_room' and action.get('time', 0.0) <= t:
+                name = action.get('params', {}).get('room_name', '').strip()
+                if name:
+                    room_name = name
+        return self.room_manager.get_room_by_name(room_name)
 
     def _ensure_room_tiles(self, room):
         """Guarantee the tileset_editor exists and has tile data for *room*.
@@ -1923,6 +2049,49 @@ class CutsceneEditor:
             screen.blit(bg, (bx - 8, by - 4))
             screen.blit(banner, (bx, by))
 
+        # Actor drag banner — shown while dragging an actor's start position
+        if self._actor_drag_idx >= 0 and self.cutscene_data:
+            actors = self.cutscene_data.get('actors', [])
+            if self._actor_drag_idx < len(actors):
+                a = actors[self._actor_drag_idx]
+                drag_txt = (f'Dragging  {a.get("id", "actor")}  →  '
+                            f'X {a.get("x", 0):.1f}   Y {a.get("y", 0):.1f}')
+                banner = self.font_medium.render(drag_txt, True, _C['accent2'])
+                bg = pygame.Surface((banner.get_width() + 18, banner.get_height() + 10),
+                                    pygame.SRCALPHA)
+                bg.fill((0, 0, 0, 185))
+                bx, by = vp.x + 10, vp.y + 10
+                screen.blit(bg, (bx - 8, by - 4))
+                screen.blit(banner, (bx, by))
+
+        # Hover highlight — draw a ring around whichever actor the cursor is
+        # near so the user knows it can be dragged (only in static/idle mode).
+        if (not self._playing and not self._runtime and not self._pick_mode
+                and self._actor_drag_idx < 0 and self.cutscene_data
+                and vp.collidepoint(pygame.mouse.get_pos())):
+            mx2, my2 = pygame.mouse.get_pos()
+            vx2 = mx2 - vp.x
+            vy2 = my2 - vp.y
+            hwx = vx2 / (RENDER_SCALE * self._vp_zoom) + self.camera.x / RENDER_SCALE
+            hwy = vy2 / (RENDER_SCALE * self._vp_zoom) + self.camera.y / RENDER_SCALE
+            actors = self.cutscene_data.get('actors', [])
+            hit_radius = 20.0
+            for i, actor in enumerate(actors):
+                ax = float(actor.get('x', 0))
+                ay = float(actor.get('y', 0))
+                if abs(hwx - ax) <= hit_radius and abs(hwy - ay) <= hit_radius:
+                    col = _ACTOR_COLORS[i % len(_ACTOR_COLORS)]
+                    # Convert world position → screen position for the ring
+                    scr_x = int(vp.x + (ax * RENDER_SCALE - self.camera.x) * self._vp_zoom)
+                    scr_y = int(vp.y + (ay * RENDER_SCALE - self.camera.y) * self._vp_zoom)
+                    ring_r = int(16 * self._vp_zoom)
+                    pygame.draw.circle(screen, col,   (scr_x, scr_y), ring_r, 2)
+                    pygame.draw.circle(screen, _C['white'], (scr_x, scr_y), ring_r, 1)
+                    hint = self.font_small.render('drag to move', True, col)
+                    screen.blit(hint, (scr_x + ring_r + 4,
+                                       scr_y - hint.get_height() // 2))
+                    break
+
         # Mouse world-coords readout in viewport (zoom-corrected)
         mx, my = pygame.mouse.get_pos()
         if vp.collidepoint(mx, my):
@@ -2091,19 +2260,32 @@ class CutsceneEditor:
             pygame.draw.rect(inter, _C['accent'],
                              (rx, ry, room.width * RENDER_SCALE, room.height * RENDER_SCALE), 2)
 
+        # ── Actors + foreground tiles — draw in the correct order so fg tiles
+        # (trees, buildings, anything with tile.layer >= 0) occlude actors that
+        # stand behind them, exactly as the LayerManager does in normal gameplay.
+        #
+        # Order:
+        #   1. Actors (Y-sorted)      ← drawn BEFORE fg tiles
+        #   2. Foreground tile layer  ← drawn AFTER actors, occludes those behind
+        #
+        # This mirrors the LayerManager split: bg tiles → actors (Y-sorted) → fg tiles.
+        if self._runtime:
+            # Runtime path — covers both active playback and scrubbing (paused).
+            colors = {'WHITE': (255, 255, 255), 'RED': (220, 60, 60)}
+            self._runtime.draw_actors(inter, self.camera, colors)  # Y-sorted, before fg
+        else:
+            # Static editor path — Y-sort actor markers so deeper ones draw behind.
+            actors = self.cutscene_data.get('actors', []) if self.cutscene_data else []
+            actors_sorted = sorted(enumerate(actors), key=lambda t: t[1].get('y', 0))
+            for i, actor in actors_sorted:
+                self._draw_actor_marker(inter, actor, i, i == self._actor_sel)
+
+        # Foreground tile layer — drawn after actors so it occludes them correctly.
         if room:
             inter.blit(self._get_baked_tile_surface(room, True), (-cam_x, -cam_y))
 
         if self._runtime:
-            # Draw through runtime whenever it exists — covers both active playback
-            # and scrubbing (paused). This is what makes seek() show up in the viewport.
-            colors = {'WHITE': (255, 255, 255), 'RED': (220, 60, 60)}
-            self._runtime.draw_actors(inter, self.camera, colors)
             self._runtime.draw_overlay(inter, iw, ih)
-        else:
-            actors = self.cutscene_data.get('actors', []) if self.cutscene_data else []
-            for i, actor in enumerate(actors):
-                self._draw_actor_marker(inter, actor, i, i == self._actor_sel)
 
         # Scale the intermediate surface to fill the viewport.
         # Cache the output surface — pygame.transform.scale allocates a new
@@ -2554,6 +2736,24 @@ class CutsceneEditor:
                 self._btns[f'cycle_{key}'] = self._draw_button(
                     screen, x, y, W, 22, f'◀  {display_buf}  ▶', _C['highlight'])
                 y += 26
+            elif hint == 'room':
+                # Two-row browser: group filter on top, room name below.
+                self._btns['room_group_prev'] = self._draw_button(
+                    screen, x, y, 20, 22, '<', _C['highlight'])
+                gname = self._form_room_group or 'All Groups'
+                gs = self.font_small.render(gname, True, _C['text_dim'])
+                screen.blit(gs, (x + 24, y + (22 - gs.get_height()) // 2))
+                self._btns['room_group_next'] = self._draw_button(
+                    screen, x + W - 20, y, 20, 22, '>', _C['highlight'])
+                y += 26
+                self._btns['room_name_prev'] = self._draw_button(
+                    screen, x, y, 20, 22, '<', _C['highlight'])
+                rname = buf or '(none)'
+                rs = self.font_medium.render(rname, True, _C['text'])
+                screen.blit(rs, (x + 24, y + (22 - rs.get_height()) // 2))
+                self._btns['room_name_next'] = self._draw_button(
+                    screen, x + W - 20, y, 20, 22, '>', _C['highlight'])
+                y += 30
             else:
                 y = self._draw_text_field(screen, x, y, W, key, buf,
                                           self._form_focus == key, form_key=key)
@@ -2816,6 +3016,40 @@ class CutsceneEditor:
         return y + 26
 
     # ── Room cycle (used by button handler) ───────────────────────────────────
+
+    def _rooms_for_group(self, group):
+        """Return room names visible in *group*.
+
+        An empty/None *group* means "All Groups" — every non-transient room is
+        included.  Otherwise only rooms whose .group attribute matches are returned.
+        """
+        return [r.name for r in self.room_manager.rooms
+                if not getattr(r, 'is_transient', False)
+                and (not group or r.group == group)]
+
+    def _cycle_room_group(self, delta):
+        """Cycle through room groups in the change_room action form.
+
+        Moves to the previous/next group and resets room_name to the first
+        room in that group so the value is always valid.
+        """
+        groups = [g for g in self.room_manager.groups]
+        if not groups:
+            return
+        cur   = self._form_room_group
+        idx   = groups.index(cur) if cur in groups else 0
+        self._form_room_group = groups[(idx + delta) % len(groups)]
+        rooms = self._rooms_for_group(self._form_room_group)
+        self._form_params['room_name'] = rooms[0] if rooms else ''
+
+    def _cycle_room_in_group(self, delta):
+        """Cycle through rooms within the currently selected group."""
+        rooms = self._rooms_for_group(self._form_room_group)
+        if not rooms:
+            return
+        cur   = self._form_params.get('room_name', '')
+        idx   = rooms.index(cur) if cur in rooms else 0
+        self._form_params['room_name'] = rooms[(idx + delta) % len(rooms)]
 
     def _cycle_room(self, delta):
         """Advance (+1) or reverse (-1) through the room list.

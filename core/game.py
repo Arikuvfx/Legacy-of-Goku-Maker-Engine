@@ -119,6 +119,7 @@ class Game:
         self.ui                    = UI(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.sprite_hud            = SpriteHUD(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.dialogue_box          = DialogueBox(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.dialogue_box.set_player(self.player)
         self.level_up_notification = LevelUpNotification(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.flying_controller     = FlyingController(SCREEN_WIDTH, SCREEN_HEIGHT)
 
@@ -128,6 +129,9 @@ class Game:
         self.room_editor  = RoomEditor(self.room_manager, SCREEN_WIDTH, SCREEN_HEIGHT)
         # Let the editor share the game's baked-tile blitting path.
         self.room_editor.blit_tiles_callback = self.blit_room_tiles
+        # Let the editor flush the baked-surface cache before each draw so
+        # deleted/painted tiles are visible immediately without leaving the editor.
+        self.room_editor.flush_tile_cache_callback = self._flush_dirty_tile_rooms
 
         # ── Dev tools ─────────────────────────────────────────────────────────
         self.dev_menu             = DevMenu(self.game_config, SCREEN_WIDTH, SCREEN_HEIGHT, self.sound_manager)
@@ -163,6 +167,7 @@ class Game:
         self.bombs                = []   # BombProjectiles from Shooter enemies
         self.enemy_bullets        = []   # bullet_projectiles from Gunner enemies
         self.enemy_rockets        = []   # rocket_projectiles from RocketLauncher enemies
+        self.enemy_kiblasts       = []   # Projectiles from kiblast-style enemies (e.g. Android 17/18)
         self.explosions           = []   # Active ExplosionEffect instances
         self.enemies              = []
         self.npcs                 = []
@@ -175,6 +180,7 @@ class Game:
         # ── Performance caches ────────────────────────────────────────────────
         # key: (room_name, is_background) → pre-baked tile Surface
         self._room_tile_surfaces: dict = {}
+        self._dirty_tile_rooms:   set  = set()   # rooms pending a surface rebuild
         # key: font_size → pygame.Font  (avoids allocating a Font every frame)
         self._font_cache: dict = {}
 
@@ -1244,6 +1250,7 @@ class Game:
         self.bombs         = []
         self.enemy_bullets = []
         self.enemy_rockets = []
+        self.enemy_kiblasts = []
         self.explosions    = []
         self.dmg_numbers.clear()  # Wipe leftover popups on room transition
 
@@ -1428,7 +1435,37 @@ class Game:
                             if _live._tween is not None:
                                 _live._tween.start_x = self.player.x
                                 _live._tween.start_y = self.player.y
+                            # Bug fix: _entity_factory always creates the actor with
+                            # costume='base'. If the real player is transformed, swap
+                            # the actor's sprite to the SSJ sheet so the cutscene
+                            # doesn't look like an untransform the moment it starts.
+                            _ts = self.player.transformation
+                            if _ts and _ts.is_transformed:
+                                from core.sprite_system import create_character_sprite
+                                _char = getattr(self.player, 'character', 'goku')
+                                _live.entity.sprite = create_character_sprite(
+                                    _char, 'ssj', 32, 32)
+                                _live.entity.sprite.set_animation(
+                                    getattr(self.player, 'current_animation_state', 'idle'),
+                                    _live.entity.direction,
+                                )
                         break
+
+                    # Snapshot the player's full transformation state so that
+                    # player.update() running during the cutscene (e.g. completing
+                    # an in-progress untransform animation) can't corrupt it.
+                    # Restored in _update_cutscene_triggers when the cutscene ends.
+                    self._pre_cutscene_transform = None
+                    if self.player.transformation:
+                        _ts = self.player.transformation
+                        self._pre_cutscene_transform = {
+                            'is_transformed':    _ts.is_transformed,
+                            'is_transforming':   _ts.is_transforming,
+                            'is_untransforming': _ts.is_untransforming,
+                            'transformed_ki':    _ts.transformed_ki,
+                            'sprite':            self.player.sprite,
+                            'anim_state':        self.player.current_animation_state,
+                        }
 
                     # Rebase camera_target so the camera travels from the player's
                     # current world position directly to each tween's destination.
@@ -1479,6 +1516,24 @@ class Game:
                 self.dialogue_box.update(dt)
             if self.active_cutscene_runtime.finished:
                 self._sync_player_from_cutscene(self.active_cutscene_runtime)
+                # Restore the transformation state that was snapshotted at cutscene
+                # start. This undoes any side-effects from player.update() running
+                # during the cutscene (e.g. completing an in-progress untransform).
+                snap = getattr(self, '_pre_cutscene_transform', None)
+                if snap and self.player.transformation:
+                    _ts = self.player.transformation
+                    _ts.is_transformed    = snap['is_transformed']
+                    _ts.is_transforming   = snap['is_transforming']
+                    _ts.is_untransforming = snap['is_untransforming']
+                    _ts.transformed_ki    = snap['transformed_ki']
+                    self.player.sprite    = snap['sprite']
+                    self.player.current_animation_state = snap['anim_state']
+                    # Re-sync the sprite to the restored animation state so the
+                    # first frame after the cutscene looks correct.
+                    if hasattr(self.player.sprite, 'set_animation'):
+                        self.player.sprite.set_animation(
+                            snap['anim_state'], self.player.direction)
+                self._pre_cutscene_transform       = None
                 self.active_cutscene_runtime       = None
                 self.sprite_hud._hud_slide_out     = False
                 self.sprite_hud._hud_slide_in      = True
@@ -1693,6 +1748,7 @@ class Game:
             self._update_bombs(dt)
             self._update_enemy_bullets(dt)
             self._update_enemy_rockets(dt)
+            self._update_enemy_kiblasts(dt)
 
             # Tick damage number popups.
             self.dmg_numbers.update(dt)
@@ -1719,7 +1775,9 @@ class Game:
             self._update_gates(dt)
 
             # Transformation system (tracks energy and applies power-up state).
-            if self.player.transformation:
+            # Frozen during cutscenes so ki doesn't drain while the player is
+            # locked into a scripted sequence.
+            if self.player.transformation and not self.active_cutscene_runtime:
                 self.player.transformation.update(dt, enemies_defeated_this_frame)
 
             # Adaptive music — switch between exploration and battle tracks.
@@ -1971,6 +2029,13 @@ class Game:
                     direction=rocket_data['direction'],
                 ))
 
+            # Ki-blasts (e.g. Android 17/18) — use the same Projectile class as the player
+            kiblast_data = enemy.get_kiblast_spawn_data()
+            if kiblast_data:
+                blast = Projectile(kiblast_data['x'], kiblast_data['y'], kiblast_data['direction'])
+                blast.damage = kiblast_data['damage']  # Attach damage so the update method can use it
+                self.enemy_kiblasts.append(blast)
+
         for bomb in self.bombs[:]:
             bomb.update(dt, self.player)
 
@@ -2018,6 +2083,36 @@ class Game:
 
             if not rocket.active:
                 self.enemy_rockets.remove(rocket)
+
+    def _update_enemy_kiblasts(self, dt):
+        """Tick all enemy ki-blasts, check player collision, and prune spent ones."""
+        for blast in self.enemy_kiblasts[:]:
+            blast.update(self.current_room.width, self.current_room.height, dt)
+
+            if blast.active:
+                r = blast.radius
+                blast_rect = pygame.Rect(blast.x - r, blast.y - r, r * 2, r * 2)
+                player_rect = self.player.get_collision_rect()
+                if blast_rect.colliderect(player_rect):
+                    damage = getattr(blast, 'damage', 14)
+                    dx = self.player.x - blast.x
+                    dy = self.player.y - blast.y
+                    dist = math.sqrt(dx * dx + dy * dy)
+                    if dist > 0:
+                        dx /= dist
+                        dy /= dist
+                    self.player.take_damage(damage, dx, dy)
+                    self.player.hurt_tint = 1.0
+                    blast.active = False
+                    self.dmg_numbers.spawn(
+                        self.player.x, self.player.y - self.player.height // 2,
+                        self.player.last_damage_taken, variant='player',
+                    )
+
+            if not blast.active:
+                self.enemy_kiblasts.remove(blast)
+
+
 
     @staticmethod
     def _npc_portrait_key(npc):
@@ -2117,6 +2212,11 @@ class Game:
             pygame.display.flip()
             return
 
+        # Flush any stale baked tile surfaces once per frame before anything
+        # tries to access them — keeps rebuilds to one per frame regardless of
+        # how many on_tile_changed calls arrived during event processing.
+        self._flush_dirty_tile_rooms()
+
         # Fill with the default "green dev room" background colour.
         self.logical_surface.fill((34, 139, 34))
 
@@ -2213,16 +2313,25 @@ class Game:
             if self.player.current_beam:
                 self.layer_manager.add_object(self.player.current_beam)
 
-            # Enemy bullets and rockets are not y-sorted — draw them directly.
+            # Enemy bullets, rockets, and ki-blasts are not y-sorted — draw them directly.
             for bullet in self.enemy_bullets:
                 bullet.draw(self.logical_surface, self.camera, self.colors)
             for rocket in self.enemy_rockets:
                 rocket.draw(self.logical_surface, self.camera, self.colors)
+            for blast in self.enemy_kiblasts:
+                blast.draw(self.logical_surface, self.camera, self.colors)
 
             self.layer_manager.draw_all(self.logical_surface, self.camera, self.colors, RENDER_SCALE)
 
             # Damage number popups — drawn on top of sprites but below the HUD
             self.dmg_numbers.draw(self.logical_surface, self.camera, RENDER_SCALE)
+
+        # Cutscene actors are drawn here — BEFORE the foreground tile layer — so that
+        # foreground tiles (trees, buildings, tile.layer >= 0) correctly occlude actors
+        # standing behind them, matching the layering seen in the cutscene editor.
+        elif self.active_cutscene_runtime and not self.pause_menu.active:
+            _cs_colors = {'WHITE': (255, 255, 255), 'RED': (220, 60, 60)}
+            self.active_cutscene_runtime.draw_actors(self.logical_surface, self.camera, _cs_colors)
 
         # Flying pad path previews — editor-only overlay drawn after the layer pass.
         if self.dev_menu.active or self.room_editor.active:
@@ -2253,11 +2362,10 @@ class Game:
         if not self.dev_menu.active:
             self._draw_ui(self.dt)
 
-        # Active in-game cutscene overlay — drawn over the world but under dev tools.
-        # Suppressed while the pause menu is open so it never bleeds through.
+        # Cutscene colour/invert overlay — must sit on top of everything (tiles, actors,
+        # weather, dialogue) so fades and flash effects cover the full screen.
+        # draw_actors() was already called before the foreground tile layer above.
         if self.active_cutscene_runtime and not self.pause_menu.active:
-            colors = {'WHITE': (255, 255, 255), 'RED': (220, 60, 60)}
-            self.active_cutscene_runtime.draw_actors(self.logical_surface, self.camera, colors)
             w, h = self.logical_surface.get_size()
             self.active_cutscene_runtime.draw_overlay(self.logical_surface, w, h)
 
@@ -2306,15 +2414,30 @@ class Game:
         self._tile_change_hook_installed = True
 
     def invalidate_tile_cache(self, room_name: str = None):
-        """Drop baked tile surfaces so they rebuild on the next draw call.
+        """Mark a room's baked surface as stale.
 
-        Pass room_name=None to flush everything at once (e.g. after a full reload).
+        Actual eviction happens once per frame in _flush_dirty_tile_rooms(),
+        not immediately, so multiple on_tile_changed calls within the same
+        frame only trigger one rebuild instead of one per mouse-motion event.
         """
-        if room_name is None:
+        self._dirty_tile_rooms.add(room_name)  # None = flush everything
+
+    def _flush_dirty_tile_rooms(self):
+        """Evict stale baked surfaces exactly once per frame.
+
+        Call this at the top of the draw loop before any tile surface is
+        accessed so every draw pass works with fresh data without rebuilding
+        more than once regardless of how many events arrived this frame.
+        """
+        if not self._dirty_tile_rooms:
+            return
+        if None in self._dirty_tile_rooms:
             self._room_tile_surfaces.clear()
         else:
-            self._room_tile_surfaces.pop((room_name, True),  None)
-            self._room_tile_surfaces.pop((room_name, False), None)
+            for room in self._dirty_tile_rooms:
+                self._room_tile_surfaces.pop((room, True),  None)
+                self._room_tile_surfaces.pop((room, False), None)
+        self._dirty_tile_rooms.clear()
 
     def _build_room_tile_surface(self, room_name: str, bg: bool) -> pygame.Surface:
         """Pre-render all tiles for one layer into a single static Surface.
@@ -2468,7 +2591,7 @@ class Game:
                 )
                 if self.sprite_hud.hud_offset_y >= 0.0:
                     self.sprite_hud._hud_slide_in = False
-            self.sprite_hud.draw(self.logical_surface, self.player)
+            self.sprite_hud.draw(self.logical_surface, self.player, enemies=self.enemies, dt=dt)
 
         # Full-screen overlays for main menu and sub-screens.
         if self.ui.current_screen == 'main_menu':

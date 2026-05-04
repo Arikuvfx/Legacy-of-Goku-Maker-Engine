@@ -311,11 +311,42 @@ class ObjectEditor:
         # UI click detection
         self.ui_rects = {}
 
+        # Panel show/hide toggle (same pattern as EditorToolbar)
+        self.palette_visible = True
+        self._panel_tab_w = 18
+        self._panel_tab_h = 72
+        self._hover_panel_toggle = False
+
     def set_toolbar(self, toolbar):
         """Set the toolbar reference and pass it to sub-editors that need to hide it"""
         self.toolbar = toolbar
         # Pass toolbar to flying pad path editor so it can hide it during editing
         self.flying_pad_path_editor.set_toolbar(toolbar)
+
+    # -------------------------------------------------------------------------
+    # Panel show/hide tab
+    # -------------------------------------------------------------------------
+
+    def _panel_toggle_rect(self):
+        """Return the rect for the ◀/▶ tab that straddles the panel's left edge."""
+        tx = (self.palette_x - self._panel_tab_w) if self.palette_visible else (self.screen_width - self._panel_tab_w)
+        ty = self.palette_y + 150
+        return pygame.Rect(tx, ty, self._panel_tab_w, self._panel_tab_h)
+
+    def _draw_panel_toggle_tab(self, screen):
+        """Render the small ◀/▶ tab — always visible so the panel can be recalled."""
+        rect   = self._panel_toggle_rect()
+        bg     = self.colors['panel_light'] if self._hover_panel_toggle else self.colors['panel']
+        border = self.colors['accent']      if self._hover_panel_toggle else self.colors['grid']
+        pygame.draw.rect(screen, bg,     rect, border_radius=6)
+        pygame.draw.rect(screen, border, rect, 1, border_radius=6)
+        arrow = '◀' if self.palette_visible else '▶'
+        font  = self.font_small
+        label = font.render(
+            arrow, True,
+            self.colors['accent'] if self._hover_panel_toggle else self.colors['text_dim']
+        )
+        screen.blit(label, label.get_rect(center=rect.center))
 
     def _generate_variant_sprites(self):
         """Load or generate sprites for every object variant.
@@ -711,6 +742,8 @@ class ObjectEditor:
 
     def _is_in_palette(self, mouse_x, mouse_y):
         """Check if the mouse is hovering over the palette"""
+        if not self.palette_visible:
+            return False
         return (mouse_x >= self.palette_x and
                 mouse_y >= self.palette_y and
                 mouse_y <= self.palette_y + self.palette_height)
@@ -1208,6 +1241,11 @@ class ObjectEditor:
 
         # Right-click to delete objects
         if event.type == pygame.MOUSEBUTTONDOWN:
+            # Panel show/hide toggle — checked first so it always fires
+            if event.button == 1 and self._panel_toggle_rect().collidepoint(mouse_pos):
+                self.palette_visible = not self.palette_visible
+                return
+
             if event.button == 3:
                 if not self._is_in_palette(mouse_pos[0], mouse_pos[1]):
                     if self.hovered_object and self.hovered_object_type:
@@ -1799,6 +1837,14 @@ class ObjectEditor:
         if self.flying_pad_path_editor.active:
             return
 
+        # Update hover state and always draw the toggle tab
+        mx, my = pygame.mouse.get_pos()
+        self._hover_panel_toggle = self._panel_toggle_rect().collidepoint(mx, my)
+        self._draw_panel_toggle_tab(screen)
+
+        if not self.palette_visible:
+            return
+
         palette_rect = pygame.Rect(self.palette_x, self.palette_y, self.palette_width, self.palette_height)
         palette_bg = pygame.Surface((self.palette_width, self.palette_height), pygame.SRCALPHA)
         palette_bg.fill(self.colors['bg_transparent'])
@@ -2168,20 +2214,21 @@ class ObjectEditor:
 
             y_pos += 30
 
-            # One-shot toggle button
-            shot_label = self.font_medium.render("One-Shot:", True, self.colors['text'])
-            screen.blit(shot_label, (self.palette_x + self.palette_padding, y_pos))
+            # One-shot toggle — hidden while the dropdown list is open
+            if not self.cutscene_dropdown_open:
+                shot_label = self.font_medium.render("One-Shot:", True, self.colors['text'])
+                screen.blit(shot_label, (self.palette_x + self.palette_padding, y_pos))
 
-            btn_x = self.palette_x + self.palette_padding + 120
-            btn_rect = pygame.Rect(btn_x, y_pos - 3, 60, 22)
-            btn_color = self.colors['success'] if self.cutscene_one_shot else self.colors['panel']
-            pygame.draw.rect(screen, btn_color, btn_rect, border_radius=4)
-            pygame.draw.rect(screen, self.colors['accent'], btn_rect, 2, border_radius=4)
-            btn_text = self.font_small.render('ON' if self.cutscene_one_shot else 'OFF', True, self.colors['text'])
-            screen.blit(btn_text, btn_text.get_rect(center=btn_rect.center))
-            self.ui_rects['cutscene_oneshot_rect'] = btn_rect
+                btn_x = self.palette_x + self.palette_padding + 120
+                btn_rect = pygame.Rect(btn_x, y_pos - 3, 60, 22)
+                btn_color = self.colors['success'] if self.cutscene_one_shot else self.colors['panel']
+                pygame.draw.rect(screen, btn_color, btn_rect, border_radius=4)
+                pygame.draw.rect(screen, self.colors['accent'], btn_rect, 2, border_radius=4)
+                btn_text = self.font_small.render('ON' if self.cutscene_one_shot else 'OFF', True, self.colors['text'])
+                screen.blit(btn_text, btn_text.get_rect(center=btn_rect.center))
+                self.ui_rects['cutscene_oneshot_rect'] = btn_rect
 
-            y_pos += 30
+                y_pos += 30
 
         instructions = [
             "Click: Select Object",

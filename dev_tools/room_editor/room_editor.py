@@ -170,6 +170,10 @@ class RoomEditor:
         # same baked-surface path as gameplay instead of scaling every tile
         # every frame.  Falls back to the per-tile loop when None.
         self.blit_tiles_callback = None
+        # Wired by game.py to game._flush_dirty_tile_rooms so that deleted /
+        # painted tiles are evicted from the baked-surface cache before the
+        # very next draw call — even while the room editor owns the draw loop.
+        self.flush_tile_cache_callback = None
 
     @staticmethod
     def _load_icon(path, w, h):
@@ -1434,6 +1438,11 @@ class RoomEditor:
             tile_list = data['after'] if forward else data['before']
             self.tileset_editor.room_tiles[room] = [Tile.from_dict(t) for t in tile_list]
 
+            # Invalidate the baked tile surface so the change is visible immediately
+            # without needing to place another tile to trigger a cache rebuild.
+            if callable(getattr(self.tileset_editor, 'on_tile_changed', None)):
+                self.tileset_editor.on_tile_changed(room)
+
     def _readd_object(self, obj, obj_type: str, room_name: str):
         """Re-insert a previously deleted object back into the room (for undo/redo)."""
         if not self.object_editor:
@@ -2127,6 +2136,11 @@ class RoomEditor:
             return
 
         screen.fill((34, 139, 34))
+
+        # Flush any tiles invalidated by paint/erase this frame before reading
+        # the baked surface cache — ensures deletions are visible immediately.
+        if callable(self.flush_tile_cache_callback):
+            self.flush_tile_cache_callback()
 
         # Background tiles — use baked surface if available (O(1) blit),
         # fall back to per-tile loop only when the callback isn't wired.

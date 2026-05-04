@@ -374,6 +374,11 @@ class CutsceneRuntime:
         self._weather_fade_dur     = 0.0
         self._weather_fade_elapsed = 0.0
 
+        # Room-change callback — set by the caller (e.g. game.py) after construction
+        # so the runtime can request a room transition without importing game state.
+        # Signature: on_change_room(room_name: str, spawn_x: None, spawn_y: None)
+        self.on_change_room = None
+
         # Auto-weather: set via the top-level "weather" key in the cutscene JSON.
         # The runtime handles the full fade-in/out lifecycle automatically so
         # designers don't need to add timeline actions for it. Fade-in fires
@@ -507,8 +512,19 @@ class CutsceneRuntime:
             self.finished = True
 
     def draw_actors(self, screen, camera, colors):
-        """Draw all cutscene actors. Call this after the room tile layers."""
-        for actor in self.actors.values():
+        """Draw all cutscene actors in Y-sorted order.
+
+        Actors are sorted by their ground Y position (bottom-to-top) so
+        entities higher on screen (smaller Y) draw behind those lower on
+        screen (larger Y), matching the LayerManager's depth behaviour.
+
+        IMPORTANT: call this BEFORE blitting the foreground tile layer so
+        that foreground tiles (trees, buildings — tile.layer >= 0) correctly
+        occlude actors that stand behind them.  draw_overlay() is still
+        called last.
+        """
+        sorted_actors = sorted(self.actors.values(), key=lambda a: a.entity.y)
+        for actor in sorted_actors:
             actor.draw(screen, camera, colors)
 
     def draw_weather(self, screen, screen_width, screen_height):
@@ -994,16 +1010,22 @@ class CutsceneRuntime:
                 )
 
     def _do_room(self, atype, params):
-        """Handle 'room' target actions (background layer scroll).
+        """Handle 'room' target actions.
 
-        scroll      — begin looping the bg tile layer at speed px/s in direction.
-        scroll_stop — freeze the bg layer at its current offset.
+        change_room — immediately transition to a different room.
+                      Calls self.on_change_room(room_name, None, None)
+                      if the callback has been wired up by the host (game.py).
 
-        Suppressed during seek() — the post-loop block recomputes the offset
-        analytically and restores the live velocity.
+        All actions are suppressed during seek() replay — the post-loop block
+        handles any state that needs to be recomputed analytically at t.
         """
         if getattr(self, '_seeking', False):
             return
+
+        if atype == 'change_room':
+            room_name = params.get('room_name', '').strip()
+            if room_name and callable(self.on_change_room):
+                self.on_change_room(room_name, None, None)
 
     def _do_screen(self, atype, params):
         if atype == 'fade_out':
