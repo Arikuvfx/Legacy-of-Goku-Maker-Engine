@@ -10,6 +10,7 @@ from objects.level_gate import LevelGate, LevelGateManager
 from objects.room_transition import RoomTransition, RoomTransitionManager, TransitionConfigDialog
 from objects.flying_pad import FlyingPad, FlyingPadManager
 from objects.save_point import SavePoint, SavePointManager
+from objects.world_map import WorldMapObject, WorldMapObjectManager
 from objects.cutscene_trigger import CutsceneTrigger, CutsceneTriggerManager, draw_cutscene_trigger
 from dev_tools.room_editor.room_editor_tools.flying_pad_path_editor import FlyingPadPathEditor
 
@@ -105,6 +106,9 @@ class ObjectEditor:
         self.save_point_manager = SavePointManager()
         self.on_save_point_placed = None
         self.on_save_point_deleted = None
+        self.world_map_manager = WorldMapObjectManager()
+        self.on_world_map_placed = None
+        self.on_world_map_deleted = None
 
         # ── Cutscene triggers ─────────────────────────────────────────────────
         self.cutscene_trigger_manager = CutsceneTriggerManager()
@@ -119,6 +123,11 @@ class ObjectEditor:
         self.cutscene_one_shot = True
         self.cutscene_dropdown_open = False     # whether the dropdown list is visible
         self.cutscene_dropdown_names = []       # cached list of cutscene file names
+
+        # ── World map selection ───────────────────────────────────────────────
+        self.world_map_name_text = ""           # stem of the selected world map JSON
+        self.world_map_dropdown_open = False    # whether the map-name dropdown is open
+        self.world_map_dropdown_names = []      # cached list of world map stems
 
         self.hovered_object = None        # object under the cursor (for deletion highlight)
         self.hovered_object_type = None
@@ -135,28 +144,28 @@ class ObjectEditor:
 
         # ── Variant definitions ───────────────────────────────────────────────
         self.stone_variants = [
-            {'type': 'small', 'name': 'Small', 'width': 16, 'height': 16},
-            {'type': 'medium', 'name': 'Medium', 'width': 24, 'height': 24},
-            {'type': 'big', 'name': 'Big', 'width': 32, 'height': 32}
+            {'type': 'small', 'name': 'Small', 'width': 16, 'height': 16, 'sprite': None},
+            {'type': 'medium', 'name': 'Medium', 'width': 24, 'height': 24, 'sprite': None},
+            {'type': 'big', 'name': 'Big', 'width': 32, 'height': 32, 'sprite': None}
         ]
 
         self.gate_variants = [
-            {'type': 'stone', 'name': 'Stone'},
-            {'type': 'wood', 'name': 'Wood'},
-            {'type': 'makeshift wood', 'name': 'Makeshift'},
-            {'type': 'stone formation', 'name': 'Formation'},
-            {'type': 'metal', 'name': 'Metal'}
+            {'type': 'stone', 'name': 'Stone', 'sprite': None},
+            {'type': 'wood', 'name': 'Wood', 'sprite': None},
+            {'type': 'makeshift wood', 'name': 'Makeshift', 'sprite': None},
+            {'type': 'stone formation', 'name': 'Formation', 'sprite': None},
+            {'type': 'metal', 'name': 'Metal', 'sprite': None}
         ]
 
         self.flying_pad_variants = [
-            {'type': 'stone1', 'name': 'Stone1'},
-            {'type': 'stone2', 'name': 'Stone2'},
-            {'type': 'gras', 'name': 'Gras'},
-            {'type': 'cracked', 'name': 'Cracked'},
-            {'type': 'trunk', 'name': 'Trunk'},
-            {'type': 'kami', 'name': 'Kami'},
-            {'type': 'ice', 'name': 'Ice'},
-            {'type': 'buu', 'name': 'Buu'}
+            {'type': 'stone1', 'name': 'Stone1', 'sprite': None},
+            {'type': 'stone2', 'name': 'Stone2', 'sprite': None},
+            {'type': 'gras', 'name': 'Gras', 'sprite': None},
+            {'type': 'cracked', 'name': 'Cracked', 'sprite': None},
+            {'type': 'trunk', 'name': 'Trunk', 'sprite': None},
+            {'type': 'kami', 'name': 'Kami', 'sprite': None},
+            {'type': 'ice', 'name': 'Ice', 'sprite': None},
+            {'type': 'buu', 'name': 'Buu', 'sprite': None}
         ]
 
         self.categories = {
@@ -205,10 +214,24 @@ class ObjectEditor:
                     'object_type': 'save_point',
                     'has_variants': True,
                     'variants': [
-                        {'type': 'big', 'name': 'Big Save Point', 'width': 64, 'height': 52},
-                        {'type': 'small', 'name': 'Small Save Point', 'width': 32, 'height': 27}
+                        {'type': 'big', 'name': 'Big Save Point', 'width': 64, 'height': 52, 'sprite': None},
+                        {'type': 'small', 'name': 'Small Save Point', 'width': 32, 'height': 27, 'sprite': None}
                     ],
                     'default_variant': 'big'
+                },
+                {
+                    'id': 'world_map_object',
+                    'name': 'World Map',
+                    'sprite': None,
+                    'width': 32,
+                    'height': 37,
+                    'object_type': 'world_map_object',
+                    'has_variants': True,
+                    'variants': [
+                        {'type': 'world_map',      'name': 'World Map',      'width': 32, 'height': 37, 'sprite': None},
+                        {'type': 'world_map_sign', 'name': 'World Map Sign', 'width': 29, 'height': 32, 'sprite': None},
+                    ],
+                    'default_variant': 'world_map'
                 }
             ],
             'Structures': [
@@ -329,8 +352,9 @@ class ObjectEditor:
 
     def _panel_toggle_rect(self):
         """Return the rect for the ◀/▶ tab that straddles the panel's left edge."""
-        tx = (self.palette_x - self._panel_tab_w) if self.palette_visible else (self.screen_width - self._panel_tab_w)
-        ty = self.palette_y + 150
+        gap = 6
+        tx = (self.palette_x - self._panel_tab_w - gap) if self.palette_visible else (self.screen_width - self._panel_tab_w)
+        ty = self.palette_y + (self.palette_height - self._panel_tab_h) // 2
         return pygame.Rect(tx, ty, self._panel_tab_w, self._panel_tab_h)
 
     def _draw_panel_toggle_tab(self, screen):
@@ -381,13 +405,18 @@ class ObjectEditor:
 
                     elif obj['object_type'] == 'level_gate':
                         gate = LevelGate(0, 0, variant['type'], 1)
+                        # Store per-variant dimensions so the preview scales correctly
+                        # (stone formation is 71×68, all others are 32×32)
+                        variant['width']  = gate.width
+                        variant['height'] = gate.height
                         if gate.sprite:
                             variant['sprite'] = gate.sprite.copy()
                         else:
                             # Fallback placeholder
-                            sprite = pygame.Surface((32, 32), pygame.SRCALPHA)
+                            w, h = gate.width, gate.height
+                            sprite = pygame.Surface((w, h), pygame.SRCALPHA)
                             sprite.fill((100, 100, 100))
-                            pygame.draw.rect(sprite, (0, 0, 0), (0, 0, 32, 32), 2)
+                            pygame.draw.rect(sprite, (0, 0, 0), (0, 0, w, h), 2)
                             variant['sprite'] = sprite
 
                     elif obj['object_type'] == 'flying_pad':
@@ -452,6 +481,26 @@ class ObjectEditor:
                                 pygame.draw.circle(sprite, color, (center_x, center_y), radius)
                                 pygame.draw.circle(sprite, (255, 255, 200), (center_x, center_y), radius, 2)
 
+                            variant['sprite'] = sprite
+
+                    elif obj['object_type'] == 'world_map_object':
+                        variant_type = variant['type']
+                        try:
+                            sprite_path = f'assets/objects/world_map/{variant_type}.png'
+                            sprite = pygame.image.load(sprite_path).convert_alpha()
+                            # Derive world-unit size directly from pixel dimensions —
+                            # draw() will multiply by RENDER_SCALE, so no division here.
+                            variant['width']  = sprite.get_width()
+                            variant['height'] = sprite.get_height()
+                            variant['sprite'] = sprite
+                        except Exception:
+                            # Asset not on disk yet — use a brown/tan placeholder
+                            w = variant.get('width', 32)
+                            h = variant.get('height', 32)
+                            sprite = pygame.Surface((w, h), pygame.SRCALPHA)
+                            color = (101, 67, 33) if variant_type == 'world_map_sign' else (139, 90, 43)
+                            sprite.fill(color)
+                            pygame.draw.rect(sprite, (0, 0, 0), (0, 0, w, h), 2)
                             variant['sprite'] = sprite
 
                 # Set the main object sprite to the default variant
@@ -519,6 +568,7 @@ class ObjectEditor:
             self.preview_cutscene_trigger = None
             self.cutscene_id_input_active = False
             self.cutscene_dropdown_open = False
+            self.world_map_dropdown_open = False
 
     def _get_current_variant(self, obj):
         """Get the currently selected variant for an object"""
@@ -596,6 +646,12 @@ class ObjectEditor:
             distance = ((save_point.x - world_x) ** 2 + (save_point.y - world_y) ** 2) ** 0.5
             if distance < max(save_point.width, save_point.height) / 2:
                 return save_point, 'save_point'
+
+        # Check world map objects
+        for obj in self.world_map_manager.get_objects(self.current_room_name):
+            distance = ((obj.x - world_x) ** 2 + (obj.y - world_y) ** 2) ** 0.5
+            if distance < max(obj.width, obj.height) / 2:
+                return obj, 'world_map_object'
 
         # Check cutscene triggers
         triggers = self.cutscene_trigger_manager.get_triggers(self.current_room_name)
@@ -685,6 +741,15 @@ class ObjectEditor:
 
             if hasattr(self, 'on_save_point_deleted') and self.on_save_point_deleted:
                 self.on_save_point_deleted(obj)
+
+        elif obj_type == 'world_map_object':
+            self.world_map_manager.remove_object(self.current_room_name, obj)
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(self.current_room_name)
+                if room and hasattr(room, 'world_map_objects') and obj in room.world_map_objects:
+                    room.world_map_objects.remove(obj)
+            if self.on_world_map_deleted:
+                self.on_world_map_deleted(obj, self.current_room_name)
 
         elif obj_type == 'cutscene_trigger':
             self.cutscene_trigger_manager.remove_trigger(obj)
@@ -898,6 +963,24 @@ class ObjectEditor:
             if self.on_save_point_placed:
                 self.on_save_point_placed(save_point)
 
+        elif self.selected_object.get('object_type') == 'world_map_object':
+            variant = self.selected_variant or self._get_current_variant(self.selected_object)
+            variant_type = variant['type'] if variant and 'type' in variant else 'world_map'
+            map_name = self.world_map_name_text if variant_type == 'world_map' else ''
+
+            obj = WorldMapObject(int(self.preview_x), int(self.preview_y), variant_type, map_name)
+            self.world_map_manager.add_object(room_name, obj)
+
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(room_name)
+                if room:
+                    if not hasattr(room, 'world_map_objects'):
+                        room.world_map_objects = []
+                    room.world_map_objects.append(obj)
+
+            if self.on_world_map_placed:
+                self.on_world_map_placed(obj, room_name)
+
         elif self.selected_object.get('object_type') == 'level_gate':
             # Get selected variant or default
             variant = self.selected_variant or self._get_current_variant(self.selected_object)
@@ -1015,9 +1098,10 @@ class ObjectEditor:
         spawn_height = getattr(self.pending_transition_for_spawn, 'spawn_height',
                                self.pending_transition_for_spawn.height)
 
-        # preview coords are world-center; the transition object stores top-left
-        spawn_x = int(self.transition_spawn_preview_x) - spawn_width // 2
-        spawn_y = int(self.transition_spawn_preview_y) - spawn_height // 2
+        # preview coords are world-center; convert to top-left for storage
+        # so the transition controller can compute the center as spawn_x + spawn_width // 2.
+        spawn_x = int(self.transition_spawn_preview_x - spawn_width // 2)
+        spawn_y = int(self.transition_spawn_preview_y - spawn_height // 2)
 
         self.pending_transition_for_spawn.spawn_x = spawn_x
         self.pending_transition_for_spawn.spawn_y = spawn_y
@@ -1083,6 +1167,14 @@ class ObjectEditor:
             return sorted(
                 f[:-5] for f in os.listdir(cutscene_dir) if f.endswith('.json')
             )
+        except FileNotFoundError:
+            return []
+
+    def _get_world_map_names(self):
+        """Return a sorted list of world map stems from assets/world_maps/*.json."""
+        save_dir = os.path.join('assets', 'world_maps')
+        try:
+            return sorted(f[:-5] for f in os.listdir(save_dir) if f.endswith('.json'))
         except FileNotFoundError:
             return []
 
@@ -1300,6 +1392,30 @@ class ObjectEditor:
                         self.cutscene_one_shot = not self.cutscene_one_shot
                         return
 
+                # Handle world map dropdown clicks
+                if (self.selected_object and isinstance(self.selected_object, dict)
+                        and self.selected_object.get('object_type') == 'world_map_object'):
+                    current_variant = self._get_current_variant(self.selected_object)
+                    if current_variant and current_variant.get('type') == 'world_map':
+                        # Dropdown button — toggle open/closed
+                        wm_btn = self.ui_rects.get('world_map_dropdown_btn')
+                        if wm_btn and wm_btn.collidepoint(mouse_pos):
+                            self.world_map_dropdown_open = not self.world_map_dropdown_open
+                            if self.world_map_dropdown_open:
+                                self.world_map_dropdown_names = self._get_world_map_names()
+                            return
+
+                        # Item inside open dropdown list
+                        if self.world_map_dropdown_open:
+                            for item_rect, name in self.ui_rects.get('world_map_dropdown_items', []):
+                                if item_rect.collidepoint(mouse_pos):
+                                    self.world_map_name_text = name
+                                    self.world_map_dropdown_open = False
+                                    return
+                            # Click outside list — close without selecting
+                            self.world_map_dropdown_open = False
+                            return
+
                 # Check if clicking on variant selector
                 if self._is_variant_selector_clicked(mouse_pos):
                     return
@@ -1387,6 +1503,18 @@ class ObjectEditor:
                 elif self.placing_transition:
                     self.placing_transition = False
                     self.preview_transition = None
+                elif self.placing_transition_spawn:
+                    self.placing_transition_spawn = False
+                    self.transition_spawn_source_room = None
+                    self.pending_transition_for_spawn = None
+                elif self.selected_object is not None:
+                    # Deselect first — a second ESC will then close the editor.
+                    # This also prevents the room editor's re-activation guard from
+                    # immediately re-opening the panel on the next frame.
+                    self.selected_object = None
+                    self.selected_variant = None
+                    self.hovered_object = None
+                    self.hovered_object_type = None
                 else:
                     self.active = False
 
@@ -1406,11 +1534,16 @@ class ObjectEditor:
         self.mouse_world_y = (mouse_pos[1] + camera_y) / RENDER_SCALE
 
         if self.placing_transition_spawn:
-            if self.grid_snap:
-                grid_x = int(self.mouse_world_x / TILE_SIZE) * TILE_SIZE + TILE_SIZE // 2
-                grid_y = int(self.mouse_world_y / TILE_SIZE) * TILE_SIZE + TILE_SIZE // 2
-                self.transition_spawn_preview_x = grid_x
-                self.transition_spawn_preview_y = grid_y
+            if self.grid_snap and self.pending_transition_for_spawn:
+                spawn_width = getattr(self.pending_transition_for_spawn, 'spawn_width',
+                                      getattr(self.pending_transition_for_spawn, 'width', 32))
+                spawn_height = getattr(self.pending_transition_for_spawn, 'spawn_height',
+                                       getattr(self.pending_transition_for_spawn, 'height', 32))
+                # Snap top-left to tile grid, then convert to center for the preview system
+                grid_x = int(self.mouse_world_x / TILE_SIZE) * TILE_SIZE
+                grid_y = int(self.mouse_world_y / TILE_SIZE) * TILE_SIZE
+                self.transition_spawn_preview_x = grid_x + spawn_width // 2
+                self.transition_spawn_preview_y = grid_y + spawn_height // 2
             else:
                 self.transition_spawn_preview_x = self.mouse_world_x
                 self.transition_spawn_preview_y = self.mouse_world_y
@@ -1842,6 +1975,10 @@ class ObjectEditor:
         self._hover_panel_toggle = self._panel_toggle_rect().collidepoint(mx, my)
         self._draw_panel_toggle_tab(screen)
 
+        # Always draw the transition config dialog — it must be visible even
+        # when the palette panel is hidden (user closed panel to place freely).
+        self.transition_config.draw(screen)
+
         if not self.palette_visible:
             return
 
@@ -1917,7 +2054,6 @@ class ObjectEditor:
 
         self._draw_variant_selector(screen)
         self._draw_settings_panel(screen)
-        self.transition_config.draw(screen)
 
     def _draw_object_item(self, screen, obj, x, y):
         """Draw a single object in the palette"""
@@ -1943,13 +2079,14 @@ class ObjectEditor:
         pygame.draw.rect(screen, border_color, item_rect, border_width, border_radius=5)
 
         if obj['sprite']:
-            sprite = obj['sprite'].copy()
-
+            src = obj['sprite']
+            sw, sh = src.get_size()
+            max_dim = self.item_size - 8  # 8px padding on each axis
+            scale = min(max_dim / sw, max_dim / sh)
+            scaled = pygame.transform.scale(src, (max(1, int(sw * scale)), max(1, int(sh * scale))))
             if is_disabled:
-                sprite.fill((100, 100, 100, 150), special_flags=pygame.BLEND_RGBA_MULT)
-
-            sprite_rect = sprite.get_rect(center=item_rect.center)
-            screen.blit(sprite, sprite_rect)
+                scaled.fill((100, 100, 100, 150), special_flags=pygame.BLEND_RGBA_MULT)
+            screen.blit(scaled, scaled.get_rect(center=item_rect.center))
 
         name_color = self.colors['disabled'] if is_disabled else self.colors['text_dim']
         name_text = self.font_small.render(obj['name'], True, name_color)
@@ -2081,6 +2218,15 @@ class ObjectEditor:
         for save_point in save_points:
             if save_point.active:
                 save_point.draw(screen, temp_camera, colors)
+
+    def draw_world_map_objects(self, screen, camera_x, camera_y, colors):
+        """Draw world map objects in the current room."""
+        if not self.current_room_name:
+            return
+        temp_camera = self._make_camera(camera_x, camera_y)
+        for obj in self.world_map_manager.get_objects(self.current_room_name):
+            if obj.active:
+                obj.draw(screen, temp_camera, colors)
 
     def draw_cutscene_triggers(self, screen, camera_x, camera_y):
         """Draw all cutscene trigger zones in the current room (dev mode only)."""
@@ -2227,6 +2373,65 @@ class ObjectEditor:
                 btn_text = self.font_small.render('ON' if self.cutscene_one_shot else 'OFF', True, self.colors['text'])
                 screen.blit(btn_text, btn_text.get_rect(center=btn_rect.center))
                 self.ui_rects['cutscene_oneshot_rect'] = btn_rect
+
+                y_pos += 30
+
+        if (self.selected_object and isinstance(self.selected_object, dict)
+                and self.selected_object.get('object_type') == 'world_map_object'):
+            current_variant = self._get_current_variant(self.selected_object)
+            if current_variant and current_variant.get('type') == 'world_map':
+                map_label = self.font_medium.render("Map:", True, self.colors['text'])
+                screen.blit(map_label, (self.palette_x + self.palette_padding, y_pos))
+
+                # ── Dropdown button ───────────────────────────────────────────
+                btn_x = self.palette_x + self.palette_padding + 120
+                btn_rect = pygame.Rect(btn_x, y_pos - 3, 200, 25)
+                btn_bg = self.colors['input_active'] if self.world_map_dropdown_open else self.colors['input_bg']
+                pygame.draw.rect(screen, btn_bg, btn_rect)
+                pygame.draw.rect(screen,
+                                 self.colors['accent'] if self.world_map_dropdown_open else self.colors['grid'],
+                                 btn_rect, 2)
+
+                display_label = self.world_map_name_text if self.world_map_name_text else '<select map>'
+                label_surf = self.font_small.render(display_label, True, self.colors['text'])
+                label_clip = pygame.Rect(btn_rect.x + 4, btn_rect.y, btn_rect.w - 20, btn_rect.h)
+                screen.set_clip(label_clip)
+                screen.blit(label_surf, (btn_rect.x + 4, btn_rect.y + 6))
+                screen.set_clip(None)
+
+                arrow_x = btn_rect.right - 14
+                arrow_y = btn_rect.centery
+                arrow_pts = [(arrow_x, arrow_y - 4), (arrow_x + 8, arrow_y - 4), (arrow_x + 4, arrow_y + 4)]
+                pygame.draw.polygon(screen, self.colors['text_dim'], arrow_pts)
+
+                self.ui_rects['world_map_dropdown_btn'] = btn_rect
+
+                # ── Open dropdown list ────────────────────────────────────────
+                if self.world_map_dropdown_open:
+                    names = self.world_map_dropdown_names
+                    item_h = 22
+                    list_h = max(item_h, len(names) * item_h)
+                    list_rect = pygame.Rect(btn_rect.x, btn_rect.bottom, btn_rect.w, list_h)
+
+                    list_bg = pygame.Surface((list_rect.w, list_rect.h), pygame.SRCALPHA)
+                    list_bg.fill((30, 30, 45, 240))
+                    screen.blit(list_bg, list_rect.topleft)
+                    pygame.draw.rect(screen, self.colors['accent'], list_rect, 1)
+
+                    self.ui_rects['world_map_dropdown_items'] = []
+                    if not names:
+                        empty_surf = self.font_small.render('<no maps found>', True, self.colors['text_dark'])
+                        screen.blit(empty_surf, (list_rect.x + 4, list_rect.y + 4))
+                    else:
+                        for i, name in enumerate(names):
+                            item_rect = pygame.Rect(list_rect.x, list_rect.y + i * item_h, list_rect.w, item_h)
+                            is_sel = name == self.world_map_name_text
+                            if is_sel:
+                                pygame.draw.rect(screen, self.colors['variant_selected'], item_rect)
+                            item_surf = self.font_small.render(name, True,
+                                                               self.colors['text'] if is_sel else self.colors['text_dim'])
+                            screen.blit(item_surf, (item_rect.x + 6, item_rect.y + 4))
+                            self.ui_rects['world_map_dropdown_items'].append((item_rect, name))
 
                 y_pos += 30
 

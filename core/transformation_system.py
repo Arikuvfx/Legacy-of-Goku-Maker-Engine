@@ -170,6 +170,14 @@ class TransformationSystem:
             self.is_untransforming = True
             self.is_transformed = False
 
+            # Cancel any in-progress attack. If a melee/blast was started in the
+            # same frame that ki hits 0, start_untransform() will overwrite
+            # current_animation_state before the melee branch can clear
+            # is_attacking — leaving the player permanently frozen. Clearing it
+            # here (and again in complete_untransform as a safety net) prevents that.
+            self.player.is_attacking = False
+            self.player.pending_blast = None
+
             # Set untransform animation
             self.player.sprite.set_animation('untransform', self.player.direction)
             self.player.current_animation_state = 'untransform'
@@ -181,6 +189,11 @@ class TransformationSystem:
         """
         if self.is_untransforming:
             self.is_untransforming = False
+
+            # Safety net: ensure is_attacking is cleared even if start_untransform
+            # interrupted a melee/blast mid-animation (would otherwise freeze movement).
+            self.player.is_attacking = False
+            self.player.pending_blast = None
 
             # Restore original sprite sheets
             from core.sprite_system import create_character_sprite

@@ -1,6 +1,19 @@
+"""
+game.py — Top-level Game class and entry point.
+
+Coordinates every subsystem: rendering, audio, input, room loading, entity AI,
+cutscenes, save/load, and the full dev-tooling layer. Cross-system calls route
+through Game rather than between subsystems directly.
+
+Boot sequence:  pygame.init → build all subsystems → create default room → run()
+Main loop:      handle_events → update → draw → clock.tick(FPS)
+"""
+
 import sys
 import math
 import time
+
+# ── Game subsystems — import order follows dependency depth ────────────────────
 from attacks import Projectile
 from config.settings import *
 from core.camera import Camera
@@ -36,6 +49,7 @@ from ui.character_switch_menu import CharacterSwitchMenu
 from ui.pause_menu import PauseMenu
 from dev_tools.room_editor.room_editor_tools.mission_manager import MissionManager
 from dev_tools.cutscene_editor import CutsceneEditor
+from dev_tools.world_map_editor import WorldMapEditor
 
 
 # Tell Windows this process is DPI-aware so it reports the true screen resolution.
@@ -138,6 +152,8 @@ class Game:
         self.npc_config_menu      = NPCConfigMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.sprite_editor        = SpriteEditor(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.transition_config_menu = TransitionConfigMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.world_map_editor = WorldMapEditor(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.world_map_editor.room_manager = self.room_manager
         self.cutscene_editor = CutsceneEditor(
             self.room_manager,
             self.room_editor,
@@ -161,6 +177,41 @@ class Game:
         self._csf_speed   = 255.0 / _FADE_DUR      # alpha units per second
         self._csf_pending = None
 
+        # Map-jump screen fade — begins once the player drifts fully off the top
+        # of the camera view.  Separate from _csf_* so cutscenes are unaffected.
+        # _mjf_ prefix = ‘map-jump fly’; every flying-sequence variable lives here.
+        self._mjf_alpha  = 0.0
+        self._mjf_active = False
+        self._MJF_SPEED  = 255.0 / 1.5   # full black in 1.5 s
+
+        # World-map flying sequence — activated after the map-jump fade-out.
+        #   _mjf_state:  None | 'pending_fade_in' | 'fade_in' | 'flying'
+        #   'pending_fade_in' — player has exited; waiting for alpha to hit 255
+        #   'fade_in'         — alpha counting back down to 0 over the flying scene
+        #   'flying'          — fully visible; player steers the flying sprite
+        self._mjf_state              = None
+        self._MJF_FADE_IN_SPEED      = 255.0 / 0.8   # fade in over 0.8 s
+        self._MJF_FLY_SPEED          = 400            # screen-pixels / second
+        self._mjf_fly_x              = 0.0            # screen-space centre X of flying sprite
+        self._mjf_fly_y              = 0.0            # screen-space centre Y of flying sprite
+        self._mjf_cam_x              = 0.0            # world-space camera X in texture pixels
+        self._mjf_cam_y              = 0.0            # world-space camera Y in texture pixels
+        self._mjf_cam_angle          = 0.0            # viewing angle in radians (Mode 7 rotation)
+        self._mjf_altitude           = 0.5            # normalised altitude: 0.0 = low, 1.0 = high
+        self._mjf_flying_frames: list = []            # raw pygame Surfaces (one per frame)
+        self._mjf_flying_frame_idx   = 0
+        self._mjf_flying_frame_timer = 0.0
+        self._MJF_FLY_FRAME_DUR      = 0.12           # seconds per animation frame
+        # Focal length for the Mode 7 ground plane.
+        # Controls the perceived camera altitude / viewing angle.
+        # Lower  → shallower angle, strong perspective (ground rushes toward horizon).
+        # Higher → steeper angle, flatter look (more overhead / top-down).
+        # The horizon line (horizon_y) is set independently and is never affected.
+        self._MJF_FOCAL              = 160   # default ≈ 80 px
+        self._MJF_HORIZON_OFFSET     = 2
+        # Max upward pixel shift at the horizon (curvature effect). 0 = flat plane.
+        self._MJF_CURVATURE          = 100
+
         # ── Active game-object lists ──────────────────────────────────────────
         self.projectiles          = []
         self.melee_attacks        = []
@@ -176,6 +227,7 @@ class Game:
         self.room_transitions     = []
         self.level_gates          = []
         self.flying_pads          = []
+        self.world_map_objects = []
 
         # ── Performance caches ────────────────────────────────────────────────
         # key: (room_name, is_background) → pre-baked tile Surface
@@ -183,6 +235,7 @@ class Game:
         self._dirty_tile_rooms:   set  = set()   # rooms pending a surface rebuild
         # key: font_size → pygame.Font  (avoids allocating a Font every frame)
         self._font_cache: dict = {}
+        self._scaled_tile_cache: dict = {}
 
         # ── Save point system ─────────────────────────────────────────────────
         self.save_points           = []
@@ -192,6 +245,7 @@ class Game:
         self.pause_menu            = PauseMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.play_time             = 0.0   # total seconds spent in gameplay
         self.nearby_save_point     = None
+        self.nearby_world_map_obj  = None   # WorldMapObject the player can currently interact with
 
         # ── Test mode ─────────────────────────────────────────────────────────
         # Prevents save operations while a room is being previewed live.
@@ -391,6 +445,10 @@ class Game:
                 self.cutscene_editor.handle_input(event)
                 continue
 
+            if self.world_map_editor.active:
+                self.world_map_editor.handle_input(event)
+                continue
+
             if self.room_editor.active:
                 result = self.room_editor.handle_input(event)
                 if result and result.startswith('test_room:'):
@@ -413,6 +471,9 @@ class Game:
                 elif result == 'open_cutscene_editor':
                     self.dev_menu.active = False
                     self.cutscene_editor.toggle()
+                elif result == 'open_world_map_editor':
+                    self.dev_menu.active = False
+                    self.world_map_editor.toggle()
                 continue
 
             # ── Normal gameplay input ─────────────────────────────────────────
@@ -435,7 +496,19 @@ class Game:
                             self.player.stop_beam()
 
     def _handle_game_keydown(self, event):
-        """Key-down events during normal gameplay."""
+        """Key-down events during normal gameplay.
+
+        Keybindings at a glance:
+          F1      — dev menu toggle
+          F2      — exit test mode (returns to room editor)
+          ESC     — pause menu
+          Arrows  — move; double-tap a direction to start running
+          Shift   — hold to run
+          E       — interact / melee / advance dialogue
+          Q       — ki blast (blast mode) or begin beam charge (beam mode)
+          TAB     — cycle ki mode: blast → beam → transform → blast
+          X       — trigger transformation (transform mode, when fully charged)
+        """
         if event.key == pygame.K_F1:
             self.dev_menu.toggle()
 
@@ -491,11 +564,19 @@ class Game:
         # Don't allow interact while a flying sequence is in progress.
         if self.flying_controller.is_active():
             return
+        if self._mjf_state in ('pending_fade_in', 'fade_in', 'flying',
+                               'landing_fade_out', 'landing_fade_in'):
+            return
 
         # Save point takes top priority.
         if self.nearby_save_point and not self.dialogue_box.active and not self.save_point_menu.active:
             if self.nearby_save_point.variant == 'big':
                 self.save_point_menu.open()
+            return
+
+        # World-map object — start the jump sequence.
+        if self.nearby_world_map_obj and self.player.can_act():
+            self._start_map_jump()
             return
 
         # Begin talking to a nearby NPC.
@@ -523,8 +604,91 @@ class Game:
                 self.melee_attacks.append(melee)
                 self.sound_manager.play_sfx('punch')
 
+    def _start_map_jump(self):
+        """Kick off the world-map jump sequence for the player.
+
+        Determines the correct costume (base or ssj) so the sprite system
+        loads map_jump.png from the right character folder, then delegates
+        the actual animation / movement to player.start_map_jump().
+        The on_map_jump_exit callback is wired here so game.py handles the
+        scene transition once the player is fully off-screen.
+        """
+        # Remember which world map this object points to so the Mode7 renderer
+        # can load the correct tile map instead of the default PNG.
+        new_map_name = getattr(self.nearby_world_map_obj, 'map_name', '') or ''
+        if getattr(self, '_active_world_map_name', None) != new_map_name:
+            # Map changed — bust the texture cache so it re-renders from the new map.
+            self._active_world_map_name = new_map_name
+            for attr in ('_world_map_texture', '_world_map_tex_arr', '_wm_locations'):
+                if hasattr(self, attr):
+                    delattr(self, attr)
+        # Derive the current form so the sprite loader picks the right folder.
+        ts      = self.player.transformation
+        costume = 'ssj' if (ts and ts.is_transformed) else 'base'
+
+        # If the player's sprite isn't already on the right costume sheet, swap
+        # it now so map_jump.png is loaded from the correct directory.
+        if getattr(self.player, 'costume', 'base') != costume:
+            from core.sprite_system import create_character_sprite
+            self.player.sprite  = create_character_sprite(
+                self.player.character, costume, 32, 32)
+            self.player.costume = costume
+
+        def _on_exit():
+            """Called when the player drifts fully off the top of the screen.
+
+            Load the character-specific flying sprite and transition the game
+            into the world-map flying sequence.  If the black fade is already
+            complete we can start fading back in immediately; otherwise mark
+            'pending_fade_in' so the update loop waits for full black first.
+            """
+            self._load_map_fly_sprite()
+            # Place the flying sprite at screen-centre, slightly below mid.
+            self._mjf_fly_x = SCREEN_WIDTH  / 2
+            self._mjf_fly_y = SCREEN_HEIGHT * 0.65
+            # Neutral cam seed — the pin correction below overwrites this.
+            # Do NOT derive from the cached texture: on re-entry the texture
+            # still exists and tex.width/2 would place the camera at the map
+            # centre instead of above the correct location pin.
+            self._mjf_cam_x = 0.0
+            self._mjf_cam_y = 0.0
+            # Always reset to mid-altitude so the player doesn't re-enter at
+            # ground level after having descended to land on the previous visit.
+            self._mjf_altitude = 0.5
+            # Signal that the pin correction must run on the next draw tick.
+            # Using a flag (rather than relying on the texture lazy-load block)
+            # ensures the correction fires even when the texture is already cached.
+            self._mjf_needs_pin_correction = True
+            # Record which room we came from so the draw path can reposition
+            # the camera to the matching location pin.
+            self._mjf_origin_room = self.current_room.name if self.current_room else ''
+            if self._mjf_alpha >= 255.0:
+                self._mjf_state  = 'fade_in'
+                self._mjf_active = False
+            else:
+                self._mjf_state = 'pending_fade_in'
+            # Reset the player sprite so it doesn't stay frozen on the
+            # map_jump frame while the screen is still visible.
+            self.player.sprite.set_animation('idle', self.player.direction)
+            self.player.current_animation_state = 'idle'
+
+        self.player.on_map_jump_exit = _on_exit
+        self.camera.locked = True
+        # Reset the fade so a repeated jump always starts from transparent.
+        self._mjf_alpha  = 0.0
+        self._mjf_active = False
+        self.player.start_map_jump()
+
     def _start_npc_dialogue(self, npc):
-        """Begin a conversation with an NPC, routing through the mission system."""
+        """Begin a conversation with an NPC, routing through the mission system.
+
+        Mission state routing (via mission_manager.get_npc_dialogue_state):
+          'offer'     — quest not accepted yet; show the pitch
+          'active'    — mission running; give a status/reminder line
+          'completed' — all objectives met; run reward dialogue & claim XP/items
+          'rewarded'  — fully done; show post-completion lines
+          None        — plain NPC with no mission; use dialogue_config directly
+        """
         # Hide the NPC's own indicator the moment dialogue starts.
         npc.is_talking = True
         iid   = getattr(npc, 'instance_id', '')
@@ -759,6 +923,15 @@ class Game:
 
         self._load_room_objects_as_copies(room)
 
+        # ── Pre-bake tile surfaces so frame 1 has no spike ──────────────────────
+        # invalidate_tile_cache was called inside _load_room_objects_as_copies,
+        # so flush it now and build both layers immediately rather than lazily
+        # on the first rendered frame.
+        self._flush_dirty_tile_rooms()
+        self._room_tile_surfaces[(room_name, True)] = self._build_room_tile_surface(room_name, True)
+        self._room_tile_surfaces[(room_name, False)] = self._build_room_tile_surface(room_name, False)
+        # ────────────────────────────────────────────────────────────────────────
+
         # Determine where to place the player — prefer the room's spawn point.
         if hasattr(room, 'spawn_points') and room.spawn_points:
             spawn_pos = (room.spawn_points[0].x, room.spawn_points[0].y)
@@ -931,6 +1104,15 @@ class Game:
                 copy_sp.active = True
                 self.save_points.append(copy_sp)
 
+        # World map objects — copy so test mode doesn't mutate the editor originals
+        self.world_map_objects    = []
+        self.nearby_world_map_obj = None
+        self.camera.locked        = False
+        if hasattr(room, 'world_map_objects') and room.world_map_objects:
+            from objects.world_map import WorldMapObject
+            for obj in room.world_map_objects:
+                self.world_map_objects.append(WorldMapObject.from_dict(obj.to_dict()))
+
         # Entities (enemies and NPCs)
         self.enemies = []
         self.npcs    = []
@@ -1048,6 +1230,8 @@ class Game:
         self.level_gates         = room.level_gates[:]         if hasattr(room, 'level_gates')         and room.level_gates         else []
         self.room_transitions    = room.room_transitions[:]    if hasattr(room, 'room_transitions')    and room.room_transitions    else []
         self.save_points         = room.save_points[:]         if hasattr(room, 'save_points')         and room.save_points         else []
+        self.world_map_objects   = room.world_map_objects[:]   if hasattr(room, 'world_map_objects')   and room.world_map_objects   else []
+
 
         # Spawn entities.
         self.enemies = []
@@ -1088,6 +1272,9 @@ class Game:
 
         Runs up to max_iterations passes so it resolves even in tight corners.
         Does nothing when there is no overlap to begin with.
+
+        20 iterations handles any realistic tight 3-wall corner;
+        fewer leaves enemies visibly clipping through walls after hard knockback.
         """
         import pygame
 
@@ -1226,11 +1413,16 @@ class Game:
         Used to prevent knockback from clipping entities through walls, stones,
         gates, and transitions.
         """
+        # Only include WorldMapObjects that have a real collision rect.
+        # The plain 'world_map' variant returns None from get_collision_rect(),
+        # which crashes enemy collision checks (colliderect(None)).
+        _solid_wm = [o for o in self.world_map_objects if o.get_collision_rect() is not None]
         obstacles = (
             self.collision_objects
             + self.destructible_stones
             + self.level_gates
             + self.room_transitions
+            + _solid_wm
         )
         self.player.obstacles = obstacles
         for enemy in self.enemies:
@@ -1414,6 +1606,32 @@ class Game:
                         self.cutscene_editor._entity_factory,
                         dialogue_box=self.dialogue_box,
                     )
+
+                    # Wire up the change_room callback. The runtime declares
+                    # on_change_room = None and calls it when the action fires,
+                    # but game.py must supply the real implementation.
+                    def _cutscene_change_room(room_name, _sx, _sy):
+                        target_room = self.room_manager.get_room_by_name(room_name)
+                        if not target_room:
+                            print(f'[Game] change_room: room not found: {room_name}')
+                            return
+
+                        # ── Sync editor tiles into the room object (same as test-mode start) ──
+                        te = getattr(self.room_editor, 'tileset_editor', None)
+                        if te and room_name in getattr(te, 'room_tiles', {}):
+                            target_room.tiles = te.room_tiles[room_name][:]
+                        elif not hasattr(target_room, 'tiles'):
+                            target_room.tiles = []
+
+                        self.room_manager.current_room = target_room
+                        self.current_room = target_room
+                        if self.is_test_mode:
+                            self._load_room_objects_as_copies(target_room)
+                        else:
+                            self._load_room_objects(target_room)
+                        self.mission_manager.on_room_entered(room_name)
+
+                    self.active_cutscene_runtime.on_change_room = _cutscene_change_room
                     self.active_cutscene_runtime.seek(0.0)
 
                     # After seek() resets actor positions to their scripted spawn,
@@ -1557,19 +1775,29 @@ class Game:
         if not fired_id:
             return
 
-        # Load the cutscene JSON from disk and queue it to launch immediately.
-        import os, json
-        cutscene_path = os.path.join('data', 'cutscenes', f'{fired_id}.json')
-        if not os.path.exists(cutscene_path):
-            print(f'[Game] cutscene file not found: {cutscene_path}')
-            return
-        try:
-            with open(cutscene_path) as f:
-                cutscene_data = json.load(f)
-        except Exception as e:
-            print(f'[Game] failed to load cutscene "{fired_id}": {e}')
-            import traceback; traceback.print_exc()
-            return
+        # Load the cutscene data -- prefer the editor's live in-memory copy when it
+        # has this cutscene open, so unsaved edits (e.g. a freshly-added change_room
+        # action) are visible immediately during testing without requiring a manual save.
+        cutscene_data = None
+        ce = getattr(self, 'cutscene_editor', None)
+        if (ce
+                and getattr(ce, 'cutscene_name', '') == fired_id
+                and ce.cutscene_data):
+            cutscene_data = ce.cutscene_data
+
+        if cutscene_data is None:
+            import os, json
+            cutscene_path = os.path.join('data', 'cutscenes', f'{fired_id}.json')
+            if not os.path.exists(cutscene_path):
+                print(f'[Game] cutscene file not found: {cutscene_path}')
+                return
+            try:
+                with open(cutscene_path) as f:
+                    cutscene_data = json.load(f)
+            except Exception as e:
+                print(f'[Game] failed to load cutscene "{fired_id}": {e}')
+                import traceback; traceback.print_exc()
+                return
 
         # Start the cutscene on the next frame (no fade-out, direct launch).
         self._csf_pending = cutscene_data
@@ -1593,6 +1821,1352 @@ class Game:
             self._csf_surf.fill((0, 0, 0))
         self._csf_surf.set_alpha(min(255, alpha))
         surface.blit(self._csf_surf, (0, 0))
+
+    def _draw_map_jump_fade(self, surface):
+        """Draw the black fade overlay that plays once the player leaves the camera
+        during the world-map jump sequence.  No-op when alpha is 0.
+        """
+        alpha = int(self._mjf_alpha)
+        if alpha <= 0:
+            return
+        w, h = surface.get_size()
+        if not hasattr(self, '_mjf_surf') or self._mjf_surf.get_size() != (w, h):
+            self._mjf_surf = pygame.Surface((w, h))
+            self._mjf_surf.fill((0, 0, 0))
+        self._mjf_surf.set_alpha(min(255, alpha))
+        surface.blit(self._mjf_surf, (0, 0))
+
+    # ── World-map flying helpers ──────────────────────────────────────────────
+
+    def _load_map_fly_sprite(self):
+        """Load the character-specific flying sprite for the world-map sequence.
+
+        flying.png is a horizontal strip of (player.width × player.height) frames
+        with one row per direction — 8 rows total, matching the layout used by
+        FlyingController:
+          Row 0: down
+          Row 1: left
+          Row 2: right
+          Row 3: up
+          Row 4: down_left
+          Row 5: down_right
+          Row 6: up_left
+          Row 7: up_right
+
+        All eight rows are loaded up-front so the active frame set can switch
+        instantly when the player changes direction while flying.
+
+        Falls back in order:
+          1. Last frame of the map_jump animation (already loaded).
+          2. A simple gold disc placeholder so the game never crashes.
+        """
+        path = f'{self.player.sprite.base_path}/flying.png'
+        frame_w = self.player.width
+        frame_h = self.player.height
+        # Row order must match flying.png — clockwise starting from down.
+        _DIR_ROWS = {
+            'down':       0,
+            'down_left':  1,
+            'left':       2,
+            'up_left':    3,
+            'up':         4,
+            'up_right':   5,
+            'right':      6,
+            'down_right': 7,
+        }
+        try:
+            sheet = pygame.image.load(path).convert_alpha()
+            n     = max(1, sheet.get_width() // frame_w)
+            # Only slice rows that actually exist in the sheet.
+            max_rows = sheet.get_height() // frame_h
+            self._mjf_flying_frames_by_dir = {
+                direction: [
+                    sheet.subsurface(pygame.Rect(i * frame_w, row * frame_h, frame_w, frame_h))
+                    for i in range(n)
+                ]
+                for direction, row in _DIR_ROWS.items()
+                if row < max_rows
+            }
+            # Always face 'up' on the world map so the player's back is shown
+            # (the map rotates under the player; the sprite never turns).
+            start_dir = 'up' if 'up' in self._mjf_flying_frames_by_dir else 'down'
+            self._mjf_flying_frames = self._mjf_flying_frames_by_dir.get(start_dir, list(self._mjf_flying_frames_by_dir.values())[0])
+        except Exception as e:
+            print(f'[map_fly] could not load {path}: {e}')
+            jump_frames = getattr(self.player, '_map_jump_frames', [])
+            fallback = [jump_frames[-1]] if jump_frames else None
+            if fallback is None:
+                s = pygame.Surface((32, 32), pygame.SRCALPHA)
+                pygame.draw.circle(s, (255, 220, 0), (16, 16), 14)
+                pygame.draw.circle(s, (255, 255, 120), (13, 12), 5)
+                fallback = [s]
+            # No per-direction data available — use the same fallback for all dirs.
+            self._mjf_flying_frames_by_dir = {d: fallback for d in _DIR_ROWS}
+            self._mjf_flying_frames = fallback
+
+        self._mjf_flying_frame_idx   = 0
+        self._mjf_flying_frame_timer = 0.0
+        self._mjf_fly_direction      = 'up'  # always face forward (show player's back)
+        self._mjf_cam_angle          = 0.0                    # reset rotation each sequence
+
+    def _load_map_land_sprite(self):
+        """Load map_land.png — 32×32 frames, one row per direction, left-to-right.
+
+        Row order mirrors flying.png (clockwise from down).  Only rows that
+        actually exist in the sheet are loaded so a 1-row sheet works too.
+        """
+        _path    = f'{self.player.sprite.base_path}/map_land.png'
+        _frame_w = 32
+        _frame_h = 32
+        _DIR_ROWS = [
+            'down', 'down_left', 'left', 'up_left',
+            'up',   'up_right',  'right', 'down_right',
+        ]
+        try:
+            sheet  = pygame.image.load(_path).convert_alpha()
+            cols   = max(1, sheet.get_width()  // _frame_w)
+            rows   = max(1, sheet.get_height() // _frame_h)
+            frames_by_dir = {}
+            for row_idx, direction in enumerate(_DIR_ROWS[:rows]):
+                frames_by_dir[direction] = [
+                    sheet.subsurface(pygame.Rect(c * _frame_w, row_idx * _frame_h, _frame_w, _frame_h))
+                    for c in range(cols)
+                ]
+            # Fallback: if only one row, use it for every direction.
+            if len(frames_by_dir) == 1:
+                only = list(frames_by_dir.values())[0]
+                frames_by_dir = {d: only for d in _DIR_ROWS}
+        except Exception as e:
+            print(f'[map_land] FAILED to load {_path}: {e}')
+            s = pygame.Surface((_frame_w, _frame_h), pygame.SRCALPHA)
+            frames_by_dir = {d: [s] for d in _DIR_ROWS}
+
+        self._mjf_land_frames_by_dir = frames_by_dir
+        self._mjf_land_frames        = frames_by_dir.get(
+            self.player.direction, list(frames_by_dir.values())[0])
+        self._mjf_land_frame_idx     = 0
+        self._mjf_land_frame_timer   = 0.0
+        self._mjf_land_elapsed       = 0.0   # total time spent in landing_fade_in state
+        self._MJF_LAND_FRAME_DUR     = 0.12  # matches flying animation speed
+
+    def _draw_landing_sprite(self):
+        """Blit the current map_land frame at the player's world position.
+
+        Called during 'landing_fade_in' after the layer manager has already
+        drawn the player's normal sprite, so the land animation sits on top.
+        Frames are scaled by RENDER_SCALE to match every other sprite in the
+        game world (the layer manager applies the same scaling).
+
+        The shadow is drawn first (below the sprite) using the same
+        layer_manager._draw_shadow() call that every other entity (enemies,
+        NPCs, the player during ascent) uses, so it matches perfectly.
+        """
+        _land_frames = getattr(self, '_mjf_land_frames', [])
+        if not _land_frames:
+            return
+        _frame  = _land_frames[min(self._mjf_land_frame_idx, len(_land_frames) - 1)]
+        _sw     = 32 * RENDER_SCALE
+        _sh     = 32 * RENDER_SCALE
+        _scaled = pygame.transform.scale(_frame, (_sw, _sh))
+        _cx = int(self.player.x * RENDER_SCALE - self.camera.x)
+        _cy = int(self.player.y * RENDER_SCALE - self.camera.y)
+        _sx = _cx - _sw // 2
+        _sy = _cy - _sh // 2
+
+        # ── Shadow — use the standard layer_manager shadow (same as all entities) ──
+        self.layer_manager._draw_shadow(self.logical_surface, self.player, self.camera)
+        # ── End shadow ────────────────────────────────────────────────────────
+
+        self.logical_surface.blit(_scaled, (_sx, _sy))
+
+    def _update_map_flying(self, dt):
+        """Tick the world-map flying sequence.
+
+        State machine:
+          'pending_fade_in' — alpha still rising; wait for full black.
+          'fade_in'         — alpha counting back to 0 while flying scene is shown.
+          'flying'          — fully visible; arrow keys move the flying sprite.
+        """
+        if self._mjf_state == 'pending_fade_in':
+            # Keep ramping alpha until black, then flip to fade-in.
+            self._mjf_alpha = min(255.0, self._mjf_alpha + self._MJF_SPEED * dt)
+            if self._mjf_alpha >= 255.0:
+                self._mjf_state  = 'fade_in'
+                self._mjf_active = False
+
+        elif self._mjf_state == 'fade_in':
+            self._mjf_alpha = max(0.0, self._mjf_alpha - self._MJF_FADE_IN_SPEED * dt)
+            if self._mjf_alpha <= 0.0:
+                self._mjf_state = 'flying'
+                self.camera.locked = False   # safe to release now
+
+        elif self._mjf_state == 'flying':
+            keys = pygame.key.get_pressed()
+            spd  = self._MJF_FLY_SPEED * dt
+
+            left  = keys[pygame.K_LEFT]
+            right = keys[pygame.K_RIGHT]
+            up    = keys[pygame.K_UP]
+            down  = keys[pygame.K_DOWN]
+
+            # Up/down changes the sprite row; left/right only rotates the map.
+            if up:
+                new_dir = 'up'
+            elif down:
+                new_dir = 'down'
+            else:
+                new_dir = getattr(self, '_mjf_fly_direction', 'up')
+
+            # Screen-space sprite stays fixed — the map plane rotates/moves under it.
+            # (No changes to _mjf_fly_x / _mjf_fly_y here.)
+
+            # Left/right: rotate the camera angle so the plane spins under the player.
+            # Up/down: move forward/back along the current facing direction.
+            # At high altitude the viewport covers far more of the map, so the same
+            # angle increment looks much faster.  Scale speed down with altitude so
+            # the visual rotation rate feels consistent regardless of height.
+            _alt = getattr(self, '_mjf_altitude', 0.5)
+            ROTATE_SPD = 1.8 * dt * (1.0 - 0.75 * _alt)
+            MAP_SPD    = self._MJF_FLY_SPEED * 1.8 * dt
+
+            if up or down:
+                self._mjf_moving_backward = down and not up
+
+            if left or right:
+                import math as _math
+                d_angle = ROTATE_SPD * (-1 if left else 1)
+                old_angle = self._mjf_cam_angle
+
+                # Use the same constants as _draw_world_map_flying_scene so the
+                # pivot lands on the exact world-map point under the shadow.
+                _sh        = SCREEN_HEIGHT
+                _sky_h     = int(_sh * 0.35)                          # fixed sky height
+                _base_f    = getattr(self, '_MJF_FOCAL', SCREEN_WIDTH // 8)
+                _FOCAL     = int(_base_f * (0.3 + 1.9 * _alt))        # matches draw method
+                _PROJ_HOR  = int(_sh * 0.20)                           # PROJECTION_HORIZON
+                _vground_h = _sh - _PROJ_HOR
+                _HOR_OFF   = 2                                          # HORIZON_OFFSET
+                _hor_y     = int(_sh * (0.30 - 0.20 * _alt))           # horizon_y from draw
+
+                # Pivot = shadow screen position — must match shadow_ground_y in draw code
+                _pivot_screen_y = int(_sky_h + (_sh - _sky_h) * 0.32)
+
+                # Curvature-corrected depth: the ground pixel visible at
+                # shadow_ground_y comes from a deeper render row because the
+                # curvature loop shifts rows upward.  Invert that shift
+                # iteratively (4 steps converge well within 1 px).
+                _RENDER_DIV = 2
+                _curve_px   = getattr(self, '_MJF_CURVATURE', 14)
+                _eff_g      = max(_sh - _hor_y - _HOR_OFF, 1)
+                _T          = float(_pivot_screen_y - _hor_y - _HOR_OFF)
+                _sc         = _T
+                for _ in range(4):
+                    _tc  = 1.0 - _sc / max(1.0, float(_eff_g - 1))
+                    _sc  = _T + float(int(_tc * _tc * _curve_px))
+                _sc     = max(0.0, min(float(_eff_g - 1), _sc))
+                _rows_f = (int(_sc) // _RENDER_DIV + 1) * _RENDER_DIV + _HOR_OFF
+                _depth  = _FOCAL * _vground_h / max(_rows_f, 1)
+
+                _pivot_x = self._mjf_cam_x + _math.sin(old_angle) * _depth
+                _pivot_y = self._mjf_cam_y - _math.cos(old_angle) * _depth
+
+                self._mjf_cam_angle += d_angle
+                _na = self._mjf_cam_angle
+                self._mjf_cam_x = _pivot_x - _math.sin(_na) * _depth
+                self._mjf_cam_y = _pivot_y + _math.cos(_na) * _depth
+
+                _tex = getattr(self, '_world_map_texture', None)
+                if _tex:
+                    self._mjf_cam_x %= _tex.get_width()
+                    self._mjf_cam_y %= _tex.get_height()
+
+            # Space = rise, Shift = descend.
+            rise    = keys[pygame.K_SPACE]
+            descend = keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]
+            ALT_SPD = 0.8 * dt
+            if rise or descend:
+                _old_alt = self._mjf_altitude
+                _new_alt = (min(1.0, _old_alt + ALT_SPD) if rise
+                            else max(0.0, _old_alt - ALT_SPD))
+                if _new_alt != _old_alt:
+                    # ── Zoom-into-shadow anchor (Buu's Fury style) ────────────
+                    # Keep the world-map point currently under the shadow fixed
+                    # while FOCAL / horizon_y change with altitude, so the camera
+                    # zooms in/out on that exact spot instead of drifting.
+                    import math as _math
+                    _sw, _sh   = SCREEN_WIDTH, SCREEN_HEIGHT
+                    _base_f    = getattr(self, '_MJF_FOCAL', _sw // 8)
+                    _PROJ_HOR  = int(_sh * 0.20)   # must match _draw_world_map_flying_scene
+                    _vground_h = _sh - _PROJ_HOR
+                    _HOR_OFF   = 2                  # HORIZON_OFFSET constant
+                    _sky_h     = int(_sh * 0.35)    # fixed sky height
+                    # Shadow is always drawn at the same row — must match shadow_ground_y in draw code.
+                    _shad_gy   = int(_sky_h + (_sh - _sky_h) * 0.32)
+
+                    # --- old projection: world point under the shadow ---
+                    _old_FOCAL = int(_base_f * (0.3 + 1.9 * _old_alt))
+                    _old_hor_y = int(_sh * (0.30 - 0.20 * _old_alt))
+                    _old_row   = max(_shad_gy - _old_hor_y, 1)
+                    _old_depth = _old_FOCAL * _vground_h / (_old_row + _HOR_OFF)
+
+                    _angle  = self._mjf_cam_angle
+                    # Shadow is at screen-centre (cols = 0), so the world point is:
+                    _world_x = self._mjf_cam_x + _math.sin(_angle) * _old_depth
+                    _world_y = self._mjf_cam_y - _math.cos(_angle) * _old_depth
+
+                    # --- apply altitude ---
+                    self._mjf_altitude = _new_alt
+
+                    # --- new projection: re-derive cam so same world point stays ---
+                    _new_FOCAL = int(_base_f * (0.3 + 1.9 * _new_alt))
+                    _new_hor_y = int(_sh * (0.30 - 0.20 * _new_alt))
+                    _new_row   = max(_shad_gy - _new_hor_y, 1)
+                    _new_depth = _new_FOCAL * _vground_h / (_new_row + _HOR_OFF)
+
+                    _tex = getattr(self, '_world_map_texture', None)
+                    if _tex:
+                        _tw, _th = _tex.get_width(), _tex.get_height()
+                        self._mjf_cam_x = (_world_x - _math.sin(_angle) * _new_depth) % _tw
+                        self._mjf_cam_y = (_world_y + _math.cos(_angle) * _new_depth) % _th
+                    else:
+                        self._mjf_cam_x = _world_x - _math.sin(_angle) * _new_depth
+                        self._mjf_cam_y = _world_y + _math.cos(_angle) * _new_depth
+                    # ── End zoom anchor ───────────────────────────────────────
+
+            tex = getattr(self, '_world_map_texture', None)
+            if tex:
+                import math as _math
+                tw, th = tex.get_width(), tex.get_height()
+                dx = _math.sin(self._mjf_cam_angle) * MAP_SPD
+                dy = -_math.cos(self._mjf_cam_angle) * MAP_SPD
+                if up:
+                    self._mjf_cam_x = (self._mjf_cam_x + dx) % tw
+                    self._mjf_cam_y = (self._mjf_cam_y + dy) % th
+                if down:
+                    self._mjf_cam_x = (self._mjf_cam_x - dx) % tw
+                    self._mjf_cam_y = (self._mjf_cam_y - dy) % th
+
+            # Switch sprite row when direction changes.
+            if new_dir != getattr(self, '_mjf_fly_direction', None):
+                self._mjf_fly_direction = new_dir
+                frames_by_dir = getattr(self, '_mjf_flying_frames_by_dir', {})
+                if new_dir in frames_by_dir:
+                    self._mjf_flying_frames      = frames_by_dir[new_dir]
+                    self._mjf_flying_frame_idx   = 0
+                    self._mjf_flying_frame_timer = 0.0
+
+            # (Sprite is fixed; no screen-bounds clamping needed.)
+
+            # ── Landing detection — collision between shadow and icon ─────────
+            # Collision is checked in screen space: the player's shadow rect
+            # overlaps the icon's projected ground-contact point. Only fires at
+            # or near minimum altitude so the player has to descend first.
+            # Landing detection: axis-aligned rectangle in world (texture-pixel) space.
+            # The icon is the centre. _LAND_W is the half-width (left/right reach),
+            # _LAND_H is the half-height (forward/backward reach).
+            # Both are in texture pixels; 1 map tile = texture_width / 362 px.
+            # _LAND_PAD expands the icon's screen rect on all sides (pixels).
+            # Increase to make the trigger zone larger, decrease to tighten it.
+            # 3-D proximity check: XY distance on the map plane + altitude match.
+            # _LAND_RADIUS   : trigger distance in texture pixels (XY plane).
+            # _LAND_ALT_RANGE: how close in altitude (0.0-1.0) the player must
+            #                  be to the icon's altitude. Icons default to 0.0
+            #                  (ground); set 'altitude' on an icon dict to place
+            #                  it at a different height in future.
+            _LAND_RADIUS    = 30
+            _LAND_ALT_RANGE = 0.15
+
+            _pending_icons = getattr(self, '_wm_last_icon_screen_positions', [])
+            self._mjf_nearby_loc_name = ''   # reset each tick; set below if close
+            if _pending_icons:
+                import math as _math
+                _tex = getattr(self, '_world_map_texture', None)
+                _tw  = _tex.get_width()  if _tex else 1
+                _th  = _tex.get_height() if _tex else 1
+                _alt    = self._mjf_altitude
+                _base_f = getattr(self, '_MJF_FOCAL', SCREEN_WIDTH // 8)
+                _focal  = int(_base_f * (0.3 + 1.9 * _alt))
+                _vgh    = SCREEN_HEIGHT - int(SCREEN_HEIGHT * 0.20)
+                _hor_y  = int(SCREEN_HEIGHT * (0.30 - 0.20 * _alt))
+                _sky_h2 = int(SCREEN_HEIGHT * 0.35)
+                # Must match shadow_ground_y formula in draw: sky_h + (sh-sky_h)*0.32
+                _sky_h2_draw = int(SCREEN_HEIGHT * 0.35)
+                _shad_y = int(_sky_h2_draw + (SCREEN_HEIGHT - _sky_h2_draw) * 0.32)
+                _row    = max(_shad_y - _hor_y, 1)
+                _pdepth = _focal * _vgh / (_row + 2)
+                _angle  = self._mjf_cam_angle
+                _px = (self._mjf_cam_x + _math.sin(_angle) * _pdepth) % _tw
+                _py = (self._mjf_cam_y - _math.cos(_angle) * _pdepth) % _th
+                for _li_wx, _li_wy, _li_loc in _pending_icons:
+                    # Altitude check: player must be within _LAND_ALT_RANGE of
+                    # the icon's altitude (default 0.0 = ground level).
+                    _icon_alt = _li_loc.get('altitude', 0.0)
+                    if abs(_alt - _icon_alt) > _LAND_ALT_RANGE:
+                        continue
+                    _ddx = (_li_wx - _px) % _tw
+                    if _ddx > _tw * 0.5: _ddx -= _tw
+                    _ddy = (_li_wy - _py) % _th
+                    if _ddy > _th * 0.5: _ddy -= _th
+                    _dist = _math.sqrt(_ddx * _ddx + _ddy * _ddy)
+                    if _dist <= _LAND_RADIUS * 3:
+                        self._mjf_nearby_loc_name = _li_loc.get('name', _li_loc.get('room', ''))
+                    if _dist <= _LAND_RADIUS:
+                        # Player loses control; fade to black then transition.
+                        self._mjf_landing_room = _li_loc['room']
+                        self._mjf_landing_loc  = _li_loc
+                        self._mjf_alpha        = 0.0
+                        self._mjf_state        = 'landing_fade_out'
+                        # Hide the HUD immediately so it is not visible during
+                        # the landing sequence.  It will slide back in once the
+                        # player has fully descended and the fade clears.
+                        _scaled_frame_h = int(self.sprite_hud.config['frame']['h'] * self.sprite_hud.scale)
+                        self.sprite_hud.hud_offset_y   = -(self.sprite_hud.hud_y + _scaled_frame_h + 10)
+                        self.sprite_hud._hud_slide_out = False
+                        self.sprite_hud._hud_slide_in  = False
+                        break
+
+        elif self._mjf_state == 'landing_fade_out':
+            # Fade to black over 1.5 s — mirrors the rising fade-out speed exactly.
+            _LAND_FO_SPD = 255.0 / 1.5
+            self._mjf_alpha = min(255.0, self._mjf_alpha + _LAND_FO_SPD * dt)
+            if self._mjf_alpha >= 255.0:
+                # Screen is fully black — perform the room transition now.
+                _target_room_name = getattr(self, '_mjf_landing_room', '')
+                _target_room      = self.room_manager.get_room_by_name(_target_room_name)
+                if _target_room:
+                    self.room_manager.current_room = _target_room
+                    self.current_room              = _target_room
+                    if self.is_test_mode:
+                        self._load_room_objects_as_copies(_target_room)
+                    else:
+                        self._load_room_objects(_target_room)
+                    # Place player at the WorldMapObject in the target room.
+                    _spawn_x = _target_room.width  / 2
+                    _spawn_y = _target_room.height / 2
+                    for _wmo in self.world_map_objects:
+                        if getattr(_wmo, 'variant', '') == 'world_map':
+                            _spawn_x = _wmo.x
+                            # player.y is the CENTRE of the sprite frame, but the
+                            # visible character sits in the upper half of the frame.
+                            # Offsetting by half the player height aligns the visual
+                            # character with the centre of the WMO.
+                            _spawn_y = _wmo.y - self.player.height // 2
+                            break
+                    self.player.x = _spawn_x
+                    self.player.y = _spawn_y
+                    # Set camera centred on spawn, clamped to room bounds.
+                    self.camera.x = max(0, int(_spawn_x * RENDER_SCALE) - self.camera.screen_width  // 2)
+                    self.camera.y = max(0, int(_spawn_y * RENDER_SCALE) - self.camera.screen_height // 2)
+                    self.camera.x = min(self.camera.x, _target_room.width  * RENDER_SCALE - SCREEN_WIDTH)
+                    self.camera.y = min(self.camera.y, _target_room.height * RENDER_SCALE - SCREEN_HEIGHT)
+                    self.camera.locked = False
+                    self.player.is_map_jumping  = False
+                    self.player.map_jump_moving = False
+                    self.player.on_map_jump_exit = None
+                    # Start the player above the top of the screen so they
+                    # descend into the spawn point — the opposite of the ascent.
+                    _above_screen_y = (self.camera.y - 32 * 2) / RENDER_SCALE
+                    self.player.y              = _above_screen_y
+                    self._mjf_land_start_y     = _above_screen_y
+                    self._mjf_land_target_y    = _spawn_y
+                    self._mjf_land_speed       = 120.0   # world-units / sec — mirrors ascent feel
+                    self._mjf_landing_done     = False
+                    self._load_map_land_sprite()
+                    self.mission_manager.on_room_entered(_target_room_name)
+                self._mjf_alpha = 255.0   # start fully black; fade_in counts down to 0
+                self._mjf_state = 'landing_fade_in'
+
+        elif self._mjf_state == 'landing_fade_in':
+            _LAND_FI_SPD = 255.0 / 1.5
+            self._mjf_alpha = max(0.0, self._mjf_alpha - _LAND_FI_SPD * dt)
+            self.player.is_map_jumping  = False
+            self.player.map_jump_moving = False
+            # Descend the player toward the spawn point.
+            if not getattr(self, '_mjf_landing_done', False):
+                self.player.y += getattr(self, '_mjf_land_speed', 120.0) * dt
+                if self.player.y >= getattr(self, '_mjf_land_target_y', self.player.y):
+                    self.player.y          = self._mjf_land_target_y
+                    self._mjf_landing_done = True
+            # Advance the land-sprite animation for the full landing duration.
+            # Uses while/-= (mirrors the ascending sprite system) so variable-dt
+            # frames never discard overflow and the loop plays smoothly to the end.
+            # Frame schedule: frame 0 briefly at the start, frame 1 for the
+            # bulk of the descent, last frame briefly just before touchdown.
+            # _FRAME0_DUR    — how long (seconds) the first frame is held.
+            # _FRAME_LAST_DIST — switch to the last frame when this many
+            #                    world-units remain (= land_speed × 0.20 s).
+            _land_frames = getattr(self, '_mjf_land_frames', [])
+            if _land_frames:
+                _n = len(_land_frames)
+                self._mjf_land_elapsed = getattr(self, '_mjf_land_elapsed', 0.0) + dt
+                _FRAME0_DUR      = 0.15
+                _FRAME_LAST_DIST = getattr(self, '_mjf_land_speed', 120.0) * 0.20
+                _dist_left       = max(0.0, getattr(self, '_mjf_land_target_y', self.player.y) - self.player.y)
+                _is_done         = getattr(self, '_mjf_landing_done', False)
+                if _n == 1:
+                    self._mjf_land_frame_idx = 0
+                elif _n == 2:
+                    # Two-frame sheet: first briefly, second for the rest.
+                    self._mjf_land_frame_idx = 0 if self._mjf_land_elapsed < _FRAME0_DUR else 1
+                else:
+                    # Three-or-more-frame sheet:
+                    #   brief frame 0 → long frame 1 → brief last frame
+                    if self._mjf_land_elapsed < _FRAME0_DUR:
+                        self._mjf_land_frame_idx = 0
+                    elif _is_done or _dist_left <= _FRAME_LAST_DIST:
+                        self._mjf_land_frame_idx = _n - 1
+                    else:
+                        self._mjf_land_frame_idx = 1
+            if self._mjf_alpha <= 0.0:
+                self.player.y = getattr(self, '_mjf_land_target_y', self.player.y)
+                try:
+                    self.player.sprite.set_animation('idle', self.player.direction)
+                    self.player.current_animation_state = 'idle'
+                except Exception:
+                    pass
+                self._mjf_state = None
+                # Landing sequence fully finished — slide the HUD back down
+                # from its hidden (off-screen) position into view.
+                _scaled_frame_h = int(self.sprite_hud.config['frame']['h'] * self.sprite_hud.scale)
+                self.sprite_hud.hud_offset_y   = -(self.sprite_hud.hud_y + _scaled_frame_h + 10)
+                self.sprite_hud._hud_slide_out = False
+                self.sprite_hud._hud_slide_in  = True
+
+        # Advance the flying sprite animation (looping) while on the world map.
+        if self._mjf_flying_frames:
+            self._mjf_flying_frame_timer += dt
+            if self._mjf_flying_frame_timer >= self._MJF_FLY_FRAME_DUR:
+                self._mjf_flying_frame_timer = 0.0
+                self._mjf_flying_frame_idx = (
+                    (self._mjf_flying_frame_idx + 1) % len(self._mjf_flying_frames)
+                )
+
+    def _build_world_map_surface(self, map_name: str, frame_idx: int = 0):
+        """Render the tile-map JSON produced by the world map editor into a single
+        pygame Surface that the Mode7 renderer can use as its ground texture.
+
+        Returns None if the file is missing or contains no tiles, so the caller
+        can fall back to the static PNG.
+        """
+        import json as _json
+        import os as _os
+
+        path = _os.path.join('assets', 'world_maps', f'{map_name}.json')
+        try:
+            with open(path) as f:
+                data = _json.load(f)
+        except Exception as e:
+            print(f'[world_map] could not open {path}: {e}')
+            return None
+
+        # Support both multi-frame and legacy 'tiles' formats (mirrors world_map.py).
+        if 'frames' in data and data['frames']:
+            frame_idx = max(0, min(frame_idx, len(data['frames']) - 1))
+            tiles_list = data['frames'][frame_idx]
+        else:
+            tiles_list = data.get('tiles', [])
+
+        if not tiles_list:
+            print(f'[world_map] {map_name}.json has no tiles — falling back to PNG')
+            return None
+
+        # Constants must match world_map.py / world_map_editor.py.
+        NATIVE = 8          # source tile size in pixels
+        MAP_W  = 362       # map width  in tiles
+        MAP_H  = 263       # map height in tiles
+
+        # We render at native resolution (1 pixel per source pixel) then let the
+        # existing 2× upscale path in the caller handle magnification.
+        surf_w = MAP_W * NATIVE
+        surf_h = MAP_H * NATIVE
+        surface = pygame.Surface((surf_w, surf_h))
+        surface.fill((0, 0, 0))
+
+        # Load each referenced tileset once.
+        tileset_dir = _os.path.join('assets', 'tilesets', 'world_map')
+        tilesets: dict = {}
+
+        for td in tiles_list:
+            ts_name = td['ts']
+            if ts_name not in tilesets:
+                ts_path = _os.path.join(tileset_dir, ts_name)
+                if not ts_path.lower().endswith('.png'):
+                    ts_path += '.png'
+                try:
+                    tilesets[ts_name] = pygame.image.load(ts_path).convert()
+                except Exception as e:
+                    print(f'[world_map] could not load tileset {ts_name}: {e}')
+                    tilesets[ts_name] = None
+
+        # Blit each tile onto the surface.
+        for td in tiles_list:
+            ts_img = tilesets.get(td['ts'])
+            if ts_img is None:
+                continue
+            src_rect = pygame.Rect(td['tx'] * NATIVE, td['ty'] * NATIVE, NATIVE, NATIVE)
+            dst_x    = td['x'] * NATIVE
+            dst_y    = td['y'] * NATIVE
+            surface.blit(ts_img, (dst_x, dst_y), src_rect)
+
+        print(f'[world_map] built surface from {map_name}.json: {surf_w}x{surf_h}, {len(tiles_list)} tiles')
+        # Return at 2× scale to match the legacy PNG pipeline.
+        try:
+            _png_ref = pygame.image.load('assets/map/world_map.png')
+            target_w = _png_ref.get_width() * 2  # same 2× upscale the fallback path uses
+            target_h = _png_ref.get_height() * 2
+            del _png_ref
+            print(f'[world_map] scaling tile surface to match PNG: {target_w}x{target_h}')
+        except Exception:
+            # PNG missing — use a sensible default (~2px per tile)
+            target_w = MAP_W * 2
+            target_h = MAP_H * 2
+            print(f'[world_map] PNG not found, defaulting to {target_w}x{target_h}')
+        return pygame.transform.scale(surface, (surf_w * 2, surf_h * 2))
+
+    def _draw_world_map_flying_scene(self):
+        """Draw the world-map flying view.
+
+        Renders the world map (assets/map/world_map.png) as a perspective
+        plane below the player — like a 3-D ground surface seen from the air.
+        The horizon divides the screen: sky above, map plane below.
+
+        Technique: scanline-by-scanline perspective projection.  Each screen
+        row samples a horizontal strip from the map texture.  Rows near the
+        horizon are far from the camera → wide strip (many texture pixels
+        compressed into one screen row).  Rows at the bottom are close → narrow
+        strip (few texture pixels, zoomed in).  Player position scrolls the
+        texture so flying around actually moves across the map.
+
+        Called from draw() whenever _mjf_state is 'fade_in' or 'flying'.
+        """
+        sw, sh = SCREEN_WIDTH, SCREEN_HEIGHT
+        altitude = getattr(self, '_mjf_altitude', 0.5)
+
+        # Fixed sky size (never changes)
+        sky_h = int(sh * 0.35)
+
+        # Draw the ground starting exactly below the sky
+        horizon_y = int(sh * (0.30 - 0.20 * altitude))
+        ground_h = sh - horizon_y
+
+        # Hidden projection horizon:
+        # smaller values = stronger angle and less visible repetition
+        PROJECTION_HORIZON = int(sh * 0.20)
+
+        # ── Sky (skybox image above the horizon) ──────────────────────────
+        import math as _math
+        import numpy as _np
+
+        # ── Lazy-load map texture ──────────────────────────────────────────
+        if not hasattr(self, '_world_map_texture'):
+            active_map = getattr(self, '_active_world_map_name', '')
+            self._wm_tex_frames: list = []   # one Surface per editor frame
+            self._wm_tex_frame_idx   = 0
+            self._wm_tex_frame_timer = 0.0
+            self._WM_TEX_FRAME_DUR   = 1  # seconds per map frame
+
+            if active_map:
+                # Count frames in the JSON first.
+                import json as _jf, os as _osf
+                _jpath = _osf.path.join('assets', 'world_maps', f'{active_map}.json')
+                try:
+                    with open(_jpath) as _jf_:
+                        _jdata = _jf.load(_jf_)
+                    _n_frames = len(_jdata.get('frames', [])) or 1
+                except Exception:
+                    _n_frames = 1
+
+                for _fi in range(_n_frames):
+                    _raw = self._build_world_map_surface(active_map, _fi)
+                    if _raw is not None:
+                        self._wm_tex_frames.append(_raw)
+
+            if not self._wm_tex_frames:
+                # Fall back to the legacy static PNG.
+                try:
+                    _raw = pygame.image.load('assets/map/world_map.png').convert()
+                    _raw = pygame.transform.scale(
+                        _raw, (_raw.get_width() * 2, _raw.get_height() * 2)
+                    )
+                    print(f'[world_map] loaded fallback PNG, 2x upscaled to {_raw.get_width()}x{_raw.get_height()}')
+                    self._wm_tex_frames.append(_raw)
+                except Exception as e:
+                    print(f'[world_map] could not load map texture: {e}')
+
+            # Pre-bake a numpy array for EVERY frame now, at load time.
+            # Frame advance then becomes a free pointer swap instead of an
+            # expensive surfarray.array3d() call mid-frame.
+            import numpy as _np_load
+            self._wm_tex_arr_frames: list = []
+            for _surf in self._wm_tex_frames:
+                try:
+                    self._wm_tex_arr_frames.append(
+                        _np_load.array(pygame.surfarray.array3d(_surf), dtype=_np_load.uint8)
+                    )
+                except Exception:
+                    self._wm_tex_arr_frames.append(None)
+
+            raw = self._wm_tex_frames[0] if self._wm_tex_frames else None
+            self._world_map_texture = raw
+            self._world_map_tex_arr = self._wm_tex_arr_frames[0] if self._wm_tex_arr_frames else None
+            if raw:
+                print(f'[world_map] texture ready: {raw.get_width()}x{raw.get_height()}, '
+                      f'{len(self._wm_tex_arr_frames)} frame(s) pre-baked')
+
+        # ── Advance map frame animation ────────────────────────────────────
+        _tex_frames = getattr(self, '_wm_tex_frames', [])
+        if len(_tex_frames) > 1:
+            self._wm_tex_frame_timer += self.dt
+            if self._wm_tex_frame_timer >= self._WM_TEX_FRAME_DUR:
+                self._wm_tex_frame_timer -= self._WM_TEX_FRAME_DUR
+                self._wm_tex_frame_idx = (self._wm_tex_frame_idx + 1) % len(_tex_frames)
+                # O(1) pointer swap — numpy arrays were pre-baked at load time.
+                self._world_map_texture = _tex_frames[self._wm_tex_frame_idx]
+                _arr_frames = getattr(self, '_wm_tex_arr_frames', [])
+                self._world_map_tex_arr = (
+                    _arr_frames[self._wm_tex_frame_idx]
+                    if self._wm_tex_frame_idx < len(_arr_frames) else None
+                )
+
+        texture = self._world_map_texture
+        tex_arr = getattr(self, '_world_map_tex_arr', None)
+
+        # ── Pin-correction: place the camera so the player shadow lands on the
+        # location pin for the room we came from.  Runs on every entry (not just
+        # first) via the _mjf_needs_pin_correction flag set in _on_exit.
+        # This block sits AFTER the texture is guaranteed to be loaded (so
+        # texture dimensions are available) and BEFORE the perspective math below
+        # (so the corrected cam_x/cam_y are used on this very frame).
+        if getattr(self, '_mjf_needs_pin_correction', False) and texture:
+            import math as _pin_math
+            _origin_room = getattr(self, '_mjf_origin_room', '')
+            _active_map  = getattr(self, '_active_world_map_name', '')
+            _locs = getattr(self, '_wm_locations', None)
+            if _locs is None and _active_map:
+                import json as _jl, os as _osl
+                try:
+                    with open(_osl.path.join('assets', 'world_maps',
+                                             f'{_active_map}.json')) as _fl:
+                        _locs = _jl.load(_fl).get('locations', [])
+                    self._wm_locations = _locs
+                except Exception:
+                    _locs = []
+            _ppt_x = texture.get_width()  / 362
+            _ppt_y = texture.get_height() / 263
+            for _loc in (_locs or []):
+                if _loc.get('room', '') == _origin_room:
+                    # Compute the depth at the shadow's screen row so we can
+                    # offset the camera backward from the pin.  Without this
+                    # offset the camera sits ON the pin and the player shadow
+                    # projects past it, appearing on the wrong side of the map.
+                    _alt     = getattr(self, '_mjf_altitude', 0.5)
+                    _base_f  = getattr(self, '_MJF_FOCAL', sw // 8)
+                    _FOCAL_p = int(_base_f * (0.3 + 1.9 * _alt))
+                    _PROJ_p  = int(sh * 0.20)           # PROJECTION_HORIZON
+                    _vgh_p   = sh - _PROJ_p
+                    _sky_hp  = int(sh * 0.35)
+                    _hor_yp  = int(sh * (0.30 - 0.20 * _alt))
+                    _shad_yp = int(_sky_hp + (sh - _sky_hp) * 0.32)
+                    _row_p   = max(_shad_yp - _hor_yp + 2, 1)
+                    _dep_p   = _FOCAL_p * _vgh_p / _row_p
+                    # _load_map_fly_sprite always resets cam_angle to 0.0
+                    _ang     = self._mjf_cam_angle
+                    _pin_x   = _loc['x'] * _ppt_x
+                    _pin_y   = _loc['y'] * _ppt_y
+                    # Position camera so shadow == pin in world space:
+                    #   shadow_world = (cam_x + sin(a)*d,  cam_y - cos(a)*d)
+                    #   => cam = (pin_x - sin(a)*d,  pin_y + cos(a)*d)
+                    self._mjf_cam_x = (_pin_x - _pin_math.sin(_ang) * _dep_p) % texture.get_width()
+                    self._mjf_cam_y = (_pin_y + _pin_math.cos(_ang) * _dep_p) % texture.get_height()
+                    break
+            self._mjf_needs_pin_correction = False
+            self._mjf_origin_room = ''
+
+        base_focal = getattr(self, '_MJF_FOCAL', sw // 8)
+
+        # In your renderer:
+        #   larger FOCAL  = world appears farther away
+        #   smaller FOCAL = world appears closer to the player
+        #
+        # Therefore:
+        #   altitude = 0.0 (low / descended)  -> small FOCAL  -> close
+        #   altitude = 1.0 (high / ascended)  -> large FOCAL  -> far
+        FOCAL = int(base_focal * (0.3 + 1.9 * altitude))
+        RENDER_DIV = 2
+
+        HORIZON_OFFSET = 2
+        if texture:
+            tw, th = texture.get_width(), texture.get_height()
+        else:
+            tw = th = 1
+
+        # ── Sky — completely unaffected by altitude ────────────────────────
+        if not hasattr(self, '_world_map_sky'):
+            try:
+                self._world_map_sky = pygame.image.load(
+                    'assets/map/world_map_sky.png'
+                ).convert()
+            except Exception as e:
+                print(f'[world_map] could not load sky texture: {e}')
+                self._world_map_sky = None
+
+        # Sky is scaled once to sky_horizon_y (fixed) and cached — rescale only
+        # if the screen size changes (e.g. window resize).
+        if self._world_map_sky:
+            _sky_cache_key = (sw, sky_h)
+            if (not hasattr(self, '_mjf_scaled_sky')
+                    or self._mjf_scaled_sky_key != _sky_cache_key):
+                self._mjf_scaled_sky     = pygame.transform.scale(self._world_map_sky, _sky_cache_key)
+                self._mjf_scaled_sky_key = _sky_cache_key
+            scaled_sky = self._mjf_scaled_sky
+            sky_off_x = -int((self._mjf_cam_angle * 5.0 % (_math.pi * 2)) / (_math.pi * 2) * sw) % sw
+            self.logical_surface.blit(scaled_sky, (sky_off_x - sw, 0))
+            self.logical_surface.blit(scaled_sky, (sky_off_x,      0))
+        else:
+            self.logical_surface.fill((8, 10, 35))
+            for i in range(80):
+                sx = (i * 137 + 41) % sw
+                sy = (i * 97  + 13) % horizon_y
+                br = 120 + (i * 53) % 136
+                pygame.draw.line(
+                    self.logical_surface,
+                    (140, 200, 220),
+                    (0, sky_h - 1),
+                    (sw - 1, sky_h - 1),
+                    2
+                )
+
+        # ── Perspective plane (Mode 7, fully vectorised) ──────────────────────
+        if texture and tex_arr is not None:
+            cam_x = self._mjf_cam_x
+            cam_y = self._mjf_cam_y
+            angle = self._mjf_cam_angle
+
+            cos_a = _math.cos(angle)
+            sin_a = _math.sin(angle)
+
+            render_w         = max(sw // RENDER_DIV, 1)
+            # Project the ground using the full screen height so the perspective
+            # converges above the visible sky. This makes the map continue "behind"
+            # the sky instead of stopping at the sky/ground boundary.
+            projection_ground_h = sh
+
+            # Visible ground area still begins at horizon_y.
+            effective_ground = max(ground_h - HORIZON_OFFSET, 1)
+
+            # Render enough scanlines for the visible ground only.
+            render_h = max(effective_ground // RENDER_DIV, 1)
+
+            # Reuse offscreen surface across frames (alloc only on first call / resize).
+            if (not hasattr(self, '_mjf_ground_surf')
+                    or self._mjf_ground_surf.get_size() != (render_w, render_h)):
+                self._mjf_ground_surf = pygame.Surface((render_w, render_h))
+
+            # Row indices — HORIZON_OFFSET guarantees depth ≤ tw for every row,
+            # so the texture never repeats within the visible ground plane.
+            rows_r = _np.arange(1, render_h + 1, dtype=_np.float32)   # (render_h,)
+            rows_f = rows_r * RENDER_DIV + HORIZON_OFFSET              # (render_h,)
+
+            virtual_ground_h = sh - PROJECTION_HORIZON
+            depth = (FOCAL * virtual_ground_h / rows_f).astype(_np.float32)
+
+            fwd_x = ( sin_a * depth).astype(_np.float32)
+            fwd_y = (-cos_a * depth).astype(_np.float32)
+            rgt_x = ( cos_a * depth).astype(_np.float32)
+            rgt_y = ( sin_a * depth).astype(_np.float32)
+
+            # Cache the column coordinate array — render_w is constant per screen size.
+            if (not hasattr(self, '_mjf_cols_cache')
+                    or len(self._mjf_cols_cache) != render_w):
+                self._mjf_cols_cache = _np.linspace(-0.5, 0.5, render_w, dtype=_np.float32)
+            cols = self._mjf_cols_cache
+
+            tx = (cam_x + fwd_x[:, None] + cols[None, :] * rgt_x[:, None]).astype(_np.int32) % tw
+            ty = (cam_y + fwd_y[:, None] + cols[None, :] * rgt_y[:, None]).astype(_np.int32) % th
+
+            pixels = tex_arr[tx, ty]   # (render_h, render_w, 3)
+
+            pygame.surfarray.blit_array(self._mjf_ground_surf, pixels.transpose(1, 0, 2))
+
+            scaled_ground = pygame.transform.scale(self._mjf_ground_surf, (sw, effective_ground))
+
+            # ── Ground curvature ──────────────────────────────────────────────
+            # Rows near the horizon are shifted upward by a quadratic amount that
+            # peaks at the horizon and falls to zero at the bottom of the screen.
+            # The clip rect prevents upward-shifted rows from bleeding into the sky.
+            #
+            # Vectorised band approach: instead of one blit per pixel row (~300+
+            # calls), we compute all row shifts with numpy and group consecutive
+            # rows that share the same integer shift into a single subsurface blit.
+            # With _MJF_CURVATURE=14 there are at most 15 distinct shift values,
+            # collapsing hundreds of blits into ≤15.
+            _curve_px = getattr(self, '_MJF_CURVATURE', 14)
+            self.logical_surface.set_clip(pygame.Rect(0, sky_h, sw, sh - sky_h))
+
+            _n    = effective_ground
+            _denom = max(1, _n - 1)
+            _t_arr  = 1.0 - _np.arange(_n, dtype=_np.float32) / _denom
+            _dy_arr = (_t_arr * _t_arr * _curve_px).astype(_np.int32)
+
+            # Band boundaries: indices where the shift value changes.
+            _change_idx = (_np.where(_np.diff(_dy_arr) != 0)[0] + 1).tolist()
+            _starts = [0] + _change_idx
+            _ends   = _change_idx + [_n]
+
+            for _start, _end in zip(_starts, _ends):
+                _dy      = int(_dy_arr[_start])
+                _next_dy = int(_dy_arr[_end]) if _end < _n else 0
+                # Extend the band downward to fill any gap left by the shift decrease.
+                _bh = min(_end - _start + max(0, _dy - _next_dy), _n - _start)
+                _band = scaled_ground.subsurface((0, _start, sw, _bh))
+                self.logical_surface.blit(_band, (0, horizon_y + HORIZON_OFFSET + _start - _dy))
+
+            self.logical_surface.set_clip(None)
+
+        elif not texture:
+            pygame.draw.rect(self.logical_surface, (28, 65, 28),
+                             (0, horizon_y, sw, ground_h))
+
+        # ── Horizon blend overlay ─────────────────────────────────────────────
+        if not hasattr(self, '_world_map_blend'):
+            try:
+                self._world_map_blend = pygame.image.load(
+                    'assets/map/world_map_blend.png'
+                ).convert_alpha()
+            except Exception as e:
+                print(f'[world_map] could not load blend texture: {e}')
+                self._world_map_blend = None
+
+        if self._world_map_blend:
+            blend_w = sw
+            blend_h = 86 * RENDER_SCALE
+            # Cache the scaled+tinted blend — it never changes unless the window is resized.
+            _blend_cache_key = (blend_w, blend_h)
+            if (not hasattr(self, '_mjf_blend_cached')
+                    or self._mjf_blend_cached_key != _blend_cache_key):
+                _b = pygame.transform.scale(self._world_map_blend, _blend_cache_key)
+                _b.fill((80, 80, 80), special_flags=pygame.BLEND_RGB_MULT)
+                self._mjf_blend_cached     = _b
+                self._mjf_blend_cached_key = _blend_cache_key
+            self.logical_surface.blit(self._mjf_blend_cached, (0, sky_h - 8), special_flags=pygame.BLEND_RGB_ADD)
+
+        # ── Flying character sprite ────────────────────────────────────────
+        if self._mjf_flying_frames:
+            frame = self._mjf_flying_frames[self._mjf_flying_frame_idx]
+
+            sprite_scale = RENDER_SCALE * (3.0 - 2.3 * altitude)
+            w = int(frame.get_width() * sprite_scale)
+            h = int(frame.get_height() * sprite_scale)
+
+            base_scale = RENDER_SCALE * 3.0
+            base_h = int(frame.get_height() * base_scale)
+
+            # Pixel-measured from Buu's Fury reference: the sprite barely moves
+            # vertically on screen. Altitude is communicated through scale and
+            # horizon height — NOT by the sprite sweeping up and down.
+            # sprite_cy = sky_h * (0.70 at max alt  →  0.84 at ground level)
+            sprite_y = sky_h * (0.48 + 0.63 * (1.0 - altitude))
+
+            # Shadow — now after sprite_y is known
+            shadow_x = int(self._mjf_fly_x)
+            # Shadow Y: placed lower on screen (0.65 factor vs old 0.35) and shifts
+            # slightly toward the horizon at higher altitude, matching Buu's Fury reference.
+            # Pixel-measured from GBA footage: shadow sits at ~77% of screen height at
+            # low alt, drifting up to ~75% at high alt.
+            shadow_ground_y = int(sky_h + (sh - sky_h) * 0.32)
+
+            # ── GBA-style shadow – pixel-exact 11-step lookup ────────────────
+            # Each entry: (total_w, total_h, [(left_inset, right_inset), ...])
+            # Row definitions extracted pixel-by-pixel from the Buu's Fury
+            # reference sprites (white = transparent, black = opaque).
+            # Shapes are indexed 0 (lowest altitude) → 10 (highest altitude).
+            # All sizes are in GBA native pixels; multiply by RENDER_SCALE for
+            # logical-surface coordinates.  Drawn as plain black rects – no
+            # surfaces, no blending, no ellipses.
+            _SHADOW_SHAPES = (
+                # 0  alt≈0.00  20×8
+                (25, 6, ((2, 0), (2, 0), (2, 0), (0, 0), (0, 0), (0, 0))),
+                # 1  alt≈0.10  18×8
+                (25, 6, ((3, 2), (3, 2), (3, 2), (0, 0), (0, 0), (0, 0))),
+                # 2  alt≈0.20  18×8
+                (25, 6, ((3, 2), (3, 2), (3, 2), (1.5, 0), (1.5, 0), (1.5, 0))),
+                # 3  alt≈0.30  20×8
+                (25, 6, ((4,4),(4,4),(4,4),(1.5,1.5),(1.5,1.5),(1.5,1.5))),
+                # 4  alt≈0.40  20×8  (asymmetric – left inset 1, right inset 2)
+                (25, 6, ((4,4),(4,4),(4,4),(2.5,2.5),(2.5,2.5),(2.5,2.5))),
+                # 5  alt≈0.50  16×8  (asymmetric – left inset 2, right inset 0)
+                (25, 6, ((6,6),(6,6),(6,6),(4.5,4.5),(4.5,4.5),(4.5,4.5))),
+                # 6  alt≈0.60  14×8  fully solid
+                (25, 7, ((8,8),(8,8),(6.5,6.5),(6.5,6.5),(6.5,6.5),(8,8),(8,8))),
+                # 7  alt≈0.70  14×6
+                (25, 7, ((7,7),(7,7),(7,7),(7,7),(7,7),(7,7),(7,7))),
+                # 8  alt≈0.80  14×6  (inset top AND bottom)
+                (25, 5, ((8.5,8.5),(8.5,8.5),(7,7),(7,7),(7,7))),
+                # 9  alt≈0.90  12×6  fully solid
+                (25, 6, ((8.5,8.5),(8.5,8.5),(7,7),(7,7),(8.5,8.5),(8.5,8.5))),
+                # 10 alt≈1.00  12×4
+                (25, 6, ((8.5,8.5),(8.5,8.5),(8.5,8.5),(8.5,8.5),(8.5,8.5),(8.5,8.5))),
+                # 11
+                (25, 6, ((10, 10), (10, 10), (8.5, 8.5), (8.5, 8.5))),
+            )
+            _idx = min(11, int(altitude * 12))
+            _tw, _th, _rows = _SHADOW_SHAPES[_idx]
+            RS = RENDER_SCALE
+            # Top-left corner of shadow bounding box
+            _sx = shadow_x - (_tw * RS) // 2
+            _sy = shadow_ground_y - (_th * RS) // 2
+            for _ry, (_li, _ri) in enumerate(_rows):
+                _rw = (_tw - _li - _ri) * RS
+                if _rw > 0:
+                    pygame.draw.rect(
+                        self.logical_surface, (0, 0, 0),
+                        (_sx + _li * RS, _sy + _ry * RS, _rw, RS)
+                    )
+            # ── End shadow ────────────────────────────────────────────────
+
+            # GBA-style artifacting: scale down to a quantised native size first,
+            # then scale back up with nearest-neighbour.  This makes whole pixel
+            # rows/columns snap in and out as altitude changes, matching the
+            # discrete affine-matrix scaling the GBA hardware produced.
+            # _STEPS controls how coarsely the size quantises — lower = chunkier.
+            _STEPS = 1.5
+            _native_w = max(1, round(w / RENDER_SCALE / _STEPS) * _STEPS // _STEPS)
+            _native_h = max(1, round(h / RENDER_SCALE / _STEPS) * _STEPS // _STEPS)
+            _small = pygame.transform.scale(frame, (_native_w, _native_h))
+            _mjf_scaled = pygame.transform.scale(_small, (w, h))
+            _mjf_rect   = _mjf_scaled.get_rect(center=(int(self._mjf_fly_x), int(sprite_y)))
+            self._mjf_sprite_rect = _mjf_rect  # expose to update loop for collision
+            # Depth of the player on the ground plane — used for painter's-algo
+            # sorting against location icons drawn later.
+            _shad_row_p      = max(shadow_ground_y - horizon_y + HORIZON_OFFSET, 1)
+            _mjf_player_depth = FOCAL * (sh - PROJECTION_HORIZON) / _shad_row_p
+        else:
+            _mjf_scaled       = None
+            _mjf_rect         = None
+            _mjf_player_depth = float('inf')  # no player → never occludes icons
+
+        # ── Mini-map HUD (top-right corner) ──────────────────────────────────
+        # ── Size control: change _HUD_SCALE to make both sprites bigger/smaller.
+        _HUD_SCALE = RENDER_SCALE * 1.5   # e.g. RENDER_SCALE*2 for double size
+        if not hasattr(self, '_world_map_hud'):
+            try:
+                _raw_hud = pygame.image.load('assets/map/world_map_hud.png').convert_alpha()
+                self._world_map_hud = pygame.transform.scale(
+                    _raw_hud,
+                    (_raw_hud.get_width() * _HUD_SCALE, _raw_hud.get_height() * _HUD_SCALE)
+                )
+            except Exception as e:
+                print(f'[world_map] could not load world_map_hud.png: {e}')
+                self._world_map_hud = None
+
+        if not hasattr(self, '_world_map_arrow_base'):
+            try:
+                _raw_arrow = pygame.image.load('assets/map/world_map_arrow.png').convert_alpha()
+                # Store the raw sprite (native size) so rotation artifacts naturally
+                _br  = _raw_arrow.get_bounding_rect()
+                _nw  = _raw_arrow.get_width()  + 2 * abs(_raw_arrow.get_width()  // 2 - _br.centerx)
+                _nh  = _raw_arrow.get_height() + 2 * abs(_raw_arrow.get_height() // 2 - _br.centery)
+                _recentered = pygame.Surface((_nw, _nh), pygame.SRCALPHA)
+                _recentered.blit(_raw_arrow, (_nw // 2 - _br.centerx, _nh // 2 - _br.centery))
+                self._world_map_arrow_base     = _recentered        # raw, for rotating
+                self._world_map_arrow_hud_scale = int(_HUD_SCALE)   # scale applied after rotate
+            except Exception as e:
+                print(f'[world_map] could not load world_map_arrow.png: {e}')
+                self._world_map_arrow_base      = None
+                self._world_map_arrow_hud_scale = int(_HUD_SCALE)
+
+        if self._world_map_hud:
+            _hud   = self._world_map_hud
+            _hud_w = _hud.get_width()
+            _hud_h = _hud.get_height()
+            _hud_x = sw - _hud_w - 8 * RENDER_SCALE
+            _hud_y = 8 * RENDER_SCALE
+            self.logical_surface.blit(_hud, (_hud_x, _hud_y),
+                                      special_flags=pygame.BLEND_ADD)
+
+            if texture:
+                _shad_screen_y  = int(sky_h + (sh - sky_h) * 0.32)
+                _shad_row       = max(_shad_screen_y - horizon_y + HORIZON_OFFSET, 1)
+                _shad_depth     = FOCAL * (sh - PROJECTION_HORIZON) / _shad_row
+                _angle          = self._mjf_cam_angle
+                _shadow_world_x = self._mjf_cam_x + _math.sin(_angle) * _shad_depth
+                _shadow_world_y = self._mjf_cam_y - _math.cos(_angle) * _shad_depth
+
+                _norm_x = (_shadow_world_x % tw) / tw
+                _norm_y = (_shadow_world_y % th) / th
+                _dot_x  = int(_hud_x + _norm_x * _hud_w)
+                _dot_y  = int(_hud_y + _norm_y * _hud_h)
+
+                if self._world_map_arrow_base:
+                    _arrow_deg = _math.degrees(_angle)
+                    if getattr(self, '_mjf_moving_backward', False):
+                        _arrow_deg += 180.0
+                    # Rotate at native 5×7 size so pixels artifact naturally,
+                    # then scale up to display size.
+                    _arrow_rot = pygame.transform.rotate(
+                        self._world_map_arrow_base, -_arrow_deg
+                    )
+                    _hs = self._world_map_arrow_hud_scale
+                    _arrow_rot = pygame.transform.scale(
+                        _arrow_rot,
+                        (_arrow_rot.get_width() * _hs, _arrow_rot.get_height() * _hs)
+                    )
+                    self.logical_surface.blit(
+                        _arrow_rot, _arrow_rot.get_rect(center=(_dot_x, _dot_y)))
+                else:
+                    pygame.draw.circle(
+                        self.logical_surface, (255, 255, 80), (_dot_x, _dot_y), RENDER_SCALE + 1)
+                    pygame.draw.circle(
+                        self.logical_surface, (255, 50, 50),  (_dot_x, _dot_y), RENDER_SCALE)
+
+                # ── Location markers on minimap ────────────────────────────────
+                if not hasattr(self, '_world_map_loc_sprite'):
+                    try:
+                        self._world_map_loc_sprite = pygame.image.load(
+                            'assets/map/world_map_loc.png'
+                        ).convert_alpha()
+                    except Exception as e:
+                        print(f'[world_map] could not load world_map_loc.png: {e}')
+                        self._world_map_loc_sprite = None
+
+                if self._world_map_loc_sprite and self._wm_locations:
+                    _loc_size = 4 * RENDER_SCALE
+                    _loc_spr  = pygame.transform.scale(
+                        self._world_map_loc_sprite, (_loc_size, _loc_size)
+                    )
+                    _ppt_x_hm = tw / 362
+                    _ppt_y_hm = th / 263
+                    for _mloc in self._wm_locations:
+                        _mloc_wx  = (_mloc['x'] * _ppt_x_hm) % tw
+                        _mloc_wy  = (_mloc['y'] * _ppt_y_hm) % th
+                        _mloc_nx  = _mloc_wx / tw
+                        _mloc_ny  = _mloc_wy / th
+                        _mloc_sx  = int(_hud_x + _mloc_nx * _hud_w)
+                        _mloc_sy  = int(_hud_y + _mloc_ny * _hud_h)
+                        self.logical_surface.blit(
+                            _loc_spr, _loc_spr.get_rect(center=(_mloc_sx, _mloc_sy))
+                        )
+
+        # ── Location billboards ───────────────────────────────────────────────
+        # Explicitly clear any clip that may have leaked from the ground-tile
+        # rendering pass. Icons must draw freely over the full surface.
+        self.logical_surface.set_clip(None)
+        # Load icon surfaces once, cached by stem
+        if not hasattr(self, '_wm_icon_cache'):
+            self._wm_icon_cache = {}
+
+        # Load location list once (alongside the texture)
+        if not hasattr(self, '_wm_locations'):
+            self._wm_locations = []
+            _active_map = getattr(self, '_active_world_map_name', '')
+            if _active_map:
+                import json as _json, os as _os
+                try:
+                    with open(_os.path.join('assets', 'world_maps',
+                                            f'{_active_map}.json')) as _f:
+                        _ld = _json.load(_f)
+                    self._wm_locations = _ld.get('locations', [])
+                except Exception:
+                    pass
+
+        # Project and collect each location marker (deferred draw for depth sort)
+        _icon_draw_list = []         # list of (depth, surf, rect)
+        # Collision list: world coords for every location that has a room.
+        # Built independently of the draw loop so culling never hides icons.
+        _icon_screen_positions = []
+        if texture and self._wm_locations:
+            _coll_ppt_x = tw / 362
+            _coll_ppt_y = th / 263
+            for _cloc in self._wm_locations:
+                if _cloc.get('room', ''):
+                    _icon_screen_positions.append(
+                        (_cloc['x'] * _coll_ppt_x, _cloc['y'] * _coll_ppt_y, _cloc)
+                    )
+        if texture and self._wm_locations:
+            _MAP_TILE_W = 362
+            _MAP_TILE_H = 263
+            _ppt_x = tw / _MAP_TILE_W  # texture pixels per tile, X
+            _ppt_y = th / _MAP_TILE_H  # texture pixels per tile, Y
+
+            virtual_ground_h = sh - PROJECTION_HORIZON
+
+            for _loc in self._wm_locations:
+                # Convert tile coord → texture pixel space
+                _wx = _loc['x'] * _ppt_x
+                _wy = _loc['y'] * _ppt_y
+
+                # Delta from camera with shortest-path wrapping
+                _dx = (_wx - cam_x) % tw
+                if _dx > tw * 0.5:
+                    _dx -= tw
+                _dy = (_wy - cam_y) % th
+                if _dy > th * 0.5:
+                    _dy -= th
+
+                # Project onto camera axes
+                _depth = _dx * sin_a - _dy * cos_a
+                if _depth <= 1:
+                    continue  # behind camera or too close
+
+                _col = (_dx * cos_a + _dy * sin_a) / _depth
+
+                # Screen position (ground plane hit point)
+                _rows_f = FOCAL * virtual_ground_h / _depth
+                _screen_x = int(sw * 0.5 + _col * sw)
+                _row_offset = max(0, int(_rows_f) - HORIZON_OFFSET)
+                _t_curve = 1.0 - (_row_offset / max(1, effective_ground - 1))
+                _dy_curve = int(_t_curve * _t_curve * _curve_px)
+                _screen_y = int(horizon_y + _rows_f - _dy_curve)
+
+                # Perspective scale: larger when closer, smaller when farther.
+                _near_depth = base_focal * virtual_ground_h / max(1, sh - horizon_y)
+                _persp = max(0.1, min(2.5, _near_depth / _depth))
+
+                _icon_stem = _loc.get('icon', '')
+                if _icon_stem:
+                    if _icon_stem not in self._wm_icon_cache:
+                        try:
+                            self._wm_icon_cache[_icon_stem] = pygame.image.load(
+                                f'assets/map/icons/{_icon_stem}.png'
+                            ).convert_alpha()
+                        except Exception:
+                            self._wm_icon_cache[_icon_stem] = None
+
+                    _icon_raw = self._wm_icon_cache[_icon_stem]
+                    if _icon_raw:
+                        _isz = max(2, int(50 * RENDER_SCALE * _persp))  # ← change 50 to resize icons
+                        _icon_surf = pygame.transform.scale(_icon_raw, (_isz, _isz))
+                        _icon_rect = _icon_surf.get_rect(midbottom=(_screen_x, _screen_y))
+                        if (0 <= _screen_x < sw) and (sky_h < _screen_y < sh):
+                            _icon_draw_list.append((_depth, _icon_surf, _icon_rect))
+
+        # ── Painter's algorithm: draw icons + player back-to-front ────────────
+        # Sprites and icons always draw at full opacity. The black overlay drawn
+        # at the end of this function covers everything — no per-sprite fading.
+        _icon_draw_list.sort(key=lambda e: e[0], reverse=True)
+        _player_drawn = False
+        for _entry_depth, _entry_surf, _entry_rect in _icon_draw_list:
+            # Draw the player once, at the point where its depth is reached.
+            if not _player_drawn and _entry_depth <= _mjf_player_depth:
+                if _mjf_scaled is not None:
+                    _mjf_scaled.set_alpha(255)
+                    self.logical_surface.blit(_mjf_scaled, _mjf_rect)
+                _player_drawn = True
+            _screen_rect = self.logical_surface.get_rect()
+            _visible = _entry_rect.clip(_screen_rect)
+            if _visible.width > 0 and _visible.height > 0:
+                _src_rect = pygame.Rect(
+                    _visible.x - _entry_rect.x,
+                    _visible.y - _entry_rect.y,
+                    _visible.width,
+                    _visible.height,
+                )
+                _entry_surf.set_alpha(255)
+                self.logical_surface.blit(_entry_surf, _visible, _src_rect)
+        # If no icons were closer than the player (or no icons at all), draw now.
+        if not _player_drawn and _mjf_scaled is not None:
+            _mjf_scaled.set_alpha(255)
+            self.logical_surface.blit(_mjf_scaled, _mjf_rect)
+
+        # Persist icon screen positions so _update_map_flying can do collision.
+        self._wm_last_icon_screen_positions = _icon_screen_positions
+
+        # ── Lower bar ─────────────────────────────────────────────────────────
+        if not hasattr(self, '_world_map_lower_bar'):
+            try:
+                _raw_lb = pygame.image.load('assets/map/lower_bar.png').convert_alpha()
+                self._world_map_lower_bar = _raw_lb
+            except Exception as e:
+                print(f'[world_map] could not load lower_bar.png: {e}')
+                self._world_map_lower_bar = None
+
+        if self._world_map_lower_bar:
+            _lb      = self._world_map_lower_bar
+            _lb_h    = int(_lb.get_height() * RENDER_SCALE * 2)
+            _lb_surf = pygame.transform.scale(_lb, (sw, _lb_h))
+            _lb_y    = sh - _lb_h - int(4 * RENDER_SCALE) - 50
+            self.logical_surface.blit(_lb_surf, (0, _lb_y))
+
+            # ── Bitmap font helpers ───────────────────────────────────────────
+            import os as _os
+            _FDIR = _os.path.join('assets', 'ui', 'fonts', 'world_map')
+            _SPACE_W = int(_lb_h * 0.3)   # width of a space character
+
+            # Lazy per-height glyph cache: (char, height) → colourised Surface
+            if not hasattr(self, '_wm_glyph_cache'):
+                self._wm_glyph_cache: dict = {}
+
+            def _char_to_filename(ch):
+                if ch == ':':  return 'collon.png'
+                if ch == '/':  return 'slash.png'
+                return ch.upper() + '.png'
+
+            def _get_glyph(ch, height, color):
+                key = (ch, height, color)
+                if key in self._wm_glyph_cache:
+                    return self._wm_glyph_cache[key]
+                path = _os.path.join(_FDIR, _char_to_filename(ch))
+                try:
+                    raw = pygame.image.load(path).convert_alpha()
+                    # Scale to target height, preserve aspect ratio
+                    ow, oh = raw.get_size()
+                    nw = max(1, int(ow * height / oh))
+                    scaled = pygame.transform.scale(raw, (nw, height))
+                    # Colorise: replace white/light pixels with the target colour
+                    coloured = scaled.copy()
+                    coloured.fill(color, special_flags=pygame.BLEND_RGB_MULT)
+                    self._wm_glyph_cache[key] = coloured
+                    return coloured
+                except Exception:
+                    self._wm_glyph_cache[key] = None
+                    return None
+
+            def _measure(text, height, color):
+                w = 0
+                for ch in text:
+                    if ch == ' ':
+                        w += _SPACE_W
+                    else:
+                        g = _get_glyph(ch, height, color)
+                        if g:
+                            w += g.get_width() + _SPACING
+                return w
+
+            def _blit_text(surf, text, x, y, height, color):
+                for ch in text:
+                    if ch == ' ':
+                        x += _SPACE_W
+                    else:
+                        g = _get_glyph(ch, height, color)
+                        if g:
+                            surf.blit(g, (x, y))
+                            x += g.get_width() + _SPACING
+                return x
+
+            # ── Draw centred button hints ─────────────────────────────────────
+            _WHITE    = (255, 255, 255)
+            _CYAN     = (0, 220, 200)
+            _SPACING = 4
+            _gh       = int(_lb_h * 0.38)   # glyph height
+            _nearby   = getattr(self, '_mjf_nearby_loc_name', '')
+            if _nearby:
+                _segments = [(_nearby, _WHITE)]
+            else:
+                _segments = [
+                    ('A BUTTON: ', _WHITE),
+                    ('DESCEND/LAND  ', _CYAN),
+                    ('B BUTTON: ', _WHITE),
+                    ('ASCEND', _CYAN),
+                ]
+            _total_w = sum(_measure(t, _gh, c) for t, c in _segments)
+            _tx      = (sw - _total_w) // 2
+            _ty      = _lb_y + (_lb_h - _gh) // 2
+            for _txt, _col in _segments:
+                _tx = _blit_text(self.logical_surface, _txt, _tx, _ty, _gh, _col)
+
+        # Fade overlay drawn last so it covers the ground, player sprite, and
+        # all location icons — non-zero during 'fade_in' and 'landing_fade_out'.
+        self._draw_map_jump_fade(self.logical_surface)
 
     # ── Character switching ───────────────────────────────────────────────────
 
@@ -1661,6 +3235,11 @@ class Game:
         current_time   = time.time()
         dt             = current_time - self.last_time
         self.last_time = current_time
+        # Clamp dt so a focus-loss / debugger pause / OS interrupt never causes
+        # a multi-second physics step that flings entities through walls or
+        # corrupts fade-timers.  Cap at ~66 ms (4 frames @ 60 fps) — anything
+        # higher is almost certainly a debugger break, minimize, or OS sleep.
+        dt             = min(dt, 4.0 / 60.0)
         self.dt        = dt
 
         # When the room editor is open, skip all game simulation — only tick the editor.
@@ -1676,6 +3255,14 @@ class Game:
         self.pause_menu.update(dt)
 
         if self.ui.current_screen == 'game':
+            # ── World-map flying sequence ──────────────────────────────────────
+            # Once the map-jump fade-out has fired (or is completing), hand off
+            # all update logic to _update_map_flying and skip game simulation.
+            if self._mjf_state in ('pending_fade_in', 'fade_in', 'flying',
+                                   'landing_fade_out', 'landing_fade_in'):
+                self._update_map_flying(dt)
+                return
+
             # Accumulate play time only while unpaused and no overlay is blocking.
             if not self.save_point_menu.active and not self.character_switch_menu.active \
                     and not self.pause_menu.active:
@@ -1687,6 +3274,16 @@ class Game:
                 self._update_player_movement(dt)
 
             self.player.update(dt)
+
+            # Tick the map-jump fade-out.  Start once the player's sprite has
+            # fully cleared the top of the camera; ramp alpha to full black.
+            if self.player.is_map_jumping and self.player.map_jump_moving:
+                player_screen_top = (self.player.y * RENDER_SCALE - self.camera.y
+                                     + self.player.height * RENDER_SCALE)
+                if player_screen_top < 0:
+                    self._mjf_active = True
+            if self._mjf_active:
+                self._mjf_alpha = min(255.0, self._mjf_alpha + self._MJF_SPEED * dt)
 
             # Fade the damage tint back to neutral each frame.
             if self.player.hurt_tint > 0:
@@ -1768,6 +3365,9 @@ class Game:
             # Save point proximity detection.
             self._update_save_points(dt)
 
+            # World-map object proximity detection.
+            self._update_world_map_objects(dt)
+
             # Destructible stones.
             self._update_stones(dt)
 
@@ -1789,6 +3389,9 @@ class Game:
                 return
             if self.dev_menu.active:
                 self.dev_menu.update(dt)
+                return
+            if self.world_map_editor.active:
+                self.world_map_editor.update(dt)
                 return
             if self.sprite_editor.active:
                 self.sprite_editor.update(dt)
@@ -1832,41 +3435,24 @@ class Game:
             old_y = self.player.y
             self.player.move(dx, dy, is_running, self.current_room.width, self.current_room.height)
 
-            # Resolve collisions in priority order: stones → gates → walls → NPCs.
-            # On a hit we restore the pre-move position; running causes knockback.
+            # Collision resolution.
+            # player.move() already handles walls/stones/gates/transitions
+            # axis-by-axis, so the player never clips through them.
+            # Here we only need to:
+            #   1. Trigger running knockback when the player is blocked while sprinting.
+            #   2. Handle NPC collisions (not in player.obstacles).
             collision = False
 
-            for stone in self.destructible_stones:
-                if stone.check_collision_with_player(self.player):
-                    self.player.x = old_x
-                    self.player.y = old_y
-                    if is_running:
-                        self.player.start_collision_knockback(dx, dy)
-                        self.camera.start_shake(intensity=15, duration=0.3)
-                    collision = True
-                    break
-
-            if not collision:
-                for gate in self.level_gates:
-                    if gate.active and gate.check_collision_with_player(self.player):
-                        self.player.x = old_x
-                        self.player.y = old_y
-                        if is_running:
-                            self.player.start_collision_knockback(dx, dy)
-                            self.camera.start_shake(intensity=15, duration=0.3)
-                        collision = True
-                        break
-
-            if not collision:
-                for obj in self.collision_objects:
-                    if obj.check_collision_with_player(self.player):
-                        self.player.x = old_x
-                        self.player.y = old_y
-                        if is_running:
-                            self.player.start_collision_knockback(dx, dy)
-                            self.camera.start_shake(intensity=15, duration=0.3)
-                        collision = True
-                        break
+            # Running knockback — fire if move() blocked at least one axis while
+            # sprinting, and the post-knockback cooldown has expired so holding
+            # the key doesn't chain infinite bounces.
+            # Diagonal movement just slides along the wall — no knockback.
+            if is_running and (self.player._blocked_x or self.player._blocked_y) \
+                    and self.player._knockback_cooldown <= 0 \
+                    and not (dx != 0 and dy != 0):
+                self.player.start_collision_knockback(dx, dy)
+                self.camera.start_shake(intensity=15, duration=0.3)
+                collision = True
 
             if not collision:
                 # NPC collision — use a slim hitbox at the NPC's feet to feel natural.
@@ -1995,8 +3581,16 @@ class Game:
         """Poll shooter enemies for new projectile spawns, tick all in-flight bombs,
         and collect explosion effects when a bomb detonates.
         """
-        for enemy in self.enemies:
-            if not (hasattr(enemy, 'enemy_category') and enemy.enemy_category == 'shooter'):
+        # Rebuild the shooter cache only when the enemy list changes length
+        # (room load or enemy death). Saves an O(n) category scan every tick —
+        # noticeable in dense rooms with 15+ enemies.
+        _en_count = len(self.enemies)
+        if getattr(self, '_shooter_cache_len', -1) != _en_count:
+            self._shooter_enemies    = [e for e in self.enemies
+                                        if getattr(e, 'enemy_category', '') == 'shooter']
+            self._shooter_cache_len  = _en_count
+        for enemy in self._shooter_enemies:
+            if not enemy.active:
                 continue
 
             # Bombs
@@ -2113,6 +3707,10 @@ class Game:
                 self.enemy_kiblasts.remove(blast)
 
 
+    # Class-level so re.compile() runs once per interpreter start, not on
+    # every NPC interaction. Static methods can’t reference self, so the
+    # compiled pattern has to live here.
+    _NPC_VARIANT_RE = __import__('re').compile(r'(\d+)$')
 
     @staticmethod
     def _npc_portrait_key(npc):
@@ -2130,8 +3728,7 @@ class Game:
         if variant in (None, '', 'default'):
             suffix = ''
         else:
-            import re
-            m      = re.search(r'(\d+)$', variant)
+            m      = Game._NPC_VARIANT_RE.search(variant)
             suffix = str(int(m.group(1)) + 1) if m else '2'
 
         return f"npc_{npc_id}{suffix}"
@@ -2141,7 +3738,8 @@ class Game:
         self.nearby_npc = None
         for npc in self.npcs[:]:
             npc.update(dt, self.player, self.current_room.width, self.current_room.height)
-            if npc.can_interact(self.player):
+            # Only update nearby_npc once — first in-range NPC wins.
+            if self.nearby_npc is None and npc.can_interact(self.player):
                 self.nearby_npc = npc
 
     def _update_save_points(self, dt):
@@ -2153,6 +3751,45 @@ class Game:
             (sp for sp in self.save_points if sp.is_player_nearby and sp.active),
             None
         )
+
+    def _update_world_map_objects(self, dt):
+        """Tick world-map objects and resolve which one (if any) the player can interact with.
+
+        'world_map' (flat):  player must be standing on the object — checked via
+                              rect overlap with the player's collision rect.
+        'world_map_sign':    player must be within a small proximity radius, the
+                              same approach used for NPCs and save points.
+        """
+        import pygame as _pg
+
+        _SIGN_INTERACT_RADIUS = 24   # World units — tweak to feel right
+
+        self.nearby_world_map_obj = None
+        player_rect = self.player.get_collision_rect()
+
+        for obj in self.world_map_objects:
+            if not obj.active:
+                continue
+
+            if obj.variant == 'world_map':
+                # Flat map: player walks onto it — overlap test.
+                obj_rect = _pg.Rect(
+                    obj.x - obj.width  // 2,
+                    obj.y - obj.height // 2,
+                    obj.width,
+                    obj.height,
+                )
+                if player_rect.colliderect(obj_rect):
+                    self.nearby_world_map_obj = obj
+                    break
+
+            elif obj.variant == 'world_map_sign':
+                # Sign: proximity radius, same pattern as NPCs.
+                dx = self.player.x - obj.x
+                dy = self.player.y - obj.y
+                if (dx * dx + dy * dy) <= _SIGN_INTERACT_RADIUS ** 2:
+                    self.nearby_world_map_obj = obj
+                    break
 
     def _update_stones(self, dt):
         """Tick destructible stones, check melee hits, and remove anything destroyed."""
@@ -2212,6 +3849,16 @@ class Game:
             pygame.display.flip()
             return
 
+        # World-map flying sequence — replace the entire game scene with the
+        # flying view (character sprite on a sky/space background) once the
+        # fade-out has completed.  The black overlay is drawn on top by
+        # _draw_world_map_flying_scene so the fade-in still works correctly.
+        if self._mjf_state in ('fade_in', 'flying',
+                               'landing_fade_out'):
+            self._draw_world_map_flying_scene()
+            pygame.display.flip()
+            return
+
         # Flush any stale baked tile surfaces once per frame before anything
         # tries to access them — keeps rebuilds to one per frame regardless of
         # how many on_tile_changed calls arrived during event processing.
@@ -2226,33 +3873,35 @@ class Game:
         visible_x_end   = (self.camera.x + SCREEN_WIDTH)  // RENDER_SCALE
         visible_y_end   = (self.camera.y + SCREEN_HEIGHT) // RENDER_SCALE
 
-        # Draw a subtle tile grid so the designer can see the grid while editing.
-        first_grid_x = (visible_x_start // TILE_SIZE) * TILE_SIZE
-        first_grid_y = (visible_y_start // TILE_SIZE) * TILE_SIZE
+        # Draw a subtle tile grid and room boundary — only when the dev menu or
+        # room editor is active. Skipping this in normal gameplay saves hundreds
+        # of draw.line calls per frame.
+        if self.dev_menu.active or self.room_editor.active:
+            first_grid_x = (visible_x_start // TILE_SIZE) * TILE_SIZE
+            first_grid_y = (visible_y_start // TILE_SIZE) * TILE_SIZE
 
-        x = first_grid_x
-        while x <= visible_x_end:
-            screen_x = (x * RENDER_SCALE) - self.camera.x
-            if -50 <= screen_x <= SCREEN_WIDTH + 50:
-                pygame.draw.line(self.logical_surface, (44, 149, 44),
-                                 (int(screen_x), 0), (int(screen_x), SCREEN_HEIGHT), 1)
-            x += TILE_SIZE
+            x = first_grid_x
+            while x <= visible_x_end:
+                screen_x = (x * RENDER_SCALE) - self.camera.x
+                if -50 <= screen_x <= SCREEN_WIDTH + 50:
+                    pygame.draw.line(self.logical_surface, (44, 149, 44),
+                                     (int(screen_x), 0), (int(screen_x), SCREEN_HEIGHT), 1)
+                x += TILE_SIZE
 
-        y = first_grid_y
-        while y <= visible_y_end:
-            screen_y = (y * RENDER_SCALE) - self.camera.y
-            if -50 <= screen_y <= SCREEN_HEIGHT + 50:
-                pygame.draw.line(self.logical_surface, (44, 149, 44),
-                                 (0, int(screen_y)), (SCREEN_WIDTH, int(screen_y)), 1)
-            y += TILE_SIZE
+            y = first_grid_y
+            while y <= visible_y_end:
+                screen_y = (y * RENDER_SCALE) - self.camera.y
+                if -50 <= screen_y <= SCREEN_HEIGHT + 50:
+                    pygame.draw.line(self.logical_surface, (44, 149, 44),
+                                     (0, int(screen_y)), (SCREEN_WIDTH, int(screen_y)), 1)
+                y += TILE_SIZE
 
-        # Red outline marks the hard boundary of the current room.
-        pygame.draw.rect(self.logical_surface, self.colors['RED'], (
-            (0 * RENDER_SCALE) - self.camera.x,
-            (0 * RENDER_SCALE) - self.camera.y,
-            self.current_room.width  * RENDER_SCALE,
-            self.current_room.height * RENDER_SCALE,
-        ), 3)
+            pygame.draw.rect(self.logical_surface, self.colors['RED'], (
+                (0 * RENDER_SCALE) - self.camera.x,
+                (0 * RENDER_SCALE) - self.camera.y,
+                self.current_room.width  * RENDER_SCALE,
+                self.current_room.height * RENDER_SCALE,
+            ), 3)
 
         # Draw the spawn-point sprite if one has been placed in the editor.
         if hasattr(self, 'room_editor') and self.room_editor and self.room_editor.object_editor:
@@ -2280,17 +3929,16 @@ class Game:
                 px    = (nearby_pad.x * RENDER_SCALE) - self.camera.x
                 py    = ((nearby_pad.y - 25) * RENDER_SCALE) - self.camera.y
                 font  = self._get_font(20)
-                text  = font.render("E to Fly", True, self.colors['YELLOW'])
+                # Cache the rendered text surface — it never changes.
+                if not hasattr(self, '_fly_hint_surf'):
+                    _ft = font.render("E to Fly", True, self.colors['YELLOW'])
+                    _fbg = pygame.Surface((_ft.get_width() + 10, _ft.get_height() + 5), pygame.SRCALPHA)
+                    _fbg.fill((0, 0, 0, 180))
+                    self._fly_hint_surf = (_ft, _fbg)
+                text, bg = self._fly_hint_surf
                 trect = text.get_rect(center=(px, py))
-                bg    = pygame.Surface((trect.width + 10, trect.height + 5), pygame.SRCALPHA)
-                bg.fill((0, 0, 0, 180))
                 self.logical_surface.blit(bg,   trect.inflate(10, 5).topleft)
                 self.logical_surface.blit(text, trect)
-
-        # Save points
-        for sp in self.save_points:
-            if sp.active:
-                sp.draw(self.logical_surface, self.camera, self.colors, RENDER_SCALE)
 
         # Wire the tile-change hook lazily (tileset_editor may not exist yet in __init__).
         self._install_tile_change_hook()
@@ -2304,9 +3952,14 @@ class Game:
         # its own actor layer separately).
         if not self.active_cutscene_runtime:
             self.layer_manager.clear()
-            for obj in (self.projectiles + [self.player] + self.enemies + self.npcs
+            # During the landing sequence the player sprite is drawn manually by
+            # _draw_landing_sprite(), so exclude it from the layer manager to
+            # avoid two overlapping player sprites.
+            _player_list = [] if self._mjf_state == 'landing_fade_in' else [self.player]
+            for obj in (self.projectiles + _player_list + self.enemies + self.npcs
                         + self.destructible_stones + self.level_gates
-                        + self.bombs + self.explosions + self.flying_pads):
+                        + self.bombs + self.explosions + self.flying_pads
+                        + self.save_points + self.world_map_objects):
                 self.layer_manager.add_object(obj)
             for melee in self.melee_attacks:
                 self.layer_manager.add_object(melee)
@@ -2342,6 +3995,10 @@ class Game:
         # Foreground tile layer (same baked path as background).
         self._draw_room_tiles(bg=False)
 
+        # Ghost silhouette — drawn immediately after foreground tiles so the
+        # player remains readable when standing behind a fence, tree, or wall.
+        self._draw_player_silhouette_if_occluded()
+
         # Test-mode indicator banner — drawn after foreground tiles so it's always on top.
         if self.is_test_mode:
             test_font = self._get_font(32)
@@ -2374,6 +4031,7 @@ class Game:
         self.room_editor.draw(self.logical_surface)
         self.dev_menu.draw(self.logical_surface)
         self.cutscene_editor.draw(self.logical_surface)
+        self.world_map_editor.draw(self.logical_surface)
 
         # Collision and transition outlines in editor view mode.
         if self.room_editor.active and self.room_editor.current_view == 'view_room':
@@ -2481,6 +4139,11 @@ class Game:
 
         tileset_mgr = te.tileset_manager
         for tile in tiles:
+            # When the editor's "Hide other layers" mode is on, only bake tiles
+            # that belong to the layer currently being edited.
+            if te.hide_other_layers and tile.layer != te.current_layer:
+                continue
+
             is_bg_tile = tile.layer < 0
             if bg != is_bg_tile:
                 continue
@@ -2561,6 +4224,99 @@ class Game:
         )
         self.logical_surface.blit(scaled, (int(screen_x), int(screen_y)))
 
+    def _get_foreground_tiles(self):
+        """Return all foreground tiles (layer >= 0) for the current room.
+
+        Prefers the editor's live tile list so freshly painted tiles are
+        considered immediately without needing a cache rebuild.
+
+        Result is cached per (room_name, tile_list_id) and invalidated
+        automatically when the tile cache is flushed (same invalidation path
+        as the baked tile surfaces).
+        """
+        if not self.current_room:
+            return []
+        te = getattr(self.room_editor, 'tileset_editor', None)
+        room_name = self.current_room.name
+        if te and room_name in getattr(te, 'room_tiles', {}):
+            tiles = te.room_tiles[room_name]
+        else:
+            tiles = getattr(self.current_room, 'tiles', None) or []
+
+        # Cache key: room name + id of the tile list (changes when tiles are
+        # repainted or the room switches, matching tile-surface invalidation).
+        cache_key = (room_name, id(tiles))
+        cached = getattr(self, '_fg_tiles_cache', None)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+
+        result = [t for t in tiles if t.layer >= 0]
+        self._fg_tiles_cache = (cache_key, result)
+        return result
+
+    def _draw_player_silhouette_if_occluded(self):
+        """After the foreground tile layer is drawn, check whether any opaque
+        foreground tile pixel overlaps the player.  If so, blit a pixel-accurate
+        dark ghost so the player stays readable through walls/fences/trees.
+
+        Tile surfaces are retrieved and scaled here, then forwarded to
+        draw_player_silhouette which builds an occlusion mask from their opaque
+        pixels.  Transparent tile borders are excluded, so the ghost only appears
+        where a genuinely solid tile sits on top of the player sprite.
+        """
+        if self.active_cutscene_runtime:
+            return
+
+        fg_tiles = self._get_foreground_tiles()
+        if not fg_tiles:
+            return
+
+        # Build the player's screen-space bounding rect.
+        pw = int(self.player.width  * RENDER_SCALE)
+        ph = int(self.player.height * RENDER_SCALE)
+        px = int(self.player.x * RENDER_SCALE - self.camera.x)
+        py = int(self.player.y * RENDER_SCALE - self.camera.y)
+        player_rect = pygame.Rect(px - pw // 2, py - ph // 2, pw, ph)
+
+        te = getattr(self.room_editor, 'tileset_editor', None)
+
+        # Collect every tile whose bounding rect overlaps the player, together
+        # with its scaled surface.  draw_player_silhouette will then mask the
+        # silhouette to only the pixels those surfaces actually cover.
+        overlapping: list = []   # [(scaled_surface | None, screen_x, screen_y)]
+
+        for tile in fg_tiles:
+            tx = int(tile.x * RENDER_SCALE - self.camera.x)
+            ty = int(tile.y * RENDER_SCALE - self.camera.y)
+
+            tw = th = TILE_SIZE * RENDER_SCALE
+            if te:
+                tileset = te.tileset_manager.get_tileset(tile.tileset_name)
+                if tileset:
+                    tw = int(tileset.tile_width * RENDER_SCALE)
+                    th = int(tileset.tile_height * RENDER_SCALE)
+
+            if not player_rect.colliderect(pygame.Rect(tx, ty, tw, th)):
+                continue
+
+            tile_surf = None
+            if te and tileset:
+                raw = tileset.get_tile_surface(tile.tile_x, tile.tile_y)
+                if raw:
+                    scale_key = (tile.tileset_name, tile.tile_x, tile.tile_y, tw, th)
+                    if scale_key not in self._scaled_tile_cache:
+                        self._scaled_tile_cache[scale_key] = pygame.transform.scale(raw, (tw, th))
+                    tile_surf = self._scaled_tile_cache[scale_key]
+
+            cache_key = (tile.tileset_name, tile.tile_x, tile.tile_y)
+            overlapping.append((tile_surf, tx, ty, cache_key))
+
+        if overlapping:
+            self.layer_manager.draw_player_silhouette(
+                self.logical_surface, self.player, self.camera,
+                fg_tile_surfaces=overlapping,
+            )
+
     def _draw_ui(self, dt):
         """Draw all UI elements that appear on top of the game world."""
         self.npc_config_menu.draw(self.logical_surface, self.colors)
@@ -2575,8 +4331,15 @@ class Game:
         self._draw_cutscene_fade(self.logical_surface)
 
         # HUD slide animation — slides in/out when entering/leaving game mode.
+        # Suppressed entirely during the world-map flying/landing sequence so the
+        # HUD is never visible while the player is descending.  It is triggered to
+        # slide back in by _update_map_flying once the fade has fully cleared.
+        _in_map_sequence = self._mjf_state in (
+            'pending_fade_in', 'fade_in', 'flying',
+            'landing_fade_out', 'landing_fade_in',
+        )
         if self.ui.current_screen == 'game' and not self.character_switch_menu.active \
-                and not self.pause_menu.active:
+                and not self.pause_menu.active and not _in_map_sequence:
             _HUD_SLIDE_SPEED = 400
             # Derive the hidden position from the actual scaled frame height so
             # the entire HUD (including the boss bar) clears the top of the screen.
@@ -2605,6 +4368,15 @@ class Game:
             self.ui.draw_inventory_screen(self.logical_surface, self.player, self.colors)
         elif self.ui.current_screen == 'options':
             self.ui.draw_options_screen(self.logical_surface, self.colors)
+
+        # Map-jump fade drawn dead last so it covers every UI element including
+        # the HUD — otherwise the HUD renders on top and the fade looks incomplete.
+        self._draw_map_jump_fade(self.logical_surface)
+
+        # Landing sprite drawn on top of the fade overlay so the player is
+        # visible descending as the black screen fades away.
+        if self._mjf_state == 'landing_fade_in':
+            self._draw_landing_sprite()
 
     # ── Editor / room sync ────────────────────────────────────────────────────
 
@@ -2676,6 +4448,9 @@ class Game:
 
     def run(self):
         """Main loop — runs until self.running is False or an unhandled exception occurs."""
+        # try/finally guarantees cleanup() fires even on an unhandled crash.
+        # cleanup() flushes room data and editor state — losing that mid-session
+        # would be very painful, so we always run it before the process dies.
         self.last_time = time.time()
         try:
             while self.running:

@@ -1,9 +1,10 @@
 import pygame
+from config.settings import RENDER_SCALE as _RENDER_SCALE
 from core.draw_layers import get_beam_layer, DrawLayer
 
 
 class BeamAttack:
-    def __init__(self, x, y, direction, scale=2.0):
+    def __init__(self, x, y, direction, scale=_RENDER_SCALE):
         self.x = x
         self.y = y
         self.direction = direction

@@ -47,6 +47,8 @@ class EntityEditor:
         'disabled': (100, 100, 100),
         'variant_bg': (25, 25, 40),
         'variant_selected': (50, 150, 255),
+        'button': (60, 60, 80),
+        'button_hover': (80, 80, 100),
         # Entity-category accent colours (used for preview sprites)
         'npc_color': (50, 150, 200),
         'enemy_color': (220, 60, 60),
@@ -398,16 +400,18 @@ class EntityEditor:
 
     def _panel_toggle_rect(self):
         """Return the rect for the ◀/▶ tab that straddles the panel's left edge."""
-        tx = (self.palette_x - self._panel_tab_w) if self.palette_visible else (self.screen_width - self._panel_tab_w)
-        ty = self.palette_y + 150
+        gap = 6
+        tx = (self.palette_x - self._panel_tab_w - gap) if self.palette_visible else (
+                    self.screen_width - self._panel_tab_w)
+        ty = self.palette_y + (self.palette_height - self._panel_tab_h) // 2
         return pygame.Rect(tx, ty, self._panel_tab_w, self._panel_tab_h)
 
     def _draw_panel_toggle_tab(self, screen):
         """Render the small ◀/▶ tab — always visible so the panel can be recalled."""
-        rect   = self._panel_toggle_rect()
-        bg     = self.COLORS['panel_light'] if self._hover_panel_toggle else self.COLORS['panel']
-        border = self.COLORS['accent']      if self._hover_panel_toggle else self.COLORS['grid']
-        pygame.draw.rect(screen, bg,     rect, border_radius=6)
+        rect = self._panel_toggle_rect()
+        bg = self.COLORS['button_hover'] if self._hover_panel_toggle else self.COLORS['button']
+        border = self.COLORS['accent'] if self._hover_panel_toggle else (60, 60, 80)
+        pygame.draw.rect(screen, bg, rect, border_radius=6)
         pygame.draw.rect(screen, border, rect, 1, border_radius=6)
         arrow = '◀' if self.palette_visible else '▶'
         label = self.font_small.render(
@@ -1248,8 +1252,11 @@ class EntityEditor:
 
         # sprite fills tile at correct proportions (no squishing)
         if entity['sprite']:
-            sprite = pygame.transform.scale(entity['sprite'], (item_w - 8, item_h - 8))
-            screen.blit(sprite, sprite.get_rect(center=item_rect.center))
+            src = entity['sprite']
+            sw, sh = src.get_size()
+            scale = min((item_w - 8) / sw, (item_h - 8) / sh)
+            scaled = pygame.transform.scale(src, (max(1, int(sw * scale)), max(1, int(sh * scale))))
+            screen.blit(scaled, scaled.get_rect(center=item_rect.center))
 
         # name label below tile
         name_surf = self.font_small.render(entity['name'], True, self.COLORS['text_dim'])

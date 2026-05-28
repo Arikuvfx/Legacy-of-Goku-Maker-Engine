@@ -27,6 +27,11 @@ class Camera:
         self._lerp_active  = False
         self._lerp_speed   = 5.0   # higher = faster blend (good range: 3–8)
 
+        # When True the camera position is frozen — the player is no longer tracked.
+        # Used during the world-map jump sequence so the camera doesn't follow
+        # the player off-screen.
+        self.locked = False
+
         # Camera shake state
         self.shake_intensity = 0
         self.shake_duration  = 0
@@ -69,6 +74,12 @@ class Camera:
         else:
             self.shake_offset_x = 0
             self.shake_offset_y = 0
+
+        # When locked the camera doesn't track the target — it stays exactly
+        # where it is.  Shake still runs above so an impact on the same frame
+        # as the lock isn't silently dropped.
+        if self.locked:
+            return
 
         # Centre the viewport on the target (in screen space).
         target_screen_x = target.x * RENDER_SCALE

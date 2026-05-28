@@ -5,7 +5,7 @@ from core.draw_layers import DrawLayer
 
 
 class NPC:
-    def __init__(self, x, y, dialogue_config=None):
+    def __init__(self, x, y, dialogue_config=None, facing_direction='down', npc_type='static'):
         """Create an NPC at world position (*x*, *y*).
 
         Args:
@@ -14,6 +14,9 @@ class NPC:
                 Keys: 'dialogues' (list of strings), 'trigger_limit' (-1 for
                 unlimited), 'triggers_used', 'after_limit_text',
                 'random_order', 'give_item', 'item_given'.
+            facing_direction: Initial facing direction ('down', 'up', 'left',
+                'right').  Defaults to 'down'.
+            npc_type: 'static' or 'moving'.  Defaults to 'static'.
         """
         self.x = x
         self.y = y
@@ -21,7 +24,7 @@ class NPC:
         self.height = 32
         self.speed = 1.5
         self.active = True
-        self.npc_type = 'static'
+        self.npc_type = npc_type
 
         # Movement for moving NPCs
         self.idle_timer = 2.0  # start with a wait so NPCs don't all move at once
@@ -48,7 +51,12 @@ class NPC:
         }
         self.current_dialogue_index = 0
         self.is_talking = False
-        self.facing_direction = 'down'
+        self.facing_direction = facing_direction  # set from constructor, not hardcoded
+
+        # True once the sprite animation has been synced to facing_direction.
+        # Stays False until the first update() so we can sync even if the
+        # sprite is assigned after construction (as game._spawn_room_entities does).
+        self._sprite_facing_synced = False
 
         # Interaction
         self.interaction_range = 50
@@ -84,6 +92,14 @@ class NPC:
 
         if self.has_sprite and self.sprite:
             self.sprite.update(dt)
+
+        # On the very first update after the sprite is assigned, sync its
+        # animation to the configured facing direction.  This handles the case
+        # where the sprite is set externally (after __init__) and would
+        # otherwise always start in its default idle-down pose.
+        if not self._sprite_facing_synced and self.has_sprite and self.sprite:
+            self.sprite.set_animation('idle', self.facing_direction)
+            self._sprite_facing_synced = True
 
         # Check if player is in interaction range
         player_distance = self.distance_to(player.x, player.y)

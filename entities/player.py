@@ -112,15 +112,20 @@ class Player:
         # -----------------------------------------------------------------
         # Collision hitbox — smaller than the visual sprite
         # -----------------------------------------------------------------
-        self.hitbox_width = 10
-        self.hitbox_height = 1
+        self.hitbox_width = 18
+        self.hitbox_height = 10
+
+        # Add dedicated wall-collision size:
+        self.wall_hitbox_width = 18
+        self.wall_hitbox_height = 14
+        self.wall_hitbox_offset_y = 10
 
         # Per-direction hitbox offsets so the hitbox sits at the player's feet
         self.hitbox_offsets = {
             'up':    {'x':  0, 'y': -2},
             'down':  {'x':  0, 'y': 14},
-            'left':  {'x': -2, 'y': 14},
-            'right': {'x':  2, 'y': 14},
+            'left':  {'x':  0, 'y': 14},
+            'right': {'x':  0, 'y': 14},
         }
 
         # -----------------------------------------------------------------
@@ -151,6 +156,14 @@ class Player:
         self.collision_knockback_velocity_x = 0
         self.collision_knockback_velocity_y = 0
         self.collision_knockback_strength = 400
+        # Cooldown after knockback ends so holding the key doesn't immediately
+        # re-trigger another knockback on the very next frame.
+        self._knockback_cooldown       = 0.0
+        self._knockback_cooldown_dur   = 0.25   # seconds before knockback can fire again
+        # Set by move() each frame so game.py knows which axes were blocked
+        # by obstacles — used to trigger running knockback correctly.
+        self._blocked_x = False
+        self._blocked_y = False
 
         self.last_move_direction = {'dx': 0, 'dy': 0}  # Most recent input vector
 
@@ -167,6 +180,27 @@ class Player:
 
         # Transition lock — set externally during room-change animations
         self.is_transitioning = False
+
+        # -----------------------------------------------------------------
+        # World-map jump sequence
+        # Started by game.py when the player interacts with a world-map object.
+        # Phase 1 (pre_move): the map_jump animation plays from frame 1.
+        # Phase 2 (moving):   on frame 2 the sprite freezes and the player
+        #                     drifts upward off-screen at map_jump_speed.
+        # on_map_jump_exit is called once the player is fully out of view.
+        # -----------------------------------------------------------------
+        self.is_map_jumping          = False
+        self.map_jump_moving         = False   # True once the upward drift begins
+        self.map_jump_timer          = 0.0     # Elapsed time since jump started
+        # Seconds each frame is shown.  Tune to match the actual frame rate of
+        # map_jump.png (default assumes ~6 fps, i.e. 0.18 s/frame).
+        self._MAP_JUMP_FRAME_DURATION = 0.18
+        self.map_jump_speed           = 160     # World units per second (upward)
+        self.on_map_jump_exit         = None   # Callback: fired when fully off-screen
+        # Populated by start_map_jump() — raw pygame surfaces, one per frame.
+        self._map_jump_frames         = []
+        self._map_jump_frame_idx      = 0
+        self._map_jump_frame_timer    = 0.0
 
         # Injected by the room/game system after construction
         self.obstacles = []
@@ -191,6 +225,10 @@ class Player:
         """False while locked in an animation, transitioning, or knocked back."""
         if self.is_transitioning:
             return False
+        if self.is_map_jumping:
+            return False
+        if self.is_collision_knockback:
+            return False
         if self.transformation and not self.transformation.can_player_act():
             return False
         return not (self.is_attacking or self.is_charging_beam
@@ -199,6 +237,8 @@ class Player:
     def can_move(self):
         """False during collision knockback or whenever can_act() returns False."""
         if self.is_transitioning:
+            return False
+        if self.is_map_jumping:
             return False
         if self.is_collision_knockback:
             return False
@@ -220,16 +260,17 @@ class Player:
         return pygame.Rect(left, top, self.hitbox_width, self.hitbox_height)
 
     def check_collision_with_obstacles(self, new_x, new_y):
-        """True if the hitbox centred at (new_x, new_y) overlaps any obstacle."""
+        """True if the wall hitbox at (new_x, new_y) overlaps any obstacle."""
         temp_rect = pygame.Rect(
-            new_x - self.hitbox_width // 2,
-            new_y - self.hitbox_height // 2,
-            self.hitbox_width,
-            self.hitbox_height,
+            new_x - self.wall_hitbox_width // 2,
+            new_y + self.wall_hitbox_offset_y - self.wall_hitbox_height // 2,
+            self.wall_hitbox_width,
+            self.wall_hitbox_height,
         )
         for obstacle in self.obstacles:
             if hasattr(obstacle, 'get_collision_rect'):
-                if temp_rect.colliderect(obstacle.get_collision_rect()):
+                rect = obstacle.get_collision_rect()
+                if rect is not None and temp_rect.colliderect(rect):
                     return True
         return False
 
@@ -265,12 +306,29 @@ class Player:
         self.is_running = is_running
         current_speed = self.run_speed if is_running else self.speed
 
-        self.x += dx * current_speed
-        self.y += dy * current_speed
+        # Reset per-frame block flags — game.py reads these to trigger knockback.
+        self._blocked_x = False
+        self._blocked_y = False
 
-        # Clamp to room bounds (uses half-width/height so the sprite edge stays in)
-        self.x = max(self.width // 2,  min(self.x, world_width  - self.width // 2))
-        self.y = max(self.height // 2, min(self.y, world_height - self.height // 2))
+        # Apply X and Y axes independently so the player slides along walls
+        # instead of either tunnelling through corners or being fully blocked
+        # when moving diagonally.  Each axis is only committed if it doesn't
+        # produce a new obstacle overlap.
+        if dx != 0:
+            new_x = self.x + dx * current_speed
+            new_x = max(self.width // 2, min(new_x, world_width - self.width // 2))
+            if not self.check_collision_with_obstacles(new_x, self.y):
+                self.x = new_x
+            else:
+                self._blocked_x = True
+
+        if dy != 0:
+            new_y = self.y + dy * current_speed
+            new_y = max(self.height // 2, min(new_y, world_height - self.height // 2))
+            if not self.check_collision_with_obstacles(self.x, new_y):
+                self.y = new_y
+            else:
+                self._blocked_y = True
 
         anim = 'run' if is_running else 'walk'
         self.sprite.set_animation(anim, self.direction)
@@ -284,6 +342,12 @@ class Player:
         # Push in the opposite direction of travel
         self.collision_knockback_velocity_x = -collision_direction_x * self.collision_knockback_strength
         self.collision_knockback_velocity_y = -collision_direction_y * self.collision_knockback_strength
+
+        # If an attack was in progress, cancel it — the hurt animation is about
+        # to overwrite 'melee'/'kiblast', so is_attacking would never be cleared
+        # by the animation-state machine and the player would be stuck forever.
+        self.is_attacking = False
+        self.pending_blast = None
 
         self.sprite.set_animation('hurt', self.direction)
         self.current_animation_state = 'hurt'
@@ -360,7 +424,7 @@ class Player:
 
         # Spawn the beam slightly in front of the player based on facing direction
         ox, oy = self._get_spawn_offset()
-        self.current_beam = BeamAttack(self.x + ox, self.y + oy, self.direction, scale=2.0)
+        self.current_beam = BeamAttack(self.x + ox, self.y + oy, self.direction)
         return self.current_beam
 
     def stop_beam(self):
@@ -386,6 +450,61 @@ class Player:
         self.direction = 'down'
         self.sprite.set_animation('untransform', 'down')
         self.current_animation_state = 'untransform'
+
+    def start_map_jump(self):
+        """Begin the world-map jump sequence.
+
+        Loads map_jump.png directly from the current form's character folder
+        (bypassing the sprite system, which only knows its registered animation
+        names).  The sheet is assumed to be a horizontal strip of frames each
+        as wide as self.width.  Frame 1 plays once, then the sprite freezes on
+        frame 2 while the player drifts upward off the screen.
+        """
+        if self.is_map_jumping:
+            return
+
+        # Cancel any ongoing combat state so nothing conflicts mid-sequence.
+        self.is_attacking      = False
+        self.is_charging_beam  = False
+        self.is_firing_beam    = False
+        self.pending_blast     = None
+        self.is_q_pressed      = False
+        self.current_beam      = None
+
+        # Derive the correct folder (base or transformed form).
+        # Use self.sprite.base_path so this always matches wherever
+        # CharacterSpriteLoader put the rest of the sprites.
+        path = f'{self.sprite.base_path}/map_jump.png'
+
+        self._map_jump_frames      = []
+        self._map_jump_frame_idx   = 0
+        self._map_jump_frame_timer = 0.0
+
+        try:
+            sheet      = pygame.image.load(path).convert_alpha()
+            frame_w    = self.width   # 32 px per frame (horizontal strip)
+            frame_h    = self.height  # 32 px per frame (one row per direction)
+            num_frames = max(1, sheet.get_width() // frame_w)
+            # Match the standard 4-dir row layout: down=0, left=1, right=2, up=3
+            direction_row = {'down': 0, 'left': 1, 'right': 2, 'up': 3}.get(self.direction, 0)
+            row_y = direction_row * frame_h
+            self._map_jump_frames = [
+                sheet.subsurface(pygame.Rect(i * frame_w, row_y, frame_w, frame_h))
+                for i in range(num_frames)
+            ]
+        except Exception as e:
+            # Sheet not found — sequence still runs (player just drifts up
+            # without a sprite change so nothing hard-crashes).
+            print(f'[map_jump] could not load {path}: {e}')
+
+        self.is_map_jumping  = True
+        self.map_jump_moving = False
+        self.map_jump_timer  = 0.0
+
+        # Keep current_animation_state consistent so any external check that
+        # reads it sees a meaningful value.  Direction is intentionally left
+        # unchanged so the player faces whichever way they were looking.
+        self.current_animation_state = 'map_jump'
 
     # =========================================================================
     # Combat — taking damage
@@ -533,6 +652,43 @@ class Player:
     def update(self, dt):
         """Advance timers, physics, and animation state for one frame."""
 
+        # Reset per-frame block flags here (not just inside move()) so they
+        # are always False during knockback frames when move() is never called.
+        self._blocked_x = False
+        self._blocked_y = False
+
+        # ------------------------------------------------------------------
+        # World-map jump sequence — runs exclusively; all other state frozen
+        # ------------------------------------------------------------------
+        if self.is_map_jumping:
+            self.map_jump_timer += dt
+
+            if not self.map_jump_moving:
+                # Phase 1 — advance frames normally until we reach frame 2
+                # (index 1).  Once there, lock into moving phase.
+                self._map_jump_frame_timer += dt
+                if self._map_jump_frame_timer >= self._MAP_JUMP_FRAME_DURATION:
+                    self._map_jump_frame_timer = 0.0
+                    next_idx = self._map_jump_frame_idx + 1
+                    if next_idx < len(self._map_jump_frames):
+                        self._map_jump_frame_idx = next_idx
+                    # Frame 2 reached (index 1) — begin moving upward.
+                    if self._map_jump_frame_idx >= 1:
+                        self.map_jump_moving = True
+            else:
+                # Phase 2 — sprite frozen on frame 2, player drifts upward.
+                # Do NOT advance _map_jump_frame_idx here.
+                self.y -= self.map_jump_speed * dt
+
+                # Fully off the top of the screen → fire exit callback.
+                if self.y + self.height < 0:
+                    self.is_map_jumping  = False
+                    self.map_jump_moving = False
+                    if callable(self.on_map_jump_exit):
+                        self.on_map_jump_exit()
+
+            return  # Skip all other update logic during the jump sequence
+
         # ------------------------------------------------------------------
         # Collision knockback (wall-bounce) — runs independently of damage knockback
         # ------------------------------------------------------------------
@@ -565,12 +721,18 @@ class Player:
                 self.is_collision_knockback = False
                 self.collision_knockback_velocity_x = 0
                 self.collision_knockback_velocity_y = 0
+                self._knockback_cooldown = self._knockback_cooldown_dur  # prevent immediate re-trigger
                 # Only snap to idle if regular damage knockback has also finished.
                 # If both triggered at once, let the damage-knockback path handle it.
                 if not self.is_knocked_back:
                     self.sprite.set_animation('idle', self.direction)
                     self.current_animation_state = 'idle'
                 return  # Skip the rest of update while we're mid-bounce
+
+        # Tick the post-knockback cooldown so repeated wall-running doesn't
+        # chain infinite knockbacks while the key is held.
+        if self._knockback_cooldown > 0:
+            self._knockback_cooldown = max(0.0, self._knockback_cooldown - dt)
 
         # ------------------------------------------------------------------
         # Damage knockback — applied by take_damage(); clears on timer expiry
@@ -718,5 +880,15 @@ class Player:
 
     def draw(self, screen, camera, colors):
         """Draw the player sprite with the current hurt tint applied."""
+        if self.is_map_jumping and self._map_jump_frames:
+            frame  = self._map_jump_frames[self._map_jump_frame_idx]
+            sx     = int(self.x * RENDER_SCALE - camera.x)
+            sy     = int(self.y * RENDER_SCALE - camera.y)
+            w      = int(self.width  * RENDER_SCALE)
+            h      = int(frame.get_height() * RENDER_SCALE)
+            scaled = pygame.transform.scale(frame, (w, h))
+            screen.blit(scaled, scaled.get_rect(center=(sx, sy)))
+            return
+
         tint = getattr(self, 'hurt_tint', 0.0)
         self.sprite.draw(screen, self.x, self.y, camera, scale=RENDER_SCALE, hurt_tint=tint)

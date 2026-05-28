@@ -55,8 +55,9 @@ class DevMenu:
 
         # Main menu options
         self.main_options = [
-            {'id': 'room_editor',     'label': 'ROOM EDITOR',     'icon': 'room'},
-            {'id': 'sprite_editor',   'label': 'SPRITE EDITOR',   'icon': 'sprite'},
+            {'id': 'room_editor',       'label': 'ROOM EDITOR',       'icon': 'room'},
+            {'id': 'world_map_editor',  'label': 'WORLD MAP EDITOR',  'icon': 'map'},
+            {'id': 'sprite_editor',     'label': 'SPRITE EDITOR',     'icon': 'sprite'},
             {'id': 'cutscene_editor', 'label': 'CUTSCENE EDITOR', 'icon': 'cutscene'},
             {'id': 'config',          'label': 'CONFIGURATION',   'icon': 'config'},
             {'id': 'close',           'label': 'CLOSE MENU',      'icon': 'close'},
@@ -595,6 +596,8 @@ class DevMenu:
         if self.current_menu == 'main':
             if option_id == 'room_editor':
                 return 'open_room_editor'
+            elif option_id == 'world_map_editor':
+                return 'open_world_map_editor'
             elif option_id == 'sprite_editor':
                 return 'open_sprite_editor'
             elif option_id == 'cutscene_editor':
@@ -642,8 +645,9 @@ class DevMenu:
     def _get_menu_title(self):
         """Return the display title for the active submenu."""
         return {
-            'main':      'DEVELOPER MENU',
-            'config':    'CONFIGURATION',
-            'xp_config': 'XP SYSTEM CONFIG',
-            'room_editor': 'ROOM EDITOR',
+            'main':            'DEVELOPER MENU',
+            'config':          'CONFIGURATION',
+            'xp_config':       'XP SYSTEM CONFIG',
+            'room_editor':     'ROOM EDITOR',
+            'world_map_editor': 'WORLD MAP EDITOR',
         }.get(self.current_menu, 'DEV MENU')

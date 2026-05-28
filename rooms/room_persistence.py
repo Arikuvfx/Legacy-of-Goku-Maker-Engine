@@ -31,7 +31,9 @@ class RoomPersistence:
                 'level_gates':          self._serialize_level_gates(room),
                 'entities':             self._serialize_entities(room),
                 'flying_pads':          self._serialize_flying_pads(room),
+                'save_points':          self._serialize_save_points(room),
                 'cutscene_triggers':     self._serialize_cutscene_triggers(room),
+                'world_map_objects':     self._serialize_world_map_objects(room),
             }
             with open(self._get_room_filepath(room.name), 'w') as f:
                 json.dump(data, f, indent=2)
@@ -185,10 +187,30 @@ class RoomPersistence:
             })
         return out
 
+    def _serialize_save_points(self, room):
+        if not getattr(room, 'save_points', None):
+            return []
+        return [{'x': sp.x, 'y': sp.y, 'variant': sp.variant}
+                for sp in room.save_points]
+
     def _serialize_cutscene_triggers(self, room):
         if not getattr(room, 'cutscene_triggers', None):
             return []
         return [t.to_dict() for t in room.cutscene_triggers]
+
+    def _serialize_world_map_objects(self, room):
+        if not getattr(room, 'world_map_objects', None):
+            return []
+        return [o.to_dict() for o in room.world_map_objects]
+
+    def deserialize_world_map_objects(self, data):
+        from objects.world_map import WorldMapObject
+        return [WorldMapObject.from_dict(o) for o in data]
+
+    def deserialize_save_points(self, save_points_data):
+        from objects.save_point import SavePoint
+        return [SavePoint(x=d['x'], y=d['y'], variant=d.get('variant', 'big'))
+                for d in save_points_data]
 
     def deserialize_cutscene_triggers(self, data, room_name):
         from objects.cutscene_trigger import CutsceneTrigger
@@ -377,7 +399,9 @@ class RoomManagerWithPersistence:
         room.level_gates         = self.persistence.deserialize_level_gates(data['level_gates'])         if data.get('level_gates')         else []
         room.entities            = self.persistence.deserialize_entities(data['entities'])            if data.get('entities')            else []
         room.flying_pads         = self.persistence.deserialize_flying_pads(data['flying_pads'])      if data.get('flying_pads')         else []
+        room.save_points         = self.persistence.deserialize_save_points(data['save_points'])      if data.get('save_points')         else []
         room.cutscene_triggers   = self.persistence.deserialize_cutscene_triggers(data['cutscene_triggers'], room_name) if data.get('cutscene_triggers') else []
+        room.world_map_objects   = self.persistence.deserialize_world_map_objects(data['world_map_objects']) if data.get('world_map_objects') else []
 
         existing = self.get_room_by_name(room_name)
         if existing:

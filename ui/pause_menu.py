@@ -836,7 +836,7 @@ class PauseMenu:
 
         def draw_div():
             nonlocal cy
-            pygame.draw.line(screen,(60,100,60),(stats_x,cy),(stats_x+stats_w,cy),1); cy+=2
+            cy += 2
 
         right_col_x=stats_x+int(stats_w*0.60); cy_start=cy
 

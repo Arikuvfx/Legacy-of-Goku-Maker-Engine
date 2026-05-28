@@ -15,9 +15,9 @@ class Projectile:
         self.frames = []
         self.current_frame = 0
         self.frame_timer = 0
-        self.frame_duration = 0.5
-        self.frame_width = 24
-        self.frame_height = 8
+        self.frame_duration = 0.1
+        self.frame_width = 16
+        self.frame_height = 16
 
         # Load spritesheet
         try:
@@ -66,7 +66,6 @@ class Projectile:
 
     def draw(self, screen, camera, colors):
         if self.active:
-            # ONLY FIX: Convert WORLD coordinates to SCREEN coordinates like player
             from config.settings import RENDER_SCALE
             screen_x = (self.x * RENDER_SCALE) - camera.x
             screen_y = (self.y * RENDER_SCALE) - camera.y
@@ -74,21 +73,25 @@ class Projectile:
             if self.frames:
                 current_sprite = self.frames[self.current_frame]
 
-                # Rotate sprite based on direction (keep original size)
+                # Scale sprite up to match RENDER_SCALE before rotating
+                scaled_w = self.frame_width  * RENDER_SCALE
+                scaled_h = self.frame_height * RENDER_SCALE
+                scaled_sprite = pygame.transform.scale(current_sprite, (scaled_w, scaled_h))
+
                 if self.direction == 'up':
-                    rotated_sprite = pygame.transform.rotate(current_sprite, 0)
+                    rotated_sprite = pygame.transform.rotate(scaled_sprite, 0)
                 elif self.direction == 'down':
-                    rotated_sprite = pygame.transform.rotate(current_sprite, 180)
+                    rotated_sprite = pygame.transform.rotate(scaled_sprite, 180)
                 elif self.direction == 'left':
-                    rotated_sprite = pygame.transform.rotate(current_sprite, 90)
+                    rotated_sprite = pygame.transform.rotate(scaled_sprite, 90)
                 elif self.direction == 'right':
-                    rotated_sprite = pygame.transform.rotate(current_sprite, 270)
+                    rotated_sprite = pygame.transform.rotate(scaled_sprite, 270)
                 else:
-                    rotated_sprite = current_sprite
+                    rotated_sprite = scaled_sprite
 
                 sprite_rect = rotated_sprite.get_rect(center=(int(screen_x), int(screen_y)))
                 screen.blit(rotated_sprite, sprite_rect)
             else:
-                # Fallback drawing (keep original size)
-                pygame.draw.circle(screen, colors['CYAN'], (int(screen_x), int(screen_y)), self.radius)
-                pygame.draw.circle(screen, colors['YELLOW'], (int(screen_x), int(screen_y)), self.radius - 3)
+                # Fallback circle also scaled up
+                pygame.draw.circle(screen, colors['CYAN'],   (int(screen_x), int(screen_y)), self.radius * RENDER_SCALE)
+                pygame.draw.circle(screen, colors['YELLOW'], (int(screen_x), int(screen_y)), (self.radius - 3) * RENDER_SCALE)

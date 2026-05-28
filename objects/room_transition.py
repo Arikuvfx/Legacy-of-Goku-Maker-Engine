@@ -27,6 +27,12 @@ class RoomTransition:
         self.last_collision_x = 0
         self.last_collision_y = 0
 
+        # Cooldown: prevents instant re-trigger after a transition fires.
+        # Use start_cooldown() after a transition is used, and call
+        # RoomTransitionManager.start_cooldowns() when entering a new room.
+        self._cooldown_until_ms: int = 0
+        self.COOLDOWN_MS: int = 500
+
     def get_rect(self) -> pygame.Rect:
         """Get collision rectangle"""
         return pygame.Rect(self.x, self.y, self.width, self.height)
@@ -35,8 +41,21 @@ class RoomTransition:
         """Get center position"""
         return (self.x + self.width // 2, self.y + self.height // 2)
 
+    def start_cooldown(self):
+        """Arm the cooldown timer. Call this immediately after this transition
+        fires so it cannot re-trigger until COOLDOWN_MS milliseconds have passed."""
+        self._cooldown_until_ms = pygame.time.get_ticks() + self.COOLDOWN_MS
+
+    def is_on_cooldown(self) -> bool:
+        """Return True while the transition is still cooling down."""
+        return pygame.time.get_ticks() < self._cooldown_until_ms
+
     def check_collision(self, player) -> bool:
         """Check if player is touching this transition"""
+        # Don't trigger while cooling down — prevents instant re-trigger on spawn.
+        if self.is_on_cooldown():
+            return False
+
         player_rect = pygame.Rect(
             player.x - player.width // 2,
             player.y - player.height // 2,
@@ -275,6 +294,18 @@ class RoomTransitionManager:
         if room_name in self.transitions:
             self.transitions[room_name] = []
 
+    def start_cooldowns(self, room_name: str):
+        """Put every transition in a room on cooldown.
+
+        Call this immediately after the player enters a new room so that any
+        transition they spawn on or next to cannot fire until COOLDOWN_MS ms
+        have elapsed.  This prevents the classic instant-retrigger loop where
+        the player walks through portal A → spawns touching portal B → gets
+        teleported straight back.
+        """
+        for transition in self.transitions.get(room_name, []):
+            transition.start_cooldown()
+
 
 class TransitionConfigDialog:
     """Dialog for configuring room transition properties with dropdown menus"""
@@ -289,6 +320,12 @@ class TransitionConfigDialog:
             'target_room': False,
             'exit_direction': False,
             'entry_direction': False
+        }
+        # Scroll offset (in items) for each dropdown
+        self.dropdown_scroll = {
+            'target_room': 0,
+            'exit_direction': 0,
+            'entry_direction': 0
         }
         self.directions = ['up', 'down', 'left', 'right']
 
@@ -360,16 +397,34 @@ class TransitionConfigDialog:
                         for key in self.dropdowns:
                             if key != dropdown_name:
                                 self.dropdowns[key] = False
-                        # Toggle this dropdown
-                        self.dropdowns[dropdown_name] = not self.dropdowns[dropdown_name]
+                        # Toggle this dropdown and reset scroll
+                        opening = not self.dropdowns[dropdown_name]
+                        self.dropdowns[dropdown_name] = opening
+                        if opening:
+                            self.dropdown_scroll[dropdown_name] = 0
                         return None
 
             # Check dropdown item clicks
             for dropdown_name in ['target_room', 'exit_direction', 'entry_direction']:
                 if self.dropdowns[dropdown_name]:
                     items = self._get_dropdown_items(dropdown_name)
-                    for i, item in enumerate(items):
-                        rect_name = f'{dropdown_name}_item_{i}'
+                    max_visible = 5
+
+                    # Scroll arrow clicks
+                    up_key = f'{dropdown_name}_scroll_up'
+                    down_key = f'{dropdown_name}_scroll_down'
+                    if up_key in self.ui_rects and self.ui_rects[up_key].collidepoint(mouse_pos):
+                        self.dropdown_scroll[dropdown_name] = max(0, self.dropdown_scroll[dropdown_name] - 1)
+                        return None
+                    if down_key in self.ui_rects and self.ui_rects[down_key].collidepoint(mouse_pos):
+                        max_scroll = max(0, len(items) - max_visible)
+                        self.dropdown_scroll[dropdown_name] = min(max_scroll,
+                                                                  self.dropdown_scroll[dropdown_name] + 1)
+                        return None
+
+                    # Item clicks (keyed by actual index)
+                    for actual_index, item in enumerate(items):
+                        rect_name = f'{dropdown_name}_item_{actual_index}'
                         if rect_name in self.ui_rects:
                             if self.ui_rects[rect_name].collidepoint(mouse_pos):
                                 self._set_dropdown_value(dropdown_name, item)
@@ -387,6 +442,22 @@ class TransitionConfigDialog:
             if not clicked_on_dropdown:
                 for key in self.dropdowns:
                     self.dropdowns[key] = False
+
+        elif event.type == pygame.MOUSEWHEEL:
+            # Scroll whichever dropdown is open, if mouse is over it
+            mouse_pos = pygame.mouse.get_pos()
+            for dropdown_name in ['target_room', 'exit_direction', 'entry_direction']:
+                if self.dropdowns[dropdown_name]:
+                    rect_key = f'{dropdown_name}_dropdown'
+                    if rect_key in self.ui_rects and self.ui_rects[rect_key].collidepoint(mouse_pos):
+                        items = self._get_dropdown_items(dropdown_name)
+                        max_visible = 5
+                        max_scroll = max(0, len(items) - max_visible)
+                        self.dropdown_scroll[dropdown_name] = max(
+                            0, min(max_scroll,
+                                   self.dropdown_scroll[dropdown_name] - event.y)
+                        )
+                        return None
 
         elif event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
@@ -522,7 +593,18 @@ class TransitionConfigDialog:
             # Draw dropdown menu if open
             if self.dropdowns[field_id]:
                 items = self._get_dropdown_items(field_id)
-                dropdown_height = min(len(items) * 35 + 10, 200)
+                max_visible = 5
+                scroll_offset = self.dropdown_scroll[field_id]
+                visible_items = items[scroll_offset: scroll_offset + max_visible]
+
+                can_scroll_up = scroll_offset > 0
+                can_scroll_down = scroll_offset + max_visible < len(items)
+
+                # Reserve space for scroll arrows (20px each) when needed
+                arrow_h = 20
+                top_arrow_h = arrow_h if can_scroll_up else 0
+                bot_arrow_h = arrow_h if can_scroll_down else 0
+                dropdown_height = top_arrow_h + len(visible_items) * 35 + bot_arrow_h + 10
                 dropdown_rect = pygame.Rect(20, toggle_rect.bottom + 5, dialog_width - 40, dropdown_height)
 
                 # Dropdown background
@@ -531,9 +613,25 @@ class TransitionConfigDialog:
                 pygame.draw.rect(dropdown_surface, self.colors['accent'],
                                  (0, 0, dropdown_rect.width, dropdown_rect.height), 2)
 
+                # Store dropdown rect for scroll hit-testing
+                self.ui_rects[f'{field_id}_dropdown'] = dropdown_rect.move(dialog_x, dialog_y)
+
+                # Top scroll arrow
+                if can_scroll_up:
+                    arrow_rect = pygame.Rect(5, 2, dropdown_rect.width - 10, arrow_h - 2)
+                    adj = (adjusted_mouse[0] - dropdown_rect.x, adjusted_mouse[1] - dropdown_rect.y)
+                    if arrow_rect.collidepoint(adj):
+                        pygame.draw.rect(dropdown_surface, self.colors['dropdown_hover'], arrow_rect, border_radius=3)
+                    cx = dropdown_rect.width // 2
+                    pygame.draw.polygon(dropdown_surface, self.colors['text'],
+                                        [(cx, 5), (cx - 8, 16), (cx + 8, 16)])
+                    self.ui_rects[f'{field_id}_scroll_up'] = arrow_rect.move(dialog_x + dropdown_rect.x,
+                                                                              dialog_y + dropdown_rect.y)
+
                 # Draw items
-                item_y = 5
-                for i, item in enumerate(items):
+                item_y = top_arrow_h + 5
+                for i, item in enumerate(visible_items):
+                    actual_index = scroll_offset + i
                     item_rect = pygame.Rect(5, item_y, dropdown_rect.width - 10, 30)
                     item_global_rect = item_rect.move(dialog_x + dropdown_rect.x, dialog_y + dropdown_rect.y)
 
@@ -548,9 +646,21 @@ class TransitionConfigDialog:
                     item_text = self.font_small.render(item, True, self.colors['text'])
                     dropdown_surface.blit(item_text, (item_rect.x + 10, item_rect.y + 7))
 
-                    self.ui_rects[f'{field_id}_item_{i}'] = item_global_rect
-                    self.ui_rects[f'{field_id}_dropdown'] = dropdown_rect.move(dialog_x, dialog_y)
+                    self.ui_rects[f'{field_id}_item_{actual_index}'] = item_global_rect
                     item_y += 35
+
+                # Bottom scroll arrow
+                if can_scroll_down:
+                    arrow_rect = pygame.Rect(5, item_y + 2, dropdown_rect.width - 10, arrow_h - 2)
+                    adj = (adjusted_mouse[0] - dropdown_rect.x, adjusted_mouse[1] - dropdown_rect.y)
+                    if arrow_rect.collidepoint(adj):
+                        pygame.draw.rect(dropdown_surface, self.colors['dropdown_hover'], arrow_rect, border_radius=3)
+                    cx = dropdown_rect.width // 2
+                    base_y = item_y + arrow_h - 4
+                    pygame.draw.polygon(dropdown_surface, self.colors['text'],
+                                        [(cx, base_y), (cx - 8, base_y - 11), (cx + 8, base_y - 11)])
+                    self.ui_rects[f'{field_id}_scroll_down'] = arrow_rect.move(dialog_x + dropdown_rect.x,
+                                                                                dialog_y + dropdown_rect.y)
 
                 dialog_surface.blit(dropdown_surface, dropdown_rect.topleft)
 

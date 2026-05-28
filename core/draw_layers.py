@@ -68,6 +68,11 @@ class LayerManager:
         self._shadow_sprite_big = None
         self._shadow_cache: dict = {}   # (width, big) -> scaled Surface
         self._load_shadow()
+        self._silhouette_black = None
+        self._silhouette_alpha = None
+        self._silhouette_temp = None
+        self._silhouette_screen_size = None
+        self._mask_cache: dict = {}
 
     def _load_shadow(self):
         """Load shadow sprites once at startup; fall back to a drawn ellipse if missing."""
@@ -164,6 +169,78 @@ class LayerManager:
         # Debug visualization
         if self.debug_mode:
             self._draw_debug_info(screen, sorted_objects)
+
+    def draw_player_silhouette(self, screen, player, camera, fg_tile_surfaces=None):
+        OCCLUSION_ALPHA_THRESHOLD = 128
+        w, h = screen.get_size()
+
+        if self._silhouette_screen_size != (w, h):
+            self._silhouette_screen_size = (w, h)
+            self._silhouette_temp = pygame.Surface((w, h), pygame.SRCALPHA)
+            self._silhouette_black = pygame.Surface((w, h), pygame.SRCALPHA)
+            self._silhouette_black.fill((0, 0, 0, 255))
+            self._silhouette_alpha = pygame.Surface((w, h), pygame.SRCALPHA)
+            self._silhouette_alpha.fill((255, 255, 255, 100))
+            self._silhouette_occlusion = pygame.Surface((w, h), pygame.SRCALPHA)
+            self._silhouette_occlusion_dirty = True
+
+        temp = self._silhouette_temp
+        black = self._silhouette_black
+        alpha_surf = self._silhouette_alpha
+
+        # ── 1. Compute player's screen bounding rect ──────────────────────────────
+        pw = int(player.sprite.sprite_width * RENDER_SCALE)
+        ph = int(player.sprite.sprite_height * RENDER_SCALE)
+        cx = int(player.x * RENDER_SCALE - camera.x)
+        cy = int(player.y * RENDER_SCALE - camera.y)
+        px = cx - pw // 2
+        py = cy - ph // 2
+
+        # ── 2. Draw player to temp ────────────────────────────────────────────────
+        temp.fill((0, 0, 0, 0))
+        player.draw(temp, camera, {})
+
+        # ── 3. Build occlusion surface from nearby tiles ──────────────────────────
+        occlusion = self._silhouette_occlusion
+        occlusion.fill((0, 0, 0, 0))
+        player_rect = pygame.Rect(px, py, pw, ph)
+        for tile_surf, tx, ty, cache_key in fg_tile_surfaces:
+            if tile_surf is None:
+                continue
+            if not pygame.Rect(tx, ty, tile_surf.get_width(), tile_surf.get_height()).colliderect(player_rect):
+                continue
+            if len(self._mask_cache) > 512:
+                keys = list(self._mask_cache.keys())
+                for k in keys[:256]:
+                    del self._mask_cache[k]
+            if cache_key not in self._mask_cache:
+                mask = pygame.mask.from_surface(tile_surf, threshold=128)
+                self._mask_cache[cache_key] = mask.to_surface(
+                    setcolor=(255, 255, 255, 255), unsetcolor=(0, 0, 0, 0))
+            occlusion.blit(self._mask_cache[cache_key], (tx, ty))
+
+        # ── 4. Crop both surfaces to player area before any mask operations ───────
+        screen_rect = pygame.Rect(0, 0, w, h)
+        crop_pad = 4
+        crop = pygame.Rect(px - crop_pad, py - crop_pad, pw + crop_pad * 2, ph + crop_pad * 2).clip(screen_rect)
+        if crop.width == 0 or crop.height == 0:
+            return
+
+        occlusion_sub = occlusion.subsurface(crop)
+        tile_mask = pygame.mask.from_surface(occlusion_sub, threshold=128)
+        if not tile_mask.count():
+            return  # no solid tile pixels in player area at all — bail early, cheaply
+
+        player_sub = temp.subsurface(crop)
+        player_mask = pygame.mask.from_surface(player_sub, threshold=10)
+
+        overlap = player_mask.overlap_mask(tile_mask, (0, 0))
+        if not overlap.count():
+            return
+
+        # ── 5. Draw silhouette only over the cropped area ─────────────────────────
+        silhouette = overlap.to_surface(setcolor=(0, 0, 0, 100), unsetcolor=(0, 0, 0, 0))
+        screen.blit(silhouette, crop.topleft)
 
     def _draw_debug_info(self, screen: pygame.Surface, sorted_objects: List[DrawableObject]):
         """Overlay layer counts in the top-left corner when debug_mode is on."""

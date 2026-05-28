@@ -494,6 +494,10 @@ class TilesetEditor:
 
             if self._is_in_ui_rect(mouse_x, mouse_y, 'hide_layers_checkbox'):
                 self.hide_other_layers = not self.hide_other_layers
+                # Invalidate the baked tile cache so the new visibility is
+                # reflected immediately — without this the old surface persists.
+                if callable(getattr(self, 'on_tile_changed', None)):
+                    self.on_tile_changed(current_room_name)
                 return
 
             # Pygame 1.x scroll convention: button 4 = scroll up, button 5 = scroll down

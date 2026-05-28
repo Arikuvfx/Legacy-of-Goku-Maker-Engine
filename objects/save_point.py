@@ -19,15 +19,20 @@ class SavePoint:
         self.y = y
         self.variant = variant
 
-        # Set dimensions based on variant
+        # Set dimensions based on variant (world-unit size matching the actual sprite)
         if variant == 'big':
             self.width = 64
             self.height = 52
-        else:  # small
-            self.width = 144
-            self.height = 40
+        else:  # small — sprite is 32×27
+            self.width = 32
+            self.height = 27
 
         self.active = True
+
+        # Layer-manager integration
+        from core.draw_layers import DrawLayer
+        self.draw_layer = DrawLayer.GROUND  # layer -100, always behind the player
+        self.y_sort = False
 
         # Visual properties for fallback rendering
         self.color = (255, 215, 0)  # Gold/yellow
@@ -42,6 +47,10 @@ class SavePoint:
         # Sprite loading
         self.sprite = None
         self._load_sprite()
+
+    def get_sort_key(self):
+        """Used by LayerManager to sort against other world objects."""
+        return (self.draw_layer, 0)
 
     def _load_sprite(self):
         """Load custom sprite or use None for fallback"""
@@ -144,16 +153,20 @@ class SavePointMenu:
         self.arrow_sprite = None
         self._load_arrow_sprite()
 
-        # Menu dimensions - scale the sprite up to a reasonable size
-        self.menu_width = int(432 * RENDER_SCALE)
-        self.menu_height = int(120 * RENDER_SCALE)
-        self.padding = int(15 * RENDER_SCALE)
+        # Menu dimensions — scale the sprite by the largest integer multiplier
+        # that fits comfortably on screen, so pixels are always uniform.
+        _sprite_w, _sprite_h = 144, 40
+        _scale = max(1, int(screen_height * 0.24 / _sprite_h))
+        self.menu_width = _sprite_w * _scale
+        self.menu_height = _sprite_h * _scale
+        self.padding = max(8, int(screen_width * 0.012))
 
-        # Custom bitmap font setup - use larger scale for bigger text
+        # Font scale proportional to menu height so text fits inside the box
+        font_scale = 6
         self.bitmap_font = BitmapFont(
             'assets/ui/fonts',
-            letter_spacing=int(2.5 * RENDER_SCALE),
-            scale=RENDER_SCALE * 3
+            letter_spacing=6,
+            scale=font_scale
         )
 
         # Colors
@@ -302,9 +315,9 @@ class SavePointMenu:
         current_width = int(self.menu_width * scale_factor)
         current_height = int(self.menu_height * scale_factor)
 
-        # Position in lower middle of screen
+        # Position centred horizontally, near the bottom of the screen
         menu_x = (self.screen_width - current_width) // 2
-        menu_y = self.screen_height - current_height - int(80 * RENDER_SCALE)
+        menu_y = self.screen_height - current_height - 120
 
         # Draw the menu background sprite
         if self.menu_sprite:
@@ -352,15 +365,18 @@ class SavePointMenu:
 
         # Only draw text if scale is complete or nearly complete
         if self.scale_progress >= 0.8:
-            # Calculate menu center
             menu_center_x = menu_x + (current_width // 2)
 
-            # Draw menu options - stacked vertically and centered inside the box
-            option_y_start = menu_y + int(24 * RENDER_SCALE * scale_factor)
-            option_spacing = int(42 * RENDER_SCALE * scale_factor)
+            # --- INDEPENDENT LAYOUT ---
+            # Each option has its own Y offset from menu_y, fully decoupled.
+            # Adjust individual values here without affecting the other option.
+            option_y_offsets = [
+                int(24 * scale_factor) + 24,   # "Save" — distance from top edge
+                int(56 * scale_factor) + 76,   # "Switch Characters" — independent position
+            ]
 
             for i, option in enumerate(self.options):
-                option_y = option_y_start + (i * option_spacing)
+                option_y = menu_y + option_y_offsets[i]
 
                 # Get the text to display (typewriter effect)
                 chars_to_show = self.typewriter_chars_shown[i]
@@ -377,30 +393,31 @@ class SavePointMenu:
                 text_surface = self.bitmap_font.render(display_text)
                 text_height = text_surface.get_height()
 
-                # Center based on FULL text width (so position doesn't shift)
-                text_x = menu_center_x - (full_text_width // 2)
+                # Each option has its own independent horizontal nudge from centre.
+                # Adjust individual values here without affecting the other option.
+                text_x_offsets = [-3, 13]  # [Save, Switch Characters]
+                text_x = menu_center_x - (full_text_width // 2) + text_x_offsets[i]
 
                 # Draw arrow when selected option starts typing
                 if i == self.selected_option and chars_to_show > 0:
-                    # Position arrow to the left of the text with some spacing
-                    arrow_spacing = int(2 * RENDER_SCALE)
+                    arrow_spacing = int(6 * RENDER_SCALE) - 24
 
                     # Only draw arrow if it should be visible (blink effect)
                     if self.arrow_visible:
                         if self.arrow_sprite:
-                            # Use arrow sprite
-                            arrow_scale = RENDER_SCALE * 3
+                            # Scale arrow to match text height
+                            arrow_scale = text_height / self.arrow_sprite.get_height()
                             scaled_arrow = pygame.transform.scale(
                                 self.arrow_sprite,
                                 (int(self.arrow_sprite.get_width() * arrow_scale),
                                  int(self.arrow_sprite.get_height() * arrow_scale))
                             )
 
-                            # Position arrow to the left of text, vertically centered
+                            # Position arrow left of text, vertically centered with text row
                             arrow_x = text_x - scaled_arrow.get_width() - arrow_spacing
-                            arrow_y = option_y + (text_height // 2) - (scaled_arrow.get_height() // 2)
+                            arrow_y = option_y + (text_height // 2) - (scaled_arrow.get_height() // 2) + 6
 
-                            screen.blit(scaled_arrow, (arrow_x + 7, arrow_y + 6))
+                            screen.blit(scaled_arrow, (arrow_x, arrow_y))
                         else:
                             # Fallback: Draw a star indicator
                             arrow_x = text_x - arrow_spacing
@@ -421,7 +438,7 @@ class SavePointMenu:
                             ]
                             pygame.draw.polygon(screen, self.arrow_color, star_points)
 
-                # Draw the partial text at the fixed position
+                # Draw text string at its independent coordinate slot
                 screen.blit(text_surface, (text_x, option_y))
 
     def _ease_out_back(self, t):

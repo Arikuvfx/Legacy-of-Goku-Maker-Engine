@@ -539,6 +539,18 @@ class RoomEditor:
                 self.viewing_room.cutscene_triggers
             )
 
+        # Sync save points so placed save points are visible when re-opening a room.
+        if self.object_editor and hasattr(self.object_editor, 'save_point_manager'):
+            if not hasattr(self.viewing_room, 'save_points'):
+                self.viewing_room.save_points = []
+            self.object_editor.save_point_manager.save_points[room_name] = self.viewing_room.save_points
+
+        # Sync world map objects
+        if self.object_editor and hasattr(self.object_editor, 'world_map_manager'):
+            if not hasattr(self.viewing_room, 'world_map_objects'):
+                self.viewing_room.world_map_objects = []
+            self.object_editor.world_map_manager._objects[room_name] = self.viewing_room.world_map_objects
+
         center_x = (self.viewing_room.width * RENDER_SCALE - self.screen_width) // 2
         center_y = (self.viewing_room.height * RENDER_SCALE - self.screen_height) // 2
         self.camera.x = center_x
@@ -641,6 +653,23 @@ class RoomEditor:
 
         # If placing spawn, ONLY allow object editor input
         if is_placing_spawn:
+            # ESC cancels spawn placement and returns to the source room
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                source_room_name = getattr(self.object_editor, 'transition_spawn_source_room', None)
+                self.object_editor.placing_transition_spawn = False
+                self.object_editor.transition_spawn_source_room = None
+                self.object_editor.pending_transition_for_spawn = None
+                if source_room_name:
+                    source_room = self.room_manager.get_room_by_name(source_room_name)
+                    if source_room:
+                        self.viewing_room = source_room
+                        self._sync_room_to_editor(source_room)
+                        self.camera.x = (source_room.width * RENDER_SCALE - self.screen_width) // 2
+                        self.camera.y = (source_room.height * RENDER_SCALE - self.screen_height) // 2
+                        if self.object_editor:
+                            self.object_editor.current_room_name = source_room_name
+                return None
+
             if self.object_editor:
                 self.object_editor.handle_input(
                     event,
@@ -793,6 +822,18 @@ class RoomEditor:
                 self._tile_stroke_before = None
 
             return None
+
+        # If the object editor was closed while a placement (or selected object) was
+        # still in progress, reactivate it silently with the palette hidden so that
+        # clicks and ESC are routed correctly.
+        if self.object_editor and not self.object_editor.active and (
+            self.object_editor.placing_transition or
+            self.object_editor.placing_collision or
+            self.object_editor.placing_cutscene_trigger or
+            self.object_editor.selected_object is not None
+        ):
+            self.object_editor.active = True
+            self.object_editor.palette_visible = False
 
         if self.object_editor and self.object_editor.active:
             # ── Cutscene-trigger drag intercept ───────────────────────────────
@@ -1188,6 +1229,14 @@ class RoomEditor:
                         room.level_gates = gates
                         transferred_count += 1
 
+            # Save points
+            if hasattr(self.object_editor, 'save_point_manager'):
+                for room in self.room_manager.rooms:
+                    save_points = self.object_editor.save_point_manager.get_save_points(room.name)
+                    if save_points:
+                        room.save_points = save_points
+                        transferred_count += 1
+
             # Cutscene triggers
             if hasattr(self.object_editor, 'cutscene_trigger_manager'):
                 for room in self.room_manager.rooms:
@@ -1253,6 +1302,18 @@ class RoomEditor:
             if not hasattr(room, 'level_gates'):
                 room.level_gates = []
             self.object_editor.gate_manager.gates[room_name] = room.level_gates
+
+        # Sync save points
+        if self.object_editor and hasattr(self.object_editor, 'save_point_manager'):
+            if not hasattr(room, 'save_points'):
+                room.save_points = []
+            self.object_editor.save_point_manager.save_points[room_name] = room.save_points
+
+        # Sync world map objects
+        if self.object_editor and hasattr(self.object_editor, 'world_map_manager'):
+            if not hasattr(room, 'world_map_objects'):
+                room.world_map_objects = []
+            self.object_editor.world_map_manager._objects[room_name] = room.world_map_objects
 
         # Sync cutscene triggers
         if self.object_editor and hasattr(self.object_editor, 'cutscene_trigger_manager'):
@@ -2240,6 +2301,15 @@ class RoomEditor:
                 self.colors
             )
 
+        # Draw world map objects
+        if self.object_editor:
+            self.object_editor.draw_world_map_objects(
+                screen,
+                int(self.camera.x),
+                int(self.camera.y),
+                self.colors
+            )
+
         # Draw level gates
         if self.object_editor:
             self.object_editor.draw_level_gates(
@@ -2385,6 +2455,7 @@ class RoomEditor:
             self.object_editor.draw_collision_objects(zoom_surf, cam_x, cam_y)
             self.object_editor.draw_flying_pads(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_save_points(zoom_surf, cam_x, cam_y, self.colors)
+            self.object_editor.draw_world_map_objects(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_level_gates(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_room_transitions(zoom_surf, cam_x, cam_y)
 

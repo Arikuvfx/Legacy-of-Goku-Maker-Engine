@@ -21,7 +21,7 @@ class LevelGate:
             'stone':           {'width': 32, 'height': 32, 'health': 1},
             'wood':            {'width': 32, 'height': 32, 'health': 1},
             'makeshift wood':  {'width': 32, 'height': 32, 'health': 1},
-            'stone formation': {'width': 32, 'height': 32, 'health': 1},
+            'stone formation': {'width': 71, 'height': 68, 'health': 1},
             'metal':           {'width': 32, 'height': 32, 'health': 1},
         }
 
@@ -150,6 +150,23 @@ class LevelGate:
 
     def can_be_destroyed_by(self, player) -> bool:
         return player.level >= self.required_level
+
+    def get_collision_rect(self):
+        """Return the gate's solid rect, or None when it should not block movement.
+
+        The player's check_collision_with_obstacles loop calls get_collision_rect()
+        on every obstacle.  Returning None signals 'no collision this frame' without
+        the caller needing to know anything about gate state.
+        """
+        if not self.active or self.is_destroying:
+            return None
+        if self.gate_type == 'metal' and self.is_unlocked:
+            return None
+        return pygame.Rect(
+            self.x - self.width  // 2,
+            self.y - self.height // 2,
+            self.width, self.height,
+        )
 
     def check_collision_with_player(self, player) -> bool:
         if not self.active:
@@ -293,7 +310,7 @@ class LevelGate:
     def _draw_level_requirement(self, screen, sx, sy, colors):
         font = get_gate_font()
         text = str(self.required_level)
-        fy   = sy - (self.height * RENDER_SCALE // 2) + 45 + self.float_offset
+        fy   = sy - 4 + self.float_offset
         scale = 1.5
 
         outline = font.render(text, True, (0, 0, 0))

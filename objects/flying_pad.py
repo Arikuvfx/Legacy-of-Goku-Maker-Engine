@@ -40,7 +40,7 @@ class FlyingPad(LayeredDrawMixin):
     """Flying pad object that transports player along a predefined path"""
 
     def __init__(self, x: int, y: int, pad_type: str = 'stone'):
-        LayeredDrawMixin.__init__(self, layer=DrawLayer.PLAYER, y_sort=True)
+        LayeredDrawMixin.__init__(self, layer=DrawLayer.PLAYER, y_sort=False)
         self.x = x
         self.y = y
         self.width = 32
