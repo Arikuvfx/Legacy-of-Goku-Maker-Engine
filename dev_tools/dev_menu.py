@@ -193,11 +193,12 @@ class DevMenu:
         """
         self.icons = {}
 
-        icon_types = ['room', 'sprite', 'cutscene', 'config', 'close', 'xp', 'transform', 'back']
+        icon_types = ['room', 'map', 'sprite', 'cutscene', 'config', 'close', 'xp', 'transform', 'back']
 
         # Fallback colors keyed by icon type — used when no PNG is present
         icon_colors = {
             'room':      (100, 255, 100),
+            'map':       ( 80, 180, 255),
             'sprite':    (100, 200, 255),
             'cutscene':  (255, 160,  80),
             'config':    (100, 100, 255),
@@ -207,11 +208,16 @@ class DevMenu:
             'back':      (150, 150, 150),
         }
 
+        # Extra filename aliases checked before the generic conventions
+        icon_aliases = {
+            'map': ['worldmap.png'],
+        }
+
         os.makedirs(self.icons_path, exist_ok=True)
 
         for icon_type in icon_types:
-            # Try each naming convention in order
-            candidates = [
+            # Try aliases first (e.g. worldmap.png for the 'map' key), then generic conventions
+            candidates = icon_aliases.get(icon_type, []) + [
                 f"{icon_type}.png",
                 f"icon_{icon_type}.png",
                 f"{icon_type}_icon.png",

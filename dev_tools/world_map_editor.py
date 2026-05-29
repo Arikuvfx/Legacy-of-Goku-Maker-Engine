@@ -318,6 +318,12 @@ class WorldMapEditor:
         self.loc_dialog_room      = ''
         self.loc_dialog_field     = 'name'  # 'name' | 'room'
         self.loc_dialog_rects: dict[str, pygame.Rect] = {}
+        self.room_dropdown_open   = False   # whether the room dropdown popup is visible
+        self.room_dropdown_scroll = 0       # first visible item index
+        self.room_dropdown_hover  = -1      # hovered item index (-1 = none)
+
+        # Reference to the game's RoomManager (set externally via set_room_manager)
+        self.room_manager = None
 
         # ── New-map dialog ────────────────────────────────────────────────────
         self.new_map_dialog = False
@@ -536,6 +542,9 @@ class WorldMapEditor:
         self.loc_dialog_is_new  = is_new
         self.loc_dialog_new_pos = pos
         self.loc_dialog_field   = 'name'
+        self.room_dropdown_open  = False
+        self.room_dropdown_scroll = 0
+        self.room_dropdown_hover  = -1
         default_icon = self.icon_names[0] if self.icon_names else ''
         if is_new:
             self.loc_dialog_name = ''
@@ -569,8 +578,24 @@ class WorldMapEditor:
                 self.selected_loc.icon = self.loc_dialog_icon
         self._cancel_loc_dialog()
 
+    def set_room_manager(self, rm):
+        """Wire up the game's RoomManager so the room dropdown can list rooms."""
+        self.room_manager = rm
+
+    def _get_room_names(self) -> list:
+        """Return a sorted list of room name strings from the room manager."""
+        if self.room_manager is None:
+            return []
+        try:
+            return sorted(self.room_manager.get_room_names())
+        except Exception:
+            return []
+
     def _cancel_loc_dialog(self):
-        self.loc_dialog = False
+        self.loc_dialog          = False
+        self.room_dropdown_open  = False
+        self.room_dropdown_scroll = 0
+        self.room_dropdown_hover  = -1
 
     def _push_undo(self):
         """Snapshot the current map state onto the undo stack."""
@@ -937,6 +962,36 @@ class WorldMapEditor:
 
     def _handle_loc_dialog_event(self, event: pygame.event.Event):
         if event.type == pygame.KEYDOWN:
+            # If the dropdown is open, arrow keys scroll it; Enter selects; Escape closes
+            if self.room_dropdown_open:
+                room_names = self._get_room_names()
+                MAX_VIS    = 8
+                if event.key == pygame.K_ESCAPE:
+                    self.room_dropdown_open = False
+                elif event.key == pygame.K_RETURN:
+                    # Pick the currently highlighted item (first visible if none hovered)
+                    if room_names:
+                        # find the hovered item from loc_dialog_rects
+                        mx, my = pygame.mouse.get_pos()
+                        picked = None
+                        for key, rect in self.loc_dialog_rects.items():
+                            if key.startswith('dropdown_') and rect.collidepoint(mx, my):
+                                idx = int(key.split('_')[1])
+                                picked = room_names[idx]
+                                break
+                        if picked is None and room_names:
+                            picked = room_names[self.room_dropdown_scroll]
+                        if picked:
+                            self.loc_dialog_room = picked
+                    self.room_dropdown_open = False
+                elif event.key == pygame.K_DOWN:
+                    self.room_dropdown_scroll = min(
+                        self.room_dropdown_scroll + 1,
+                        max(0, len(room_names) - MAX_VIS))
+                elif event.key == pygame.K_UP:
+                    self.room_dropdown_scroll = max(0, self.room_dropdown_scroll - 1)
+                return
+
             if event.key == pygame.K_RETURN:
                 if self.loc_dialog_field == 'name':
                     self.loc_dialog_field = 'room'
@@ -950,27 +1005,55 @@ class WorldMapEditor:
             elif event.key == pygame.K_BACKSPACE:
                 if self.loc_dialog_field == 'name':
                     self.loc_dialog_name = self.loc_dialog_name[:-1]
-                else:
-                    self.loc_dialog_room = self.loc_dialog_room[:-1]
+                # Room field no longer accepts manual typing — it's a dropdown
             else:
                 ch = event.unicode
                 if ch.isprintable():
                     if self.loc_dialog_field == 'name' and len(self.loc_dialog_name) < 40:
                         self.loc_dialog_name += ch
-                    elif self.loc_dialog_field == 'room' and len(self.loc_dialog_room) < 64:
-                        self.loc_dialog_room += ch
+                    # Room field is dropdown-only — no typing
+
         elif event.type == pygame.MOUSEBUTTONDOWN:
+            # Scroll the dropdown with the mouse wheel
+            if event.button in (4, 5) and self.room_dropdown_open:
+                room_names = self._get_room_names()
+                MAX_VIS    = 8
+                if event.button == 4:   # scroll up
+                    self.room_dropdown_scroll = max(0, self.room_dropdown_scroll - 1)
+                else:                   # scroll down
+                    self.room_dropdown_scroll = min(
+                        self.room_dropdown_scroll + 1,
+                        max(0, len(room_names) - MAX_VIS))
+                return
+
             for key, rect in self.loc_dialog_rects.items():
                 if not rect.collidepoint(event.pos):
                     continue
                 if key == 'field_name':
                     self.loc_dialog_field = 'name'
+                    self.room_dropdown_open = False
                 elif key == 'field_room':
+                    # Toggle the dropdown
                     self.loc_dialog_field = 'room'
+                    self.room_dropdown_open = not self.room_dropdown_open
+                    self.room_dropdown_scroll = 0
+                    # Scroll so the current selection is visible
+                    room_names = self._get_room_names()
+                    if self.loc_dialog_room in room_names:
+                        idx = room_names.index(self.loc_dialog_room)
+                        MAX_VIS = 8
+                        self.room_dropdown_scroll = max(0, idx - MAX_VIS // 2)
+                elif key.startswith('dropdown_'):
+                    idx = int(key.split('_')[1])
+                    room_names = self._get_room_names()
+                    if 0 <= idx < len(room_names):
+                        self.loc_dialog_room = room_names[idx]
+                    self.room_dropdown_open = False
                 elif key.startswith('icon_'):
                     idx = int(key.split('_')[1])
                     if 0 <= idx < len(self.icon_names):
                         self.loc_dialog_icon = self.icon_names[idx]
+                    self.room_dropdown_open = False
                 elif key == 'ok':
                     self._commit_loc_dialog()
                 elif key == 'cancel':
@@ -1394,12 +1477,25 @@ class WorldMapEditor:
             ix, by + 50, w - 40)
         self.loc_dialog_rects['field_name'] = n_field
 
-        # Room field
-        r_field = self._draw_input_field(
-            screen, 'Room ID:',
-            self.loc_dialog_room, self.loc_dialog_field == 'room',
-            ix, by + 120, w - 40)
-        self.loc_dialog_rects['field_room'] = r_field
+        # Room dropdown button (replaces the old text input)
+        room_lbl = self.font_small.render('Room ID:', True, self.C['dim'])
+        screen.blit(room_lbl, (ix, by + 120))
+        btn_rect = pygame.Rect(ix, by + 138, w - 40, 28)
+        focused  = (self.loc_dialog_field == 'room')
+        border_col = self.C['accent'] if focused else self.C['input_border']
+        bg_col     = self.C['btn_hover'] if (focused or self.room_dropdown_open) else self.C['input_bg']
+        pygame.draw.rect(screen, bg_col, btn_rect, border_radius=4)
+        pygame.draw.rect(screen, border_col, btn_rect, 1, border_radius=4)
+        # Label: current value or placeholder
+        room_label = self.loc_dialog_room if self.loc_dialog_room else '(select a room…)'
+        lbl_col    = self.C['text'] if self.loc_dialog_room else self.C['dim']
+        lbl_surf   = self.font_medium.render(room_label, True, lbl_col)
+        screen.blit(lbl_surf, (btn_rect.x + 6, btn_rect.y + 5))
+        # Chevron
+        arrow = '▲' if self.room_dropdown_open else '▼'
+        arr_s = self.font_medium.render(arrow, True, self.C['dim'])
+        screen.blit(arr_s, (btn_rect.right - arr_s.get_width() - 8, btn_rect.y + 5))
+        self.loc_dialog_rects['field_room'] = btn_rect
 
         # Icon picker
         icon_lbl_y = by + 196
@@ -1455,3 +1551,49 @@ class WorldMapEditor:
         hint = self.font_small.render('Tab to switch field · Enter/Esc to confirm/cancel',
                                       True, self.C['dim'])
         screen.blit(hint, (bx + (w - hint.get_width()) // 2, by + h - 14))
+
+        # ── Room dropdown popup (drawn last so it floats above icon picker) ───
+        if self.room_dropdown_open:
+            room_names = self._get_room_names()
+            MAX_VIS    = 8
+            ITEM_H     = 26
+            pop_w      = w - 40
+            pop_h      = min(len(room_names), MAX_VIS) * ITEM_H + 4
+            if not room_names:
+                pop_h = ITEM_H + 4
+            # Position below the button; flip above if it would go off-screen
+            btn_bottom = by + 138 + 28
+            if btn_bottom + pop_h > self.screen_height - 20:
+                pop_y = by + 138 - pop_h
+            else:
+                pop_y = btn_bottom
+            pop_x = ix
+            popup_rect = pygame.Rect(pop_x, pop_y, pop_w, pop_h)
+            pygame.draw.rect(screen, self.C['panel'], popup_rect, border_radius=4)
+            pygame.draw.rect(screen, self.C['accent'], popup_rect, 1, border_radius=4)
+            if not room_names:
+                ns = self.font_small.render('(no rooms found)', True, self.C['dim'])
+                screen.blit(ns, (pop_x + 6, pop_y + 5))
+            else:
+                mx2, my2 = pygame.mouse.get_pos()
+                end = min(self.room_dropdown_scroll + MAX_VIS, len(room_names))
+                for i, name in enumerate(room_names[self.room_dropdown_scroll:end]):
+                    abs_idx   = self.room_dropdown_scroll + i
+                    item_rect = pygame.Rect(pop_x + 2, pop_y + 2 + i * ITEM_H,
+                                            pop_w - 4, ITEM_H)
+                    hovered   = item_rect.collidepoint(mx2, my2)
+                    selected  = (name == self.loc_dialog_room)
+                    if selected:
+                        pygame.draw.rect(screen, self.C['accent'], item_rect, border_radius=3)
+                    elif hovered:
+                        pygame.draw.rect(screen, self.C['btn_hover'], item_rect, border_radius=3)
+                    col  = self.C['text'] if (selected or hovered) else self.C['dim']
+                    ns   = self.font_medium.render(name, True, col)
+                    screen.blit(ns, (item_rect.x + 6, item_rect.y + 4))
+                    self.loc_dialog_rects[f'dropdown_{abs_idx}'] = item_rect
+                # Scroll hint
+                if len(room_names) > MAX_VIS:
+                    sh = self.font_small.render(
+                        f'↑↓ scroll  ({self.room_dropdown_scroll+1}–{end} of {len(room_names)})',
+                        True, self.C['dim'])
+                    screen.blit(sh, (pop_x + 4, pop_y + pop_h + 2))
