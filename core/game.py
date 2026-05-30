@@ -1816,10 +1816,11 @@ class Game:
             return
         w, h = surface.get_size()
         # Lazily create / resize the overlay surface as needed.
+        # Use SRCALPHA so the alpha is baked into the fill — set_alpha() does not
+        # work correctly when blitting onto a pygame.SCALED display surface.
         if (not hasattr(self, '_csf_surf') or self._csf_surf.get_size() != (w, h)):
-            self._csf_surf = pygame.Surface((w, h))
-            self._csf_surf.fill((0, 0, 0))
-        self._csf_surf.set_alpha(min(255, alpha))
+            self._csf_surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        self._csf_surf.fill((0, 0, 0, min(255, alpha)))
         surface.blit(self._csf_surf, (0, 0))
 
     def _draw_map_jump_fade(self, surface):
@@ -1830,10 +1831,11 @@ class Game:
         if alpha <= 0:
             return
         w, h = surface.get_size()
+        # Use SRCALPHA so the alpha is baked into the fill — set_alpha() does not
+        # work correctly when blitting onto a pygame.SCALED display surface.
         if not hasattr(self, '_mjf_surf') or self._mjf_surf.get_size() != (w, h):
-            self._mjf_surf = pygame.Surface((w, h))
-            self._mjf_surf.fill((0, 0, 0))
-        self._mjf_surf.set_alpha(min(255, alpha))
+            self._mjf_surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        self._mjf_surf.fill((0, 0, 0, min(255, alpha)))
         surface.blit(self._mjf_surf, (0, 0))
 
     # ── World-map flying helpers ──────────────────────────────────────────────
@@ -2273,8 +2275,8 @@ class Game:
                     self._mjf_landing_done     = False
                     self._load_map_land_sprite()
                     self.mission_manager.on_room_entered(_target_room_name)
-                self._mjf_alpha = 255.0   # start fully black; fade_in counts down to 0
-                self._mjf_state = 'landing_fade_in'
+                    self._mjf_alpha = 255.0   # start fully black; fade_in counts down to 0
+                    self._mjf_state = 'landing_fade_in'
 
         elif self._mjf_state == 'landing_fade_in':
             _LAND_FI_SPD = 255.0 / 1.5
@@ -2319,8 +2321,9 @@ class Game:
                         self._mjf_land_frame_idx = 1
             if self._mjf_alpha <= 0.0:
                 self.player.y = getattr(self, '_mjf_land_target_y', self.player.y)
+                self.player.direction = 'down'
                 try:
-                    self.player.sprite.set_animation('idle', self.player.direction)
+                    self.player.sprite.set_animation('idle', 'down')
                     self.player.current_animation_state = 'idle'
                 except Exception:
                     pass
@@ -3034,7 +3037,7 @@ class Game:
 
                     _icon_raw = self._wm_icon_cache[_icon_stem]
                     if _icon_raw:
-                        _isz = max(2, int(50 * RENDER_SCALE * _persp))  # ← change 50 to resize icons
+                        _isz = max(2, int(100 * RENDER_SCALE * _persp))  # ← change 50 to resize icons
                         _icon_surf = pygame.transform.scale(_icon_raw, (_isz, _isz))
                         _icon_rect = _icon_surf.get_rect(midbottom=(_screen_x, _screen_y))
                         if (0 <= _screen_x < sw) and (sky_h < _screen_y < sh):
@@ -3284,6 +3287,24 @@ class Game:
                     self._mjf_active = True
             if self._mjf_active:
                 self._mjf_alpha = min(255.0, self._mjf_alpha + self._MJF_SPEED * dt)
+                # Once fully black, don't wait for _on_exit — load the fly sprite
+                # and transition immediately.  The player's map_jump animation may
+                # still be running off-screen for several seconds before the
+                # callback fires, causing a long black freeze.  We pre-load
+                # everything _on_exit would do right now.
+                if self._mjf_alpha >= 255.0 and self._mjf_state is None:
+                    self._load_map_fly_sprite()
+                    self._mjf_fly_x = SCREEN_WIDTH  / 2
+                    self._mjf_fly_y = SCREEN_HEIGHT * 0.65
+                    self._mjf_cam_x = 0.0
+                    self._mjf_cam_y = 0.0
+                    self._mjf_altitude = 0.5
+                    self._mjf_needs_pin_correction = True
+                    self._mjf_origin_room = self.current_room.name if self.current_room else ''
+                    self._mjf_state  = 'fade_in'
+                    self._mjf_active = False
+                    self.player.sprite.set_animation('idle', self.player.direction)
+                    self.player.current_animation_state = 'idle'
 
             # Fade the damage tint back to neutral each frame.
             if self.player.hurt_tint > 0:
@@ -3822,10 +3843,16 @@ class Game:
 
             for projectile in self.projectiles:
                 if projectile.active:
-                    gate.check_collision_with_attack(projectile, 'projectile')
+                    if gate.check_collision_with_attack(projectile, 'projectile', self.player):
+                        projectile.active = False
 
             if self.player.current_beam:
-                gate.check_collision_with_attack(self.player.current_beam, 'beam')
+                beam = self.player.current_beam
+                if gate not in getattr(beam, '_hit_gates', set()):
+                    if gate.check_collision_with_attack(beam, 'beam', self.player):
+                        if not hasattr(beam, '_hit_gates'):
+                            beam._hit_gates = set()
+                        beam._hit_gates.add(gate)
 
             if not gate.active:
                 self.level_gates.remove(gate)
@@ -3853,7 +3880,7 @@ class Game:
         # flying view (character sprite on a sky/space background) once the
         # fade-out has completed.  The black overlay is drawn on top by
         # _draw_world_map_flying_scene so the fade-in still works correctly.
-        if self._mjf_state in ('fade_in', 'flying',
+        if self._mjf_state in ('pending_fade_in', 'fade_in', 'flying',
                                'landing_fade_out'):
             self._draw_world_map_flying_scene()
             pygame.display.flip()
@@ -3952,11 +3979,10 @@ class Game:
         # its own actor layer separately).
         if not self.active_cutscene_runtime:
             self.layer_manager.clear()
-            # During the landing sequence the player sprite is drawn manually by
-            # _draw_landing_sprite(), so exclude it from the layer manager to
-            # avoid two overlapping player sprites.
-            _player_list = [] if self._mjf_state == 'landing_fade_in' else [self.player]
-            for obj in (self.projectiles + _player_list + self.enemies + self.npcs
+            # During landing_fade_in the landing animation replaces the normal
+            # player sprite — omit the player here so only one sprite is visible.
+            _player_objs = [] if self._mjf_state == 'landing_fade_in' else [self.player]
+            for obj in (self.projectiles + _player_objs + self.enemies + self.npcs
                         + self.destructible_stones + self.level_gates
                         + self.bombs + self.explosions + self.flying_pads
                         + self.save_points + self.world_map_objects):
@@ -3978,6 +4004,13 @@ class Game:
 
             # Damage number popups — drawn on top of sprites but below the HUD
             self.dmg_numbers.draw(self.logical_surface, self.camera, RENDER_SCALE)
+
+            # Landing animation — replaces the normal player sprite while descending
+            # into the room.  Drawn after layer_manager.draw_all (player was excluded
+            # above) and before the foreground tile layer so trees/walls still occlude
+            # the descending character correctly.
+            if self._mjf_state == 'landing_fade_in':
+                self._draw_landing_sprite()
 
         # Cutscene actors are drawn here — BEFORE the foreground tile layer — so that
         # foreground tiles (trees, buildings, tile.layer >= 0) correctly occlude actors
@@ -4138,7 +4171,7 @@ class Game:
         )
 
         tileset_mgr = te.tileset_manager
-        for tile in tiles:
+        for tile in sorted(tiles, key=lambda t: t.layer):
             # When the editor's "Hide other layers" mode is on, only bake tiles
             # that belong to the layer currently being edited.
             if te.hide_other_layers and tile.layer != te.current_layer:
@@ -4372,11 +4405,6 @@ class Game:
         # Map-jump fade drawn dead last so it covers every UI element including
         # the HUD — otherwise the HUD renders on top and the fade looks incomplete.
         self._draw_map_jump_fade(self.logical_surface)
-
-        # Landing sprite drawn on top of the fade overlay so the player is
-        # visible descending as the black screen fades away.
-        if self._mjf_state == 'landing_fade_in':
-            self._draw_landing_sprite()
 
     # ── Editor / room sync ────────────────────────────────────────────────────
 

@@ -757,7 +757,7 @@ class TilesetEditor:
         if room_name not in self.room_tiles:
             return
 
-        for tile in self.room_tiles[room_name]:
+        for tile in sorted(self.room_tiles[room_name], key=lambda t: t.layer):
             # Optionally dim everything except the active editing layer
             if self.hide_other_layers and tile.layer != self.current_layer:
                 continue

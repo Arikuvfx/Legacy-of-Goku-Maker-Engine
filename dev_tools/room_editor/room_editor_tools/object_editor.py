@@ -966,7 +966,7 @@ class ObjectEditor:
         elif self.selected_object.get('object_type') == 'world_map_object':
             variant = self.selected_variant or self._get_current_variant(self.selected_object)
             variant_type = variant['type'] if variant and 'type' in variant else 'world_map'
-            map_name = self.world_map_name_text if variant_type == 'world_map' else ''
+            map_name = self.world_map_name_text
 
             obj = WorldMapObject(int(self.preview_x), int(self.preview_y), variant_type, map_name)
             self.world_map_manager.add_object(room_name, obj)
@@ -1396,7 +1396,7 @@ class ObjectEditor:
                 if (self.selected_object and isinstance(self.selected_object, dict)
                         and self.selected_object.get('object_type') == 'world_map_object'):
                     current_variant = self._get_current_variant(self.selected_object)
-                    if current_variant and current_variant.get('type') == 'world_map':
+                    if current_variant and current_variant.get('type') in ('world_map', 'world_map_sign'):
                         # Dropdown button — toggle open/closed
                         wm_btn = self.ui_rects.get('world_map_dropdown_btn')
                         if wm_btn and wm_btn.collidepoint(mouse_pos):
@@ -1889,8 +1889,14 @@ class ObjectEditor:
             preview_surf = scaled_sprite.copy()
             preview_surf.set_alpha(100)
 
+            # Match the anchor convention used by WorldMapObject.draw():
+            # 'world_map_sign' uses midbottom, all others use center.
+            is_sign = (
+                    self.selected_object.get('object_type') == 'world_map_object'
+                    and (self.selected_variant or {}).get('type') == 'world_map_sign'
+            )
             preview_x = int(screen_x - scaled_width // 2)
-            preview_y = int(screen_y - scaled_height // 2)
+            preview_y = int(screen_y - scaled_height) if is_sign else int(screen_y - scaled_height // 2)
 
             screen.blit(preview_surf, (preview_x, preview_y))
 
@@ -2379,7 +2385,7 @@ class ObjectEditor:
         if (self.selected_object and isinstance(self.selected_object, dict)
                 and self.selected_object.get('object_type') == 'world_map_object'):
             current_variant = self._get_current_variant(self.selected_object)
-            if current_variant and current_variant.get('type') == 'world_map':
+            if current_variant and current_variant.get('type') in ('world_map', 'world_map_sign'):
                 map_label = self.font_medium.render("Map:", True, self.colors['text'])
                 screen.blit(map_label, (self.palette_x + self.palette_padding, y_pos))
 

@@ -230,9 +230,10 @@ class LevelGate:
 
         damage = {'melee': 10, 'projectile': 15, 'beam': 5}.get(attack_type, 5)
         self.health -= damage
-        self.flash_timer    = 0.1
-        self.shake_offset_x = (hash(self.flash_timer)     % 3) - 1
-        self.shake_offset_y = (hash(self.flash_timer * 2) % 3) - 1
+        if attack_type == 'melee':
+            self.flash_timer    = 0.1
+            self.shake_offset_x = (hash(self.flash_timer)     % 3) - 1
+            self.shake_offset_y = (hash(self.flash_timer * 2) % 3) - 1
 
         if self.health <= 0:
             self.start_destruction()

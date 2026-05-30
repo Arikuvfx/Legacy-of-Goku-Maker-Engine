@@ -603,8 +603,11 @@ class WorldMapEditor:
         if not wm:
             return
         import copy
+        # Deep-copy every frame so independent edits on different frames are
+        # each undoable. WMTile is a small dataclass so this is cheap enough.
         self._undo_stack.append((
-            dict(wm.tiles),                  # shallow copy — WMTile is immutable
+            [dict(frame) for frame in wm._frames],    # list of shallow-copied frame dicts
+            wm.frame_idx,                              # restore the active frame too
             [copy.copy(loc) for loc in wm.locations],
         ))
         if len(self._undo_stack) > self._MAX_UNDO:
@@ -615,9 +618,10 @@ class WorldMapEditor:
         wm = self.current_map
         if not wm or not self._undo_stack:
             return
-        tiles_snap, locs_snap = self._undo_stack.pop()
-        wm.tiles     = tiles_snap
-        wm.locations = locs_snap
+        frames_snap, frame_idx_snap, locs_snap = self._undo_stack.pop()
+        wm._frames    = frames_snap
+        wm.frame_idx  = max(0, min(frame_idx_snap, len(wm._frames) - 1))
+        wm.locations  = locs_snap
         if self.selected_loc not in wm.locations:
             self.selected_loc = None
 
