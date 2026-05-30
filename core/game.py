@@ -691,6 +691,14 @@ class Game:
         """
         # Hide the NPC's own indicator the moment dialogue starts.
         npc.is_talking = True
+
+        # Immediately snap the player to idle so walking-into-E never leaves
+        # the walk/run animation frozen on screen during the conversation.
+        if self.player.current_animation_state in ('walk', 'run'):
+            self.player.sprite.set_animation('idle', self.player.direction)
+            self.player.current_animation_state = 'idle'
+        self.player.is_running = False
+
         iid   = getattr(npc, 'instance_id', '')
         state = self.mission_manager.get_npc_dialogue_state(iid) if iid else None
 
@@ -2082,9 +2090,9 @@ class Game:
                     self._mjf_cam_x %= _tex.get_width()
                     self._mjf_cam_y %= _tex.get_height()
 
-            # Space = rise, Shift = descend.
-            rise    = keys[pygame.K_SPACE]
-            descend = keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]
+            # E = rise, Q = descend.
+            rise    = keys[pygame.K_e]
+            descend = keys[pygame.K_q]
             ALT_SPD = 0.8 * dt
             if rise or descend:
                 _old_alt = self._mjf_altitude
@@ -3100,7 +3108,7 @@ class Game:
                 self._wm_glyph_cache: dict = {}
 
             def _char_to_filename(ch):
-                if ch == ':':  return 'collon.png'
+                if ch == ':':  return 'colon.png'
                 if ch == '/':  return 'slash.png'
                 return ch.upper() + '.png'
 
@@ -3271,9 +3279,10 @@ class Game:
                     and not self.pause_menu.active:
                 self.play_time += dt
 
-            # Player movement is also suppressed during cutscenes.
+            # Player movement is also suppressed during cutscenes and NPC dialogue.
             if not self.save_point_menu.active and not self.character_switch_menu.active \
-                    and not self.pause_menu.active and not self.active_cutscene_runtime:
+                    and not self.pause_menu.active and not self.active_cutscene_runtime \
+                    and not self.dialogue_box.active:
                 self._update_player_movement(dt)
 
             self.player.update(dt)
