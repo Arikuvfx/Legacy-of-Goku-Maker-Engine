@@ -1,7 +1,25 @@
 # Legacy-of-Goku-Maker-Engine
 This is a WIP LOG Series Maker Engine with the goal to have an easy engine to use to make fan games of the Legacy of Goku Series, developed by Ariku but being an open source project.
 
+Version 0.0.9 - Hotfix
 
+```
+Changes/Additions:
+- world map location icon size increased
+- changed world map elevation keys for up and down
+
+Major Bugfixes:
+- crash when undoing in world map editor fix
+- sign variant of world map object not having the drop-down fix
+- sign placed higher than shown in preview fix
+- fade ins not fully turning black fix
+- player on top on fade fix
+- can move while talking to a npc fix
+- white layer above gates when shooting attacks fix
+- animation freeze when talking to npc fix
+- long pause between fade out and fade in when going to the world map fix
+- tile editor layering fix
+```
 
 Version 0.0.9
 ```
