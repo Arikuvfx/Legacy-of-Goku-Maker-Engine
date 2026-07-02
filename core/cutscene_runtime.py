@@ -304,12 +304,17 @@ class CutsceneRuntime:
         dialogue_box:   Optional DialogueBox for 'dialogue' actions.
     """
 
-    def __init__(self, cutscene_data, camera, entity_factory, dialogue_box=None):
+    def __init__(self, cutscene_data, camera, entity_factory, dialogue_box=None,
+                 sound_manager=None):
         from config.settings import RENDER_SCALE
 
         self.data          = cutscene_data
         self.camera        = camera
         self.dialogue_box  = dialogue_box
+        # Used by 'sound'-target actions (play_music / play_sfx). None is
+        # tolerated — those actions just become no-ops, same as a missing
+        # dialogue_box silently skipping dialogue actions.
+        self.sound_manager = sound_manager
         self.elapsed       = 0.0
         self.finished      = False
         self.paused        = False
@@ -671,6 +676,7 @@ class CutsceneRuntime:
         last_invert_action   = None
         last_weather_on      = None  # most-recent weather_start / weather_fade_in
         last_weather_off     = None  # most-recent weather_stop  / weather_fade_out
+        last_music_action    = None  # most-recent play_music (sound target)
 
         self.action_index = 0
         self._seeking = True
@@ -744,15 +750,46 @@ class CutsceneRuntime:
                     last_weather_on  = None  # instant stop — nothing left to resume
                 elif atype == 'weather_fade_out':
                     last_weather_off = action
+            elif target == 'sound':
+                if atype in ('play_music', 'stop_music'):
+                    # Whichever of these fired most recently determines the
+                    # music state at t — a stop_music after the last
+                    # play_music means music should be silent at t, not
+                    # resumed. Both are persistent state, unlike play_sfx.
+                    last_music_action = action
+                # play_sfx deliberately untracked — it's a one-shot fire-and-
+                # forget effect, not persistent state, so there's nothing to
+                # resolve for it after scrubbing (same as it staying silent
+                # during the loop above via the _seeking guard in _do_sound).
             elif target in self.actors:
                 if atype in ('set_animation', 'move_to', 'fly_to', 'face'):
                     last_anim_time[target] = action['time']
                 if atype in ('move_to', 'fly_to'):
                     last_move_start[target] = action['time']
-                elif atype in ('teleport', 'set_animation', 'face'):
+                elif atype in ('teleport', 'set_animation', 'face',
+                               'set_character', 'set_costume'):
                     last_move_start.pop(target, None)
 
         self._seeking = False
+
+        # ── Music: actually start whatever track should be playing at t ───────
+        # play_music was suppressed during the loop above (like change_room),
+        # but unlike change_room/dialogue, music is ongoing state — if we
+        # never resolved it, a track set to fire at t=0.0 would be silently
+        # lost forever: game.py always calls seek(0.0) right after creating a
+        # fresh runtime to establish the first frame, which would consume the
+        # action (advance past it in the pending_actions list) without ever
+        # actually starting the track. So re-fire it for real now that
+        # _seeking is False. SoundEngine.play_music() already no-ops if this
+        # exact track is already playing, so repeated scrubs across the same
+        # window don't restart it.
+        if last_music_action is not None:
+            if last_music_action['type'] == 'play_music':
+                self._do_sound(last_music_action['type'], last_music_action.get('params', {}))
+            elif last_music_action['type'] == 'stop_music' and self.sound_manager is not None:
+                # Cut instantly rather than fading — we just jumped straight
+                # to t, there's no in-progress fade to animate through.
+                self.sound_manager.stop_music(fade_out=False)
 
         # ── Dialogue: never open a box while scrubbing ────────────────────────
         # show() is suppressed during the replay loop (via _seeking). Here we
@@ -987,6 +1024,8 @@ class CutsceneRuntime:
             self._do_screen(atype, params)
         elif target == 'room':
             self._do_room(atype, params)
+        elif target == 'sound':
+            self._do_sound(atype, params)
         elif target in self.actors:
             self._do_actor(self.actors[target], atype, params)
 
@@ -1026,6 +1065,37 @@ class CutsceneRuntime:
             room_name = params.get('room_name', '').strip()
             if room_name and callable(self.on_change_room):
                 self.on_change_room(room_name, None, None)
+
+    def _do_sound(self, atype, params):
+        """Play music or fire a one-shot sound effect via SoundManager.
+
+        Skipped while scrubbing (self._seeking), for the same reason
+        change_room is skipped in _do_room above: this is a one-shot side
+        effect rather than state seek() can meaningfully resolve at an
+        arbitrary t, so we just don't fire it — the action is still marked
+        consumed (seek() advances action_index past it) so it won't fire
+        again on resumed forward playback either. Scrubbing never plays audio.
+        """
+        if getattr(self, '_seeking', False):
+            return
+        if self.sound_manager is None:
+            return
+
+        if atype == 'play_music':
+            track = params.get('track', '').strip()
+            if track:
+                loop = params.get('loop', True)
+                self.sound_manager.play_music(
+                    track,
+                    loops=-1 if loop else 0,
+                    fade_in=params.get('fade_in', True),
+                )
+        elif atype == 'play_sfx':
+            sfx = params.get('sfx', '').strip()
+            if sfx:
+                self.sound_manager.play_sfx(sfx)
+        elif atype == 'stop_music':
+            self.sound_manager.stop_music(fade_out=params.get('fade_out', True))
 
     def _do_screen(self, atype, params):
         if atype == 'fade_out':
@@ -1176,3 +1246,17 @@ class CutsceneRuntime:
                 arc_height=params.get('arc_height', 48.0),
                 direction=params.get('direction', None),
             )
+        elif atype == 'set_character':
+            new_char = params.get('character', '').strip()
+            if new_char and hasattr(actor.entity, 'sprite'):
+                from core.sprite_system import create_character_sprite
+                current_anim = getattr(actor.entity, 'current_animation_state', 'idle')
+                current_dir  = getattr(actor.entity, 'direction', 'down')
+                actor.entity.character = new_char
+                actor.entity.sprite    = create_character_sprite(new_char, 'base', 32, 32)
+                actor.entity.direction = current_dir
+                actor.set_animation(current_anim, current_dir)
+        elif atype == 'set_costume':
+            new_costume = params.get('costume', '').strip()
+            if new_costume:
+                actor.set_costume(new_costume)

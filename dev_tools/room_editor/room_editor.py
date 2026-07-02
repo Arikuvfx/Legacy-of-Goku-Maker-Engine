@@ -296,6 +296,7 @@ class RoomEditor:
         # Handle mouse clicks for menu navigation
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             mouse_pos = event.pos
+
             for clickable in self.clickable_rects:
                 if clickable['rect'].collidepoint(mouse_pos):
                     clicked_index = clickable['index']
@@ -558,6 +559,9 @@ class RoomEditor:
         self.current_view = 'view_room'
         pygame.key.set_repeat(0, 0)
 
+        # Sync the toolbar's bg panel with this room's current settings
+        self.toolbar.sync_from_room(getattr(self.viewing_room, 'scrolling_bg', {}))
+
         # Fresh undo/redo history per room visit
         self._undo_stack.clear()
         self._redo_stack.clear()
@@ -681,8 +685,24 @@ class RoomEditor:
 
         # Normal editor mode - check for toolbar clicks
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            # Let toolbar handle slider drags before the click routing. If a
+            # drag just started on a bg slider, sync the new value onto the
+            # room immediately — relying on a later thumbnail/clear click to
+            # trigger 'bg_apply' meant slider-only edits were never written
+            # back to viewing_room.scrolling_bg at all.
+            md_result = self.toolbar.handle_mousedown(event.pos)
+            if md_result == 'bg_apply' and self.viewing_room:
+                self.viewing_room.scrolling_bg = self.toolbar.get_bg_settings()
             result = self.toolbar.handle_click(event.pos)
             if result:
+                if result == 'bg_apply':
+                    # Write toolbar bg settings back to the room
+                    if self.viewing_room:
+                        self.viewing_room.scrolling_bg = self.toolbar.get_bg_settings()
+                        # Bust the preview cache so the new image loads on the next draw
+                        if hasattr(self, '_bg_image_cache'):
+                            self._bg_image_cache.clear()
+                    return None
                 # Each editor panel is mutually exclusive — toggling one always
                 # closes the others so we never end up with two panels open.
                 if result == 'tiles':
@@ -731,11 +751,26 @@ class RoomEditor:
                         # Mark cache dirty so the next draw rebuilds the overview surface
                         self._zoom_dirty = True
                 elif result == 'action_test':
+                    # Persist any unsaved edits (including scrolling-bg settings
+                    # applied via the Background panel) before launching the
+                    # test session, since test mode reloads the room from disk.
+                    self._save_current_room()
                     self.deactivate()
                     return f'test_room:{self.viewing_room.name}'
                 elif result == 'action_save':
                     self._save_current_room()
                 return None
+
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self.toolbar.handle_mouseup()
+
+        if event.type == pygame.MOUSEMOTION:
+            mm_result = self.toolbar.handle_mousemotion(event.pos)
+            if mm_result == 'bg_apply' and self.viewing_room:
+                self.viewing_room.scrolling_bg = self.toolbar.get_bg_settings()
+
+        if event.type == pygame.MOUSEWHEEL:
+            self.toolbar.handle_scroll(event.y)
 
         # F2/F3/F4 are keyboard shortcuts for the same toolbar buttons above.
         # Same mutual-exclusion logic applies — toggling one closes the others.
@@ -2198,6 +2233,38 @@ class RoomEditor:
 
         screen.fill((34, 139, 34))
 
+        # ── Scrolling background preview ──────────────────────────────────────
+        if self.viewing_room:
+            bg = getattr(self.viewing_room, 'scrolling_bg', {})
+            img_path = bg.get('image', '')
+            if img_path:
+                room_name = self.viewing_room.name
+                if not hasattr(self, '_bg_image_cache'):
+                    self._bg_image_cache = {}
+                if img_path not in self._bg_image_cache:
+                    try:
+                        import os
+                        raw = pygame.image.load(os.path.join('assets', 'bg', os.path.basename(img_path))).convert()
+                        sw, sh = screen.get_size()
+                        ratio = sh / raw.get_height()
+                        nw    = max(1, int(raw.get_width() * ratio))
+                        self._bg_image_cache[img_path] = pygame.transform.scale(raw, (nw, sh))
+                    except Exception:
+                        self._bg_image_cache[img_path] = None
+                surf = self._bg_image_cache.get(img_path)
+                if surf:
+                    parallax = bg.get('parallax', 0.5)
+                    sw, sh   = screen.get_size()
+                    iw       = surf.get_width()
+                    off_x    = int(self.camera.x * parallax) % iw
+                    y = 0
+                    while y < sh:
+                        x = -off_x
+                        while x < sw:
+                            screen.blit(surf, (x, y))
+                            x += iw
+                        y += surf.get_height()
+
         # Flush any tiles invalidated by paint/erase this frame before reading
         # the baked surface cache — ensures deletions are visible immediately.
         if callable(self.flush_tile_cache_callback):
@@ -2295,6 +2362,15 @@ class RoomEditor:
         # Draw save points
         if self.object_editor:
             self.object_editor.draw_save_points(
+                screen,
+                int(self.camera.x),
+                int(self.camera.y),
+                self.colors
+            )
+
+        # Draw music objects (editor-only icon; never drawn during test/gameplay)
+        if self.object_editor:
+            self.object_editor.draw_music_objects(
                 screen,
                 int(self.camera.x),
                 int(self.camera.y),
@@ -2455,6 +2531,7 @@ class RoomEditor:
             self.object_editor.draw_collision_objects(zoom_surf, cam_x, cam_y)
             self.object_editor.draw_flying_pads(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_save_points(zoom_surf, cam_x, cam_y, self.colors)
+            self.object_editor.draw_music_objects(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_world_map_objects(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_level_gates(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_room_transitions(zoom_surf, cam_x, cam_y)

@@ -95,7 +95,7 @@ class AnimatedSprite:
         self.sprite_width = sprite_width
         self.sprite_height = sprite_height
 
-        self.base_path = f"assets/sprites/{character_name}/{costume_name}"
+        self.base_path = f"assets/sprites/player/{character_name}/{costume_name}"
 
         self.animations = {}
         self.current_animation = None
@@ -376,7 +376,7 @@ class CharacterSpriteLoader:
 
     @staticmethod
     def load_character(character_name, costume_name, sprite_width, sprite_height):
-        folder = f"assets/sprites/{character_name}/{costume_name}"
+        folder = f"assets/sprites/player/{character_name}/{costume_name}"
         sprite_width, sprite_height = _load_sprite_size(folder, sprite_width, sprite_height)
         sprite = AnimatedSprite(character_name, costume_name, sprite_width, sprite_height)
 
@@ -384,7 +384,7 @@ class CharacterSpriteLoader:
         animations_4dir = [
             ('idle', 0.3, True, 1),
             ('walk', 0.1, True, 1),
-            ('run', 0.08, True, 1),
+            ('run', 0.13, True, 1),
             ('melee', 0.1, False, 2),  # Load first 2 variants from melee.png
             ('melee2', 0.1, False, 2),
             ('melee3', 0.1, False, 1),
@@ -431,7 +431,7 @@ class CharacterSpriteLoader:
 
     @staticmethod
     def list_available_costumes(character_name):
-        char_path = f"assets/sprites/{character_name}"
+        char_path = f"assets/sprites/player/{character_name}"
         if not os.path.exists(char_path):
             return []
 

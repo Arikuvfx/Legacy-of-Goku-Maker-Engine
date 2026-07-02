@@ -193,6 +193,14 @@ class Enemy:
         self.knockback_velocity_x = 0
         self.knockback_velocity_y = 0
 
+        # Brief invulnerability window after taking a hit (i-frames) — mirrors
+        # the player's take_damage system. Decoupled from is_knocked_back so a
+        # hit can land again while the enemy is still mid-stagger, once the
+        # i-frame window has elapsed.
+        self.invulnerable = False
+        self.invulnerable_timer = 0
+        self.invulnerable_duration = 0.2
+
         # Hurt tint — red flash that fades after taking damage
         self.hurt_tint = 0.0            # 1.0 = full red, 0.0 = no tint
         self.hurt_tint_duration = 0.45  # Seconds to fully fade back to normal
@@ -695,6 +703,14 @@ class Enemy:
         # Fade out the hurt tint each frame
         if self.hurt_tint > 0:
             self.hurt_tint = max(0.0, self.hurt_tint - dt / self.hurt_tint_duration)
+
+        # I-frame timer — ticks regardless of knockback state so the window
+        # can fully expire (and the enemy become hittable again) even while
+        # still mid-stagger.
+        if self.invulnerable:
+            self.invulnerable_timer -= dt
+            if self.invulnerable_timer <= 0:
+                self.invulnerable = False
 
         self.update_stuck_detection(dt)
 
@@ -1506,10 +1522,22 @@ class Enemy:
             self.sprite.set_animation('idle', self.direction)
 
     def take_damage(self, damage):
-        """Reduce HP and track hit combos for the advanced AI retreat decision."""
+        """Reduce HP and track hit combos for the advanced AI retreat decision.
+
+        Returns False (no-op) if the enemy is still within its post-hit
+        i-frame window — same gating the player uses, decoupled from
+        is_knocked_back so a hit can land again mid-stagger once i-frames
+        have expired.
+        """
+        if self.invulnerable:
+            return False
+
         self.last_damage_dealt = damage  # Stored so game.py can spawn a popup
         self.hp -= damage
         self.hurt_tint = 1.0
+
+        self.invulnerable = True
+        self.invulnerable_timer = self.invulnerable_duration
 
         if self.ai_type == 'advanced':
             current_time = time.time()
@@ -1529,6 +1557,8 @@ class Enemy:
             self.death_frame_index = 0
             self.death_frame_timer = 0.0
 
+        return True
+
     def get_xp_reward(self, game_config):
         """Return XP granted to the player on kill."""
         return game_config.basic_enemy_xp
@@ -1540,9 +1570,12 @@ class Enemy:
     def check_collision_with_attack(self, attack, attack_type):
         """Test whether a player attack hits this enemy and apply damage/knockback.
 
-        Returns True if a hit was registered.
+        Returns True if a hit was registered. Being mid-knockback no longer
+        blocks this outright — take_damage()'s own i-frame window (decoupled
+        from is_knocked_back) is what gates repeat hits now, so an enemy can
+        be damaged again while still staggered once i-frames expire.
         """
-        if not self.active or self.is_knocked_back:
+        if not self.active:
             return False
 
         if attack_type == 'melee':
@@ -1566,7 +1599,8 @@ class Enemy:
                 attack.size, attack.size,
             )
             if attack_rect.colliderect(self.get_collision_rect()):
-                self.take_damage(15)
+                if not self.take_damage(15):
+                    return False  # Still in i-frames — swing passes through harmlessly
 
                 dx = self.x - attack.x
                 dy = self.y - attack.y
@@ -1589,7 +1623,8 @@ class Enemy:
                     dx /= dist
                     dy /= dist
 
-                self.take_damage(20)
+                if not self.take_damage(20):
+                    return False
                 self.apply_knockback(dx, dy, 250)
                 return True
 
@@ -1610,8 +1645,9 @@ class Enemy:
                                             attack.length, attack.width)
 
                 if beam_rect.colliderect(self.get_collision_rect()):
-                    self.take_damage(5)  # Beam ticks low damage continuously
-                    return True
+                    # Beam ticks low damage continuously, now naturally throttled
+                    # by the i-frame window instead of a hard stagger lock.
+                    return self.take_damage(5)
 
         return False
 

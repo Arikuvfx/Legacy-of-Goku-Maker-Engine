@@ -59,6 +59,7 @@ class DevMenu:
             {'id': 'world_map_editor',  'label': 'WORLD MAP EDITOR',  'icon': 'map'},
             {'id': 'sprite_editor',     'label': 'SPRITE EDITOR',     'icon': 'sprite'},
             {'id': 'cutscene_editor', 'label': 'CUTSCENE EDITOR', 'icon': 'cutscene'},
+            {'id': 'character_creator', 'label': 'CHARACTER CREATOR', 'icon': 'character'},
             {'id': 'config',          'label': 'CONFIGURATION',   'icon': 'config'},
             {'id': 'close',           'label': 'CLOSE MENU',      'icon': 'close'},
         ]
@@ -193,7 +194,7 @@ class DevMenu:
         """
         self.icons = {}
 
-        icon_types = ['room', 'map', 'sprite', 'cutscene', 'config', 'close', 'xp', 'transform', 'back']
+        icon_types = ['room', 'map', 'sprite', 'cutscene', 'character', 'config', 'close', 'xp', 'transform', 'back']
 
         # Fallback colors keyed by icon type — used when no PNG is present
         icon_colors = {
@@ -201,6 +202,7 @@ class DevMenu:
             'map':       ( 80, 180, 255),
             'sprite':    (100, 200, 255),
             'cutscene':  (255, 160,  80),
+            'character': (255, 120, 220),
             'config':    (100, 100, 255),
             'close':     (255,  50,  50),
             'xp':        (255, 215,   0),
@@ -608,6 +610,8 @@ class DevMenu:
                 return 'open_sprite_editor'
             elif option_id == 'cutscene_editor':
                 return 'open_cutscene_editor'
+            elif option_id == 'character_creator':
+                return 'open_character_creator'
             elif option_id == 'config':
                 self._enter_menu('config')
             elif option_id == 'close':
@@ -651,9 +655,10 @@ class DevMenu:
     def _get_menu_title(self):
         """Return the display title for the active submenu."""
         return {
-            'main':            'DEVELOPER MENU',
-            'config':          'CONFIGURATION',
-            'xp_config':       'XP SYSTEM CONFIG',
-            'room_editor':     'ROOM EDITOR',
-            'world_map_editor': 'WORLD MAP EDITOR',
+            'main':              'DEVELOPER MENU',
+            'config':            'CONFIGURATION',
+            'xp_config':         'XP SYSTEM CONFIG',
+            'room_editor':       'ROOM EDITOR',
+            'world_map_editor':  'WORLD MAP EDITOR',
+            'character_creator': 'CHARACTER CREATOR',
         }.get(self.current_menu, 'DEV MENU')

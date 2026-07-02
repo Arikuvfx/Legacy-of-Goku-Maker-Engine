@@ -338,6 +338,16 @@ class PauseMenu:
         elif idx == 1:
             self._sound_engine.set_music_volume(self.options_values[1])
 
+    def _play_switch_sfx(self):
+        """Play the L/R tab-switch sound, if a sound engine has been wired up."""
+        if self._sound_engine:
+            self._sound_engine.play_sound('switch')
+
+    def _play_select_sfx(self):
+        """Play the confirm/select sound (A button), if a sound engine has been wired up."""
+        if self._sound_engine:
+            self._sound_engine.play_sound('select')
+
     # ── Update ────────────────────────────────────────────────────────────────
 
     def update(self, dt):
@@ -380,10 +390,12 @@ class PauseMenu:
         if key == pygame.K_LEFT and not self.options_editing:
             self.tab_index = 4 if self.tab_index == 0 else self.tab_index - 1
             self._press('l')
+            self._play_switch_sfx()
 
         elif key == pygame.K_RIGHT and not self.options_editing:
             self.tab_index = 0 if self.tab_index == 4 else self.tab_index + 1
             self._press('r')
+            self._play_switch_sfx()
 
         elif TABS[self.tab_index] == 'INVENTORY' and key == pygame.K_UP:
             if self.inv_scroll_offset > 0:
@@ -431,6 +443,7 @@ class PauseMenu:
                 if key == pygame.K_z and self.options_item_index <= 2:
                     self.options_editing = True
                     self._press('a')
+                    self._play_select_sfx()
                 elif key == pygame.K_UP:
                     self.options_item_index = 3 if self.options_item_index == 4 else max(0, self.options_item_index - 1)
                 elif key == pygame.K_DOWN:
@@ -465,17 +478,20 @@ class PauseMenu:
         if _hit('l_tab') and not self.options_editing:
             self.tab_index = 4 if self.tab_index == 0 else self.tab_index - 1
             self._press('l')
+            self._play_switch_sfx()
             return None
 
         if _hit('r_tab') and not self.options_editing:
             self.tab_index = 0 if self.tab_index == 4 else self.tab_index + 1
             self._press('r')
+            self._play_switch_sfx()
             return None
 
         if _hit('a_select') and self.tab_index in (1, 2, 3):
             if self.tab_index == 3 and self.options_item_index <= 2:
                 self.options_editing = not self.options_editing
                 self._press('a')
+                self._play_select_sfx()
             return None
 
         if _hit('scroll_up'):
@@ -516,6 +532,7 @@ class PauseMenu:
                     if self.options_item_index == i and i <= 2:
                         self.options_editing = True
                         self._press('a')
+                        self._play_select_sfx()
                     else:
                         self.options_editing    = False
                         self.options_item_index = i

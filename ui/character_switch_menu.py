@@ -6,6 +6,8 @@ and per-character walk/idle animation. Selected character plays their walk
 cycle; unselected characters hold their idle frame.
 """
 
+from __future__ import annotations
+
 import pygame
 import os
 from config.settings import RENDER_SCALE
@@ -28,14 +30,7 @@ class CharacterSwitchMenu:
         self.canvas_x = (screen_width  - self.canvas_width)  // 2
         self.canvas_y = (screen_height - self.canvas_height) // 2
 
-        self.characters = [
-            {'id': 'goku',   'name': 'Goku',   'unlocked': True, 'costume': 'base',
-             'animation_frame': 0, 'animation_timer': 0.0},
-            {'id': 'gohan',  'name': 'Gohan',  'unlocked': True, 'costume': 'base',
-             'animation_frame': 0, 'animation_timer': 0.0},
-            {'id': 'vegeta', 'name': 'Vegeta', 'unlocked': True, 'costume': 'base',
-             'animation_frame': 0, 'animation_timer': 0.0},
-        ]
+        self.characters = self._discover_characters()
 
         # Tracks which buttons are currently showing their pressed sprite
         self.button_states = {'left': False, 'right': False, 'a': False, 'b': False}
@@ -68,6 +63,65 @@ class CharacterSwitchMenu:
         # Background texture offset — shift the tile pattern if needed
         self.bg_offset_x = 0
         self.bg_offset_y = 0
+
+    # ── Character discovery ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _discover_characters():
+        import json
+        chars_dir = 'assets/characters'
+        order_file = 'assets/character_menu_order.json'
+
+        if not os.path.isdir(chars_dir):
+            return []
+
+        # Load the custom order saved by the character creator (may not exist yet)
+        saved_order = []
+        try:
+            with open(order_file, 'r') as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                saved_order = [str(x) for x in data]
+        except Exception:
+            pass
+
+        # Parse every character JSON, keyed by ID
+        configs = {}
+        for filename in os.listdir(chars_dir):
+            if not filename.endswith('.json') or filename.startswith('_'):
+                continue
+            path = os.path.join(chars_dir, filename)
+            try:
+                with open(path, 'r') as f:
+                    cfg = json.load(f)
+            except Exception:
+                continue
+            if not isinstance(cfg, dict):
+                continue
+            char_id = cfg.get('id') or filename[:-5]
+            configs[char_id] = cfg
+
+        # Apply the saved order: known IDs first, then any new ones alphabetically
+        if saved_order:
+            ordered_ids = [cid for cid in saved_order if cid in configs]
+            leftover = sorted(set(configs) - set(ordered_ids))
+            final_ids = ordered_ids + leftover
+        else:
+            final_ids = sorted(configs)
+
+        characters = []
+        for char_id in final_ids:
+            cfg = configs[char_id]
+            characters.append({
+                'id': char_id,
+                'name': cfg.get('display_name', char_id.capitalize()),
+                'unlocked': True,
+                'costume': cfg.get('costume', 'base'),
+                'animation_frame': 0,
+                'animation_timer': 0.0,
+            })
+
+        return characters
 
     # ── Asset loading ─────────────────────────────────────────────────────────
 
@@ -113,7 +167,7 @@ class CharacterSwitchMenu:
 
             # Idle — grab top-left frame only
             try:
-                sheet = pygame.image.load(f'assets/sprites/{cid}/{costume}/idle.png').convert_alpha()
+                sheet = pygame.image.load(f'assets/sprites/player/{cid}/{costume}/idle.png').convert_alpha()
                 fw = sheet.get_width()  // 2
                 fh = sheet.get_height() // 4
                 frame = sheet.subsurface(pygame.Rect(0, 0, fw, fh))
@@ -125,7 +179,7 @@ class CharacterSwitchMenu:
 
             # Walk — extract all 4 "facing down" frames from the top row
             try:
-                sheet = pygame.image.load(f'assets/sprites/{cid}/{costume}/walk.png').convert_alpha()
+                sheet = pygame.image.load(f'assets/sprites/player/{cid}/{costume}/walk.png').convert_alpha()
                 fw = sheet.get_width()  // 4
                 fh = sheet.get_height() // 4
                 char['walk_frames'] = [
@@ -144,10 +198,15 @@ class CharacterSwitchMenu:
 
     def open(self, current_character='goku'):
         self.active = True
+        # Refresh from disk so characters added in the creator appear immediately.
+        self.characters = self._discover_characters()
+        self._load_character_sprites()
         for i, char in enumerate(self.characters):
             if char['id'] == current_character:
                 self.selected_character = i
                 break
+        else:
+            self.selected_character = 0
         for char in self.characters:
             char['animation_frame'] = 0
             char['animation_timer'] = 0.0

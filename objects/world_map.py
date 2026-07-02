@@ -74,11 +74,13 @@ class WorldMapObject:
         'world_map_sign': {'width': 29, 'height': 32},
     }
 
-    def __init__(self, x, y, variant='world_map', map_name=''):
+    def __init__(self, x, y, variant='world_map', map_name='', entity_name=''):
         self.x       = float(x)
         self.y       = float(y)
         self.variant = variant
-        self.map_name = map_name   # stem of the JSON file, e.g. 'overworld'
+        self.map_name    = map_name     # stem of the JSON file, e.g. 'overworld'
+        self.entity_name = entity_name  # name of the WMEntity this object represents
+                                        # (empty = not linked to any entity)
         self.frame_idx = 0         # which frame to display (for future animation)
         self.active  = True
 
@@ -236,13 +238,15 @@ class WorldMapObject:
 
     def to_dict(self):
         return {'type': 'world_map_object', 'variant': self.variant,
-                'x': self.x, 'y': self.y, 'map_name': self.map_name}
+                'x': self.x, 'y': self.y, 'map_name': self.map_name,
+                'entity_name': self.entity_name}
 
     @staticmethod
     def from_dict(data):
         return WorldMapObject(data.get('x', 0), data.get('y', 0),
                               data.get('variant', 'world_map'),
-                              data.get('map_name', ''))
+                              data.get('map_name', ''),
+                              data.get('entity_name', ''))
 
 
 class WorldMapObjectManager:

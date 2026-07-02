@@ -126,6 +126,24 @@ class CutsceneActor:
         if hasattr(self.entity, 'current_animation_state'):
             self.entity.current_animation_state = state
 
+    def set_costume(self, costume: str):
+        """Switch the actor to a different costume folder.
+
+        Reloads the entity's sprite from
+        assets/sprites/player/{character}/{costume}/ while preserving the
+        current animation state and facing direction.
+        """
+        entity    = self.entity
+        character = getattr(entity, 'character', None)
+        if not character:
+            return
+        from core.sprite_system import create_character_sprite
+        current_anim = getattr(entity, 'current_animation_state', 'idle')
+        current_dir  = getattr(entity, 'direction', 'down')
+        entity.sprite    = create_character_sprite(character, costume, 32, 32)
+        entity.direction = current_dir
+        self.set_animation(current_anim, current_dir)
+
     @staticmethod
     def _hot_load_animation(sprite, state):
         """Load all directions of *state* from {sprite.base_path}/{state}.png.

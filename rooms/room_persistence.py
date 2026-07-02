@@ -34,6 +34,7 @@ class RoomPersistence:
                 'save_points':          self._serialize_save_points(room),
                 'cutscene_triggers':     self._serialize_cutscene_triggers(room),
                 'world_map_objects':     self._serialize_world_map_objects(room),
+                'music_objects':         self._serialize_music_objects(room),
             }
             with open(self._get_room_filepath(room.name), 'w') as f:
                 json.dump(data, f, indent=2)
@@ -206,6 +207,15 @@ class RoomPersistence:
     def deserialize_world_map_objects(self, data):
         from objects.world_map import WorldMapObject
         return [WorldMapObject.from_dict(o) for o in data]
+
+    def _serialize_music_objects(self, room):
+        if not getattr(room, 'music_objects', None):
+            return []
+        return [o.to_dict() for o in room.music_objects]
+
+    def deserialize_music_objects(self, data):
+        from objects.music_object import MusicObject
+        return [MusicObject.from_dict(o) for o in data]
 
     def deserialize_save_points(self, save_points_data):
         from objects.save_point import SavePoint
@@ -402,6 +412,7 @@ class RoomManagerWithPersistence:
         room.save_points         = self.persistence.deserialize_save_points(data['save_points'])      if data.get('save_points')         else []
         room.cutscene_triggers   = self.persistence.deserialize_cutscene_triggers(data['cutscene_triggers'], room_name) if data.get('cutscene_triggers') else []
         room.world_map_objects   = self.persistence.deserialize_world_map_objects(data['world_map_objects']) if data.get('world_map_objects') else []
+        room.music_objects       = self.persistence.deserialize_music_objects(data['music_objects'])      if data.get('music_objects')       else []
 
         existing = self.get_room_by_name(room_name)
         if existing:

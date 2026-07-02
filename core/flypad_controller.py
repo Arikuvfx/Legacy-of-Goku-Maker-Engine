@@ -56,6 +56,13 @@ class FlyingController:
         self.on_flight_complete: Optional[Callable] = None
         self.transition_controller = None  # Reference to TransitionController.
 
+        # Sound — 'flyoff' plays once as the player takes off; once it
+        # finishes, 'aura' loops for the remainder of the flight and is
+        # stopped on landing/cancel. See set_sound_manager().
+        self.sound_manager = None
+        self._flyoff_channel = None   # Channel the one-shot take-off sfx is on.
+        self._aura_looping   = False  # Whether the looping aura sfx is active.
+
         # Flying sprite (currently unused visually but available for effects)
         self.flying_sprite = None
         self._load_flying_sprite()
@@ -84,6 +91,15 @@ class FlyingController:
             transition_controller: Active TransitionController instance.
         """
         self.transition_controller = transition_controller
+
+    def set_sound_manager(self, sound_manager):
+        """
+        Attach the SoundManager so take-off/flying sfx can be played.
+
+        Args:
+            sound_manager: Active SoundManager instance.
+        """
+        self.sound_manager = sound_manager
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -125,6 +141,18 @@ class FlyingController:
         if hasattr(self.player, 'current_beam') and self.player.current_beam:
             self.player.current_beam = None
 
+        # Play the take-off sfx. Once it finishes (polled in update()),
+        # the looping aura sfx picks up for the rest of the flight.
+        self._flyoff_channel = None
+        self._aura_looping   = False
+        if self.sound_manager:
+            self._flyoff_channel = self.sound_manager.play_sfx('flyoff')
+            # If the sfx couldn't be played (missing/disabled), fall back to
+            # starting the aura loop immediately so the flight isn't silent.
+            if self._flyoff_channel is None:
+                self.sound_manager.play_looping_sfx('aura')
+                self._aura_looping = True
+
     def cancel_flight(self):
         """Immediately abort the flying sequence and restore player control."""
         if self.is_flying:
@@ -162,6 +190,14 @@ class FlyingController:
         """
         if not self.is_flying or not self.player:
             return
+
+        # Once the one-shot take-off sfx finishes playing, hand off to the
+        # looping aura sfx for the remainder of the flight.
+        if self._flyoff_channel is not None and not self._flyoff_channel.get_busy():
+            self._flyoff_channel = None
+            if self.sound_manager and not self._aura_looping:
+                self.sound_manager.play_looping_sfx('aura')
+                self._aura_looping = True
 
         if self.is_transitioning_rooms:
             self._update_room_transition(dt)
@@ -353,6 +389,22 @@ class FlyingController:
         """
         if not self.player:
             return
+
+        # Stop any take-off/aura sfx that's still going — but leave it alone
+        # if the player is currently transformed, since the transformation
+        # system owns the aura loop in that case and will stop it on its own
+        # detransform check.
+        if self.sound_manager:
+            player_is_transformed = False
+            if hasattr(self.player, 'is_transformed'):
+                try:
+                    player_is_transformed = self.player.is_transformed()
+                except Exception:
+                    player_is_transformed = False
+            if not player_is_transformed:
+                self.sound_manager.stop_looping_sfx('aura')
+        self._flyoff_channel = None
+        self._aura_looping   = False
 
         if hasattr(self.player, 'is_flying'):
             self.player.is_flying = False

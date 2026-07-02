@@ -12,6 +12,7 @@ from objects.flying_pad import FlyingPad, FlyingPadManager
 from objects.save_point import SavePoint, SavePointManager
 from objects.world_map import WorldMapObject, WorldMapObjectManager
 from objects.cutscene_trigger import CutsceneTrigger, CutsceneTriggerManager, draw_cutscene_trigger
+from objects.music_object import MusicObject, MusicObjectManager, get_available_music_tracks
 from dev_tools.room_editor.room_editor_tools.flying_pad_path_editor import FlyingPadPathEditor
 
 
@@ -109,6 +110,16 @@ class ObjectEditor:
         self.world_map_manager = WorldMapObjectManager()
         self.on_world_map_placed = None
         self.on_world_map_deleted = None
+
+        # ── Music object ──────────────────────────────────────────────────────
+        self.music_manager = MusicObjectManager()
+        self.on_music_placed = None
+        self.on_music_deleted = None
+        self.music_track_text = ""          # currently selected track filename
+        self.music_dropdown_open = False    # whether the track dropdown is open
+        self.music_dropdown_names = []      # cached list of track filenames
+        self.music_dropdown_scroll = 0      # index of first visible item (for long track lists)
+        self._music_dropdown_visible_rows = 8  # recomputed in draw based on available space
 
         # ── Cutscene triggers ─────────────────────────────────────────────────
         self.cutscene_trigger_manager = CutsceneTriggerManager()
@@ -304,6 +315,26 @@ class ObjectEditor:
             'width': 16,
             'height': 16,
             'is_cutscene_trigger': True
+        })
+
+        # Add music object to System category.
+        # Invisible in-game — this icon is only ever shown inside the editor.
+        music_sprite = pygame.Surface((16, 16), pygame.SRCALPHA)
+        music_sprite.fill((80, 220, 180, 100))
+        pygame.draw.rect(music_sprite, (80, 220, 180), (0, 0, 16, 16), 2)
+        # Simple music-note glyph so it reads differently from the other icons
+        pygame.draw.circle(music_sprite, (80, 220, 180), (5, 12), 3)
+        pygame.draw.line(music_sprite, (80, 220, 180), (8, 12), (8, 3), 2)
+        pygame.draw.line(music_sprite, (80, 220, 180), (8, 3), (13, 5), 2)
+
+        self.categories['System'].append({
+            'id': 'music_object',
+            'name': 'Music',
+            'sprite': music_sprite,
+            'width': 16,
+            'height': 16,
+            'object_type': 'music_object',
+            'is_music_object': True
         })
 
         # Generate sprites and variant sprites
@@ -519,7 +550,7 @@ class ObjectEditor:
                     continue
 
                 # Skip objects that already have sprites (system objects are built manually above)
-                system_flags = ('is_spawn', 'is_collision', 'is_transition', 'is_cutscene_trigger')
+                system_flags = ('is_spawn', 'is_collision', 'is_transition', 'is_cutscene_trigger', 'is_music_object')
                 if any(obj.get(flag, False) for flag in system_flags):
                     continue
 
@@ -569,6 +600,8 @@ class ObjectEditor:
             self.cutscene_id_input_active = False
             self.cutscene_dropdown_open = False
             self.world_map_dropdown_open = False
+            self.music_dropdown_open = False
+            self.music_dropdown_scroll = 0
 
     def _get_current_variant(self, obj):
         """Get the currently selected variant for an object"""
@@ -659,6 +692,12 @@ class ObjectEditor:
             if (trigger.x <= world_x <= trigger.x + trigger.width and
                     trigger.y <= world_y <= trigger.y + trigger.height):
                 return trigger, 'cutscene_trigger'
+
+        # Check music object
+        for music_obj in self.music_manager.get_music_objects(self.current_room_name):
+            distance = ((music_obj.x - world_x) ** 2 + (music_obj.y - world_y) ** 2) ** 0.5
+            if distance < max(music_obj.width, music_obj.height) / 2:
+                return music_obj, 'music_object'
 
         return None, None
 
@@ -762,6 +801,16 @@ class ObjectEditor:
             if hasattr(self, 'on_cutscene_trigger_deleted') and self.on_cutscene_trigger_deleted:
                 self.on_cutscene_trigger_deleted(obj, self.current_room_name)
 
+        elif obj_type == 'music_object':
+            self.music_manager.remove_music_object(self.current_room_name)
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(self.current_room_name)
+                if room and hasattr(room, 'music_objects') and obj in room.music_objects:
+                    room.music_objects.remove(obj)
+
+            if hasattr(self, 'on_music_deleted') and self.on_music_deleted:
+                self.on_music_deleted(obj, self.current_room_name)
+
     def _is_object_disabled(self, obj) -> bool:
         """Check if we can't place this object (e.g. spawn already exists)"""
         if not obj or not isinstance(obj, dict):
@@ -769,6 +818,9 @@ class ObjectEditor:
 
         if obj.get('is_spawn', False):
             return self.spawn_manager.has_spawn_point(self.current_room_name)
+        if obj.get('is_music_object', False):
+            # Only one Music object per room — a room can only have one active track
+            return self.music_manager.has_music_object(self.current_room_name)
         return False
 
     def _is_level_input_clicked(self, mouse_pos):
@@ -1005,6 +1057,22 @@ class ObjectEditor:
             if hasattr(self, 'on_gate_placed') and self.on_gate_placed:
                 self.on_gate_placed(gate, room_name)
 
+        elif self.selected_object.get('object_type') == 'music_object':
+            music_obj = MusicObject(int(self.preview_x), int(self.preview_y), self.music_track_text)
+
+            # Replaces any existing Music object in the manager (singleton per room)
+            self.music_manager.add_music_object(room_name, music_obj)
+
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(room_name)
+                if room:
+                    if not hasattr(room, 'music_objects'):
+                        room.music_objects = []
+                    room.music_objects = [music_obj]
+
+            if hasattr(self, 'on_music_placed') and self.on_music_placed:
+                self.on_music_placed(music_obj, room_name)
+
     def _draw_delete_highlight(self, screen, camera_x, camera_y):
         """Draw red outline around object that's about to be deleted"""
         obj = self.hovered_object
@@ -1178,6 +1246,10 @@ class ObjectEditor:
         except FileNotFoundError:
             return []
 
+    def _get_music_track_names(self):
+        """Return a sorted list of track filenames from assets/audio/music/."""
+        return get_available_music_tracks()
+
     def _is_cutscene_id_input_clicked(self, mouse_pos):
         """Check if the cutscene ID text box was clicked."""
         if not self.selected_object or not isinstance(self.selected_object, dict):
@@ -1327,9 +1399,20 @@ class ObjectEditor:
             return
 
         # Scroll through palette
-        if event.type == pygame.MOUSEWHEEL and self._is_in_palette(mouse_pos[0], mouse_pos[1]):
-            self.scroll_offset -= event.y * 30
-            self.scroll_offset = max(0, min(self.scroll_offset, self.max_scroll))
+        if event.type == pygame.MOUSEWHEEL:
+            # If the music track dropdown is open and the cursor is over its
+            # list, scroll the list instead of the palette underneath it.
+            if self.music_dropdown_open:
+                list_rect = self.ui_rects.get('music_dropdown_list_rect')
+                if list_rect and list_rect.collidepoint(mouse_pos):
+                    max_scroll = max(0, len(self.music_dropdown_names) - self._music_dropdown_visible_rows)
+                    self.music_dropdown_scroll -= event.y
+                    self.music_dropdown_scroll = max(0, min(self.music_dropdown_scroll, max_scroll))
+                    return
+
+            if self._is_in_palette(mouse_pos[0], mouse_pos[1]):
+                self.scroll_offset -= event.y * 30
+                self.scroll_offset = max(0, min(self.scroll_offset, self.max_scroll))
 
         # Right-click to delete objects
         if event.type == pygame.MOUSEBUTTONDOWN:
@@ -1415,6 +1498,42 @@ class ObjectEditor:
                             # Click outside list — close without selecting
                             self.world_map_dropdown_open = False
                             return
+
+                # Handle music track dropdown clicks
+                if (self.selected_object and isinstance(self.selected_object, dict)
+                        and self.selected_object.get('is_music_object', False)):
+
+                    # Dropdown button — toggle open/closed
+                    mus_btn = self.ui_rects.get('music_dropdown_btn')
+                    if mus_btn and mus_btn.collidepoint(mouse_pos):
+                        self.music_dropdown_open = not self.music_dropdown_open
+                        self.music_dropdown_scroll = 0
+                        if self.music_dropdown_open:
+                            self.music_dropdown_names = self._get_music_track_names()
+                        return
+
+                    # Scroll arrow clicks (only present when the list overflows)
+                    if self.music_dropdown_open:
+                        up_arrow = self.ui_rects.get('music_dropdown_scroll_up')
+                        if up_arrow and up_arrow.collidepoint(mouse_pos):
+                            self.music_dropdown_scroll = max(0, self.music_dropdown_scroll - 1)
+                            return
+                        down_arrow = self.ui_rects.get('music_dropdown_scroll_down')
+                        if down_arrow and down_arrow.collidepoint(mouse_pos):
+                            max_scroll = max(0, len(self.music_dropdown_names) - self._music_dropdown_visible_rows)
+                            self.music_dropdown_scroll = min(max_scroll, self.music_dropdown_scroll + 1)
+                            return
+
+                    # Item inside open dropdown list
+                    if self.music_dropdown_open:
+                        for item_rect, name in self.ui_rects.get('music_dropdown_items', []):
+                            if item_rect.collidepoint(mouse_pos):
+                                self.music_track_text = name
+                                self.music_dropdown_open = False
+                                return
+                        # Click outside list — close without selecting
+                        self.music_dropdown_open = False
+                        return
 
                 # Check if clicking on variant selector
                 if self._is_variant_selector_clicked(mouse_pos):
@@ -2234,6 +2353,19 @@ class ObjectEditor:
             if obj.active:
                 obj.draw(screen, temp_camera, colors)
 
+    def draw_music_objects(self, screen, camera_x, camera_y, colors=None):
+        """Draw Music object icons in the current room (editor overlay only).
+
+        This is intentionally editor-only — the Music object has no in-game
+        sprite and must never be drawn while actually testing/playing a room.
+        """
+        if not self.current_room_name:
+            return
+        temp_camera = self._make_camera(camera_x, camera_y)
+        for music_obj in self.music_manager.get_music_objects(self.current_room_name):
+            if music_obj.active:
+                music_obj.draw(screen, temp_camera, colors)
+
     def draw_cutscene_triggers(self, screen, camera_x, camera_y):
         """Draw all cutscene trigger zones in the current room (dev mode only)."""
         if not self.current_room_name:
@@ -2440,6 +2572,98 @@ class ObjectEditor:
                             self.ui_rects['world_map_dropdown_items'].append((item_rect, name))
 
                 y_pos += 30
+
+        if self.selected_object and isinstance(self.selected_object, dict) and self.selected_object.get(
+                'is_music_object', False):
+            track_label = self.font_medium.render("Track:", True, self.colors['text'])
+            screen.blit(track_label, (self.palette_x + self.palette_padding, y_pos))
+
+            # ── Dropdown button ───────────────────────────────────────────────
+            btn_x = self.palette_x + self.palette_padding + 120
+            btn_rect = pygame.Rect(btn_x, y_pos - 3, 200, 25)
+            btn_bg = self.colors['input_active'] if self.music_dropdown_open else self.colors['input_bg']
+            pygame.draw.rect(screen, btn_bg, btn_rect)
+            pygame.draw.rect(screen,
+                             self.colors['accent'] if self.music_dropdown_open else self.colors['grid'],
+                             btn_rect, 2)
+
+            display_label = self.music_track_text if self.music_track_text else '<select track>'
+            label_surf = self.font_small.render(display_label, True, self.colors['text'])
+            label_clip = pygame.Rect(btn_rect.x + 4, btn_rect.y, btn_rect.w - 20, btn_rect.h)
+            screen.set_clip(label_clip)
+            screen.blit(label_surf, (btn_rect.x + 4, btn_rect.y + 6))
+            screen.set_clip(None)
+
+            arrow_x = btn_rect.right - 14
+            arrow_y = btn_rect.centery
+            arrow_pts = [(arrow_x, arrow_y - 4), (arrow_x + 8, arrow_y - 4), (arrow_x + 4, arrow_y + 4)]
+            pygame.draw.polygon(screen, self.colors['text_dim'], arrow_pts)
+
+            self.ui_rects['music_dropdown_btn'] = btn_rect
+
+            # ── Open dropdown list ────────────────────────────────────────────
+            if self.music_dropdown_open:
+                names = self.music_dropdown_names
+                item_h = 22
+
+                # Cap how many rows we show so the list can never run off the
+                # bottom of the screen — the rest is reached by scrolling.
+                max_rows_on_screen = max(1, (self.screen_height - btn_rect.bottom - 10) // item_h)
+                visible_rows = max(1, min(max_rows_on_screen, 8, len(names) or 1))
+                self._music_dropdown_visible_rows = visible_rows
+
+                max_scroll = max(0, len(names) - visible_rows)
+                self.music_dropdown_scroll = max(0, min(self.music_dropdown_scroll, max_scroll))
+                scroll = self.music_dropdown_scroll
+
+                list_h = max(item_h, min(len(names), visible_rows) * item_h)
+                list_rect = pygame.Rect(btn_rect.x, btn_rect.bottom, btn_rect.w, list_h)
+                self.ui_rects['music_dropdown_list_rect'] = list_rect
+
+                list_bg = pygame.Surface((list_rect.w, list_rect.h), pygame.SRCALPHA)
+                list_bg.fill((30, 30, 45, 240))
+                screen.blit(list_bg, list_rect.topleft)
+                pygame.draw.rect(screen, self.colors['accent'], list_rect, 1)
+
+                self.ui_rects['music_dropdown_items'] = []
+                self.ui_rects['music_dropdown_scroll_up'] = None
+                self.ui_rects['music_dropdown_scroll_down'] = None
+
+                if not names:
+                    empty_surf = self.font_small.render('<no tracks found>', True, self.colors['text_dark'])
+                    screen.blit(empty_surf, (list_rect.x + 4, list_rect.y + 4))
+                else:
+                    visible_names = names[scroll:scroll + visible_rows]
+                    for i, name in enumerate(visible_names):
+                        item_rect = pygame.Rect(list_rect.x, list_rect.y + i * item_h, list_rect.w, item_h)
+                        is_sel = name == self.music_track_text
+                        if is_sel:
+                            pygame.draw.rect(screen, self.colors['variant_selected'], item_rect)
+                        item_surf = self.font_small.render(name, True,
+                                                           self.colors['text'] if is_sel else self.colors['text_dim'])
+                        screen.blit(item_surf, (item_rect.x + 6, item_rect.y + 4))
+                        self.ui_rects['music_dropdown_items'].append((item_rect, name))
+
+                    # Scroll indicators — also act as click targets, and make it
+                    # obvious the list has more items than fit on screen.
+                    if scroll > 0:
+                        up_rect = pygame.Rect(list_rect.right - 18, list_rect.y + 2, 14, 12)
+                        pygame.draw.polygon(screen, self.colors['accent'], [
+                            (up_rect.centerx, up_rect.top),
+                            (up_rect.left, up_rect.bottom),
+                            (up_rect.right, up_rect.bottom),
+                        ])
+                        self.ui_rects['music_dropdown_scroll_up'] = up_rect
+                    if scroll + visible_rows < len(names):
+                        down_rect = pygame.Rect(list_rect.right - 18, list_rect.bottom - 14, 14, 12)
+                        pygame.draw.polygon(screen, self.colors['accent'], [
+                            (down_rect.left, down_rect.top),
+                            (down_rect.right, down_rect.top),
+                            (down_rect.centerx, down_rect.bottom),
+                        ])
+                        self.ui_rects['music_dropdown_scroll_down'] = down_rect
+
+            y_pos += 30
 
         instructions = [
             "Click: Select Object",

@@ -12,6 +12,7 @@ Main loop:      handle_events → update → draw → clock.tick(FPS)
 import sys
 import math
 import time
+import random
 
 # ── Game subsystems — import order follows dependency depth ────────────────────
 from attacks import Projectile
@@ -50,6 +51,7 @@ from ui.pause_menu import PauseMenu
 from dev_tools.room_editor.room_editor_tools.mission_manager import MissionManager
 from dev_tools.cutscene_editor import CutsceneEditor
 from dev_tools.world_map_editor import WorldMapEditor
+from dev_tools import character_creator
 
 
 # Tell Windows this process is DPI-aware so it reports the true screen resolution.
@@ -154,12 +156,14 @@ class Game:
         self.transition_config_menu = TransitionConfigMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.world_map_editor = WorldMapEditor(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.world_map_editor.room_manager = self.room_manager
+        self.character_creator = character_creator.CharacterCreator(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.cutscene_editor = CutsceneEditor(
             self.room_manager,
             self.room_editor,
             SCREEN_WIDTH,
             SCREEN_HEIGHT,
             dialogue_box=self.dialogue_box,
+            sound_manager=self.sound_manager,
         )
 
         # ── Active cutscene runtime ───────────────────────────────────────────
@@ -228,6 +232,7 @@ class Game:
         self.level_gates          = []
         self.flying_pads          = []
         self.world_map_objects = []
+        self.music_objects        = []   # room's placed Music object (0 or 1); invisible, sets BGM only
 
         # ── Performance caches ────────────────────────────────────────────────
         # key: (room_name, is_background) → pre-baked tile Surface
@@ -236,6 +241,12 @@ class Game:
         # key: font_size → pygame.Font  (avoids allocating a Font every frame)
         self._font_cache: dict = {}
         self._scaled_tile_cache: dict = {}
+        # Scrolling background (room.scrolling_bg): key: image filename → scaled Surface
+        self._bg_image_cache: dict = {}
+        # Per-room autonomous scroll offset accumulators, so each room's background
+        # keeps its own phase instead of resetting/jumping when you switch rooms.
+        # key: room_name → [offset_x, offset_y]
+        self._bg_scroll_accum: dict = {}
 
         # ── Save point system ─────────────────────────────────────────────────
         self.save_points           = []
@@ -243,6 +254,7 @@ class Game:
         self.save_point_menu       = SavePointMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.character_switch_menu = CharacterSwitchMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.pause_menu            = PauseMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.pause_menu.set_sound_engine(self.sound_engine)
         self.play_time             = 0.0   # total seconds spent in gameplay
         self.nearby_save_point     = None
         self.nearby_world_map_obj  = None   # WorldMapObject the player can currently interact with
@@ -274,6 +286,8 @@ class Game:
         oe.on_save_point_deleted       = self._on_save_point_deleted
         oe.on_cutscene_trigger_placed  = self._on_cutscene_trigger_placed
         oe.on_cutscene_trigger_deleted = self._on_cutscene_trigger_deleted
+        oe.on_music_placed             = self._on_music_placed
+        oe.on_music_deleted            = self._on_music_deleted
 
         # Tile-change hook is installed lazily in draw() once tileset_editor exists.
         self._tile_change_hook_installed = False
@@ -301,6 +315,7 @@ class Game:
         # ── Flying controller callbacks ───────────────────────────────────────
         self.flying_controller.on_room_transition = self._handle_flying_room_transition
         self.flying_controller.on_flight_complete = self._handle_flying_complete
+        self.flying_controller.set_sound_manager(self.sound_manager)
 
         # ── Transition / fade system ──────────────────────────────────────────
         self.transition_controller = TransitionController(SCREEN_WIDTH, SCREEN_HEIGHT)
@@ -449,6 +464,10 @@ class Game:
                 self.world_map_editor.handle_input(event)
                 continue
 
+            if self.character_creator.active:
+                self.character_creator.handle_input(event)
+                continue
+
             if self.room_editor.active:
                 result = self.room_editor.handle_input(event)
                 if result and result.startswith('test_room:'):
@@ -474,6 +493,9 @@ class Game:
                 elif result == 'open_world_map_editor':
                     self.dev_menu.active = False
                     self.world_map_editor.toggle()
+                elif result == 'open_character_creator':
+                    self.dev_menu.active = False
+                    self.character_creator.toggle()
                 continue
 
             # ── Normal gameplay input ─────────────────────────────────────────
@@ -534,10 +556,11 @@ class Game:
             self._handle_interact()
 
         elif event.key == pygame.K_TAB:
-            # Cycle through ki attack modes: blast → beam → transform → blast …
-            modes = ('blast', 'beam', 'transform')
-            idx = modes.index(self.player.ki_attack_mode) if self.player.ki_attack_mode in modes else 0
-            self.player.ki_attack_mode = modes[(idx + 1) % len(modes)]
+            # Cycle through only the modes this character is allowed to use.
+            modes = self._get_allowed_ki_modes()
+            if len(modes) > 1:
+                idx = modes.index(self.player.ki_attack_mode) if self.player.ki_attack_mode in modes else 0
+                self.player.ki_attack_mode = modes[(idx + 1) % len(modes)]
 
         elif event.key == pygame.K_x:
             # X triggers a transformation when the system is charged and ready.
@@ -598,11 +621,14 @@ class Game:
         if nearby_pad and len(nearby_pad.waypoints) > 0:
             self.flying_controller.start_flight(self.player, nearby_pad)
         else:
-            # Default: throw a melee punch.
+            # Default: throw a melee punch. Whether it plays melee1/melee2
+            # (hit) or melee_miss depends on whether it connects with
+            # anything — resolved once the swing ends, see the melee-attack
+            # cleanup loop in update().
             melee = self.player.melee_attack()
             if melee:
+                melee.hit_something = False
                 self.melee_attacks.append(melee)
-                self.sound_manager.play_sfx('punch')
 
     def _start_map_jump(self):
         """Kick off the world-map jump sequence for the player.
@@ -619,12 +645,19 @@ class Game:
         if getattr(self, '_active_world_map_name', None) != new_map_name:
             # Map changed — bust the texture cache so it re-renders from the new map.
             self._active_world_map_name = new_map_name
-            for attr in ('_world_map_texture', '_world_map_tex_arr', '_wm_locations'):
+            for attr in ('_world_map_texture', '_world_map_tex_arr', '_wm_locations',
+                         '_wm_entities', '_wm_vehicle_cache'):
                 if hasattr(self, attr):
                     delattr(self, attr)
         # Derive the current form so the sprite loader picks the right folder.
+        # Uses the path TransformationSystem already resolved (e.g.
+        # "base/transformations/ssj") rather than a hardcoded 'ssj', which
+        # would point at a non-existent folder now that transformation
+        # sprites live nested under the base costume.
         ts      = self.player.transformation
-        costume = 'ssj' if (ts and ts.is_transformed) else 'base'
+        costume = (ts.current_transform_costume
+                   if (ts and ts.is_transformed and ts.current_transform_costume)
+                   else 'base')
 
         # If the player's sprite isn't already on the right costume sheet, swap
         # it now so map_jump.png is loaded from the correct directory.
@@ -633,6 +666,12 @@ class Game:
             self.player.sprite  = create_character_sprite(
                 self.player.character, costume, 32, 32)
             self.player.costume = costume
+
+        # Capture the WMO reference NOW — nearby_world_map_obj will be cleared
+        # to None by _update_world_map_objects before _on_exit fires, because the
+        # player moves away from the object during the jump animation.
+        _captured_wmo = self.nearby_world_map_obj
+        self._mjf_origin_wmo = _captured_wmo   # also stored on self for the fast-path fade block
 
         def _on_exit():
             """Called when the player drifts fully off the top of the screen.
@@ -660,8 +699,14 @@ class Game:
             # ensures the correction fires even when the texture is already cached.
             self._mjf_needs_pin_correction = True
             # Record which room we came from so the draw path can reposition
-            # the camera to the matching location pin.
-            self._mjf_origin_room = self.current_room.name if self.current_room else ''
+            # the camera to the matching location pin (or entity position).
+            self._mjf_origin_room   = self.current_room.name if self.current_room else ''
+            # If the player entered this room via an entity collision, use that
+            # entity's name for the camera correction — regardless of which WMO
+            # they used to leave. _mjf_last_entry_entity is set at landing time
+            # when the entity name is definitively known.
+            self._mjf_origin_entity = getattr(self, '_mjf_last_entry_entity', '')
+            self._apply_world_map_music(new_map_name)
             if self._mjf_alpha >= 255.0:
                 self._mjf_state  = 'fade_in'
                 self._mjf_active = False
@@ -1121,6 +1166,14 @@ class Game:
             for obj in room.world_map_objects:
                 self.world_map_objects.append(WorldMapObject.from_dict(obj.to_dict()))
 
+        # Music object — copy so test mode doesn't mutate the editor original
+        self.music_objects = []
+        if hasattr(room, 'music_objects') and room.music_objects:
+            from objects.music_object import MusicObject
+            for obj in room.music_objects:
+                self.music_objects.append(MusicObject.from_dict(obj.to_dict()))
+        self._apply_room_music(room)
+
         # Entities (enemies and NPCs)
         self.enemies = []
         self.npcs    = []
@@ -1136,6 +1189,13 @@ class Game:
         """Restore all rooms to their pre-test state and clear test entities."""
         if not self.is_test_mode or not self.test_room_backup:
             return
+
+        # Whatever music the test room started (via its Music object, a
+        # cutscene's play_music action, etc.) otherwise just keeps playing
+        # forever — nothing re-applies a context/room track on exiting test
+        # mode. Cut it instantly here so dropping back into the room editor
+        # is silent right away, with no fade-out lag.
+        self.sound_manager.stop_music(fade_out=False)
 
         for room_name, backup in self.test_room_backup.items():
             room = self.room_manager.get_room_by_name(room_name)
@@ -1239,6 +1299,8 @@ class Game:
         self.room_transitions    = room.room_transitions[:]    if hasattr(room, 'room_transitions')    and room.room_transitions    else []
         self.save_points         = room.save_points[:]         if hasattr(room, 'save_points')         and room.save_points         else []
         self.world_map_objects   = room.world_map_objects[:]   if hasattr(room, 'world_map_objects')   and room.world_map_objects   else []
+        self.music_objects       = room.music_objects[:]       if hasattr(room, 'music_objects')       and room.music_objects       else []
+        self._apply_room_music(room)
 
 
         # Spawn entities.
@@ -1536,15 +1598,101 @@ class Game:
         if room:
             self.room_manager.save_room(room)
 
+    def _on_music_placed(self, music_obj, room_name):
+        """Sync game list when a Music object is placed in the editor, and
+        persist so the track choice isn't lost. If it was placed in the room
+        currently being viewed/tested, apply it immediately."""
+        if not self.is_test_mode and self.current_room and self.current_room.name == room_name:
+            self.music_objects = [music_obj]
+            self._apply_room_music(self.current_room)
+
+        room = self.room_manager.get_room_by_name(room_name)
+        if room:
+            self.room_manager.save_room(room)
+
+    def _on_music_deleted(self, music_obj, room_name):
+        """Sync game list when a Music object is removed in the editor.
+
+        Per design, removing the room's Music object does NOT stop or change
+        whatever is currently playing — it just means this room no longer
+        specifies a track for future room entries.
+        """
+        if not self.is_test_mode and self.current_room and self.current_room.name == room_name:
+            if music_obj in self.music_objects:
+                self.music_objects.remove(music_obj)
+
+        room = self.room_manager.get_room_by_name(room_name)
+        if room:
+            self.room_manager.save_room(room)
+
+    def _apply_room_music(self, room):
+        """Apply the given room's Music object, if any, to the currently playing track.
+
+        Design rule: if the room has no Music object placed, do nothing —
+        whatever track is already playing keeps playing uninterrupted.
+        """
+        if not room:
+            return
+
+        music_objs = getattr(room, 'music_objects', None)
+        if not music_objs:
+            return  # No Music object placed — keep whatever is already playing
+
+        track = music_objs[0].track
+        if not track:
+            return  # Music object placed but no track chosen yet — leave music as-is
+
+        if track == self.sound_engine.current_music:
+            return  # Already playing this track — avoid restarting it on every room entry
+
+        self.sound_manager.play_music(track)
+
+    def _apply_world_map_music(self, map_name):
+        """Apply the given world map's music track, if any, to the currently
+        playing track. Mirrors _apply_room_music's behavior/design rule: if the
+        map has no track set (or the JSON can't be read), do nothing and leave
+        whatever is already playing alone.
+
+        The 'music' field is written by the world map editor's Mode7 Music
+        dropdown (see WorldMap.to_dict in dev_tools/world_map_editor.py) and
+        stores a track stem, ready to hand straight to play_music().
+        """
+        if not map_name:
+            return
+
+        import json as _json
+        import os as _os
+
+        path = _os.path.join('assets', 'world_maps', f'{map_name}.json')
+        try:
+            with open(path) as f:
+                data = _json.load(f)
+        except Exception:
+            return  # No saved map data yet — leave music as-is
+
+        track = data.get('music', '')
+        if not track:
+            return  # No track set for this map — keep whatever is already playing
+
+        if track == self.sound_engine.current_music:
+            return  # Already playing this track — avoid restarting it on re-entry
+
+        self.sound_manager.play_music(track)
+
     def _sync_player_from_cutscene(self, runtime):
-        """After a cutscene ends, move the player to the final position and
-        direction of the actor that shares the same character as the current player.
+        """After a cutscene ends, move the player to the final position,
+        direction, and character of the actor that shares the same
+        character as the current player.
 
         Matching priority:
           1. type == 'player'  AND  character == self.player.character  (exact match)
           2. type == 'player'  with no 'character' field set            (untagged fallback)
         The first exact match wins; if none is found, the first untagged player
         actor is used so cutscenes that don't specify a character still work.
+
+        If a `set_character` action changed the actor's character mid-cutscene,
+        that change is mirrored onto the real player here so transformations
+        performed during playback persist afterwards instead of reverting.
         """
         player_character = getattr(self.player, 'character', None)
         exact_match    = None   # actor_def with matching character field
@@ -1574,15 +1722,28 @@ class Game:
 
             # Mirror the actor's final facing direction onto the real player so
             # they don't snap back to their pre-cutscene direction on resume.
-            final_direction = getattr(entity, 'direction', None)
-            if final_direction:
-                self.player.direction = final_direction
-                # Also push the direction into the sprite so the idle frame shown
-                # immediately after the cutscene matches the new direction.
-                if hasattr(self.player, 'sprite') and self.player.sprite:
-                    current_anim = getattr(self.player, 'current_animation_state', 'idle')
-                    if hasattr(self.player.sprite, 'set_animation'):
-                        self.player.sprite.set_animation(current_anim, final_direction)
+            final_direction = getattr(entity, 'direction', None) or self.player.direction
+            self.player.direction = final_direction
+
+            # Mirror any character change made via a `set_character` cutscene
+            # action onto the real player. The cutscene actor is a throwaway
+            # entity created by the editor's entity_factory, so without this
+            # the transformation only ever existed on that temp object and
+            # the player would snap back to their pre-cutscene character the
+            # moment playback ends.
+            final_character = getattr(entity, 'character', None)
+            if final_character and final_character != player_character:
+                # Reuse the same swap helper as the in-game character-switch
+                # menu so the transformation comes with correctly-updated
+                # equipped attacks / ki mode, not just a cosmetic sprite swap.
+                self._switch_character(final_character)
+            elif hasattr(self.player, 'sprite') and self.player.sprite:
+                # No character change — just push the final facing into the
+                # existing sprite so the idle frame shown immediately after
+                # the cutscene matches the new direction.
+                current_anim = getattr(self.player, 'current_animation_state', 'idle')
+                if hasattr(self.player.sprite, 'set_animation'):
+                    self.player.sprite.set_animation(current_anim, final_direction)
 
     def _update_cutscene_triggers(self, dt):
         """Tick the active cutscene runtime, or check for new trigger fires.
@@ -1613,6 +1774,7 @@ class Game:
                         self.camera,
                         self.cutscene_editor._entity_factory,
                         dialogue_box=self.dialogue_box,
+                        sound_manager=self.sound_manager,
                     )
 
                     # Wire up the change_room callback. The runtime declares
@@ -1649,32 +1811,43 @@ class Game:
                     for _adef in data.get('actors', []):
                         if _adef.get('type') != 'player':
                             continue
+
+                        _live = self.active_cutscene_runtime.actors.get(_adef['id'])
+                        if not (_live and hasattr(_live, 'entity')):
+                            continue
+
+                        # Position/direction sync is unconditional: wherever you stood and
+                        # whichever way you faced in the room carries into the cutscene,
+                        # regardless of what character this actor is scripted to become.
+                        _live.entity.x = self.player.x
+                        _live.entity.y = self.player.y
+                        _live.entity.direction = self.player.direction
+                        _live.set_animation(
+                            getattr(self.player, 'current_animation_state', 'idle'),
+                            self.player.direction,
+                        )
+                        if _live._tween is not None:
+                            _live._tween.start_x = self.player.x
+                            _live._tween.start_y = self.player.y
+
+                        # Character/transformation overrides stay gated on the match —
+                        # don't force the player's real character onto an actor that's
+                        # deliberately authored to start as someone else.
                         _ac = _adef.get('character')
                         if _ac is not None and _ac != _pc:
-                            continue
-                        _live = self.active_cutscene_runtime.actors.get(_adef['id'])
-                        if _live and hasattr(_live, 'entity'):
-                            _live.entity.x = self.player.x
-                            _live.entity.y = self.player.y
-                            # Also fix the tween's baked start position so it
-                            # smoothly moves FROM the real player position.
-                            if _live._tween is not None:
-                                _live._tween.start_x = self.player.x
-                                _live._tween.start_y = self.player.y
-                            # Bug fix: _entity_factory always creates the actor with
-                            # costume='base'. If the real player is transformed, swap
-                            # the actor's sprite to the SSJ sheet so the cutscene
-                            # doesn't look like an untransform the moment it starts.
-                            _ts = self.player.transformation
-                            if _ts and _ts.is_transformed:
-                                from core.sprite_system import create_character_sprite
-                                _char = getattr(self.player, 'character', 'goku')
-                                _live.entity.sprite = create_character_sprite(
-                                    _char, 'ssj', 32, 32)
-                                _live.entity.sprite.set_animation(
-                                    getattr(self.player, 'current_animation_state', 'idle'),
-                                    _live.entity.direction,
-                                )
+                            break
+                        if _pc:
+                            _live.entity.character = _pc
+
+                        _ts = self.player.transformation
+                        if _ts and _ts.is_transformed:
+                            from core.sprite_system import create_character_sprite
+                            _char = getattr(self.player, 'character', 'goku')
+                            _live.entity.sprite = create_character_sprite(_char, 'ssj', 32, 32)
+                            _live.entity.sprite.set_animation(
+                                getattr(self.player, 'current_animation_state', 'idle'),
+                                _live.entity.direction,
+                            )
                         break
 
                     # Snapshot the player's full transformation state so that
@@ -1741,24 +1914,24 @@ class Game:
             if self.dialogue_box:
                 self.dialogue_box.update(dt)
             if self.active_cutscene_runtime.finished:
+                _char_before = getattr(self.player, 'character', None)
                 self._sync_player_from_cutscene(self.active_cutscene_runtime)
-                # Restore the transformation state that was snapshotted at cutscene
-                # start. This undoes any side-effects from player.update() running
-                # during the cutscene (e.g. completing an in-progress untransform).
+                _char_after = getattr(self.player, 'character', None)
+                _char_changed = _char_before != _char_after
+
                 snap = getattr(self, '_pre_cutscene_transform', None)
                 if snap and self.player.transformation:
                     _ts = self.player.transformation
-                    _ts.is_transformed    = snap['is_transformed']
-                    _ts.is_transforming   = snap['is_transforming']
+                    _ts.is_transformed = snap['is_transformed']
+                    _ts.is_transforming = snap['is_transforming']
                     _ts.is_untransforming = snap['is_untransforming']
-                    _ts.transformed_ki    = snap['transformed_ki']
-                    self.player.sprite    = snap['sprite']
-                    self.player.current_animation_state = snap['anim_state']
-                    # Re-sync the sprite to the restored animation state so the
-                    # first frame after the cutscene looks correct.
-                    if hasattr(self.player.sprite, 'set_animation'):
-                        self.player.sprite.set_animation(
-                            snap['anim_state'], self.player.direction)
+                    _ts.transformed_ki = snap['transformed_ki']
+                    if not _char_changed:  # don't clobber the sprite _switch_character just set
+                        self.player.sprite = snap['sprite']
+                        self.player.current_animation_state = snap['anim_state']
+                        if hasattr(self.player.sprite, 'set_animation'):
+                            self.player.sprite.set_animation(
+                                snap['anim_state'], self.player.direction)
                 self._pre_cutscene_transform       = None
                 self.active_cutscene_runtime       = None
                 self.sprite_hud._hud_slide_out     = False
@@ -1847,6 +2020,71 @@ class Game:
         surface.blit(self._mjf_surf, (0, 0))
 
     # ── World-map flying helpers ──────────────────────────────────────────────
+
+    def _wm_entity_tile_pos(self, entity_name: str):
+        """Return the current (tile_x, tile_y) of the named world-map entity.
+        Uses the EXACT same path-interpolation logic as the draw loop's _wm_ent_pos
+        nested function so the position always matches what is shown on screen.
+        """
+        import math as _m, os as _o, json as _j
+
+        entities = getattr(self, '_wm_entities', None)
+        if not entities:
+            _map = getattr(self, '_active_world_map_name', '')
+            if not _map:
+                return None
+            try:
+                with open(_o.path.join('assets', 'world_maps', f'{_map}.json')) as _f:
+                    self._wm_entities = _j.load(_f).get('entities', [])
+                entities = self._wm_entities
+            except Exception:
+                return None
+
+        ent = next((e for e in entities if e.get('name', '') == entity_name), None)
+        if ent is None:
+            return None
+
+        path   = ent.get('path', [])
+        closed = ent.get('closed', False)
+        t      = getattr(self, '_wm_entity_anim_t', 0.0)
+
+        if not path:
+            return None
+        if len(path) == 1:
+            return float(path[0][0]), float(path[0][1])
+
+        # Mirror the draw loop exactly: close the loop by appending path[0]
+        pts = list(path)
+        if closed:
+            pts.append(path[0])
+
+        segs, total = [], 0.0
+        for _i in range(len(pts) - 1):
+            _d = _m.hypot(pts[_i+1][0] - pts[_i][0], pts[_i+1][1] - pts[_i][1])
+            segs.append(_d)
+            total += _d
+
+        if total == 0.0:
+            return float(path[0][0]), float(path[0][1])
+
+        _SPEED = 2.5   # must match _wm_ent_pos in the draw loop
+        if closed:
+            dist = (t * _SPEED) % total
+        else:
+            cycle = total * 2.0
+            phase = (t * _SPEED) % cycle
+            dist  = phase if phase <= total else cycle - phase
+
+        walked = 0.0
+        for _i, _sl in enumerate(segs):
+            if walked + _sl >= dist or _i == len(segs) - 1:
+                frac = ((dist - walked) / _sl) if _sl > 0 else 0.0
+                frac = max(0.0, min(1.0, frac))
+                return (pts[_i][0] + frac * (pts[_i+1][0] - pts[_i][0]),
+                        pts[_i][1] + frac * (pts[_i+1][1] - pts[_i][1]))
+            walked += _sl
+
+        return float(path[-1][0]), float(path[-1][1])
 
     def _load_map_fly_sprite(self):
         """Load the character-specific flying sprite for the world-map sequence.
@@ -2019,13 +2257,31 @@ class Game:
             up    = keys[pygame.K_UP]
             down  = keys[pygame.K_DOWN]
 
-            # Up/down changes the sprite row; left/right only rotates the map.
-            if up:
+            # Direction determines sprite row:
+            # up/down = forward/backward, left/right = banking turn.
+            # Left/right alone inherits the last vertical direction:
+            #   previously going up   -> up_left / up_right
+            #   previously going down -> down_left / down_right
+            _cur_dir = getattr(self, '_mjf_fly_direction', 'up')
+            _going_down = _cur_dir in ('down', 'down_left', 'down_right')
+            if up and left:
+                new_dir = 'up_left'
+            elif up and right:
+                new_dir = 'up_right'
+            elif down and left:
+                new_dir = 'down_left'
+            elif down and right:
+                new_dir = 'down_right'
+            elif up:
                 new_dir = 'up'
             elif down:
                 new_dir = 'down'
+            elif left:
+                new_dir = 'down_left' if _going_down else 'up_left'
+            elif right:
+                new_dir = 'down_right' if _going_down else 'up_right'
             else:
-                new_dir = getattr(self, '_mjf_fly_direction', 'up')
+                new_dir = _cur_dir
 
             # Screen-space sprite stays fixed — the map plane rotates/moves under it.
             # (No changes to _mjf_fly_x / _mjf_fly_y here.)
@@ -2209,8 +2465,11 @@ class Game:
                 _py = (self._mjf_cam_y - _math.cos(_angle) * _pdepth) % _th
                 for _li_wx, _li_wy, _li_loc in _pending_icons:
                     # Altitude check: player must be within _LAND_ALT_RANGE of
-                    # the icon's altitude (default 0.0 = ground level).
-                    _icon_alt = _li_loc.get('altitude', 0.0)
+                    # the icon's altitude. Derive from the editor 'height' field
+                    # (0-500 = ground to high) mapped to the 0.0-1.0 altitude range,
+                    # falling back to an explicit 'altitude' key if set directly.
+                    _icon_alt = _li_loc.get('altitude',
+                                            max(0.0, _li_loc.get('height', 0) / 2000.0))
                     if abs(_alt - _icon_alt) > _LAND_ALT_RANGE:
                         continue
                     _ddx = (_li_wx - _px) % _tw
@@ -2224,6 +2483,12 @@ class Game:
                         # Player loses control; fade to black then transition.
                         self._mjf_landing_room = _li_loc['room']
                         self._mjf_landing_loc  = _li_loc
+                        # Remember which entity (if any) brought the player here.
+                        # This persists in the room so the return WMO jump can
+                        # position the camera at the entity's new position.
+                        # Clear it explicitly for non-entity pins so stale names
+                        # from a previous visit don't bleed through.
+                        self._mjf_last_entry_entity = _li_loc.get('_entity_name', '')
                         self._mjf_alpha        = 0.0
                         self._mjf_state        = 'landing_fade_out'
                         # Hide the HUD immediately so it is not visible during
@@ -2251,17 +2516,32 @@ class Game:
                     else:
                         self._load_room_objects(_target_room)
                     # Place player at the WorldMapObject in the target room.
+                    # If the landing was triggered by a named entity (not a fixed
+                    # location pin), prefer the WMO whose entity_name matches.
+                    # Fall back to the first generic 'world_map' WMO, then room centre.
                     _spawn_x = _target_room.width  / 2
                     _spawn_y = _target_room.height / 2
+                    _landing_loc  = getattr(self, '_mjf_landing_loc', {})
+                    _landing_ent  = _landing_loc.get('_entity_name', '') if _landing_loc else ''
+                    _best_wmo     = None
+                    _fallback_wmo = None
                     for _wmo in self.world_map_objects:
-                        if getattr(_wmo, 'variant', '') == 'world_map':
-                            _spawn_x = _wmo.x
-                            # player.y is the CENTRE of the sprite frame, but the
-                            # visible character sits in the upper half of the frame.
-                            # Offsetting by half the player height aligns the visual
-                            # character with the centre of the WMO.
-                            _spawn_y = _wmo.y - self.player.height // 2
-                            break
+                        if getattr(_wmo, 'variant', '') != 'world_map':
+                            continue
+                        _ename = getattr(_wmo, 'entity_name', '')
+                        if _landing_ent and _ename == _landing_ent:
+                            _best_wmo = _wmo
+                            break                   # exact match — stop searching
+                        if _fallback_wmo is None:
+                            _fallback_wmo = _wmo    # remember first generic WMO
+                    _chosen_wmo = _best_wmo or _fallback_wmo
+                    if _chosen_wmo:
+                        _spawn_x = _chosen_wmo.x
+                        # player.y is the CENTRE of the sprite frame, but the
+                        # visible character sits in the upper half of the frame.
+                        # Offsetting by half the player height aligns the visual
+                        # character with the centre of the WMO.
+                        _spawn_y = _chosen_wmo.y - self.player.height // 2
                     self.player.x = _spawn_x
                     self.player.y = _spawn_y
                     # Set camera centred on spawn, clamped to room bounds.
@@ -2550,8 +2830,10 @@ class Game:
         # (so the corrected cam_x/cam_y are used on this very frame).
         if getattr(self, '_mjf_needs_pin_correction', False) and texture:
             import math as _pin_math
-            _origin_room = getattr(self, '_mjf_origin_room', '')
-            _active_map  = getattr(self, '_active_world_map_name', '')
+            _origin_room   = getattr(self, '_mjf_origin_room',   '')
+            _origin_entity = getattr(self, '_mjf_origin_entity', '')
+            print(f'[pin_correction] origin_room={_origin_room!r}  origin_entity={_origin_entity!r}  anim_t={getattr(self,"_wm_entity_anim_t",None):.2f}')
+            _active_map    = getattr(self, '_active_world_map_name', '')
             _locs = getattr(self, '_wm_locations', None)
             if _locs is None and _active_map:
                 import json as _jl, os as _osl
@@ -2564,34 +2846,47 @@ class Game:
                     _locs = []
             _ppt_x = texture.get_width()  / 362
             _ppt_y = texture.get_height() / 263
-            for _loc in (_locs or []):
-                if _loc.get('room', '') == _origin_room:
-                    # Compute the depth at the shadow's screen row so we can
-                    # offset the camera backward from the pin.  Without this
-                    # offset the camera sits ON the pin and the player shadow
-                    # projects past it, appearing on the wrong side of the map.
-                    _alt     = getattr(self, '_mjf_altitude', 0.5)
-                    _base_f  = getattr(self, '_MJF_FOCAL', sw // 8)
-                    _FOCAL_p = int(_base_f * (0.3 + 1.9 * _alt))
-                    _PROJ_p  = int(sh * 0.20)           # PROJECTION_HORIZON
-                    _vgh_p   = sh - _PROJ_p
-                    _sky_hp  = int(sh * 0.35)
-                    _hor_yp  = int(sh * (0.30 - 0.20 * _alt))
-                    _shad_yp = int(_sky_hp + (sh - _sky_hp) * 0.32)
-                    _row_p   = max(_shad_yp - _hor_yp + 2, 1)
-                    _dep_p   = _FOCAL_p * _vgh_p / _row_p
-                    # _load_map_fly_sprite always resets cam_angle to 0.0
-                    _ang     = self._mjf_cam_angle
-                    _pin_x   = _loc['x'] * _ppt_x
-                    _pin_y   = _loc['y'] * _ppt_y
-                    # Position camera so shadow == pin in world space:
-                    #   shadow_world = (cam_x + sin(a)*d,  cam_y - cos(a)*d)
-                    #   => cam = (pin_x - sin(a)*d,  pin_y + cos(a)*d)
-                    self._mjf_cam_x = (_pin_x - _pin_math.sin(_ang) * _dep_p) % texture.get_width()
-                    self._mjf_cam_y = (_pin_y + _pin_math.cos(_ang) * _dep_p) % texture.get_height()
-                    break
+
+            # Compute depth/angle constants used for the spawn-margin offset
+            _alt     = getattr(self, '_mjf_altitude', 0.5)
+            _base_f  = getattr(self, '_MJF_FOCAL', sw // 8)
+            _FOCAL_p = int(_base_f * (0.3 + 1.9 * _alt))
+            _PROJ_p  = int(sh * 0.20)
+            _vgh_p   = sh - _PROJ_p
+            _sky_hp  = int(sh * 0.35)
+            _hor_yp  = int(sh * (0.30 - 0.20 * _alt))
+            _shad_yp = int(_sky_hp + (sh - _sky_hp) * 0.32)
+            _row_p   = max(_shad_yp - _hor_yp + 2, 1)
+            _dep_p   = _FOCAL_p * _vgh_p / _row_p
+            _ang     = self._mjf_cam_angle
+            _SPAWN_MARGIN = 40
+
+            _pin_found = False
+
+            # Priority 1: if we came from an entity room, use the entity's
+            # current animated tile position — it keeps moving while in the room.
+            if _origin_entity:
+                _etile = self._wm_entity_tile_pos(_origin_entity)
+                if _etile is not None:
+                    _pin_x = _etile[0] * _ppt_x
+                    _pin_y = _etile[1] * _ppt_y
+                    self._mjf_cam_x = (_pin_x - _pin_math.sin(_ang) * (_dep_p + _SPAWN_MARGIN)) % texture.get_width()
+                    self._mjf_cam_y = (_pin_y + _pin_math.cos(_ang) * (_dep_p + _SPAWN_MARGIN)) % texture.get_height()
+                    _pin_found = True
+
+            # Priority 2: fall back to matching a location pin by room name
+            if not _pin_found:
+                for _loc in (_locs or []):
+                    if _loc.get('room', '') == _origin_room:
+                        _pin_x = _loc['x'] * _ppt_x
+                        _pin_y = _loc['y'] * _ppt_y
+                        self._mjf_cam_x = (_pin_x - _pin_math.sin(_ang) * (_dep_p + _SPAWN_MARGIN)) % texture.get_width()
+                        self._mjf_cam_y = (_pin_y + _pin_math.cos(_ang) * (_dep_p + _SPAWN_MARGIN)) % texture.get_height()
+                        break
+
             self._mjf_needs_pin_correction = False
-            self._mjf_origin_room = ''
+            self._mjf_origin_room          = ''
+            self._mjf_origin_entity        = ''
 
         base_focal = getattr(self, '_MJF_FOCAL', sw // 8)
 
@@ -2775,8 +3070,10 @@ class Game:
             # Pixel-measured from Buu's Fury reference: the sprite barely moves
             # vertically on screen. Altitude is communicated through scale and
             # horizon height — NOT by the sprite sweeping up and down.
-            # sprite_cy = sky_h * (0.70 at max alt  →  0.84 at ground level)
-            sprite_y = sky_h * (0.48 + 0.63 * (1.0 - altitude))
+            # sprite_cy = sky_h * (0.30 at max alt  ->  0.93 at ground level)
+            # Lowered the base from 0.48 -> 0.30 so the icon rises higher
+            # on-screen as altitude increases (was capped near the midpoint).
+            sprite_y = sky_h * (0.30 + 0.63 * (1.0 - altitude))
 
             # Shadow — now after sprite_y is known
             shadow_x = int(self._mjf_fly_x)
@@ -2977,8 +3274,29 @@ class Game:
                                             f'{_active_map}.json')) as _f:
                         _ld = _json.load(_f)
                     self._wm_locations = _ld.get('locations', [])
+                    # Load entities from the same file (avoid a second open)
+                    if not hasattr(self, '_wm_entities'):
+                        self._wm_entities = _ld.get('entities', [])
                 except Exception:
                     pass
+
+        # Load entity list once (in case locations were already loaded without them)
+        if not hasattr(self, '_wm_entities'):
+            self._wm_entities = []
+            _active_map2 = getattr(self, '_active_world_map_name', '')
+            if _active_map2:
+                import json as _json2, os as _os2
+                try:
+                    with open(_os2.path.join('assets', 'world_maps',
+                                             f'{_active_map2}.json')) as _f2:
+                        self._wm_entities = _json2.load(_f2).get('entities', [])
+                except Exception:
+                    pass
+
+        # Vehicle sprite cache and animation timer
+        if not hasattr(self, '_wm_vehicle_cache'):
+            self._wm_vehicle_cache: dict = {}
+        # _wm_entity_anim_t is advanced in update() every frame.
 
         # Project and collect each location marker (deferred draw for depth sort)
         _icon_draw_list = []         # list of (depth, surf, rect)
@@ -3033,6 +3351,20 @@ class Game:
                 _near_depth = base_focal * virtual_ground_h / max(1, sh - horizon_y)
                 _persp = max(0.1, min(2.5, _near_depth / _depth))
 
+                # Apply the location's height as a perspective-scaled vertical offset.
+                # height > 0 raises the icon above the ground plane; < 0 lowers it.
+                # Cap the persp used here at 1.0 so the offset stays stable as the
+                # player flies close — without the cap, growing _persp at short range
+                # would shoot the icon above the skyline and trigger the cull early.
+                # Save the ground-plane y before the offset so culling is always
+                # based on where the tile sits on the map, not where the icon floats.
+                _loc_height = _loc.get('height', 0)
+                _ground_screen_y = _screen_y   # unmodified ground-plane hit
+                if _loc_height:
+                    _height_persp = min(1.0, max(0.5, _persp))
+                    _screen_y -= int(_loc_height * _height_persp * 0.5)
+                    _screen_y = max(int(horizon_y) + 4, _screen_y)
+
                 _icon_stem = _loc.get('icon', '')
                 if _icon_stem:
                     if _icon_stem not in self._wm_icon_cache:
@@ -3048,8 +3380,210 @@ class Game:
                         _isz = max(2, int(100 * RENDER_SCALE * _persp))  # ← change 50 to resize icons
                         _icon_surf = pygame.transform.scale(_icon_raw, (_isz, _isz))
                         _icon_rect = _icon_surf.get_rect(midbottom=(_screen_x, _screen_y))
-                        if (0 <= _screen_x < sw) and (sky_h < _screen_y < sh):
+                        # Cull on the ground-plane position (_ground_screen_y), not
+                        # the visually-shifted _screen_y.  This means an icon whose
+                        # tile is behind the horizon correctly hides (ground y <= sky_h),
+                        # while an icon whose tile is in front stays visible even if
+                        # the height offset pushed the sprite above sky_h.
+                        if (0 <= _screen_x < sw) and (_ground_screen_y > sky_h) and (_icon_rect.top < sh):
                             _icon_draw_list.append((_depth, _icon_surf, _icon_rect))
+
+        # ── World-map entity vehicles ─────────────────────────────────────────
+        # Each entity follows a path defined in the editor.  We project its
+        # current position with the same perspective math as location icons and
+        # insert it into the depth-sorted draw list so painter's algorithm handles
+        # occlusion correctly.
+        import math as _mve
+
+        def _wm_ent_pos(ent, t):
+            """Return (tile_x, tile_y) float for entity *ent* at time *t* seconds."""
+            path = ent.get('path', [])
+            if not path:
+                return None
+            if len(path) == 1:
+                return float(path[0][0]), float(path[0][1])
+            closed = ent.get('closed', False)
+            pts = list(path)
+            if closed:
+                pts.append(path[0])
+            segs, total = [], 0.0
+            for _i in range(len(pts) - 1):
+                _d = _mve.hypot(pts[_i+1][0] - pts[_i][0], pts[_i+1][1] - pts[_i][1])
+                segs.append(_d); total += _d
+            if total == 0.0:
+                return float(path[0][0]), float(path[0][1])
+            _SPEED = 2.5
+            if closed:
+                dist = (t * _SPEED) % total
+            else:
+                cycle = total * 2.0
+                phase = (t * _SPEED) % cycle
+                dist  = phase if phase <= total else cycle - phase
+            walked = 0.0
+            for _i, _sl in enumerate(segs):
+                if walked + _sl >= dist or _i == len(segs) - 1:
+                    frac = ((dist - walked) / _sl) if _sl > 0 else 0.0
+                    frac = max(0.0, min(1.0, frac))
+                    return (pts[_i][0] + frac * (pts[_i+1][0] - pts[_i][0]),
+                            pts[_i][1] + frac * (pts[_i+1][1] - pts[_i][1]))
+                walked += _sl
+            return float(path[-1][0]), float(path[-1][1])
+
+        # ── Entity collision entries ───────────────────────────────────────────
+        # Entities with a linked room use the same collision loop as location icons.
+        # We append them here, after _wm_ent_pos is defined, using the entity's
+        # current animated world position so the trigger zone moves with the entity.
+        if texture and self._wm_entities:
+            _cent_ppt_x = tw / 362
+            _cent_ppt_y = th / 263
+            for _cent in self._wm_entities:
+                if not _cent.get('room', ''):
+                    continue
+                _cepos = _wm_ent_pos(_cent, self._wm_entity_anim_t)
+                if _cepos is None:
+                    continue
+                _ce_wx = _cepos[0] * _cent_ppt_x
+                _ce_wy = _cepos[1] * _cent_ppt_y
+                _cent_loc = {
+                    'room':         _cent['room'],
+                    'name':         _cent.get('name', ''),
+                    'height':       _cent.get('height', 0),
+                    'x':            _cepos[0], 'y': _cepos[1],
+                    '_entity_name': _cent.get('name', ''),  # used by landing to pick correct WMO
+                }
+                _icon_screen_positions.append((_ce_wx, _ce_wy, _cent_loc))
+
+        def _wm_dir_row(dx, dy, num_dirs):
+            """Map movement vector to spritesheet row (frames right, dirs top-to-bottom)."""
+            if num_dirs <= 1:
+                return 0
+            _a = (_mve.atan2(dy, dx) + _mve.pi * 2) % (_mve.pi * 2)
+            if num_dirs >= 8:
+                _sec = int((_a + _mve.pi / 8) / (_mve.pi / 4)) % 8
+                return {0: 2, 1: 7, 2: 0, 3: 4, 4: 1, 5: 5, 6: 3, 7: 6}.get(_sec, 0)
+            else:
+                _sec = int((_a + _mve.pi / 4) / (_mve.pi / 2)) % 4
+                return {0: 2, 1: 0, 2: 1, 3: 3}.get(_sec, 0)  # E→right S→down W→left N→up
+
+        def _wm_load_vehicle(stem):
+            """Load and cache a vehicle spritesheet, returning a frames dict."""
+            if stem in self._wm_vehicle_cache:
+                return self._wm_vehicle_cache[stem]
+            import os as _osv
+            _path = _osv.path.join('assets', 'map', 'vehicle', stem + '.png')
+            try:
+                _sh = pygame.image.load(_path).convert_alpha()
+                _sw2, _sh2 = _sh.get_size()
+                _fh    = 32
+                _ndirs = max(1, _sh2 // _fh)
+                _fw    = 32 if (_sw2 % 32 == 0) else 64
+                _nf    = max(1, _sw2 // _fw)
+                _fbr   = {}
+                for _r in range(_ndirs):
+                    _fbr[_r] = [
+                        _sh.subsurface(pygame.Rect(_f * _fw, _r * _fh, _fw, _fh)).copy()
+                        for _f in range(_nf)
+                    ]
+                entry = {'frames_by_row': _fbr, 'num_dirs': _ndirs,
+                         'num_frames': _nf, 'frame_w': _fw, 'frame_h': _fh}
+                self._wm_vehicle_cache[stem] = entry
+                return entry
+            except Exception as _ev:
+                print(f'[world_map] could not load vehicle {stem}: {_ev}')
+                self._wm_vehicle_cache[stem] = None
+                return None
+
+        _ANIM_FPS  = 4.0
+        _ent_fidx  = int(self._wm_entity_anim_t * _ANIM_FPS)
+
+        if texture and self._wm_entities:
+            _MAP_TILE_W_E = 362;  _MAP_TILE_H_E = 263
+            _ppt_xe = tw / _MAP_TILE_W_E
+            _ppt_ye = th / _MAP_TILE_H_E
+            _vgh_e  = sh - PROJECTION_HORIZON
+
+            for _ent in self._wm_entities:
+                if not _ent.get('path'):
+                    continue
+                _epos = _wm_ent_pos(_ent, self._wm_entity_anim_t)
+                if _epos is None:
+                    continue
+                _epx, _epy = _epos
+
+                # Movement direction (sample slightly ahead for dir row)
+                _epos2 = _wm_ent_pos(_ent, self._wm_entity_anim_t + 0.15)
+                if _epos2 and _epos2 != _epos:
+                    _emx, _emy = _epos2[0] - _epx, _epos2[1] - _epy
+                else:
+                    _p = _ent.get('path', [])
+                    _emx, _emy = ((_p[1][0]-_p[0][0], _p[1][1]-_p[0][1]) if len(_p)>=2 else (0, 1))
+
+                # World → texture pixel coords
+                _ewx = _epx * _ppt_xe
+                _ewy = _epy * _ppt_ye
+
+                # Project (identical to location-icon projection above)
+                _edx = (_ewx - cam_x) % tw
+                if _edx > tw * 0.5: _edx -= tw
+                _edy = (_ewy - cam_y) % th
+                if _edy > th * 0.5: _edy -= th
+
+                _edepth = _edx * sin_a - _edy * cos_a
+                if _edepth <= 1:
+                    continue
+
+                _ecol      = (_edx * cos_a + _edy * sin_a) / _edepth
+                _erows_f   = FOCAL * _vgh_e / _edepth
+                _escreen_x = int(sw * 0.5 + _ecol * sw)
+                _erow_off  = max(0, int(_erows_f) - HORIZON_OFFSET)
+                _et_curve  = 1.0 - (_erow_off / max(1, effective_ground - 1))
+                _edy_curve = int(_et_curve * _et_curve * _curve_px)
+                _escreen_y = int(horizon_y + _erows_f - _edy_curve)
+                _eground_screen_y = _escreen_y  # ground-plane y before height offset
+
+                _enear  = base_focal * _vgh_e / max(1, sh - horizon_y)
+                _epersp = max(0.1, min(2.5, _enear / _edepth))
+
+                # Apply entity height offset (same formula as location icons)
+                _ent_height = _ent.get('height', 0)
+                if _ent_height:
+                    _eheight_persp = min(1.0, max(0.5, _epersp))
+                    _escreen_y -= int(_ent_height * _eheight_persp * 0.5)
+                    _escreen_y = max(int(horizon_y) + 4, _escreen_y)
+
+                if not (0 <= _escreen_x < sw) or _eground_screen_y <= sky_h:
+                    continue
+
+                # Load spritesheet and pick the correct directional frame
+                _vstem = _ent.get('sprite', '')
+                if not _vstem:
+                    continue
+                _vdata = _wm_load_vehicle(_vstem)
+                if not _vdata:
+                    continue
+
+                # Rotate world-space movement into camera-relative screen space.
+                # The camera faces direction (sin_a, -cos_a) in texture coords.
+                # Rotating (emx, emy) by -cam_angle gives the direction as seen
+                # on screen: positive x = right, positive y = toward camera (down).
+                _ecam_dx =  _emx * cos_a + _emy * sin_a   # screen-right component
+                _ecam_dy = -_emx * sin_a + _emy * cos_a   # screen-down component
+                _erow   = _wm_dir_row(_ecam_dx, _ecam_dy, _vdata['num_dirs'])
+                _erow   = min(_erow, _vdata['num_dirs'] - 1)
+                _efrms  = _vdata['frames_by_row'].get(_erow,
+                          _vdata['frames_by_row'].get(0, []))
+                if not _efrms:
+                    continue
+                _eframe = _efrms[_ent_fidx % len(_efrms)]
+
+                # Scale proportionally to perspective
+                _eish = max(4, int(_vdata['frame_h'] * RENDER_SCALE * _epersp * 2))
+                _eisw = max(4, int(_eish * _vdata['frame_w'] / _vdata['frame_h']))
+                _esurf = pygame.transform.scale(_eframe, (_eisw, _eish))
+                _erect = _esurf.get_rect(midbottom=(_escreen_x, _escreen_y))
+
+                if _erect.top < sh:
+                    _icon_draw_list.append((_edepth, _esurf, _erect))
 
         # ── Painter's algorithm: draw icons + player back-to-front ────────────
         # Sprites and icons always draw at full opacity. The black overlay drawn
@@ -3181,20 +3715,46 @@ class Game:
 
     # ── Character switching ───────────────────────────────────────────────────
 
+    def _get_allowed_ki_modes(self) -> tuple:
+        """Return the ordered tuple of ki-attack modes this character can cycle through.
+
+        Derived directly from player.equipped_attacks:
+          - 'ki_blast' in equipped  → blast mode available
+          - any other attack equipped → beam mode available
+          - transform is always appended last
+
+        Falls back to ('blast', 'transform') when no config has been loaded yet.
+        """
+        equipped = getattr(self.player, 'equipped_attacks', [])
+
+        modes: list[str] = []
+        if 'ki_blast' in equipped:
+            modes.append('blast')
+        if any(a != 'ki_blast' for a in equipped):
+            modes.append('beam')
+
+        # Always include transform so the player can still power up.
+        modes.append('transform')
+
+        # If nothing was equipped at all, keep blast as the default so the
+        # game is still playable before any config file has been saved.
+        return tuple(modes) if len(modes) > 1 else ('blast', 'transform')
+
     def _switch_character(self, character_id):
         """Swap the player's sprite to character_id while keeping all gameplay state intact."""
         from core.sprite_system import create_character_sprite
 
         # Snapshot current state before the swap.
         state = {
-            'x':         self.player.x,
-            'y':         self.player.y,
-            'hp':        self.player.hp,
-            'ki':        self.player.ki,
-            'level':     self.player.level,
-            'stats':     self.player.stats.copy(),
+            'x': self.player.x,
+            'y': self.player.y,
+            'hp': self.player.hp,
+            'ki': self.player.ki,
+            'level': self.player.level,
+            'stats': self.player.stats.copy(),
             'inventory': self.player.inventory.copy(),
             'direction': self.player.direction,
+            'current_animation_state': getattr(self.player, 'current_animation_state', 'idle'),  # capture BEFORE swap
         }
 
         self.player.character = character_id
@@ -3203,6 +3763,27 @@ class Game:
         # Restore state so the swap is completely seamless to the player.
         for key, value in state.items():
             setattr(self.player, key, value)
+
+        # The freshly created sprite doesn't know the player's pre-swap
+        # facing — push it in now, or the new character defaults to facing
+        # down until the player's next manual direction change.
+        if hasattr(self.player.sprite, 'set_animation'):
+            self.player.sprite.set_animation(
+                state['current_animation_state'], state['direction'])
+
+        # Apply the character's attack config so only equipped attacks are usable.
+        cfg = character_creator.load_config(character_id)
+        atk = cfg.get('attacks', {})
+
+        self.player.equipped_attacks = list(atk.get('equipped_attacks', []))
+        self.player.ki_mode_config   = atk.get('ki_attack_mode', 'blast')
+
+        # Reset ki_attack_mode to the first mode the new character actually has.
+        # This prevents being left in e.g. beam mode after switching to a character
+        # that only has blast equipped, and vice-versa.
+        allowed = self._get_allowed_ki_modes()
+        if self.player.ki_attack_mode not in allowed:
+            self.player.ki_attack_mode = allowed[0] if allowed else 'blast'
 
     # ── Flying-controller callbacks ───────────────────────────────────────────
 
@@ -3252,6 +3833,13 @@ class Game:
         # higher is almost certainly a debugger break, minimize, or OS sleep.
         dt             = min(dt, 4.0 / 60.0)
         self.dt        = dt
+
+        # Advance the world-map entity animation clock every frame so that
+        # in-room WorldMapObjects linked to entities always reflect the entity's
+        # true path position, even when the world-map flying scene is not active.
+        if not hasattr(self, '_wm_entity_anim_t'):
+            self._wm_entity_anim_t = 0.0
+        self._wm_entity_anim_t += dt
 
         # When the room editor is open, skip all game simulation — only tick the editor.
         if self.room_editor.active:
@@ -3309,7 +3897,9 @@ class Game:
                     self._mjf_cam_y = 0.0
                     self._mjf_altitude = 0.5
                     self._mjf_needs_pin_correction = True
-                    self._mjf_origin_room = self.current_room.name if self.current_room else ''
+                    self._mjf_origin_room   = self.current_room.name if self.current_room else ''
+                    self._mjf_origin_entity = getattr(self, '_mjf_last_entry_entity', '')
+                    self._apply_world_map_music(getattr(self, '_active_world_map_name', ''))
                     self._mjf_state  = 'fade_in'
                     self._mjf_active = False
                     self.player.sprite.set_animation('idle', self.player.direction)
@@ -3366,6 +3956,8 @@ class Game:
             for melee in self.melee_attacks[:]:
                 melee.update(dt)
                 if not melee.active:
+                    if not getattr(melee, 'hit_something', False):
+                        self.sound_manager.play_sfx('melee_miss')
                     self.melee_attacks.remove(melee)
 
             # Enemy AI, combat resolution, and defeat handling.
@@ -3410,6 +4002,18 @@ class Game:
             if self.player.transformation and not self.active_cutscene_runtime:
                 self.player.transformation.update(dt, enemies_defeated_this_frame)
 
+            # Transformation aura — loops for as long as the player is
+            # transformed and stops the moment they detransform.
+            # play_looping_sfx is idempotent, so calling it every frame while
+            # transformed doesn't restart the loop from the beginning.
+            # NOTE: the flying pad also uses the 'aura' sfx for the duration
+            # of a flight, so we must not stop it here while a flight is in
+            # progress — FlyingController owns stopping it once landed.
+            if self.player.is_transformed():
+                self.sound_manager.play_looping_sfx('aura')
+            elif not self.flying_controller.is_active():
+                self.sound_manager.stop_looping_sfx('aura')
+
             # Adaptive music — switch between exploration and battle tracks.
             self.sound_manager.update_battle_state(dt, len(self.enemies) > 0)
 
@@ -3425,6 +4029,9 @@ class Game:
                 return
             if self.sprite_editor.active:
                 self.sprite_editor.update(dt)
+                return
+            if self.character_creator.active:
+                self.character_creator.update(dt)
                 return
             if self.room_editor.active:
                 self.room_editor.update(dt, self._get_logical_mouse_pos())
@@ -3465,6 +4072,21 @@ class Game:
             old_y = self.player.y
             self.player.move(dx, dy, is_running, self.current_room.width, self.current_room.height)
 
+            actually_moved = (self.player.x != old_x) or (self.player.y != old_y)
+
+            # Sprint footsteps — walking has no sound, only running does, and
+            # only while the player is actually displacing. Without this,
+            # holding into a wall while "running" (is_running stays true as
+            # long as a direction key is held) would loop the run sound even
+            # though the player is standing still against the wall.
+            if actually_moved and self.player.tick_footsteps(dt):
+                self.sound_manager.play_sfx('run')
+            elif not actually_moved:
+                # Fully blocked this frame — stop the timer from counting
+                # down while stationary so the next real step, once the
+                # player moves away from the wall, fires immediately.
+                self.player.footstep_timer = 0.0
+
             # Collision resolution.
             # player.move() already handles walls/stones/gates/transitions
             # axis-by-axis, so the player never clips through them.
@@ -3482,6 +4104,7 @@ class Game:
                     and not (dx != 0 and dy != 0):
                 self.player.start_collision_knockback(dx, dy)
                 self.camera.start_shake(intensity=15, duration=0.3)
+                self.sound_manager.play_sfx('bump')
                 collision = True
 
             if not collision:
@@ -3547,6 +4170,16 @@ class Game:
             if not self.player.is_firing_beam:
                 self.player.current_beam = None
 
+    def _play_melee_hit_sfx(self):
+        """Randomly pick one of the two melee-connect swing sounds."""
+        self.sound_manager.play_sfx(random.choice(('melee1', 'melee2')))
+
+    def _play_impact_sfx(self):
+        """Randomly pick one of the two hit-impact sounds — used whenever
+        the player or an enemy actually takes a hit (as opposed to the
+        swing sound itself)."""
+        self.sound_manager.play_sfx(random.choice(('impact1', 'impact2')))
+
     def _update_enemies(self, dt):
         """Run AI for all active enemies, resolve combat, and remove the dead.
 
@@ -3561,6 +4194,7 @@ class Game:
 
             # If the enemy's AI called player.take_damage() during update, spawn a popup
             if self.player.last_damage_taken > 0:
+                self._play_impact_sfx()
                 self.dmg_numbers.spawn(
                     self.player.x, self.player.y - self.player.height // 2,
                     self.player.last_damage_taken, variant='player',
@@ -3568,7 +4202,9 @@ class Game:
 
             for melee in self.melee_attacks:
                 if melee.active and enemy.check_collision_with_attack(melee, 'melee'):
-                    self.sound_manager.play_sfx('enemy_hit')
+                    melee.hit_something = True
+                    self._play_melee_hit_sfx()
+                    self._play_impact_sfx()
                     self.dmg_numbers.spawn(
                         enemy.x, enemy.y - enemy.height // 2,
                         enemy.last_damage_dealt, variant='enemy',
@@ -3689,6 +4325,7 @@ class Game:
                 self.player.take_damage(bullet.damage, dx, dy)
                 self.player.hurt_tint = 1.0
                 bullet.active         = False
+                self._play_impact_sfx()
                 self.dmg_numbers.spawn(
                     self.player.x, self.player.y - self.player.height // 2,
                     self.player.last_damage_taken, variant='player',
@@ -3728,6 +4365,7 @@ class Game:
                     self.player.take_damage(damage, dx, dy)
                     self.player.hurt_tint = 1.0
                     blast.active = False
+                    self._play_impact_sfx()
                     self.dmg_numbers.spawn(
                         self.player.x, self.player.y - self.player.height // 2,
                         self.player.last_damage_taken, variant='player',
@@ -3827,7 +4465,8 @@ class Game:
             stone.update(dt)
             for melee in self.melee_attacks:
                 if melee.active and stone.check_collision_with_attack(melee, 'melee'):
-                    self.sound_manager.play_sfx('punch')
+                    melee.hit_something = True
+                    self._play_melee_hit_sfx()
             if not stone.active:
                 self.destructible_stones.remove(stone)
 
@@ -3848,7 +4487,8 @@ class Game:
 
             for melee in self.melee_attacks:
                 if melee.active and gate.check_collision_with_attack(melee, 'melee', self.player):
-                    self.sound_manager.play_sfx('punch')
+                    melee.hit_something = True
+                    self._play_melee_hit_sfx()
 
             for projectile in self.projectiles:
                 if projectile.active:
@@ -3902,6 +4542,10 @@ class Game:
 
         # Fill with the default "green dev room" background colour.
         self.logical_surface.fill((34, 139, 34))
+
+        # Scrolling background — was previously only drawn by the room editor's
+        # own preview, so it never appeared during actual gameplay/test mode.
+        self._draw_scrolling_background(self.dt)
 
         # Compute the world-space tile range that is currently on screen.
         visible_x_start = self.camera.x // RENDER_SCALE
@@ -4070,6 +4714,7 @@ class Game:
 
         # Dev tools — always drawn last so they sit on top of everything.
         self.sprite_editor.draw(self.logical_surface)
+        self.character_creator.draw(self.logical_surface, self.dt)
         self.room_editor.draw(self.logical_surface)
         self.dev_menu.draw(self.logical_surface)
         self.cutscene_editor.draw(self.logical_surface)
@@ -4197,6 +4842,64 @@ class Game:
                 surf.blit(scaled, (int(tile.x * RENDER_SCALE), int(tile.y * RENDER_SCALE)))
 
         return surf
+
+    def _draw_scrolling_background(self, dt):
+        """Draw the current room's scrolling background image, if it has one.
+
+        Mirrors the room editor's preview (camera-driven parallax) and adds
+        the autonomous scroll_x / scroll_y motion configured in the
+        Background panel, which the editor preview never animated either —
+        this is the single source of truth for both editor and gameplay.
+        """
+        room = self.current_room
+        if not room:
+            return
+
+        bg = getattr(room, 'scrolling_bg', None)
+        if not bg:
+            return
+
+        img_path = bg.get('image', '')
+        if not img_path:
+            return
+
+        if img_path not in self._bg_image_cache:
+            try:
+                import os
+                raw = pygame.image.load(
+                    os.path.join('assets', 'bg', os.path.basename(img_path))
+                ).convert()
+                sw, sh = self.logical_surface.get_size()
+                ratio  = sh / raw.get_height()
+                nw     = max(1, int(raw.get_width() * ratio))
+                self._bg_image_cache[img_path] = pygame.transform.scale(raw, (nw, sh))
+            except Exception:
+                self._bg_image_cache[img_path] = None
+
+        surf = self._bg_image_cache.get(img_path)
+        if not surf:
+            return
+
+        # Advance this room's own scroll phase over time so background motion
+        # keeps going independently of the camera.
+        accum = self._bg_scroll_accum.setdefault(room.name, [0.0, 0.0])
+        accum[0] += bg.get('scroll_x', 0.0) * dt
+        accum[1] += bg.get('scroll_y', 0.0) * dt
+
+        parallax = bg.get('parallax', 0.5)
+        sw, sh   = self.logical_surface.get_size()
+        iw, ih   = surf.get_size()
+
+        off_x = int(self.camera.x * parallax + accum[0]) % iw
+        off_y = int(accum[1]) % ih
+
+        y = -off_y
+        while y < sh:
+            x = -off_x
+            while x < sw:
+                self.logical_surface.blit(surf, (x, y))
+                x += iw
+            y += ih
 
     def _draw_room_tiles(self, bg: bool):
         """Blit the baked tile surface for the current room.
@@ -4432,6 +5135,7 @@ class Game:
         transition_manager = oe.transition_manager
         gate_manager       = oe.gate_manager
         flying_pad_manager = oe.flying_pad_manager
+        music_manager       = oe.music_manager
 
         for room in self.room_manager.rooms:
             if hasattr(room, 'spawn_points') and room.spawn_points:
@@ -4457,6 +5161,10 @@ class Game:
             if not hasattr(room, 'save_points'):
                 room.save_points = []
             self.save_point_manager.save_points[room.name] = room.save_points
+
+            if not hasattr(room, 'music_objects'):
+                room.music_objects = []
+            music_manager.music_objects[room.name] = room.music_objects
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 

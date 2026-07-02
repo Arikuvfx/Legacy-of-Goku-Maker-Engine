@@ -43,6 +43,9 @@ class TransformationSystem:
         self.original_character = None
         self.original_costume = None
 
+        # Sprite folder for the active transformation (resolved from character config)
+        self.current_transform_costume = None
+
     def update(self, dt, enemies_defeated_this_frame=0):
         """
         Update transformation progress
@@ -132,6 +135,14 @@ class TransformationSystem:
                 self.original_character = getattr(self.player.sprite, 'character', 'goku')
                 self.original_costume = getattr(self.player.sprite, 'costume', 'base')
 
+            # Resolve the sprite folder for this transformation from the character config.
+            # This replaces the old hardcoded 'ssj' costume string — SSJ is a
+            # transformation, not a costume, and its folder is defined in the
+            # character's JSON under "transformations[n].costume".
+            self.current_transform_costume = self._resolve_transform_costume(
+                self.original_character
+            )
+
             # Set transformation animation
             self.player.sprite.set_animation('transform', self.player.direction)
             self.player.current_animation_state = 'transform'
@@ -150,12 +161,15 @@ class TransformationSystem:
             self.transformed_ki = self.max_transformed_ki
             self.transform_animation_progress = 1.0  # Ensure it's at 100%
 
-            # Switch to transformed sprite sheets
+            # Switch to transformed sprite sheets.
+            # Use the folder resolved in start_transform (e.g. "ssj", "ssj2") —
+            # NOT a hardcoded string, because the transformation form is defined
+            # in assets/characters/{id}.json, not hard-wired here.
             from core.sprite_system import create_character_sprite
-            character = getattr(self.player.sprite, 'character', 'goku')
+            character = self.original_character or getattr(self.player.sprite, 'character', 'goku')
+            transform_costume = self.current_transform_costume or 'ssj'  # 'ssj' only as last-resort fallback
 
-            # Load SSJ sprites (goku/base/ssj/)
-            self.player.sprite = create_character_sprite(character, 'ssj', 32, 32)
+            self.player.sprite = create_character_sprite(character, transform_costume, 32, 32)
             self.player.sprite.set_animation('idle', self.player.direction)
             self.player.current_animation_state = 'idle'
 
@@ -229,6 +243,56 @@ class TransformationSystem:
         self.is_untransforming = False
         self.transformed_ki = self.max_transformed_ki
         self.transform_animation_progress = 0.0
+        self.current_transform_costume = None
+
+    def _resolve_transform_costume(self, char_id: str) -> str:
+        """Return the costume path for the player's active transformation.
+
+        Sourced from assets/characters/{char_id}.json — the same config
+        character_creator.py writes via sync_transformations() — rather than
+        re-scanning the sprite folders directly. This matters now that:
+          1. Transformation sprites live nested under the base costume
+             (assets/sprites/player/{char_id}/{base_costume}/transformations/{form}/),
+             not directly under the character folder.
+          2. A character can have more than one registered transformation
+             (SSJ, SSJ2, ...), so "just list the folder and take an entry"
+             no longer reliably picks the right one — os.listdir() sorts
+             alphabetically, which has nothing to do with which
+             transformation the creator tool actually registered first or
+             which one the game intends to use.
+
+        Currently always resolves to the FIRST entry in cfg["transformations"]
+        (authoring order, not alphabetical) — there's no in-game selection
+        between multiple forms yet. If/when the game adds a way to pick
+        between SSJ/SSJ2/etc, this is the place to index into the list
+        instead of always taking [0].
+        """
+        from dev_tools import character_creator
+
+        cfg = character_creator.load_config(char_id)
+        transformations = cfg.get("transformations", [])
+        if transformations:
+            costume = transformations[0].get("costume")
+            if costume:
+                return costume
+
+        # Fallback: no transformations registered in the config (e.g. an old
+        # project whose sprites were never run through sync_transformations()).
+        # Scan the filesystem directly as a last resort so this doesn't just
+        # silently fail — this mirrors discover_transformations()'s nested path.
+        import os
+        base_costume = cfg.get("costume") or "base"
+        transforms_dir = f"assets/sprites/player/{char_id}/{base_costume}/transformations"
+        if os.path.isdir(transforms_dir):
+            entries = sorted(
+                e for e in os.listdir(transforms_dir)
+                if os.path.isdir(os.path.join(transforms_dir, e))
+                and not e.startswith(".")
+            )
+            if entries:
+                return f"{base_costume}/transformations/{entries[0]}"
+
+        return "ssj"  # legacy last-resort fallback
 
     def add_progress(self, amount):
         """Manually add progress (for special events, items, etc)"""

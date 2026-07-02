@@ -60,6 +60,11 @@ class Player:
         self.attack_timer = 0
         self.attack_cooldown = 0
 
+        # Sprint footsteps — walking is silent, only running plays a sound.
+        # Ticked by game.py (which owns dt) right after calling move().
+        self.footstep_timer = 0.0
+        self.footstep_interval = 0.28  # seconds between footstep sounds while sprinting
+
         self.draw_layer = DrawLayer.PLAYER
         self.y_sort = True
 
@@ -89,6 +94,13 @@ class Player:
         # Ki attack state
         # -----------------------------------------------------------------
         self.ki_attack_mode = 'blast'       # 'blast' | 'beam' | 'transform'
+
+        # Attacks this character is allowed to use, loaded from their JSON config.
+        # 'ki_mode_config' mirrors cfg["attacks"]["ki_attack_mode"] and controls
+        # which modes the TAB key cycles through ('blast'|'beam'|'both').
+        self.equipped_attacks = []
+        self.ki_mode_config   = 'blast'     # default until config is applied
+
         self.is_charging_beam = False
         self.beam_charge_time = 0
         self.beam_charge_required = 1.5     # Seconds of charge before auto-fire
@@ -333,6 +345,24 @@ class Player:
         anim = 'run' if is_running else 'walk'
         self.sprite.set_animation(anim, self.direction)
         self.current_animation_state = anim
+
+    def tick_footsteps(self, dt):
+        """Advance the sprint-footstep timer. Returns True the frame a footstep should play.
+
+        Walking is intentionally silent — only sprinting (is_running) ticks
+        this at all. Resets whenever the player stops running so the first
+        footstep after starting a new sprint fires immediately. Also silent
+        during collision knockback, since a wall-bounce isn't a footstep.
+        """
+        if not self.is_running or self.is_collision_knockback:
+            self.footstep_timer = 0.0
+            return False
+
+        self.footstep_timer -= dt
+        if self.footstep_timer <= 0:
+            self.footstep_timer = self.footstep_interval
+            return True
+        return False
 
     def start_collision_knockback(self, collision_direction_x, collision_direction_y):
         """Bounce the player back after walking into a solid obstacle at speed."""

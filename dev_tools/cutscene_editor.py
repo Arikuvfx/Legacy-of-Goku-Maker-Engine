@@ -122,13 +122,34 @@ _ACTION_PARAMS = {
                       ('duration', 'Duration (s)', 'float'),
                       ('arc_height', 'Arc Height', 'float'),
                       ('direction', 'Direction', 'dir')],
+    # Swaps which player character a 'player'-type actor displays — e.g. a
+    # Goku actor turning into Gohan mid-scene. Sourced from the same character
+    # roster as the in-game character switch menu (assets/sprites/player/).
+    'set_character': [('character', 'Character', 'character')],
+    # Switches the actor's sprite folder to a different costume — e.g. from
+    # 'base' to 'ssj' mid-scene. Costumes are discovered from the actor's
+    # current character folder (assets/sprites/player/{character}/).
+    'set_costume':   [('costume',   'Costume',   'costume')],
+    # Starts a music track through SoundManager.play_music(), bypassing the
+    # exploration/battle/boss context map — same as a room's Music object.
+    'play_music':    [('track', 'Music Track', 'music_track'),
+                      ('loop', 'Loop', 'bool'),
+                      ('fade_in', 'Fade In', 'bool')],
+    # Fires a one-shot sound effect through SoundManager.play_sfx().
+    'play_sfx':      [('sfx', 'Sound Effect', 'sfx_name')],
+    # Stops whatever music is currently playing, via SoundManager.stop_music().
+    # fade_out=True fades over SoundEngine.fade_duration (1s); False cuts it
+    # instantly. Doesn't care what track is playing or how it was started
+    # (context, room Music object, or an earlier play_music action).
+    'stop_music':    [('fade_out', 'Fade Out', 'bool')],
 }
 
 _CAMERA_ACTIONS = ['pan_to', 'snap_to', 'shake']
 _SCREEN_ACTIONS = ['fade_in', 'fade_out', 'flash', 'invert', 'dialogue',
                    'weather_start', 'weather_stop']
 _ROOM_ACTIONS   = ['change_room']
-_ACTOR_ACTIONS  = ['set_animation', 'move_to', 'face', 'teleport', 'fly_to']
+_SOUND_ACTIONS  = ['play_music', 'play_sfx', 'stop_music']
+_ACTOR_ACTIONS  = ['set_animation', 'move_to', 'face', 'teleport', 'fly_to', 'set_character', 'set_costume']
 _INVERT_MODES   = ['full', 'red', 'green', 'blue', 'greyscale']
 
 _CUTSCENE_DIR        = os.path.join('data', 'cutscenes')
@@ -154,6 +175,7 @@ _ACTOR_COLORS = [
 _CAMERA_COLOR = (82, 122, 255)
 _SCREEN_COLOR = (110, 122, 155)
 _ROOM_COLOR   = (60, 180, 130)
+_SOUND_COLOR  = (230, 165, 60)
 
 
 def _ensure_dir():
@@ -178,12 +200,17 @@ class CutsceneEditor:
     """
 
     def __init__(self, room_manager, room_editor, screen_width, screen_height,
-                 dialogue_box=None):
+                 dialogue_box=None, sound_manager=None):
         self.room_manager  = room_manager
         self.room_editor   = room_editor
         self.screen_width  = screen_width
         self.screen_height = screen_height
         self.dialogue_box  = dialogue_box
+        # Used to populate the Music Track / Sound Effect pickers on the
+        # play_music / play_sfx action forms, and to let the dev preview a
+        # track or sfx instantly from the inspector without running the
+        # whole cutscene. None is tolerated (pickers just show no options).
+        self.sound_manager = sound_manager
         self.active        = False
 
         # Fonts
@@ -262,6 +289,27 @@ class CutsceneEditor:
         self._portrait_dropdown_rect   = None
         self._portrait_dropdown_scroll = 0
 
+        # ── Character dropdown overlay (set_character action) ────────────────
+        self._character_dropdown_open   = False
+        self._character_dropdown_items  = []
+        self._character_dropdown_rect   = None
+        self._character_dropdown_scroll = 0
+
+        # ── Costume dropdown overlay (set_costume action) ─────────────────────
+        self._costume_dropdown_open   = False
+        self._costume_dropdown_items  = []
+        self._costume_dropdown_rect   = None
+        self._costume_dropdown_scroll = 0
+
+        # ── Sound dropdown overlay (play_music 'track' / play_sfx 'sfx') ──────
+        # Shared between both fields; self._sound_dropdown_field ('track' or
+        # 'sfx') says which _form_params key a selection should be written to.
+        self._sound_dropdown_open   = False
+        self._sound_dropdown_items  = []
+        self._sound_dropdown_rect   = None
+        self._sound_dropdown_scroll = 0
+        self._sound_dropdown_field  = 'track'
+
         # ── Actor add form (shown in left panel) ──────────────────────────────
         self._actor_form     = False
         self._actor_type_idx = 0
@@ -339,6 +387,12 @@ class CutsceneEditor:
 
         On close: auto-saves dirty work, then always persists the viewport
         state (camera pos + zoom) so the next open lands right where you left.
+        Also cuts any music instantly — the Preview button and the live
+        CutsceneRuntime used for timeline scrubbing/playback both drive the
+        real SoundManager, so a track previewed (or a play_music/stop_music
+        action scrubbed over) while the editor was open can otherwise keep
+        playing indefinitely after you leave, with no fade-out ever fired to
+        end it. fade_out=False so there's no lingering fade-out delay either.
         On open: refreshes the file list so newly added cutscenes appear.
         """
         if self.active:
@@ -348,6 +402,8 @@ class CutsceneEditor:
                     self._save_cutscene()
                 else:
                     self._save_viewport_state()
+            if self.sound_manager is not None:
+                self.sound_manager.stop_music(fade_out=False)
         self.active = not self.active
         if self.active:
             self._refresh_file_list()
@@ -544,6 +600,15 @@ class CutsceneEditor:
             if self._portrait_dropdown_open:
                 self._portrait_dropdown_open = False
                 return None
+            if self._character_dropdown_open:
+                self._character_dropdown_open = False
+                return None
+            if self._costume_dropdown_open:
+                self._costume_dropdown_open = False
+                return None
+            if self._sound_dropdown_open:
+                self._sound_dropdown_open = False
+                return None
             if self._pick_mode:
                 self._pick_mode = None
                 return None
@@ -561,7 +626,7 @@ class CutsceneEditor:
                     self.view = 'list'
                     self._refresh_file_list()
                 return None
-            self.active = False
+            self.toggle()
             return None
 
         # Space plays / stops — but not while a dialogue box is open because
@@ -711,7 +776,7 @@ class CutsceneEditor:
                 from core.cutscene_runtime import CutsceneRuntime
                 self._runtime = CutsceneRuntime(
                     self.cutscene_data, self.camera, self._entity_factory,
-                    dialogue_box=self.dialogue_box)
+                    dialogue_box=self.dialogue_box, sound_manager=self.sound_manager)
             except Exception as e:
                 print(f'[CutsceneEditor] _scrub_to runtime error: {e}')
                 return
@@ -834,6 +899,45 @@ class CutsceneEditor:
                 if 0 <= actual < len(self._portrait_dropdown_items):
                     self._form_params['portrait'] = self._portrait_dropdown_items[actual]
             self._portrait_dropdown_open = False
+            return None
+
+        # Character dropdown: consume click before anything else
+        if self._character_dropdown_open:
+            if self._character_dropdown_rect and self._character_dropdown_rect.collidepoint(pos):
+                mx2, my2 = pos
+                item_h   = 22
+                rel_y    = my2 - self._character_dropdown_rect.y - 4
+                item_idx = rel_y // item_h
+                actual   = item_idx + self._character_dropdown_scroll
+                if 0 <= actual < len(self._character_dropdown_items):
+                    self._form_params['character'] = self._character_dropdown_items[actual]
+            self._character_dropdown_open = False
+            return None
+
+        # Costume dropdown: consume click before anything else
+        if self._costume_dropdown_open:
+            if self._costume_dropdown_rect and self._costume_dropdown_rect.collidepoint(pos):
+                mx2, my2 = pos
+                item_h   = 22
+                rel_y    = my2 - self._costume_dropdown_rect.y - 4
+                item_idx = rel_y // item_h
+                actual   = item_idx + self._costume_dropdown_scroll
+                if 0 <= actual < len(self._costume_dropdown_items):
+                    self._form_params['costume'] = self._costume_dropdown_items[actual]
+            self._costume_dropdown_open = False
+            return None
+
+        # Sound dropdown (music track / sfx name): consume click before anything else
+        if self._sound_dropdown_open:
+            if self._sound_dropdown_rect and self._sound_dropdown_rect.collidepoint(pos):
+                mx2, my2 = pos
+                item_h   = 22
+                rel_y    = my2 - self._sound_dropdown_rect.y - 4
+                item_idx = rel_y // item_h
+                actual   = item_idx + self._sound_dropdown_scroll
+                if 0 <= actual < len(self._sound_dropdown_items):
+                    self._form_params[self._sound_dropdown_field] = self._sound_dropdown_items[actual]
+            self._sound_dropdown_open = False
             return None
 
         mx, my = pos
@@ -988,6 +1092,30 @@ class CutsceneEditor:
                 self._portrait_dropdown_scroll - dy))
             return
 
+        # Character dropdown scroll — same deal.
+        if (self._character_dropdown_open and self._character_dropdown_rect
+                and self._character_dropdown_rect.collidepoint(mx, my)):
+            max_scroll = max(0, len(self._character_dropdown_items) - 8)
+            self._character_dropdown_scroll = max(0, min(max_scroll,
+                self._character_dropdown_scroll - dy))
+            return
+
+        # Costume dropdown scroll — same deal.
+        if (self._costume_dropdown_open and self._costume_dropdown_rect
+                and self._costume_dropdown_rect.collidepoint(mx, my)):
+            max_scroll = max(0, len(self._costume_dropdown_items) - 8)
+            self._costume_dropdown_scroll = max(0, min(max_scroll,
+                self._costume_dropdown_scroll - dy))
+            return
+
+        # Sound dropdown scroll — same deal.
+        if (self._sound_dropdown_open and self._sound_dropdown_rect
+                and self._sound_dropdown_rect.collidepoint(mx, my)):
+            max_scroll = max(0, len(self._sound_dropdown_items) - 8)
+            self._sound_dropdown_scroll = max(0, min(max_scroll,
+                self._sound_dropdown_scroll - dy))
+            return
+
         if self.view == 'list':
             self._list_scroll = _clamp(self._list_scroll - dy * 20, 0, 9999)
             return
@@ -1058,7 +1186,7 @@ class CutsceneEditor:
             return None
 
         if name == 'close':
-            self.active = False
+            self.toggle()
             return None
 
         if name == 'list_new':
@@ -1239,6 +1367,18 @@ class CutsceneEditor:
             if name == 'cycle_portrait':
                 self._open_portrait_dropdown(name)
                 return None
+            if name == 'cycle_character':
+                self._open_character_dropdown(name)
+                return None
+            if name == 'cycle_costume':
+                self._open_costume_dropdown(name)
+                return None
+            if name == 'cycle_track':
+                self._open_sound_dropdown('track', name)
+                return None
+            if name == 'cycle_sfx':
+                self._open_sound_dropdown('sfx', name)
+                return None
             self._cycle_dropdown(name)
             return None
 
@@ -1247,6 +1387,10 @@ class CutsceneEditor:
             return None
         if name in ('room_name_prev', 'room_name_next'):
             self._cycle_room_in_group(-1 if name.endswith('prev') else 1)
+            return None
+
+        if name == 'preview_sound':
+            self._preview_sound()
             return None
 
         # ── Timeline zoom buttons ──────────────────────────────────────────────
@@ -1297,7 +1441,7 @@ class CutsceneEditor:
     def _set_form_target(self, target):
         self._form_target = target
         actors = self.cutscene_data.get('actors', []) if self.cutscene_data else []
-        all_targets = ['camera', 'screen', 'room'] + [a['id'] for a in actors]
+        all_targets = ['camera', 'screen', 'room', 'sound'] + [a['id'] for a in actors]
         self._form_target_idx = all_targets.index(target) if target in all_targets else 0
         self._reset_form_params()
 
@@ -1307,7 +1451,7 @@ class CutsceneEditor:
 
     def _cycle_form_target(self, delta):
         actors = self.cutscene_data.get('actors', []) if self.cutscene_data else []
-        all_targets = ['camera', 'screen', 'room'] + [a['id'] for a in actors]
+        all_targets = ['camera', 'screen', 'room', 'sound'] + [a['id'] for a in actors]
         self._form_target_idx = (self._form_target_idx + delta) % len(all_targets)
         self._form_target = all_targets[self._form_target_idx]
         if self._form_target == 'camera':
@@ -1316,6 +1460,8 @@ class CutsceneEditor:
             self._set_form_type('fade_in')
         elif self._form_target == 'room':
             self._set_form_type('change_room')
+        elif self._form_target == 'sound':
+            self._set_form_type('play_music')
         else:
             self._set_form_type('set_animation')
 
@@ -1326,6 +1472,8 @@ class CutsceneEditor:
             pool = _SCREEN_ACTIONS
         elif self._form_target == 'room':
             pool = _ROOM_ACTIONS
+        elif self._form_target == 'sound':
+            pool = _SOUND_ACTIONS
         else:
             pool = _ACTOR_ACTIONS
         idx = pool.index(self._form_type) if self._form_type in pool else 0
@@ -1348,6 +1496,182 @@ class CutsceneEditor:
             self._portrait_dropdown_rect = pygame.Rect(
                 btn_rect.x, btn_rect.bottom + 2, pop_w, pop_h)
         self._portrait_dropdown_open = True
+
+    def _discover_player_characters(self):
+        """Return every player character ID, one sub-folder per character
+        under assets/sprites/player/ — the same source of truth used by
+        character_creator.py's own discover_characters()."""
+        players_dir = os.path.join('assets', 'sprites', 'player')
+        try:
+            return sorted(
+                d for d in os.listdir(players_dir)
+                if os.path.isdir(os.path.join(players_dir, d))
+            )
+        except OSError:
+            return []
+
+    def _default_character(self):
+        chars = self._discover_player_characters()
+        return chars[0] if chars else 'goku'
+
+    def _open_character_dropdown(self, btn_name):
+        """Popup list of every discovered player character, used by the
+        'character' param of the set_character action (see _ACTION_PARAMS).
+        Mirrors _open_portrait_dropdown(), minus the blank '(none)' entry —
+        a set_character action always needs a real character to switch to."""
+        keys = self._discover_player_characters()
+        self._character_dropdown_items  = keys
+        self._character_dropdown_scroll = 0
+        btn_rect = self._btns.get(btn_name)
+        if btn_rect:
+            item_h  = 22
+            visible = min(8, len(keys))
+            pop_h   = visible * item_h + 8
+            pop_w   = max(btn_rect.width, 160)
+            self._character_dropdown_rect = pygame.Rect(
+                btn_rect.x, btn_rect.bottom + 2, pop_w, pop_h)
+        self._character_dropdown_open = True
+
+    def _discover_costumes_for_actor(self, actor_id: str) -> list:
+        """Return the costume folder names for the character currently used by
+        *actor_id* at the playhead position.
+
+        Resolves the character in priority order:
+          1. The last set_character action targeting this actor whose time is
+             <= the current form's time — so the dropdown reflects the character
+             after a mid-scene swap, not the original spawn character.
+          2. The actor_def's 'character' field (spawn character).
+          3. The live entity's .character attribute (fallback).
+
+        Then scans assets/sprites/player/{character}/ for sub-directories that
+        contain at least one *.png file directly (same logic as
+        discover_costumes() in character_creator.py).
+        """
+        import glob as _glob
+
+        # Current form time — used to find the last set_character before this action.
+        try:
+            form_t = float(self._form_time_buf)
+        except (ValueError, AttributeError):
+            form_t = 0.0
+
+        # Walk actions up to form_t and track the last set_character for this actor.
+        character = ''
+        for action in sorted(self.cutscene_data.get('actions', []),
+                             key=lambda a: a.get('time', 0.0)):
+            if action.get('time', 0.0) > form_t:
+                break
+            if (action.get('target') == actor_id
+                    and action.get('type') == 'set_character'):
+                character = action.get('params', {}).get('character', '') or character
+
+        # Fall back to the actor_def's initial character if no override was found.
+        if not character:
+            actor_def = next(
+                (a for a in self.cutscene_data.get('actors', [])
+                 if a.get('id') == actor_id),
+                None,
+            )
+            character = (actor_def or {}).get('character', '')
+
+        # Last resort: live entity attribute.
+        if not character:
+            entity = self._actor_entities.get(actor_id)
+            if entity:
+                character = getattr(entity, 'character', '')
+
+        if not character:
+            return ['base']
+
+        char_dir = os.path.join('assets', 'sprites', 'player', character)
+        if not os.path.isdir(char_dir):
+            return ['base']
+
+        costumes = []
+        for entry in sorted(os.scandir(char_dir), key=lambda e: e.name):
+            if (entry.is_dir()
+                    and not entry.name.startswith('.')
+                    and entry.name != 'transformations'
+                    and _glob.glob(os.path.join(entry.path, '*.png'))):
+                costumes.append(entry.name)
+        return costumes if costumes else ['base']
+
+    def _open_costume_dropdown(self, btn_name):
+        """Popup list of costumes for the currently targeted actor, used by the
+        'costume' param of the set_costume action (see _ACTION_PARAMS)."""
+        keys = self._discover_costumes_for_actor(self._form_target)
+        self._costume_dropdown_items  = keys
+        self._costume_dropdown_scroll = 0
+        btn_rect = self._btns.get(btn_name)
+        if btn_rect:
+            item_h  = 22
+            visible = min(8, len(keys))
+            pop_h   = visible * item_h + 8
+            pop_w   = max(btn_rect.width, 160)
+            self._costume_dropdown_rect = pygame.Rect(
+                btn_rect.x, btn_rect.bottom + 2, pop_w, pop_h)
+        self._costume_dropdown_open = True
+
+    def _available_music_tracks(self):
+        """Return every music track name loaded by the SoundEngine, sorted.
+
+        Sourced from sound_manager.sound_engine.music_tracks — the same dict
+        AudioAssetLoader.load_from_directory() populates from assets/audio/music/.
+        Empty if no sound_manager was given to the editor.
+        """
+        sm = self.sound_manager
+        if sm is None or getattr(sm, 'sound_engine', None) is None:
+            return []
+        return sorted(sm.sound_engine.music_tracks.keys())
+
+    def _available_sfx_names(self):
+        """Return every sound effect name loaded by the SoundEngine, sorted.
+
+        Sourced from sound_manager.sound_engine.sound_effects — populated the
+        same way as _available_music_tracks() above.
+        """
+        sm = self.sound_manager
+        if sm is None or getattr(sm, 'sound_engine', None) is None:
+            return []
+        return sorted(sm.sound_engine.sound_effects.keys())
+
+    def _open_sound_dropdown(self, field, btn_name):
+        """Popup list of music tracks (field='track') or sound effects
+        (field='sfx'), used by the play_music / play_sfx action forms."""
+        keys = self._available_music_tracks() if field == 'track' else self._available_sfx_names()
+        self._sound_dropdown_field   = field
+        self._sound_dropdown_items   = keys
+        self._sound_dropdown_scroll  = 0
+        btn_rect = self._btns.get(btn_name)
+        if btn_rect:
+            item_h  = 22
+            visible = min(8, len(keys))
+            pop_h   = visible * item_h + 8
+            pop_w   = max(btn_rect.width, 160)
+            self._sound_dropdown_rect = pygame.Rect(
+                btn_rect.x, btn_rect.bottom + 2, pop_w, pop_h)
+        self._sound_dropdown_open = True
+
+    def _preview_sound(self):
+        """Instantly play/stop the currently-selected track or sfx through the
+        real SoundManager, so a dev can audition a play_music / play_sfx /
+        stop_music action from the inspector without running the whole
+        cutscene. No-op if no sound_manager was given to the editor.
+        """
+        if self.sound_manager is None:
+            return
+        if self._form_type == 'play_music':
+            track = self._form_params.get('track', '')
+            if track:
+                fade_in = self._form_params.get('fade_in', 'True') != 'False'
+                self.sound_manager.play_music(track, fade_in=fade_in)
+        elif self._form_type == 'play_sfx':
+            sfx = self._form_params.get('sfx', '')
+            if sfx:
+                self.sound_manager.play_sfx(sfx)
+        elif self._form_type == 'stop_music':
+            fade_out = self._form_params.get('fade_out', 'True') != 'False'
+            self.sound_manager.stop_music(fade_out=fade_out)
 
     def _get_actor_anim_states(self, actor_def):
         """Return a sorted list of animation state names for *actor_def*.
@@ -1406,12 +1730,14 @@ class CutsceneEditor:
         buf   = self._form_params.get(field, '')
         if field in ('state', 'anim_state'):
             actor_def = None
-            if self._form_target not in ('camera', 'screen', 'room'):
+            if self._form_target not in ('camera', 'screen', 'room', 'sound'):
                 for a in (self.cutscene_data or {}).get('actors', []):
                     if a['id'] == self._form_target:
                         actor_def = a
                         break
             pool = self._get_actor_anim_states(actor_def)
+        elif field in ('loop', 'fade_in'):
+            pool = ['True', 'False']
         elif field == 'direction' and self._form_type == 'scroll':
             pool = ['right', 'left', 'down', 'up',
                     'down_right', 'down_left', 'up_right', 'up_left']
@@ -1496,8 +1822,15 @@ class CutsceneEditor:
             'intensity': '8', 'state': 'idle', 'direction': 'down',
             'anim_state': 'walk', 'portrait': '', 'text': '',
             'weather_type': 'rain', 'speed': '120.0', 'alpha': '-1',
-            'room_name': '',
+            'room_name': '', 'character': self._default_character(),
+            'loop': 'True', 'fade_in': 'True', 'fade_out': 'True',
         }
+        if key == 'track':
+            tracks = self._available_music_tracks()
+            return tracks[0] if tracks else ''
+        if key == 'sfx':
+            names = self._available_sfx_names()
+            return names[0] if names else ''
         # scroll uses a much slower default speed than weather
         return base.get(key, '')
 
@@ -1517,6 +1850,7 @@ class CutsceneEditor:
             try:
                 if hint == 'float':   params[key] = float(raw)
                 elif hint == 'int':   params[key] = int(raw)
+                elif hint == 'bool':  params[key] = (raw == 'True')
                 else:                 params[key] = raw
             except ValueError:
                 params[key] = raw
@@ -1689,7 +2023,7 @@ class CutsceneEditor:
             if self._runtime is None:
                 self._runtime = CutsceneRuntime(
                     self.cutscene_data, self.camera, self._entity_factory,
-                    dialogue_box=self.dialogue_box)
+                    dialogue_box=self.dialogue_box, sound_manager=self.sound_manager)
             self._runtime.seek(self._tl_playhead_t)
             # Snap the camera to the correct start position so there is no
             # one-frame jump when playback begins (same logic as _scrub_to).
@@ -1940,6 +2274,7 @@ class CutsceneEditor:
             ('Camera', _CAMERA_COLOR, 'camera'),
             ('Screen', _SCREEN_COLOR, 'screen'),
             ('Room',   _ROOM_COLOR,   'room'),
+            ('Sound',  _SOUND_COLOR,  'sound'),
         ]
         actors = self.cutscene_data.get('actors', []) if self.cutscene_data else []
         for i, a in enumerate(actors):
@@ -2215,6 +2550,124 @@ class CutsceneEditor:
                 lbl = self.font_small.render(label, True, text_col)
                 screen.blit(lbl, (ir.x + 6, iy + (item_h - lbl.get_height()) // 2))
             if len(self._portrait_dropdown_items) > visible:
+                hint = self.font_small.render('scroll ↕', True, _C['text_dim'])
+                screen.blit(hint, (dr.x + dr.width - hint.get_width() - 4,
+                                   dr.bottom - hint.get_height() - 2))
+
+        # Character dropdown overlay — same idea, sourced from discovered
+        # player characters (see _discover_player_characters()).
+        if self._character_dropdown_open and self._character_dropdown_rect:
+            dr       = self._character_dropdown_rect
+            item_h   = 22
+            visible  = min(8, len(self._character_dropdown_items))
+            cur_val  = self._form_params.get('character', '')
+            shadow = pygame.Surface((dr.width + 4, dr.height + 4), pygame.SRCALPHA)
+            shadow.fill((0, 0, 0, 110))
+            screen.blit(shadow, (dr.x + 2, dr.y + 2))
+            pygame.draw.rect(screen, _C['panel2'], dr)
+            pygame.draw.rect(screen, _C['accent'],  dr, 1)
+            scroll = self._character_dropdown_scroll
+            for i in range(visible):
+                actual = i + scroll
+                if actual >= len(self._character_dropdown_items):
+                    break
+                key   = self._character_dropdown_items[actual]
+                label = key if key else '(none)'
+                iy    = dr.y + 4 + i * item_h
+                ir    = pygame.Rect(dr.x + 1, iy, dr.width - 2, item_h)
+                if key == cur_val:
+                    pygame.draw.rect(screen, _C['accent'], ir)
+                    text_col = _C['bg']
+                else:
+                    hmx, hmy = pygame.mouse.get_pos()
+                    if ir.collidepoint(hmx, hmy):
+                        pygame.draw.rect(screen, _C['highlight'], ir)
+                    text_col = _C['text']
+                lbl = self.font_small.render(label, True, text_col)
+                screen.blit(lbl, (ir.x + 6, iy + (item_h - lbl.get_height()) // 2))
+            if not self._character_dropdown_items:
+                hint = self.font_small.render(
+                    'No characters found in assets/sprites/player/', True, _C['text_dim'])
+                screen.blit(hint, (dr.x + 6, dr.y + 6))
+            elif len(self._character_dropdown_items) > visible:
+                hint = self.font_small.render('scroll ↕', True, _C['text_dim'])
+                screen.blit(hint, (dr.x + dr.width - hint.get_width() - 4,
+                                   dr.bottom - hint.get_height() - 2))
+
+        # Costume dropdown overlay — sourced from the actor's character folder.
+        if self._costume_dropdown_open and self._costume_dropdown_rect:
+            dr       = self._costume_dropdown_rect
+            item_h   = 22
+            visible  = min(8, len(self._costume_dropdown_items))
+            cur_val  = self._form_params.get('costume', '')
+            shadow = pygame.Surface((dr.width + 4, dr.height + 4), pygame.SRCALPHA)
+            shadow.fill((0, 0, 0, 110))
+            screen.blit(shadow, (dr.x + 2, dr.y + 2))
+            pygame.draw.rect(screen, _C['panel2'], dr)
+            pygame.draw.rect(screen, _C['accent2'], dr, 1)
+            scroll = self._costume_dropdown_scroll
+            for i in range(visible):
+                actual = i + scroll
+                if actual >= len(self._costume_dropdown_items):
+                    break
+                key   = self._costume_dropdown_items[actual]
+                label = key if key else '(none)'
+                iy    = dr.y + 4 + i * item_h
+                ir    = pygame.Rect(dr.x + 1, iy, dr.width - 2, item_h)
+                if key == cur_val:
+                    pygame.draw.rect(screen, _C['accent2'], ir)
+                    text_col = _C['bg']
+                else:
+                    hmx, hmy = pygame.mouse.get_pos()
+                    if ir.collidepoint(hmx, hmy):
+                        pygame.draw.rect(screen, _C['highlight'], ir)
+                    text_col = _C['text']
+                lbl = self.font_small.render(label, True, text_col)
+                screen.blit(lbl, (ir.x + 6, iy + (item_h - lbl.get_height()) // 2))
+            if not self._costume_dropdown_items:
+                hint = self.font_small.render(
+                    'No costumes found for this actor', True, _C['text_dim'])
+                screen.blit(hint, (dr.x + 6, dr.y + 6))
+            elif len(self._costume_dropdown_items) > visible:
+                hint = self.font_small.render('scroll ↕', True, _C['text_dim'])
+                screen.blit(hint, (dr.x + dr.width - hint.get_width() - 4,
+                                   dr.bottom - hint.get_height() - 2))
+
+        if self._sound_dropdown_open and self._sound_dropdown_rect:
+            dr       = self._sound_dropdown_rect
+            item_h   = 22
+            visible  = min(8, len(self._sound_dropdown_items))
+            cur_val  = self._form_params.get(self._sound_dropdown_field, '')
+            shadow = pygame.Surface((dr.width + 4, dr.height + 4), pygame.SRCALPHA)
+            shadow.fill((0, 0, 0, 110))
+            screen.blit(shadow, (dr.x + 2, dr.y + 2))
+            pygame.draw.rect(screen, _C['panel2'], dr)
+            pygame.draw.rect(screen, _SOUND_COLOR, dr, 1)
+            scroll = self._sound_dropdown_scroll
+            for i in range(visible):
+                actual = i + scroll
+                if actual >= len(self._sound_dropdown_items):
+                    break
+                key   = self._sound_dropdown_items[actual]
+                label = key if key else '(none)'
+                iy    = dr.y + 4 + i * item_h
+                ir    = pygame.Rect(dr.x + 1, iy, dr.width - 2, item_h)
+                if key == cur_val:
+                    pygame.draw.rect(screen, _SOUND_COLOR, ir)
+                    text_col = _C['bg']
+                else:
+                    hmx, hmy = pygame.mouse.get_pos()
+                    if ir.collidepoint(hmx, hmy):
+                        pygame.draw.rect(screen, _C['highlight'], ir)
+                    text_col = _C['text']
+                lbl = self.font_small.render(label, True, text_col)
+                screen.blit(lbl, (ir.x + 6, iy + (item_h - lbl.get_height()) // 2))
+            if not self._sound_dropdown_items:
+                no_what = 'music tracks' if self._sound_dropdown_field == 'track' else 'sound effects'
+                hint = self.font_small.render(
+                    f'No {no_what} loaded', True, _C['text_dim'])
+                screen.blit(hint, (dr.x + 6, dr.y + 6))
+            elif len(self._sound_dropdown_items) > visible:
                 hint = self.font_small.render('scroll ↕', True, _C['text_dim'])
                 screen.blit(hint, (dr.x + dr.width - hint.get_width() - 4,
                                    dr.bottom - hint.get_height() - 2))
@@ -2566,8 +3019,8 @@ class CutsceneEditor:
 
         # Fixed tracks (camera, screen)
         for ti, (label, color, target) in enumerate(tracks):
-            is_actor = ti >= 3
-            actor_idx = ti - 3 if is_actor else -1
+            is_actor = ti >= 4
+            actor_idx = ti - 4 if is_actor else -1
             selected  = (is_actor and actor_idx == self._actor_sel)
 
             row_r = pygame.Rect(x, y, W, 26)
@@ -2578,7 +3031,10 @@ class CutsceneEditor:
             pygame.draw.rect(screen, color, (x, y, 3, 26), border_radius=2)
 
             # Icon + label
-            icon = '🎬' if target == 'camera' else ('🖥' if target == 'screen' else ('🏙' if target == 'room' else '👤'))
+            icon = ('🎬' if target == 'camera' else
+                    '🖥' if target == 'screen' else
+                    '🏙' if target == 'room' else
+                    '🔊' if target == 'sound' else '👤')
             it = self.font_small.render(icon + ' ' + label, True, _C['text'])
             screen.blit(it, (x + 7, y + (26 - it.get_height()) // 2))
 
@@ -2709,7 +3165,8 @@ class CutsceneEditor:
         self._btns['form_target_prev'] = self._draw_button(screen, x, y, 20, 22, '<', _C['highlight'])
         tc_col = (_CAMERA_COLOR if self._form_target == 'camera' else
                   _SCREEN_COLOR if self._form_target == 'screen' else
-                  _ROOM_COLOR   if self._form_target == 'room'   else _C['accent2'])
+                  _ROOM_COLOR   if self._form_target == 'room'   else
+                  _SOUND_COLOR  if self._form_target == 'sound'  else _C['accent2'])
         tn = self.font_medium.render(self._form_target, True, tc_col)
         screen.blit(tn, (x + 24, y + 2))
         self._btns['form_target_next'] = self._draw_button(screen, x + W - 20, y, 20, 22, '>', _C['highlight'])
@@ -2731,8 +3188,10 @@ class CutsceneEditor:
             y += 14
             buf = self._form_params.get(key, '')
             if hint in ('dir', 'anim', 'anim_player', 'anim_enemy', 'portrait',
-                        'invert_mode', 'weather_type', 'scroll_dir'):
-                display_buf = buf if buf != '' else 'auto'
+                        'invert_mode', 'weather_type', 'scroll_dir', 'character', 'costume',
+                        'music_track', 'sfx_name', 'bool'):
+                empty_label = '(none)' if hint in ('music_track', 'sfx_name') else 'auto'
+                display_buf = buf if buf != '' else empty_label
                 self._btns[f'cycle_{key}'] = self._draw_button(
                     screen, x, y, W, 22, f'◀  {display_buf}  ▶', _C['highlight'])
                 y += 26
@@ -2773,6 +3232,12 @@ class CutsceneEditor:
                             '⊕ Click viewport for Start X,Y', _C['highlight'])
                         y += 24
                 y += 4
+
+        if self._form_type in ('play_music', 'play_sfx', 'stop_music') and self.sound_manager is not None:
+            preview_label = '■ Preview Stop' if self._form_type == 'stop_music' else '▶ Preview'
+            self._btns['preview_sound'] = self._draw_button(
+                screen, x, y, W, _BTN_H, preview_label, _SOUND_COLOR)
+            y += _BTN_H + 6
 
         y += 6
         self._btns['form_commit'] = self._draw_button(

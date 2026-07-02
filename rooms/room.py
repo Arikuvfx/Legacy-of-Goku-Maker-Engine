@@ -38,6 +38,7 @@ class Room:
         self.save_points = []
         self.cutscene_triggers = []
         self.world_map_objects = []
+        self.music_objects = []
 
         # Transient rooms are never saved to disk and hidden from the editor.
         # Used for the startup fallback room created by Game._create_default_room.

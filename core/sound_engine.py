@@ -15,8 +15,12 @@ class SoundEngine:
         self.is_music_playing = False
 
         # Sound effects
-        self.sfx_volume = 0.8
+        self.sfx_volume = 0.1
         self.sound_effects = {}
+
+        # Looping sound effects (e.g. transformation aura) — tracks the
+        # Channel each looping sfx is playing on so it can be stopped later.
+        self.looping_channels = {}
 
         # Music tracks
         self.music_tracks = {}
@@ -45,8 +49,8 @@ class SoundEngine:
                 sound.set_volume(self.sfx_volume)
                 self.sound_effects[name] = sound
                 return True
-            except:
-                print(f"Warning: Could not load sound effect: {filepath}")
+            except Exception as e:
+                print(f"Warning: Could not load sound effect '{filepath}': {e}")
                 return False
         else:
             print(f"Warning: Sound effect file not found: {filepath}")
@@ -80,8 +84,8 @@ class SoundEngine:
 
             self.current_music = name
             self.is_music_playing = True
-        except:
-            print(f"Error: Could not play music track: {name}")
+        except Exception as e:
+            print(f"Error: Could not play music track '{name}': {e}")
 
     def stop_music(self, fade_out=True):
         """Stop the current music"""
@@ -104,14 +108,39 @@ class SoundEngine:
         self.is_music_playing = True
 
     def play_sound(self, name):
-        """Play a sound effect"""
+        """Play a sound effect. Returns the Channel it's playing on (or None
+        if it couldn't be played), so callers can poll get_busy() to know
+        when a one-shot effect has finished."""
+        if not self.sfx_enabled:
+            return None
+
+        if name in self.sound_effects:
+            return self.sound_effects[name].play()
+        else:
+            print(f"Warning: Sound effect '{name}' not loaded")
+            return None
+
+    def play_looping_sound(self, name):
+        """Start a sound effect looping indefinitely. No-op if it's already looping."""
         if not self.sfx_enabled:
             return
 
-        if name in self.sound_effects:
-            self.sound_effects[name].play()
-        else:
+        if name not in self.sound_effects:
             print(f"Warning: Sound effect '{name}' not loaded")
+            return
+
+        channel = self.looping_channels.get(name)
+        if channel is not None and channel.get_busy():
+            return  # Already looping — don't restart it.
+
+        self.looping_channels[name] = self.sound_effects[name].play(loops=-1)
+
+    def stop_looping_sound(self, name):
+        """Stop a looping sound effect started with play_looping_sound."""
+        channel = self.looping_channels.get(name)
+        if channel is not None:
+            channel.stop()
+            self.looping_channels[name] = None
 
     def set_music_volume(self, volume):
         """Set music volume (0.0 to 1.0)"""
@@ -141,6 +170,7 @@ class SoundEngine:
         pygame.mixer.music.stop()
         for sound in self.sound_effects.values():
             sound.stop()
+        self.looping_channels.clear()
         pygame.mixer.quit()
 
 
@@ -238,8 +268,45 @@ class SoundManager:
             self.set_context('exploration')
 
     def play_sfx(self, sfx_name):
-        """Play a sound effect"""
-        self.sound_engine.play_sound(sfx_name)
+        """Play a sound effect. Returns the Channel it's playing on (or None),
+        so callers can poll get_busy() to know when it has finished."""
+        return self.sound_engine.play_sound(sfx_name)
+
+    def play_music(self, track_name, loops=-1, fade_in=True):
+        """Directly play a track by name, bypassing the exploration/battle/
+        boss context map entirely. Intended for room-level Music objects.
+
+        NOTE: because this bypasses set_context(), it does NOT update
+        self.current_context. That means update_battle_state() will still
+        switch to the 'battle'/'boss' context map entries when enemies
+        appear (as before), and when combat ends it will call
+        set_context('exploration'), which resumes context_music['exploration']
+        — the generic exploration theme, NOT whatever room track was playing
+        via this method. If you want a room's custom track to resume after
+        combat instead of the generic theme, the cleanest fix is to have the
+        caller also update self.context_music['exploration'] = track_name
+        when applying a room's music, and reset it to the default theme name
+        when entering a room with no Music object. That's a product decision
+        this method deliberately doesn't make on its own.
+        """
+        self.sound_engine.play_music(track_name, loops=loops, fade_in=fade_in)
+
+    def stop_music(self, fade_out=True):
+        """Stop whatever music is currently playing, regardless of how it was
+        started (context map, a room's Music object, or a direct play_music
+        call) — it doesn't touch self.current_context, so nothing "resumes"
+        into it automatically afterwards. Callers that want a specific
+        context playing again should call set_context() instead/afterwards.
+        """
+        self.sound_engine.stop_music(fade_out=fade_out)
+
+    def play_looping_sfx(self, sfx_name):
+        """Start a looping sound effect (e.g. transformation aura). Idempotent."""
+        self.sound_engine.play_looping_sound(sfx_name)
+
+    def stop_looping_sfx(self, sfx_name):
+        """Stop a looping sound effect started with play_looping_sfx."""
+        self.sound_engine.stop_looping_sound(sfx_name)
 
     def reset_battle_timer(self):
         """Reset the battle music timer"""
@@ -269,32 +336,63 @@ class AudioAssetLoader:
         assets/audio/
             music/
                 exploration.ogg
-                battle.ogg
+                battle.it          ← tracker/module music (see note below)
                 boss.ogg
                 dev_menu.ogg
             sfx/
-                blast.wav
-                hit.wav
-                etc.
+                combat/
+                    punch.wav
+                    enemy_hit.wav
+                misc/
+                    footstep_run.wav
+                    menu_select.wav
+                blast.wav           ← files directly in sfx/ still work too
+
+        SFX are looked up by bare filename (no extension, no folder), same as
+        before — subfolders are just for your own organization and don't
+        affect play_sfx() calls. play_sfx('footstep_run') works whether the
+        file lives at sfx/footstep_run.wav or sfx/misc/footstep_run.wav.
+        Any folder depth works; add more categories freely.
+
+        Tracker module music (.it / .xm / .s3m / .mod)
+        ------------------------------------------------
+        pygame.mixer.music plays these natively through SDL_mixer — no extra
+        code needed beyond recognizing the extension here. The big win over
+        .ogg/.mp3 is looping: tracker formats store their own loop/restart
+        position inside the file, so play_music(name, loops=-1) loops back to
+        a sample-accurate point with no seam, instead of just restarting at
+        byte 0. Drop .it files in assets/audio/music/ like any other track —
+        SoundEngine.play_music()/stop_music() don't need to know the format.
+
+        Requires SDL_mixer to have been built with module support (true for
+        the official pygame PyPI wheels, SDL_mixer 2.0.2+). If a .it file
+        fails to load, play_music()'s except branch will print an error —
+        check pygame.mixer.get_sdl_mixer_version() if that happens.
         """
         music_path = os.path.join(base_path, 'music')
         sfx_path = os.path.join(base_path, 'sfx')
 
-        # Load music tracks
+        # Load music tracks — includes tracker/module formats alongside the
+        # usual streamed formats; SDL_mixer auto-detects from file content.
+        MUSIC_EXTENSIONS = ('.ogg', '.mp3', '.wav', '.it', '.xm', '.s3m', '.mod')
         if os.path.exists(music_path):
             for filename in os.listdir(music_path):
-                if filename.endswith(('.ogg', '.mp3', '.wav')):
+                if filename.lower().endswith(MUSIC_EXTENSIONS):
                     name = os.path.splitext(filename)[0]
                     filepath = os.path.join(music_path, filename)
                     sound_engine.load_music(name, filepath)
                     print(f" Loaded music: {name}")
 
-        # Load sound effects
+        # Load sound effects — walks the full sfx/ tree so category subfolders
+        # (combat/, misc/, etc.) are picked up, not just the top level.
         if os.path.exists(sfx_path):
-            for filename in os.listdir(sfx_path):
-                if filename.endswith('.wav'):
-                    name = os.path.splitext(filename)[0]
-                    filepath = os.path.join(sfx_path, filename)
-                    sound_engine.load_sound_effect(name, filepath)
-                    print(f" Loaded SFX: {name}")
-
+            for root, _dirs, filenames in os.walk(sfx_path):
+                for filename in filenames:
+                    if filename.lower().endswith('.wav'):
+                        name = os.path.splitext(filename)[0]
+                        if name in sound_engine.sound_effects:
+                            print(f"⚠️ Duplicate SFX name '{name}' — "
+                                  f"{os.path.join(root, filename)} overwrites the earlier one")
+                        filepath = os.path.join(root, filename)
+                        sound_engine.load_sound_effect(name, filepath)
+                        print(f" Loaded SFX: {name}")
