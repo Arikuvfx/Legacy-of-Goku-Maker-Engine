@@ -70,18 +70,27 @@ class CharacterSwitchMenu:
     def _discover_characters():
         import json
         chars_dir = 'assets/characters'
-        order_file = 'assets/character_menu_order.json'
+        # character_creator.py consolidated order + deletions into this one
+        # file (see MENU_FILE / save_character_menu() there): a dict shaped
+        # like {"order": [...], "removed": [...]}. This used to point at
+        # assets/character_menu_order.json (a plain list) — that was the old
+        # pre-consolidation location the creator migrated away from, so it
+        # never got written to anymore and this menu silently fell back to
+        # alphabetical order (which is why "gohan" showed before "goku").
+        menu_file = 'assets/character_menu.json'
 
         if not os.path.isdir(chars_dir):
             return []
 
         # Load the custom order saved by the character creator (may not exist yet)
         saved_order = []
+        removed = set()
         try:
-            with open(order_file, 'r') as f:
+            with open(menu_file, 'r') as f:
                 data = json.load(f)
-            if isinstance(data, list):
-                saved_order = [str(x) for x in data]
+            if isinstance(data, dict):
+                saved_order = [str(x) for x in data.get('order', [])]
+                removed = {str(x) for x in data.get('removed', [])}
         except Exception:
             pass
 
@@ -99,6 +108,12 @@ class CharacterSwitchMenu:
             if not isinstance(cfg, dict):
                 continue
             char_id = cfg.get('id') or filename[:-5]
+            if char_id in removed:
+                # Matches character_creator.py's discover_characters(): a
+                # character explicitly deleted in the creator shouldn't
+                # still show up here just because its config file/sprite
+                # folder happens to still exist on disk.
+                continue
             configs[char_id] = cfg
 
         # Apply the saved order: known IDs first, then any new ones alphabetically
@@ -253,14 +268,14 @@ class CharacterSwitchMenu:
         key = event.key
 
         if key == pygame.K_LEFT:
-            self._set_button_pressed('left')
             if self.selected_character > 0:
+                self._set_button_pressed('left')
                 self.selected_character -= 1
                 self._reset_char_anim(self.selected_character)
 
         elif key == pygame.K_RIGHT:
-            self._set_button_pressed('right')
             if self.selected_character < len(self.characters) - 1:
+                self._set_button_pressed('right')
                 self.selected_character += 1
                 self._reset_char_anim(self.selected_character)
 

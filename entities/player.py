@@ -53,6 +53,14 @@ class Player:
         self.stat_points = 0
         self.pending_level_up = False
 
+        # -----------------------------------------------------------------
+        # Passive ki regen — like Buu's Fury: a small trickle back every so
+        # often, even while just standing around (not tied to combat).
+        # -----------------------------------------------------------------
+        self.ki_regen_interval = 10.0        # Seconds between regen ticks
+        self.ki_regen_percent  = 0.05        # 5% of max_ki per tick
+        self.ki_regen_timer    = 0.0
+
         self.direction = 'down'
         self.inventory = []
         self.is_running = False
@@ -90,6 +98,15 @@ class Player:
         self.costume = costume
         self.current_animation_state = 'idle'
 
+        # Stand-still ("idle wait") timer. After IDLE_WAIT_DELAY seconds of
+        # being in the plain 'idle' state, we play idle_transition (the
+        # varying-length lead-in frames, once) then settle into idle_wait
+        # (the actual looping wait pose) — both always facing down regardless
+        # of self.direction. Reset via enter_idle() any time the player
+        # returns to normal idle. See update()'s animation-state machine.
+        self.idle_timer = 0.0
+        self.IDLE_WAIT_DELAY = 5.0
+
         # -----------------------------------------------------------------
         # Ki attack state
         # -----------------------------------------------------------------
@@ -114,6 +131,18 @@ class Player:
 
         # Blast is queued here and spawned once the kiblast animation finishes
         self.pending_blast = None
+
+        # While Q is held, hold-fire animations alternate frame 2 / frame 1.
+        # Reset to 2 so the first hold-fire shot after the initial 0->1 throw
+        # always starts on frame 2 (see _advance_blast_or_idle).
+        self._blast_hold_frame = 2
+
+        # Set by _advance_blast_or_idle() when chaining into another hold-fire
+        # shot. Deliberately NOT the same variable as pending_blast — arming
+        # pending_blast immediately would overwrite the 'ready' flag from the
+        # shot that just finished before game.py has a chance to read it and
+        # spawn its projectile. Consumed one frame later, at the top of update().
+        self._queue_next_pending = False
 
         # -----------------------------------------------------------------
         # Double-tap detection for dashes / special inputs
@@ -260,6 +289,17 @@ class Player:
         """Ki cost for the current attack (0 while transformed — free attacks)."""
         return 0 if self.is_transformed() else self.blast_ki_cost
 
+    def enter_idle(self):
+        """Return to standing idle and (re)start the stand-still timer.
+
+        Centralized so every place that snaps back to idle also resets the
+        idle-wait clock — otherwise stopping right as the wait animation was
+        about to trigger would carry a stale timer into the next stand-still.
+        """
+        self.sprite.set_animation('idle', self.direction)
+        self.current_animation_state = 'idle'
+        self.idle_timer = 0.0
+
     # =========================================================================
     # Collision helpers
     # =========================================================================
@@ -295,6 +335,16 @@ class Player:
     # =========================================================================
 
     def move(self, dx, dy, is_running, world_width, world_height):
+        """Apply one frame of directional input.
+
+        dx/dy are the raw -1/0/1 input axes (not yet scaled by speed). Movement
+        is resolved per-axis so the player slides along walls on a diagonal
+        instead of being fully stopped by a corner. Updates facing direction
+        (diagonals keep the last cardinal facing to avoid sprite flicker),
+        picks walk/run animation, and sets self._blocked_x/_blocked_y so
+        game.py can trigger collision knockback when a real wall stops motion.
+        No-ops entirely if can_move() is False (mid-attack, knocked back, etc.).
+        """
         if not self.can_move():
             return
 
@@ -419,6 +469,58 @@ class Player:
         ox, oy = self._get_spawn_offset()
         return self.x + ox, self.y + oy
 
+    def _can_continue_blast_hold(self):
+        """Like can_act(), but ignores is_attacking — we're evaluating this from
+        inside the attack's own finish handler, so is_attacking is still True."""
+        if self.is_transitioning or self.is_map_jumping or self.is_collision_knockback:
+            return False
+        if self.transformation and not self.transformation.can_player_act():
+            return False
+        return not self.is_knocked_back
+
+    def _advance_blast_or_idle(self):
+        """Called when a kiblast (or kiblast-hold) throw animation finishes.
+
+        If Q is still held, we're in blast mode, and there's enough ki for
+        another shot, keep firing — alternating the hold animation between
+        frame 2 and frame 1 each time, spawning a blast on every switch.
+        Otherwise, drop back to idle.
+        """
+        ki_cost = self.get_current_ki_cost()
+
+        if (self.is_q_pressed and self._can_continue_blast_hold()
+                and self.ki_attack_mode == 'blast' and self.ki >= ki_cost):
+            # Use the CURRENT hold frame for this shot (2 on the first hold-fire
+            # shot), then flip it for next time: 2, 1, 2, 1, ...
+            next_frame = self._blast_hold_frame
+            hold_anim = f'kiblast_hold{next_frame}'
+
+            # Safety net: if this animation somehow isn't loaded, switching to it
+            # would silently no-op and leave the sprite stuck on the already-
+            # finished previous animation — which would retrigger this method
+            # every single frame instead of once per cycle. Bail to idle instead.
+            if not self.sprite.has_animation(hold_anim, self.direction):
+                self.is_attacking = False
+                self._blast_hold_frame = 2
+                self.enter_idle()
+                return
+
+            self.ki -= ki_cost
+            self.is_attacking = True
+            self.attack_cooldown = 0.5
+            self._blast_hold_frame = 1 if next_frame == 2 else 2
+            self.sprite.set_animation(hold_anim, self.direction)
+            self.current_animation_state = 'kiblast_hold'
+
+            # Don't touch pending_blast here — it may still be 'ready' from the
+            # shot that just finished, awaiting game.py's spawn check this same
+            # frame. Queue it for arming next frame instead (see update()).
+            self._queue_next_pending = True
+        else:
+            self.is_attacking = False
+            self._blast_hold_frame = 2  # Reset so the next fresh press starts on frame 2
+            self.enter_idle()
+
     def start_charging_beam(self):
         """Begin the beam charge animation. Returns True on success."""
         if not self.can_act():
@@ -466,8 +568,7 @@ class Player:
         self.current_beam = None
 
         if self.current_animation_state in ('charge', 'kiblast', 'firebeam'):
-            self.sprite.set_animation('idle', self.direction)
-            self.current_animation_state = 'idle'
+            self.enter_idle()
 
     def start_transform_animation(self):
         """Begin the transform animation — always faces down regardless of current direction."""
@@ -509,6 +610,10 @@ class Player:
         self._map_jump_frames      = []
         self._map_jump_frame_idx   = 0
         self._map_jump_frame_timer = 0.0
+        # Pre-scaled-frame cache for draw() — reset here since a fresh load
+        # means new source Surface objects (stale entries would point at
+        # frames that no longer match this direction/sheet).
+        self._map_jump_scaled_cache = {}
 
         try:
             sheet      = pygame.image.load(path).convert_alpha()
@@ -755,8 +860,7 @@ class Player:
                 # Only snap to idle if regular damage knockback has also finished.
                 # If both triggered at once, let the damage-knockback path handle it.
                 if not self.is_knocked_back:
-                    self.sprite.set_animation('idle', self.direction)
-                    self.current_animation_state = 'idle'
+                    self.enter_idle()
                 return  # Skip the rest of update while we're mid-bounce
 
         # Tick the post-knockback cooldown so repeated wall-running doesn't
@@ -809,8 +913,7 @@ class Player:
                 # If the hurt animation already finished while knockback was running,
                 # we missed the transition window — force idle now.
                 if self.current_animation_state == 'hurt' and not self.is_collision_knockback:
-                    self.sprite.set_animation('idle', self.direction)
-                    self.current_animation_state = 'idle'
+                    self.enter_idle()
 
         # ------------------------------------------------------------------
         # I-frame timer
@@ -820,9 +923,33 @@ class Player:
             if self.invulnerable_timer <= 0:
                 self.invulnerable = False
 
+        # ------------------------------------------------------------------
+        # Arm pending_blast for a queued hold-fire shot. Deferred by one frame
+        # from _advance_blast_or_idle() so it doesn't overwrite the 'ready'
+        # flag from the previous shot before game.py has spawned it.
+        # ------------------------------------------------------------------
+        if self._queue_next_pending:
+            self._queue_next_pending = False
+            self.pending_blast = True
+
         # Attack cooldown
         if self.attack_cooldown > 0:
             self.attack_cooldown -= dt
+
+        # ------------------------------------------------------------------
+        # Passive ki regen — ticks continuously regardless of what else the
+        # player is doing (uses a running timer so it's independent of
+        # attack_cooldown and doesn't get reset by combat).
+        # ------------------------------------------------------------------
+        if self.ki < self.max_ki:
+            self.ki_regen_timer += dt
+            if self.ki_regen_timer >= self.ki_regen_interval:
+                self.ki_regen_timer -= self.ki_regen_interval
+                self.ki = min(self.max_ki, self.ki + self.max_ki * self.ki_regen_percent)
+        else:
+            # Don't let the timer build up while already at full ki, so regen
+            # doesn't "fast forward" the moment a blast is fired.
+            self.ki_regen_timer = 0.0
 
         # ------------------------------------------------------------------
         # Sprite animation tick — must happen before the animation-state checks
@@ -852,24 +979,46 @@ class Player:
         elif self.current_animation_state == 'melee':
             if self.sprite.is_animation_finished():
                 self.is_attacking = False
-                self.sprite.set_animation('idle', self.direction)
-                self.current_animation_state = 'idle'
+                self.enter_idle()
 
         elif self.current_animation_state == 'kiblast':
             if self.sprite.is_animation_finished():
-                self.is_attacking = False
                 # Raise the 'ready' flag so the game loop knows it can spawn the projectile now
                 if self.pending_blast:
                     self.pending_blast = 'ready'
-                self.sprite.set_animation('idle', self.direction)
-                self.current_animation_state = 'idle'
+                self._advance_blast_or_idle()
+
+        elif self.current_animation_state == 'kiblast_hold':
+            if self.sprite.is_animation_finished():
+                if self.pending_blast:
+                    self.pending_blast = 'ready'
+                self._advance_blast_or_idle()
 
         elif self.current_animation_state == 'hurt':
             if self.sprite.is_animation_finished():
                 # Don't snap to idle until both knockback types have cleared
                 if not self.is_knocked_back and not self.is_collision_knockback:
-                    self.sprite.set_animation('idle', self.direction)
-                    self.current_animation_state = 'idle'
+                    self.enter_idle()
+
+        elif self.current_animation_state == 'idle':
+            # Stand-still timer — after IDLE_WAIT_DELAY seconds of plain idle,
+            # kick off the wait animation. idle_transition plays its (variable-
+            # length) lead-in frames once, then hands off to the looping
+            # idle_wait pose. Both are hardcoded to 'down' below regardless of
+            # self.direction, so a character idling while facing left/right/up
+            # still turns to face the camera for the wait.
+            self.idle_timer += dt
+            if self.idle_timer >= self.IDLE_WAIT_DELAY and self.sprite.has_animation('idle_transition', 'down'):
+                self.sprite.set_animation('idle_transition', 'down')
+                self.current_animation_state = 'idle_transition'
+
+        elif self.current_animation_state == 'idle_transition':
+            if self.sprite.is_animation_finished():
+                self.sprite.set_animation('idle_wait', 'down')
+                self.current_animation_state = 'idle_wait'
+
+        elif self.current_animation_state == 'idle_wait':
+            pass  # Loops in place until movement/an action interrupts it elsewhere
 
         elif self.current_animation_state == 'charge':
             if self.is_charging_beam and not self.is_q_pressed:
@@ -882,8 +1031,7 @@ class Player:
                 self._tick_beam_ki_drain(dt)
             else:
                 # Beam stopped externally (e.g. enemy killed us mid-fire)
-                self.sprite.set_animation('idle', self.direction)
-                self.current_animation_state = 'idle'
+                self.enter_idle()
 
         # Safety fallback — if the beam is still firing but the animation state
         # drifted out of 'firebeam' somehow, drain Ki and check for stop.
@@ -911,12 +1059,24 @@ class Player:
     def draw(self, screen, camera, colors):
         """Draw the player sprite with the current hurt tint applied."""
         if self.is_map_jumping and self._map_jump_frames:
-            frame  = self._map_jump_frames[self._map_jump_frame_idx]
+            idx    = self._map_jump_frame_idx
             sx     = int(self.x * RENDER_SCALE - camera.x)
             sy     = int(self.y * RENDER_SCALE - camera.y)
-            w      = int(self.width  * RENDER_SCALE)
-            h      = int(frame.get_height() * RENDER_SCALE)
-            scaled = pygame.transform.scale(frame, (w, h))
+            w      = int(self.width * RENDER_SCALE)
+            h      = int(self._map_jump_frames[idx].get_height() * RENDER_SCALE)
+
+            # Scaling is deterministic per frame index (same source frame,
+            # same target size every time), so cache it instead of re-scaling
+            # on every single frame of the ascent. Cache is reset in
+            # start_map_jump() whenever a new jump sequence starts.
+            cache = getattr(self, '_map_jump_scaled_cache', None)
+            if cache is None:
+                cache = self._map_jump_scaled_cache = {}
+            scaled = cache.get(idx)
+            if scaled is None:
+                scaled = pygame.transform.scale(self._map_jump_frames[idx], (w, h))
+                cache[idx] = scaled
+
             screen.blit(scaled, scaled.get_rect(center=(sx, sy)))
             return
 

@@ -121,11 +121,11 @@ def discover_characters() -> list[str]:
     """
     if not SPRITES_DIR.exists():
         return []
+    order, removed = load_character_menu()
     found = sorted(
         d.name for d in SPRITES_DIR.iterdir()
-        if d.is_dir() and not d.name.startswith(".")
+        if d.is_dir() and not d.name.startswith(".") and d.name not in removed
     )
-    order = load_character_order()
     if not order:
         return found
     found_set = set(found)
@@ -418,59 +418,120 @@ def delete_config(char_id: str) -> None:
         path.unlink()
 
 
-# ── Custom menu order ───────────────────────────────────────────────
-# Lets the ▲/▼ controls in the character list (and anything else that
-# calls discover_characters(), e.g. an in-game character-select menu)
-# show characters in a hand-picked order instead of always alphabetical.
+# ── Character menu state (order + deletions) ────────────────────────
+# One small file holds everything the roster needs beyond the sprite
+# folders and per-character configs themselves:
+#   - "order":   hand-picked ordering from the ▲/▼ controls
+#   - "removed": IDs explicitly deleted via the character creator
 #
-# This lives next to assets/characters/, NOT inside it — anything that
+# It lives next to assets/characters/, NOT inside it — anything that
 # scans assets/characters/*.json and treats each file as a character
-# config (e.g. a character-select menu calling cfg.get('id')) would
-# choke on this file, since its contents are a JSON list, not a dict.
-ORDER_FILE         = CHARACTERS_DIR.parent / "character_menu_order.json"
-_LEGACY_ORDER_FILE = CHARACTERS_DIR / "_order.json"   # old, broken location
+# config (e.g. an in-game character-select menu calling cfg.get('id'))
+# would choke on this file otherwise.
+#
+# discover_characters() lists sprite sub-folders, not config files, so
+# deleting a character's config alone doesn't make it disappear from
+# the roster (its sprite folder is still on disk) — "removed" tracks
+# IDs the user explicitly deleted so they stay hidden even after the
+# tool is reopened, without touching any sprite assets. Re-creating a
+# character with the same ID (via "New") clears it from "removed" again.
+MENU_FILE           = CHARACTERS_DIR.parent / "character_menu.json"
+_LEGACY_ORDER_FILE   = CHARACTERS_DIR / "_order.json"                    # oldest, broken location
+_LEGACY_ORDER_FILE_2 = CHARACTERS_DIR.parent / "character_menu_order.json"    # pre-consolidation
+_LEGACY_REMOVED_FILE = CHARACTERS_DIR.parent / "character_menu_removed.json"  # pre-consolidation
 
 
-def _migrate_legacy_order_file() -> None:
-    """One-time cleanup for projects that saved an order with an earlier
-    version of this tool, which wrote the file inside assets/characters/.
-    Moves its contents to ORDER_FILE, then deletes the old copy so it
-    stops being mistaken for a character config."""
-    try:
-        data = json.loads(_LEGACY_ORDER_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, list):
-            save_character_order([str(cid) for cid in data])
-    except Exception:
-        pass
-    finally:
+def _migrate_legacy_menu_files() -> None:
+    """One-time cleanup: earlier versions of this tool stored order (and
+    later, deletions) in one or two separate files. Pull whatever's found
+    into MENU_FILE, then remove the old files so they aren't mistaken for
+    something else and don't linger as clutter."""
+    order:   list[str] = []
+    removed: list[str] = []
+
+    if _LEGACY_ORDER_FILE.exists():
         try:
-            _LEGACY_ORDER_FILE.unlink()
+            data = json.loads(_LEGACY_ORDER_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                order = [str(cid) for cid in data]
+        except Exception:
+            pass
+    if _LEGACY_ORDER_FILE_2.exists():
+        try:
+            data = json.loads(_LEGACY_ORDER_FILE_2.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                order = [str(cid) for cid in data]
+        except Exception:
+            pass
+    if _LEGACY_REMOVED_FILE.exists():
+        try:
+            data = json.loads(_LEGACY_REMOVED_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                removed = [str(cid) for cid in data]
+        except Exception:
+            pass
+
+    if order or removed:
+        save_character_menu(order, removed)
+
+    for legacy in (_LEGACY_ORDER_FILE, _LEGACY_ORDER_FILE_2, _LEGACY_REMOVED_FILE):
+        try:
+            legacy.unlink()
         except Exception:
             pass
 
 
-def load_character_order() -> list[str]:
-    """Return the saved custom menu ordering of character IDs.
-    May be stale (reference deleted characters, omit new ones) — callers
-    should reconcile against the real folder list. Returns [] if no
-    custom order has been saved yet."""
-    if not ORDER_FILE.exists() and _LEGACY_ORDER_FILE.exists():
-        _migrate_legacy_order_file()
-    if not ORDER_FILE.exists():
-        return []
+def load_character_menu() -> tuple[list[str], set[str]]:
+    """Return (order, removed) from MENU_FILE. order may be stale
+    (reference deleted characters, omit new ones) — callers should
+    reconcile against the real folder list. Returns ([], set()) if
+    nothing has been saved yet."""
+    if not MENU_FILE.exists() and (
+        _LEGACY_ORDER_FILE.exists() or _LEGACY_ORDER_FILE_2.exists() or _LEGACY_REMOVED_FILE.exists()
+    ):
+        _migrate_legacy_menu_files()
+    if not MENU_FILE.exists():
+        return [], set()
     try:
-        data = json.loads(ORDER_FILE.read_text(encoding="utf-8"))
-        if isinstance(data, list):
-            return [str(cid) for cid in data]
+        data = json.loads(MENU_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            order   = [str(cid) for cid in data.get("order", [])]
+            removed = {str(cid) for cid in data.get("removed", [])}
+            return order, removed
     except Exception:
         pass
-    return []
+    return [], set()
+
+
+def save_character_menu(order: list[str], removed: list[str] | set[str]) -> None:
+    """Persist both the menu ordering and the deleted-character list together."""
+    MENU_FILE.parent.mkdir(parents=True, exist_ok=True)
+    MENU_FILE.write_text(
+        json.dumps({"order": order, "removed": sorted(removed)}, indent=2),
+        encoding="utf-8",
+    )
+
+
+def load_character_order() -> list[str]:
+    """Return just the saved custom menu ordering of character IDs."""
+    order, _removed = load_character_menu()
+    return order
+
+
+def load_removed_characters() -> set[str]:
+    """Return just the set of explicitly-deleted character IDs."""
+    _order, removed = load_character_menu()
+    return removed
 
 
 def save_character_order(order: list[str]) -> None:
-    """Persist the menu ordering of character IDs."""
-    ORDER_FILE.parent.mkdir(parents=True, exist_ok=True)
-    ORDER_FILE.write_text(json.dumps(order, indent=2), encoding="utf-8")
+    """Persist the menu ordering, keeping the removed list untouched."""
+    save_character_menu(order, load_removed_characters())
+
+
+def save_removed_characters(removed: set[str]) -> None:
+    """Persist the removed-character list, keeping the order untouched."""
+    save_character_menu(load_character_order(), removed)
 
 
 
@@ -540,21 +601,62 @@ def sync_transformations(cfg: dict, costumes: list[str],
 #  Tiny widget helpers (all draw onto a given surface)
 # ══════════════════════════════════════════════════════════════════════
 
+# ── Cached text rendering (perf) ────────────────────────────────────────
+# pygame's font.render() rasterizes glyphs from scratch on every call, and
+# this editor calls it dozens of times per frame (every button, label,
+# header, and list row re-renders its text every draw() even though most
+# of that text — button captions, section headers, tab names, hint
+# strings, character-list rows — is identical to what was drawn a frame
+# ago). That's wasted CPU for a picture that hasn't changed.
+#
+# render_text_cached() memoizes by (font, exact text, colour): the first
+# time a given combo is drawn it renders and stores the Surface; every
+# repeat afterwards is a dict lookup instead of a re-rasterize. The cache
+# is safe to use anywhere the *set* of distinct text+colour combinations
+# is small and stable (button labels, headers, list entries, tab names,
+# character/attack IDs, status messages, ...).
+#
+# Deliberately NOT routed through this cache: text that changes on every
+# frame or keystroke — slider values while dragging, the text-input's
+# live contents, per-frame animation-frame counters. Those have
+# effectively unlimited distinct values, so caching them would just leak
+# Surfaces into this dict forever for no benefit.
+_TEXT_RENDER_CACHE: dict[tuple[int, str, tuple], pygame.Surface] = {}
+
+
+def render_text_cached(font: pygame.font.Font, text: str, color) -> pygame.Surface:
+    """Cached equivalent of font.render(text, True, color) for text that
+    repeats identically across frames. See _TEXT_RENDER_CACHE note above —
+    don't use this for text with high/unbounded variety."""
+    key = (id(font), text, tuple(color))
+    surface = _TEXT_RENDER_CACHE.get(key)
+    if surface is None:
+        surface = font.render(text, True, color)
+        _TEXT_RENDER_CACHE[key] = surface
+    return surface
+
+
 def draw_rect_outline(surf: pygame.Surface, rect: pygame.Rect,
                       color=C_BORDER, radius=4, width=1) -> None:
+    """Draw a rounded outline only (no fill) — used for panel/box borders."""
     pygame.draw.rect(surf, color, rect, width, border_radius=radius)
 
 
 def draw_label(surf: pygame.Surface, font: pygame.font.Font,
                text: str, x: int, y: int, color=C_TEXT_DIM) -> None:
-    surf.blit(font.render(text, True, color), (x, y))
+    """Blit a plain text label at (x, y). Text is cached (see above) since
+    field labels ("Power", "Speed", ...) are the same string every frame."""
+    surf.blit(render_text_cached(font, text, color), (x, y))
 
 
 def draw_section_header(surf: pygame.Surface, font: pygame.font.Font,
                          text: str, rect: pygame.Rect) -> None:
+    """Draw a horizontal divider line with a small caption label on top of
+    it, used to separate groups of widgets within a tab (e.g. 'Equipped
+    Attacks', 'Edit Selected')."""
     pygame.draw.line(surf, C_BORDER,
                      (rect.x, rect.y + 8), (rect.right, rect.y + 8))
-    lbl = font.render(f"  {text}  ", True, C_TEXT_DIM)
+    lbl = render_text_cached(font, f"  {text}  ", C_TEXT_DIM)
     surf.blit(lbl, (rect.x + 12, rect.y))
 
 
@@ -672,7 +774,14 @@ class Slider:
 
 
 class StatBar:
-    """Read-only coloured bar for stat display."""
+    """Read-only coloured bar for stat display.
+
+    Note: not currently wired into any tab (the Stats tab uses plain
+    Sliders instead) — kept as a ready-made widget for a future
+    read-only stat summary view. `value` changes constantly wherever a
+    live stat is shown, so its text is intentionally NOT cached (see
+    render_text_cached notes above).
+    """
     H = 18
 
     @staticmethod
@@ -695,11 +804,15 @@ def draw_button(surf: pygame.Surface, font: pygame.font.Font,
                 rect: pygame.Rect, label: str,
                 color=C_ACCENT, hover: bool = False,
                 danger: bool = False) -> None:
+    """Draw a rounded, optionally-hover-highlighted button with a caption.
+    Every button on screen (Save, Delete, tab arrows, dialog Confirm/
+    Cancel, ...) goes through here, so the caption text is cached — the
+    same handful of labels get redrawn every single frame."""
     base = (200, 60, 60) if danger else color
     bg   = tuple(min(255, c + 30) for c in base) if hover else C_PANEL
     pygame.draw.rect(surf, bg, rect, border_radius=5)
     pygame.draw.rect(surf, base, rect, 1, border_radius=5)
-    txt = font.render(label, True, base if not hover else C_TEXT)
+    txt = render_text_cached(font, label, base if not hover else C_TEXT)
     surf.blit(txt, txt.get_rect(center=rect.center))
 
 
@@ -775,7 +888,7 @@ class SpritePreview:
                 ph_w, ph_h
             )
             pygame.draw.rect(surf, C_BORDER, ph, border_radius=6)
-            lbl = font_sm.render("no sprites", True, C_TEXT_DIM)
+            lbl = render_text_cached(font_sm, "no sprites", C_TEXT_DIM)
             surf.blit(lbl, lbl.get_rect(centerx=self.rect.centerx,
                                          top=ph.bottom + 6))
 
@@ -879,8 +992,8 @@ class AnimationGridPanel:
         surf.set_clip(self.rect)
 
         if not self.animations:
-            msg = font_sm.render("No animations found for this character / form.",
-                                 True, C_TEXT_DIM)
+            msg = render_text_cached(font_sm, "No animations found for this character / form.",
+                                     C_TEXT_DIM)
             surf.blit(msg, msg.get_rect(center=self.rect.center))
             surf.set_clip(old_clip)
             return
@@ -907,9 +1020,9 @@ class AnimationGridPanel:
             pygame.draw.rect(surf, C_PANEL_DARK, cell, border_radius=8)
             pygame.draw.rect(surf, C_BORDER,     cell, 1, border_radius=8)
 
-            # Label
+            # Label (cached — the animation name itself never changes)
             lbl_text = name if len(name) <= 20 else name[:18] + "…"
-            lbl = font_sm.render(lbl_text, True, C_TEXT_DIM)
+            lbl = render_text_cached(font_sm, lbl_text, C_TEXT_DIM)
             surf.blit(lbl, (cell.x + (cw - lbl.get_width()) // 2, cell.y + 5))
 
             # Animated sprite — centred in the area below the label
@@ -1044,8 +1157,9 @@ class CharacterEditor:
         self.available_attacks = available_attacks or []
         atk.setdefault("equipped_attacks", [])
         self.equipped_attacks: list[str] = atk["equipped_attacks"]
-        self.attack_btn_rects: dict[str, pygame.Rect] = {}   # rebuilt each draw, see _draw_attacks
+        self.attack_btn_rects: dict[str, pygame.Rect] = {}   # rebuilt on demand, see _build_attack_grid
         self._attack_grid_y0 = 0
+        self._attack_grid_cache_key = None   # see _build_attack_grid's memoization
 
         # ── Transformations tab ────────────────────────────────────
         self.cfg.setdefault("transformations", [])
@@ -1272,10 +1386,10 @@ class CharacterEditor:
         btn_bord = C_ACCENT if self.preview_dropdown_open else C_BORDER
         pygame.draw.rect(surf, btn_bg,   btn_rect, border_radius=5)
         pygame.draw.rect(surf, btn_bord, btn_rect, 1, border_radius=5)
-        lbl = font.render(display + counter, True, C_TEXT)
+        lbl = render_text_cached(font, display + counter, C_TEXT)
         surf.blit(lbl, (btn_rect.x + 10,
                         btn_rect.y + (BTN_H - lbl.get_height()) // 2))
-        arrow = font_sm.render("▴" if self.preview_dropdown_open else "▾", True, C_TEXT_DIM)
+        arrow = render_text_cached(font_sm, "▴" if self.preview_dropdown_open else "▾", C_TEXT_DIM)
         surf.blit(arrow, (btn_rect.right - arrow.get_width() - 10,
                           btn_rect.y + (BTN_H - arrow.get_height()) // 2))
 
@@ -1337,18 +1451,18 @@ class CharacterEditor:
                 thumb_box = pygame.Rect(item_rect.x + 4, item_rect.y + 4, THUMB_W, self.THUMB_H)
 
             form_display = form.split("/")[-1] if "/" in form else form
-            name_lbl = font.render(form_display, True,
-                                   C_TEXT if is_sel else C_TEXT_DIM)
+            name_lbl = render_text_cached(font, form_display,
+                                          C_TEXT if is_sel else C_TEXT_DIM)
             surf.blit(name_lbl, (thumb_box.right + 10,
                                  item_rect.y + (item_rect.h - name_lbl.get_height()) // 2))
 
         # Scroll indicators
         if self.preview_dropdown_scroll > 0:
-            up_txt = font_sm.render("▲", True, C_TEXT_DIM)
+            up_txt = render_text_cached(font_sm, "▲", C_TEXT_DIM)
             surf.blit(up_txt, (drop_rect.right - up_txt.get_width() - 6,
                                drop_rect.y + 2))
         if self.preview_dropdown_scroll + VIS < n:
-            dn_txt = font_sm.render("▼", True, C_TEXT_DIM)
+            dn_txt = render_text_cached(font_sm, "▼", C_TEXT_DIM)
             surf.blit(dn_txt, (drop_rect.right - dn_txt.get_width() - 6,
                                drop_rect.bottom - dn_txt.get_height() - 2))
 
@@ -1423,11 +1537,11 @@ class CharacterEditor:
             scaled = pygame.transform.smoothscale(img, (sw, sh))
             surf.blit(scaled, scaled.get_rect(center=rect.center))
         else:
-            ph = font_sm.render("no portrait", True, C_TEXT_DIM)
+            ph = render_text_cached(font_sm, "no portrait", C_TEXT_DIM)
             surf.blit(ph, ph.get_rect(center=rect.center))
 
         cap_txt = f"{label}   ({idx + 1}/{n})" if n > 1 else label
-        cap = font_sm.render(cap_txt, True, C_TEXT_DIM)
+        cap = render_text_cached(font_sm, cap_txt, C_TEXT_DIM)
         surf.blit(cap, (rect.x, rect.bottom + 8))
 
         # Progress dots — one per form, filled for whichever is on screen.
@@ -1445,7 +1559,7 @@ class CharacterEditor:
         y = self.panel.y + 60
 
         draw_label(surf, font_sm, "ID (read-only)", lx, y + 6)
-        id_txt = font.render(self.char_id, True, C_ACCENT)
+        id_txt = render_text_cached(font, self.char_id, C_ACCENT)
         surf.blit(id_txt, (fx, y + 4))
         y += row_h
 
@@ -1463,9 +1577,8 @@ class CharacterEditor:
                     hover=arr_l.collidepoint(mx, my))
         draw_button(surf, font_sm, arr_r, "►",
                     hover=arr_r.collidepoint(mx, my))
-        costume_lbl = font.render(
-            self.costumes[self.costume_idx] if self.costumes else "—",
-            True, C_TEXT
+        costume_lbl = render_text_cached(
+            font, self.costumes[self.costume_idx] if self.costumes else "—", C_TEXT
         )
         surf.blit(costume_lbl, (fx + 34, y + 5))
         y += row_h
@@ -1502,16 +1615,29 @@ class CharacterEditor:
 
     def _build_attack_grid(self) -> None:
         """
-        (Re)compute icon-button rects for every discovered attack. Called
-        from _draw_attacks every frame so it always matches the current
-        panel size; the click handler in CharacterCreator.handle_input()
-        reads the same self.attack_btn_rects, so drawing and hit-testing
-        can never drift out of sync with each other.
+        (Re)compute icon-button rects for every discovered attack.
+
+        Called from _draw_attacks every frame so it always matches the
+        current panel size; the click handler in CharacterCreator.
+        handle_input() reads the same self.attack_btn_rects, so drawing
+        and hit-testing can never drift out of sync with each other.
+
+        PERF: the layout only actually depends on the attack roster, the
+        panel width, and the grid's top y-offset — none of which change
+        from one frame to the next while the Attacks tab just sits open.
+        We memoize on those three things and skip the recompute (which
+        touches every attack, doing a dict rebuild + N Rect allocations)
+        when nothing has actually moved.
 
         Icon size is derived from the actual pixel dimensions of the first
         available icon (HUD PNGs are already sized for display and must not
         be scaled), falling back to ATTACK_ICON_SIZE if nothing is loaded yet.
         """
+        cache_key = (tuple(self.available_attacks), self.panel.w, self._attack_grid_y0)
+        if getattr(self, "_attack_grid_cache_key", None) == cache_key:
+            return  # layout unchanged since last frame — nothing to do
+        self._attack_grid_cache_key = cache_key
+
         self.attack_btn_rects = {}
         if not self.available_attacks:
             return
@@ -1563,10 +1689,11 @@ class CharacterEditor:
         y += 30
 
         if not self.available_attacks:
-            hint = font_sm.render(
+            hint = render_text_cached(
+                font_sm,
                 "No attacks found in assets/sprites/attacks/ — add an attack "
                 "folder (e.g. 'ki_blast') to populate this list.",
-                True, C_TEXT_DIM
+                C_TEXT_DIM,
             )
             surf.blit(hint, (lx, y + 4))
             return
@@ -1592,15 +1719,16 @@ class CharacterEditor:
             pygame.draw.rect(surf, border_col, frame, 2 if selected else 1, border_radius=6)
             surf.blit(icon, draw_rect.topleft)
 
-            label = font_sm.render(
-                aid.replace("_", " ").title(), True, C_TEXT if selected else C_TEXT_DIM
+            # Cached: attack id is fixed, "selected" only ever toggles
+            # between two colours, so the label set is small and stable.
+            label = render_text_cached(
+                font_sm, aid.replace("_", " ").title(), C_TEXT if selected else C_TEXT_DIM
             )
             surf.blit(label, label.get_rect(centerx=draw_rect.centerx, top=draw_rect.bottom + 6))
 
         bottom = max(r.bottom for r in self.attack_btn_rects.values()) + 24
-        hint = font_sm.render(
-            "Click an icon to equip / unequip that attack for this character.",
-            True, C_TEXT_DIM
+        hint = render_text_cached(
+            font_sm, "Click an icon to equip / unequip that attack for this character.", C_TEXT_DIM
         )
         surf.blit(hint, (lx, bottom))
 
@@ -1621,9 +1749,9 @@ class CharacterEditor:
             counter  = f"({self.transform_idx + 1}/{len(self.transformations)})"
         else:
             name_txt, counter = "— none —", ""
-        surf.blit(font.render(name_txt, True, C_TEXT), (fx + 34, y + 5))
+        surf.blit(render_text_cached(font, name_txt, C_TEXT), (fx + 34, y + 5))
         if counter:
-            surf.blit(font_sm.render(counter, True, C_TEXT_DIM), (fx + 200, y + 8))
+            surf.blit(render_text_cached(font_sm, counter, C_TEXT_DIM), (fx + 200, y + 8))
         y += row_h
 
         # ── Add / Remove ─────────────────────────────────────────────
@@ -1637,10 +1765,11 @@ class CharacterEditor:
         y += row_h
 
         if not has_tf:
-            hint = font_sm.render(
+            hint = render_text_cached(
+                font_sm,
                 "No transformations yet — click + Add Transformation "
                 "(e.g. 'ssj', 'ssj2', 'kaioken') to create one.",
-                True, C_TEXT_DIM
+                C_TEXT_DIM,
             )
             surf.blit(hint, (lx, y + 10))
             return
@@ -1662,7 +1791,7 @@ class CharacterEditor:
         draw_button(surf, font_sm, c_arr_r, "►", hover=c_arr_r.collidepoint(mx, my))
         picker_list = self.transform_forms if self.transform_forms else self.costumes
         form_display = picker_list[self.transform_costume_idx] if picker_list else "—"
-        costume_lbl = font.render(form_display, True, C_TEXT)
+        costume_lbl = render_text_cached(font, form_display, C_TEXT)
         surf.blit(costume_lbl, (fx + 34, y + 5))
         y += row_h
 
@@ -1775,7 +1904,7 @@ class CharacterList:
         pygame.draw.rect(surf, C_PANEL_DARK, self.rect, border_radius=6)
         pygame.draw.rect(surf, C_BORDER,     self.rect, 1, border_radius=6)
 
-        hdr = font_sm.render("CHARACTERS", True, C_TEXT_DIM)
+        hdr = render_text_cached(font_sm, "CHARACTERS", C_TEXT_DIM)
         surf.blit(hdr, (self.rect.x + 12, self.rect.y + 10))
 
         mx, my = pygame.mouse.get_pos()
@@ -1803,7 +1932,9 @@ class CharacterList:
             pygame.draw.circle(surf, dot_col,
                                (item_r.x + 12, item_r.centery), 4)
 
-            lbl = font.render(cid, True, C_TEXT if is_sel else C_TEXT_DIM)
+            # Cached: character ids are a small, fixed set, and each one
+            # only ever appears in the selected/unselected colour.
+            lbl = render_text_cached(font, cid, C_TEXT if is_sel else C_TEXT_DIM)
             surf.blit(lbl, (item_r.x + 24, item_r.y + (item_r.h - lbl.get_height()) // 2))
 
         surf.set_clip(old_clip)
@@ -1968,18 +2099,36 @@ class CharacterCreator:
         self.dialog = None
 
     def _do_delete_selected(self) -> None:
-        delete_config(self.selected_id)
-        self._set_status(f"Deleted {self.selected_id}.json", ok=False)
-        self.cfg    = load_config(self.selected_id)
-        self.editor = CharacterEditor(self.editor_rect, self.selected_id, self.cfg, self.costumes,
-                                      available_attacks=self.available_attacks)
-        self.editor.dirty = False
+        deleted_id = self.selected_id
+        delete_config(deleted_id)
+
+        # Remove from the roster itself, not just its config, and persist
+        # that removal so it doesn't reappear next time the panel opens
+        # (discover_characters() would otherwise keep finding its sprite
+        # folder and re-adding it to the list).
+        removed = load_removed_characters()
+        removed.add(deleted_id)
+
+        if deleted_id in self.chars:
+            self.chars.remove(deleted_id)
+        save_character_menu(self.chars, removed)
+        self.char_list.set_chars(self.chars)
+
+        self._set_status(f"Deleted {deleted_id}", ok=False)
+
+        self.selected_id = self.char_list.selected
+        if self.selected_id:
+            self._load_char(self.selected_id)
+        else:
+            self.editor = None
 
     def _do_create_char(self, new_id: str) -> None:
+        order, removed = load_character_menu()
+        removed.discard(new_id)
         if new_id not in self.chars:
             self.chars.append(new_id)   # lands at the end of the menu order;
             self.char_list.set_chars(self.chars, new_id)   # move it with ▲/▼ if needed
-            save_character_order(self.chars)
+        save_character_menu(self.chars, removed)
         self._switch_char(new_id)
 
     # ── Transformations ──────────────────────────────────────────
@@ -2101,7 +2250,7 @@ class CharacterCreator:
             pygame.draw.rect(screen, C_DIALOG_BG, dlg, border_radius=8)
             pygame.draw.rect(screen, C_BORDER,    dlg, 1, border_radius=8)
 
-            msg = self.font.render(d["message"], True, C_TEXT)
+            msg = render_text_cached(self.font, d["message"], C_TEXT)
             screen.blit(msg, msg.get_rect(centerx=dlg.centerx, top=dlg.y + 28))
 
             btn_ok = pygame.Rect(dlg.x + 30,      dlg.bottom - 52, 160, 36)
@@ -2116,16 +2265,16 @@ class CharacterCreator:
             pygame.draw.rect(screen, C_DIALOG_BG, dlg, border_radius=8)
             pygame.draw.rect(screen, C_BORDER,    dlg, 1, border_radius=8)
 
-            msg = self.font.render(d["message"], True, C_TEXT)
+            msg = render_text_cached(self.font, d["message"], C_TEXT)
             screen.blit(msg, (dlg.x + 24, dlg.y + 24))
 
             d["field"].rect = pygame.Rect(dlg.x + 24, dlg.y + 80, W - 48, 32)
             d["field"].draw(screen, self.font_sm, dt)
 
-            hint = self.font_sm.render("lowercase, underscores only", True, C_TEXT_DIM)
+            hint = render_text_cached(self.font_sm, "lowercase, underscores only", C_TEXT_DIM)
             screen.blit(hint, (dlg.x + 24, d["field"].rect.bottom + 4))
             if d["error"]:
-                err = self.font_sm.render(d["error"], True, C_RED)
+                err = render_text_cached(self.font_sm, d["error"], C_RED)
                 screen.blit(err, (dlg.x + 24, d["field"].rect.bottom + 4))
 
             btn_ok = pygame.Rect(dlg.x + 30,      dlg.bottom - 50, 160, 34)
@@ -2201,7 +2350,7 @@ class CharacterCreator:
                     self.editor._reload_anim_grid(self.selected_id, new_costume)
 
             if self.active_tab == TAB_ATTACKS and self.editor:
-                # attack_btn_rects is rebuilt every draw() call (see
+                # attack_btn_rects is kept in sync with _draw_attacks (see
                 # CharacterEditor._build_attack_grid), so it always reflects
                 # the icons currently on screen — no separate layout math
                 # needed here, just hit-test against it directly.
@@ -2305,9 +2454,9 @@ class CharacterCreator:
         hdr_rect = pygame.Rect(0, 0, sw, HEADER_H)
         pygame.draw.rect(screen, C_PANEL, hdr_rect)
         pygame.draw.line(screen, C_BORDER, (0, HEADER_H - 1), (sw, HEADER_H - 1))
-        title = font_hd.render("CHARACTER CREATOR", True, C_TEXT)
+        title = render_text_cached(font_hd, "CHARACTER CREATOR", C_TEXT)
         screen.blit(title, (16, (HEADER_H - title.get_height()) // 2))
-        hint = font_sm.render("ESC to close  •  Ctrl+S to save", True, C_TEXT_DIM)
+        hint = render_text_cached(font_sm, "ESC to close  •  Ctrl+S to save", C_TEXT_DIM)
         screen.blit(hint, (sw - hint.get_width() - 16, (HEADER_H - hint.get_height()) // 2))
 
         footer_rect = pygame.Rect(0, sh - FOOTER_H, sw, FOOTER_H)
@@ -2315,7 +2464,10 @@ class CharacterCreator:
         pygame.draw.line(screen, C_BORDER, (0, sh - FOOTER_H), (sw, sh - FOOTER_H))
 
         if self.status_timer > 0:
-            sm = font_sm.render(self.status_msg, True, self.status_col)
+            # Cached: a given status message ("Saved x.json", ...) is shown
+            # unchanged for status_timer's whole countdown, so this would
+            # otherwise re-rasterize the same string every frame for ~2s.
+            sm = render_text_cached(font_sm, self.status_msg, self.status_col)
             screen.blit(sm, (LIST_W + PAD * 3, sh - FOOTER_H + 18))
 
         draw_button(screen, font_sm, self.btn_save, "Save  ✓",
@@ -2326,7 +2478,7 @@ class CharacterCreator:
                     hover=self.btn_new.collidepoint(mx, my))
 
         if self.editor and self.editor.dirty:
-            dot_txt = font_sm.render("● unsaved", True, C_ACCENT2)
+            dot_txt = render_text_cached(font_sm, "● unsaved", C_ACCENT2)
             screen.blit(dot_txt, (self.btn_save.x - dot_txt.get_width() - 12, self.btn_save.y + 8))
 
         dirty_id = (self.selected_id or "") if (self.editor and self.editor.dirty) else ""
@@ -2349,7 +2501,7 @@ class CharacterCreator:
                              border_radius=6 if i == 0 else (6 if i == len(TAB_NAMES)-1 else 0))
             col = C_BORDER if not is_act else C_ACCENT
             pygame.draw.rect(screen, col, tr, 1)
-            lbl = font.render(name, True, C_TEXT if is_act else C_TEXT_DIM)
+            lbl = render_text_cached(font, name, C_TEXT if is_act else C_TEXT_DIM)
             screen.blit(lbl, lbl.get_rect(center=tr.center))
         tr = self.tab_rects[self.active_tab]
         pygame.draw.line(screen, C_TAB_ACT, (tr.x + 1, tr.bottom), (tr.right - 1, tr.bottom), 2)
@@ -2361,9 +2513,9 @@ class CharacterCreator:
             self.editor.draw(screen, font, font_sm, self.active_tab, dt)
             screen.set_clip(old_clip)
         elif self.chars == []:
-            msg = font.render(
-                "No characters found in assets/sprites/player/ — create one with + New Character",
-                True, C_TEXT_DIM
+            msg = render_text_cached(
+                font, "No characters found in assets/sprites/player/ — create one with + New Character",
+                C_TEXT_DIM,
             )
             screen.blit(msg, msg.get_rect(center=self.editor_rect.center))
 

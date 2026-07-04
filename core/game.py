@@ -75,6 +75,13 @@ class Game:
     """
 
     def __init__(self):
+        """
+        Boot the whole game: pygame/display/audio setup, then construct every
+        subsystem in dependency order (camera, room manager, player, dev tools,
+        UI, mission/cutscene managers, etc.) and wire their cross-references.
+        Everything the main loop touches is created here — see the section
+        comments below for where each subsystem is set up.
+        """
         pygame.init()
 
         # Whitelist only the events we actually handle.
@@ -119,7 +126,16 @@ class Game:
         AudioAssetLoader.load_from_directory(self.sound_engine)
 
         # ── Player ────────────────────────────────────────────────────────────
-        self.player = Player(WORLD_WIDTH // 2, WORLD_HEIGHT // 2, game_config=self.game_config)
+        # Respect the saved character menu order (character_creator's
+        # discover_characters()) instead of silently falling through to
+        # Player.__init__'s hardcoded 'goku' default.
+        roster = character_creator.discover_characters()
+        starting_character = roster[0] if roster else 'goku'
+        self.player = Player(
+            WORLD_WIDTH // 2, WORLD_HEIGHT // 2,
+            character=starting_character,
+            game_config=self.game_config,
+        )
         self.player.update_derived_stats()
         self.player.transformation = TransformationSystem(self.player, self.game_config)
         self.player.in_transition  = False
@@ -465,7 +481,13 @@ class Game:
                 continue
 
             if self.character_creator.active:
-                self.character_creator.handle_input(event)
+                result = self.character_creator.handle_input(event)
+                if result == 'close' and hasattr(self.player, 'character'):
+                    # Pick up any config the player just saved for the
+                    # character they're currently playing as — otherwise
+                    # equipped attacks stay stale until they visit the
+                    # character-switch menu.
+                    self._reload_attack_config(self.player.character)
                 continue
 
             if self.room_editor.active:
@@ -546,11 +568,11 @@ class Game:
 
         elif event.key == pygame.K_q:
             # Q fires a ki blast or begins charging a beam, depending on the current mode.
+            self.player.is_q_pressed = True
             if self.player.ki_attack_mode == 'blast':
                 self.player.shoot_blast()
             elif self.player.ki_attack_mode == 'beam':
                 self.player.start_charging_beam()
-                self.player.is_q_pressed = True
 
         elif event.key == pygame.K_e:
             self._handle_interact()
@@ -595,6 +617,17 @@ class Game:
         if self.nearby_save_point and not self.dialogue_box.active and not self.save_point_menu.active:
             if self.nearby_save_point.variant == 'big':
                 self.save_point_menu.open()
+                # Opening the menu suppresses _update_player_movement() for as
+                # long as it stays open (see the update() gating around
+                # save_point_menu.active), and that function is the only place
+                # that snaps 'walk'/'run' back to 'idle'. Without this, a
+                # player who interacts mid-run stays frozen on a run/walk
+                # frame for the entire time the menu is open. Mirror the same
+                # snap-to-idle logic here so the animation resolves correctly.
+                self.player.is_running = False
+                if not self.player.is_transitioning:
+                    if self.player.current_animation_state in ('walk', 'run'):
+                        self.player.enter_idle()
             return
 
         # World-map object — start the jump sequence.
@@ -621,10 +654,9 @@ class Game:
         if nearby_pad and len(nearby_pad.waypoints) > 0:
             self.flying_controller.start_flight(self.player, nearby_pad)
         else:
-            # Default: throw a melee punch. Whether it plays melee1/melee2
-            # (hit) or melee_miss depends on whether it connects with
-            # anything — resolved once the swing ends, see the melee-attack
-            # cleanup loop in update().
+            # Default: throw a melee punch. A random melee1/melee2 swing
+            # sound plays either way (hit or miss) — resolved once the
+            # swing ends, see the melee-attack cleanup loop in update().
             melee = self.player.melee_attack()
             if melee:
                 melee.hit_something = False
@@ -714,8 +746,7 @@ class Game:
                 self._mjf_state = 'pending_fade_in'
             # Reset the player sprite so it doesn't stay frozen on the
             # map_jump frame while the screen is still visible.
-            self.player.sprite.set_animation('idle', self.player.direction)
-            self.player.current_animation_state = 'idle'
+            self.player.enter_idle()
 
         self.player.on_map_jump_exit = _on_exit
         self.camera.locked = True
@@ -740,8 +771,7 @@ class Game:
         # Immediately snap the player to idle so walking-into-E never leaves
         # the walk/run animation frozen on screen during the conversation.
         if self.player.current_animation_state in ('walk', 'run'):
-            self.player.sprite.set_animation('idle', self.player.direction)
-            self.player.current_animation_state = 'idle'
+            self.player.enter_idle()
         self.player.is_running = False
 
         iid   = getattr(npc, 'instance_id', '')
@@ -1349,6 +1379,7 @@ class Game:
         import pygame
 
         def get_entity_rect(e):
+            """Bounding box for a movable entity, centered on (e.x, e.y)."""
             return pygame.Rect(e.x - e.width // 2, e.y - e.height // 2, e.width, e.height)
 
         def get_obstacle_rect(obs):
@@ -1781,6 +1812,9 @@ class Game:
                     # on_change_room = None and calls it when the action fires,
                     # but game.py must supply the real implementation.
                     def _cutscene_change_room(room_name, _sx, _sy):
+                        """Callback wired into the cutscene runtime's change_room
+                        action: swaps the active room, re-syncs its tiles/objects,
+                        and notifies the mission manager the new room was entered."""
                         target_room = self.room_manager.get_room_by_name(room_name)
                         if not target_room:
                             print(f'[Game] change_room: room not found: {room_name}')
@@ -2196,6 +2230,10 @@ class Game:
         self._mjf_land_frame_timer   = 0.0
         self._mjf_land_elapsed       = 0.0   # total time spent in landing_fade_in state
         self._MJF_LAND_FRAME_DUR     = 0.12  # matches flying animation speed
+        # Pre-scaled-frame cache for _draw_landing_sprite — reset here since a
+        # fresh load means new source Surface objects (old cache entries would
+        # be stale / point at frames that no longer match this direction).
+        self._mjf_land_scaled_cache  = {}
 
     def _draw_landing_sprite(self):
         """Blit the current map_land frame at the player's world position.
@@ -2212,10 +2250,22 @@ class Game:
         _land_frames = getattr(self, '_mjf_land_frames', [])
         if not _land_frames:
             return
-        _frame  = _land_frames[min(self._mjf_land_frame_idx, len(_land_frames) - 1)]
+        _idx    = min(self._mjf_land_frame_idx, len(_land_frames) - 1)
         _sw     = 32 * RENDER_SCALE
         _sh     = 32 * RENDER_SCALE
-        _scaled = pygame.transform.scale(_frame, (_sw, _sh))
+
+        # Scaling is deterministic per frame index (same source frame, same
+        # target size every time), so cache it instead of re-scaling on every
+        # single frame of the landing sequence. Cache is reset in
+        # _load_map_land_sprite() whenever a new landing sequence starts.
+        _cache = getattr(self, '_mjf_land_scaled_cache', None)
+        if _cache is None:
+            _cache = self._mjf_land_scaled_cache = {}
+        _scaled = _cache.get(_idx)
+        if _scaled is None:
+            _scaled = pygame.transform.scale(_land_frames[_idx], (_sw, _sh))
+            _cache[_idx] = _scaled
+
         _cx = int(self.player.x * RENDER_SCALE - self.camera.x)
         _cy = int(self.player.y * RENDER_SCALE - self.camera.y)
         _sx = _cx - _sw // 2
@@ -2611,8 +2661,7 @@ class Game:
                 self.player.y = getattr(self, '_mjf_land_target_y', self.player.y)
                 self.player.direction = 'down'
                 try:
-                    self.player.sprite.set_animation('idle', 'down')
-                    self.player.current_animation_state = 'idle'
+                    self.player.enter_idle()
                 except Exception:
                     pass
                 self._mjf_state = None
@@ -3642,11 +3691,15 @@ class Game:
                 self._wm_glyph_cache: dict = {}
 
             def _char_to_filename(ch):
+                """Map a single character to its glyph filename (handles the
+                punctuation that isn't a plain A-Z/0-9 image name)."""
                 if ch == ':':  return 'colon.png'
                 if ch == '/':  return 'slash.png'
                 return ch.upper() + '.png'
 
             def _get_glyph(ch, height, color):
+                """Load, scale to `height`, and tint one glyph, caching the
+                result per (char, height, color) so repeat calls are free."""
                 key = (ch, height, color)
                 if key in self._wm_glyph_cache:
                     return self._wm_glyph_cache[key]
@@ -3667,6 +3720,8 @@ class Game:
                     return None
 
             def _measure(text, height, color):
+                """Return the pixel width `text` would take up if drawn at
+                `height`/`color` — used to center button-hint labels."""
                 w = 0
                 for ch in text:
                     if ch == ' ':
@@ -3678,6 +3733,8 @@ class Game:
                 return w
 
             def _blit_text(surf, text, x, y, height, color):
+                """Draw `text` glyph-by-glyph onto `surf` starting at (x, y);
+                returns the x position just past the last glyph drawn."""
                 for ch in text:
                     if ch == ' ':
                         x += _SPACE_W
@@ -3740,6 +3797,23 @@ class Game:
         # game is still playable before any config file has been saved.
         return tuple(modes) if len(modes) > 1 else ('blast', 'transform')
 
+    def _reload_attack_config(self, character_id):
+        """(Re-)apply character_id's saved attack config to the live player:
+        equipped attacks and ki mode. Used both when swapping to a different
+        character and when picking up edits made in the character creator
+        for the character currently being played."""
+        cfg = character_creator.load_config(character_id)
+        atk = cfg.get('attacks', {})
+
+        self.player.equipped_attacks = list(atk.get('equipped_attacks', []))
+        self.player.ki_mode_config   = atk.get('ki_attack_mode', 'blast')
+
+        # Keep ki_attack_mode valid for whatever's now equipped — prevents
+        # being left in e.g. beam mode after a character loses beam attacks.
+        allowed = self._get_allowed_ki_modes()
+        if self.player.ki_attack_mode not in allowed:
+            self.player.ki_attack_mode = allowed[0] if allowed else 'blast'
+
     def _switch_character(self, character_id):
         """Swap the player's sprite to character_id while keeping all gameplay state intact."""
         from core.sprite_system import create_character_sprite
@@ -3772,18 +3846,7 @@ class Game:
                 state['current_animation_state'], state['direction'])
 
         # Apply the character's attack config so only equipped attacks are usable.
-        cfg = character_creator.load_config(character_id)
-        atk = cfg.get('attacks', {})
-
-        self.player.equipped_attacks = list(atk.get('equipped_attacks', []))
-        self.player.ki_mode_config   = atk.get('ki_attack_mode', 'blast')
-
-        # Reset ki_attack_mode to the first mode the new character actually has.
-        # This prevents being left in e.g. beam mode after switching to a character
-        # that only has blast equipped, and vice-versa.
-        allowed = self._get_allowed_ki_modes()
-        if self.player.ki_attack_mode not in allowed:
-            self.player.ki_attack_mode = allowed[0] if allowed else 'blast'
+        self._reload_attack_config(character_id)
 
     # ── Flying-controller callbacks ───────────────────────────────────────────
 
@@ -3902,8 +3965,7 @@ class Game:
                     self._apply_world_map_music(getattr(self, '_active_world_map_name', ''))
                     self._mjf_state  = 'fade_in'
                     self._mjf_active = False
-                    self.player.sprite.set_animation('idle', self.player.direction)
-                    self.player.current_animation_state = 'idle'
+                    self.player.enter_idle()
 
             # Fade the damage tint back to neutral each frame.
             if self.player.hurt_tint > 0:
@@ -3919,7 +3981,7 @@ class Game:
             if self.player.pending_blast == 'ready':
                 spawn_x, spawn_y = self.player.get_blast_spawn_position()
                 self.projectiles.append(Projectile(spawn_x, spawn_y, self.player.direction))
-                self.sound_manager.play_sfx('blast')
+                self.sound_manager.play_sfx(random.choice(('kiblast1', 'kiblast2')))
                 self.player.pending_blast = None
 
             # Screen transition update.
@@ -3957,7 +4019,7 @@ class Game:
                 melee.update(dt)
                 if not melee.active:
                     if not getattr(melee, 'hit_something', False):
-                        self.sound_manager.play_sfx('melee_miss')
+                        self.sound_manager.play_sfx(random.choice(('melee1', 'melee2')))
                     self.melee_attacks.remove(melee)
 
             # Enemy AI, combat resolution, and defeat handling.
@@ -4064,8 +4126,7 @@ class Game:
             self.player.is_running = False
             if not self.player.is_transitioning:
                 if self.player.current_animation_state in ('walk', 'run'):
-                    self.player.sprite.set_animation('idle', self.player.direction)
-                    self.player.current_animation_state = 'idle'
+                    self.player.enter_idle()
 
         if (dx != 0 or dy != 0) and not self.flying_controller.is_active():
             old_x = self.player.x

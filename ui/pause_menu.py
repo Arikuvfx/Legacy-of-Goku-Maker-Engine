@@ -19,6 +19,7 @@ import pygame
 import os
 from config.settings import RENDER_SCALE
 from core.bitmap_font import BitmapFont
+from dev_tools.character_creator import discover_characters
 
 _S = max(1, RENDER_SCALE)
 
@@ -217,13 +218,14 @@ class PauseMenu:
         self.optionbar_empty  = _img('assets/ui/textbox/options/optionbar_empty.png')
         self.optionbar_filled = _img('assets/ui/textbox/options/optionbar_filled.png')
 
-        # Character name tag sprites (selected / unselected variant per character)
+        # Character name tag sprites (selected / unselected variant per character).
+        # Rebuilt dynamically from the roster each time the menu opens (see
+        # _refresh_name_sprites / open()) so new/removed characters show up
+        # without restarting the game. _name_sprite_img_cache avoids re-reading
+        # a character's images off disk once they've been loaded.
+        self._name_sprite_img_cache = {}
         self._name_sprites = {}
-        for cid in ('goku', 'gohan', 'vegeta'):
-            sel   = _img(f'assets/ui/textbox/names/{cid}_selected.png')
-            unsel = _img(f'assets/ui/textbox/names/{cid}_unselected.png')
-            if sel or unsel:
-                self._name_sprites[cid] = {'selected': sel, 'unselected': unsel}
+        self._refresh_name_sprites()
 
         # Inventory sub-tab sprites
         self._inv_tabs = [
@@ -284,6 +286,33 @@ class PauseMenu:
             self._bg_tile_w = 1
             self._bg_tile_h = 1
 
+    def _refresh_name_sprites(self):
+        """
+        Rebuild self._name_sprites from the current character roster.
+
+        Called on init and every time the menu opens, so adding/removing a
+        character (e.g. via the character creator dev tool) shows up in the
+        Status page name-tag row without needing a game restart. Already-loaded
+        images are kept in _name_sprite_img_cache so this doesn't re-hit disk
+        for characters that haven't changed.
+        """
+        def _img(path):
+            try:    return pygame.image.load(path).convert_alpha()
+            except: return None
+
+        roster = discover_characters()
+        fresh  = {}
+        for cid in roster:
+            if cid in self._name_sprite_img_cache:
+                sel, unsel = self._name_sprite_img_cache[cid]
+            else:
+                sel   = _img(f'assets/ui/textbox/names/{cid}_selected.png')
+                unsel = _img(f'assets/ui/textbox/names/{cid}_unselected.png')
+                self._name_sprite_img_cache[cid] = (sel, unsel)
+            if sel or unsel:
+                fresh[cid] = {'selected': sel, 'unselected': unsel}
+        self._name_sprites = fresh
+
     def _load_char_sprite(self, char_id, costume='base'):
         if char_id in self._char_sprite_cache:
             return self._char_sprite_cache[char_id]
@@ -299,6 +328,7 @@ class PauseMenu:
 
     def open(self, player):
         self.active              = True
+        self._refresh_name_sprites()
         self.tab_index           = 0
         self.equip_slot_index    = 0
         self.options_item_index  = 0
