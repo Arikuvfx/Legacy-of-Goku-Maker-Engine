@@ -34,7 +34,7 @@ jobs:
       #    Change "game.py" below if your entry point script has a
       #    different name.
       - name: Build with PyInstaller
-        run: pyinstaller --onefile --noconsole --icon=icon.ico your_game.py
+        run: pyinstaller --onefile --noconsole --icon=icon.ico main.py
 
       # 5. Upload the result so you can download it from the Actions tab
       - name: Upload build artifact
