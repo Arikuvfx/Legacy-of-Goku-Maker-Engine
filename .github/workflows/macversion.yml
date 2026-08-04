@@ -27,6 +27,7 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
+          pip install Pillow
 
       # 4. Build the Mac app
       #    --windowed = no terminal window pops up (good for a GUI game)
@@ -34,7 +35,7 @@ jobs:
       #    Change "game.py" below if your entry point script has a
       #    different name.
       - name: Build with PyInstaller
-        run: pyinstaller --onefile --noconsole --icon=icon.icns main.py
+        run: pyinstaller --onefile --noconsole --icon=icon.ico main.py
 
       # 5. Upload the result so you can download it from the Actions tab
       - name: Upload build artifact
