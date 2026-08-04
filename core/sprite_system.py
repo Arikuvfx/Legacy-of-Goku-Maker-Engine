@@ -68,16 +68,27 @@ class SpriteSheet:
 class Animation:
     """Drives a flipbook of frames at a fixed rate."""
 
-    def __init__(self, frames, frame_duration=0.1, loop=True):
+    def __init__(self, frames, frame_duration=0.1, loop=True, loop_tail_frames=None):
         self.frames = frames
         self.frame_duration = frame_duration
         self.loop = loop
+        # When set on a non-looping animation, the animation plays through
+        # every frame once as usual, but instead of freezing on the final
+        # frame it keeps looping the last `loop_tail_frames` frames forever
+        # (until reset()/a new animation takes over). e.g. loop_tail_frames=2
+        # on a 6-frame punch plays 0,1,2,3,4,5 then loops 4,5,4,5,4,5...
+        self.loop_tail_frames = loop_tail_frames
         self.current_frame = 0
         self.time_elapsed = 0
         self.finished = False
 
     def update(self, dt):
-        if self.finished and not self.loop:
+        # Once finished, a plain non-looping animation just holds its last
+        # frame forever — nothing left to advance. A tail-looping animation
+        # is a different story: it's marked finished after its first full
+        # playthrough (see below) but still needs to keep ticking so the
+        # tail frames continue to cycle.
+        if self.finished and not self.loop and not self.loop_tail_frames:
             return
 
         self.time_elapsed += dt
@@ -86,12 +97,27 @@ class Animation:
             self.time_elapsed = 0
             self.current_frame += 1
 
+            tail_start = (
+                max(0, len(self.frames) - self.loop_tail_frames)
+                if self.loop_tail_frames else None
+            )
+
             if self.current_frame >= len(self.frames):
                 if self.loop:
                     self.current_frame = 0
+                elif self.loop_tail_frames:
+                    # First time reaching the end: mark finished (same signal
+                    # every other non-looping animation gives) and drop back
+                    # into the tail range instead of freezing on frame -1.
+                    self.finished = True
+                    self.current_frame = tail_start
                 else:
                     self.current_frame = len(self.frames) - 1
                     self.finished = True
+            elif self.finished and self.loop_tail_frames and self.current_frame < tail_start:
+                # Already past the first playthrough and looping the tail —
+                # keep current_frame from drifting below the tail range.
+                self.current_frame = tail_start
 
     def get_current_frame(self):
         if not self.frames:
@@ -164,11 +190,15 @@ class AnimatedSprite:
         return sprite
 
     def load_animation(self, animation_name, direction, frame_duration=0.1, loop=True, num_variants=1,
-                       use_8_directions=False):
+                       use_8_directions=False, loop_tail_frames=None):
         """Load one directional animation from {base_path}/{animation_name}.png.
 
         Sheet rows map to directions; stacked variant blocks sit below them
         (each block is num_directions rows tall).
+
+        loop_tail_frames: for a non-looping animation, loop just the last N
+        frames forever once the full sheet has played through once (instead
+        of freezing on the final frame). See Animation.loop_tail_frames.
 
         Returns True on success, False if the file is missing or has no frames.
         """
@@ -195,7 +225,7 @@ class AnimatedSprite:
             if not frames:
                 continue
 
-            animation = Animation(frames, frame_duration, loop)
+            animation = Animation(frames, frame_duration, loop, loop_tail_frames)
             variants.append(animation)
 
         if not variants:
@@ -205,15 +235,18 @@ class AnimatedSprite:
         return True
 
     def load_animation_all_directions(self, animation_name, frame_duration=0.1, loop=True, num_variants=1,
-                                      use_8_directions=False):
+                                      use_8_directions=False, loop_tail_frames=None):
         """Load an animation for every direction in one shot.
 
         use_8_directions=True  → down, down_left, left, up_left, up, up_right, right, down_right
         use_8_directions=False → down, left, right, up  (legacy 4-dir)
+
+        loop_tail_frames: see load_animation() — looped through to every direction.
         """
         directions, _, _ = _directions(use_8_directions)
         for direction in directions:
-            self.load_animation(animation_name, direction, frame_duration, loop, num_variants, use_8_directions)
+            self.load_animation(animation_name, direction, frame_duration, loop, num_variants, use_8_directions,
+                                loop_tail_frames)
 
     def append_animation_variants(self, animation_name, source_filename, frame_duration=0.1, loop=True, num_variants=1,
                                   use_8_directions=False):
@@ -366,6 +399,33 @@ class AnimatedSprite:
                 self.current_variant_index = 0
                 anim.reset()
 
+    def restart_animation(self, animation_name, direction):
+        """Force this animation to reset to frame 0 and play from the start,
+        even if it's already the current animation — set_animation() above
+        deliberately no-ops in that case (so callers can safely re-request
+        the same animation every frame without constantly resetting it), but
+        some callers genuinely want a fresh restart every time they call this
+        even mid-playback. Example: an enemy repeatedly hurt by a beam should
+        visibly flinch on every single landed hit, not just the first one —
+        calling set_animation('hurt', ...) on each hit was a no-op once
+        already playing 'hurt', so it only ever looked like it flinched once
+        and had to fully finish before flinching again.
+        """
+        key = f"{animation_name}_{direction}"
+        if key not in self.animations:
+            return
+
+        self.current_animation = key
+        self.current_direction = direction
+
+        anim = self.animations[key]
+        if isinstance(anim, list):
+            self.current_variant_index = random.randrange(len(anim))
+            anim[self.current_variant_index].reset()
+        else:
+            self.current_variant_index = 0
+            anim.reset()
+
     def update(self, dt):
         """Tick the current animation forward by dt seconds."""
         if not self.current_animation or self.current_animation not in self.animations:
@@ -400,11 +460,16 @@ class AnimatedSprite:
         self._scaled_frame_cache[id(frame)] = scaled
         return scaled
 
-    def draw(self, screen, x, y, camera=None, scale=1.0, hurt_tint=0.0):
+    def draw(self, screen, x, y, camera=None, scale=1.0, hurt_tint=0.0, flash_white=False):
         """Draw the current frame at world position (x, y).
 
         hurt_tint is a 0.0-1.0 value that adds red via BLEND_RGB_ADD —
         this keeps transparent pixels clean instead of drawing a coloured box.
+
+        flash_white is the same idea but a flat white add, on/off rather
+        than graduated — used for Player.charged_melee_flash_on's blink
+        during the charged-melee wind-up. Stacks with hurt_tint if both are
+        ever true at once (unlikely, but neither excludes the other).
 
         Note: `scale` is accepted for backwards compatibility but isn't used —
         on-screen size is driven entirely by RENDER_SCALE plus this sprite's
@@ -459,13 +524,23 @@ class AnimatedSprite:
 
             frame = self._get_scaled_frame(frame)
 
-            # Hurt tint: add red to each pixel's RGB, alpha untouched → no square artifact.
-            # Only copy+tint when actually flashing hurt, so the common case (no
-            # tint) just blits the cached scaled surface directly with no copy at all.
-            if hurt_tint > 0:
+            # Hurt tint / charged-melee flash: add colour to each pixel's RGB,
+            # alpha untouched → no square artifact. Only copy when actually
+            # flashing, so the common case (neither active) just blits the
+            # cached scaled surface directly with no copy at all.
+            if hurt_tint > 0 or flash_white:
                 frame = frame.copy()
-                red_amount = int(hurt_tint * 180)
-                frame.fill((red_amount, 0, 0), special_flags=pygame.BLEND_RGB_ADD)
+                if hurt_tint > 0:
+                    red_amount = int(hurt_tint * 180)
+                    frame.fill((red_amount, 0, 0), special_flags=pygame.BLEND_RGB_ADD)
+                if flash_white:
+                    # Was a flat (255, 255, 255) add, which drives every pixel
+                    # straight to pure white — effectively a 100%-opaque flash
+                    # with none of the sprite's detail showing through. Scale
+                    # it down the same way hurt_tint does above, landing in
+                    # the ~50-70% range instead.
+                    white_amount = int(0.65 * 255)
+                    frame.fill((white_amount, white_amount, white_amount), special_flags=pygame.BLEND_RGB_ADD)
 
             offset_x = self._scaled_width // 2
             offset_y = self._scaled_height // 2
@@ -486,6 +561,18 @@ class AnimatedSprite:
                 return anim.finished
         return False
 
+    def get_current_frame_index(self):
+        """Return the 0-based frame index of the active animation variant, or -1 if none."""
+        if not self.current_animation or self.current_animation not in self.animations:
+            return -1
+        anim = self.animations[self.current_animation]
+        if isinstance(anim, list):
+            idx = getattr(self, 'current_variant_index', 0)
+            if 0 <= idx < len(anim):
+                return anim[idx].current_frame
+            return -1
+        return anim.current_frame
+
 
 def _load_sprite_size(folder, default_w=32, default_h=32):
     """Read frame size from {folder}/sprite_size.txt if it exists.
@@ -504,6 +591,22 @@ def _load_sprite_size(folder, default_w=32, default_h=32):
         except Exception:
             pass
     return default_w, default_h
+
+
+def _sheet_frame_count(filepath, frame_width):
+    """Auto-detect how many frames wide a single-row sheet is, without
+    building any Animation objects — used to split charged_melee.png into
+    a held first frame (charged_melee_hold) and a played-through remainder
+    (charged_melee_action) without hardcoding the sheet's length.
+    Returns 0 if the file is missing or frame_width is invalid.
+    """
+    if not os.path.exists(filepath) or frame_width <= 0:
+        return 0
+    try:
+        sheet = pygame.image.load(filepath)
+        return sheet.get_width() // frame_width
+    except pygame.error:
+        return 0
 
 
 def _has_png(folder):
@@ -548,15 +651,33 @@ class CharacterSpriteLoader:
         # Standard 4-directional animations
         animations_4dir = [
             ('idle', 0.3, True, 1),
-            ('walk', 0.1, True, 1),
+            ('walk', 0.13, True, 1),
             ('run', 0.13, True, 1),
-            ('melee', 0.1, False, 2),  # Load first 2 variants from melee.png
-            ('melee2', 0.1, False, 2),
-            ('melee3', 0.1, False, 1),
+            ('melee', 0.06, False, 2),  # Load first 2 variants from melee.png
+            ('melee2', 0.06, False, 2),
+            ('melee3', 0.06, False, 1),
             ('hurt', 0.1, False, 1),
             ('death', 0.15, False, 1),
             ('charge', 0.1, True, 1),
-            ('block', 0.2, True, 1),
+            ('charge_genkidama', 0.1, True, 1),
+            ('big_bang_attack', 0.1, True, 1),
+            ('hold_masenko', 0.1, True, 1),
+            ('charge_sword', 0.1, True, 1),
+            ('firebeam', 0.1, True, 1),
+            # Banshee Blast: one single pose held for both charging AND
+            # firing (see Player.start_charging_banshee_blast/
+            # fire_banshee_blast_auto, which set this animation once and
+            # never swap to a separate firebeam-style key) — loop=True so
+            # it keeps playing for however long the whole charge+fire
+            # sequence lasts, same as 'charge'/'firebeam' above. Without
+            # this entry, set_animation('banshee_blast', ...) would find
+            # no matching key in self.animations and silently no-op,
+            # leaving the player stuck on whatever animation was already
+            # playing (e.g. 'idle') instead of switching at all.
+            ('banshee_blast', 0.1, True, 1),
+            ('instant_transmission', 0.1, True, 1),
+            ('teleport', 0.3, True, 1),
+            ('blocking', 0.2, True, 1),
             ('transform', 0.15, False, 1),
             ('untransform', 0.15, False, 1),
         ]
@@ -580,7 +701,7 @@ class CharacterSpriteLoader:
 
         # kiblast.png is laid out as [start, right-hand throw, left-hand throw] on one row.
         # A single Q press always shows frame 0 followed by frame 1 — fixed, not random.
-        sprite.load_animation_fixed_frames_all_directions('kiblast', frame_duration=0.3,
+        sprite.load_animation_fixed_frames_all_directions('kiblast', frame_duration=0.4,
                                                            frame_indices=(0, 1), use_8_directions=False)
 
         # Hold-fire follow-up animations: while Q stays held after the first shot,
@@ -588,20 +709,97 @@ class CharacterSpriteLoader:
         # on each switch (see Player._advance_blast_or_idle). Both read from the
         # same kiblast.png sheet — source_name is required since there's no
         # separate kiblast_hold1.png / kiblast_hold2.png file on disk.
-        sprite.load_animation_fixed_frames_all_directions('kiblast_hold2', frame_duration=0.3,
+        sprite.load_animation_fixed_frames_all_directions('kiblast_hold2', frame_duration=0.4,
                                                            frame_indices=(2,), use_8_directions=False,
                                                            source_name='kiblast')
-        sprite.load_animation_fixed_frames_all_directions('kiblast_hold1', frame_duration=0.3,
+        sprite.load_animation_fixed_frames_all_directions('kiblast_hold1', frame_duration=0.4,
                                                            frame_indices=(1,), use_8_directions=False,
                                                            source_name='kiblast')
 
         # Load third melee variant from melee_extra.png (optional)
-        sprite.append_animation_variants('melee', 'melee_extra.png', frame_duration=0.1, loop=False, num_variants=1,
+        sprite.append_animation_variants('melee', 'melee_extra.png', frame_duration=0.06, loop=False, num_variants=1,
                                          use_8_directions=False)
+
+        # Energy Punch: plays through once, then holds the punch pose by
+        # looping its last 2 frames for the remainder of Player.punch_duration
+        # (see Player.energy_punch()) instead of freezing on a single frame.
+        sprite.load_animation_all_directions('energy_punch', frame_duration=0.1, loop=False, num_variants=1,
+                                             use_8_directions=False, loop_tail_frames=2)
+
+        # Dragon Fist: same "play through once, then hold" shape as Energy
+        # Punch above. 4-frame sheet — plays 0,1,2,3 once, then loops 2,3
+        # for as long as Q is held (see Player.update_dragon_fist(), which
+        # also waits for current_frame_index to reach 2 before launching
+        # the head).
+        sprite.load_animation_all_directions('dragon_fist', frame_duration=0.1, loop=False, num_variants=1,
+                                             use_8_directions=False, loop_tail_frames=2)
+
+        # Charged Melee: holding the melee button rolls a normal swing into
+        # a wind-up (see Player.start_charging_melee) — frame 0 held while
+        # the sprite blinks white — then either a lunge or a rooted spin,
+        # both of which just play out whatever frames follow frame 0 on the
+        # same sheet (see Player.release_charged_melee). Split into two
+        # derived animations so switching from the held charge into the
+        # action doesn't replay frame 0 a second time:
+        #   charged_melee_hold   — frame 0 alone, held for however long the
+        #                          charge lasts (not looped — a single frame
+        #                          animation has nothing to loop through, it
+        #                          just never reports finished).
+        #   charged_melee_action — every frame AFTER 0, played once then
+        #                          held automatically on its last frame
+        #                          (load_animation_fixed_frames always
+        #                          builds non-looping Animations — see
+        #                          Animation.update()) for however long the
+        #                          lunge/spin actually lasts.
+        # Frame count is auto-detected from the sheet's width rather than
+        # hardcoded, since it varies per character. Entirely optional: if
+        # charged_melee.png doesn't exist yet, has_animation() simply
+        # returns False and start_charging_melee()/release_charged_melee()
+        # just leave whichever animation was already playing in place.
+        _charged_melee_count = _sheet_frame_count(f"{folder}/charged_melee.png", sprite_width)
+        if _charged_melee_count > 0:
+            sprite.load_animation_fixed_frames_all_directions(
+                'charged_melee_hold', frame_duration=0.1, frame_indices=(0,),
+                use_8_directions=False, source_name='charged_melee')
+        if _charged_melee_count > 1:
+            sprite.load_animation_fixed_frames_all_directions(
+                'charged_melee_action', frame_duration=0.1,
+                frame_indices=tuple(range(1, _charged_melee_count)),
+                use_8_directions=False, source_name='charged_melee')
+
+        # Ghost Kamikaze cast: unlike Dragon Fist/Energy Punch above, this
+        # genuinely needs to loop (not just play-once-then-hold-tail) —
+        # Player.update_ghost_kamikaze_cast() counts completed loops by
+        # watching get_current_frame_index() wrap back to 0, spawning one
+        # ghost per wrap, so loop=True is required here or the loop-count
+        # never advances past 0.
+        sprite.load_animation_all_directions('ghost_kamikaze_cast', frame_duration=0.1, loop=True,
+                                             num_variants=1, use_8_directions=False)
+
+        # Ghost Kamikaze hold pose: only down has a dedicated sprite
+        # (ghost_kamikaze_hold.png, down row only) — left/right/up just
+        # freeze on frame 0 of the cast sheet instead of getting their own
+        # art. Load the frame-0-of-cast fallback for all 4 directions
+        # first (same "read a different sheet, register under a different
+        # key" trick as kiblast_hold1/2 above), then load the dedicated
+        # down sprite second so it overwrites just that one direction's
+        # entry — has_animation()/set_animation() can't tell the
+        # difference either way, so update_ghost_kamikaze_cast() doesn't
+        # need any direction-specific branching.
+        sprite.load_animation_fixed_frames_all_directions('ghost_kamikaze_hold', frame_duration=0.1,
+                                                           frame_indices=(0,), use_8_directions=False,
+                                                           source_name='ghost_kamikaze_cast')
+        sprite.load_animation('ghost_kamikaze_hold', 'down', frame_duration=0.1, loop=True, num_variants=1)
 
         # 8-directional animations (like flying)
         animations_8dir = [
             ('flying', 0.1, True, 1),
+            # Clockwise and counter-clockwise spins are hand-drawn as two
+            # separate full sheets (not mirror images of each other), so
+            # both get loaded straight — see start_sword_spin() in
+            # player.py for how the right one is picked at spin time.
+            ('sword_spin_cw', 0.1, True, 1),
+            ('sword_spin_ccw', 0.1, True, 1),
         ]
 
         for anim_name, duration, loop, num_variants in animations_8dir:
@@ -749,6 +947,96 @@ class NPCSpriteLoader:
         return [d for d in os.listdir(path) if os.path.isdir(os.path.join(path, d))]
 
 
+class CritterSpriteLoader:
+    """Loads animations for small ambient wildlife (squirrels, birds, butterflies...).
+
+    Folder layout mirrors NPCSpriteLoader/EnemySpriteLoader:
+      Direct:   assets/sprites/critters/{critter_type}/
+      Variant:  assets/sprites/critters/{critter_type}/variants/{variant}/
+
+    Unlike NPCs/enemies, critters don't share one fixed animation list —
+    a butterfly only flies, a squirrel only idles/walks, a bird might do
+    both. CRITTER_ANIMATIONS declares, per critter_type, which animations
+    to look for and whether they're 4-dir or 8-dir sheets. Anything not
+    found on disk is skipped silently (load_animation already no-ops on
+    a missing file), so a critter can ship with just one animation file.
+    """
+
+    # (animation_name, frame_duration, loop, use_8_directions)
+    CRITTER_ANIMATIONS = {
+        'squirrel': [
+            ('idle', 0.3, True, False),
+            ('walk', 0.12, True, False),
+        ],
+        'bird': [
+            ('idle', 0.3, True, False),
+            ('walk', 0.15, True, False),
+            ('flying', 0.1, True, True),
+        ],
+        'butterfly': [
+            ('flying', 0.1, True, False),
+            ('idle', 0.3, True, False),
+        ],
+    }
+
+    # Fallback for any critter_type not listed above — assume the simplest
+    # possible case (idle only, 4-directional) so new critter folders work
+    # without a code change; add a real entry above once a critter needs
+    # more than that.
+    DEFAULT_ANIMATIONS = [
+        ('idle', 0.3, True, False),
+    ]
+
+    @staticmethod
+    def load_critter(critter_type, variant='default', sprite_width=16, sprite_height=16):
+        """Load a critter sprite, checking variant/flat folder layouts like enemies/NPCs do."""
+        direct_path = f"assets/sprites/critters/{critter_type}"
+        base_path = _resolve_variant_folder(direct_path, variant)
+        if base_path is None:
+            return None
+
+        sprite_width, sprite_height = _load_sprite_size(base_path, sprite_width, sprite_height)
+
+        sprite = AnimatedSprite._create_bare(critter_type, variant, sprite_width, sprite_height, base_path)
+
+        animations = CritterSpriteLoader.CRITTER_ANIMATIONS.get(
+            critter_type, CritterSpriteLoader.DEFAULT_ANIMATIONS
+        )
+
+        for anim_name, duration, loop, use_8dir in animations:
+            sprite.load_animation_all_directions(anim_name, duration, loop, 1, use_8_directions=use_8dir)
+
+        def _loaded(name):
+            return sprite.has_animation(name, 'down') or sprite.has_animation(name, 'down_left')
+
+        if not any(_loaded(name) for name, *_ in animations):
+            return None
+
+        # Prefer idle as the resting pose; fall back to whichever animation
+        # actually loaded (e.g. a butterfly that only has 'flying').
+        default_anim = 'idle' if _loaded('idle') else next(
+            (name for name, *_ in animations if _loaded(name)), None
+        )
+        if default_anim:
+            sprite.set_animation(default_anim, 'down')
+
+        return sprite
+
+    @staticmethod
+    def list_available_critters():
+        critters_path = "assets/sprites/critters"
+        if not os.path.exists(critters_path):
+            return []
+        return [d for d in os.listdir(critters_path) if os.path.isdir(os.path.join(critters_path, d))]
+
+    @staticmethod
+    def list_available_variants(critter_type):
+        variants_path = f"assets/sprites/critters/{critter_type}/variants"
+        if not os.path.exists(variants_path):
+            return []
+        return [d for d in os.listdir(variants_path) if os.path.isdir(os.path.join(variants_path, d))]
+
+
 def create_character_sprite(character, costume='base', width=32, height=32):
     """Shorthand for CharacterSpriteLoader.load_character."""
     return CharacterSpriteLoader.load_character(character, costume, width, height)
@@ -762,6 +1050,11 @@ def create_enemy_sprite(enemy_type, variant='default', width=32, height=32):
 def create_npc_sprite(npc_type, variant='default', width=32, height=32):
     """Shorthand for NPCSpriteLoader.load_npc."""
     return NPCSpriteLoader.load_npc(npc_type, variant, width, height)
+
+
+def create_critter_sprite(critter_type, variant='default', width=16, height=16):
+    """Shorthand for CritterSpriteLoader.load_critter."""
+    return CritterSpriteLoader.load_critter(critter_type, variant, width, height)
 
 
 def create_boss_sprite(boss_id, variant='default', width=48, height=48):

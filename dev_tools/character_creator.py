@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import copy
 import math
 from pathlib import Path
@@ -42,11 +43,71 @@ import pygame
 # ──────────────────────────────────────────────────────────────────────
 #  Paths
 # ──────────────────────────────────────────────────────────────────────
-SPRITES_DIR    = Path("assets/sprites/player")
-CHARACTERS_DIR = Path("assets/characters")
-ATTACKS_DIR    = Path("assets/sprites/attacks")   # global roster, not per-character
-HUD_ICONS_DIR  = Path("assets/ui/hud")            # named icon PNGs used in the HUD picker
-PORTRAITS_DIR  = Path("assets/portraits")         # see CharacterEditor._load_portrait()
+#
+# IMPORTANT: these must NOT be resolved against the current working
+# directory. A relative Path("assets/characters") only happens to work in
+# PyCharm because the project root is the CWD there. Once this is packaged
+# into a .exe (PyInstaller etc.), the CWD when double-clicked isn't
+# guaranteed to be the folder the .exe lives in — so a relative path can
+# silently miss the real assets/characters folder, load_config() then
+# falls back to DEFAULT_CONFIG, and edits made in the character creator
+# appear to do nothing in the shipped build.
+#
+# Instead, anchor everything to the folder the running program actually
+# lives in: the .exe's own folder when frozen (PyInstaller), or this
+# project's root folder (one level up from dev_tools/) when run from source.
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent.parent
+
+SPRITES_DIR    = BASE_DIR / "assets/sprites/player"
+CHARACTERS_DIR = BASE_DIR / "assets/characters"
+ATTACKS_DIR    = BASE_DIR / "assets/sprites/attacks"   # global roster, not per-character
+HUD_ICONS_DIR  = BASE_DIR / "assets/ui/hud"            # named icon PNGs used in the HUD picker
+PORTRAITS_DIR  = BASE_DIR / "assets/portraits"         # see CharacterEditor._load_portrait()
+
+
+def resolve_portrait_path(char_id: str, costume: str = "", form: str = "") -> Optional[Path]:
+    """
+    Resolve the portrait image file for a character/costume/transformation
+    combo, with graceful fallback so portrait art can be added incrementally
+    (per-costume) instead of needing every costume x transformation combo
+    filled in up front.
+
+    `costume` is a bare costume folder name (e.g. "base", "gi_alt") — NOT a
+    transformation path. `form` is a bare transformation name (e.g. "ssj"),
+    or "" for that costume's base look.
+
+    Naming convention, flat folder assets/portraits/:
+      {char_id}_{costume}_{form}.png   — costume + transformation specific
+      {char_id}_{costume}.png          — costume-specific base look
+      {char_id}_{form}.png             — legacy, costume-agnostic transformation
+      {char_id}.png                    — legacy, costume-agnostic base look
+
+    The last two exist so characters that only ever had flat, costume-less
+    portraits (the old convention) keep working untouched; once a
+    costume-specific portrait is added for a given costume, it takes over
+    for that costume only.
+    """
+    candidates = []
+    if costume and form:
+        candidates.append(f"{char_id}_{costume}_{form}")
+    if costume:
+        candidates.append(f"{char_id}_{costume}")
+    if form:
+        candidates.append(f"{char_id}_{form}")
+    candidates.append(char_id)
+
+    seen = set()
+    for name in candidates:
+        if name in seen:
+            continue
+        seen.add(name)
+        path = PORTRAITS_DIR / f"{name}.png"
+        if path.exists():
+            return path
+    return None
 
 # ──────────────────────────────────────────────────────────────────────
 #  Palette  (dark dev-tool)
@@ -90,6 +151,10 @@ DEFAULT_CONFIG: dict = {
         "blast_cost":      20,
         "beam_cost":       50,
         "melee_duration":  0.5,       # seconds
+        # Whether holding the melee button (rather than tapping it) lunges
+        # forward or spins in place once fully charged — see
+        # Player.release_charged_melee() / Game._reload_attack_config().
+        "charged_melee_style": "lunge",   # "lunge" | "spin"
         "walk_speed":      150,
         "run_speed":       300,
         "fly_speed":       450,
@@ -103,6 +168,14 @@ DEFAULT_CONFIG: dict = {
     # folders discover_costumes() finds for this character — it's what gets
     # shown in the preview when a transformation is selected/stepped through.
     "transformations": [],
+    # "costume" paths (e.g. "base/transformations/ssj") the user explicitly
+    # removed via the editor. sync_transformations() re-registers any
+    # on-disk transformation folder that doesn't already have a config
+    # entry — without this list it can't tell "never added yet" apart from
+    # "deliberately deleted", so a removed transformation would silently
+    # reappear the next time the character is loaded as long as its sprite
+    # folder still exists on disk.
+    "removed_transformations": [],
 }
 
 # ══════════════════════════════════════════════════════════════════════
@@ -174,6 +247,58 @@ def discover_transformations(char_id: str, costume: str = "base") -> list[str]:
         and not d.name.startswith(".")
         and any(d.glob("*.png"))
     ]
+
+
+def discover_animation_ids(char_id: str) -> list[str]:
+    """
+    Return base animation names for a character (e.g. ["idle", "walk",
+    "run", "attack"]) — the *.png stems directly under each of the
+    character's form folders (assets/sprites/player/{char_id}/{form}/),
+    NOT the per-direction keys discover_animations() produces (it suffixes
+    each with "_down"/"_left"/etc. after slicing the sheet). This is the
+    lighter-weight, direction-agnostic id play_character_animation actions
+    reference (direction is resolved separately, from the character's
+    current facing, at runtime).
+
+    Unioned across every form/costume (via discover_costumes()) rather
+    than scoped to just "base", since which costume is active when the
+    action fires isn't known at edit time and animation sets are expected
+    to be consistent across a character's forms. Returns [] if char_id is
+    falsy or nothing can be loaded.
+    """
+    if not char_id:
+        return []
+    base = SPRITES_DIR / char_id
+    if not base.exists():
+        return []
+
+    names: set[str] = set()
+    for form in discover_costumes(char_id):
+        folder = base / form
+        if not folder.exists():
+            continue
+        names.update(png.stem for png in folder.glob("*.png"))
+    return sorted(names)
+
+
+def discover_portraits() -> list[str]:
+    """Return every portrait id — the filename stem of each *.png directly
+    in assets/portraits/ (e.g. "Goku", "Goku_base_ssj", "Vegeta_gi_alt").
+
+    These are exactly the ids resolve_portrait_path() matches against
+    ({char_id}_{costume}_{form}, {char_id}_{costume}, {char_id}_{form},
+    {char_id}) — that function resolves ONE portrait for a specific
+    char/costume/form combo with fallback; this instead lists every id
+    that actually exists on disk, for pickers (e.g. the event editor's
+    dialogue_box/set_portrait action fields) that need the full roster
+    up front rather than resolving on demand.
+    """
+    if not PORTRAITS_DIR.exists():
+        return []
+    return sorted(
+        p.stem for p in PORTRAITS_DIR.iterdir()
+        if p.is_file() and p.suffix.lower() == ".png" and not p.name.startswith(".")
+    )
 
 
 def discover_attacks() -> list[str]:
@@ -545,15 +670,21 @@ def sync_transformations(cfg: dict, costumes: list[str],
       These are stored with costume = "transformations/ssj" to match the path
       that _resolve_transform_costume() returns at runtime.
 
-    costumes: base costume list (legacy path — non-base costumes in a flat
-      layout were previously treated as transformations). Still handled so
-      existing projects aren't broken.
+    costumes: base costume list, used only to resolve which costume is
+      "current" for the nested-layout registration below. A plain costume is
+      NOT a transformation — an outfit swap and a power-up form are different
+      things — so alternate costume folders are never auto-registered as
+      transformations here. Only genuine transformation sub-folders
+      (assets/sprites/player/{char}/{costume}/transformations/{form}/) get
+      auto-registered, and each stays scoped to the costume it was found under.
 
     Matching is by the "costume" field. Returns True if any entries were added.
     """
     cfg.setdefault("transformations", [])
+    cfg.setdefault("removed_transformations", [])
     transformations = cfg["transformations"]
-    used = {t.get("costume") for t in transformations}
+    used    = {t.get("costume") for t in transformations}
+    removed = set(cfg["removed_transformations"])
 
     added = False
 
@@ -566,6 +697,11 @@ def sync_transformations(cfg: dict, costumes: list[str],
         costume_path = f"{base}/transformations/{form}"
         if costume_path in used:
             continue
+        # The folder is still on disk, but the user explicitly deleted this
+        # transformation via the editor before — respect that instead of
+        # silently re-adding it every time the character is loaded.
+        if costume_path in removed:
+            continue
         transformations.append({
             "id":            form,
             "display_name":  form.replace("_", " ").upper(),
@@ -576,22 +712,6 @@ def sync_transformations(cfg: dict, costumes: list[str],
             "ki_drain":      0.0,
         })
         used.add(costume_path)
-        added = True
-
-    # Legacy flat layout: non-base costume folders treated as transformations
-    for costume in costumes:
-        if costume == base or costume in used:
-            continue
-        transformations.append({
-            "id":            costume,
-            "display_name":  costume.replace("_", " ").upper(),
-            "costume":       costume,
-            "power_mult":    1.0,
-            "defense_mult":  1.0,
-            "speed_mult":    1.0,
-            "ki_drain":      0.0,
-        })
-        used.add(costume)
         added = True
 
     return added
@@ -1156,15 +1276,24 @@ class CharacterEditor:
         # the save data in place — no separate flush() step needed.
         self.available_attacks = available_attacks or []
         atk.setdefault("equipped_attacks", [])
+        atk.setdefault("charged_melee_style", "lunge")
+        self._charged_melee_style_rect: Optional[pygame.Rect] = None
         self.equipped_attacks: list[str] = atk["equipped_attacks"]
         self.attack_btn_rects: dict[str, pygame.Rect] = {}   # rebuilt on demand, see _build_attack_grid
         self._attack_grid_y0 = 0
         self._attack_grid_cache_key = None   # see _build_attack_grid's memoization
 
         # ── Transformations tab ────────────────────────────────────
+        # self.transformations is the FULL list for every costume this
+        # character has; a given costume's transformations are the entries
+        # whose "costume" field is "{that costume}/transformations/{form}".
+        # Always go through visible_transformations() (scoped to whichever
+        # costume is selected on the Identity tab) rather than indexing
+        # this list directly — a costume's transformation should only ever
+        # be visible/navigable while that costume itself is selected.
         self.cfg.setdefault("transformations", [])
         self.transformations: list[dict] = self.cfg["transformations"]
-        self.transform_idx          = 0 if self.transformations else -1
+        self.transform_idx          = 0 if self.visible_transformations() else -1
         self.transform_costume_idx  = 0
         self.transform_name_input: Optional[TextInput] = None
         self.transform_sliders: dict[str, Slider] = {}
@@ -1174,8 +1303,26 @@ class CharacterEditor:
         # Slowly cycles the Identity-tab portrait through the base look
         # plus every registered transformation — see _portrait_cycle_forms()
         # / _load_portrait() / _draw_identity_portrait().
-        self.portrait_cache: dict[str, Optional[pygame.Surface]] = {}
+        self.portrait_cache: dict[tuple[str, str], Optional[pygame.Surface]] = {}
         self.portrait_cycle_timer = 0.0
+
+    # ── Transformation scoping ───────────────────────────────────────
+    def _current_costume(self) -> str:
+        """The base costume currently selected on the Identity tab."""
+        return self.costumes[self.costume_idx] if self.costumes else "base"
+
+    def _transforms_for_costume(self, costume: str) -> list[dict]:
+        """Transformations that belong to `costume` — i.e. entries stored as
+        '{costume}/transformations/{form}'. A costume's transformation is its
+        own thing, distinct from the costume itself, and should never show up
+        while a *different* costume is selected."""
+        prefix = f"{costume}/transformations/"
+        return [t for t in self.transformations if t.get("costume", "").startswith(prefix)]
+
+    def visible_transformations(self) -> list[dict]:
+        """Transformations to display/navigate on the Transformations tab:
+        only those owned by the costume currently selected on the Identity tab."""
+        return self._transforms_for_costume(self._current_costume())
 
     # ── Transformation widget (re)build ─────────────────────────────
     def _load_transform_widgets(self) -> None:
@@ -1184,25 +1331,24 @@ class CharacterEditor:
         changes (add / remove / step)."""
         fx = self.panel.x + 140
         fw = self.panel.w - 160
-        if not (0 <= self.transform_idx < len(self.transformations)):
+        visible = self.visible_transformations()
+        if not (0 <= self.transform_idx < len(visible)):
             self.transform_name_input = None
             self.transform_sliders    = {}
             return
 
-        tf = self.transformations[self.transform_idx]
+        tf = visible[self.transform_idx]
         self.transform_name_input = TextInput(
             pygame.Rect(fx, 0, fw, 28), tf.get("display_name", "")
         )
-        # The costume field is now stored as e.g. "base/transformations/ssj".
+        # The costume field is stored as e.g. "base/transformations/ssj".
         # Extract just the form name ("ssj") for the transform_forms picker index.
         saved_costume = tf.get("costume", "")
         if "/transformations/" in saved_costume:
             form_name = saved_costume.split("/transformations/")[-1]
-        elif "/" in saved_costume:
-            form_name = saved_costume.split("/")[-1]
         else:
             form_name = saved_costume
-        picker_list = self.transform_forms if self.transform_forms else self.costumes
+        picker_list = self.transform_forms
         self.transform_costume_idx = (
             picker_list.index(form_name)
             if form_name in picker_list else 0
@@ -1277,15 +1423,19 @@ class CharacterEditor:
             else:
                 self.cfg["attacks"][key] = int(sl.value)
 
-        if 0 <= self.transform_idx < len(self.transformations) and self.transform_name_input:
-            tf = self.transformations[self.transform_idx]
+        visible = self.visible_transformations()
+        if 0 <= self.transform_idx < len(visible) and self.transform_name_input:
+            tf = visible[self.transform_idx]
             tf["display_name"] = self.transform_name_input.value.strip() or tf.get("id", "")
+            base_costume = self._current_costume()
+            # A transformation's "costume" field always nests under the
+            # costume that owns it — never a bare costume name, since a
+            # costume is not itself a transformation.
             if self.transform_forms:
-                form = self.transform_forms[self.transform_costume_idx] if self.transform_forms else ""
-                base_costume = self.costumes[self.costume_idx] if self.costumes else "base"
-                tf["costume"] = f"{base_costume}/transformations/{form}" if form else tf.get("costume", "base")
+                form = self.transform_forms[self.transform_costume_idx]
+                tf["costume"] = f"{base_costume}/transformations/{form}"
             else:
-                tf["costume"] = self.costumes[self.transform_costume_idx] if self.costumes else tf.get("costume", "base")
+                tf.setdefault("costume", f"{base_costume}/transformations/{tf.get('id', '')}")
             for key, sl in self.transform_sliders.items():
                 tf[key] = round(sl.value, 2) if key != "ki_drain" else round(sl.value, 1)
 
@@ -1472,15 +1622,18 @@ class CharacterEditor:
 
     def _portrait_cycle_forms(self) -> list[tuple[str, str]]:
         """(form_suffix, display_label) pairs to cycle through in the
-        Identity-tab portrait preview: the character's current base look,
-        followed by every registered transformation, in order.
+        Identity-tab portrait preview: the currently selected costume's
+        base look, followed only by *that costume's own* registered
+        transformations, in order. A different costume's transformation
+        never appears here — it isn't relevant until that costume is
+        selected.
 
         form_suffix is "" for the base look (portrait file has no suffix,
         e.g. "goku.png") and the bare form name for a transformation (e.g.
         "ssj" → "goku_ssj.png"), matching assets/portraits/{char_id}[_{form}].png.
         """
         forms: list[tuple[str, str]] = [("", "Base")]
-        for tf in self.transformations:
+        for tf in self.visible_transformations():
             costume = tf.get("costume", "")
             form = costume.split("/")[-1] if costume else ""
             if form:
@@ -1488,27 +1641,20 @@ class CharacterEditor:
         return forms
 
     def _load_portrait(self, form: str) -> Optional[pygame.Surface]:
-        """Load (and cache) the portrait for a given form.
-
-        Naming convention (flat folder, same as PauseMenu._load_char_sprite()):
-          assets/portraits/{char_id}.png          — base look
-          assets/portraits/{char_id}_{form}.png   — transformation, e.g. "goku_ssj.png"
-        Falls back to the base portrait if a form-specific file doesn't exist yet.
-        """
-        if form in self.portrait_cache:
-            return self.portrait_cache[form]
+        """Load (and cache) the portrait for the currently selected costume
+        + a given transformation form (see resolve_portrait_path())."""
+        costume = self._current_costume()
+        cache_key = (costume, form)
+        if cache_key in self.portrait_cache:
+            return self.portrait_cache[cache_key]
         surf = None
-        candidates = [PORTRAITS_DIR / (f"{self.char_id}_{form}.png" if form else f"{self.char_id}.png")]
-        if form:
-            candidates.append(PORTRAITS_DIR / f"{self.char_id}.png")
-        for path in candidates:
-            if path.exists():
-                try:
-                    surf = pygame.image.load(str(path)).convert_alpha()
-                    break
-                except Exception:
-                    surf = None
-        self.portrait_cache[form] = surf
+        path = resolve_portrait_path(self.char_id, costume, form)
+        if path:
+            try:
+                surf = pygame.image.load(str(path)).convert_alpha()
+            except Exception:
+                surf = None
+        self.portrait_cache[cache_key] = surf
         return surf
 
     def _draw_identity_portrait(self, surf: pygame.Surface,
@@ -1679,6 +1825,21 @@ class CharacterEditor:
             sl.draw(surf, font_sm)
             y += row_h
 
+        # ── Charged Melee style ──────────────────────────────────────
+        # Holding the melee attack button (see Player.start_charging_melee)
+        # rolls into either a forward lunge or a rooted in-place spin once
+        # fully charged — pick which one this character uses. Read by
+        # Game._reload_attack_config() into player.charged_melee_style.
+        y += 14
+        mx, my = pygame.mouse.get_pos()
+        draw_label(surf, font_sm, "Charged Melee Style", lx, y + 6)
+        style = self.cfg["attacks"].get("charged_melee_style", "lunge")
+        style_btn = pygame.Rect(fx, y + 2, 140, 28)
+        self._charged_melee_style_rect = style_btn
+        draw_button(surf, font_sm, style_btn, "Lunge" if style == "lunge" else "Spin",
+                   hover=style_btn.collidepoint(mx, my))
+        y += row_h
+
         # ── Equipped Attacks (icon picker) ──────────────────────────
         # Click an icon to toggle whether this character has that attack
         # equipped — see discover_attacks() for where the roster comes
@@ -1733,20 +1894,21 @@ class CharacterEditor:
         surf.blit(hint, (lx, bottom))
 
     def _draw_transformations(self, surf, font, font_sm, lx, fx, fw, row_h, dt):
-        mx, my = pygame.mouse.get_pos()
-        has_tf = bool(self.transformations)
+        mx, my  = pygame.mouse.get_pos()
+        visible = self.visible_transformations()
+        has_tf  = bool(visible)
         y = self.panel.y + 60
 
-        # ── Stepper: step through every transformation in the preview ──
-        draw_label(surf, font_sm, "Preview", lx, y + 6)
+        # ── Stepper: step through this costume's own transformations ──
+        draw_label(surf, font_sm, f"Preview ({self._current_costume()})", lx, y + 6)
         arr_l = pygame.Rect(fx,       y + 2, 26, 26)
         arr_r = pygame.Rect(fx + 160, y + 2, 26, 26)
         draw_button(surf, font_sm, arr_l, "◄", hover=has_tf and arr_l.collidepoint(mx, my))
         draw_button(surf, font_sm, arr_r, "►", hover=has_tf and arr_r.collidepoint(mx, my))
         if has_tf:
-            tf = self.transformations[self.transform_idx]
+            tf = visible[self.transform_idx]
             name_txt = tf.get("display_name") or tf.get("id", "—")
-            counter  = f"({self.transform_idx + 1}/{len(self.transformations)})"
+            counter  = f"({self.transform_idx + 1}/{len(visible)})"
         else:
             name_txt, counter = "— none —", ""
         surf.blit(render_text_cached(font, name_txt, C_TEXT), (fx + 34, y + 5))
@@ -1767,8 +1929,8 @@ class CharacterEditor:
         if not has_tf:
             hint = render_text_cached(
                 font_sm,
-                "No transformations yet — click + Add Transformation "
-                "(e.g. 'ssj', 'ssj2', 'kaioken') to create one.",
+                f"'{self._current_costume()}' has no transformations yet — click "
+                "+ Add Transformation (e.g. 'ssj', 'ssj2', 'kaioken') to create one.",
                 C_TEXT_DIM,
             )
             surf.blit(hint, (lx, y + 10))
@@ -1789,7 +1951,7 @@ class CharacterEditor:
         c_arr_r = pygame.Rect(fx + 160, y + 2, 26, 26)
         draw_button(surf, font_sm, c_arr_l, "◄", hover=c_arr_l.collidepoint(mx, my))
         draw_button(surf, font_sm, c_arr_r, "►", hover=c_arr_r.collidepoint(mx, my))
-        picker_list = self.transform_forms if self.transform_forms else self.costumes
+        picker_list = self.transform_forms
         form_display = picker_list[self.transform_costume_idx] if picker_list else "—"
         costume_lbl = render_text_cached(font, form_display, C_TEXT)
         surf.blit(costume_lbl, (fx + 34, y + 5))
@@ -2132,6 +2294,17 @@ class CharacterCreator:
         self._switch_char(new_id)
 
     # ── Transformations ──────────────────────────────────────────
+    def _reset_transform_scope(self) -> None:
+        """Switching the Identity-tab costume changes which transformations
+        are in scope, so re-point transform_idx/widgets at the new costume's
+        own list instead of leaving them on the previous costume's entry."""
+        ed = self.editor
+        if not ed:
+            return
+        visible = ed.visible_transformations()
+        ed.transform_idx = 0 if visible else -1
+        ed._load_transform_widgets()
+
     def _set_transform_preview(self, costume: str) -> None:
         """Show the given costume's sprites in both the sidebar quick
         preview and the Preview-tab animation grid.
@@ -2145,6 +2318,15 @@ class CharacterCreator:
             costume = self.costumes[0] if self.costumes else "base"
         self.preview.load(self.selected_id, costume)
         self.editor._reload_anim_grid(self.selected_id, costume)
+        # The Preview tab's dropdown label is driven by preview_form_idx,
+        # not by whatever the grid happens to currently hold — without
+        # this, switching forms here (sidebar/grid) leaves that index
+        # pointing at the old form, so the Preview tab shows a label like
+        # "base" next to sprites that are actually SSJ until the dropdown
+        # is opened and a selection is made there.
+        all_forms = self.editor._all_preview_forms()
+        if costume in all_forms:
+            self.editor.preview_form_idx = all_forms.index(costume)
 
     def _do_add_transformation(self, raw_id: str) -> None:
         if not self.editor:
@@ -2155,8 +2337,15 @@ class CharacterCreator:
         while new_id in existing:
             new_id = f"{raw_id}_{n}"
             n += 1
-        base_costume = self.costumes[ed.costume_idx] if self.costumes else "base"
-        default_costume = base_costume  # costume field will be set properly in flush() when user picks a form
+        base_costume = ed._current_costume()
+        # A new transformation always belongs to the costume that's selected
+        # right now — it's stored nested under that costume, never as a bare
+        # costume name, since a costume is not itself a transformation.
+        if ed.transform_forms:
+            form = ed.transform_forms[ed.transform_costume_idx]
+        else:
+            form = new_id
+        default_costume = f"{base_costume}/transformations/{form}"
         ed.transformations.append({
             "id":            new_id,
             "display_name":  new_id.replace("_", " ").title(),
@@ -2166,22 +2355,35 @@ class CharacterCreator:
             "speed_mult":    1.0,
             "ki_drain":      0.0,
         })
-        ed.transform_idx = len(ed.transformations) - 1
+        ed.transform_idx = len(ed.visible_transformations()) - 1
         ed._load_transform_widgets()
         ed.dirty = True
         self._set_transform_preview(default_costume)
-        self._set_status(f"Added transformation '{new_id}'")
+        self._set_status(f"Added transformation '{new_id}' to '{base_costume}'")
 
     def _do_remove_transformation(self) -> None:
-        if not self.editor or not self.editor.transformations:
-            return
         ed = self.editor
-        removed = ed.transformations.pop(ed.transform_idx)
-        ed.transform_idx = min(ed.transform_idx, len(ed.transformations) - 1)
+        if not ed:
+            return
+        visible = ed.visible_transformations()
+        if not (0 <= ed.transform_idx < len(visible)):
+            return
+        removed = visible[ed.transform_idx]
+        ed.transformations.remove(removed)
+        # Remember this costume path was deliberately deleted so
+        # sync_transformations() doesn't silently re-add it next time this
+        # character is loaded, as long as its sprite folder still exists.
+        removed_costume = removed.get("costume", "")
+        if removed_costume:
+            ed.cfg.setdefault("removed_transformations", [])
+            if removed_costume not in ed.cfg["removed_transformations"]:
+                ed.cfg["removed_transformations"].append(removed_costume)
+        new_visible = ed.visible_transformations()
+        ed.transform_idx = min(ed.transform_idx, len(new_visible) - 1) if new_visible else -1
         ed._load_transform_widgets()
         ed.dirty = True
-        if ed.transformations:
-            self._set_transform_preview(ed.transformations[ed.transform_idx].get("costume", ""))
+        if new_visible:
+            self._set_transform_preview(new_visible[ed.transform_idx].get("costume", ""))
         else:
             self._set_transform_preview(self.cfg.get("costume", "base"))
         self._set_status(f"Removed transformation '{removed.get('id', '')}'", ok=False)
@@ -2311,7 +2513,19 @@ class CharacterCreator:
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             for i, tr in enumerate(self.tab_rects):
                 if tr.collidepoint(mx, my):
+                    prev_tab = self.active_tab
                     self.active_tab = i
+                    # The sidebar preview otherwise still shows whatever
+                    # costume the previous tab left it on, and only
+                    # updates once the user clicks a form arrow inside
+                    # this tab — so jump straight to the currently
+                    # selected transformation's form as soon as the tab
+                    # is opened.
+                    if i == TAB_TRANSFORM and i != prev_tab and self.editor:
+                        visible = self.editor.visible_transformations()
+                        idx = self.editor.transform_idx
+                        if 0 <= idx < len(visible):
+                            self._set_transform_preview(visible[idx].get("costume", ""))
 
             if self.btn_save.collidepoint(mx, my) and self.editor:
                 self.editor.flush()
@@ -2340,6 +2554,7 @@ class CharacterCreator:
                     self.editor.transform_forms = self.transform_forms
                     self.preview.load(self.selected_id, new_costume)
                     self.editor._reload_anim_grid(self.selected_id, new_costume)
+                    self._reset_transform_scope()
                 if arr_r.collidepoint(mx, my):
                     self.editor.costume_idx = (self.editor.costume_idx + 1) % max(1, len(self.costumes))
                     self.editor.dirty = True
@@ -2348,8 +2563,20 @@ class CharacterCreator:
                     self.editor.transform_forms = self.transform_forms
                     self.preview.load(self.selected_id, new_costume)
                     self.editor._reload_anim_grid(self.selected_id, new_costume)
+                    self._reset_transform_scope()
 
             if self.active_tab == TAB_ATTACKS and self.editor:
+                # _charged_melee_style_rect is kept in sync with
+                # _draw_attacks (set every frame it draws the button), same
+                # pattern as attack_btn_rects below.
+                style_rect = self.editor._charged_melee_style_rect
+                if style_rect and style_rect.collidepoint(mx, my):
+                    atk = self.editor.cfg["attacks"]
+                    atk["charged_melee_style"] = (
+                        "spin" if atk.get("charged_melee_style", "lunge") == "lunge" else "lunge"
+                    )
+                    self.editor.dirty = True
+
                 # attack_btn_rects is kept in sync with _draw_attacks (see
                 # CharacterEditor._build_attack_grid), so it always reflects
                 # the icons currently on screen — no separate layout math
@@ -2363,11 +2590,12 @@ class CharacterCreator:
                         self.editor.dirty = True
 
             if self.active_tab == TAB_TRANSFORM and self.editor:
-                ed     = self.editor
-                fx_t   = self.editor_rect.x + 140
-                y0     = self.editor_rect.y + 60   # matches _draw_transformations's top margin
-                row_h_ = 42
-                n      = len(ed.transformations)
+                ed      = self.editor
+                fx_t    = self.editor_rect.x + 140
+                y0      = self.editor_rect.y + 60   # matches _draw_transformations's top margin
+                row_h_  = 42
+                visible = ed.visible_transformations()
+                n       = len(visible)
 
                 arr_l = pygame.Rect(fx_t,       y0 + 2, 26, 26)
                 arr_r = pygame.Rect(fx_t + 160, y0 + 2, 26, 26)
@@ -2375,23 +2603,23 @@ class CharacterCreator:
                     ed.flush()
                     ed.transform_idx = (ed.transform_idx - 1) % n
                     ed._load_transform_widgets()
-                    self._set_transform_preview(ed.transformations[ed.transform_idx].get("costume", ""))
+                    self._set_transform_preview(ed.visible_transformations()[ed.transform_idx].get("costume", ""))
                 if n and arr_r.collidepoint(mx, my):
                     ed.flush()
                     ed.transform_idx = (ed.transform_idx + 1) % n
                     ed._load_transform_widgets()
-                    self._set_transform_preview(ed.transformations[ed.transform_idx].get("costume", ""))
+                    self._set_transform_preview(ed.visible_transformations()[ed.transform_idx].get("costume", ""))
 
                 btn_add    = pygame.Rect(fx_t,       y0 + row_h_ + 2, 150, 28)
                 btn_remove = pygame.Rect(fx_t + 160, y0 + row_h_ + 2, 110, 28)
                 if btn_add.collidepoint(mx, my):
                     self._open_input("New transformation ID:", self._do_add_transformation)
                 if n and btn_remove.collidepoint(mx, my):
-                    tf    = ed.transformations[ed.transform_idx]
+                    tf    = visible[ed.transform_idx]
                     label = tf.get("display_name") or tf.get("id", "")
                     self._open_confirm(f"Remove transformation '{label}'?", self._do_remove_transformation)
 
-                picker_list = self.editor.transform_forms if self.editor.transform_forms else self.costumes
+                picker_list = self.editor.transform_forms
                 if n and picker_list:
                     y_costume = y0 + 3 * row_h_ + 30
                     c_arr_l = pygame.Rect(fx_t,       y_costume + 2, 26, 26)
@@ -2401,15 +2629,13 @@ class CharacterCreator:
                         ed.transform_costume_idx = (ed.transform_costume_idx - 1) % len(picker_list)
                         ed.dirty = True
                         form = picker_list[ed.transform_costume_idx]
-                        base_c = self.costumes[ed.costume_idx] if self.costumes else "base"
-                        self._set_transform_preview(f"{base_c}/transformations/{form}" if ed.transform_forms else form)
+                        self._set_transform_preview(f"{ed._current_costume()}/transformations/{form}")
                     if c_arr_r.collidepoint(mx, my):
                         ed.flush()
                         ed.transform_costume_idx = (ed.transform_costume_idx + 1) % len(picker_list)
                         ed.dirty = True
                         form = picker_list[ed.transform_costume_idx]
-                        base_c = self.costumes[ed.costume_idx] if self.costumes else "base"
-                        self._set_transform_preview(f"{base_c}/transformations/{form}" if ed.transform_forms else form)
+                        self._set_transform_preview(f"{ed._current_costume()}/transformations/{form}")
 
         new_sel = self.char_list.handle_event(event)
         if new_sel:

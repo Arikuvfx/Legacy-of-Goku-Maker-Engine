@@ -5,7 +5,23 @@ from config.settings import (
     WHITE, GRAY, PURPLE, BLUE, RED, YELLOW, BLACK,
     RENDER_SCALE,
 )
-from attacks import Projectile, BeamAttack, MeleeAttack
+from attacks import Projectile, BeamAttack, MeleeAttack, KamehamehaChargeEffect
+from attacks.banshee_blast import BansheeBlastAttack, BansheeBlastChargeEffect, BANSHEE_BLAST_CHARGE_OFFSETS
+# NOTE: add these two to attacks/__init__.py's exports (alongside BeamAttack/
+# KamehamehaChargeEffect) so this import keeps working — they currently only
+# live in attacks/final_flash.py.
+from attacks.final_flash import FinalFlashAttack, FinalFlashChargeEffect
+from attacks.big_bang_kamehameha import BigBangKamehamehaAttack, BigBangKamehamehaChargeEffect
+from attacks.genkidama import GenkidamaChargeEffect, GenkidamaBlast
+from attacks.masenko import MasenkoAimIndicator, MasenkoHoldEffect, MasenkoProjectile
+# NOTE: same deal as the FinalFlash import above — add these to attacks/__init__.py's
+# exports if you want them importable from `attacks` directly instead.
+from attacks.burning_attack import BurningAttack, BurningChargeEffect
+from attacks.flame_kamehameha import FlameKamehamehaAttack
+from attacks.energy_sword import EnergySwordChargeEffect, EnergySwordSpinEffect
+from attacks.dragon_fist import DragonFistAttack, _DIRECTION_UNIT as _DRAGON_FIST_DIRECTION_UNIT
+from attacks.ghost_kamikaze_attack import GhostKamikazeAttack, get_ghost_kamikaze_spawn_offset
+from attacks.big_bang_attack import BigBangAttackChargeEffect, BigBangAttackBlast
 from core.sprite_system import create_character_sprite
 from core.draw_layers import DrawLayer
 
@@ -16,9 +32,26 @@ from core.draw_layers import DrawLayer
 # ---------------------------------------------------------------------------
 _DIRECTION_SPAWN_OFFSETS = {
     'up':    (0,   -15),
-    'down':  (0,    15),
-    'left':  (-15,   5),
-    'right': (15,    5),
+    'down':  (0,    10),
+    'left':  (-12,   4),
+    'right': (12,    4),
+}
+
+# Collapses the sword spin's 8-directional octants down to the 4-directional
+# facing self.direction otherwise uses everywhere else (idle, melee, spawn
+# offsets, ...). Diagonals lean horizontal since left/right is the axis the
+# rest of the game already treats as the "primary" facing (flips, offsets).
+# Used only when the spin ends with the player having stayed in place —
+# see Player.stop_sword_spin().
+_OCTANT_TO_CARDINAL = {
+    'up':         'up',
+    'up_right':   'right',
+    'right':      'right',
+    'down_right': 'right',
+    'down':       'down',
+    'down_left':  'left',
+    'left':       'left',
+    'up_left':    'left',
 }
 
 
@@ -40,8 +73,8 @@ class Player:
         self.shadow_size = 'small'  # 'small' or 'big'
 
         # Divide by RENDER_SCALE so world-unit speed stays consistent across resolutions
-        self.speed = 5 / RENDER_SCALE
-        self.run_speed = 10 / RENDER_SCALE
+        self.speed = 3 / RENDER_SCALE
+        self.run_speed = 6 / RENDER_SCALE
 
         self.hp = 100
         self.max_hp = 100
@@ -52,6 +85,10 @@ class Player:
         self.exp_to_next_level = 100
         self.stat_points = 0
         self.pending_level_up = False
+
+        # Currency earned from enemy zeni drops (see core/zeni_system.py /
+        # Enemy.get_zeni_drop() — credited in game.py's enemy-cleanup loop).
+        self.zeni = 0
 
         # -----------------------------------------------------------------
         # Passive ki regen — like Buu's Fury: a small trickle back every so
@@ -90,6 +127,7 @@ class Player:
             'energy':   1,
             'speed':    1,
             'defense':  1,
+            'ki_regen': 30,   # matches character_creator default; drives ki_regen_interval
         }
 
         # Sprite + animation
@@ -110,7 +148,7 @@ class Player:
         # -----------------------------------------------------------------
         # Ki attack state
         # -----------------------------------------------------------------
-        self.ki_attack_mode = 'blast'       # 'blast' | 'beam' | 'transform'
+        self.ki_attack_mode = 'blast'       # 'blast' | 'beam' | 'kamekameha' | 'banshee_blast' | 'final_flash' | 'big_bang_kamehameha' | 'burning_attack' | 'flame_kamehameha' | 'energy_punch' | 'transform'
 
         # Attacks this character is allowed to use, loaded from their JSON config.
         # 'ki_mode_config' mirrors cfg["attacks"]["ki_attack_mode"] and controls
@@ -118,19 +156,405 @@ class Player:
         self.equipped_attacks = []
         self.ki_mode_config   = 'blast'     # default until config is applied
 
+        # Whether this character has at least one transformation defined
+        # in the character creator (cfg["transformations"]). Gates whether
+        # 'transform' shows up as a cyclable ki mode at all — set in
+        # Game._reload_attack_config().
+        self.has_transformation = False
+
         self.is_charging_beam = False
         self.beam_charge_time = 0
-        self.beam_charge_required = 1.5     # Seconds of charge before auto-fire
+        # Seconds of charge before auto-fire. This is a fallback/default
+        # value only — as soon as a charge starts, start_charging_beam()
+        # overwrites it with the actual length of the charge-up animation
+        # (KamehamehaChargeEffect.get_total_duration()), so the beam never
+        # fires before the sprite has finished playing through all of its
+        # frames, no matter how many frames the sheet has.
+        self.beam_charge_required = 0.3
         self.is_firing_beam = False
         self.current_beam = None
+        self.current_charge_effect = None
+
+        # Kamekameha — exact same charge-then-auto-fire beam as the regular
+        # Kamehameha above (same BeamAttack/KamehamehaChargeEffect classes,
+        # same 'charge'/'firebeam' player sprite states), just pointed at its
+        # own 'kamekameha' attack_name so it loads sprites from
+        # assets/sprites/attacks/kamekameha/ instead. Kept as fully separate
+        # state (own ki_attack_mode value 'kamekameha') so it can be equipped/
+        # cycled to and fired independently of the regular beam.
+        self.is_charging_kamekameha = False
+        self.kamekameha_charge_time = 0
+        self.kamekameha_charge_required = 0.3
+        self.is_firing_kamekameha = False
+        self.current_kamekameha = None
+        self.current_kamekameha_charge_effect = None
+
+        # Banshee Blast — same charge-then-auto-fire beam shape as
+        # Kamekameha above (BansheeBlastAttack/BansheeBlastChargeEffect,
+        # thin subclasses of BeamAttack/KamehamehaChargeEffect pointed at
+        # 'banshee_blast' — see banshee_blast.py), with two differences:
+        # the charge effect plays through once and holds on its last frame
+        # instead of pulsing (pulse_steps=0, baked into
+        # BansheeBlastChargeEffect), and the fired beam's middle tiles all
+        # flip between their 3 sprites in sync rather than in a traveling
+        # wave (middle_sync_random=True, baked into BansheeBlastAttack).
+        # The player sprite also doesn't switch between a charge and a
+        # fire animation the way kamekameha's does — see
+        # start_charging_banshee_blast()/fire_banshee_blast_auto() below,
+        # which both leave current_animation_state at 'banshee_blast'.
+        self.is_charging_banshee_blast = False
+        self.banshee_blast_charge_time = 0
+        self.banshee_blast_charge_required = 0.3
+        self.is_firing_banshee_blast = False
+        self.current_banshee_blast = None
+        self.current_banshee_blast_charge_effect = None
+
+        # Energy Punch — instant close-range strike, no charge-up. Q plays
+        # the 'energy_punch' animation once; once it's finished it just sits
+        # frozen on its own last frame (same non-looping-animation behavior
+        # every finished animation already has) for the rest of a fixed
+        # 1-second window, then the player returns to idle. There's no
+        # separate attack object (unlike beam/final_flash/kamekameha) —
+        # Game._update_energy_punch checks every active enemy's distance to
+        # the player directly for the "very near" hit while is_punching is
+        # True, passing the player itself in as the attack.
+        self.is_punching = False
+        self.punch_timer = 0
+        self.punch_duration = 1.0
+        self.energy_punch_damage = 20
+        self.energy_punch_radius = 24        # World px — deliberately tight ("very near")
+        self.energy_punch_knockback = 200
+
+        # Block — held via F (see start_blocking/stop_blocking). While
+        # active, can_act() (and therefore can_move()) returns False, so
+        # blocking is a full stop: no moving, no starting another action.
+        # take_damage() halves incoming damage, clamps knockback to a 1px
+        # nudge, and skips the hurt animation while this is set.
+        self.is_blocking = False
+
+        # Final Flash — same auto-fire-after-charge shape as the beam above
+        # (see start_charging_final_flash/update_final_flash_charge/
+        # fire_final_flash_auto/stop_final_flash), kept as fully separate
+        # state rather than reusing the beam's so both attacks could in
+        # theory be mid-charge/decay independently and so each gets its own
+        # ki_attack_mode value ('final_flash') for the HUD/mode-cycling to
+        # select. final_flash_charge_required is a fallback only, same as
+        # beam_charge_required — start_charging_final_flash() overwrites it
+        # with FinalFlashChargeEffect.get_total_duration() once charging
+        # actually begins.
+        self.is_charging_final_flash = False
+        self.final_flash_charge_time = 0
+        self.final_flash_charge_required = 1
+        self.is_firing_final_flash = False
+        self.current_final_flash = None
+        self.current_final_flash_charge_effect = None
+
+        # Big Bang Kamehameha — same auto-fire-after-charge shape as Final
+        # Flash above (see start_charging_big_bang_kamehameha/
+        # update_big_bang_kamehameha_charge/fire_big_bang_kamehameha_auto/
+        # stop_big_bang_kamehameha), kept as fully separate state for the
+        # same reasons final_flash's is. big_bang_kamehameha_charge_required
+        # is a fallback only — start_charging_big_bang_kamehameha()
+        # overwrites it with BigBangKamehamehaChargeEffect.get_total_duration()
+        # once charging actually begins.
+        self.is_charging_big_bang_kamehameha = False
+        self.big_bang_kamehameha_charge_time = 0
+        self.big_bang_kamehameha_charge_required = 1
+        self.is_firing_big_bang_kamehameha = False
+        self.current_big_bang_kamehameha = None
+        self.current_big_bang_kamehameha_charge_effect = None
+
+        # Flame Kamehameha — same charge-then-auto-fire shape as the regular
+        # beam (see start_charging_beam/update_beam_charge/fire_beam_auto):
+        # holding Q plays the charging_flame_kamehameha charge-up effect for
+        # flame_kamehameha_charge_required seconds, then the attack itself
+        # spawns automatically. flame_kamehameha_charge_required is a
+        # fallback only — start_charging_flame_kamehameha() overwrites it
+        # with the charge effect's actual animation length, same convention
+        # as beam_charge_required.
+        self.is_charging_flame_kamehameha = False
+        self.flame_kamehameha_charge_time = 0
+        self.flame_kamehameha_charge_required = 0.3
+        self.current_flame_kamehameha_charge_effect = None
+        self.is_firing_flame_kamehameha = False
+        self.current_flame_kamehameha = None
+        self.flame_kamehameha_ki_drain = 20  # Ki drained per second while firing, mirrors beam_ki_drain
+
+        # Genkidama state — unlike beam, this doesn't auto-fire: it charges
+        # while Q is held and fires whatever state was reached the moment Q
+        # is released (see start_charging_genkidama/release_genkidama).
+        self.is_charging_genkidama = False
+        self.genkidama_charge_effect = None
+        # Ki cost scales with the state actually fired at.
+        self.genkidama_ki_cost = {1: 15, 2: 25, 3: 40, 4: 60, 5: 90}
+
+        # Brief throw pose shown right after release — reuses the firebeam
+        # sprite for a fixed duration rather than looping indefinitely like
+        # the actual beam does (see release_genkidama/update()).
+        self.is_firing_genkidama = False
+        self.genkidama_fire_pose_timer = 0.0
+        self.genkidama_fire_pose_duration = 0.3
+
+        # Burning Attack state — charges while the attack button is held (the
+        # player freezes on the kiblast wind-up frame, see start_charging_burning),
+        # and fires on release like genkidama does, rather than auto-firing like
+        # the beam. See start_charging_burning/update_burning_charge/release_burning.
+        self.is_charging_burning = False
+        self.burning_charge_effect = None
+        self.burning_ki_cost = 20
+        self.burning_stun_duration = 1.5
+
+        # Instant Transmission state — while targeting, the whole world
+        # freezes (driven by Game._update_instant_transmission) and the
+        # player aims a screen-space cursor; on release it teleports to
+        # each selected enemy in pick order, then back to its starting
+        # position. See start_targeting_instant_transmission,
+        # begin_teleport_sequence, and update_it_teleport below.
+        self.is_targeting_it = False
+        self.is_teleporting_it = False
+        self.it_original_pos = None
+        self._it_pre_direction = None  # facing to restore once the whole IT sequence ends
+        self.it_hop_queue = []      # enemies to visit, in pick order
+        self.it_hop_index = 0
+        # Each hop is: a short flicker burst in place ('pre'), then the
+        # actual position change, then a flicker burst at the new spot
+        # ('post') — longer at a target (a little flurry) than on the
+        # final trip home. See update_it_teleport for the full state
+        # machine. it_going_home marks whether the current 'post' burst
+        # is the final one (heading back to it_original_pos) so we know
+        # to end the sequence instead of starting the next hop's 'pre'.
+        self.it_flicker_stage = None      # None | 'pre' | 'post'
+        self.it_going_home = False
+        # Set True the instant a hop's position actually changes (both
+        # "landed on a target" and "landed back home" branches, in
+        # update_it_teleport's 'pre' stage below) and consumed once by
+        # Game via pop_pending_it_teleport_hop() — same pending-flag
+        # pattern as pop_pending_charged_melee_hit() — so teleport.wav
+        # plays exactly once per hop, including the final trip home.
+        self.it_teleport_hop_occurred = False
+        self.it_flicker_showing_alt = False  # False='teleport' shown, True='instant_transmission' shown
+        self.it_teleport_show_frame2_next = True  # alternates which teleport.png frame is forced
+        self.it_flicker_step = 0
+        self.it_flicker_steps_needed = 0
+        self.it_ki_cost = 30
+        # How fast the teleport/instant_transmission flicker alternates,
+        # and how many alternations each flicker burst runs for. Tune to
+        # taste — these are an approximation of a captured sequence that
+        # wasn't fully consistent between captures, so exact counts here
+        # are a best guess rather than a locked spec.
+        self.it_flicker_interval = 0.12
+        self.it_flicker_timer = 0.0
+        self.IT_PRE_FLICKER_ALTERNATIONS = 2         # quick flash before departing
+        self.IT_POST_FLICKER_ALTERNATIONS_HOP = 4    # brief flurry once arrived at a target
+        self.IT_POST_FLICKER_ALTERNATIONS_HOME = 2   # quick flash arriving back home
+
+        # Delay between landing next to a target and actually applying the
+        # hit, so the damage doesn't register in the exact same frame as
+        # the teleport-in flicker — gives a beat for the "arrival" to read
+        # before the "attack" lands. Counted in real seconds (via dt),
+        # independent of the flicker cadence above, so it keeps working
+        # even if IT_POST_FLICKER_ALTERNATIONS_HOP or it_flicker_interval
+        # are retuned later.
+        self.it_hit_delay = 0.15
+        self._it_pending_hit_target = None
+        self._it_hit_delay_timer = 0.0
+
+        # Masenko state — charges while Q is held (oscillating aim indicator
+        # + hold_masenko overlay), and always throws on release rather than
+        # auto-firing or escalating through states like beam/genkidama do.
+        # No throw-pose state here (unlike genkidama) — throw_masenko()
+        # snaps straight back to idle the instant it's released.
+        self.is_charging_masenko = False
+        self.masenko_indicator   = None   # MasenkoAimIndicator, live only while charging
+        self.masenko_hold_effect = None   # MasenkoHoldEffect overlay, live only while charging
+        self.masenko_ki_cost     = 25
+
+        # Energy Sword state — unlike the other ki attacks, ki is spent
+        # once, up front, the moment the charge successfully starts (the
+        # cost of drawing the blade). If the charge finishes, the player
+        # automatically spins for a short, FREE duration slashing anything
+        # nearby, then returns to idle on its own. Releasing Q early,
+        # while still charging, cancels the draw — ki drained so far is
+        # not refunded. Once the spin has started it can't be cancelled
+        # early and costs no further ki.
+        self.is_charging_sword = False
+        self.sword_charge_time = 0
+        # Fallback only — overwritten with the charge effect's real
+        # animation length as soon as a charge starts, same convention as
+        # beam_charge_required.
+        self.sword_charge_required = 0.4
+        self.current_sword_charge_effect = None
+
+        self.is_spinning_sword = False
+        self.energy_sword_spin = None
+        self.sword_spin_timer = 0.0
+        self.sword_spin_duration = 2.0  # seconds the free spin lasts
+        # A bit brisker than EnergySwordSpinEffect's own 2.0 default.
+        self.sword_spin_rotations_per_second = 3.0
+        # Walking while spinning is intentionally slower than normal walk
+        # speed (on top of running already being capped out) — swinging a
+        # blade around one's whole body isn't exactly nimble footwork.
+        # Applied in move() whenever is_spinning_sword is True.
+        self.sword_spin_move_speed_mult = 0.5
+
+        # Total ki a full charge costs. Charging drains continuously (like
+        # the beam does while firing) rather than being paid as a lump sum
+        # up front — energy_sword_ki_drain (ki/second) is derived from this
+        # divided by however long the charge actually takes, recomputed in
+        # start_charging_sword() once sword_charge_required is known.
+        self.energy_sword_ki_cost = 20
+        self.energy_sword_ki_drain = 20     # ki/second; overwritten once charge starts
+        self.energy_sword_damage = 15
+
+        # Dragon Fist state — instant on press, no charge-up (like
+        # energy_punch), but held for as long as Q stays down instead of
+        # firing-and-forgetting. The head launches out immediately (see
+        # DragonFistAttack), then hands control to movement input once
+        # it's fully extended; the player's own sprite stays on the
+        # 'dragon_fist' pose for the whole hold regardless of how the
+        # head is being steered (see move()'s redirect to
+        # _move_dragon_fist_head). Releasing Q starts the head retracting
+        # back to the player instead of ending the attack instantly (see
+        # stop_dragon_fist()/update_dragon_fist()) — is_using_dragon_fist
+        # itself only drops once that retract sweep finishes.
+        self.is_using_dragon_fist = False
+        self.current_dragon_fist = None
+        self.dragon_fist_ki_drain = 20        # ki/second while held, mirrors beam_ki_drain
+
+        # Ghost Kamikaze — see start_ghost_kamikaze()/update_ghost_kamikaze_cast()
+        # and attacks/ghost_kamikaze.py's GhostKamikazeAttack for the full
+        # creation → hold → attack lifecycle. is_casting covers the 3-loop
+        # cast animation; is_holding covers the fixed pose afterward, which
+        # can_move() lets the player break out of early (see move()).
+        self.is_casting_ghost_kamikaze = False
+        self.is_holding_ghost_kamikaze = False
+        self.current_ghost_kamikaze = None
+        self.ghost_kamikaze_ki_cost = 35
+        self.ghost_kamikaze_required_loops = 3
+        # Charged per-ghost as it actually spawns (see
+        # update_ghost_kamikaze_cast()), rather than the whole
+        # ghost_kamikaze_ki_cost being taken in one lump sum up front in
+        # start_ghost_kamikaze() — same total cost, just spent gradually
+        # across the 3 loops instead of one big chunk disappearing the
+        # instant the attack is pressed. Derived from ghost_kamikaze_ki_cost
+        # rather than a separately-tuned number so the two can't drift out
+        # of sync — start_ghost_kamikaze()'s affordability gate still checks
+        # the full ghost_kamikaze_ki_cost (the player still needs enough ki
+        # for the *entire* attack to begin at all), this only changes when
+        # each piece of it actually leaves the ki bar.
+        self.ghost_kamikaze_ki_cost_per_ghost = (
+            self.ghost_kamikaze_ki_cost / self.ghost_kamikaze_required_loops
+        )
+        self.ghost_kamikaze_loop_count = 0
+        self.ghost_kamikaze_prev_frame_index = 0
+        # Each loop's ghost spawns once the cast animation reaches this
+        # frame within that loop (0-indexed, so 2 = the 3rd frame) rather
+        # than at the very start of the loop — see
+        # update_ghost_kamikaze_cast(). No separate "already spawned this
+        # loop" bookkeeping is needed here: GhostKamikazeAttack.
+        # spawn_next_ghost() itself won't spawn a new ghost while the
+        # previous one hasn't cleared the spawn point yet, so calling it
+        # repeatedly every frame past this threshold is safe.
+        self.ghost_kamikaze_spawn_frame_index = 2
+
+        # Big Bang Attack — see start_charging_big_bang_attack()/
+        # update_big_bang_charge()/release_big_bang_attack() and
+        # attacks/big_bang_attack.py for the charge effect and the
+        # thrown blast. Unlike Genkidama's 5-tier charge, there's only
+        # one power level here — is_charging just gates whether Q is
+        # currently held down through the fixed intro sequence (see
+        # BigBangAttackChargeEffect), not which tier gets thrown.
+        self.is_charging_big_bang_attack = False
+        self.current_big_bang_charge = None
+        self.big_bang_attack_ki_cost = 30
+        # Brief throw pose after release, same shape as Genkidama's own
+        # fire pose (is_firing_genkidama/genkidama_fire_pose_timer) —
+        # held just long enough to read as a throw before returning to
+        # idle (see release_big_bang_attack()/update()'s
+        # 'big_bang_attack_fire' dispatch).
+        self.is_firing_big_bang_attack = False
+        self.big_bang_attack_fire_pose_timer = 0.0
+        self.big_bang_attack_fire_pose_duration = 0.3
+
+        # Per-input-frame speed the player's movement input steers the
+        # head at during the 'controlled' phase — not multiplied by dt,
+        # matching move()'s own dx/dy * current_speed convention (one
+        # move() call = one frame's worth of motion already).
+        self.dragon_fist_head_speed = 4
+        # Opening lunge: on throw, the player is carried forward along the
+        # throw direction automatically (no input required/accepted) for
+        # dragon_fist_lunge_duration seconds, world-units/sec speed given
+        # by dragon_fist_follow_speed, with the fist assembly translated
+        # along for the ride each frame (see _advance_dragon_fist_lunge)
+        # so the whole thing moves as one unit. After the timer runs out,
+        # control hands off to the normal head-steering scheme.
+        self.dragon_fist_follow_speed = 20
+        self.dragon_fist_lunge_duration = 1.5   # seconds
+        self.dragon_fist_lunge_timer = 0.0
+        self.is_dragon_fist_lunging = False
+
+        # Armed on press, resolved once the dragon_fist animation reaches
+        # its release frame — see update_dragon_fist(). Same "arm now,
+        # resolve on a later frame" shape as pending_blast below, except
+        # DragonFistAttack isn't handed off to game.py, since it isn't
+        # added to any external list the way Projectile is.
+        self.pending_dragon_fist = None
 
         # Attack costs
         self.blast_ki_cost = 10
         self.beam_ki_drain = 20             # Ki drained per second while firing
+        self.kamekameha_ki_drain = 20       # Ki drained per second while firing, mirrors beam_ki_drain
+        self.banshee_blast_ki_drain = 20    # Ki drained per second while firing, mirrors beam_ki_drain
+        self.final_flash_ki_drain = 20      # Ki drained per second while firing — tune independently of the beam
+        self.big_bang_kamehameha_ki_drain = 20  # Ki drained per second while firing — tune independently of the beam
         self.melee_duration = 0.3
+
+        # Charged Melee — holding E (rather than tapping it) rolls the
+        # normal melee swing into a wind-up once it finishes: frame 0 of
+        # charged_melee.png held for charged_melee_charge_required seconds
+        # while the sprite blinks white (see update_charged_melee_charge(),
+        # draw()'s flash_white pass), then either a forward lunge (same
+        # shape as Dragon Fist's opening lunge — see
+        # _advance_charged_melee_lunge) or a rooted spin (no movability,
+        # like the energy sword spin — can_act()/can_move() already block
+        # movement via is_attacking, so no extra code is needed for that
+        # case), depending on charged_melee_style. That's set per-character
+        # from the character creator (see Game._reload_attack_config).
+        # Whichever style plays, it's the SAME charged_melee.png sheet
+        # continuing past frame 0 — no separate charge/action effect
+        # objects. Hits during the action are just regular MeleeAttack
+        # instances spawned every charged_melee_hit_interval seconds (see
+        # pop_pending_charged_melee_hit()), reusing melee's existing
+        # collision/sfx/cleanup pipeline in game.py wholesale instead of a
+        # bespoke hitbox.
+        self.is_e_pressed = False
+        self.is_charging_melee = False
+        self.charged_melee_charge_time = 0.0
+        self.charged_melee_charge_required = 1.0     # seconds
+        self.charged_melee_flash_timer = 0.0
+        self.charged_melee_flash_interval = 0.1      # blink rate while charging
+        self.charged_melee_flash_on = False
+        self.is_charged_melee_active = False         # True through the whole lunge/spin action
+        self.charged_melee_style = 'lunge'           # 'lunge' | 'spin'
+        self.charged_melee_lunge_duration = 0.3      # seconds
+        self.charged_melee_spin_duration = 1.0       # seconds
+        self.charged_melee_action_timer = 0.0
+        self.charged_melee_follow_speed = 50        # world units/sec while lunging
+        self.charged_melee_hit_interval = 0.2        # seconds between hit ticks during the action
+        self.charged_melee_hit_timer = 0.0
+        self.pending_charged_melee_hit = False
 
         # Blast is queued here and spawned once the kiblast animation finishes
         self.pending_blast = None
+
+        # Ultra Volleyball reuses the same kiblast throw animation as a
+        # regular blast (see shoot_ultra_volleyball()) but is tracked with
+        # its own pending/current fields so it doesn't collide with a
+        # regular blast's own pending_blast bookkeeping — see the
+        # 'kiblast' branch in update() below, which advances both
+        # independently off the same animation frame.
+        self.pending_ultra_volleyball = None
+        self.ultra_volleyball_ki_cost = 25
 
         # While Q is held, hold-fire animations alternate frame 2 / frame 1.
         # Reset to 2 so the first hold-fire shot after the initial 0->1 throw
@@ -272,17 +696,67 @@ class Player:
             return False
         if self.transformation and not self.transformation.can_player_act():
             return False
-        return not (self.is_attacking or self.is_charging_beam
-                    or self.is_firing_beam or self.is_knocked_back)
+        return not (self.is_attacking or self.is_punching or self.is_charging_beam
+                    or self.is_firing_beam or self.is_charging_kamekameha
+                    or self.is_firing_kamekameha or self.is_charging_banshee_blast
+                    or self.is_firing_banshee_blast or self.is_charging_final_flash
+                    or self.is_firing_final_flash or self.is_charging_flame_kamehameha
+                    or self.is_firing_flame_kamehameha
+                    or self.is_charging_big_bang_kamehameha
+                    or self.is_firing_big_bang_kamehameha
+                    or self.is_charging_genkidama
+                    or self.is_firing_genkidama or self.is_charging_masenko
+                    or self.is_charging_sword or self.is_spinning_sword
+                    or self.is_using_dragon_fist
+                    or self.is_targeting_it or self.is_teleporting_it
+                    or self.is_charging_burning
+                    or self.is_casting_ghost_kamikaze or self.is_holding_ghost_kamikaze
+                    or (self.current_ghost_kamikaze is not None and self.current_ghost_kamikaze.active)
+                    or self.is_charging_big_bang_attack or self.is_firing_big_bang_attack
+                    or self.is_knocked_back or self.is_blocking)
 
     def can_move(self):
-        """False during collision knockback or whenever can_act() returns False."""
+        """False during collision knockback or whenever can_act() returns False.
+
+        Energy sword spin and Dragon Fist are deliberate exceptions:
+        can_act() is False during both (you can't start another attack
+        mid-spin or mid-fist), but the player can still move — for the
+        sword that means walking around at reduced speed; for Dragon
+        Fist, move() redirects the input entirely into steering the fist's
+        head instead of moving the player (see _move_dragon_fist_head).
+        """
         if self.is_transitioning:
             return False
         if self.is_map_jumping:
             return False
         if self.is_collision_knockback:
             return False
+        if self.is_spinning_sword:
+            return not self.is_knocked_back
+        if self.is_using_dragon_fist:
+            return not self.is_knocked_back
+        if self.is_casting_ghost_kamikaze:
+            # Deliberate exception, same shape as sword-spin/dragon-fist
+            # above: can_act() is False during the cast (can't start
+            # another attack mid-cast), but moving is allowed and cancels
+            # the attack outright instead of letting it keep forming up
+            # (see move()'s cancel() call below).
+            return not self.is_knocked_back
+        if self.is_holding_ghost_kamikaze:
+            # Deliberate exception, same shape as sword-spin/dragon-fist
+            # above: can_act() is False during the hold (can't start
+            # another attack), but moving is allowed and — per the
+            # spec — cuts the hold short, launching the ghosts
+            # immediately (see move()'s launch_now() call below).
+            return not self.is_knocked_back
+        if (self.current_ghost_kamikaze is not None and self.current_ghost_kamikaze.active
+                and not self.is_casting_ghost_kamikaze and not self.is_holding_ghost_kamikaze):
+            # Same shape as the exceptions above: the ghosts are still
+            # resolving in the background (traveling to a target, or
+            # playing out their no-target end), which blocks can_act()
+            # from starting a new attack, but the player isn't locked
+            # into anything themselves and should still be able to walk.
+            return not self.is_knocked_back
         return self.can_act()
 
     def get_current_ki_cost(self):
@@ -348,6 +822,33 @@ class Player:
         if not self.can_move():
             return
 
+        if self.is_casting_ghost_kamikaze:
+            # Player moved mid-cast — cancels the attack outright rather
+            # than letting it keep forming up (see GhostKamikazeAttack.
+            # cancel(), which destroys every ghost created so far,
+            # however many loops have completed). stop_ghost_kamikaze()
+            # handles resetting this player's own casting flags/
+            # animation state back to idle; it deliberately doesn't touch
+            # current_ghost_kamikaze itself, which is exactly why cancel()
+            # needs to be called on it here first. Falls through to
+            # ordinary movement below rather than returning, same as the
+            # is_holding_ghost_kamikaze case right below.
+            if self.current_ghost_kamikaze:
+                self.current_ghost_kamikaze.cancel()
+            self.stop_ghost_kamikaze()
+
+        if self.is_holding_ghost_kamikaze:
+            # Player moved during the hold — per the spec, this cuts the
+            # wait short and sends the ghosts off immediately (same
+            # resolution GhostKamikazeAttack would reach on its own once
+            # hold_duration elapses — see its launch_now()). Falls
+            # through to ordinary movement below rather than returning,
+            # unlike Dragon Fist's redirect, since there's nothing left
+            # for this input to steer.
+            if self.current_ghost_kamikaze:
+                self.current_ghost_kamikaze.launch_now()
+            self.is_holding_ghost_kamikaze = False
+
         # Cache room dimensions so knockback bounds checks stay in sync
         self.current_room_width = world_width
         self.current_room_height = world_height
@@ -355,6 +856,17 @@ class Player:
         # Track the most recent input vector for collision-knockback direction
         self.last_move_direction['dx'] = dx
         self.last_move_direction['dy'] = dy
+
+        if self.is_using_dragon_fist:
+            # Movement input steers the fist's head instead of the player
+            # (see _move_dragon_fist_head) — the player's own position is
+            # dragged along separately, slowly, and horizontally-only, in
+            # update_dragon_fist(). Facing/sprite/animation are
+            # deliberately left untouched here: the player stays on the
+            # 'dragon_fist' pose for the whole hold no matter which way
+            # the head gets steered.
+            self._move_dragon_fist_head(dx, dy)
+            return
 
         if dx != 0 or dy != 0:
             if dx != 0 and dy == 0:
@@ -366,7 +878,13 @@ class Player:
             # Diagonal: keep the current direction to avoid sprite flipping
 
         self.is_running = is_running
-        current_speed = self.run_speed if is_running else self.speed
+        if self.is_spinning_sword:
+            # Slower than a normal walk, and deliberately ignores is_running —
+            # spinning a blade around yourself isn't compatible with sprinting,
+            # on top of already being capped out of running by game.py.
+            current_speed = self.speed * self.sword_spin_move_speed_mult
+        else:
+            current_speed = self.run_speed if is_running else self.speed
 
         # Reset per-frame block flags — game.py reads these to trigger knockback.
         self._blocked_x = False
@@ -395,6 +913,23 @@ class Player:
         anim = 'run' if is_running else 'walk'
         self.sprite.set_animation(anim, self.direction)
         self.current_animation_state = anim
+
+    def _move_dragon_fist_head(self, dx, dy):
+        """Steer the Dragon Fist head by one frame of raw input, then clamp
+        it back into its current leash box — recomputed every call since
+        the box's "back" edge tracks the player's own position (see
+        DragonFistAttack.clamp_head_to_leash / ._leash_bounds).
+
+        No-ops during the initial 'shooting' launch or the release
+        'retracting' sweep — the player only gets manual control once the
+        head has fully extended and is waiting on input.
+        """
+        fist = self.current_dragon_fist
+        if not fist or fist.state != 'controlled':
+            return
+        fist.head_x += dx * self.dragon_fist_head_speed
+        fist.head_y += dy * self.dragon_fist_head_speed
+        fist.clamp_head_to_leash(self.x, self.y)
 
     def tick_footsteps(self, dt):
         """Advance the sprint-footstep timer. Returns True the frame a footstep should play.
@@ -428,6 +963,12 @@ class Player:
         # by the animation-state machine and the player would be stuck forever.
         self.is_attacking = False
         self.pending_blast = None
+        self.pending_ultra_volleyball = None
+        self.is_charging_burning = False
+        self.burning_charge_effect = None
+        self.is_charging_melee = False
+        self.is_charged_melee_active = False
+        self.charged_melee_flash_on = False
 
         self.sprite.set_animation('hurt', self.direction)
         self.current_animation_state = 'hurt'
@@ -442,13 +983,147 @@ class Player:
             return None
 
         self.is_attacking = True
-        self.attack_cooldown = 0.4
+        # No added cooldown here — is_attacking (via can_act()) already blocks
+        # a new attack for the whole swing, so a melee-specific cooldown on
+        # top of that just delays the *next* swing past when this one visibly
+        # finishes. Leaving it at 0 lets melee -> melee chain back-to-back the
+        # instant the animation completes, matching the original game.
+        self.attack_cooldown = 0
         self.sprite.set_animation('melee', self.direction)
         self.current_animation_state = 'melee'
 
         melee = MeleeAttack(self.x, self.y, self.direction)
         melee.owner = self
         return melee
+
+    def start_charging_melee(self):
+        """Begin the charged-melee wind-up: hold frame 0 of
+        charged_melee.png for charged_melee_charge_required seconds while
+        the sprite blinks white (see update_charged_melee_charge()), then
+        auto-release into the lunge or spin (see release_charged_melee()).
+        is_attacking stays True the whole time — same can_act()/can_move()
+        lockout as the regular melee swing, just longer.
+
+        Called from the 'melee' animation-state branch in update() when
+        the normal swing finishes with E still held (see is_e_pressed).
+        """
+        self.is_charging_melee = True
+        self.charged_melee_charge_time = 0.0
+        self.charged_melee_flash_timer = 0.0
+        self.charged_melee_flash_on = False
+
+        if self.sprite.has_animation('charged_melee_hold', self.direction):
+            self.sprite.set_animation('charged_melee_hold', self.direction)
+        self.current_animation_state = 'charged_melee_charge'
+
+    def update_charged_melee_charge(self, dt):
+        """Advance the charge timer/blink and auto-release once fully
+        charged — or cancel back to idle if E is released early (mirrors
+        the energy sword charge's early-release-cancels behavior)."""
+        if not self.is_e_pressed:
+            self.cancel_charging_melee()
+            return
+
+        self.charged_melee_charge_time += dt
+        self.charged_melee_flash_timer += dt
+        if self.charged_melee_flash_timer >= self.charged_melee_flash_interval:
+            self.charged_melee_flash_timer -= self.charged_melee_flash_interval
+            self.charged_melee_flash_on = not self.charged_melee_flash_on
+
+        if self.charged_melee_charge_time >= self.charged_melee_charge_required:
+            self.release_charged_melee()
+
+    def cancel_charging_melee(self):
+        """E released before the charge finished — drop it and return to idle."""
+        self.is_charging_melee = False
+        self.is_attacking = False
+        self.charged_melee_flash_on = False
+        if self.current_animation_state == 'charged_melee_charge':
+            self.enter_idle()
+
+    def release_charged_melee(self):
+        """Charge finished — play the rest of charged_melee.png (frame 1
+        onward) while either lunging forward or spinning in place, per
+        charged_melee_style. No movement code is needed for the spin case:
+        is_attacking stays True, so can_act()/can_move() already block the
+        player from moving on their own — same "rooted" feel as the energy
+        sword spin has without needing a can_move() exception, unlike
+        Dragon Fist/the sword spin which explicitly opt back INTO movement.
+        """
+        self.is_charging_melee = False
+        self.is_charged_melee_active = True
+        self.charged_melee_flash_on = False
+        self.charged_melee_action_timer = (
+            self.charged_melee_lunge_duration if self.charged_melee_style == 'lunge'
+            else self.charged_melee_spin_duration
+        )
+        self.charged_melee_hit_timer = 0.0
+
+        if self.sprite.has_animation('charged_melee_action', self.direction):
+            self.sprite.set_animation('charged_melee_action', self.direction)
+        self.current_animation_state = 'charged_melee_action'
+
+    def update_charged_melee_action(self, dt):
+        """Advance the lunge/spin for its fixed duration, ticking off
+        periodic melee hits along the way (see pop_pending_charged_melee_hit)."""
+        if self.charged_melee_style == 'lunge':
+            self._advance_charged_melee_lunge(dt)
+
+        self.charged_melee_hit_timer += dt
+        if self.charged_melee_hit_timer >= self.charged_melee_hit_interval:
+            self.charged_melee_hit_timer -= self.charged_melee_hit_interval
+            self.pending_charged_melee_hit = True
+
+        self.charged_melee_action_timer -= dt
+        if self.charged_melee_action_timer <= 0:
+            self.stop_charged_melee()
+
+    def _advance_charged_melee_lunge(self, dt):
+        """Carry the player forward along their facing at
+        charged_melee_follow_speed, respecting world bounds/obstacles —
+        same shape as _advance_dragon_fist_lunge, just without a fist
+        assembly that needs to be translated along for the ride."""
+        dxu, dyu = _DRAGON_FIST_DIRECTION_UNIT.get(self.direction, (0, 0))
+        step = self.charged_melee_follow_speed * dt
+
+        if dxu != 0:
+            new_x = self.x + dxu * step
+            new_x = max(self.width // 2, min(new_x, self.current_room_width - self.width // 2))
+            if not self.check_collision_with_obstacles(new_x, self.y):
+                self.x = new_x
+        if dyu != 0:
+            new_y = self.y + dyu * step
+            new_y = max(self.height // 2, min(new_y, self.current_room_height - self.height // 2))
+            if not self.check_collision_with_obstacles(self.x, new_y):
+                self.y = new_y
+
+    def stop_charged_melee(self):
+        """End the lunge/spin (naturally, on timeout — or externally, e.g.
+        we got hit or killed mid-attack) and return to idle."""
+        self.is_charging_melee = False
+        self.is_charged_melee_active = False
+        self.is_attacking = False
+        self.charged_melee_flash_on = False
+        if self.current_animation_state == 'charged_melee_action':
+            self.enter_idle()
+
+    def pop_pending_charged_melee_hit(self):
+        """Consume and return a fresh MeleeAttack at the player's current
+        position/facing if a charged-melee hit tick fired this frame (see
+        update_charged_melee_action()), or None otherwise.
+
+        Reuses MeleeAttack wholesale — same collision/sfx/cleanup pipeline
+        in game.py as a regular tap-melee swing — rather than a bespoke
+        persistent hitbox, since a periodic instant check is all either
+        the lunge or the spin actually needs.
+        """
+        if not self.pending_charged_melee_hit:
+            return None
+        self.pending_charged_melee_hit = False
+        hit = MeleeAttack(self.x, self.y, self.direction)
+        hit.owner = self
+        hit.hit_something = False
+        return hit
 
     def shoot_blast(self):
         """Queue a ki blast — the projectile spawns once the kiblast animation finishes."""
@@ -463,6 +1138,24 @@ class Player:
             self.sprite.set_animation('kiblast', self.direction)
             self.current_animation_state = 'kiblast'
             self.pending_blast = True  # Checked in update(); set to 'ready' when animation ends
+
+    def shoot_ultra_volleyball(self):
+        """Queue an Ultra Volleyball — reuses the exact same kiblast
+        wind-up/throw animation as a regular blast (see shoot_blast()
+        above); the fixed 3-segment UltraVolleyballAttack spawns once
+        frame 1 of that animation plays, same release-frame timing a
+        regular blast uses, tracked separately via
+        pending_ultra_volleyball so the two don't stomp each other."""
+        if not self.can_act() or self.attack_cooldown > 0:
+            return
+
+        if self.ki >= self.ultra_volleyball_ki_cost:
+            self.ki -= self.ultra_volleyball_ki_cost
+            self.is_attacking = True
+            self.attack_cooldown = 0.5
+            self.sprite.set_animation('kiblast', self.direction)
+            self.current_animation_state = 'kiblast'
+            self.pending_ultra_volleyball = True  # Checked in update(); set to 'ready' on frame 1
 
     def get_blast_spawn_position(self):
         """Return (x, y) world position where the blast projectile should appear."""
@@ -512,10 +1205,10 @@ class Player:
             self.sprite.set_animation(hold_anim, self.direction)
             self.current_animation_state = 'kiblast_hold'
 
-            # Don't touch pending_blast here — it may still be 'ready' from the
-            # shot that just finished, awaiting game.py's spawn check this same
-            # frame. Queue it for arming next frame instead (see update()).
-            self._queue_next_pending = True
+            # pending_blast was already consumed by game.py (set 'ready' on frame 1
+            # of the kiblast animation, before is_animation_finished() fired here),
+            # so it's safe to arm the next blast immediately.
+            self.pending_blast = True
         else:
             self.is_attacking = False
             self._blast_hold_frame = 2  # Reset so the next fresh press starts on frame 2
@@ -532,6 +1225,11 @@ class Player:
             self.is_q_pressed = True
             self.sprite.set_animation('charge', self.direction)
             self.current_animation_state = 'charge'
+            self.current_charge_effect = KamehamehaChargeEffect(self)
+            # Sync the auto-fire threshold to however long the charge-up
+            # sprite actually takes to play through all of its frames, so
+            # the beam can never fire before that animation has finished.
+            self.beam_charge_required = self.current_charge_effect.get_total_duration()
             return True
 
         return False
@@ -539,6 +1237,8 @@ class Player:
     def update_beam_charge(self, dt):
         """Advance the beam charge timer and auto-fire when fully charged."""
         if self.is_charging_beam:
+            if self.current_charge_effect:
+                self.current_charge_effect.update(dt)
             self.beam_charge_time += dt
             if self.beam_charge_time >= self.beam_charge_required and not self.is_firing_beam:
                 self.fire_beam_auto()
@@ -551,6 +1251,7 @@ class Player:
         self.is_charging_beam = False
         self.is_firing_beam = True
         self.beam_charge_time = 0
+        self.current_charge_effect = None
         self.sprite.set_animation('firebeam', self.direction)
         self.current_animation_state = 'firebeam'
 
@@ -560,14 +1261,1445 @@ class Player:
         return self.current_beam
 
     def stop_beam(self):
-        """Cancel beam charging or firing and return to idle."""
+        """Cancel beam charging, or hand a firing beam off to its decay
+        sweep instead of instantly removing it.
+
+        current_beam is deliberately NOT cleared here when a beam is
+        firing — it stays assigned (and keeps getting updated/drawn
+        normally by whatever owns the render loop) until the beam's own
+        decay sweep finishes and it marks itself inactive; update() below
+        is what actually drops the reference at that point. Charging
+        (no beam spawned yet) still clears immediately since there's
+        nothing to decay.
+        """
         self.is_charging_beam = False
         self.is_firing_beam = False
         self.beam_charge_time = 0
         self.is_q_pressed = False
-        self.current_beam = None
+        self.current_charge_effect = None
+
+        if self.current_beam:
+            self.current_beam.start_decay()
 
         if self.current_animation_state in ('charge', 'kiblast', 'firebeam'):
+            self.enter_idle()
+
+    def start_charging_kamekameha(self):
+        """Begin the Kamekameha charge animation. Returns True on success.
+
+        Mirrors start_charging_beam() exactly — see that method for the
+        reasoning — just against Kamekameha's own state and pointed at the
+        'kamekameha' attack_name so KamehamehaChargeEffect/BeamAttack load
+        sprites from assets/sprites/attacks/kamekameha/ instead of the
+        regular kamehameha folder. Reuses the same 'charge'/'firebeam'
+        player sprite states since visually the charge/fire pose is
+        identical to the regular beam.
+        """
+        if not self.can_act():
+            return False
+
+        if self.ki > 0 or self.is_transformed():
+            self.is_charging_kamekameha = True
+            self.kamekameha_charge_time = 0
+            self.is_q_pressed = True
+            self.sprite.set_animation('charge', self.direction)
+            self.current_animation_state = 'kamekameha_charge'
+            self.current_kamekameha_charge_effect = KamehamehaChargeEffect(
+                self, attack_name='kamekameha'
+            )
+            # Sync the auto-fire threshold to however long the charge-up
+            # sprite actually takes to play through all of its frames, so
+            # the beam can never fire before that animation has finished —
+            # same convention as beam_charge_required.
+            self.kamekameha_charge_required = \
+                self.current_kamekameha_charge_effect.get_total_duration()
+            return True
+
+        return False
+
+    def update_kamekameha_charge(self, dt):
+        """Advance the Kamekameha charge timer and auto-fire when fully
+        charged. Mirrors update_beam_charge() exactly."""
+        if self.is_charging_kamekameha:
+            if self.current_kamekameha_charge_effect:
+                self.current_kamekameha_charge_effect.update(dt)
+            self.kamekameha_charge_time += dt
+            if (self.kamekameha_charge_time >= self.kamekameha_charge_required
+                    and not self.is_firing_kamekameha):
+                self.fire_kamekameha_auto()
+
+    def fire_kamekameha_auto(self):
+        """Transition from charging to firing once the charge threshold is
+        met. Mirrors fire_beam_auto() exactly."""
+        if not (self.is_charging_kamekameha
+                and self.kamekameha_charge_time >= self.kamekameha_charge_required):
+            return None
+
+        self.is_charging_kamekameha = False
+        self.is_firing_kamekameha = True
+        self.kamekameha_charge_time = 0
+        self.current_kamekameha_charge_effect = None
+        self.sprite.set_animation('firebeam', self.direction)
+        self.current_animation_state = 'kamekameha_fire'
+
+        # Spawn slightly in front of the player based on facing direction,
+        # same offset table the beam uses.
+        ox, oy = self._get_spawn_offset()
+        self.current_kamekameha = BeamAttack(
+            self.x + ox, self.y + oy, self.direction, attack_name='kamekameha'
+        )
+        return self.current_kamekameha
+
+    def stop_kamekameha(self):
+        """Cancel Kamekameha charging, or hand a firing one off to its decay
+        sweep instead of instantly removing it. Mirrors stop_beam() exactly
+        — see that method for the current_kamekameha-not-cleared reasoning.
+        """
+        self.is_charging_kamekameha = False
+        self.is_firing_kamekameha = False
+        self.kamekameha_charge_time = 0
+        self.is_q_pressed = False
+        self.current_kamekameha_charge_effect = None
+
+        if self.current_kamekameha:
+            self.current_kamekameha.start_decay()
+
+        if self.current_animation_state in ('kamekameha_charge', 'kamekameha_fire'):
+            self.enter_idle()
+
+    def start_charging_banshee_blast(self):
+        """Begin the Banshee Blast charge animation. Returns True on success.
+
+        Mirrors start_charging_kamekameha() exactly, with one deliberate
+        difference: the player sprite uses a single 'banshee_blast'
+        animation key for both charging and firing (see
+        fire_banshee_blast_auto(), which never re-calls set_animation),
+        instead of switching from 'charge' to 'firebeam' the way beam/
+        kamekameha do. current_animation_state still moves from
+        'banshee_blast_charge' to 'banshee_blast_fire' though — that's
+        just this method's own internal state-machine label, unrelated to
+        which sprite animation is actually playing (see the dispatch in
+        update() below and _tick_banshee_blast_ki_drain()).
+        """
+        if not self.can_act():
+            return False
+
+        if self.ki > 0 or self.is_transformed():
+            self.is_charging_banshee_blast = True
+            self.banshee_blast_charge_time = 0
+            self.is_q_pressed = True
+            self.sprite.set_animation('banshee_blast', self.direction)
+            self.current_animation_state = 'banshee_blast_charge'
+            self.current_banshee_blast_charge_effect = BansheeBlastChargeEffect(self)
+            # Sync the auto-fire threshold to however long the charge-up
+            # sprite actually takes to play through all of its frames, so
+            # the beam can never fire before that animation has finished —
+            # same convention as beam_charge_required/kamekameha_charge_required.
+            self.banshee_blast_charge_required = \
+                self.current_banshee_blast_charge_effect.get_total_duration()
+            return True
+
+        return False
+
+    def update_banshee_blast_charge(self, dt):
+        """Advance the Banshee Blast charge timer and auto-fire when fully
+        charged. Mirrors update_kamekameha_charge() exactly."""
+        if self.is_charging_banshee_blast:
+            if self.current_banshee_blast_charge_effect:
+                self.current_banshee_blast_charge_effect.update(dt)
+            self.banshee_blast_charge_time += dt
+            if (self.banshee_blast_charge_time >= self.banshee_blast_charge_required
+                    and not self.is_firing_banshee_blast):
+                self.fire_banshee_blast_auto()
+
+    def fire_banshee_blast_auto(self):
+        """Transition from charging to firing once the charge threshold is
+        met. Mirrors fire_kamekameha_auto() exactly, except the player
+        sprite is left alone — it stays on the same 'banshee_blast'
+        animation it's already playing rather than switching to a
+        separate fire pose."""
+        if not (self.is_charging_banshee_blast
+                and self.banshee_blast_charge_time >= self.banshee_blast_charge_required):
+            return None
+
+        self.is_charging_banshee_blast = False
+        self.is_firing_banshee_blast = True
+        self.banshee_blast_charge_time = 0
+        self.current_banshee_blast_charge_effect = None
+        self.current_animation_state = 'banshee_blast_fire'
+
+        # Spawn exactly where the charge sprite was drawn — NOT the
+        # generic _get_spawn_offset()/_DIRECTION_SPAWN_OFFSETS table every
+        # other beam uses. BansheeBlastChargeEffect.draw() positions
+        # itself at (player.x + offset_x, player.y - player.height/2 +
+        # offset_y) using BANSHEE_BLAST_CHARGE_OFFSETS (see banshee_blast.
+        # py) — mirror that same formula here so the fired beam's begin
+        # sprite starts flush with wherever the charge orb was sitting,
+        # instead of at a different, unrelated spawn point.
+        ox, oy = BANSHEE_BLAST_CHARGE_OFFSETS.get(self.direction, (0, 0))
+        self.current_banshee_blast = BansheeBlastAttack(
+            self.x + ox, self.y - self.height / 2 + oy, self.direction
+        )
+        return self.current_banshee_blast
+
+    def stop_banshee_blast(self):
+        """Cancel Banshee Blast charging, or hand a firing one off to its
+        decay sweep instead of instantly removing it. Mirrors
+        stop_kamekameha() exactly.
+        """
+        self.is_charging_banshee_blast = False
+        self.is_firing_banshee_blast = False
+        self.banshee_blast_charge_time = 0
+        self.is_q_pressed = False
+        self.current_banshee_blast_charge_effect = None
+
+        if self.current_banshee_blast:
+            self.current_banshee_blast.start_decay()
+
+        if self.current_animation_state in ('banshee_blast_charge', 'banshee_blast_fire'):
+            self.enter_idle()
+
+    def energy_punch(self):
+        """Throw an instant close-range Energy Punch. Returns True on
+        success. Unlike beam/kamekameha/final_flash there's nothing to
+        charge — pressing Q just plays the attack animation once, holds on
+        its last frame for the rest of a fixed 1-second window (see the
+        'energy_punch' branch in update()), then returns to idle. The actual
+        "did this hit anyone" check happens every frame in
+        Game._update_energy_punch while is_punching is True.
+        """
+        if not self.can_act():
+            return False
+
+        self.is_punching = True
+        self.punch_timer = 0
+        self.sprite.set_animation('energy_punch', self.direction)
+        self.current_animation_state = 'energy_punch'
+        return True
+
+    def start_charging_final_flash(self):
+        """Begin the Final Flash charge animation. Returns True on success.
+
+        Mirrors start_charging_beam() exactly — see that method for the
+        reasoning — just against Final Flash's own state and a
+        'charge_final_flash' animation instead of the shared 'charge' one,
+        since Final Flash's charge pose is its own sprite, not a reskin of
+        the Kamehameha's.
+        """
+        if not self.can_act():
+            return False
+
+        if self.ki > 0 or self.is_transformed():
+            self.is_charging_final_flash = True
+            self.final_flash_charge_time = 0
+            self.is_q_pressed = True
+            self.sprite.set_animation('charge_final_flash', self.direction)
+            self.current_animation_state = 'final_flash_charge'
+            self.current_final_flash_charge_effect = FinalFlashChargeEffect(self)
+            # Sync the auto-fire threshold to however long the charge-up
+            # sprite actually takes (1 second by default — see
+            # FinalFlashChargeEffect), same convention as the beam.
+            self.final_flash_charge_required = self.current_final_flash_charge_effect.get_total_duration()
+            return True
+
+        return False
+
+    def update_final_flash_charge(self, dt):
+        """Advance the Final Flash charge timer and auto-fire when fully charged."""
+        if self.is_charging_final_flash:
+            if self.current_final_flash_charge_effect:
+                self.current_final_flash_charge_effect.update(dt)
+            self.final_flash_charge_time += dt
+            if (self.final_flash_charge_time >= self.final_flash_charge_required
+                    and not self.is_firing_final_flash):
+                self.fire_final_flash_auto()
+
+    def fire_final_flash_auto(self):
+        """Transition from charging to firing once the charge threshold is met."""
+        if not (self.is_charging_final_flash
+                and self.final_flash_charge_time >= self.final_flash_charge_required):
+            return None
+
+        self.is_charging_final_flash = False
+        self.is_firing_final_flash = True
+        self.final_flash_charge_time = 0
+        self.current_final_flash_charge_effect = None
+        self.sprite.set_animation('firebeam', self.direction)
+        self.current_animation_state = 'final_flash_fire'
+
+        # Spawn slightly in front of the player based on facing direction,
+        # same offset table the beam uses.
+        ox, oy = self._get_spawn_offset()
+        self.current_final_flash = FinalFlashAttack(self.x + ox, self.y + oy, self.direction)
+        return self.current_final_flash
+
+    def stop_final_flash(self):
+        """Cancel Final Flash charging, or hand a firing one off to its
+        decay sweep instead of instantly removing it. Mirrors stop_beam()
+        exactly — see that method for the current_final_flash-not-cleared
+        reasoning.
+        """
+        self.is_charging_final_flash = False
+        self.is_firing_final_flash = False
+        self.final_flash_charge_time = 0
+        self.is_q_pressed = False
+        self.current_final_flash_charge_effect = None
+
+        if self.current_final_flash:
+            self.current_final_flash.start_decay()
+
+        if self.current_animation_state in ('final_flash_charge', 'final_flash_fire'):
+            self.enter_idle()
+
+    def start_charging_big_bang_kamehameha(self):
+        """Begin the Big Bang Kamehameha charge animation. Returns True on
+        success.
+
+        Mirrors start_charging_final_flash() exactly — see that method for
+        the reasoning — except the charge pose reuses the shared 'charge'
+        animation (same as beam/kamekameha) rather than a dedicated one:
+        Big Bang Kamehameha's charge-up is the plain Kamehameha's own
+        charging sprite/position, not unique art (see
+        BigBangKamehamehaChargeEffect's docstring in
+        attacks/big_bang_kamehameha.py).
+        """
+        if not self.can_act():
+            return False
+
+        if self.ki > 0 or self.is_transformed():
+            self.is_charging_big_bang_kamehameha = True
+            self.big_bang_kamehameha_charge_time = 0
+            self.is_q_pressed = True
+            self.sprite.set_animation('charge', self.direction)
+            self.current_animation_state = 'big_bang_kamehameha_charge'
+            self.current_big_bang_kamehameha_charge_effect = BigBangKamehamehaChargeEffect(self)
+            # Sync the auto-fire threshold to however long the charge-up
+            # sprite actually takes, same convention as final_flash/beam.
+            self.big_bang_kamehameha_charge_required = self.current_big_bang_kamehameha_charge_effect.get_total_duration()
+            return True
+
+        return False
+
+    def update_big_bang_kamehameha_charge(self, dt):
+        """Advance the Big Bang Kamehameha charge timer and auto-fire when
+        fully charged."""
+        if self.is_charging_big_bang_kamehameha:
+            if self.current_big_bang_kamehameha_charge_effect:
+                self.current_big_bang_kamehameha_charge_effect.update(dt)
+            self.big_bang_kamehameha_charge_time += dt
+            if (self.big_bang_kamehameha_charge_time >= self.big_bang_kamehameha_charge_required
+                    and not self.is_firing_big_bang_kamehameha):
+                self.fire_big_bang_kamehameha_auto()
+
+    def fire_big_bang_kamehameha_auto(self):
+        """Transition from charging to firing once the charge threshold is met."""
+        if not (self.is_charging_big_bang_kamehameha
+                and self.big_bang_kamehameha_charge_time >= self.big_bang_kamehameha_charge_required):
+            return None
+
+        self.is_charging_big_bang_kamehameha = False
+        self.is_firing_big_bang_kamehameha = True
+        self.big_bang_kamehameha_charge_time = 0
+        self.current_big_bang_kamehameha_charge_effect = None
+        self.sprite.set_animation('firebeam', self.direction)
+        self.current_animation_state = 'big_bang_kamehameha_fire'
+
+        # Spawn slightly in front of the player based on facing direction,
+        # same offset table the beam/final_flash use.
+        ox, oy = self._get_spawn_offset()
+        self.current_big_bang_kamehameha = BigBangKamehamehaAttack(self.x + ox, self.y + oy, self.direction)
+        return self.current_big_bang_kamehameha
+
+    def stop_big_bang_kamehameha(self):
+        """Cancel Big Bang Kamehameha charging, or hand a firing one off to
+        its decay sweep instead of instantly removing it. Mirrors
+        stop_final_flash()/stop_beam() exactly — see stop_beam() for the
+        current_big_bang_kamehameha-not-cleared reasoning.
+        """
+        self.is_charging_big_bang_kamehameha = False
+        self.is_firing_big_bang_kamehameha = False
+        self.big_bang_kamehameha_charge_time = 0
+        self.is_q_pressed = False
+        self.current_big_bang_kamehameha_charge_effect = None
+
+        if self.current_big_bang_kamehameha:
+            self.current_big_bang_kamehameha.start_decay()
+
+        if self.current_animation_state in ('big_bang_kamehameha_charge', 'big_bang_kamehameha_fire'):
+            self.enter_idle()
+
+    def start_charging_flame_kamehameha(self):
+        """Begin the Flame Kamehameha charge animation. Returns True on
+        success. Mirrors start_charging_beam() exactly — see that method
+        for the reasoning — just against Flame Kamehameha's own state and
+        pointed at the 'flame_kamehameha' attack_name so
+        KamehamehaChargeEffect loads charging_flame_kamehameha.png instead
+        of the regular charging_kamehameha.png.
+        """
+        if not self.can_act():
+            return False
+
+        if self.ki > 0 or self.is_transformed():
+            self.is_charging_flame_kamehameha = True
+            self.flame_kamehameha_charge_time = 0
+            self.is_q_pressed = True
+            self.sprite.set_animation('charge', self.direction)
+            self.current_animation_state = 'flame_kamehameha_charge'
+            self.current_flame_kamehameha_charge_effect = KamehamehaChargeEffect(
+                self, attack_name='flame_kamehameha'
+            )
+            # Sync the auto-fire threshold to however long the charge-up
+            # sprite actually takes to play through all of its frames, so
+            # the attack can never fire before that animation has finished
+            # — same convention as beam_charge_required.
+            self.flame_kamehameha_charge_required = \
+                self.current_flame_kamehameha_charge_effect.get_total_duration()
+            return True
+
+        return False
+
+    def update_flame_kamehameha_charge(self, dt):
+        """Advance the Flame Kamehameha charge timer and auto-fire when
+        fully charged. Mirrors update_beam_charge() exactly."""
+        if self.is_charging_flame_kamehameha:
+            if self.current_flame_kamehameha_charge_effect:
+                self.current_flame_kamehameha_charge_effect.update(dt)
+            self.flame_kamehameha_charge_time += dt
+            if (self.flame_kamehameha_charge_time >= self.flame_kamehameha_charge_required
+                    and not self.is_firing_flame_kamehameha):
+                self.fire_flame_kamehameha_auto()
+
+    def fire_flame_kamehameha_auto(self):
+        """Transition from charging to firing once the charge threshold is
+        met. Mirrors fire_beam_auto(); once fired, FlameKamehamehaAttack
+        itself becomes fully active instantly and just holds/oscillates
+        (see its own docstring) — the charge delay lives entirely here,
+        before it's even constructed.
+        """
+        if not (self.is_charging_flame_kamehameha
+                and self.flame_kamehameha_charge_time >= self.flame_kamehameha_charge_required):
+            return None
+
+        self.is_charging_flame_kamehameha = False
+        self.is_firing_flame_kamehameha = True
+        self.flame_kamehameha_charge_time = 0
+        self.current_flame_kamehameha_charge_effect = None
+        self.sprite.set_animation('firebeam', self.direction)
+        self.current_animation_state = 'flame_kamehameha_fire'
+
+        ox, oy = self._get_spawn_offset()
+        self.current_flame_kamehameha = FlameKamehamehaAttack(self.x + ox, self.y + oy, self.direction)
+        return self.current_flame_kamehameha
+
+    def start_flame_kamehameha(self):
+        """Back-compat alias for start_charging_flame_kamehameha().
+
+        The attack used to fire the instant Q went down; it now charges
+        first like the regular beam, so this just forwards to the charge
+        starter under the old name in case anything still calls it.
+        """
+        return self.start_charging_flame_kamehameha()
+
+    def stop_flame_kamehameha(self):
+        """Cancel Flame Kamehameha charging, or end a firing one outright.
+
+        Mirrors stop_beam(), except (per FlameKamehamehaAttack's own
+        docstring) there's no decay sweep to hand a firing attack off to —
+        current_flame_kamehameha IS cleared here immediately rather than
+        kept around for a decay animation to keep playing through.
+        """
+        self.is_charging_flame_kamehameha = False
+        self.is_firing_flame_kamehameha = False
+        self.flame_kamehameha_charge_time = 0
+        self.is_q_pressed = False
+        self.current_flame_kamehameha_charge_effect = None
+
+        if self.current_flame_kamehameha:
+            self.current_flame_kamehameha.stop()
+        self.current_flame_kamehameha = None
+
+        if self.current_animation_state in ('flame_kamehameha_charge', 'flame_kamehameha_fire'):
+            self.enter_idle()
+
+    def start_charging_genkidama(self):
+        """Begin the genkidama charge. Returns True on success.
+
+        Unlike the beam, this never auto-fires — it just keeps escalating
+        through its 5 states for as long as Q is held, and release_genkidama()
+        fires whatever state was reached when Q comes back up."""
+        if not self.can_act():
+            return False
+
+        if self.ki < self.genkidama_ki_cost[1] and not self.is_transformed():
+            return False
+
+        self.is_charging_genkidama = True
+        self.is_q_pressed = True
+        self.sprite.set_animation('charge_genkidama', self.direction)
+        self.current_animation_state = 'genkidama_charge'
+        self.genkidama_charge_effect = GenkidamaChargeEffect(self)
+        return True
+
+    def update_genkidama_charge(self, dt):
+        """Advance the genkidama charge timer/state and its visual effect."""
+        if self.is_charging_genkidama and self.genkidama_charge_effect:
+            self.genkidama_charge_effect.update(dt)
+
+    def release_genkidama(self):
+        """Called when the charge key is released. Fires whatever state was
+        reached, and returns the GenkidamaBlast to spawn — or None if there
+        was nothing to fire (e.g. not enough ki, or charging was never
+        actually active)."""
+        if not self.is_charging_genkidama or not self.genkidama_charge_effect:
+            return None
+
+        state = self.genkidama_charge_effect.state
+        cost = self.genkidama_ki_cost.get(state, self.genkidama_ki_cost[1])
+
+        if self.ki < cost and not self.is_transformed():
+            # Not enough ki to actually let it off — cancel silently rather
+            # than firing for free.
+            self.stop_genkidama()
+            return None
+
+        if not self.is_transformed():
+            self.ki -= cost
+
+        sprite = self.genkidama_charge_effect.get_state_sprite(state)
+        ox, oy = self._get_spawn_offset()
+        blast = GenkidamaBlast(self.x + ox, self.y + oy, self.direction, state, sprite=sprite)
+
+        # Done charging — clear charge state directly (not via stop_genkidama(),
+        # which would snap straight to idle) so we can show a brief throw pose
+        # first instead.
+        self.is_charging_genkidama = False
+        self.is_q_pressed = False
+        self.genkidama_charge_effect = None
+
+        self.is_firing_genkidama = True
+        self.genkidama_fire_pose_timer = self.genkidama_fire_pose_duration
+        self.sprite.set_animation('firebeam', self.direction)
+        self.current_animation_state = 'genkidama_fire'
+
+        return blast
+
+    def stop_genkidama(self):
+        """Cancel genkidama charging (without firing) and clear its state."""
+        self.is_charging_genkidama = False
+        self.is_q_pressed = False
+        self.genkidama_charge_effect = None
+
+        if self.current_animation_state == 'genkidama_charge':
+            self.enter_idle()
+
+    def start_charging_big_bang_attack(self):
+        """Begin the Big Bang Attack charge. Returns True on success.
+
+        Unlike Genkidama, there's nothing to escalate here — the charge
+        effect just plays its fixed charge1 -> charge2 -> state1 ->
+        (flicker) charge2 -> state1 intro (see BigBangAttackChargeEffect)
+        and then holds there, regardless of how much longer Q stays down
+        after that. Releasing always throws the exact same single blast
+        (see release_big_bang_attack()) no matter which point in that
+        intro release happens to land on — there's no partial-charge,
+        weaker version the way an early Genkidama release gives one."""
+        if not self.can_act():
+            return False
+
+        if self.ki < self.big_bang_attack_ki_cost and not self.is_transformed():
+            return False
+
+        self.is_charging_big_bang_attack = True
+        self.is_q_pressed = True
+        self.sprite.set_animation('big_bang_attack', self.direction)
+        self.current_animation_state = 'big_bang_attack_charge'
+        self.current_big_bang_charge = BigBangAttackChargeEffect(self)
+        return True
+
+    def update_big_bang_charge(self, dt):
+        """Advance the Big Bang Attack charge's fixed intro sequence."""
+        if self.is_charging_big_bang_attack and self.current_big_bang_charge:
+            self.current_big_bang_charge.update(dt)
+
+    def release_big_bang_attack(self):
+        """Called when the charge key is released. Always throws the
+        one single blast regardless of which intro phase happened to be
+        showing at the exact moment of release (see
+        BigBangAttackChargeEffect.get_fire_sprite()) — returns the
+        BigBangAttackBlast to spawn, or None if there was nothing to
+        fire (e.g. not enough ki, or charging was never actually
+        active)."""
+        if not self.is_charging_big_bang_attack or not self.current_big_bang_charge:
+            return None
+
+        if self.ki < self.big_bang_attack_ki_cost and not self.is_transformed():
+            # Not enough ki to actually let it off — cancel silently
+            # rather than firing for free.
+            self.stop_big_bang_attack()
+            return None
+
+        if not self.is_transformed():
+            self.ki -= self.big_bang_attack_ki_cost
+
+        sprite = self.current_big_bang_charge.get_fire_sprite()
+        ox, oy = self._get_spawn_offset()
+        blast = BigBangAttackBlast(self.x + ox, self.y + oy, self.direction, sprite=sprite)
+
+        # Done charging — unlike genkidama, there's no separate throw
+        # pose to hold first; releasing the attack snaps the player
+        # straight back to idle the same instant it fires.
+        self.is_charging_big_bang_attack = False
+        self.is_q_pressed = False
+        self.current_big_bang_charge = None
+        self.enter_idle()
+
+        return blast
+
+    def stop_big_bang_attack(self):
+        """Cancel Big Bang Attack charging (without firing) and clear
+        its state."""
+        self.is_charging_big_bang_attack = False
+        self.is_q_pressed = False
+        self.current_big_bang_charge = None
+
+        if self.current_animation_state == 'big_bang_attack_charge':
+            self.enter_idle()
+
+    def start_charging_burning(self):
+        """Begin charging the burning attack. Returns True on success.
+
+        Unlike the beam/final-flash charges (their own dedicated 'charge'
+        animation), the burning attack's charge pose is just the kiblast
+        wind-up held on frame 0 — see update_burning_charge(), which re-pins
+        the frame every tick since self.sprite.update(dt) in update() would
+        otherwise advance it. BurningChargeEffect draws the extra charging
+        sprite next to the player; game.py should call release_burning() on
+        button-up (mirroring release_genkidama()).
+        """
+        if not self.can_act() or self.ki < self.burning_ki_cost:
+            return False
+
+        self.is_charging_burning = True
+        self.is_q_pressed = True
+        self.sprite.set_animation('kiblast', self.direction)
+        self.current_animation_state = 'burning_charge'
+        self.burning_charge_effect = BurningChargeEffect(self)
+        return True
+
+    def update_burning_charge(self, dt):
+        """Advance the charge visual and keep the player pinned on kiblast frame 0."""
+        if not self.is_charging_burning:
+            return
+        # Re-apply the animation every tick so the wind-up frame doesn't
+        # advance past frame 0 while sprite.update(dt) ticks it forward.
+        # NOTE: set_animation() only resets when the animation key actually
+        # changes, so calling it here every tick while already on 'kiblast'
+        # was a no-op — the animation kept advancing under it and got stuck
+        # on frame 1 (the throw pose) after ~0.4s. restart_animation() forces
+        # the reset unconditionally, which is what this actually needs.
+        self.sprite.restart_animation('kiblast', self.direction)
+        if self.burning_charge_effect:
+            self.burning_charge_effect.update(dt)
+
+    def release_burning(self):
+        """Fire the burning attack. Returns the BurningAttack to spawn, or
+        None if not enough ki / not actually charging — mirrors
+        release_genkidama()'s shape so game.py can handle both the same way.
+        """
+        if not self.is_charging_burning:
+            return None
+
+        if self.ki < self.burning_ki_cost:
+            self.stop_burning()
+            return None
+
+        self.ki -= self.burning_ki_cost
+
+        ox, oy = self._get_spawn_offset()
+        attack = BurningAttack(self.x + ox, self.y + oy, self.direction,
+                                self.burning_stun_duration)
+        attack.owner = self
+
+        self.is_charging_burning = False
+        self.burning_charge_effect = None
+        self.is_q_pressed = False
+
+        # Play the throw pose now that we're releasing. Reuses the existing
+        # kiblast_hold1 animation (a single-frame animation pinned to the
+        # sheet's 2nd frame / index 1, the right-hand throw pose) so the
+        # release reads as an instant, distinct snap rather than playing
+        # through the normal kiblast wind-up (0) -> throw (1) sequence —
+        # the wind-up already happened during the charge.
+        self.is_attacking = True
+        self.attack_cooldown = 0.5
+        self.sprite.set_animation('kiblast_hold1', self.direction)
+        self.current_animation_state = 'kiblast_hold'
+        # BurningAttack already spawned above (unlike a normal blast, which
+        # waits on pending_blast for the throw frame) — leave pending_blast
+        # untouched so the 'kiblast_hold' state's own finish handler
+        # (_advance_blast_or_idle) just returns the player to idle instead
+        # of chaining into another hold-fire shot; it only continues firing
+        # when ki_attack_mode == 'blast', which burning attack never is.
+
+        return attack
+
+    def stop_burning(self):
+        """Cancel burning charging (without firing) and clear its state."""
+        self.is_charging_burning = False
+        self.is_q_pressed = False
+        self.burning_charge_effect = None
+
+        if self.current_animation_state == 'burning_charge':
+            self.enter_idle()
+
+    def start_targeting_instant_transmission(self):
+        """Begin Instant Transmission targeting. Returns True on success.
+
+        While active, the whole world freezes (Game._update_instant_transmission
+        drives that) and a screen-space cursor can be aimed at enemies to
+        mark them — see Game for cursor movement/hover-select, and
+        begin_teleport_sequence below for what happens on release."""
+        if not self.can_act():
+            return False
+
+        if self.ki < self.it_ki_cost and not self.is_transformed():
+            return False
+
+        self.is_targeting_it = True
+        self.is_q_pressed = True
+        self.it_original_pos = (self.x, self.y)
+        self.sprite.set_animation('instant_transmission', self.direction)
+        self.current_animation_state = 'it_targeting'
+        return True
+
+    def stop_targeting_instant_transmission(self):
+        """Cancel targeting without teleporting anywhere (e.g. nothing was
+        selected when the key was released)."""
+        self.is_targeting_it = False
+        self.is_q_pressed = False
+
+        if self.current_animation_state == 'it_targeting':
+            self.enter_idle()
+
+    def begin_teleport_sequence(self, targets):
+        """Called by Game when the charge key is released, with `targets` =
+        the enemies selected during targeting, in pick order. Kicks off the
+        hop sequence: each target in turn, then a final hop back to
+        it_original_pos. Returns False (and cancels back to idle) if
+        nothing was selected."""
+        self.is_targeting_it = False
+        self.is_q_pressed = False
+
+        if not targets:
+            self.enter_idle()
+            return False
+
+        if not self.is_transformed():
+            self.ki -= self.it_ki_cost
+
+        # Only now — actually starting the teleport hops, not just aiming —
+        # does the character snap to face 'up' for the teleport/
+        # instant_transmission frames. Remember the pre-teleport direction
+        # so it can be restored once the whole hop sequence finishes.
+        self._it_pre_direction = self.direction
+        self.direction = 'up'
+
+        self.it_hop_queue = list(targets)
+        self.it_hop_index = 0
+        self.it_flicker_stage = 'pre'
+        self.it_going_home = False
+        self.it_flicker_showing_alt = False
+        self.it_teleport_show_frame2_next = True
+        self.it_flicker_step = 0
+        self.it_flicker_steps_needed = self.IT_PRE_FLICKER_ALTERNATIONS
+        self.it_flicker_timer = 0.0
+        self.is_teleporting_it = True
+        self._show_teleport_flicker_frame()
+        self.current_animation_state = 'it_teleport'
+        return True
+
+    def _show_teleport_flicker_frame(self):
+        """Show the 'teleport' animation for one flicker tick, forcing it
+        to the correct frame directly rather than trusting its own
+        internal timing.
+
+        The flicker switches away from 'teleport' every it_flicker_interval
+        (0.12s), but 'teleport' is registered with a much longer
+        frame_duration (0.3s) — so left to its own timing, it would never
+        accumulate enough time to advance past frame 0 before we switch to
+        'instant_transmission' and back. set_animation() also always
+        resets to frame 0 whenever the animation key actually changes,
+        which it does every single tick here. Net effect: frame 2 (index 1)
+        would never appear. Instead, alternate it manually: frame 2 first,
+        then frame 1, then frame 2 again, matching the captured order.
+        """
+        self.sprite.set_animation('teleport', self.direction)
+        anim = self.sprite.animations.get(f'teleport_{self.direction}')
+        if anim is not None and not isinstance(anim, list) and anim.frames:
+            frame_index = 1 if self.it_teleport_show_frame2_next else 0
+            anim.current_frame = frame_index % len(anim.frames)
+            anim.time_elapsed = 0
+            anim.finished = False
+        self.it_teleport_show_frame2_next = not self.it_teleport_show_frame2_next
+
+    def update_it_teleport(self, dt):
+        """Advance the teleport hop state machine by one frame. Must be
+        called every frame while is_teleporting_it is True — normally from
+        Game's frozen-world branch, since Player has no access to the
+        enemy list on its own. Returns the enemy just arrived at this
+        frame (Game should apply damage to it), or None on every other
+        frame.
+
+        Approximates how this plays in the original game: rather than one
+        clean flash per hop, the sprite flickers back and forth between
+        'teleport' and 'instant_transmission' a few times in place, then
+        the position changes, then it flickers a few more times at the
+        new spot — a short flicker before/after each target hop, and a
+        slightly longer flurry once actually arrived at a target (this is
+        also when the melee-range damage check happens). The exact
+        alternation counts here are a best-guess approximation — the
+        original capture wasn't fully consistent between takes — so treat
+        IT_PRE_FLICKER_ALTERNATIONS / IT_POST_FLICKER_ALTERNATIONS_HOP /
+        IT_POST_FLICKER_ALTERNATIONS_HOME as tunable, not exact.
+        """
+        if not self.is_teleporting_it:
+            return None
+
+        # A hit is queued from the moment we land next to a target (see the
+        # 'pre' branch below) — count it down in real time, independent of
+        # the flicker gate just below, so the attack lands a beat after the
+        # arrival flicker starts rather than on the very same frame.
+        if self._it_pending_hit_target is not None:
+            self._it_hit_delay_timer += dt
+            if self._it_hit_delay_timer >= self.it_hit_delay:
+                target = self._it_pending_hit_target
+                self._it_pending_hit_target = None
+                self._it_hit_delay_timer = 0.0
+                return target
+
+        self.it_flicker_timer += dt
+        if self.it_flicker_timer < self.it_flicker_interval:
+            return None
+
+        self.it_flicker_timer = 0.0
+
+        # Alternate the displayed animation every tick of the flicker.
+        self.it_flicker_showing_alt = not self.it_flicker_showing_alt
+        if self.it_flicker_showing_alt:
+            self.sprite.set_animation('instant_transmission', self.direction)
+        else:
+            self._show_teleport_flicker_frame()
+
+        self.it_flicker_step += 1
+        if self.it_flicker_step < self.it_flicker_steps_needed:
+            # Still flickering in place — nothing else to do this tick.
+            return None
+
+        self.it_flicker_step = 0
+
+        if self.it_flicker_stage == 'pre':
+            # The pre-move flicker just finished — jump to wherever this
+            # hop is headed, then start the (longer) post-move flicker
+            # burst there.
+            if self.it_hop_index < len(self.it_hop_queue):
+                # Hop to the next selected target, landing just below it
+                # instead of dead-center on top of it, so the player
+                # doesn't visually overlap/occupy the exact same spot as
+                # the enemy. Offset by half the enemy's own height plus
+                # half the player's, with a small gap, falling back to a
+                # fixed offset if either size isn't available on the object.
+                target = self.it_hop_queue[self.it_hop_index]
+                enemy_half_h = getattr(target, 'height', 32) / 2
+                player_half_h = getattr(self, 'height', 32) / 2
+                gap = 4
+                self.x = target.x
+                self.y = target.y + enemy_half_h + player_half_h + gap
+                self.it_hop_index += 1
+                self.it_teleport_hop_occurred = True
+
+                self.it_going_home = False
+                self.it_flicker_stage = 'post'
+                self.it_flicker_steps_needed = self.IT_POST_FLICKER_ALTERNATIONS_HOP
+                # Damage is attempted once per hop, but not on this very
+                # frame — queue it and let it_hit_delay (checked at the top
+                # of this method) deliver it a beat into the post-arrival
+                # flicker burst instead.
+                self._it_pending_hit_target = target
+                self._it_hit_delay_timer = 0.0
+                return None
+            else:
+                # Past the last target — this hop is the trip back home.
+                self.x, self.y = self.it_original_pos
+                self.it_teleport_hop_occurred = True
+                self.it_going_home = True
+                self.it_flicker_stage = 'post'
+                self.it_flicker_steps_needed = self.IT_POST_FLICKER_ALTERNATIONS_HOME
+                return None
+
+        # stage == 'post', and that arrival flicker burst just finished.
+        if self.it_going_home:
+            # Home-arrival burst complete — sequence is over.
+            self.is_teleporting_it = False
+            self.it_hop_queue = []
+            self.it_hop_index = 0
+            self.it_flicker_stage = None
+            if hasattr(self, '_it_pre_direction'):
+                self.direction = self._it_pre_direction
+            self.enter_idle()
+            return None
+
+        # More hops remain — flicker again in place before the next jump.
+        self.it_flicker_stage = 'pre'
+        self.it_flicker_steps_needed = self.IT_PRE_FLICKER_ALTERNATIONS
+        return None
+
+    def pop_pending_it_teleport_hop(self):
+        """Consume and return True exactly once if update_it_teleport()
+        actually changed position this frame (a hop landing on a target,
+        or the final hop back home), False otherwise. Game calls this
+        right after update_it_teleport() to play teleport.wav once per
+        hop — same pending-flag/consume pattern as
+        pop_pending_charged_melee_hit()."""
+        if not self.it_teleport_hop_occurred:
+            return False
+        self.it_teleport_hop_occurred = False
+        return True
+
+    def start_charging_masenko(self):
+        """Begin charging Masenko. Returns True on success.
+
+        Like genkidama, this never auto-fires — the oscillating aim
+        indicator and hold_masenko overlay run for as long as Q is held,
+        and throw_masenko() always throws at whatever position the
+        indicator was at the moment Q comes back up."""
+        if not self.can_act():
+            return False
+
+        if self.ki <= 0 and not self.is_transformed():
+            return False
+
+        self.is_charging_masenko = True
+        self.is_q_pressed = True
+        self.sprite.set_animation('hold_masenko', self.direction)
+        self.current_animation_state = 'masenko_hold'
+        self.masenko_indicator   = MasenkoAimIndicator(self)
+        self.masenko_hold_effect = MasenkoHoldEffect(self, mode='hold')
+        return True
+
+    def update_masenko_charge(self, dt):
+        """Advance the aim indicator and hold overlay while charging."""
+        if self.is_charging_masenko:
+            if self.masenko_indicator:
+                self.masenko_indicator.update(dt)
+            if self.masenko_hold_effect:
+                self.masenko_hold_effect.update(dt)
+
+    def throw_masenko(self):
+        """Called when the charge key is released. Always throws (unlike
+        beam's auto-fire or genkidama's escalating states) — returns the
+        MasenkoProjectile to spawn, or None if nothing was charging or
+        there wasn't enough ki to let it off."""
+        if not self.is_charging_masenko or not self.masenko_indicator:
+            return None
+
+        if self.ki < self.masenko_ki_cost and not self.is_transformed():
+            # Not enough ki to actually let it off — cancel silently rather
+            # than throwing for free.
+            self.stop_masenko()
+            return None
+
+        if not self.is_transformed():
+            self.ki -= self.masenko_ki_cost
+
+        target_x, target_y = self.masenko_indicator.get_target_position()
+        # Spawn from the exact same spot the hold_masenko overlay was sitting
+        # at (above the player's head) — the ball should read as that same
+        # charge simply being let go, not as a separate projectile spawning
+        # from wherever bombs/beam launch from.
+        hold_ox, hold_oy = 0, 0
+        if self.masenko_hold_effect:
+            hold_ox, hold_oy = self.masenko_hold_effect.direction_offsets.get(
+                self.direction, (0, 0))
+        masenko = MasenkoProjectile(self.x + hold_ox, self.y + hold_oy, target_x, target_y,
+                                     direction=self.direction)
+
+        # Done charging — clear all charge/fire state and snap straight back
+        # to idle. Unlike genkidama, masenko doesn't hold a throw pose — the
+        # hold overlay disappears immediately too, since once the ball is
+        # thrown there's nothing left charging above the player's head.
+        self.is_charging_masenko = False
+        self.is_q_pressed = False
+        self.masenko_indicator = None
+        self.masenko_hold_effect = None
+        self.enter_idle()
+
+        return masenko
+
+    def stop_masenko(self):
+        """Cancel masenko charging (without throwing) and clear its state."""
+        self.is_charging_masenko = False
+        self.is_q_pressed = False
+        self.masenko_indicator   = None
+        self.masenko_hold_effect = None
+
+        if self.current_animation_state == 'masenko_hold':
+            self.enter_idle()
+
+    def start_charging_sword(self):
+        """Begin drawing the energy sword. Returns True on success.
+
+        Ki is drained continuously over the charge, the same way the beam
+        drains while firing — not paid as a lump sum up front and not paid
+        on release (masenko/genkidama). If the charge finishes,
+        start_sword_spin() fires automatically and free.
+        """
+        if not self.can_act():
+            return False
+
+        if self.ki <= 0 and not self.is_transformed():
+            return False
+
+        self.is_charging_sword = True
+        self.sword_charge_time = 0
+        self.is_q_pressed = True
+
+        # No dedicated charge_sword pose for up/down yet — reuse the left
+        # pose (and its glow offset) for both rather than letting the
+        # sprite system's own fallback pick inconsistently.
+        charge_pose_direction = 'left' if self.direction in ('up', 'down') else self.direction
+        # Remembered so start_sword_spin() can pick the spin's rotation
+        # direction from whichever side the player actually charged on.
+        self._sword_charge_pose_direction = charge_pose_direction
+
+        self.sprite.set_animation('charge_sword', charge_pose_direction)
+        self.current_animation_state = 'sword_charge'
+        self.current_sword_charge_effect = EnergySwordChargeEffect(self, facing=charge_pose_direction)
+        # Sync to however long the charge-up sprite actually takes to play
+        # through all of its frames, same convention as beam_charge_required.
+        self.sword_charge_required = self.current_sword_charge_effect.get_total_duration()
+        # Spread energy_sword_ki_cost evenly over that duration so a full
+        # charge still costs the same total either way, whether it takes
+        # 0.4s or 3s to complete.
+        self.energy_sword_ki_drain = (
+            self.energy_sword_ki_cost / self.sword_charge_required
+            if self.sword_charge_required > 0 else self.energy_sword_ki_cost
+        )
+        return True
+
+    def _tick_sword_ki_drain(self, dt):
+        """Drain Ki while the sword is charging, mirroring _tick_beam_ki_drain.
+
+        Transformed state skips the Ki drain but still checks for Q release.
+        Called every tick from update_sword_charge()."""
+        if not self.is_transformed():
+            self.ki = max(0.0, self.ki - self.energy_sword_ki_drain * dt)
+            if self.ki <= 0 or not self.is_q_pressed:
+                self.stop_charging_sword()
+        elif not self.is_q_pressed:
+            self.stop_charging_sword()
+
+    def update_sword_charge(self, dt):
+        """Advance the sword charge timer and auto-spin once fully charged."""
+        if self.is_charging_sword:
+            self._tick_sword_ki_drain(dt)
+            if not self.is_charging_sword:
+                # Ran out of Ki or Q was released mid-charge — already
+                # stopped by _tick_sword_ki_drain, nothing further to do.
+                return
+            if self.current_sword_charge_effect:
+                self.current_sword_charge_effect.update(dt)
+            self.sword_charge_time += dt
+            if self.sword_charge_time >= self.sword_charge_required:
+                self.start_sword_spin()
+
+    def start_sword_spin(self):
+        """Transition from charging to the free spin once the charge threshold is met."""
+        if not (self.is_charging_sword and self.sword_charge_time >= self.sword_charge_required):
+            return
+
+        self.is_charging_sword = False
+        self.is_spinning_sword = True
+        self.sword_charge_time = 0
+        self.current_sword_charge_effect = None
+        self.sword_spin_timer = self.sword_spin_duration
+        # Spin direction mirrors the charge pose: charged facing left ->
+        # clockwise, charged facing right -> counter-clockwise (up/down
+        # charges resolve to 'left' in start_charging_sword, so they spin
+        # clockwise too, consistent with reusing the left pose/art there).
+        spin_clockwise = getattr(self, '_sword_charge_pose_direction', 'left') != 'right'
+        self.energy_sword_spin = EnergySwordSpinEffect(
+            self, damage=self.energy_sword_damage,
+            clockwise=spin_clockwise,
+            rotations_per_second=self.sword_spin_rotations_per_second,
+        )
+
+        # Clockwise and counter-clockwise spins are two separate hand-drawn
+        # sheets (sword_spin_cw / sword_spin_ccw), not mirrors of each
+        # other, so which animation name to use is picked once here and
+        # reused in update_sword_spin() for the rest of the spin.
+        self._sword_spin_anim_name = 'sword_spin_cw' if spin_clockwise else 'sword_spin_ccw'
+
+        # Optional dedicated standing-spin pose — falls back gracefully
+        # (stays on whatever the sprite was already showing) if a
+        # character's sheet doesn't have one yet. Moving during the spin
+        # will override this with the normal walk/run animation anyway,
+        # via player.move().
+        if self.sprite.has_animation(self._sword_spin_anim_name, self.direction):
+            self.sprite.set_animation(self._sword_spin_anim_name, self.direction)
+        self.current_animation_state = 'sword_spin'
+
+    def update_sword_spin(self, dt):
+        """Advance the spin effect and its free-duration timer.
+
+        Called unconditionally every frame while is_spinning_sword is
+        True (see Player.update()) rather than being gated on
+        current_animation_state — moving during the spin flips
+        current_animation_state to 'walk'/'run' via move(), but the spin
+        itself (and its hitbox/timer) needs to keep ticking regardless.
+        """
+        if not self.is_spinning_sword:
+            return
+        if self.energy_sword_spin:
+            self.energy_sword_spin.update(dt)
+            self.energy_sword_spin.tick_cooldowns(dt)
+
+            # Keep the player's own body pose in step with the sword's
+            # current octant (up/up_right/right/.../up_left) rather than
+            # the 4-directional facing it had when the spin started —
+            # sword_spin_cw/ccw are loaded 8-directionally (see
+            # sprite_system.py) specifically so this can track all 8
+            # steps. Falls back to holding whatever pose was already
+            # showing if the sheet isn't loaded for this octant yet.
+            anim_name = getattr(self, '_sword_spin_anim_name', 'sword_spin_cw')
+            octant = self.energy_sword_spin.current_octant()
+            if self.sprite.has_animation(anim_name, octant):
+                self.sprite.set_animation(anim_name, octant)
+
+        self.sword_spin_timer -= dt
+        if self.sword_spin_timer <= 0:
+            self.stop_sword_spin()
+
+    def stop_sword_spin(self):
+        """End the spin (naturally, on timeout — or externally, e.g. we
+        got hit or killed mid-spin) and return to idle."""
+        # If the player stood still the whole spin (current_animation_state
+        # never got flipped to 'walk'/'run' by move()), self.direction is
+        # still whatever it was from the pre-charge pose — snap it instead
+        # to whichever way the blade was actually pointing when the spin
+        # stopped, so idle doesn't face some stale direction the player
+        # never actually ended up facing.
+        if self.current_animation_state == 'sword_spin' and self.energy_sword_spin:
+            octant = self.energy_sword_spin.current_octant()
+            self.direction = _OCTANT_TO_CARDINAL.get(octant, self.direction)
+
+        self.is_spinning_sword = False
+        self.energy_sword_spin = None
+        if self.current_animation_state in ('sword_spin', 'walk', 'run'):
+            self.enter_idle()
+
+    def stop_charging_sword(self):
+        """Cancel an in-progress charge (Q released before it finished).
+        Ki already spent when the charge started is NOT refunded."""
+        self.is_charging_sword = False
+        self.sword_charge_time = 0
+        self.is_q_pressed = False
+        self.current_sword_charge_effect = None
+
+        if self.current_animation_state == 'sword_charge':
+            self.enter_idle()
+
+    def start_dragon_fist(self):
+        """Begin the Dragon Fist attack. No charge-up (same shape as the
+        energy punch) — Q press immediately locks the player into the
+        dragon_fist pose and starts draining Ki, but the head itself
+        doesn't launch on press anymore. It waits for the punch animation
+        to reach its release frame (frame 3 of 4) — see
+        update_dragon_fist()'s pending_dragon_fist handling — then held
+        for as long as Q stays down after that: the head launches out,
+        then hands control to movement input once it's fully extended.
+
+        Returns True on success, False if the player can't currently act
+        or doesn't have the ki for it.
+        """
+        if not self.can_act():
+            return False
+        if self.ki <= 0 and not self.is_transformed():
+            return False
+
+        self.is_using_dragon_fist = True
+        self.is_q_pressed = True
+        self.pending_dragon_fist = True
+
+        self.sprite.set_animation('dragon_fist', self.direction)
+        self.current_animation_state = 'dragon_fist'
+        return True
+
+    def stop_dragon_fist(self):
+        """Q released — hands the fist off to its retract sweep instead of
+        ending the attack instantly (mirrors stop_beam()'s decay hand-off).
+        is_using_dragon_fist itself doesn't drop until that retract
+        finishes (see update_dragon_fist()), so the player stays locked
+        into the dragon-fist pose/control scheme for the whole retract,
+        same as a beam staying 'active' through its own decay sweep.
+
+        If Q (or Ki) gives out before the wind-up ever resolved — i.e.
+        pending_dragon_fist is still True — nothing has spawned yet, so
+        there's no fist to hand off to a retract sweep. Cancel outright
+        instead.
+        """
+        self.is_q_pressed = False
+        # Mirrors the head's own retract behavior (stays exactly where it
+        # was, no sweep) — releasing early stops the forward carry in
+        # place too, rather than letting the lunge run out its full
+        # duration after the player's already let go.
+        self.is_dragon_fist_lunging = False
+        if self.current_dragon_fist:
+            self.current_dragon_fist.start_retract()
+        elif self.pending_dragon_fist:
+            self.pending_dragon_fist = False
+            self.is_using_dragon_fist = False
+
+    def update_dragon_fist(self, dt):
+        """Advance the fist itself (shoot-out / chain-follow / retract),
+        carry the player through the opening lunge if it's still running,
+        and drain Ki — stopping the attack (via stop_dragon_fist(), which
+        starts the retract) when Ki runs out or Q is released, mirroring
+        _tick_beam_ki_drain. Once the retract sweep finishes, ends the
+        attack for real and returns to idle.
+
+        Outside of the lunge window, the player's own position is left
+        untouched here — no continuous drag toward the head. (An earlier
+        version of this did drag self.x toward the head's x every frame,
+        hardcoded to the x-axis regardless of throw direction, which fired
+        constantly for left/right throws and incorrectly during lateral
+        steering on up/down throws, and — since the camera re-centers on
+        the player every frame — made the head appear to slide back
+        toward the middle of the screen on its own even though its world
+        position hadn't changed. That's gone; the head is
+        player-authoritative once 'controlled' and just stays wherever
+        control/the leash puts it.)
+        """
+        if self.pending_dragon_fist:
+            # Wind-up only: hold the head launch until the dragon_fist
+            # animation reaches its release frame (index 2 of the 4-frame
+            # sheet, i.e. frame 3) instead of spawning DragonFistAttack the
+            # instant Q is pressed. Same "arm on press, resolve once a
+            # frame threshold is crossed" shape as pending_blast /
+            # pending_ultra_volleyball, just resolved entirely here rather
+            # than handed off to game.py's update loop.
+            if not self.is_transformed():
+                self.ki = max(0.0, self.ki - self.dragon_fist_ki_drain * dt)
+            if (not self.is_transformed() and self.ki <= 0) or not self.is_q_pressed:
+                # Ran out of Ki or Q was released before the wind-up
+                # finished — nothing's spawned yet, so cancel outright
+                # (see the pending_dragon_fist branch in stop_dragon_fist).
+                self.stop_dragon_fist()
+                return
+            if self.sprite.get_current_frame_index() < 2:
+                return
+
+            self.pending_dragon_fist = False
+            self.is_dragon_fist_lunging = True
+            self.dragon_fist_lunge_timer = self.dragon_fist_lunge_duration
+            self.current_dragon_fist = DragonFistAttack(
+                self.x, self.y, self.direction, scale=RENDER_SCALE
+            )
+            return
+
+        if self.is_dragon_fist_lunging:
+            self._advance_dragon_fist_lunge(dt)
+
+        if self.current_dragon_fist:
+            self.current_dragon_fist.update(dt, self.x, self.y)
+
+        if not self.is_transformed():
+            self.ki = max(0.0, self.ki - self.dragon_fist_ki_drain * dt)
+            if self.ki <= 0 or not self.is_q_pressed:
+                self.stop_dragon_fist()
+        elif not self.is_q_pressed:
+            self.stop_dragon_fist()
+
+        # Deliberately no "if fist finished retracting, clean up here" —
+        # that's handled the same way every other attack's current_X
+        # reference is: the top-of-update() cleanup nulls current_dragon_fist
+        # and is_using_dragon_fist once DragonFistAttack marks itself
+        # inactive, and the 'dragon_fist' animation-state branch's own
+        # else clause (is_using_dragon_fist now False) calls enter_idle()
+        # the following frame — same one-frame-later shape as
+        # current_beam/current_final_flash/etc.
+
+    def _advance_dragon_fist_lunge(self, dt):
+        """One frame of the opening Dragon Fist lunge: carry the player
+        forward along the throw direction at dragon_fist_follow_speed,
+        respecting world bounds and obstacles the same way move() does,
+        then translate the fist assembly by the exact same delta so head
+        and chain ride along with the player instead of getting left
+        behind. Input is deliberately not read here — the lunge runs on
+        its own timer regardless of what the player's pressing (movement
+        input is otherwise redirected into head-steering by move(), which
+        is itself a no-op during 'shooting' anyway — see
+        _move_dragon_fist_head).
+
+        Stops itself once dragon_fist_lunge_timer runs out; stop_dragon_fist()
+        also cancels it early if Q is released first.
+        """
+        dxu, dyu = _DRAGON_FIST_DIRECTION_UNIT.get(self.direction, (0, 0))
+        step = self.dragon_fist_follow_speed * dt
+
+        moved_x = 0
+        moved_y = 0
+        if dxu != 0:
+            new_x = self.x + dxu * step
+            new_x = max(self.width // 2, min(new_x, self.current_room_width - self.width // 2))
+            if not self.check_collision_with_obstacles(new_x, self.y):
+                moved_x = new_x - self.x
+                self.x = new_x
+        if dyu != 0:
+            new_y = self.y + dyu * step
+            new_y = max(self.height // 2, min(new_y, self.current_room_height - self.height // 2))
+            if not self.check_collision_with_obstacles(self.x, new_y):
+                moved_y = new_y - self.y
+                self.y = new_y
+
+        if self.current_dragon_fist and (moved_x or moved_y):
+            self.current_dragon_fist.translate(moved_x, moved_y)
+
+        self.dragon_fist_lunge_timer -= dt
+        if self.dragon_fist_lunge_timer <= 0:
+            self.is_dragon_fist_lunging = False
+
+    def start_ghost_kamikaze(self):
+        """Begin the Ghost Kamikaze Attack. Returns the GhostKamikazeAttack
+        instance to spawn, or None.
+
+        Instant on press, no charge-up, but not instant-fire either: the
+        player loops its cast animation ghost_kamikaze_required_loops (3)
+        times — spawning one ghost per loop, left then right then
+        middle, each one popping in once that loop's frame index reaches
+        ghost_kamikaze_spawn_frame_index (see
+        update_ghost_kamikaze_cast()) rather than at the very start of
+        the loop — then holds a
+        fixed pose (ghost_kamikaze_hold) until GhostKamikazeAttack
+        resolves, either from its own hold timer or from the player
+        moving early (see can_move()/move()). Everything after the
+        initial spawn (targeting, homing, impact) is then driven by
+        GhostKamikazeAttack itself, ticked centrally by Game (see that
+        class's docstring) rather than from here.
+
+        Each ghost appears right in front of the player (self.direction
+        at the moment of the press — see get_ghost_kamikaze_spawn_offset()
+        in ghost_kamikaze_attack.py), then moves
+        out to its actual left/right/middle formation slot afterward; the
+        player's facing at launch also fixes which way "left"/"right"
+        fan out and which sprite direction every ghost keeps for its
+        entire lifetime, homing included — see GhostKamikazeAttack's
+        docstring for both.
+
+        The full ghost_kamikaze_ki_cost has to be affordable to even
+        start (checked here), but isn't actually taken here — it's
+        charged in ghost_kamikaze_ki_cost_per_ghost pieces as each ghost
+        actually spawns (see update_ghost_kamikaze_cast()), so the ki bar
+        drains gradually over the 3 loops rather than dropping in one
+        chunk the instant this is pressed.
+        """
+        if not self.can_act():
+            return None
+        if self.ki < self.ghost_kamikaze_ki_cost and not self.is_transformed():
+            return None
+
+        self.is_casting_ghost_kamikaze = True
+        self.is_holding_ghost_kamikaze = False
+        self.ghost_kamikaze_loop_count = 0
+        self.ghost_kamikaze_prev_frame_index = 0
+        self.sprite.set_animation('ghost_kamikaze_cast', self.direction)
+        self.current_animation_state = 'ghost_kamikaze_cast'
+
+        # Ghost kamikaze uses its own spawn offset (see
+        # get_ghost_kamikaze_spawn_offset() in ghost_kamikaze_attack.py)
+        # rather than the shared _get_spawn_offset()/_DIRECTION_SPAWN_OFFSETS
+        # every other attack (beam, kamehameha, etc.) draws from, so its
+        # spawn point can be tuned without affecting them.
+        ox, oy = get_ghost_kamikaze_spawn_offset(self.direction)
+        self.current_ghost_kamikaze = GhostKamikazeAttack(self.x + ox, self.y + oy, self.direction)
+        # The first ghost no longer spawns immediately here — it spawns
+        # once the cast animation reaches its
+        # ghost_kamikaze_spawn_frame_index-th frame (see
+        # update_ghost_kamikaze_cast()), same as every ghost after it.
+        return self.current_ghost_kamikaze
+
+    def update_ghost_kamikaze_cast(self, dt):
+        """Count completed loops of the cast animation by watching for
+        the sprite's frame index wrapping back down (mirrors how
+        genkidama/kiblast track frame-index thresholds, just repeated
+        across multiple loops instead of once).
+
+        Each wrap = one full loop just finished, which is exactly the
+        signal to end that loop's ghost creation animation (it's been
+        looping simultaneously with the cast sprite the whole time — see
+        _Ghost's 'spawning' state) and hand it off to its idle sprite via
+        finish_current_ghost_spawn().
+
+        The next ghost isn't spawned right at the wrap, though — every
+        frame once the current loop's frame index reaches
+        ghost_kamikaze_spawn_frame_index (the 3rd frame, 0-indexed as 2),
+        this calls spawn_next_ghost(), so the ghost pops in partway
+        through the cast animation instead of right at the start of the
+        loop. Calling it repeatedly like this (rather than once per loop)
+        is deliberately safe: GhostKamikazeAttack.spawn_next_ghost()
+        itself won't spawn a new ghost while the previous one hasn't
+        cleared the spawn point yet (see its docstring), so this
+        naturally keeps retrying every frame until that clears rather
+        than needing separate once-per-loop bookkeeping here.
+
+        Only hands off to the held pose once BOTH
+        ghost_kamikaze_required_loops (3) have completed AND every ghost
+        has actually spawned — not just the loop count on its own. If a
+        ghost's spawn got pushed later than its nominal loop (because
+        the previous one was slow to clear — see spawn_next_ghost()),
+        this keeps the cast animation looping a little longer rather
+        than cutting over to the held pose short a ghost.
+        """
+        idx = self.sprite.get_current_frame_index()
+        if idx < self.ghost_kamikaze_prev_frame_index:
+            self.ghost_kamikaze_loop_count += 1
+            if self.current_ghost_kamikaze:
+                self.current_ghost_kamikaze.finish_current_ghost_spawn()
+        self.ghost_kamikaze_prev_frame_index = idx
+
+        if idx >= self.ghost_kamikaze_spawn_frame_index and self.current_ghost_kamikaze:
+            # spawn_next_ghost() only returns True the frame it actually
+            # appends a new ghost (it's a no-op every other frame it's
+            # called on, including while the previous ghost hasn't
+            # cleared the spawn point yet — see its own docstring), so
+            # gating the ki deduction on that return value is what
+            # charges ghost_kamikaze_ki_cost_per_ghost exactly once per
+            # ghost rather than once per frame this branch runs.
+            if self.current_ghost_kamikaze.spawn_next_ghost() and not self.is_transformed():
+                self.ki -= self.ghost_kamikaze_ki_cost_per_ghost
+
+        all_ghosts_spawned = (
+            self.current_ghost_kamikaze is not None
+            and len(self.current_ghost_kamikaze.ghosts) >= self.current_ghost_kamikaze.num_ghosts
+        )
+        if self.ghost_kamikaze_loop_count >= self.ghost_kamikaze_required_loops and all_ghosts_spawned:
+            self.is_casting_ghost_kamikaze = False
+            self.is_holding_ghost_kamikaze = True
+            self.sprite.set_animation('ghost_kamikaze_hold', self.direction)
+            self.current_animation_state = 'ghost_kamikaze_hold'
+            if self.current_ghost_kamikaze:
+                self.current_ghost_kamikaze.finish_creation()
+
+    def stop_ghost_kamikaze(self):
+        """Cancel the cast/hold pose outright (e.g. the player got hit
+        mid-cast). Deliberately leaves current_ghost_kamikaze itself
+        alone — any ghosts already spawned keep playing out on their own
+        (Game keeps ticking/drawing it until it goes inactive), same as
+        how stop_dragon_fist() lets its retract sweep finish rather than
+        yanking the object out from under the render loop.
+        """
+        self.is_casting_ghost_kamikaze = False
+        self.is_holding_ghost_kamikaze = False
+        if self.current_animation_state in ('ghost_kamikaze_cast', 'ghost_kamikaze_hold'):
             self.enter_idle()
 
     def start_transform_animation(self):
@@ -601,8 +2733,56 @@ class Player:
         self.pending_blast     = None
         self.is_q_pressed      = False
         self.current_beam      = None
-
-        # Derive the correct folder (base or transformed form).
+        self.current_charge_effect = None
+        self.is_punching = False
+        self.punch_timer = 0
+        self.is_charging_kamekameha = False
+        self.is_firing_kamekameha = False
+        self.current_kamekameha = None
+        self.current_kamekameha_charge_effect = None
+        self.is_charging_banshee_blast = False
+        self.is_firing_banshee_blast = False
+        self.current_banshee_blast = None
+        self.current_banshee_blast_charge_effect = None
+        self.is_charging_final_flash = False
+        self.is_firing_final_flash = False
+        self.current_final_flash = None
+        self.current_final_flash_charge_effect = None
+        self.is_charging_big_bang_kamehameha = False
+        self.is_firing_big_bang_kamehameha = False
+        self.current_big_bang_kamehameha = None
+        self.current_big_bang_kamehameha_charge_effect = None
+        self.is_charging_flame_kamehameha = False
+        self.is_firing_flame_kamehameha = False
+        self.flame_kamehameha_charge_time = 0
+        self.current_flame_kamehameha_charge_effect = None
+        self.current_flame_kamehameha = None
+        self.is_charging_genkidama = False
+        self.genkidama_charge_effect = None
+        self.is_firing_genkidama = False
+        self.is_charging_burning = False
+        self.burning_charge_effect = None
+        self.is_charging_masenko = False
+        self.masenko_indicator = None
+        self.masenko_hold_effect = None
+        self.is_charging_sword = False
+        self.current_sword_charge_effect = None
+        self.is_spinning_sword = False
+        self.energy_sword_spin = None
+        self.is_using_dragon_fist = False
+        self.current_dragon_fist = None
+        self.is_dragon_fist_lunging = False
+        self.is_casting_ghost_kamikaze = False
+        self.is_holding_ghost_kamikaze = False
+        self.current_ghost_kamikaze = None
+        self.is_charging_big_bang_attack = False
+        self.is_firing_big_bang_attack = False
+        self.current_big_bang_charge = None
+        self.is_targeting_it = False
+        self.is_teleporting_it = False
+        self.it_hop_queue = []
+        self._it_pending_hit_target = None
+        self._it_hit_delay_timer = 0.0
         # Use self.sprite.base_path so this always matches wherever
         # CharacterSpriteLoader put the rest of the sprites.
         path = f'{self.sprite.base_path}/map_jump.png'
@@ -645,6 +2825,28 @@ class Player:
     # Combat — taking damage
     # =========================================================================
 
+    def start_blocking(self):
+        """Raise guard on F held down. Returns True on success.
+
+        Refused via the same can_act() guard as every other action-start
+        (start_charging_beam, etc.) — can't raise guard mid-attack or
+        mid-knockback.
+        """
+        if not self.can_act():
+            return False
+        self.is_blocking = True
+        self.sprite.set_animation('blocking', self.direction)
+        self.current_animation_state = 'blocking'
+        return True
+
+    def stop_blocking(self):
+        """Lower guard on F release."""
+        if not self.is_blocking:
+            return
+        self.is_blocking = False
+        if not self.is_knocked_back and not self.is_collision_knockback:
+            self.enter_idle()
+
     def take_damage(self, damage, knockback_x, knockback_y,
                     ignore_invulnerability=False, no_knockback=False):
         """Apply damage and knockback from an enemy hit.
@@ -666,11 +2868,29 @@ class Player:
             elif self.transformation.is_untransforming:
                 return
 
+        if self.is_blocking:
+            damage = round(damage / 2)
+
         self.hp = max(0, self.hp - damage)
         self.last_damage_taken = damage  # Stored so game.py can spawn a popup
 
         if no_knockback:
             # Just grant i-frames — the caller owns the visual feedback
+            self.invulnerable = True
+            self.invulnerable_timer = self.invulnerable_duration
+            return
+
+        if self.is_blocking:
+            # Guard absorbs the hit: token 1px nudge instead of full
+            # knockback physics, i-frames still granted, but no hurt
+            # animation/direction-snap and (see call sites) no hurt_tint —
+            # the block animation keeps playing straight through.
+            nudge_x = self.x + knockback_x
+            nudge_y = self.y + knockback_y
+            if not self.check_collision_with_obstacles(nudge_x, self.y):
+                self.x = nudge_x
+            if not self.check_collision_with_obstacles(self.x, nudge_y):
+                self.y = nudge_y
             self.invulnerable = True
             self.invulnerable_timer = self.invulnerable_duration
             return
@@ -713,8 +2933,72 @@ class Player:
         self.is_charging_beam = False
         self.is_firing_beam = False
         self.pending_blast = None
+        self.pending_ultra_volleyball = None
         self.is_q_pressed = False
         self.current_beam = None
+        self.current_charge_effect = None
+        self.is_punching = False
+        self.punch_timer = 0
+        # Charged melee (charge-up blink or lunge/spin) — without this,
+        # is_charging_melee/is_charged_melee_active stay True after we set
+        # current_animation_state = 'hurt' below, and the safety-fallback
+        # at the end of update() (which exists precisely to keep these
+        # ticking if current_animation_state ever drifts away from
+        # 'charged_melee_charge'/'charged_melee_action') immediately calls
+        # update_charged_melee_charge()/update_charged_melee_action() again
+        # this same frame — which can auto-release the charge or continue
+        # the lunge and stomp 'hurt' right back to 'charged_melee_action'
+        # before the hurt animation ever gets a chance to show.
+        self.is_charging_melee = False
+        self.is_charged_melee_active = False
+        self.charged_melee_flash_on = False
+        self.is_charging_kamekameha = False
+        self.is_firing_kamekameha = False
+        self.current_kamekameha = None
+        self.current_kamekameha_charge_effect = None
+        self.is_charging_banshee_blast = False
+        self.is_firing_banshee_blast = False
+        self.current_banshee_blast = None
+        self.current_banshee_blast_charge_effect = None
+        self.is_charging_final_flash = False
+        self.is_firing_final_flash = False
+        self.current_final_flash = None
+        self.current_final_flash_charge_effect = None
+        self.is_charging_big_bang_kamehameha = False
+        self.is_firing_big_bang_kamehameha = False
+        self.current_big_bang_kamehameha = None
+        self.current_big_bang_kamehameha_charge_effect = None
+        self.is_charging_flame_kamehameha = False
+        self.is_firing_flame_kamehameha = False
+        self.flame_kamehameha_charge_time = 0
+        self.current_flame_kamehameha_charge_effect = None
+        self.current_flame_kamehameha = None
+        self.is_charging_genkidama = False
+        self.genkidama_charge_effect = None
+        self.is_firing_genkidama = False
+        self.is_charging_burning = False
+        self.burning_charge_effect = None
+        self.is_charging_masenko = False
+        self.masenko_indicator = None
+        self.masenko_hold_effect = None
+        self.is_charging_sword = False
+        self.current_sword_charge_effect = None
+        self.is_spinning_sword = False
+        self.energy_sword_spin = None
+        self.is_using_dragon_fist = False
+        self.current_dragon_fist = None
+        self.is_dragon_fist_lunging = False
+        self.is_casting_ghost_kamikaze = False
+        self.is_holding_ghost_kamikaze = False
+        self.current_ghost_kamikaze = None
+        self.is_charging_big_bang_attack = False
+        self.is_firing_big_bang_attack = False
+        self.current_big_bang_charge = None
+        self.is_targeting_it = False
+        self.is_teleporting_it = False
+        self.it_hop_queue = []
+        self._it_pending_hit_target = None
+        self._it_hit_delay_timer = 0.0
 
         self.sprite.set_animation('hurt', self.direction)
         self.current_animation_state = 'hurt'
@@ -750,17 +3034,24 @@ class Player:
         return False
 
     def update_derived_stats(self):
-        """Recalculate max_hp, max_ki, speed, and run_speed from the current stat block.
+        """Recalculate max_hp, max_ki, and run_speed from the current stat block.
 
-        Called whenever a stat point is spent. Vitality → HP, Energy → Ki,
-        Speed → movement speeds. Each stat point above 1 adds a fixed increment.
+        Called whenever a stat point is spent. Vitality → HP, Energy → Ki.
+        ki_regen (1–255) maps to a regen interval of 30s (slow) → 1s (fast),
+        matching the character_creator's default of 30 → 10s.
+
+        The Speed stat intentionally has no effect here — movement speed
+        (self.speed / self.run_speed) is fixed and not derived from stats.
         """
         self.max_hp = 100 + (self.stats['vitality'] - 1) * 10
         self.max_ki = 100 + (self.stats['energy'] - 1) * 5
 
-        speed_mult = 1 + (self.stats['speed'] - 1) * 0.05
-        self.speed     = (5  / RENDER_SCALE) * speed_mult
-        self.run_speed = (10 / RENDER_SCALE) * speed_mult
+        self.speed     = 5  / RENDER_SCALE
+        self.run_speed = 10 / RENDER_SCALE
+
+        # ki_regen 1 → 30s interval, ki_regen 255 → 1s interval (linear interpolation)
+        regen_stat = max(1, self.stats.get('ki_regen', 30))
+        self.ki_regen_interval = 30.0 - (regen_stat - 1) * (29.0 / 254.0)
 
     # =========================================================================
     # Private helpers
@@ -780,6 +3071,59 @@ class Player:
         elif not self.is_q_pressed:
             self.stop_beam()
 
+    def _tick_kamekameha_ki_drain(self, dt):
+        """Drain Ki while the Kamekameha is firing, and stop it when Ki runs
+        out or Q is released. Mirrors _tick_beam_ki_drain exactly."""
+        if not self.is_transformed():
+            self.ki = max(0.0, self.ki - self.kamekameha_ki_drain * dt)
+            if self.ki <= 0 or not self.is_q_pressed:
+                self.stop_kamekameha()
+        elif not self.is_q_pressed:
+            self.stop_kamekameha()
+
+    def _tick_banshee_blast_ki_drain(self, dt):
+        """Drain Ki while the Banshee Blast is firing, and stop it when Ki
+        runs out or Q is released. Mirrors _tick_kamekameha_ki_drain exactly."""
+        if not self.is_transformed():
+            self.ki = max(0.0, self.ki - self.banshee_blast_ki_drain * dt)
+            if self.ki <= 0 or not self.is_q_pressed:
+                self.stop_banshee_blast()
+        elif not self.is_q_pressed:
+            self.stop_banshee_blast()
+
+    def _tick_final_flash_ki_drain(self, dt):
+        """Drain Ki while Final Flash is firing, and stop it when Ki runs out
+        or Q is released. Mirrors _tick_beam_ki_drain exactly — see that
+        method for the transformed-state reasoning."""
+        if not self.is_transformed():
+            self.ki = max(0.0, self.ki - self.final_flash_ki_drain * dt)
+            if self.ki <= 0 or not self.is_q_pressed:
+                self.stop_final_flash()
+        elif not self.is_q_pressed:
+            self.stop_final_flash()
+
+    def _tick_big_bang_kamehameha_ki_drain(self, dt):
+        """Drain Ki while Big Bang Kamehameha is firing, and stop it when Ki
+        runs out or Q is released. Mirrors _tick_final_flash_ki_drain
+        exactly — see that method for the transformed-state reasoning."""
+        if not self.is_transformed():
+            self.ki = max(0.0, self.ki - self.big_bang_kamehameha_ki_drain * dt)
+            if self.ki <= 0 or not self.is_q_pressed:
+                self.stop_big_bang_kamehameha()
+        elif not self.is_q_pressed:
+            self.stop_big_bang_kamehameha()
+
+    def _tick_flame_kamehameha_ki_drain(self, dt):
+        """Drain Ki while Flame Kamehameha is firing, and stop it when Ki
+        runs out or Q is released. Mirrors _tick_beam_ki_drain exactly —
+        see that method for the transformed-state reasoning."""
+        if not self.is_transformed():
+            self.ki = max(0.0, self.ki - self.flame_kamehameha_ki_drain * dt)
+            if self.ki <= 0 or not self.is_q_pressed:
+                self.stop_flame_kamehameha()
+        elif not self.is_q_pressed:
+            self.stop_flame_kamehameha()
+
     # =========================================================================
     # Main update loop
     # =========================================================================
@@ -791,6 +3135,30 @@ class Player:
         # are always False during knockback frames when move() is never called.
         self._blocked_x = False
         self._blocked_y = False
+
+        # Drop the beam reference once its decay sweep has fully consumed
+        # it (BeamAttack marks itself inactive when that happens). This is
+        # unconditional — independent of animation/map-jump state — since
+        # whatever owns the render loop (game.py) is still calling
+        # current_beam.update()/draw() every frame based purely on this
+        # reference being set, and needs it cleared once there's nothing
+        # left to show.
+        if self.current_beam and not self.current_beam.active:
+            self.current_beam = None
+        if self.current_kamekameha and not self.current_kamekameha.active:
+            self.current_kamekameha = None
+        if self.current_banshee_blast and not self.current_banshee_blast.active:
+            self.current_banshee_blast = None
+        if self.current_final_flash and not self.current_final_flash.active:
+            self.current_final_flash = None
+        if self.current_big_bang_kamehameha and not self.current_big_bang_kamehameha.active:
+            self.current_big_bang_kamehameha = None
+        if self.current_flame_kamehameha and not self.current_flame_kamehameha.active:
+            self.current_flame_kamehameha = None
+        if self.current_dragon_fist and not self.current_dragon_fist.active:
+            self.current_dragon_fist = None
+            self.is_using_dragon_fist = False
+            self.is_dragon_fist_lunging = False
 
         # ------------------------------------------------------------------
         # World-map jump sequence — runs exclusively; all other state frozen
@@ -970,28 +3338,66 @@ class Player:
             if self.sprite.is_animation_finished():
                 if self.transformation and self.transformation.is_transforming:
                     self.transformation.complete_transform()
+                    # Landing back in 'idle' should start the stand-still
+                    # clock fresh — without this, transforming while already
+                    # past IDLE_WAIT_DELAY (mid idle_transition/idle_wait)
+                    # left the stale timer in place, so the very next frame
+                    # snapped straight back into idle_transition instead of
+                    # giving a full new idle period.
+                    self.enter_idle()
 
         elif self.current_animation_state == 'untransform':
             if self.sprite.is_animation_finished():
                 if self.transformation and self.transformation.is_untransforming:
                     self.transformation.complete_untransform()
+                    # Same reasoning as the transform branch above — detransforming
+                    # back from idle_transition/idle_wait should reset the timer
+                    # rather than instantly re-triggering the wait animation.
+                    self.enter_idle()
 
         elif self.current_animation_state == 'melee':
             if self.sprite.is_animation_finished():
-                self.is_attacking = False
+                if self.is_e_pressed:
+                    # Still holding E once the normal swing finished — roll
+                    # straight into the charged-melee wind-up instead of
+                    # returning to idle (see start_charging_melee()).
+                    self.start_charging_melee()
+                else:
+                    self.is_attacking = False
+                    self.enter_idle()
+
+        elif self.current_animation_state == 'charged_melee_charge':
+            if self.is_charging_melee:
+                self.update_charged_melee_charge(dt)
+            else:
+                # Stopped externally (e.g. enemy killed us mid-charge).
+                self.enter_idle()
+
+        elif self.current_animation_state == 'charged_melee_action':
+            if self.is_charged_melee_active:
+                self.update_charged_melee_action(dt)
+            else:
+                # Stopped externally (e.g. enemy killed us mid-attack).
                 self.enter_idle()
 
         elif self.current_animation_state == 'kiblast':
+            # Frame 0 = wind-up, frame 1 = throw. Spawn the blast on the release
+            # frame rather than waiting for the full animation to finish.
+            if self.pending_blast is True and self.sprite.get_current_frame_index() >= 1:
+                self.pending_blast = 'ready'
+            # Ultra Volleyball rides the same wind-up/throw animation and
+            # release frame as a regular blast (see shoot_ultra_volleyball())
+            # — tracked independently so firing one never marks the other ready.
+            if self.pending_ultra_volleyball is True and self.sprite.get_current_frame_index() >= 1:
+                self.pending_ultra_volleyball = 'ready'
             if self.sprite.is_animation_finished():
-                # Raise the 'ready' flag so the game loop knows it can spawn the projectile now
-                if self.pending_blast:
-                    self.pending_blast = 'ready'
                 self._advance_blast_or_idle()
 
         elif self.current_animation_state == 'kiblast_hold':
+            # Single-frame animation — fire once as soon as pending_blast is armed.
+            if self.pending_blast is True:
+                self.pending_blast = 'ready'
             if self.sprite.is_animation_finished():
-                if self.pending_blast:
-                    self.pending_blast = 'ready'
                 self._advance_blast_or_idle()
 
         elif self.current_animation_state == 'hurt':
@@ -1026,6 +3432,134 @@ class Player:
             elif self.is_charging_beam:
                 self.update_beam_charge(dt)
 
+        elif self.current_animation_state == 'kamekameha_charge':
+            if self.is_charging_kamekameha and not self.is_q_pressed:
+                self.stop_kamekameha()
+            elif self.is_charging_kamekameha:
+                self.update_kamekameha_charge(dt)
+
+        elif self.current_animation_state == 'kamekameha_fire':
+            if self.is_firing_kamekameha:
+                self._tick_kamekameha_ki_drain(dt)
+            else:
+                # Stopped externally (e.g. enemy killed us mid-fire)
+                self.enter_idle()
+
+        elif self.current_animation_state == 'banshee_blast_charge':
+            if self.is_charging_banshee_blast and not self.is_q_pressed:
+                self.stop_banshee_blast()
+            elif self.is_charging_banshee_blast:
+                self.update_banshee_blast_charge(dt)
+
+        elif self.current_animation_state == 'banshee_blast_fire':
+            if self.is_firing_banshee_blast:
+                self._tick_banshee_blast_ki_drain(dt)
+            else:
+                # Stopped externally (e.g. enemy killed us mid-fire)
+                self.enter_idle()
+
+        elif self.current_animation_state == 'energy_punch':
+            # Runs the fixed 1s window itself, independent of however long the
+            # animation sheet actually is — once is_animation_finished() goes
+            # True the sprite just naturally holds on its last frame (same as
+            # every other non-looping animation), so no explicit freeze call
+            # is needed here, just letting the timer keep running.
+            self.punch_timer += dt
+            if self.punch_timer >= self.punch_duration:
+                self.is_punching = False
+                self.enter_idle()
+
+        elif self.current_animation_state == 'final_flash_charge':
+            if self.is_charging_final_flash and not self.is_q_pressed:
+                self.stop_final_flash()
+            elif self.is_charging_final_flash:
+                self.update_final_flash_charge(dt)
+
+        elif self.current_animation_state == 'final_flash_fire':
+            if self.is_firing_final_flash:
+                self._tick_final_flash_ki_drain(dt)
+            else:
+                # Stopped externally (e.g. enemy killed us mid-fire)
+                self.enter_idle()
+
+        elif self.current_animation_state == 'big_bang_kamehameha_charge':
+            if self.is_charging_big_bang_kamehameha and not self.is_q_pressed:
+                self.stop_big_bang_kamehameha()
+            elif self.is_charging_big_bang_kamehameha:
+                self.update_big_bang_kamehameha_charge(dt)
+
+        elif self.current_animation_state == 'big_bang_kamehameha_fire':
+            if self.is_firing_big_bang_kamehameha:
+                self._tick_big_bang_kamehameha_ki_drain(dt)
+            else:
+                # Stopped externally (e.g. enemy killed us mid-fire)
+                self.enter_idle()
+
+        elif self.current_animation_state == 'genkidama_charge':
+            if self.is_charging_genkidama:
+                self.update_genkidama_charge(dt)
+            else:
+                # Charge stopped externally (e.g. enemy killed us mid-charge)
+                self.enter_idle()
+
+        elif self.current_animation_state == 'burning_charge':
+            if self.is_charging_burning:
+                self.update_burning_charge(dt)
+            else:
+                # Charge stopped externally (e.g. enemy killed us mid-charge)
+                self.enter_idle()
+
+        elif self.current_animation_state == 'genkidama_fire':
+            if self.is_firing_genkidama:
+                self.genkidama_fire_pose_timer -= dt
+                if self.genkidama_fire_pose_timer <= 0:
+                    self.is_firing_genkidama = False
+                    self.enter_idle()
+            else:
+                # Stopped externally (e.g. enemy killed us mid-throw)
+                self.enter_idle()
+
+        elif self.current_animation_state == 'big_bang_attack_charge':
+            if self.is_charging_big_bang_attack:
+                self.update_big_bang_charge(dt)
+            else:
+                # Charge stopped externally (e.g. enemy killed us mid-charge)
+                self.enter_idle()
+
+        elif self.current_animation_state == 'big_bang_attack_fire':
+            if self.is_firing_big_bang_attack:
+                self.big_bang_attack_fire_pose_timer -= dt
+                if self.big_bang_attack_fire_pose_timer <= 0:
+                    self.is_firing_big_bang_attack = False
+                    self.enter_idle()
+            else:
+                # Stopped externally (e.g. enemy killed us mid-throw)
+                self.enter_idle()
+
+        elif self.current_animation_state == 'it_targeting':
+            if not self.is_targeting_it:
+                # Stopped externally (e.g. interrupted mid-target)
+                self.enter_idle()
+            # Otherwise: just hold the pose here. Cursor movement and
+            # enemy hover-selection are driven externally by Game every
+            # frame (see Game._update_instant_transmission), since Player
+            # doesn't have access to the enemy list or camera on its own.
+
+        elif self.current_animation_state == 'it_teleport':
+            if not self.is_teleporting_it:
+                # Stopped externally mid-sequence.
+                self.enter_idle()
+            # Otherwise: the hop state machine itself is advanced externally
+            # via update_it_teleport(dt), also called from Game's frozen-
+            # world branch — nothing to do here beyond holding state.
+
+        elif self.current_animation_state == 'masenko_hold':
+            if self.is_charging_masenko:
+                self.update_masenko_charge(dt)
+            else:
+                # Charge stopped externally (e.g. enemy killed us mid-charge)
+                self.enter_idle()
+
         elif self.current_animation_state == 'firebeam':
             if self.is_firing_beam:
                 self._tick_beam_ki_drain(dt)
@@ -1033,10 +3567,103 @@ class Player:
                 # Beam stopped externally (e.g. enemy killed us mid-fire)
                 self.enter_idle()
 
+        elif self.current_animation_state == 'flame_kamehameha_charge':
+            if self.is_charging_flame_kamehameha and not self.is_q_pressed:
+                self.stop_flame_kamehameha()
+            elif self.is_charging_flame_kamehameha:
+                self.update_flame_kamehameha_charge(dt)
+
+        elif self.current_animation_state == 'flame_kamehameha_fire':
+            if self.is_firing_flame_kamehameha:
+                self._tick_flame_kamehameha_ki_drain(dt)
+            else:
+                # Stopped externally (e.g. enemy killed us mid-fire)
+                self.enter_idle()
+
+        elif self.current_animation_state == 'sword_charge':
+            if self.is_charging_sword and not self.is_q_pressed:
+                self.stop_charging_sword()
+            elif self.is_charging_sword:
+                self.update_sword_charge(dt)
+
+        elif self.current_animation_state == 'dragon_fist':
+            if self.is_using_dragon_fist:
+                self.update_dragon_fist(dt)
+            else:
+                # Stopped externally (e.g. enemy killed us mid-attack), or
+                # the retract sweep finished last frame and got cleaned up
+                # by the top-of-update() cleanup — either way, back to idle.
+                self.enter_idle()
+
+        elif self.current_animation_state == 'ghost_kamikaze_cast':
+            if self.is_casting_ghost_kamikaze:
+                self.update_ghost_kamikaze_cast(dt)
+            else:
+                # Stopped externally mid-cast (e.g. enemy hit us).
+                self.enter_idle()
+
+        elif self.current_animation_state == 'ghost_kamikaze_hold':
+            if not self.is_holding_ghost_kamikaze:
+                # Stopped externally mid-hold.
+                self.enter_idle()
+            elif self.current_ghost_kamikaze is None or self.current_ghost_kamikaze.phase not in ('creating', 'holding'):
+                # GhostKamikazeAttack has resolved (hold timer ran out,
+                # or the player already moved and launch_now() fired) —
+                # the player's part is done; the ghosts carry on
+                # independently from here (see Game._update_ghost_kamikaze).
+                self.is_holding_ghost_kamikaze = False
+                self.enter_idle()
+            # Otherwise: just hold the pose. GhostKamikazeAttack's own
+            # hold_timer is ticked centrally by Game (see that class's
+            # docstring), not here.
+
         # Safety fallback — if the beam is still firing but the animation state
         # drifted out of 'firebeam' somehow, drain Ki and check for stop.
         if self.is_firing_beam and self.current_animation_state != 'firebeam':
             self._tick_beam_ki_drain(dt)
+
+        # Same safety fallback for Kamekameha.
+        if self.is_firing_kamekameha and self.current_animation_state != 'kamekameha_fire':
+            self._tick_kamekameha_ki_drain(dt)
+
+        # Same safety fallback for Banshee Blast.
+        if self.is_firing_banshee_blast and self.current_animation_state != 'banshee_blast_fire':
+            self._tick_banshee_blast_ki_drain(dt)
+
+        # Same safety fallback for Final Flash.
+        if self.is_firing_final_flash and self.current_animation_state != 'final_flash_fire':
+            self._tick_final_flash_ki_drain(dt)
+
+        # Same safety fallback for Big Bang Kamehameha.
+        if self.is_firing_big_bang_kamehameha and self.current_animation_state != 'big_bang_kamehameha_fire':
+            self._tick_big_bang_kamehameha_ki_drain(dt)
+
+        # Same safety fallback for Flame Kamehameha.
+        if self.is_firing_flame_kamehameha and self.current_animation_state != 'flame_kamehameha_fire':
+            self._tick_flame_kamehameha_ki_drain(dt)
+
+        # Same safety fallback for Dragon Fist — shouldn't normally drift
+        # since move() no longer flips current_animation_state to
+        # 'walk'/'run' while is_using_dragon_fist is True (unlike the sword
+        # spin), but kept for the same robustness reasons as the others.
+        if self.is_using_dragon_fist and self.current_animation_state != 'dragon_fist':
+            self.update_dragon_fist(dt)
+
+        # Sword spin ticks every frame regardless of current_animation_state —
+        # see update_sword_spin()'s docstring for why (moving during the
+        # spin flips current_animation_state to 'walk'/'run' via move()).
+        if self.is_spinning_sword:
+            self.update_sword_spin(dt)
+
+        # Same safety fallback for the charged-melee charge/action —
+        # shouldn't normally drift since neither phase lets move() flip
+        # current_animation_state (the spin is rooted, the lunge is forced
+        # movement rather than move()-driven), but kept for the same
+        # robustness reasons as dragon fist's fallback above.
+        if self.is_charging_melee and self.current_animation_state != 'charged_melee_charge':
+            self.update_charged_melee_charge(dt)
+        if self.is_charged_melee_active and self.current_animation_state != 'charged_melee_action':
+            self.update_charged_melee_action(dt)
 
     # =========================================================================
     # Input helpers
@@ -1081,4 +3708,6 @@ class Player:
             return
 
         tint = getattr(self, 'hurt_tint', 0.0)
-        self.sprite.draw(screen, self.x, self.y, camera, scale=RENDER_SCALE, hurt_tint=tint)
+        flash_white = getattr(self, 'charged_melee_flash_on', False)
+        self.sprite.draw(screen, self.x, self.y, camera, scale=RENDER_SCALE,
+                         hurt_tint=tint, flash_white=flash_white)

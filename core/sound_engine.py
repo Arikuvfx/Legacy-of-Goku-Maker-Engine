@@ -289,6 +289,7 @@ class SoundManager:
         when entering a room with no Music object. That's a product decision
         this method deliberately doesn't make on its own.
         """
+        print(f"🎵 Playing music (direct): {track_name}")
         self.sound_engine.play_music(track_name, loops=loops, fade_in=fade_in)
 
     def stop_music(self, fade_out=True):

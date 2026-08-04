@@ -24,6 +24,7 @@ BOSS_REGISTRY = {
         'shadow_size':   'small',
         'shadow_width':  32,
         'shadow_y_offset': 13.5,
+        'zeni_pool':     'tier3',
     },
     'android_17': {
         'hp':            350,
@@ -42,6 +43,7 @@ BOSS_REGISTRY = {
         'shadow_size':   'small',
         'shadow_width':  24,
         'shadow_y_offset': 10.0,
+        'zeni_pool':     'tier4',
     },
     'android_18': {
         'hp':            350,
@@ -60,6 +62,7 @@ BOSS_REGISTRY = {
         'shadow_size':   'small',
         'shadow_width':  24,
         'shadow_y_offset': 10.0,
+        'zeni_pool':     'tier4',
     },
 }
 
@@ -92,6 +95,7 @@ class BossEnemy(Enemy):
             ai_type=cfg['ai_type'],
             enemy_category=cfg['enemy_category'],
             shooter_style=cfg.get('shooter_style', 'bomb'),
+            zeni_pool=cfg.get('zeni_pool', 'tier3'),
         )
 
         # FIX: override projectile_sprite after init so the base AI uses the

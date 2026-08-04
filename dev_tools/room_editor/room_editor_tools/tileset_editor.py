@@ -75,6 +75,7 @@ class Tile:
 class Tileset:
     def __init__(self, name: str, image_path: str):
         self.name = name
+        self.image_path = image_path
         self.image = None
         self.tile_width = 16
         self.tile_height = 16
@@ -82,6 +83,11 @@ class Tileset:
         self.rows = 0
         self._tile_transparency_cache = {}
         self._scaled_cache = {}  # key: (tile_x, tile_y, scale) → pre-scaled Surface
+
+        # (tile_x, tile_y) anchor -> {'frames': [(tx,ty), ...], 'fps': float}
+        # The anchor is whatever coordinate is painted into the room; 'frames'
+        # is the sequence cycled through at runtime (anchor is usually frames[0]).
+        self.tile_animations = {}
 
         try:
             self.image = pygame.image.load(image_path).convert_alpha()
@@ -91,8 +97,97 @@ class Tileset:
             self.cols = w // self.tile_width
             self.rows = h // self.tile_height
             self._build_transparency_cache()
+            self._load_tile_animations(image_path)
         except (pygame.error, ValueError) as e:
             print(f"Error loading tileset {name}: {e}")
+
+    def _load_tile_animations(self, image_path):
+        """Load optional animated-tile definitions from a sidecar JSON file.
+
+        Looked up next to the tileset image as '<name>.anim.json'. Format:
+            {
+              "animations": [
+                {"anchor": [5, 3], "frames": [[5,3],[6,3],[7,3],[8,3]], "fps": 6}
+              ]
+            }
+        'anchor' is the tile coordinate that appears in the palette and gets
+        painted into rooms as a normal Tile. 'frames' is the coordinate
+        sequence cycled through at runtime (all frames must live in this same
+        tileset image). Missing/malformed files are silently ignored so a
+        tileset with no animations behaves exactly as before.
+        """
+        anim_path = os.path.splitext(image_path)[0] + '.anim.json'
+        if not os.path.exists(anim_path):
+            return
+
+        try:
+            with open(anim_path, 'r') as f:
+                data = json.load(f)
+            for entry in data.get('animations', []):
+                anchor = tuple(entry['anchor'])
+                frames = [tuple(fr) for fr in entry.get('frames', [])]
+                fps = max(0.1, float(entry.get('fps', 6)))
+                if frames:
+                    self.tile_animations[anchor] = {'frames': frames, 'fps': fps}
+        except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError) as e:
+            print(f"Error loading tile animations for {self.name}: {e}")
+
+    def get_animated_coords(self, tile_x, tile_y, tick_ms):
+        """Resolve (tile_x, tile_y) to its current animation frame, if animated.
+
+        tick_ms should be a shared clock (e.g. pygame.time.get_ticks()) so every
+        placed instance of the same animated tile stays in sync with the others.
+        Tiles with no animation defined are returned unchanged.
+        """
+        anim = self.tile_animations.get((tile_x, tile_y))
+        if not anim:
+            return tile_x, tile_y
+        frames = anim['frames']
+        frame_idx = int(tick_ms * anim['fps'] / 1000) % len(frames)
+        return frames[frame_idx]
+
+    def is_tile_animated(self, tile_x, tile_y):
+        """True if (tile_x, tile_y) is the anchor frame of an animation."""
+        return (tile_x, tile_y) in self.tile_animations
+
+    def set_animation(self, anchor, frames, fps):
+        """Register (or replace) an animation and immediately persist it to disk.
+
+        Called by the palette's 'mark selection as animated' action — the
+        person never touches the JSON file directly.
+        """
+        self.tile_animations[tuple(anchor)] = {
+            'frames': [tuple(f) for f in frames],
+            'fps': max(0.1, float(fps)),
+        }
+        self.save_tile_animations()
+
+    def remove_animation(self, anchor):
+        """Un-mark an animation and persist the change to disk."""
+        self.tile_animations.pop(tuple(anchor), None)
+        self.save_tile_animations()
+
+    def save_tile_animations(self):
+        """Write self.tile_animations back out to the '<name>.anim.json' sidecar.
+
+        Overwrites the whole file with the current in-memory state, so the
+        palette UI is always the single source of truth — no manual JSON
+        editing required.
+        """
+        if not self.image_path:
+            return
+        anim_path = os.path.splitext(self.image_path)[0] + '.anim.json'
+        data = {
+            'animations': [
+                {'anchor': list(anchor), 'frames': [list(f) for f in info['frames']], 'fps': info['fps']}
+                for anchor, info in self.tile_animations.items()
+            ]
+        }
+        try:
+            with open(anim_path, 'w') as f:
+                json.dump(data, f, indent=2)
+        except OSError as e:
+            print(f"Error saving tile animations for {self.name}: {e}")
 
     def _build_transparency_cache(self):
         """Pre-scan every tile and note which ones are fully transparent — skips empty blits at draw time."""
@@ -247,6 +342,14 @@ class TilesetEditor:
         self.foreground_mode = False
         self._last_stroke_cell = None  # (grid_x, grid_y) of last placed/erased cell
 
+        # ── Animated tile authoring (palette: select frames, press A) ──────────
+        self.fps_input_active = False
+        self.fps_input_text = "6"
+        self._pending_anim_anchor = None
+        self._pending_anim_frames = None
+        self.anim_feedback_text = ""      # brief on-screen confirmation, e.g. "Animated: 4 frames @ 6fps"
+        self.anim_feedback_until_ms = 0
+
         # ── Palette geometry ─────────────────────────────────────────────────
         self.palette_width = 600
         self.palette_x = screen_width - self.palette_width
@@ -339,6 +442,64 @@ class TilesetEditor:
         max_y = max(self.selection_start_y, self.selection_end_y)
         return min_x, max_x, min_y, max_y
 
+    def _set_anim_feedback(self, text, duration_ms=2500):
+        """Show a brief on-screen confirmation near the palette selection info."""
+        self.anim_feedback_text = text
+        self.anim_feedback_until_ms = pygame.time.get_ticks() + duration_ms
+
+    def _toggle_animate_selection(self):
+        """'A' in the palette: turn the current multi-tile selection into an
+        animation, or remove it if the selection is already animated.
+
+        The anchor (the tile you actually paint into rooms) is always the
+        top-left of the selection; the frame order is left-to-right,
+        top-to-bottom through the selected rectangle. No JSON editing —
+        this writes straight to the tileset and saves the sidecar file.
+        """
+        tileset = self.get_current_tileset()
+        if not tileset:
+            return
+
+        min_x, max_x, min_y, max_y = self._get_selection_bounds()
+        anchor = (min_x, min_y)
+
+        # Already animated — remove it and stop here.
+        if tileset.is_tile_animated(*anchor):
+            tileset.remove_animation(anchor)
+            self._set_anim_feedback("Animation removed")
+            return
+
+        frames = [
+            (tx, ty)
+            for ty in range(min_y, max_y + 1)
+            for tx in range(min_x, max_x + 1)
+            if not tileset.is_tile_empty(tx, ty)
+        ]
+
+        if len(frames) < 2:
+            self._set_anim_feedback("Select 2+ tiles first, then press A")
+            return
+
+        # Ask for playback speed via the same inline text-entry pattern used
+        # for custom layer values — defaults to 6 so pressing Enter just works.
+        self._pending_anim_anchor = anchor
+        self._pending_anim_frames = frames
+        self.fps_input_active = True
+        self.fps_input_text = "6"
+
+    def _confirm_pending_animation(self, fps):
+        """Finish creating the pending animation once FPS is confirmed."""
+        tileset = self.get_current_tileset()
+        if not tileset or not self._pending_anim_anchor or not self._pending_anim_frames:
+            self._pending_anim_anchor = None
+            self._pending_anim_frames = None
+            return
+
+        tileset.set_animation(self._pending_anim_anchor, self._pending_anim_frames, fps)
+        self._set_anim_feedback(f"Animated: {len(self._pending_anim_frames)} frames @ {fps:g}fps")
+        self._pending_anim_anchor = None
+        self._pending_anim_frames = None
+
     def _is_in_palette(self, mouse_x: int, mouse_y: int) -> bool:
         """Returns True when the mouse is over the palette panel."""
         if not self.palette_visible:
@@ -362,6 +523,25 @@ class TilesetEditor:
         shift_pressed = keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]
 
         if event.type == pygame.KEYDOWN:
+            # Handle FPS input text entry (confirming a new animation)
+            if self.fps_input_active:
+                if event.key == pygame.K_RETURN:
+                    try:
+                        fps = float(self.fps_input_text) if self.fps_input_text else 6.0
+                    except ValueError:
+                        fps = 6.0
+                    self._confirm_pending_animation(fps)
+                    self.fps_input_active = False
+                elif event.key == pygame.K_ESCAPE:
+                    self.fps_input_active = False
+                    self._pending_anim_anchor = None
+                    self._pending_anim_frames = None
+                elif event.key == pygame.K_BACKSPACE:
+                    self.fps_input_text = self.fps_input_text[:-1]
+                elif event.unicode.isdigit() or (event.unicode == '.' and '.' not in self.fps_input_text):
+                    self.fps_input_text += event.unicode
+                return
+
             # Handle layer input text entry
             if self.layer_input_active:
                 if event.key == pygame.K_RETURN:
@@ -461,6 +641,9 @@ class TilesetEditor:
                 world_x = (mouse_x + camera_x) // RENDER_SCALE
                 world_y = (mouse_y + camera_y) // RENDER_SCALE
                 self._delete_tile_at_position(world_x, world_y, current_room_name)
+
+            elif event.key == pygame.K_a and not ctrl_pressed:
+                self._toggle_animate_selection()
 
         elif event.type == pygame.MOUSEBUTTONDOWN:
             mouse_x, mouse_y = event.pos
@@ -718,14 +901,18 @@ class TilesetEditor:
         min_x, max_x, min_y, max_y = self._get_selection_bounds()
         scaled_width = tileset.tile_width * RENDER_SCALE
         scaled_height = tileset.tile_height * RENDER_SCALE
+        tick_ms = pygame.time.get_ticks()
 
         for ty in range(min_y, max_y + 1):
             for tx in range(min_x, max_x + 1):
                 if tileset.is_tile_empty(tx, ty):
                     continue
 
+                # Resolve to the current animation frame (no-op for static tiles)
+                disp_x, disp_y = tileset.get_animated_coords(tx, ty, tick_ms)
+
                 # Use the cache to avoid repeated transform.scale calls per frame
-                scaled_tile = tileset.get_scaled_tile_surface(tx, ty, RENDER_SCALE)
+                scaled_tile = tileset.get_scaled_tile_surface(disp_x, disp_y, RENDER_SCALE)
                 if not scaled_tile:
                     continue
 
@@ -757,6 +944,8 @@ class TilesetEditor:
         if room_name not in self.room_tiles:
             return
 
+        tick_ms = pygame.time.get_ticks()
+
         for tile in sorted(self.room_tiles[room_name], key=lambda t: t.layer):
             # Optionally dim everything except the active editing layer
             if self.hide_other_layers and tile.layer != self.current_layer:
@@ -783,8 +972,11 @@ class TilesetEditor:
                     -scaled_height <= screen_y <= self.screen_height):
                 continue
 
+            # Resolve to the current animation frame (no-op for static tiles)
+            disp_x, disp_y = tileset.get_animated_coords(tile.tile_x, tile.tile_y, tick_ms)
+
             # Retrieve from cache — avoids subsurface + transform.scale every frame
-            scaled_tile = tileset.get_scaled_tile_surface(tile.tile_x, tile.tile_y, RENDER_SCALE)
+            scaled_tile = tileset.get_scaled_tile_surface(disp_x, disp_y, RENDER_SCALE)
             if not scaled_tile:
                 continue
 
@@ -858,6 +1050,16 @@ class TilesetEditor:
                 pygame.draw.line(screen, self.colors['grid_dim'][:3],
                                  (x, draw_y), (x, draw_y + scaled_height), 1)
 
+            # Mark animated anchor tiles with a small badge so they're
+            # identifiable at a glance while browsing the palette
+            for (anim_tx, anim_ty) in tileset.tile_animations:
+                if not (0 <= anim_tx < tileset.cols and 0 <= anim_ty < tileset.rows):
+                    continue
+                badge_x = draw_x + anim_tx * self.grid_cell_size + self.grid_cell_size - 9
+                badge_y = draw_y + anim_ty * self.grid_cell_size + 2
+                pygame.draw.circle(screen, self.colors['accent'], (badge_x, badge_y), 5)
+                pygame.draw.circle(screen, (20, 20, 30), (badge_x, badge_y), 5, 1)
+
             # Draw selection rectangle
             min_x, max_x, min_y, max_y = self._get_selection_bounds()
             sel_width = max_x - min_x + 1
@@ -887,6 +1089,27 @@ class TilesetEditor:
             sel_text = f"Selection: {sel_width}x{sel_height}"
             sel_surf = self.font_small.render(sel_text, True, self.colors['selection'])
             screen.blit(sel_surf, (self.palette_x + 20, sel_y))
+
+            # Tell the person right here whether 'A' will animate or un-animate
+            # this exact selection — no need to remember what the dot meant.
+            if not self.fps_input_active:
+                if tileset.is_tile_animated(min_x, min_y):
+                    hint_text, hint_color = "Animated \u2014 press A to remove", self.colors['accent']
+                else:
+                    hint_text, hint_color = "Press A to animate this selection", self.colors['text_dim']
+                hint_surf = self.font_small.render(hint_text, True, hint_color)
+                screen.blit(hint_surf, (self.palette_x + 20 + sel_surf.get_width() + 12, sel_y))
+
+        # Inline FPS prompt while confirming a new animation
+        if self.fps_input_active:
+            prompt_text = f"New animation \u2014 FPS: {self.fps_input_text}_  (Enter to confirm, Esc to cancel)"
+            prompt_surf = self.font_small.render(prompt_text, True, self.colors['accent'])
+            screen.blit(prompt_surf, (self.palette_x + 20, sel_y))
+
+        # Brief confirmation after animating/un-animating a selection
+        elif self.anim_feedback_text and pygame.time.get_ticks() < self.anim_feedback_until_ms:
+            fb_surf = self.font_small.render(self.anim_feedback_text, True, self.colors['success'])
+            screen.blit(fb_surf, (self.palette_x + 20, sel_y + 18))
 
         # Controls below the palette content
         controls_y = tileset_y + self.palette_content_height + 10
@@ -1011,6 +1234,8 @@ class TilesetEditor:
             "Scroll: Pan Tileset",
             "Click World: Place Pattern",
             "Right Click: Delete Tile",
+            "Select frames, A: Animate",
+            "\u25cf on tile = animated",
             "F2: Close Editor"
         ]
 

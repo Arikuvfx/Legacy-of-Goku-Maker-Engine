@@ -91,6 +91,7 @@ class RoomEditor:
         from dev_tools.room_editor.room_editor_tools.tileset_editor import TilesetEditor
         self.tileset_editor = TilesetEditor(screen_width, screen_height)
         self.object_editor = None
+        self.flag_manager = None
         self.entity_editor = None
 
         from dev_tools.room_editor.room_editor_tools.editor_toolbar import EditorToolbar
@@ -194,6 +195,15 @@ class RoomEditor:
         self.active = False
         pygame.key.set_repeat(0, 0)
 
+    def set_flag_manager(self, flag_manager):
+        """Give the editor a FlagManager, forwarded to the object editor so
+        cutscene triggers can gate on switches/variables/timers. Object
+        editor is lazy-init'd on first open, so this also just stashes the
+        reference for when it gets created."""
+        self.flag_manager = flag_manager
+        if self.object_editor is not None:
+            self.object_editor.set_flag_manager(flag_manager)
+
     def toggle(self):
         """Open or close the editor.  Sub-editors are initialised on first open
         and reused on subsequent visits — lazy init for object/entity editor,
@@ -224,6 +234,8 @@ class RoomEditor:
                 # so it can read the active tool without duplicating state
                 if self.object_editor:
                     self.object_editor.set_toolbar(self.toolbar)
+                    if self.flag_manager is not None:
+                        self.object_editor.set_flag_manager(self.flag_manager)
 
                 # Wire object-editor placement / deletion callbacks for undo
                 self._wire_undo_callbacks()
@@ -527,6 +539,12 @@ class RoomEditor:
                 self.viewing_room.collision_objects = []
             self.object_editor.collision_manager.collision_objects[room_name] = self.viewing_room.collision_objects
 
+        if self.object_editor and hasattr(self.object_editor, 'animated_region_manager'):
+            self.object_editor.animated_region_manager.regions[room_name] = []
+            if not hasattr(self.viewing_room, 'animated_regions'):
+                self.viewing_room.animated_regions = []
+            self.object_editor.animated_region_manager.regions[room_name] = self.viewing_room.animated_regions
+
         if not hasattr(self.viewing_room, 'destructible_stones'):
             self.viewing_room.destructible_stones = []
 
@@ -538,6 +556,18 @@ class RoomEditor:
                 self.viewing_room.cutscene_triggers = []
             self.object_editor.cutscene_trigger_manager._triggers[room_name] = (
                 self.viewing_room.cutscene_triggers
+            )
+
+        # Sync trigger boxes so the manager works with the room's live list —
+        # same rationale as cutscene triggers above. Without this, boxes
+        # placed/edited (conditions + actions) via the object editor live only
+        # in trigger_box_manager and never reach viewing_room.trigger_boxes,
+        # so they're invisible on reopen and dropped on save.
+        if self.object_editor and hasattr(self.object_editor, 'trigger_box_manager'):
+            if not hasattr(self.viewing_room, 'trigger_boxes'):
+                self.viewing_room.trigger_boxes = []
+            self.object_editor.trigger_box_manager.trigger_boxes[room_name] = (
+                self.viewing_room.trigger_boxes
             )
 
         # Sync save points so placed save points are visible when re-opening a room.
@@ -864,7 +894,6 @@ class RoomEditor:
         if self.object_editor and not self.object_editor.active and (
             self.object_editor.placing_transition or
             self.object_editor.placing_collision or
-            self.object_editor.placing_cutscene_trigger or
             self.object_editor.selected_object is not None
         ):
             self.object_editor.active = True
@@ -1165,6 +1194,16 @@ class RoomEditor:
             if not hasattr(self.viewing_room, 'collision_objects'):
                 self.viewing_room.collision_objects = []
 
+        # Move animated (water/grass) regions from editor to room
+        if self.object_editor and hasattr(self.object_editor, 'animated_region_manager'):
+            regions = self.object_editor.animated_region_manager.get_regions(
+                self.viewing_room.name
+            )
+            self.viewing_room.animated_regions = regions
+        else:
+            if not hasattr(self.viewing_room, 'animated_regions'):
+                self.viewing_room.animated_regions = []
+
         # Move spawn points from editor to room
         if self.object_editor and hasattr(self.object_editor, 'spawn_manager'):
             spawn_obj = self.object_editor.spawn_manager.get_spawn_point(self.viewing_room.name)
@@ -1198,6 +1237,15 @@ class RoomEditor:
             if not hasattr(self.viewing_room, 'cutscene_triggers'):
                 self.viewing_room.cutscene_triggers = []
 
+        # Move trigger boxes from editor to room before writing to disk —
+        # same rationale as cutscene triggers above.
+        if self.object_editor and hasattr(self.object_editor, 'trigger_box_manager'):
+            boxes = self.object_editor.trigger_box_manager.get_boxes(self.viewing_room.name)
+            self.viewing_room.trigger_boxes = boxes if boxes is not None else []
+        else:
+            if not hasattr(self.viewing_room, 'trigger_boxes'):
+                self.viewing_room.trigger_boxes = []
+
         # Write everything to disk
         self.room_manager.save_room(self.viewing_room)
 
@@ -1222,6 +1270,14 @@ class RoomEditor:
                     objects = self.object_editor.collision_manager.get_collision_objects(room.name)
                     if objects:
                         room.collision_objects = objects
+                        transferred_count += 1
+
+            # Animated (water/grass) regions
+            if hasattr(self.object_editor, 'animated_region_manager'):
+                for room in self.room_manager.rooms:
+                    regions = self.object_editor.animated_region_manager.get_regions(room.name)
+                    if regions:
+                        room.animated_regions = regions
                         transferred_count += 1
 
             # Flying pads
@@ -1262,6 +1318,14 @@ class RoomEditor:
                     gates = self.object_editor.gate_manager.get_gates(room.name)
                     if gates:
                         room.level_gates = gates
+                        transferred_count += 1
+
+            # Doors
+            if hasattr(self.object_editor, 'door_manager'):
+                for room in self.room_manager.rooms:
+                    doors = self.object_editor.door_manager.get_doors(room.name)
+                    if doors:
+                        room.doors = doors
                         transferred_count += 1
 
             # Save points
@@ -1306,6 +1370,12 @@ class RoomEditor:
                 room.collision_objects = []
             self.object_editor.collision_manager.collision_objects[room_name] = room.collision_objects
 
+        # Sync water/grass animated regions
+        if self.object_editor and hasattr(self.object_editor, 'animated_region_manager'):
+            if not hasattr(room, 'animated_regions'):
+                room.animated_regions = []
+            self.object_editor.animated_region_manager.regions[room_name] = room.animated_regions
+
         # Sync flying pads
         if self.object_editor and hasattr(self.object_editor, 'flying_pad_manager'):
             if not hasattr(room, 'flying_pads'):
@@ -1337,6 +1407,12 @@ class RoomEditor:
             if not hasattr(room, 'level_gates'):
                 room.level_gates = []
             self.object_editor.gate_manager.gates[room_name] = room.level_gates
+
+        # Sync doors
+        if self.object_editor and hasattr(self.object_editor, 'door_manager'):
+            if not hasattr(room, 'doors'):
+                room.doors = []
+            self.object_editor.door_manager.doors[room_name] = room.doors
 
         # Sync save points
         if self.object_editor and hasattr(self.object_editor, 'save_point_manager'):
@@ -1378,9 +1454,17 @@ class RoomEditor:
             self._push_undo(_HistoryEntry('object_add', {'obj': obj, 'obj_type': 'collision', 'room': room}))
         oe.on_collision_placed = _on_collision_placed
 
+        def _on_animated_region_placed(obj, room):
+            self._push_undo(_HistoryEntry('object_add', {'obj': obj, 'obj_type': 'animated_region', 'room': room}))
+        oe.on_animated_region_placed = _on_animated_region_placed
+
         def _on_gate_placed(obj, room):
             self._push_undo(_HistoryEntry('object_add', {'obj': obj, 'obj_type': 'gate', 'room': room}))
         oe.on_gate_placed = _on_gate_placed
+
+        def _on_door_placed(obj, room):
+            self._push_undo(_HistoryEntry('object_add', {'obj': obj, 'obj_type': 'door', 'room': room}))
+        oe.on_door_placed = _on_door_placed
 
         def _on_spawn_placed(obj, room):
             self._push_undo(_HistoryEntry('object_add', {'obj': obj, 'obj_type': 'spawn', 'room': room}))
@@ -1408,9 +1492,17 @@ class RoomEditor:
             self._push_undo(_HistoryEntry('object_remove', {'obj': obj, 'obj_type': 'collision', 'room': room}))
         oe.on_collision_deleted = _on_collision_deleted
 
+        def _on_animated_region_deleted(obj, room):
+            self._push_undo(_HistoryEntry('object_remove', {'obj': obj, 'obj_type': 'animated_region', 'room': room}))
+        oe.on_animated_region_deleted = _on_animated_region_deleted
+
         def _on_gate_deleted(obj, room):
             self._push_undo(_HistoryEntry('object_remove', {'obj': obj, 'obj_type': 'gate', 'room': room}))
         oe.on_gate_deleted = _on_gate_deleted
+
+        def _on_door_deleted(obj, room):
+            self._push_undo(_HistoryEntry('object_remove', {'obj': obj, 'obj_type': 'door', 'room': room}))
+        oe.on_door_deleted = _on_door_deleted
 
         def _on_spawn_deleted(obj, room):
             self._push_undo(_HistoryEntry('object_remove', {'obj': obj, 'obj_type': 'spawn', 'room': room}))
@@ -1554,6 +1646,14 @@ class RoomEditor:
                 if obj not in room.collision_objects:
                     room.collision_objects.append(obj)
 
+        elif obj_type == 'animated_region':
+            oe.animated_region_manager.regions.setdefault(room_name, []).append(obj)
+            if room is not None:
+                if not hasattr(room, 'animated_regions'):
+                    room.animated_regions = []
+                if obj not in room.animated_regions:
+                    room.animated_regions.append(obj)
+
         elif obj_type == 'gate':
             oe.gate_manager.add_gate(room_name, obj)
             if room is not None:
@@ -1561,6 +1661,14 @@ class RoomEditor:
                     room.level_gates = []
                 if obj not in room.level_gates:
                     room.level_gates.append(obj)
+
+        elif obj_type == 'door':
+            oe.door_manager.add_door(room_name, obj)
+            if room is not None:
+                if not hasattr(room, 'doors'):
+                    room.doors = []
+                if obj not in room.doors:
+                    room.doors.append(obj)
 
         elif obj_type == 'spawn':
             oe.spawn_manager.spawn_points[room_name] = obj
@@ -1625,6 +1733,19 @@ class RoomEditor:
             else None
         )
 
+        # Extract zeni drop pool — only relevant for enemies/bosses. This was
+        # missing entirely before, so the entity editor's Zeni Pool selector
+        # had no effect: every placed enemy silently fell back to game.py's
+        # data.get('zeni_pool', 'tier1') default regardless of what was picked.
+        # entity_editor.py embeds the pick under '_zeni_pool' (underscore
+        # prefix — same convention as the NPC settings below, since there's
+        # no dedicated positional slot for it in this callback).
+        zeni_pool = (
+            entity.get('_zeni_pool', 'tier1')
+            if entity_type in ('enemy', 'boss')
+            else None
+        )
+
         # Generate a stable short instance ID for this entity
         import uuid
         instance_id = str(uuid.uuid4())[:8]
@@ -1661,6 +1782,10 @@ class RoomEditor:
         # Add enemy_category for enemies and bosses
         if enemy_category:
             entity_data['enemy_category'] = enemy_category
+
+        # Add zeni_pool for enemies and bosses
+        if zeni_pool:
+            entity_data['zeni_pool'] = zeni_pool
 
         # Add NPC-specific settings
         if entity.get('entity_type') == 'npc':
@@ -1954,6 +2079,7 @@ class RoomEditor:
         if key in RoomEditor._placed_sprite_cache:
             return RoomEditor._placed_sprite_cache[key]
         base = f"assets/sprites/enemies/{entity_id}"
+        critter_base = f"assets/sprites/critters/{entity_id}"
         # Try paths in priority order: variant-specific first, then generic fallbacks
         candidates = [
             # NPC paths
@@ -1963,13 +2089,22 @@ class RoomEditor:
             f"{base}/variants/{variant_type}/idle.png",
             f"{base}/idle.png",
             f"assets/sprites/enemies/boss/{entity_id}/idle.png",
+            # Critter paths — idle.png first, falling back to flying.png since
+            # always-airborne critters (e.g. butterflies) have no idle animation.
+            f"{critter_base}/variants/{variant_type}/idle.png",
+            f"{critter_base}/idle.png",
+            f"{critter_base}/variants/{variant_type}/flying.png",
+            f"{critter_base}/flying.png",
         ]
         path = next((p for p in candidates if os.path.exists(p)), None)
         sprite = None
         if path:
             try:
                 sheet = pygame.image.load(path).convert_alpha()
-                frame_h = sheet.get_height() // 4  # row 0 = down
+                # flying.png sheets are always 8-directional; everything else
+                # on these candidate paths is the 4-directional layout.
+                num_rows = 8 if path.endswith('flying.png') else 4
+                frame_h = sheet.get_height() // num_rows  # row 0 = down
                 # Use the registered frame width (w) directly — avoids assuming
                 # square frames (e.g. Pui Pui is 32×46).
                 frame_w = w if 0 < w <= sheet.get_width() else frame_h
@@ -2009,14 +2144,18 @@ class RoomEditor:
             rect = pygame.Rect(sx - sw // 2, sy - sh // 2, sw, sh)
 
             if sprite:
-                # Shadow beneath the sprite, matching draw_layers positioning
-                shadow_w = ent.get('shadow_width', 32)
-                shadow = self._get_editor_shadow(shadow_w)
-                feet_x = sx
-                hitbox_h = ent.get('hitbox_height', 32)
-                feet_y = sy + int((hitbox_h * RENDER_SCALE) // 2.25) + ent.get('shadow_y_offset', 0)
-                screen.blit(shadow, (feet_x - shadow.get_width() // 2,
-                                     feet_y - shadow.get_height() // 2))
+                # Shadow beneath the sprite, matching draw_layers positioning.
+                # Skipped for critters — draw_layers._draw_shadow only casts
+                # shadows for Player/Enemy/BossEnemy/NPC by class name, so a
+                # critter never gets one at runtime either.
+                if entity_type != 'critter':
+                    shadow_w = ent.get('shadow_width', 32)
+                    shadow = self._get_editor_shadow(shadow_w)
+                    feet_x = sx
+                    hitbox_h = ent.get('hitbox_height', 32)
+                    feet_y = sy + int((hitbox_h * RENDER_SCALE) // 2.25) + ent.get('shadow_y_offset', 0)
+                    screen.blit(shadow, (feet_x - shadow.get_width() // 2,
+                                         feet_y - shadow.get_height() // 2))
                 screen.blit(sprite, rect)
             else:
                 # ── fallback shape ──────────────────────────────────────
@@ -2048,6 +2187,13 @@ class RoomEditor:
                     pts = [(cx, cy - r), (cx + r, cy), (cx, cy + r), (cx - r, cy)]
                     pygame.draw.polygon(screen, light, pts)
                     pygame.draw.polygon(screen, dark, pts, 2)
+                elif entity_type == 'critter':
+                    # Small, soft, no outline — matches the placeholder
+                    # entity_editor's palette uses for the same category.
+                    cx, cy = rect.center
+                    r = max(2, min(sw, sh) // 3)
+                    pygame.draw.circle(screen, color, (cx, cy), r)
+                    pygame.draw.circle(screen, light, (cx, cy), max(1, r // 2))
 
             # ── name + variant label above the sprite ───────────────────
             variant_name = ent.get('variant_name', '')
@@ -2349,6 +2495,11 @@ class RoomEditor:
                 int(self.camera.x),
                 int(self.camera.y)
             )
+            self.object_editor.draw_animated_regions(
+                screen,
+                int(self.camera.x),
+                int(self.camera.y)
+            )
 
         # Draw flying pads
         if self.object_editor:
@@ -2362,15 +2513,6 @@ class RoomEditor:
         # Draw save points
         if self.object_editor:
             self.object_editor.draw_save_points(
-                screen,
-                int(self.camera.x),
-                int(self.camera.y),
-                self.colors
-            )
-
-        # Draw music objects (editor-only icon; never drawn during test/gameplay)
-        if self.object_editor:
-            self.object_editor.draw_music_objects(
                 screen,
                 int(self.camera.x),
                 int(self.camera.y),
@@ -2395,6 +2537,15 @@ class RoomEditor:
                 self.colors
             )
 
+        # Draw doors
+        if self.object_editor:
+            self.object_editor.draw_doors(
+                screen,
+                int(self.camera.x),
+                int(self.camera.y),
+                self.colors
+            )
+
         # Draw room transitions
         if self.object_editor:
             self.object_editor.draw_room_transitions(
@@ -2403,9 +2554,9 @@ class RoomEditor:
                 int(self.camera.y)
             )
 
-        # Draw cutscene triggers
+        # Draw trigger boxes
         if self.object_editor:
-            self.object_editor.draw_cutscene_triggers(
+            self.object_editor.draw_trigger_boxes(
                 screen,
                 int(self.camera.x),
                 int(self.camera.y)
@@ -2529,11 +2680,13 @@ class RoomEditor:
         if self.object_editor:
             self.object_editor.current_room_name = room_name
             self.object_editor.draw_collision_objects(zoom_surf, cam_x, cam_y)
+            self.object_editor.draw_animated_regions(zoom_surf, cam_x, cam_y)
             self.object_editor.draw_flying_pads(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_save_points(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_music_objects(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_world_map_objects(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_level_gates(zoom_surf, cam_x, cam_y, self.colors)
+            self.object_editor.draw_doors(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_room_transitions(zoom_surf, cam_x, cam_y)
 
         # Restore sub-editor and self dimensions

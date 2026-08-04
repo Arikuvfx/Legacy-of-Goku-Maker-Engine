@@ -1,19 +1,24 @@
 import os
+import colorsys
 
+import numpy as np
 import pygame
 import pygame.gfxdraw
 
 from config.settings import RENDER_SCALE, TILE_SIZE, WORLD_WIDTH, WORLD_HEIGHT
 from objects.spawn_object import SpawnObject, SpawnObjectManager
 from objects.collision_object import CollisionObject, CollisionObjectManager, draw_collision_object
+from objects.animated_region import AnimatedRegion, AnimatedRegionManager, draw_animated_region, REGION_STYLES
 from objects.level_gate import LevelGate, LevelGateManager
 from objects.room_transition import RoomTransition, RoomTransitionManager, TransitionConfigDialog
 from objects.flying_pad import FlyingPad, FlyingPadManager
 from objects.save_point import SavePoint, SavePointManager
 from objects.world_map import WorldMapObject, WorldMapObjectManager
-from objects.cutscene_trigger import CutsceneTrigger, CutsceneTriggerManager, draw_cutscene_trigger
-from objects.music_object import MusicObject, MusicObjectManager, get_available_music_tracks
+from objects.door_object import Door, DoorManager
+from objects.trigger_box import (OverlapTriggerBox, KeyTriggerBox, TriggerBoxManager,
+                                 draw_trigger_box)
 from dev_tools.room_editor.room_editor_tools.flying_pad_path_editor import FlyingPadPathEditor
+from core.event_editor import EventEditorWindow
 
 
 class ObjectEditor:
@@ -59,13 +64,23 @@ class ObjectEditor:
         self.palette_height = 940
         self.palette_padding = 10
         self.item_size = 80
-        self.items_per_row = 3
+        # How many item_size boxes (plus the 10px gap between them, same gap
+        # used at draw time below) actually fit across the palette's usable
+        # width. This used to be hardcoded to 3, which only filled ~270px of
+        # the 600px-wide panel — every category's grid sat flush left with
+        # roughly half the panel sitting empty. Deriving it from the real
+        # geometry instead means the grid always uses the full width, and
+        # it stays correct if palette_width/item_size ever change.
+        item_gap = 10
+        usable_width = self.palette_width - self.palette_padding * 2
+        self.items_per_row = max(1, (usable_width + item_gap) // (self.item_size + item_gap))
         self.scroll_offset = 0
         self.max_scroll = 0
 
         # ── Object managers ───────────────────────────────────────────────────
         self.spawn_manager = SpawnObjectManager()
         self.collision_manager = CollisionObjectManager()
+        self.animated_region_manager = AnimatedRegionManager()
         self.gate_manager = LevelGateManager()
         self.transition_manager = RoomTransitionManager()
 
@@ -78,6 +93,29 @@ class ObjectEditor:
         self.collision_start_x = 0
         self.collision_start_y = 0
         self.preview_collision = None
+
+        self.placing_animated_region = False
+        self.animated_region_start_x = 0
+        self.animated_region_start_y = 0
+        self.preview_animated_region = None
+        self.current_region_type = 'water'  # set from the palette item when placement starts
+        self.region_opacity = 100  # 0-100, applies to newly placed water/lava/grass regions
+        self._region_opacity_dragging = False
+        self.region_wave_amount = 100  # 0-100, fraction of chunks showing animated waves
+        self._region_wave_dragging = False
+        self.region_seed = 0
+        self.region_seed_text = "0"
+        self.region_seed_input_active = False
+        self.region_color = (255, 255, 255)  # RGB tint; (255,255,255) = original art colors
+        self._region_hue_dragging = False  # dragging the hue strip
+        self._region_sv_dragging = False  # dragging the saturation/value square
+        self.region_variant = 0  # 0-based index into the current tile-mode region's static variants
+        self._hue_strip_cache = None  # (size, surface) — hue gradient never changes, computed once
+        self._sv_square_cache = None  # (hue, size, surface) — recomputed only when hue changes
+        self._region_variant_sprites_cache = {}  # region_type -> list of cropped variant frames, lazy-loaded once each
+
+        self.on_animated_region_placed = None
+        self.on_animated_region_deleted = None
 
         self.placing_transition = False
         self.transition_start_x = 0
@@ -111,36 +149,71 @@ class ObjectEditor:
         self.on_world_map_placed = None
         self.on_world_map_deleted = None
 
-        # ── Music object ──────────────────────────────────────────────────────
-        self.music_manager = MusicObjectManager()
-        self.on_music_placed = None
-        self.on_music_deleted = None
-        self.music_track_text = ""          # currently selected track filename
-        self.music_dropdown_open = False    # whether the track dropdown is open
-        self.music_dropdown_names = []      # cached list of track filenames
-        self.music_dropdown_scroll = 0      # index of first visible item (for long track lists)
-        self._music_dropdown_visible_rows = 8  # recomputed in draw based on available space
+        # ── Doors ─────────────────────────────────────────────────────────────
+        self.door_manager = DoorManager()
+        self.on_door_placed = None
+        self.on_door_deleted = None
+        self.door_permanent = False  # editor toggle — applies to the next door placed
+        # Which door SFX the next door placed will use, plus a preview button
+        # so the player can hear it before committing. sound_manager is None
+        # until set_sound_manager() is called (wired up by game.py) — the
+        # preview button just no-ops silently until then.
+        self.sound_manager = None
+        _door_sounds = Door.list_door_sounds() or Door.DEFAULT_SOUND_NAMES
+        self.door_sound_options = _door_sounds
+        self.door_sound_text = _door_sounds[0]  # editor toggle — applies to the next door placed
 
-        # ── Cutscene triggers ─────────────────────────────────────────────────
-        self.cutscene_trigger_manager = CutsceneTriggerManager()
-        self.on_cutscene_trigger_placed = None
-        self.on_cutscene_trigger_deleted = None
-        self.placing_cutscene_trigger = False
-        self.cutscene_trigger_start_x = 0
-        self.cutscene_trigger_start_y = 0
-        self.preview_cutscene_trigger = None
-        self.cutscene_id_text = ""
-        self.cutscene_id_input_active = False   # kept for compat; not used by dropdown
-        self.cutscene_one_shot = True
-        self.cutscene_dropdown_open = False     # whether the dropdown list is visible
-        self.cutscene_dropdown_names = []       # cached list of cutscene file names
+        # Requires a FlagManager (see set_flag_manager) to actually build the
+        # conditions/actions popup; without one the "Edit Event" button stays
+        # disabled.
+        self.flag_manager = None
+        self.event_editor = None
+        # Character to scope the 'skill' action's add/remove pickers to —
+        # may be set via set_current_character() before the event editor
+        # exists (set_flag_manager creates it), hence "pending".
+        self._pending_character_id = None
+        self._pending_get_equipped_skills = None
+        # Known rooms (for the change_map action's room picker/Set Spawn
+        # preview) — may likewise be set via set_known_rooms() before the
+        # event editor exists, hence "pending", same rationale as the
+        # character fields above.
+        self._pending_known_rooms = None
+        self._pending_known_room_dims = None
+        # Room tile-preview provider (for the Set Spawn overlay) — same
+        # pending-until-the-event-editor-exists shape as the two above.
+        self._pending_room_preview_provider = None
+
+        # ── Trigger boxes ────────────────────────────────────────────────────
+        # OverlapTriggerBox fires on overlap alone; KeyTriggerBox additionally
+        # requires the interact key. `trigger_box_requires_key` picks which
+        # class gets instantiated on placement — sticky like the trigger box
+        # settings above, until changed.
+        self.trigger_box_manager = TriggerBoxManager()
+        self.on_trigger_box_placed = None
+        self.on_trigger_box_deleted = None
+        self.placing_trigger_box = False
+        self.trigger_box_start_x = 0
+        self.trigger_box_start_y = 0
+        self.preview_trigger_box = None
+        self.trigger_box_id_text = ""
+        self.trigger_box_id_input_active = False
+        self.trigger_box_once = True
+        self.trigger_box_requires_key = False
+        self.trigger_box_always_run = False
+
+        # Conditions + actions attached to the next trigger box placed —
+        # sticky like trigger_box_id_text/trigger_box_once above, until
+        # changed. Requires a FlagManager (see set_flag_manager) to actually
+        # build the popup; without one the "Edit Event" button stays disabled.
+        self.trigger_box_conditions = []
+        self.trigger_box_actions = []
 
         # ── World map selection ───────────────────────────────────────────────
-        self.world_map_name_text = ""           # stem of the selected world map JSON
-        self.world_map_dropdown_open = False    # whether the map-name dropdown is open
-        self.world_map_dropdown_names = []      # cached list of world map stems
+        self.world_map_name_text = ""  # stem of the selected world map JSON
+        self.world_map_dropdown_open = False  # whether the map-name dropdown is open
+        self.world_map_dropdown_names = []  # cached list of world map stems
 
-        self.hovered_object = None        # object under the cursor (for deletion highlight)
+        self.hovered_object = None  # object under the cursor (for deletion highlight)
         self.hovered_object_type = None
 
         # ── Gate level input ──────────────────────────────────────────────────
@@ -152,6 +225,7 @@ class ObjectEditor:
         self.selected_variant = None
         self.hover_variant_index = -1
         self.showing_variants_for = None
+        self.variant_scroll = 0  # index of first visible variant, for long variant lists
 
         # ── Variant definitions ───────────────────────────────────────────────
         self.stone_variants = [
@@ -179,8 +253,21 @@ class ObjectEditor:
             {'type': 'buu', 'name': 'Buu', 'sprite': None}
         ]
 
+        # Door variants are discovered from assets/sprites/structures/door/ at
+        # startup (one sheet per type — see Door.list_door_types()) rather
+        # than hardcoded here, so dropping in a new sheet is enough to make
+        # it show up in the picker. Falls back to a single 'wood' entry if
+        # the folder is empty/missing so the editor still has something to
+        # place (Door itself will fall back to a placeholder sprite for it).
+        _door_types = Door.list_door_types() or ['wood']
+        self.door_variants = [
+            {'type': t, 'name': t.replace('_', ' ').title(), 'sprite': None}
+            for t in _door_types
+        ]
+
         self.categories = {
             'System': [],
+            'Terrain': [],
             'Decorations': [
                 {
                     'id': 'destructible_stone',
@@ -239,7 +326,7 @@ class ObjectEditor:
                     'object_type': 'world_map_object',
                     'has_variants': True,
                     'variants': [
-                        {'type': 'world_map',      'name': 'World Map',      'width': 32, 'height': 37, 'sprite': None},
+                        {'type': 'world_map', 'name': 'World Map', 'width': 32, 'height': 37, 'sprite': None},
                         {'type': 'world_map_sign', 'name': 'World Map Sign', 'width': 29, 'height': 32, 'sprite': None},
                     ],
                     'default_variant': 'world_map'
@@ -250,6 +337,17 @@ class ObjectEditor:
                 {'id': 'fence_1', 'name': 'Fence', 'sprite': None, 'width': 16, 'height': 16},
                 {'id': 'sign_1', 'name': 'Sign Post', 'sprite': None, 'width': 16, 'height': 24},
                 {'id': 'well_1', 'name': 'Well', 'sprite': None, 'width': 32, 'height': 32},
+                {
+                    'id': 'door',
+                    'name': 'Door',
+                    'sprite': None,
+                    'width': 32,
+                    'height': 64,
+                    'object_type': 'door',
+                    'has_variants': True,
+                    'variants': self.door_variants,
+                    'default_variant': self.door_variants[0]['type']
+                },
             ],
             'Interactive': [
                 {'id': 'chest_1', 'name': 'Treasure Chest', 'sprite': None, 'width': 24, 'height': 20},
@@ -285,6 +383,40 @@ class ObjectEditor:
             'is_collision': True
         })
 
+        # Add every region type declared in REGION_STYLES to its own Terrain
+        # category — water/lava/grass/dirt today, but this loop is what
+        # makes adding a new one purely a REGION_STYLES + sprite-file
+        # change: drop a new entry in animated_region.py (any 'patch'-mode
+        # 64x64 sheet works the same way water/lava/grass already do) and
+        # its file at assets/tilesets/animated_tiles/<sheet>.png, and it
+        # shows up here automatically — no editor code changes needed.
+        # All region types share the same is_animated_region drag-to-resize
+        # placement flow; region_type just tells the runtime controller
+        # which sprite sheet to draw from. Palette icon is that sheet's own
+        # first frame (falls back to a hand-drawn placeholder using the
+        # style's own color if the asset isn't there yet, so a missing file
+        # never breaks the palette).
+        for region_type, style in REGION_STYLES.items():
+            icon_sprite = self._load_region_palette_icon(region_type)
+            if icon_sprite is None:
+                color = style.get('color', (200, 200, 200))
+                icon_sprite = pygame.Surface((16, 16), pygame.SRCALPHA)
+                icon_sprite.fill(color + (100,))
+                pygame.draw.rect(icon_sprite, color, (0, 0, 16, 16), 2)
+                dark_color = tuple(max(0, c - 40) for c in color)
+                for i in range(0, 48, 8):
+                    pygame.draw.line(icon_sprite, dark_color + (120,), (i, 0), (i - 16, 16), 1)
+
+            self.categories['Terrain'].append({
+                'id': f'{region_type}_region',
+                'name': style.get('label', f'{region_type.title()} Region'),
+                'sprite': icon_sprite,
+                'width': TILE_SIZE,
+                'height': TILE_SIZE,
+                'is_animated_region': True,
+                'region_type': region_type
+            })
+
         # Add room transition to System category
         transition_sprite = pygame.Surface((16, 16), pygame.SRCALPHA)
         transition_sprite.fill((0, 100, 255, 100))
@@ -301,40 +433,20 @@ class ObjectEditor:
             'is_transition': True
         })
 
-        # Add cutscene trigger to System category
-        cutscene_sprite = pygame.Surface((16, 16), pygame.SRCALPHA)
-        cutscene_sprite.fill((180, 0, 255, 100))
-        pygame.draw.rect(cutscene_sprite, (200, 0, 255), (0, 0, 16, 16), 2)
-        for i in range(0, 96, 8):
-            pygame.draw.line(cutscene_sprite, (160, 0, 200, 120), (i, 0), (i - 16, 16), 1)
+        # Add trigger box to System category.
+        trigger_box_sprite = pygame.Surface((16, 16), pygame.SRCALPHA)
+        trigger_box_sprite.fill((0, 220, 120, 100))
+        pygame.draw.rect(trigger_box_sprite, (0, 220, 120), (0, 0, 16, 16), 2)
+        pygame.draw.line(trigger_box_sprite, (0, 220, 120), (0, 0), (16, 16), 1)
+        pygame.draw.line(trigger_box_sprite, (0, 220, 120), (16, 0), (0, 16), 1)
 
         self.categories['System'].append({
-            'id': 'cutscene_trigger',
-            'name': 'Cutscene Trigger',
-            'sprite': cutscene_sprite,
+            'id': 'trigger_box',
+            'name': 'Trigger Box',
+            'sprite': trigger_box_sprite,
             'width': 16,
             'height': 16,
-            'is_cutscene_trigger': True
-        })
-
-        # Add music object to System category.
-        # Invisible in-game — this icon is only ever shown inside the editor.
-        music_sprite = pygame.Surface((16, 16), pygame.SRCALPHA)
-        music_sprite.fill((80, 220, 180, 100))
-        pygame.draw.rect(music_sprite, (80, 220, 180), (0, 0, 16, 16), 2)
-        # Simple music-note glyph so it reads differently from the other icons
-        pygame.draw.circle(music_sprite, (80, 220, 180), (5, 12), 3)
-        pygame.draw.line(music_sprite, (80, 220, 180), (8, 12), (8, 3), 2)
-        pygame.draw.line(music_sprite, (80, 220, 180), (8, 3), (13, 5), 2)
-
-        self.categories['System'].append({
-            'id': 'music_object',
-            'name': 'Music',
-            'sprite': music_sprite,
-            'width': 16,
-            'height': 16,
-            'object_type': 'music_object',
-            'is_music_object': True
+            'is_trigger_box': True
         })
 
         # Generate sprites and variant sprites
@@ -377,6 +489,81 @@ class ObjectEditor:
         # Pass toolbar to flying pad path editor so it can hide it during editing
         self.flying_pad_path_editor.set_toolbar(toolbar)
 
+    def set_sound_manager(self, sound_manager):
+        """Give the editor a SoundManager (anything with .play_sfx(name)) so
+        the door 'Preview' button can actually play the selected sound."""
+        self.sound_manager = sound_manager
+
+    def set_flag_manager(self, flag_manager):
+        """Give the editor a FlagManager so trigger boxes can gate on
+        switches/variables/timers. Enables the "Edit Event" button in the
+        trigger placement panel; without this call it stays disabled."""
+        self.flag_manager = flag_manager
+        self.event_editor = EventEditorWindow(flag_manager, colors=self.colors)
+        # Re-apply whatever character was set before the event editor
+        # existed (set_flag_manager can run after set_current_character,
+        # e.g. on first Room Editor open — see RoomEditor.set_flag_manager()).
+        if self._pending_character_id is not None:
+            self.event_editor.set_current_character(
+                self._pending_character_id, self._pending_get_equipped_skills)
+        if self._pending_known_rooms is not None:
+            self.event_editor.set_known_rooms(
+                self._pending_known_rooms, self._pending_known_room_dims)
+        if self._pending_room_preview_provider is not None:
+            self.event_editor.set_room_preview_provider(self._pending_room_preview_provider)
+
+    def set_room_preview_provider(self, provider):
+        """Tell the event editor how to render an actual tile preview for
+        the Set Spawn overlay — see EventEditorWindow.set_room_preview_provider().
+        Same pending-until-the-event-editor-exists shape as
+        set_known_rooms() above."""
+        self._pending_room_preview_provider = provider
+        if self.event_editor is not None:
+            self.event_editor.set_room_preview_provider(provider)
+
+    def set_known_rooms(self, room_names, room_dims=None):
+        """Tell the event editor which rooms actually exist right now —
+        see EventEditorWindow.set_known_rooms(). Call this (e.g. with the
+        live RoomManager's room list/sizes) whenever the host knows what
+        rooms exist, and again any time that could have changed (room
+        created/renamed/resized, Room Editor re-opened) so the change_map
+        action's room dropdown and Set Spawn preview never go stale.
+
+        Same pending-until-the-event-editor-exists shape as
+        set_current_character() above, since this can be called (e.g. by
+        RoomEditor at startup) before set_flag_manager() has created
+        self.event_editor yet.
+        """
+        self._pending_known_rooms = room_names
+        self._pending_known_room_dims = room_dims
+        if self.event_editor is not None:
+            self.event_editor.set_known_rooms(room_names, room_dims)
+
+    def set_current_character(self, character_id, get_equipped_skills=None):
+        """Tell the event editor which character's equipped skills should
+        back the 'skill' action's add/remove pickers — see
+        EventEditorWindow.set_current_character(). Call this (e.g. with
+        self.player.character and lambda: self.player.equipped_attacks)
+        whenever the host knows who's being played, and again any time
+        that could have changed (character switch, Room Editor
+        re-opened) so the picker never goes stale.
+
+        get_equipped_skills should return the character's LIVE equipped
+        list, not a saved/on-disk one — runtime 'skill' actions mutate the
+        live player directly and are never written back to disk, so a
+        disk-based list would miss anything granted/removed this session.
+
+        Without this being kept in sync, the skill picker has no idea what
+        the current character already has equipped: 'remove' shows nothing
+        to remove, and 'add' can't tell which skills are already equipped —
+        which is why "add skill" actions looked like they silently did
+        nothing.
+        """
+        self._pending_character_id = character_id
+        self._pending_get_equipped_skills = get_equipped_skills
+        if self.event_editor is not None:
+            self.event_editor.set_current_character(character_id, get_equipped_skills)
+
     # -------------------------------------------------------------------------
     # Panel show/hide tab
     # -------------------------------------------------------------------------
@@ -384,24 +571,139 @@ class ObjectEditor:
     def _panel_toggle_rect(self):
         """Return the rect for the ◀/▶ tab that straddles the panel's left edge."""
         gap = 6
-        tx = (self.palette_x - self._panel_tab_w - gap) if self.palette_visible else (self.screen_width - self._panel_tab_w)
+        tx = (self.palette_x - self._panel_tab_w - gap) if self.palette_visible else (
+                    self.screen_width - self._panel_tab_w)
         ty = self.palette_y + (self.palette_height - self._panel_tab_h) // 2
         return pygame.Rect(tx, ty, self._panel_tab_w, self._panel_tab_h)
 
     def _draw_panel_toggle_tab(self, screen):
         """Render the small ◀/▶ tab — always visible so the panel can be recalled."""
-        rect   = self._panel_toggle_rect()
-        bg     = self.colors['panel_light'] if self._hover_panel_toggle else self.colors['panel']
-        border = self.colors['accent']      if self._hover_panel_toggle else self.colors['grid']
-        pygame.draw.rect(screen, bg,     rect, border_radius=6)
+        rect = self._panel_toggle_rect()
+        bg = self.colors['panel_light'] if self._hover_panel_toggle else self.colors['panel']
+        border = self.colors['accent'] if self._hover_panel_toggle else self.colors['grid']
+        pygame.draw.rect(screen, bg, rect, border_radius=6)
         pygame.draw.rect(screen, border, rect, 1, border_radius=6)
         arrow = '◀' if self.palette_visible else '▶'
-        font  = self.font_small
+        font = self.font_small
         label = font.render(
             arrow, True,
             self.colors['accent'] if self._hover_panel_toggle else self.colors['text_dim']
         )
         screen.blit(label, label.get_rect(center=rect.center))
+
+    # Fixed corner-sample size used by _region_icon_crop_size for every
+    # tile-mode frame, regardless of that frame's own pixel size — see
+    # that method for why a fixed sample beats scaling the full frame.
+    _REGION_ICON_SAMPLE = 16
+
+    def _region_icon_crop_size(self, frame_w: int, frame_h: int):
+        """Crop size to use for palette/variant thumbnails of a region's
+        frame. Every frame — 24x24 dirt, 64x64 mud/sand/etc., 96x96
+        clouds, 40x32 whatever, whatever oddball size gets added next —
+        is sampled down to the same fixed _REGION_ICON_SAMPLE (16x16)
+        corner crop instead of the whole frame, so every region type's
+        palette icon reads as the same scale of "close-up on the
+        texture" rather than each tile size producing a differently
+        zoomed thumbnail. Full-frame art scaled down into the small
+        palette slot reads mushy/indistinct for large frames, while a
+        fixed small sample of the actual texture reads as a clean tile
+        icon at any frame size. Frames smaller than the sample size in
+        either dimension are left at their native size (nothing to crop
+        down to) rather than upscaled.
+        """
+        crop_w = min(frame_w, self._REGION_ICON_SAMPLE)
+        crop_h = min(frame_h, self._REGION_ICON_SAMPLE)
+        return crop_w, crop_h
+
+    def _load_region_palette_icon(self, region_type: str):
+        """First frame of a region type's own sprite sheet (per
+        REGION_STYLES), at its native pixel size — used as its palette
+        thumbnail so the icon actually matches the art (water/lava/grass/
+        dirt) instead of a hand-drawn placeholder.
+
+        For 64x64-framed sheets this is a 16x16 corner sample of frame 0
+        rather than the whole frame — see _region_icon_crop_size.
+
+        Returned at native size, NOT pre-scaled: _draw_object_item already
+        scales whatever sprite it's given to fit the palette slot while
+        preserving aspect ratio (see its `scale = min(max_dim/sw,
+        max_dim/sh)` — same as every other palette object, e.g. the 16x24
+        sign post). Pre-scaling here too would just chain two scales
+        together (down to a fixed box, then back up/down again to the
+        slot size), softening the result for no reason.
+
+        Returns None if the sheet file isn't there yet (e.g. asset not
+        added), so callers can fall back to their own placeholder — same
+        "never crash on a missing asset" spirit as the runtime loader in
+        game.py.
+        """
+        style = REGION_STYLES.get(region_type, {})
+        sprite_name = style.get('sheet', region_type)
+        frame_w = style.get('frame_w', style.get('frame_size', 64))
+        frame_h = style.get('frame_h', frame_w)
+        crop_w, crop_h = self._region_icon_crop_size(frame_w, frame_h)
+
+        path = os.path.join('assets', 'tilesets', 'animated_tiles', f'{sprite_name}.png')
+        if not os.path.isfile(path):
+            return None
+
+        try:
+            raw = pygame.image.load(path).convert_alpha()
+        except (pygame.error, OSError):
+            return None
+
+        crop_w = min(crop_w, raw.get_width())
+        crop_h = min(crop_h, raw.get_height())
+        if crop_w <= 0 or crop_h <= 0:
+            return None
+        return raw.subsurface((0, 0, crop_w, crop_h)).copy()
+
+    def _load_region_variant_sprites(self, region_type: str):
+        """Every static variant of a 'tile'-mode region type (one frame per
+        row of its sheet — dirt today, but works for any region_type whose
+        REGION_STYLES entry has mode='tile'), for the variant picker in the
+        settings panel — same idea as _load_region_palette_icon's single
+        first-frame crop, but returns all grid_rows frames instead of just
+        frame 0 so the picker can show real art per variant, like the
+        sprite thumbnails _draw_variant_selector uses for gates/stones/etc.
+
+        Each variant is cropped down the same way the palette icon is —
+        64x64-framed variants (woodplanks, sand, ...) get a 16x16 corner
+        sample instead of the whole 64x64 frame; non-64x64 variants
+        (dirt's 24x24) are unaffected. See _region_icon_crop_size.
+
+        Cached per region_type on first call since the sheet never changes
+        at runtime. Returns a list (possibly empty, on missing/bad asset —
+        callers fall back to a placeholder per missing entry) rather than
+        None, so the picker can still draw all num_variants slots.
+        """
+        if region_type in self._region_variant_sprites_cache:
+            return self._region_variant_sprites_cache[region_type]
+
+        style = REGION_STYLES.get(region_type, {})
+        sprite_name = style.get('sheet', region_type)
+        frame_w = style.get('frame_w', style.get('frame_size', 24))
+        frame_h = style.get('frame_h', frame_w)
+        grid_rows = style.get('grid_rows', 1)
+        crop_w, crop_h = self._region_icon_crop_size(frame_w, frame_h)
+
+        path = os.path.join('assets', 'tilesets', 'animated_tiles', f'{sprite_name}.png')
+        sprites = []
+        if os.path.isfile(path):
+            try:
+                raw = pygame.image.load(path).convert_alpha()
+                for row in range(grid_rows):
+                    y = row * frame_h
+                    # Each variant frame is still frame_h tall in the sheet
+                    # (rows are laid out at the full frame size), but only
+                    # the crop_w x crop_h corner of it is sampled out.
+                    if y + frame_h <= raw.get_height() and crop_w <= raw.get_width():
+                        sprites.append(raw.subsurface((0, y, crop_w, crop_h)).copy())
+            except (pygame.error, OSError):
+                sprites = []
+
+        self._region_variant_sprites_cache[region_type] = sprites
+        return sprites
 
     def _generate_variant_sprites(self):
         """Load or generate sprites for every object variant.
@@ -434,11 +736,21 @@ class ObjectEditor:
                             pygame.draw.rect(sprite, (0, 0, 0), (0, 0, variant['width'], variant['height']), 2)
                             variant['sprite'] = sprite
 
+                    elif obj['object_type'] == 'door':
+                        # Width/height come straight off the closed frame
+                        # (half the sheet — see Door._load_sprites), so any
+                        # size — small wood door or huge gate — just works
+                        # without per-variant config here.
+                        door = Door(0, 0, variant['type'], permanent=False)
+                        variant['width'] = door.width
+                        variant['height'] = door.height
+                        variant['sprite'] = door.closed_sprite.copy()
+
                     elif obj['object_type'] == 'level_gate':
                         gate = LevelGate(0, 0, variant['type'], 1)
                         # Store per-variant dimensions so the preview scales correctly
                         # (stone formation is 71×68, all others are 32×32)
-                        variant['width']  = gate.width
+                        variant['width'] = gate.width
                         variant['height'] = gate.height
                         if gate.sprite:
                             variant['sprite'] = gate.sprite.copy()
@@ -497,10 +809,10 @@ class ObjectEditor:
                                 center_x = width // 2
                                 center_y = height // 2
                                 points = [
-                                    (center_x, 2),          # Top
+                                    (center_x, 2),  # Top
                                     (width - 2, center_y),  # Right
-                                    (center_x, height - 2), # Bottom
-                                    (2, center_y)           # Left
+                                    (center_x, height - 2),  # Bottom
+                                    (2, center_y)  # Left
                                 ]
                                 pygame.draw.polygon(sprite, color, points)
                                 pygame.draw.polygon(sprite, (255, 255, 200), points, 2)
@@ -521,7 +833,7 @@ class ObjectEditor:
                             sprite = pygame.image.load(sprite_path).convert_alpha()
                             # Derive world-unit size directly from pixel dimensions —
                             # draw() will multiply by RENDER_SCALE, so no division here.
-                            variant['width']  = sprite.get_width()
+                            variant['width'] = sprite.get_width()
                             variant['height'] = sprite.get_height()
                             variant['sprite'] = sprite
                         except Exception:
@@ -550,7 +862,7 @@ class ObjectEditor:
                     continue
 
                 # Skip objects that already have sprites (system objects are built manually above)
-                system_flags = ('is_spawn', 'is_collision', 'is_transition', 'is_cutscene_trigger', 'is_music_object')
+                system_flags = ('is_spawn', 'is_collision', 'is_animated_region', 'is_transition')
                 if any(obj.get(flag, False) for flag in system_flags):
                     continue
 
@@ -595,13 +907,12 @@ class ObjectEditor:
             self.flying_pad_path_editor.close()
             self.pending_flying_pad = None
             self.placing_flying_pad = False
-            self.placing_cutscene_trigger = False
-            self.preview_cutscene_trigger = None
-            self.cutscene_id_input_active = False
-            self.cutscene_dropdown_open = False
+            self.placing_trigger_box = False
+            self.preview_trigger_box = None
+            self.trigger_box_id_input_active = False
             self.world_map_dropdown_open = False
-            self.music_dropdown_open = False
-            self.music_dropdown_scroll = 0
+            if self.event_editor is not None:
+                self.event_editor.active = False
 
     def _get_current_variant(self, obj):
         """Get the currently selected variant for an object"""
@@ -644,6 +955,13 @@ class ObjectEditor:
                     collision_obj.y <= world_y <= collision_obj.y + collision_obj.height):
                 return collision_obj, 'collision'
 
+        # Check water/grass regions
+        regions = self.animated_region_manager.get_regions(self.current_room_name)
+        for region in regions:
+            if (region.x <= world_x <= region.x + region.width and
+                    region.y <= world_y <= region.y + region.height):
+                return region, 'animated_region'
+
         # Check room transitions
         transitions = self.transition_manager.get_transitions(self.current_room_name)
         for transition in transitions:
@@ -666,6 +984,12 @@ class ObjectEditor:
             if distance < max(pad.width, pad.height) / 2:
                 return pad, 'flying_pad'
 
+        # Check doors
+        for door in self.door_manager.get_doors(self.current_room_name):
+            distance = ((door.x - world_x) ** 2 + (door.y - world_y) ** 2) ** 0.5
+            if distance < max(door.width, door.height) / 2:
+                return door, 'door'
+
         # Check level gates
         gates = self.gate_manager.get_gates(self.current_room_name)
         for gate in gates:
@@ -686,18 +1010,11 @@ class ObjectEditor:
             if distance < max(obj.width, obj.height) / 2:
                 return obj, 'world_map_object'
 
-        # Check cutscene triggers
-        triggers = self.cutscene_trigger_manager.get_triggers(self.current_room_name)
-        for trigger in triggers:
-            if (trigger.x <= world_x <= trigger.x + trigger.width and
-                    trigger.y <= world_y <= trigger.y + trigger.height):
-                return trigger, 'cutscene_trigger'
-
-        # Check music object
-        for music_obj in self.music_manager.get_music_objects(self.current_room_name):
-            distance = ((music_obj.x - world_x) ** 2 + (music_obj.y - world_y) ** 2) ** 0.5
-            if distance < max(music_obj.width, music_obj.height) / 2:
-                return music_obj, 'music_object'
+        # Check trigger boxes
+        for box in self.trigger_box_manager.get_boxes(self.current_room_name):
+            if (box.x <= world_x <= box.x + box.width and
+                    box.y <= world_y <= box.y + box.height):
+                return box, 'trigger_box'
 
         return None, None
 
@@ -726,6 +1043,18 @@ class ObjectEditor:
 
             if hasattr(self, 'on_collision_deleted') and self.on_collision_deleted:
                 self.on_collision_deleted(obj, self.current_room_name)
+
+        elif obj_type == 'animated_region':
+            self.animated_region_manager.remove_region(obj)
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(self.current_room_name)
+                if room and hasattr(room, 'animated_regions'):
+                    if obj in room.animated_regions:
+                        room.animated_regions.remove(obj)
+                    self.room_manager.save_room(room)
+
+            if hasattr(self, 'on_animated_region_deleted') and self.on_animated_region_deleted:
+                self.on_animated_region_deleted(obj, self.current_room_name)
 
         elif obj_type == 'flying_pad':
             self.flying_pad_manager.remove_pad(self.current_room_name, obj)
@@ -759,6 +1088,16 @@ class ObjectEditor:
             if hasattr(self, 'on_stone_deleted') and self.on_stone_deleted:
                 self.on_stone_deleted(obj, self.current_room_name)
 
+        elif obj_type == 'door':
+            self.door_manager.remove_door(self.current_room_name, obj)
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(self.current_room_name)
+                if room and hasattr(room, 'doors') and obj in room.doors:
+                    room.doors.remove(obj)
+
+            if hasattr(self, 'on_door_deleted') and self.on_door_deleted:
+                self.on_door_deleted(obj, self.current_room_name)
+
         elif obj_type == 'gate':
             self.gate_manager.remove_gate(self.current_room_name, obj)
             if self.room_manager:
@@ -790,26 +1129,16 @@ class ObjectEditor:
             if self.on_world_map_deleted:
                 self.on_world_map_deleted(obj, self.current_room_name)
 
-        elif obj_type == 'cutscene_trigger':
-            self.cutscene_trigger_manager.remove_trigger(obj)
+        elif obj_type == 'trigger_box':
+            self.trigger_box_manager.remove_box(self.current_room_name, obj)
             if self.room_manager:
                 room = self.room_manager.get_room_by_name(self.current_room_name)
-                if room and hasattr(room, 'cutscene_triggers'):
-                    if obj in room.cutscene_triggers:
-                        room.cutscene_triggers.remove(obj)
+                if room and hasattr(room, 'trigger_boxes'):
+                    if obj in room.trigger_boxes:
+                        room.trigger_boxes.remove(obj)
 
-            if hasattr(self, 'on_cutscene_trigger_deleted') and self.on_cutscene_trigger_deleted:
-                self.on_cutscene_trigger_deleted(obj, self.current_room_name)
-
-        elif obj_type == 'music_object':
-            self.music_manager.remove_music_object(self.current_room_name)
-            if self.room_manager:
-                room = self.room_manager.get_room_by_name(self.current_room_name)
-                if room and hasattr(room, 'music_objects') and obj in room.music_objects:
-                    room.music_objects.remove(obj)
-
-            if hasattr(self, 'on_music_deleted') and self.on_music_deleted:
-                self.on_music_deleted(obj, self.current_room_name)
+            if hasattr(self, 'on_trigger_box_deleted') and self.on_trigger_box_deleted:
+                self.on_trigger_box_deleted(obj, self.current_room_name)
 
     def _is_object_disabled(self, obj) -> bool:
         """Check if we can't place this object (e.g. spawn already exists)"""
@@ -818,9 +1147,42 @@ class ObjectEditor:
 
         if obj.get('is_spawn', False):
             return self.spawn_manager.has_spawn_point(self.current_room_name)
-        if obj.get('is_music_object', False):
-            # Only one Music object per room — a room can only have one active track
-            return self.music_manager.has_music_object(self.current_room_name)
+        return False
+
+    def _is_door_permanent_checkbox_clicked(self, mouse_pos):
+        """Check if the door 'Permanent' checkbox was clicked, and toggle it."""
+        if not self.selected_object or not isinstance(self.selected_object, dict):
+            return False
+        if self.selected_object.get('object_type') != 'door':
+            return False
+
+        box = self.ui_rects.get('door_permanent_checkbox')
+        if box and box.collidepoint(mouse_pos):
+            self.door_permanent = not self.door_permanent
+            return True
+        return False
+
+    def _is_door_sound_ui_clicked(self, mouse_pos):
+        """Handle clicks on the door sound picker: one small button per
+        available door SFX (selects it for the next door placed) plus a
+        ▶ Preview button (plays whichever one is currently selected).
+        Returns True if the click was consumed here."""
+        if not self.selected_object or not isinstance(self.selected_object, dict):
+            return False
+        if self.selected_object.get('object_type') != 'door':
+            return False
+
+        for rect, name in self.ui_rects.get('door_sound_buttons', []):
+            if rect.collidepoint(mouse_pos):
+                self.door_sound_text = name
+                return True
+
+        preview_rect = self.ui_rects.get('door_sound_preview_btn')
+        if preview_rect and preview_rect.collidepoint(mouse_pos):
+            if self.sound_manager is not None:
+                self.sound_manager.play_sfx(self.door_sound_text)
+            return True
+
         return False
 
     def _is_level_input_clicked(self, mouse_pos):
@@ -896,6 +1258,7 @@ class ObjectEditor:
                 if not self._is_object_disabled(obj):
                     self.selected_variant = None  # clear old variant before switching object
                     self.selected_object = obj
+                    self.variant_scroll = 0
                     # Reset variant selection when selecting new object
                     if obj.get('has_variants', False):
                         self.showing_variants_for = obj
@@ -1033,6 +1396,30 @@ class ObjectEditor:
             if self.on_world_map_placed:
                 self.on_world_map_placed(obj, room_name)
 
+        elif self.selected_object.get('object_type') == 'door':
+            variant = self.selected_variant or self._get_current_variant(self.selected_object)
+            door_type = variant['type'] if variant and 'type' in variant else self.door_variants[0]['type']
+
+            door = Door(
+                int(self.preview_x),
+                int(self.preview_y),
+                door_type,
+                permanent=self.door_permanent,
+                door_sound=self.door_sound_text
+            )
+
+            self.door_manager.add_door(room_name, door)
+
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(room_name)
+                if room:
+                    if not hasattr(room, 'doors'):
+                        room.doors = []
+                    room.doors.append(door)
+
+            if hasattr(self, 'on_door_placed') and self.on_door_placed:
+                self.on_door_placed(door, room_name)
+
         elif self.selected_object.get('object_type') == 'level_gate':
             # Get selected variant or default
             variant = self.selected_variant or self._get_current_variant(self.selected_object)
@@ -1056,22 +1443,6 @@ class ObjectEditor:
 
             if hasattr(self, 'on_gate_placed') and self.on_gate_placed:
                 self.on_gate_placed(gate, room_name)
-
-        elif self.selected_object.get('object_type') == 'music_object':
-            music_obj = MusicObject(int(self.preview_x), int(self.preview_y), self.music_track_text)
-
-            # Replaces any existing Music object in the manager (singleton per room)
-            self.music_manager.add_music_object(room_name, music_obj)
-
-            if self.room_manager:
-                room = self.room_manager.get_room_by_name(room_name)
-                if room:
-                    if not hasattr(room, 'music_objects'):
-                        room.music_objects = []
-                    room.music_objects = [music_obj]
-
-            if hasattr(self, 'on_music_placed') and self.on_music_placed:
-                self.on_music_placed(music_obj, room_name)
 
     def _draw_delete_highlight(self, screen, camera_x, camera_y):
         """Draw red outline around object that's about to be deleted"""
@@ -1099,7 +1470,7 @@ class ObjectEditor:
                              (int(screen_x), int(screen_y), int(scaled_width), int(scaled_height)),
                              pulse)
 
-        elif obj_type in ['stone', 'transition', 'cutscene_trigger']:
+        elif obj_type in ['stone', 'transition']:
             screen_x = (obj.x * RENDER_SCALE) - camera_x
             screen_y = (obj.y * RENDER_SCALE) - camera_y
             scaled_width = int(obj.width * RENDER_SCALE)
@@ -1143,6 +1514,136 @@ class ObjectEditor:
 
         if hasattr(self, 'on_collision_placed') and self.on_collision_placed:
             self.on_collision_placed(collision_obj, room_name)
+
+    def _set_region_opacity_from_mouse_x(self, mouse_x, slider_rect):
+        """Map a mouse x position over the opacity slider track to 0-100,
+        clamped to the track bounds. Used for both the initial click (jump
+        to that position) and subsequent drag motion."""
+        frac = (mouse_x - slider_rect.left) / slider_rect.width
+        self.region_opacity = max(0, min(100, round(frac * 100)))
+
+    def _set_region_wave_amount_from_mouse_x(self, mouse_x, slider_rect):
+        """Same mapping as _set_region_opacity_from_mouse_x, for the wave
+        amount slider."""
+        frac = (mouse_x - slider_rect.left) / slider_rect.width
+        self.region_wave_amount = max(0, min(100, round(frac * 100)))
+
+    def _region_color_hsv(self):
+        """Current self.region_color as (h, s, v), each in 0-1."""
+        r, g, b = self.region_color
+        return colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+
+    def _set_region_hue_from_mouse_y(self, mouse_y, hue_rect):
+        """Vertical hue strip: y position maps to hue 0-1. Keeps the
+        current saturation/value, only the hue changes."""
+        _, s, v = self._region_color_hsv()
+        frac = (mouse_y - hue_rect.top) / hue_rect.height
+        hue = max(0.0, min(1.0, frac))
+        r, g, b = colorsys.hsv_to_rgb(hue, s, v)
+        self.region_color = (round(r * 255), round(g * 255), round(b * 255))
+
+    def _set_region_sv_from_mouse(self, mouse_pos, sv_rect):
+        """Saturation/value square: x -> saturation 0-1, y -> value 1-0
+        (top of the square is brightest). Keeps the current hue."""
+        h, _, _ = self._region_color_hsv()
+        s = max(0.0, min(1.0, (mouse_pos[0] - sv_rect.left) / sv_rect.width))
+        v = max(0.0, min(1.0, 1 - (mouse_pos[1] - sv_rect.top) / sv_rect.height))
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+        self.region_color = (round(r * 255), round(g * 255), round(b * 255))
+
+    @staticmethod
+    def _hsv_to_rgb_grid(hue, s_grid, v_grid):
+        """Vectorized HSV->RGB for arrays of s/v sharing one fixed hue.
+        Returns an (..., 3) float array in 0-1."""
+        h6 = hue * 6.0
+        sector = int(h6) % 6
+        factor = 1 - abs(h6 % 2 - 1)
+
+        c_grid = v_grid * s_grid
+        x_grid = c_grid * factor
+        m_grid = v_grid - c_grid
+        zero = np.zeros_like(c_grid)
+
+        order = {
+            0: (c_grid, x_grid, zero),
+            1: (x_grid, c_grid, zero),
+            2: (zero, c_grid, x_grid),
+            3: (zero, x_grid, c_grid),
+            4: (x_grid, zero, c_grid),
+            5: (c_grid, zero, x_grid),
+        }[sector]
+        return np.stack([order[0] + m_grid, order[1] + m_grid, order[2] + m_grid], axis=-1)
+
+    def _get_hue_strip_surface(self, w, h):
+        """Vertical rainbow gradient (full saturation/value, hue 0-1 top to
+        bottom). Doesn't depend on the current color, so it's computed once
+        and reused for the lifetime of the editor."""
+        cache = self._hue_strip_cache
+        if cache and cache[0] == (w, h):
+            return cache[1]
+
+        hues = np.linspace(0.0, 1.0, h, dtype=np.float32)
+        column = np.zeros((h, 3), dtype=np.float32)
+        for i, hue in enumerate(hues):
+            column[i] = self._hsv_to_rgb_grid(float(hue), np.float32(1.0), np.float32(1.0))
+        column = np.clip(column * 255, 0, 255).astype(np.uint8)
+
+        arr = np.tile(column[np.newaxis, :, :], (w, 1, 1))  # (w, h, 3) for surfarray
+        surf = pygame.surfarray.make_surface(arr)
+        self._hue_strip_cache = ((w, h), surf)
+        return surf
+
+    def _get_sv_square_surface(self, hue, w, h):
+        """Saturation (x, 0-1) / value (y, 1-0 top-to-bottom) gradient for a
+        fixed hue. Recomputed only when the hue actually changes."""
+        cache = self._sv_square_cache
+        if cache and abs(cache[0][0] - hue) < 1e-6 and cache[0][1] == w and cache[0][2] == h:
+            return cache[1]
+
+        s = np.linspace(0.0, 1.0, w, dtype=np.float32)
+        v = np.linspace(1.0, 0.0, h, dtype=np.float32)
+        s_grid, v_grid = np.meshgrid(s, v, indexing='xy')  # shape (h, w)
+
+        rgb = self._hsv_to_rgb_grid(hue, s_grid, v_grid)
+        rgb = np.clip(rgb * 255, 0, 255).astype(np.uint8)
+        rgb = np.transpose(rgb, (1, 0, 2))  # (w, h, 3) for surfarray
+
+        surf = pygame.surfarray.make_surface(rgb)
+        self._sv_square_cache = ((hue, w, h), surf)
+        return surf
+
+    def _finalize_animated_region_placement(self, room_name):
+        """Finish placing a water/grass region after dragging"""
+        if not self.preview_animated_region:
+            return
+
+        region = AnimatedRegion(
+            int(self.preview_animated_region.x),
+            int(self.preview_animated_region.y),
+            int(self.preview_animated_region.width),
+            int(self.preview_animated_region.height),
+            room_name,
+            self.preview_animated_region.region_type,
+            self.region_opacity,
+            self.region_wave_amount,
+            self.region_seed,
+            self.region_color,
+            self.region_variant
+        )
+
+        if self.room_manager:
+            room = self.room_manager.get_room_by_name(room_name)
+            if room:
+                if not hasattr(room, 'animated_regions'):
+                    room.animated_regions = []
+
+                room.animated_regions.append(region)
+                self.animated_region_manager.regions[room_name] = room.animated_regions
+
+        self.preview_animated_region = None
+
+        if hasattr(self, 'on_animated_region_placed') and self.on_animated_region_placed:
+            self.on_animated_region_placed(region, room_name)
 
     def _finalize_transition_placement(self, room_name):
         """Finish placing a room transition after dragging"""
@@ -1199,44 +1700,92 @@ class ObjectEditor:
         self.pending_transition_for_spawn = None
         self.return_to_source_room = source_room_name
 
-    def _finalize_cutscene_trigger_placement(self, room_name):
-        """Finish placing a cutscene trigger zone after dragging."""
-        if not self.preview_cutscene_trigger:
+    def _always_run_marker_rect(self):
+        """Single source of truth for where an Always Run trigger box marker
+        will land, in world coordinates. Used by BOTH the hover preview and
+        the actual placement call, so the two can never drift apart — this
+        deliberately avoids self.preview_x/self.preview_y, which carry a
+        +TILE_SIZE//2 'centered on tile' bias baked in for point objects
+        (SavePoint, WorldMapObject, etc.) and aren't meant for rect-based
+        objects like trigger boxes."""
+        marker_size = 16
+        if self.grid_snap:
+            tile_left = int(self.mouse_world_x / TILE_SIZE) * TILE_SIZE
+            tile_top = int(self.mouse_world_y / TILE_SIZE) * TILE_SIZE
+            x = tile_left + TILE_SIZE // 2 - marker_size // 2
+            y = tile_top + TILE_SIZE // 2 - marker_size // 2
+        else:
+            x = int(self.mouse_world_x - marker_size // 2)
+            y = int(self.mouse_world_y - marker_size // 2)
+        return x, y, marker_size, marker_size
+
+    def _finalize_trigger_box_placement(self, room_name):
+        """Finish placing a trigger box zone after dragging."""
+        if not self.preview_trigger_box:
             return
 
-        trigger = CutsceneTrigger(
-            int(self.preview_cutscene_trigger.x),
-            int(self.preview_cutscene_trigger.y),
-            int(self.preview_cutscene_trigger.width),
-            int(self.preview_cutscene_trigger.height),
-            cutscene_id=self.cutscene_id_text,
-            one_shot=self.cutscene_one_shot,
-            room_name=room_name,
+        box_class = KeyTriggerBox if self.trigger_box_requires_key else OverlapTriggerBox
+        box = box_class(
+            box_id=self.trigger_box_id_text,
+            x=int(self.preview_trigger_box.x),
+            y=int(self.preview_trigger_box.y),
+            width=int(self.preview_trigger_box.width),
+            height=int(self.preview_trigger_box.height),
+            once=self.trigger_box_once,
+            conditions=list(self.trigger_box_conditions),
+            actions=list(self.trigger_box_actions),
+            always_run=self.trigger_box_always_run,
         )
 
-        self.cutscene_trigger_manager.add_trigger(trigger)
+        self.trigger_box_manager.add_box(room_name, box)
 
-        if self.room_manager:
-            room = self.room_manager.get_room_by_name(room_name)
-            if room:
-                if not hasattr(room, 'cutscene_triggers'):
-                    room.cutscene_triggers = []
-                room.cutscene_triggers.append(trigger)
+        self.preview_trigger_box = None
 
-        self.preview_cutscene_trigger = None
+        if self.on_trigger_box_placed:
+            self.on_trigger_box_placed(box, room_name)
 
-        if self.on_cutscene_trigger_placed:
-            self.on_cutscene_trigger_placed(trigger, room_name)
+    def _place_always_run_trigger_box(self, room_name):
+        """Fast-path placement for Always Run boxes. Since position/size are
+        irrelevant to firing, skip the drag-a-rectangle gesture entirely and
+        drop a small fixed-size marker at the click location instead.
 
-    def _get_cutscene_names(self):
-        """Return a sorted list of cutscene IDs from data/cutscenes/*.json."""
-        cutscene_dir = os.path.join('data', 'cutscenes')
-        try:
-            return sorted(
-                f[:-5] for f in os.listdir(cutscene_dir) if f.endswith('.json')
-            )
-        except FileNotFoundError:
-            return []
+        Uses _always_run_marker_rect() — the exact same calculation the
+        hover preview uses — so the marker always lands exactly where the
+        preview showed it, with no possibility of the two drifting apart."""
+        box_class = KeyTriggerBox if self.trigger_box_requires_key else OverlapTriggerBox
+        x, y, w, h = self._always_run_marker_rect()
+        box = box_class(
+            box_id=self.trigger_box_id_text,
+            x=x, y=y, width=w, height=h,
+            once=self.trigger_box_once,
+            conditions=list(self.trigger_box_conditions),
+            actions=list(self.trigger_box_actions),
+            always_run=True,
+        )
+
+        self.trigger_box_manager.add_box(room_name, box)
+
+        if self.on_trigger_box_placed:
+            self.on_trigger_box_placed(box, room_name)
+
+    def _open_trigger_box_conditions_popup(self):
+        """Open the generalized Event Editor for the trigger box about to be
+        placed, pre-loaded with whatever conditions/actions are currently
+        sticky (self.trigger_box_conditions/self.trigger_box_actions)."""
+        if self.event_editor is None:
+            return  # no flag_manager wired — button should be disabled anyway
+
+        def _on_save(conditions, actions):
+            self.trigger_box_conditions = conditions
+            self.trigger_box_actions = actions
+
+        self.event_editor.set_current_room(self.current_room_name)
+        self.event_editor.open(
+            title="Trigger Box Event",
+            existing_conditions=self.trigger_box_conditions,
+            existing_actions=self.trigger_box_actions,
+            on_save=_on_save,
+        )
 
     def _get_world_map_names(self):
         """Return a sorted list of world map stems from assets/world_maps/*.json."""
@@ -1245,21 +1794,6 @@ class ObjectEditor:
             return sorted(f[:-5] for f in os.listdir(save_dir) if f.endswith('.json'))
         except FileNotFoundError:
             return []
-
-    def _get_music_track_names(self):
-        """Return a sorted list of track filenames from assets/audio/music/."""
-        return get_available_music_tracks()
-
-    def _is_cutscene_id_input_clicked(self, mouse_pos):
-        """Check if the cutscene ID text box was clicked."""
-        if not self.selected_object or not isinstance(self.selected_object, dict):
-            return False
-        if not self.selected_object.get('is_cutscene_trigger', False):
-            return False
-        input_x = self.palette_x + self.palette_padding + 120
-        input_y = self.palette_y + self.palette_height - 105
-        input_rect = pygame.Rect(input_x, input_y, 150, 25)
-        return input_rect.collidepoint(mouse_pos)
 
     def handle_input(self, event, camera_x, camera_y, room_name):
         """Route pygame events to the appropriate sub-system.
@@ -1398,17 +1932,24 @@ class ObjectEditor:
 
             return
 
+        # Handle the Event Editor popup (blocks everything else while open)
+        if self.event_editor is not None and self.event_editor.active:
+            self.event_editor.handle_input(event)
+            return
+
         # Scroll through palette
         if event.type == pygame.MOUSEWHEEL:
-            # If the music track dropdown is open and the cursor is over its
-            # list, scroll the list instead of the palette underneath it.
-            if self.music_dropdown_open:
-                list_rect = self.ui_rects.get('music_dropdown_list_rect')
-                if list_rect and list_rect.collidepoint(mouse_pos):
-                    max_scroll = max(0, len(self.music_dropdown_names) - self._music_dropdown_visible_rows)
-                    self.music_dropdown_scroll -= event.y
-                    self.music_dropdown_scroll = max(0, min(self.music_dropdown_scroll, max_scroll))
-                    return
+            # If the cursor is over the variant selector row, scroll through
+            # variants horizontally instead of scrolling the palette beneath it.
+            variant_selector_rect = self.ui_rects.get('variant_selector_rect')
+            if (variant_selector_rect and variant_selector_rect.collidepoint(mouse_pos)
+                    and isinstance(self.selected_object, dict)
+                    and self.selected_object.get('has_variants', False)):
+                variants = self.selected_object.get('variants', [])
+                if variants:
+                    self.variant_scroll -= event.y
+                    self.variant_scroll = max(0, min(self.variant_scroll, max(0, len(variants) - 1)))
+                return
 
             if self._is_in_palette(mouse_pos[0], mouse_pos[1]):
                 self.scroll_offset -= event.y * 30
@@ -1431,6 +1972,20 @@ class ObjectEditor:
 
             # Left-click: place an object or interact with palette/UI
             if event.button == 1:
+                # Edit an EXISTING trigger box's own conditions/actions in
+                # place. Without this there was no way to configure a box
+                # after it's been placed — the palette panel's Event button
+                # (below) only bakes the sticky conditions/actions into a
+                # brand new box at creation time via _finalize_trigger_box_placement.
+                if (not self.placing_trigger_box
+                        and not self._is_in_palette(mouse_pos[0], mouse_pos[1])
+                        and self.hovered_object_type == 'trigger_box'
+                        and self.hovered_object is not None
+                        and self.event_editor is not None):
+                    self.event_editor.set_current_room(self.current_room_name)
+                    self.hovered_object.open_event_editor(self.event_editor)
+                    return
+
                 # Handle transition spawn placement mode
                 if self.placing_transition_spawn:
                     self._finalize_transition_spawn_placement()
@@ -1441,39 +1996,46 @@ class ObjectEditor:
                     self.gate_level_input_active = True
                     return
 
-                # Check if clicking on cutscene ID input box
-                if self._is_cutscene_id_input_clicked(mouse_pos):
-                    self.cutscene_id_input_active = True
+                # Check if clicking on the door "Permanent" checkbox
+                if self._is_door_permanent_checkbox_clicked(mouse_pos):
                     return
 
-                # Handle cutscene dropdown clicks
+                # Check if clicking on the door sound picker or its Preview button
+                if self._is_door_sound_ui_clicked(mouse_pos):
+                    return
+
+                # Handle trigger box property clicks
                 if (self.selected_object and isinstance(self.selected_object, dict)
-                        and self.selected_object.get('is_cutscene_trigger', False)):
+                        and self.selected_object.get('is_trigger_box', False)):
 
-                    # Dropdown button — toggle open/closed
-                    dd_btn = self.ui_rects.get('cutscene_dropdown_btn')
-                    if dd_btn and dd_btn.collidepoint(mouse_pos):
-                        self.cutscene_dropdown_open = not self.cutscene_dropdown_open
-                        if self.cutscene_dropdown_open:
-                            self.cutscene_dropdown_names = self._get_cutscene_names()
+                    id_rect = self.ui_rects.get('trigger_box_id_rect')
+                    if id_rect and id_rect.collidepoint(mouse_pos):
+                        self.trigger_box_id_input_active = True
                         return
 
-                    # Item inside open dropdown list
-                    if self.cutscene_dropdown_open:
-                        for item_rect, name in self.ui_rects.get('cutscene_dropdown_items', []):
-                            if item_rect.collidepoint(mouse_pos):
-                                self.cutscene_id_text = name
-                                self.cutscene_dropdown_open = False
-                                return
-                        # Click outside list — close without selecting
-                        self.cutscene_dropdown_open = False
+                    once_rect = self.ui_rects.get('trigger_box_once_rect')
+                    if once_rect and once_rect.collidepoint(mouse_pos):
+                        self.trigger_box_once = not self.trigger_box_once
                         return
 
-                    # One-shot toggle
-                    oneshot_rect = self.ui_rects.get('cutscene_oneshot_rect')
-                    if oneshot_rect and oneshot_rect.collidepoint(mouse_pos):
-                        self.cutscene_one_shot = not self.cutscene_one_shot
+                    key_rect = self.ui_rects.get('trigger_box_requires_key_rect')
+                    if key_rect and key_rect.collidepoint(mouse_pos):
+                        self.trigger_box_requires_key = not self.trigger_box_requires_key
                         return
+
+                    always_run_rect = self.ui_rects.get('trigger_box_always_run_rect')
+                    if always_run_rect and always_run_rect.collidepoint(mouse_pos):
+                        self.trigger_box_always_run = not self.trigger_box_always_run
+                        return
+
+                    # Event button — opens the picker (needs a FlagManager
+                    # wired via set_flag_manager; disabled otherwise)
+                    event_rect = self.ui_rects.get('trigger_box_event_btn')
+                    if event_rect and event_rect.collidepoint(mouse_pos) and self.flag_manager is not None:
+                        self._open_trigger_box_conditions_popup()
+                        return
+
+                    self.trigger_box_id_input_active = False
 
                 # Handle world map dropdown clicks
                 if (self.selected_object and isinstance(self.selected_object, dict)
@@ -1499,41 +2061,69 @@ class ObjectEditor:
                             self.world_map_dropdown_open = False
                             return
 
-                # Handle music track dropdown clicks
+                # Handle water/grass opacity slider
                 if (self.selected_object and isinstance(self.selected_object, dict)
-                        and self.selected_object.get('is_music_object', False)):
-
-                    # Dropdown button — toggle open/closed
-                    mus_btn = self.ui_rects.get('music_dropdown_btn')
-                    if mus_btn and mus_btn.collidepoint(mouse_pos):
-                        self.music_dropdown_open = not self.music_dropdown_open
-                        self.music_dropdown_scroll = 0
-                        if self.music_dropdown_open:
-                            self.music_dropdown_names = self._get_music_track_names()
+                        and self.selected_object.get('is_animated_region', False)):
+                    slider_rect = self.ui_rects.get('region_opacity_slider')
+                    if slider_rect and slider_rect.collidepoint(mouse_pos):
+                        self._region_opacity_dragging = True
+                        self._set_region_opacity_from_mouse_x(mouse_pos[0], slider_rect)
                         return
 
-                    # Scroll arrow clicks (only present when the list overflows)
-                    if self.music_dropdown_open:
-                        up_arrow = self.ui_rects.get('music_dropdown_scroll_up')
-                        if up_arrow and up_arrow.collidepoint(mouse_pos):
-                            self.music_dropdown_scroll = max(0, self.music_dropdown_scroll - 1)
-                            return
-                        down_arrow = self.ui_rects.get('music_dropdown_scroll_down')
-                        if down_arrow and down_arrow.collidepoint(mouse_pos):
-                            max_scroll = max(0, len(self.music_dropdown_names) - self._music_dropdown_visible_rows)
-                            self.music_dropdown_scroll = min(max_scroll, self.music_dropdown_scroll + 1)
-                            return
-
-                    # Item inside open dropdown list
-                    if self.music_dropdown_open:
-                        for item_rect, name in self.ui_rects.get('music_dropdown_items', []):
-                            if item_rect.collidepoint(mouse_pos):
-                                self.music_track_text = name
-                                self.music_dropdown_open = False
+                    if REGION_STYLES.get(self.selected_object.get('region_type'), {}).get('mode', 'patch') == 'tile':
+                        for i, variant_rect in enumerate(self.ui_rects.get('region_variant_rects', [])):
+                            if variant_rect.collidepoint(mouse_pos):
+                                self.region_variant = i
                                 return
-                        # Click outside list — close without selecting
-                        self.music_dropdown_open = False
-                        return
+
+                    if self.selected_object.get('region_type') in ('water',):
+                        wave_rect = self.ui_rects.get('region_wave_slider')
+                        if wave_rect and wave_rect.collidepoint(mouse_pos):
+                            self._region_wave_dragging = True
+                            self._set_region_wave_amount_from_mouse_x(mouse_pos[0], wave_rect)
+                            return
+
+                        seed_rect = self.ui_rects.get('region_seed_input')
+                        if seed_rect and seed_rect.collidepoint(mouse_pos):
+                            self.region_seed_input_active = True
+                            self.region_seed_text = str(self.region_seed)
+                            return
+
+                        reroll_rect = self.ui_rects.get('region_seed_reroll')
+                        if reroll_rect and reroll_rect.collidepoint(mouse_pos):
+                            import random
+                            self.region_seed = random.randint(0, 999999)
+                            self.region_seed_text = str(self.region_seed)
+                            return
+
+                    region_style = REGION_STYLES.get(self.selected_object.get('region_type'), {})
+                    if region_style.get('mode', 'patch') == 'patch':
+                        reset_rect = self.ui_rects.get('region_color_reset')
+                        if reset_rect and reset_rect.collidepoint(mouse_pos):
+                            self.region_color = (255, 255, 255)
+                            return
+
+                        sv_rect = self.ui_rects.get('region_sv_square')
+                        if sv_rect and sv_rect.collidepoint(mouse_pos):
+                            self._region_sv_dragging = True
+                            self._set_region_sv_from_mouse(mouse_pos, sv_rect)
+                            return
+
+                        hue_rect = self.ui_rects.get('region_hue_strip')
+                        if hue_rect and hue_rect.collidepoint(mouse_pos):
+                            self._region_hue_dragging = True
+                            self._set_region_hue_from_mouse_y(mouse_pos[1], hue_rect)
+                            return
+
+                # Variant scroll-arrow clicks (only present when the row overflows)
+                left_arrow = self.ui_rects.get('variant_scroll_left')
+                if left_arrow and left_arrow.collidepoint(mouse_pos):
+                    self.variant_scroll -= 1
+                    return
+                right_arrow = self.ui_rects.get('variant_scroll_right')
+                if right_arrow and right_arrow.collidepoint(mouse_pos):
+                    self.variant_scroll += 1
+                    return
 
                 # Check if clicking on variant selector
                 if self._is_variant_selector_clicked(mouse_pos):
@@ -1542,8 +2132,12 @@ class ObjectEditor:
                 # Deactivate input if clicking elsewhere
                 if self.gate_level_input_active:
                     self.gate_level_input_active = False
-                if self.cutscene_id_input_active:
-                    self.cutscene_id_input_active = False
+                if self.region_seed_input_active:
+                    self.region_seed_input_active = False
+                    try:
+                        self.region_seed = int(self.region_seed_text)
+                    except ValueError:
+                        self.region_seed_text = str(self.region_seed)
 
                 # Finish placing collision wall if we're in the middle of it
                 if self.placing_collision:
@@ -1551,10 +2145,16 @@ class ObjectEditor:
                     self.placing_collision = False
                     return
 
-                # Finish placing cutscene trigger if we're in the middle of it
-                if self.placing_cutscene_trigger:
-                    self._finalize_cutscene_trigger_placement(room_name)
-                    self.placing_cutscene_trigger = False
+                # Finish placing water/grass region if we're in the middle of it
+                if self.placing_animated_region:
+                    self._finalize_animated_region_placement(room_name)
+                    self.placing_animated_region = False
+                    return
+
+                # Finish placing trigger box if we're in the middle of it
+                if self.placing_trigger_box:
+                    self._finalize_trigger_box_placement(room_name)
+                    self.placing_trigger_box = False
                     return
 
                 # Finish placing transition if we're in the middle of it
@@ -1573,16 +2173,61 @@ class ObjectEditor:
                             self.placing_collision = True
                             self.collision_start_x = self.preview_x
                             self.collision_start_y = self.preview_y
-                        elif self.selected_object.get('is_cutscene_trigger', False):
-                            self.placing_cutscene_trigger = True
-                            self.cutscene_trigger_start_x = self.preview_x
-                            self.cutscene_trigger_start_y = self.preview_y
+                        elif self.selected_object.get('is_animated_region', False):
+                            self.placing_animated_region = True
+                            self.current_region_type = self.selected_object.get('region_type', 'water')
+                            self.animated_region_start_x = self.preview_x
+                            self.animated_region_start_y = self.preview_y
+                        elif self.selected_object.get('is_trigger_box', False):
+                            if self.trigger_box_always_run:
+                                # Position/size don't matter for firing, so
+                                # skip the drag-a-rectangle gesture and drop
+                                # a small fixed-size marker on a single click.
+                                self._place_always_run_trigger_box(room_name)
+                            else:
+                                self.placing_trigger_box = True
+                                self.trigger_box_start_x = self.preview_x
+                                self.trigger_box_start_y = self.preview_y
                         elif self.selected_object.get('is_transition', False):
                             self.placing_transition = True
                             self.transition_start_x = self.preview_x
                             self.transition_start_y = self.preview_y
                         else:
                             self._place_object(camera_x, camera_y, room_name)
+
+        # Dragging the water/grass opacity slider
+        if event.type == pygame.MOUSEMOTION and self._region_opacity_dragging:
+            slider_rect = self.ui_rects.get('region_opacity_slider')
+            if slider_rect:
+                self._set_region_opacity_from_mouse_x(mouse_pos[0], slider_rect)
+            return
+
+        # Dragging the water wave-amount slider
+        if event.type == pygame.MOUSEMOTION and self._region_wave_dragging:
+            wave_rect = self.ui_rects.get('region_wave_slider')
+            if wave_rect:
+                self._set_region_wave_amount_from_mouse_x(mouse_pos[0], wave_rect)
+            return
+
+        # Dragging the water color saturation/value square
+        if event.type == pygame.MOUSEMOTION and self._region_sv_dragging:
+            sv_rect = self.ui_rects.get('region_sv_square')
+            if sv_rect:
+                self._set_region_sv_from_mouse(mouse_pos, sv_rect)
+            return
+
+        # Dragging the water color hue strip
+        if event.type == pygame.MOUSEMOTION and self._region_hue_dragging:
+            hue_rect = self.ui_rects.get('region_hue_strip')
+            if hue_rect:
+                self._set_region_hue_from_mouse_y(mouse_pos[1], hue_rect)
+            return
+
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self._region_opacity_dragging = False
+            self._region_wave_dragging = False
+            self._region_sv_dragging = False
+            self._region_hue_dragging = False
 
         # Keyboard shortcuts
         if event.type == pygame.KEYDOWN:
@@ -1608,6 +2253,35 @@ class ObjectEditor:
                         self.gate_level_text = event.unicode
                 return
 
+            if self.trigger_box_id_input_active:
+                if event.key == pygame.K_BACKSPACE:
+                    self.trigger_box_id_text = self.trigger_box_id_text[:-1]
+                elif event.key == pygame.K_RETURN or event.key == pygame.K_ESCAPE:
+                    self.trigger_box_id_input_active = False
+                elif event.unicode and (event.unicode.isalnum() or event.unicode in ('_', '-')):
+                    if len(self.trigger_box_id_text) < 40:
+                        self.trigger_box_id_text += event.unicode
+                return
+
+            if self.region_seed_input_active:
+                if event.key == pygame.K_BACKSPACE:
+                    self.region_seed_text = self.region_seed_text[:-1]
+                    if not self.region_seed_text:
+                        self.region_seed_text = "0"
+                elif event.key == pygame.K_RETURN or event.key == pygame.K_ESCAPE:
+                    self.region_seed_input_active = False
+                    try:
+                        self.region_seed = int(self.region_seed_text)
+                        self.region_seed_text = str(self.region_seed)
+                    except ValueError:
+                        self.region_seed_text = str(self.region_seed)
+                elif event.unicode.isdigit():
+                    if self.region_seed_text == "0":
+                        self.region_seed_text = event.unicode
+                    elif len(self.region_seed_text) < 6:
+                        self.region_seed_text += event.unicode
+                return
+
             if event.key == pygame.K_g:
                 self.grid_snap = not self.grid_snap
             elif event.key == pygame.K_h:
@@ -1616,9 +2290,12 @@ class ObjectEditor:
                 if self.placing_collision:
                     self.placing_collision = False
                     self.preview_collision = None
-                elif self.placing_cutscene_trigger:
-                    self.placing_cutscene_trigger = False
-                    self.preview_cutscene_trigger = None
+                elif self.placing_animated_region:
+                    self.placing_animated_region = False
+                    self.preview_animated_region = None
+                elif self.placing_trigger_box:
+                    self.placing_trigger_box = False
+                    self.preview_trigger_box = None
                 elif self.placing_transition:
                     self.placing_transition = False
                     self.preview_transition = None
@@ -1725,10 +2402,10 @@ class ObjectEditor:
                 self.current_room_name
             )
 
-        if self.placing_cutscene_trigger:
+        if self.placing_animated_region:
             if self.grid_snap:
-                snap_start_x = int(self.cutscene_trigger_start_x / TILE_SIZE) * TILE_SIZE
-                snap_start_y = int(self.cutscene_trigger_start_y / TILE_SIZE) * TILE_SIZE
+                snap_start_x = int(self.animated_region_start_x / TILE_SIZE) * TILE_SIZE
+                snap_start_y = int(self.animated_region_start_y / TILE_SIZE) * TILE_SIZE
                 snap_end_x = int(self.mouse_world_x / TILE_SIZE) * TILE_SIZE
                 snap_end_y = int(self.mouse_world_y / TILE_SIZE) * TILE_SIZE
 
@@ -1743,19 +2420,61 @@ class ObjectEditor:
                 end_x = self.mouse_world_x
                 end_y = self.mouse_world_y
 
-                min_x = min(self.cutscene_trigger_start_x, end_x)
-                min_y = min(self.cutscene_trigger_start_y, end_y)
-                max_x = max(self.cutscene_trigger_start_x, end_x)
-                max_y = max(self.cutscene_trigger_start_y, end_y)
+                min_x = min(self.animated_region_start_x, end_x)
+                min_y = min(self.animated_region_start_y, end_y)
+                max_x = max(self.animated_region_start_x, end_x)
+                max_y = max(self.animated_region_start_y, end_y)
 
                 width = max(16, max_x - min_x)
                 height = max(16, max_y - min_y)
 
-            self.preview_cutscene_trigger = CutsceneTrigger(
-                int(min_x), int(min_y), int(width), int(height),
-                cutscene_id=self.cutscene_id_text,
-                one_shot=self.cutscene_one_shot,
-                room_name=self.current_room_name,
+            self.preview_animated_region = AnimatedRegion(
+                int(min_x),
+                int(min_y),
+                int(width),
+                int(height),
+                self.current_room_name,
+                self.current_region_type,
+                self.region_opacity,
+                self.region_wave_amount,
+                self.region_seed,
+                self.region_color,
+                self.region_variant
+            )
+
+        if self.placing_trigger_box:
+            if self.grid_snap:
+                snap_start_x = int(self.trigger_box_start_x / TILE_SIZE) * TILE_SIZE
+                snap_start_y = int(self.trigger_box_start_y / TILE_SIZE) * TILE_SIZE
+                snap_end_x = int(self.mouse_world_x / TILE_SIZE) * TILE_SIZE
+                snap_end_y = int(self.mouse_world_y / TILE_SIZE) * TILE_SIZE
+
+                min_x = min(snap_start_x, snap_end_x)
+                min_y = min(snap_start_y, snap_end_y)
+                max_x = max(snap_start_x, snap_end_x)
+                max_y = max(snap_start_y, snap_end_y)
+
+                width = max(TILE_SIZE, max_x - min_x + TILE_SIZE)
+                height = max(TILE_SIZE, max_y - min_y + TILE_SIZE)
+            else:
+                end_x = self.mouse_world_x
+                end_y = self.mouse_world_y
+
+                min_x = min(self.trigger_box_start_x, end_x)
+                min_y = min(self.trigger_box_start_y, end_y)
+                max_x = max(self.trigger_box_start_x, end_x)
+                max_y = max(self.trigger_box_start_y, end_y)
+
+                width = max(16, max_x - min_x)
+                height = max(16, max_y - min_y)
+
+            box_class = KeyTriggerBox if self.trigger_box_requires_key else OverlapTriggerBox
+            self.preview_trigger_box = box_class(
+                box_id=self.trigger_box_id_text,
+                x=int(min_x), y=int(min_y),
+                width=int(width), height=int(height),
+                once=self.trigger_box_once,
+                always_run=self.trigger_box_always_run,
             )
 
         if self.placing_transition:
@@ -1840,7 +2559,7 @@ class ObjectEditor:
           - Transition spawn-area placement
           - Collision-wall drag preview
           - Room-transition drag preview
-          - Cutscene-trigger drag preview
+          - Trigger-box drag preview
           - Standard single-object ghost sprite
         """
         if not self.active:
@@ -1939,16 +2658,45 @@ class ObjectEditor:
                                   RENDER_SCALE, dev_mode=True, selected=True)
             return
 
+        if self.placing_animated_region and self.preview_animated_region:
+            draw_animated_region(screen, self.preview_animated_region, camera_x, camera_y,
+                                 RENDER_SCALE, dev_mode=True, selected=True)
+            return
+
         if self.placing_transition and self.preview_transition:
             self.preview_transition.draw(screen,
                                          self._make_camera(camera_x, camera_y),
                                          RENDER_SCALE, dev_mode=True, selected=True)
             return
 
-        if self.placing_cutscene_trigger and self.preview_cutscene_trigger:
-            draw_cutscene_trigger(screen, self.preview_cutscene_trigger,
-                                  camera_x, camera_y, RENDER_SCALE,
-                                  dev_mode=True, selected=True)
+        if self.placing_trigger_box and self.preview_trigger_box:
+            draw_trigger_box(screen, self.preview_trigger_box,
+                             camera_x, camera_y, RENDER_SCALE,
+                             dev_mode=True, selected=True)
+            return
+
+        if (self.selected_object and isinstance(self.selected_object, dict)
+                and self.selected_object.get('is_trigger_box', False)
+                and self.trigger_box_always_run
+                and not self._is_in_palette(*pygame.mouse.get_pos())):
+            # Always Run boxes place instantly on click, so this preview
+            # stays on screen continuously (to support stamping down
+            # several markers in a row). Drawing it via draw_trigger_box
+            # with the same solid styling as a placed box made it read as
+            # "duplicated" — a real box plus a full-opacity look-alike
+            # chasing the cursor. Render a translucent ghost icon instead,
+            # matching the convention every other placeable object uses,
+            # so it's unambiguous which one is actually placed.
+            mx, my, mw, mh = self._always_run_marker_rect()
+            icon_sprite = self.selected_object.get('sprite')
+            if icon_sprite:
+                scaled_w = max(1, int(mw * RENDER_SCALE))
+                scaled_h = max(1, int(mh * RENDER_SCALE))
+                ghost = pygame.transform.scale(icon_sprite, (scaled_w, scaled_h)).copy()
+                ghost.set_alpha(120)
+                ghost_screen_x = int(mx * RENDER_SCALE - camera_x)
+                ghost_screen_y = int(my * RENDER_SCALE - camera_y)
+                screen.blit(ghost, (ghost_screen_x, ghost_screen_y))
             return
 
         if self.hovered_object and self.hovered_object_type and not self.selected_object:
@@ -2033,12 +2781,25 @@ class ObjectEditor:
             draw_collision_object(screen, collision_obj, camera_x, camera_y,
                                   RENDER_SCALE, dev_mode=True, selected=False)
 
+    def draw_animated_regions(self, screen, camera_x, camera_y):
+        """Draw all water/grass regions in the current room (editor overlay only)"""
+        if not self.current_room_name:
+            return
+
+        regions = self.animated_region_manager.get_regions(self.current_room_name)
+
+        for region in regions:
+            draw_animated_region(screen, region, camera_x, camera_y,
+                                 RENDER_SCALE, dev_mode=True, selected=False)
+
     def _make_camera(self, camera_x, camera_y):
         """Lightweight camera-like object used by draw methods that expect a .x/.y camera."""
+
         class _Camera:
             def __init__(self, x, y):
                 self.x = x
                 self.y = y
+
         return _Camera(camera_x, camera_y)
 
     def draw_room_transitions(self, screen, camera_x, camera_y):
@@ -2066,6 +2827,18 @@ class ObjectEditor:
         for gate in gates:
             if gate.active:
                 gate.draw(screen, temp_camera, colors)
+
+    def draw_doors(self, screen, camera_x, camera_y, colors=None):
+        """Draw doors in the current room (editor preview — always shows the
+        closed frame regardless of is_open, since there's no player to be
+        near in the editor)."""
+        if not self.current_room_name:
+            return
+
+        temp_camera = self._make_camera(camera_x, camera_y)
+
+        for door in self.door_manager.get_doors(self.current_room_name):
+            door.draw(screen, temp_camera, colors)
 
     def draw_spawn_points(self, screen, camera_x, camera_y):
         """Draw spawn points in the current room"""
@@ -2103,6 +2876,10 @@ class ObjectEditor:
         # Always draw the transition config dialog — it must be visible even
         # when the palette panel is hidden (user closed panel to place freely).
         self.transition_config.draw(screen)
+
+        # Note: the Event Editor popup is drawn at the very end of this
+        # method (after the settings panel etc.), not here — otherwise the
+        # rest of the palette paints right over it every frame.
 
         if not self.palette_visible:
             return
@@ -2180,6 +2957,11 @@ class ObjectEditor:
         self._draw_variant_selector(screen)
         self._draw_settings_panel(screen)
 
+        # Drawn last so its dark overlay + window actually cover the whole
+        # palette/settings panel instead of being painted over by them.
+        if self.event_editor is not None:
+            self.event_editor.draw(screen)
+
     def _draw_object_item(self, screen, obj, x, y):
         """Draw a single object in the palette"""
         item_rect = pygame.Rect(x, y, self.item_size, self.item_size)
@@ -2242,13 +3024,16 @@ class ObjectEditor:
     def _draw_variant_selector(self, screen):
         """Draw variant selection row when an object with variants is selected"""
         if not self.selected_object or not isinstance(self.selected_object, dict):
+            self.ui_rects['variant_selector_rect'] = None
             return
 
         if not self.selected_object.get('has_variants', False):
+            self.ui_rects['variant_selector_rect'] = None
             return
 
         variants = self.selected_object.get('variants', [])
         if not variants:
+            self.ui_rects['variant_selector_rect'] = None
             return
 
         # Position above settings panel
@@ -2262,6 +3047,7 @@ class ObjectEditor:
         pygame.draw.line(screen, self.colors['accent'],
                          (selector_x, selector_y),
                          (selector_x + self.palette_width, selector_y), 2)
+        self.ui_rects['variant_selector_rect'] = selector_rect
 
         # Title
         title_text = self.font_small.render("Select Variant:", True, self.colors['text_dim'])
@@ -2270,15 +3056,35 @@ class ObjectEditor:
         # Draw variant options
         variant_size = 50
         variant_spacing = 10
-        start_x = selector_x + self.palette_padding
+        arrow_width = 20  # reserved on each side when the list needs scrolling
         start_y = selector_y + 25
 
         current_variant = self.selected_variant or self._get_current_variant(self.selected_object)
 
-        self.ui_rects['variant_rects'] = []
+        # How many variants fit at once — recomputed every frame since the
+        # palette can be resized. Reserve room for scroll arrows only once
+        # we actually know the full row won't fit.
+        usable_width = self.palette_width - self.palette_padding * 2
+        slot_width = variant_size + variant_spacing
+        visible_count = max(1, usable_width // slot_width)
+        needs_scroll = len(variants) > visible_count
+        if needs_scroll:
+            # Re-derive visible_count with arrow space carved out on both sides.
+            usable_width -= arrow_width * 2
+            visible_count = max(1, usable_width // slot_width)
 
-        for i, variant in enumerate(variants):
-            variant_x = start_x + i * (variant_size + variant_spacing)
+        max_variant_scroll = max(0, len(variants) - visible_count)
+        self.variant_scroll = max(0, min(self.variant_scroll, max_variant_scroll))
+
+        start_x = selector_x + self.palette_padding + (arrow_width if needs_scroll else 0)
+        visible_variants = variants[self.variant_scroll:self.variant_scroll + visible_count]
+
+        self.ui_rects['variant_rects'] = []
+        self.ui_rects['variant_scroll_left'] = None
+        self.ui_rects['variant_scroll_right'] = None
+
+        for i, variant in enumerate(visible_variants):
+            variant_x = start_x + i * slot_width
             variant_rect = pygame.Rect(variant_x, start_y, variant_size, variant_size)
 
             is_selected = (current_variant == variant)
@@ -2315,6 +3121,46 @@ class ObjectEditor:
                 'rect': variant_rect,
                 'variant': variant
             })
+
+        if needs_scroll:
+            arrow_y = start_y + variant_size // 2
+            left_rect = pygame.Rect(selector_x + self.palette_padding, start_y, arrow_width, variant_size)
+            right_rect = pygame.Rect(
+                selector_x + self.palette_width - self.palette_padding - arrow_width,
+                start_y, arrow_width, variant_size,
+            )
+
+            left_active = self.variant_scroll > 0
+            right_active = self.variant_scroll < max_variant_scroll
+            left_color = self.colors['text'] if left_active else self.colors['text_dim']
+            right_color = self.colors['text'] if right_active else self.colors['text_dim']
+
+            pygame.draw.polygon(screen, left_color, [
+                (left_rect.right - 4, arrow_y - 8),
+                (left_rect.left + 4, arrow_y),
+                (left_rect.right - 4, arrow_y + 8),
+            ])
+            pygame.draw.polygon(screen, right_color, [
+                (right_rect.left + 4, arrow_y - 8),
+                (right_rect.right - 4, arrow_y),
+                (right_rect.left + 4, arrow_y + 8),
+            ])
+
+            if left_active:
+                self.ui_rects['variant_scroll_left'] = left_rect
+            if right_active:
+                self.ui_rects['variant_scroll_right'] = right_rect
+
+            # Position indicator, e.g. "3-8 / 14"
+            count_text = self.font_small.render(
+                f"{self.variant_scroll + 1}-{min(self.variant_scroll + visible_count, len(variants))} / {len(variants)}",
+                True, self.colors['text_dim'],
+            )
+            count_rect = count_text.get_rect(
+                right=selector_x + self.palette_width - self.palette_padding,
+                top=selector_y + 5,
+            )
+            screen.blit(count_text, count_rect)
 
     def draw_flying_pads(self, screen, camera_x, camera_y, colors):
         """Draw flying pads in the current room"""
@@ -2353,34 +3199,76 @@ class ObjectEditor:
             if obj.active:
                 obj.draw(screen, temp_camera, colors)
 
-    def draw_music_objects(self, screen, camera_x, camera_y, colors=None):
-        """Draw Music object icons in the current room (editor overlay only).
-
-        This is intentionally editor-only — the Music object has no in-game
-        sprite and must never be drawn while actually testing/playing a room.
-        """
-        if not self.current_room_name:
-            return
-        temp_camera = self._make_camera(camera_x, camera_y)
-        for music_obj in self.music_manager.get_music_objects(self.current_room_name):
-            if music_obj.active:
-                music_obj.draw(screen, temp_camera, colors)
-
-    def draw_cutscene_triggers(self, screen, camera_x, camera_y):
-        """Draw all cutscene trigger zones in the current room (dev mode only)."""
+    def draw_trigger_boxes(self, screen, camera_x, camera_y):
+        """Draw all trigger box zones in the current room (dev mode only)."""
         if not self.current_room_name:
             return
 
-        triggers = self.cutscene_trigger_manager.get_triggers(self.current_room_name)
-        for trigger in triggers:
-            draw_cutscene_trigger(
-                screen, trigger, camera_x, camera_y, RENDER_SCALE,
+        for box in self.trigger_box_manager.get_boxes(self.current_room_name):
+            draw_trigger_box(
+                screen, box, camera_x, camera_y, RENDER_SCALE,
                 dev_mode=True, selected=False
             )
 
+    def _settings_panel_content_height(self):
+        """Compute how tall _draw_settings_panel's content actually is, so the
+        panel (and therefore the clickable area for its controls) can grow to
+        fit instead of clipping/pushing rows below the palette bounds."""
+        height = 10  # top padding (y_pos = panel_y + 10)
+        height += 25  # Grid Snap row
+        height += 25  # Show Grid row
+
+        obj = self.selected_object
+        if obj and isinstance(obj, dict):
+            if obj.get('object_type') == 'level_gate':
+                height += 30
+
+            if obj.get('object_type') == 'door':
+                height += 30
+
+            if obj.get('is_trigger_box', False):
+                height += 30  # Box ID row
+                height += 30  # Once toggle row
+                height += 30  # Requires Key toggle row
+
+            if obj.get('object_type') == 'world_map_object':
+                current_variant = self._get_current_variant(obj)
+                if current_variant and current_variant.get('type') in ('world_map', 'world_map_sign'):
+                    height += 30
+
+            if obj.get('is_animated_region', False):
+                height += 20 + 14 + 16  # Opacity label + slider + gap
+                region_type = obj.get('region_type')
+                if region_type in ('water',):
+                    height += 20 + 14 + 16  # Wave Amount label + slider + gap
+                    height += 30  # Seed input + reroll row
+                if REGION_STYLES.get(region_type, {}).get('mode', 'patch') == 'patch':
+                    height += 26  # Color label + swatch + reset row
+                    height += 90 + 10  # SV square / hue strip + trailing gap
+                region_style = REGION_STYLES.get(region_type, {})
+                if region_style.get('mode', 'patch') == 'tile':
+                    # A single-frame tile sheet (grid_rows omitted or 1 —
+                    # e.g. a one-off, non-square sprite with nothing to
+                    # pick between) has no variant to choose, so the picker
+                    # itself is skipped entirely rather than showing one
+                    # useless button.
+                    num_variants = max(1, region_style.get('grid_rows', 1))
+                    if num_variants > 1:
+                        # Variant slots are square, sized to fill the row
+                        # (same math as the draw code), so their height
+                        # scales with palette width rather than a fixed
+                        # constant.
+                        btn_gap = 6
+                        slot_w = (self.palette_width - self.palette_padding * 2
+                                  - btn_gap * (num_variants - 1)) // num_variants
+                        height += 20 + slot_w + 16  # Variant label + thumbnail row + gap
+
+        height += 10  # bottom padding
+        return height
+
     def _draw_settings_panel(self, screen):
         """Draw controls and settings at the bottom of the palette"""
-        panel_height = 160
+        panel_height = max(160, self._settings_panel_content_height())
         panel_y = self.palette_y + self.palette_height - panel_height
 
         panel_rect = pygame.Rect(self.palette_x, panel_y, self.palette_width, panel_height)
@@ -2441,78 +3329,181 @@ class ObjectEditor:
             y_pos += 30
 
         if self.selected_object and isinstance(self.selected_object, dict) and self.selected_object.get(
-                'is_cutscene_trigger', False):
-            id_label = self.font_medium.render("Cutscene ID:", True, self.colors['text'])
-            screen.blit(id_label, (self.palette_x + self.palette_padding, y_pos))
+                'object_type') == 'door':
+            label = self.font_medium.render("Permanent:", True, self.colors['text'])
+            screen.blit(label, (self.palette_x + self.palette_padding, y_pos))
 
-            # ── Dropdown button ───────────────────────────────────────────────
-            btn_x = self.palette_x + self.palette_padding + 120
-            btn_rect = pygame.Rect(btn_x, y_pos - 3, 200, 25)
-            btn_bg = self.colors['input_active'] if self.cutscene_dropdown_open else self.colors['input_bg']
-            pygame.draw.rect(screen, btn_bg, btn_rect)
-            pygame.draw.rect(screen,
-                             self.colors['accent'] if self.cutscene_dropdown_open else self.colors['grid'],
-                             btn_rect, 2)
+            box_size = 20
+            box_x = self.palette_x + self.palette_padding + 100
+            box_y = y_pos - 2
+            box_rect = pygame.Rect(box_x, box_y, box_size, box_size)
+            self.ui_rects['door_permanent_checkbox'] = box_rect
 
-            display_label = self.cutscene_id_text if self.cutscene_id_text else '<select cutscene>'
-            label_surf = self.font_small.render(display_label, True, self.colors['text'])
-            label_clip = pygame.Rect(btn_rect.x + 4, btn_rect.y, btn_rect.w - 20, btn_rect.h)
-            screen.set_clip(label_clip)
-            screen.blit(label_surf, (btn_rect.x + 4, btn_rect.y + 6))
-            screen.set_clip(None)
+            box_bg = self.colors['success'] if self.door_permanent else self.colors['input_bg']
+            pygame.draw.rect(screen, box_bg, box_rect)
+            pygame.draw.rect(screen, self.colors['accent'] if self.door_permanent else self.colors['grid'],
+                             box_rect, 2)
 
-            # Small arrow indicator
-            arrow_x = btn_rect.right - 14
-            arrow_y = btn_rect.centery
-            arrow_pts = [(arrow_x, arrow_y - 4), (arrow_x + 8, arrow_y - 4), (arrow_x + 4, arrow_y + 4)]
-            pygame.draw.polygon(screen, self.colors['text_dim'], arrow_pts)
+            if self.door_permanent:
+                pygame.draw.line(screen, (255, 255, 255),
+                                 (box_x + 4, box_y + 10), (box_x + 8, box_y + 15), 2)
+                pygame.draw.line(screen, (255, 255, 255),
+                                 (box_x + 8, box_y + 15), (box_x + 16, box_y + 5), 2)
 
-            self.ui_rects['cutscene_dropdown_btn'] = btn_rect
-
-            # ── Open dropdown list ────────────────────────────────────────────
-            if self.cutscene_dropdown_open:
-                names = self.cutscene_dropdown_names
-                item_h = 22
-                list_h = max(item_h, len(names) * item_h)
-                list_rect = pygame.Rect(btn_rect.x, btn_rect.bottom, btn_rect.w, list_h)
-
-                list_bg = pygame.Surface((list_rect.w, list_rect.h), pygame.SRCALPHA)
-                list_bg.fill((30, 30, 45, 240))
-                screen.blit(list_bg, list_rect.topleft)
-                pygame.draw.rect(screen, self.colors['accent'], list_rect, 1)
-
-                self.ui_rects['cutscene_dropdown_items'] = []
-                if not names:
-                    empty_surf = self.font_small.render('<no cutscenes found>', True, self.colors['text_dark'])
-                    screen.blit(empty_surf, (list_rect.x + 4, list_rect.y + 4))
-                else:
-                    for i, name in enumerate(names):
-                        item_rect = pygame.Rect(list_rect.x, list_rect.y + i * item_h, list_rect.w, item_h)
-                        is_sel = name == self.cutscene_id_text
-                        if is_sel:
-                            pygame.draw.rect(screen, self.colors['variant_selected'], item_rect)
-                        item_surf = self.font_small.render(name, True,
-                                                           self.colors['text'] if is_sel else self.colors['text_dim'])
-                        screen.blit(item_surf, (item_rect.x + 6, item_rect.y + 4))
-                        self.ui_rects['cutscene_dropdown_items'].append((item_rect, name))
+            hint = self.font_small.render("(stays open once opened)", True, self.colors['text_dim'])
+            screen.blit(hint, (box_x + box_size + 8, y_pos + 3))
 
             y_pos += 30
 
-            # One-shot toggle — hidden while the dropdown list is open
-            if not self.cutscene_dropdown_open:
-                shot_label = self.font_medium.render("One-Shot:", True, self.colors['text'])
-                screen.blit(shot_label, (self.palette_x + self.palette_padding, y_pos))
+            # ── Door sound picker ───────────────────────────────────────────
+            sound_label = self.font_medium.render("Sound:", True, self.colors['text'])
+            screen.blit(sound_label, (self.palette_x + self.palette_padding, y_pos))
 
-                btn_x = self.palette_x + self.palette_padding + 120
-                btn_rect = pygame.Rect(btn_x, y_pos - 3, 60, 22)
-                btn_color = self.colors['success'] if self.cutscene_one_shot else self.colors['panel']
-                pygame.draw.rect(screen, btn_color, btn_rect, border_radius=4)
-                pygame.draw.rect(screen, self.colors['accent'], btn_rect, 2, border_radius=4)
-                btn_text = self.font_small.render('ON' if self.cutscene_one_shot else 'OFF', True, self.colors['text'])
-                screen.blit(btn_text, btn_text.get_rect(center=btn_rect.center))
-                self.ui_rects['cutscene_oneshot_rect'] = btn_rect
+            btn_h = 22
+            btn_gap = 4
+            btn_x = self.palette_x + self.palette_padding + 100
+            btn_y = y_pos - 2
 
-                y_pos += 30
+            door_sound_buttons = []
+            for name in self.door_sound_options:
+                # Short label — e.g. 'door1' -> '1' — so a row of these reads
+                # like numbered tabs rather than repeating "door" each time.
+                short_label = name[4:] if name.lower().startswith('door') else name
+                label_surf = self.font_small.render(short_label, True, self.colors['text'])
+                btn_w = max(24, label_surf.get_width() + 12)
+                btn_rect = pygame.Rect(btn_x, btn_y, btn_w, btn_h)
+
+                is_selected = (name == self.door_sound_text)
+                bg = self.colors['variant_selected'] if is_selected else self.colors['input_bg']
+                pygame.draw.rect(screen, bg, btn_rect)
+                pygame.draw.rect(screen, self.colors['accent'] if is_selected else self.colors['grid'],
+                                 btn_rect, 2)
+                screen.blit(label_surf, label_surf.get_rect(center=btn_rect.center))
+
+                door_sound_buttons.append((btn_rect, name))
+                btn_x += btn_w + btn_gap
+
+            self.ui_rects['door_sound_buttons'] = door_sound_buttons
+
+            # Preview button — plays whatever's currently selected. Drawn as a
+            # small play triangle + label rather than a unicode ▶ glyph, since
+            # the default pygame font doesn't reliably have that character.
+            preview_rect = pygame.Rect(btn_x + 6, btn_y, 78, btn_h)
+            preview_hover = preview_rect.collidepoint(pygame.mouse.get_pos())
+            preview_bg = self.colors['input_active'] if preview_hover else self.colors['input_bg']
+            pygame.draw.rect(screen, preview_bg, preview_rect)
+            pygame.draw.rect(screen, self.colors['accent'], preview_rect, 2)
+
+            tri_x = preview_rect.x + 8
+            tri_y = preview_rect.centery
+            pygame.draw.polygon(screen, self.colors['accent'], [
+                (tri_x, tri_y - 5), (tri_x, tri_y + 5), (tri_x + 8, tri_y)
+            ])
+            preview_label = self.font_small.render("Preview", True, self.colors['text'])
+            screen.blit(preview_label, (tri_x + 14, preview_rect.centery - preview_label.get_height() // 2))
+            self.ui_rects['door_sound_preview_btn'] = preview_rect
+
+            y_pos += 30
+
+        if self.selected_object and isinstance(self.selected_object, dict) and self.selected_object.get(
+                'is_trigger_box', False):
+            id_label = self.font_medium.render("Box ID:", True, self.colors['text'])
+            screen.blit(id_label, (self.palette_x + self.palette_padding, y_pos))
+
+            btn_x = self.palette_x + self.palette_padding + 120
+            id_rect = pygame.Rect(btn_x, y_pos - 3, 200, 25)
+            id_bg = self.colors['input_active'] if self.trigger_box_id_input_active else self.colors['input_bg']
+            pygame.draw.rect(screen, id_bg, id_rect)
+            pygame.draw.rect(screen,
+                             self.colors['accent'] if self.trigger_box_id_input_active else self.colors['grid'],
+                             id_rect, 2)
+
+            display_label = self.trigger_box_id_text if self.trigger_box_id_text else '<box id>'
+            id_text_surf = self.font_small.render(display_label, True, self.colors['text'])
+            id_clip = pygame.Rect(id_rect.x + 4, id_rect.y, id_rect.w - 8, id_rect.h)
+            screen.set_clip(id_clip)
+            screen.blit(id_text_surf, (id_rect.x + 4, id_rect.y + 6))
+            screen.set_clip(None)
+
+            self.ui_rects['trigger_box_id_rect'] = id_rect
+
+            y_pos += 30
+
+            once_label = self.font_medium.render("Once:", True, self.colors['text'])
+            screen.blit(once_label, (self.palette_x + self.palette_padding, y_pos))
+
+            once_rect = pygame.Rect(btn_x, y_pos - 3, 60, 22)
+            once_color = self.colors['success'] if self.trigger_box_once else self.colors['panel']
+            pygame.draw.rect(screen, once_color, once_rect, border_radius=4)
+            pygame.draw.rect(screen, self.colors['accent'], once_rect, 2, border_radius=4)
+            once_text = self.font_small.render('ON' if self.trigger_box_once else 'OFF', True, self.colors['text'])
+            screen.blit(once_text, once_text.get_rect(center=once_rect.center))
+            self.ui_rects['trigger_box_once_rect'] = once_rect
+
+            y_pos += 30
+
+            key_label = self.font_medium.render("Requires Key:", True, self.colors['text'])
+            screen.blit(key_label, (self.palette_x + self.palette_padding, y_pos))
+
+            key_rect = pygame.Rect(btn_x, y_pos - 3, 60, 22)
+            key_color = self.colors['success'] if self.trigger_box_requires_key else self.colors['panel']
+            pygame.draw.rect(screen, key_color, key_rect, border_radius=4)
+            pygame.draw.rect(screen, self.colors['accent'], key_rect, 2, border_radius=4)
+            key_text = self.font_small.render('ON' if self.trigger_box_requires_key else 'OFF', True,
+                                              self.colors['text'])
+            screen.blit(key_text, key_text.get_rect(center=key_rect.center))
+            self.ui_rects['trigger_box_requires_key_rect'] = key_rect
+
+            y_pos += 30
+
+            always_run_label = self.font_medium.render("Always Run:", True, self.colors['text'])
+            screen.blit(always_run_label, (self.palette_x + self.palette_padding, y_pos))
+
+            always_run_rect = pygame.Rect(btn_x, y_pos - 3, 60, 22)
+            always_run_color = self.colors['success'] if self.trigger_box_always_run else self.colors['panel']
+            pygame.draw.rect(screen, always_run_color, always_run_rect, border_radius=4)
+            pygame.draw.rect(screen, self.colors['accent'], always_run_rect, 2, border_radius=4)
+            always_run_text = self.font_small.render('ON' if self.trigger_box_always_run else 'OFF', True,
+                                                      self.colors['text'])
+            screen.blit(always_run_text, always_run_text.get_rect(center=always_run_rect.center))
+            self.ui_rects['trigger_box_always_run_rect'] = always_run_rect
+
+            if self.trigger_box_always_run:
+                hint_surf = self.font_small.render(
+                    "Fires passively — position/size ignored, single-click to place",
+                    True, self.colors['text_dark'])
+                screen.blit(hint_surf, (self.palette_x + self.palette_padding, y_pos + 24))
+                y_pos += 18
+
+            y_pos += 30
+
+            # Event button — grey/disabled until a FlagManager is wired
+            event_label = self.font_medium.render("Event:", True, self.colors['text'])
+            screen.blit(event_label, (self.palette_x + self.palette_padding, y_pos))
+
+            event_btn_rect = pygame.Rect(btn_x, y_pos - 3, 160, 25)
+            event_cond_count = len(self.trigger_box_conditions)
+            event_action_count = len(self.trigger_box_actions)
+
+            if self.flag_manager is None:
+                pygame.draw.rect(screen, self.colors['panel'], event_btn_rect)
+                pygame.draw.rect(screen, self.colors['grid'], event_btn_rect, 2)
+                event_text = "(flags not connected)"
+                event_color = self.colors['text_dark']
+            else:
+                pygame.draw.rect(screen, self.colors['input_bg'], event_btn_rect)
+                pygame.draw.rect(screen, self.colors['accent'], event_btn_rect, 2)
+                if event_cond_count or event_action_count:
+                    event_text = f"Edit ({event_cond_count} cond, {event_action_count} act)"
+                else:
+                    event_text = "None — click to add"
+                event_color = self.colors['text']
+
+            event_label_surf = self.font_small.render(event_text, True, event_color)
+            screen.blit(event_label_surf, event_label_surf.get_rect(center=event_btn_rect.center))
+            self.ui_rects['trigger_box_event_btn'] = event_btn_rect
+
+            y_pos += 30
 
         if (self.selected_object and isinstance(self.selected_object, dict)
                 and self.selected_object.get('object_type') == 'world_map_object'):
@@ -2567,103 +3558,233 @@ class ObjectEditor:
                             if is_sel:
                                 pygame.draw.rect(screen, self.colors['variant_selected'], item_rect)
                             item_surf = self.font_small.render(name, True,
-                                                               self.colors['text'] if is_sel else self.colors['text_dim'])
+                                                               self.colors['text'] if is_sel else self.colors[
+                                                                   'text_dim'])
                             screen.blit(item_surf, (item_rect.x + 6, item_rect.y + 4))
                             self.ui_rects['world_map_dropdown_items'].append((item_rect, name))
 
                 y_pos += 30
 
         if self.selected_object and isinstance(self.selected_object, dict) and self.selected_object.get(
-                'is_music_object', False):
-            track_label = self.font_medium.render("Track:", True, self.colors['text'])
-            screen.blit(track_label, (self.palette_x + self.palette_padding, y_pos))
+                'is_animated_region', False):
+            label = self.font_medium.render(f"Opacity: {self.region_opacity}%", True, self.colors['text'])
+            screen.blit(label, (self.palette_x + self.palette_padding, y_pos))
+            y_pos += 20
 
-            # ── Dropdown button ───────────────────────────────────────────────
-            btn_x = self.palette_x + self.palette_padding + 120
-            btn_rect = pygame.Rect(btn_x, y_pos - 3, 200, 25)
-            btn_bg = self.colors['input_active'] if self.music_dropdown_open else self.colors['input_bg']
-            pygame.draw.rect(screen, btn_bg, btn_rect)
-            pygame.draw.rect(screen,
-                             self.colors['accent'] if self.music_dropdown_open else self.colors['grid'],
-                             btn_rect, 2)
+            track_x = self.palette_x + self.palette_padding
+            track_y = y_pos
+            track_w = self.palette_width - self.palette_padding * 2
+            track_h = 14
+            track_rect = pygame.Rect(track_x, track_y, track_w, track_h)
 
-            display_label = self.music_track_text if self.music_track_text else '<select track>'
-            label_surf = self.font_small.render(display_label, True, self.colors['text'])
-            label_clip = pygame.Rect(btn_rect.x + 4, btn_rect.y, btn_rect.w - 20, btn_rect.h)
-            screen.set_clip(label_clip)
-            screen.blit(label_surf, (btn_rect.x + 4, btn_rect.y + 6))
-            screen.set_clip(None)
+            pygame.draw.rect(screen, self.colors['input_bg'], track_rect, border_radius=4)
 
-            arrow_x = btn_rect.right - 14
-            arrow_y = btn_rect.centery
-            arrow_pts = [(arrow_x, arrow_y - 4), (arrow_x + 8, arrow_y - 4), (arrow_x + 4, arrow_y + 4)]
-            pygame.draw.polygon(screen, self.colors['text_dim'], arrow_pts)
+            fill_w = int(track_w * (self.region_opacity / 100))
+            if fill_w > 0:
+                fill_rect = pygame.Rect(track_x, track_y, fill_w, track_h)
+                pygame.draw.rect(screen, self.colors['accent'], fill_rect, border_radius=4)
 
-            self.ui_rects['music_dropdown_btn'] = btn_rect
+            pygame.draw.rect(screen, self.colors['grid'], track_rect, 2, border_radius=4)
 
-            # ── Open dropdown list ────────────────────────────────────────────
-            if self.music_dropdown_open:
-                names = self.music_dropdown_names
-                item_h = 22
+            handle_x = track_x + fill_w
+            handle_rect = pygame.Rect(0, 0, 10, track_h + 8)
+            handle_rect.center = (handle_x, track_y + track_h // 2)
+            pygame.draw.rect(screen, self.colors['text'], handle_rect, border_radius=3)
 
-                # Cap how many rows we show so the list can never run off the
-                # bottom of the screen — the rest is reached by scrolling.
-                max_rows_on_screen = max(1, (self.screen_height - btn_rect.bottom - 10) // item_h)
-                visible_rows = max(1, min(max_rows_on_screen, 8, len(names) or 1))
-                self._music_dropdown_visible_rows = visible_rows
+            self.ui_rects['region_opacity_slider'] = track_rect
 
-                max_scroll = max(0, len(names) - visible_rows)
-                self.music_dropdown_scroll = max(0, min(self.music_dropdown_scroll, max_scroll))
-                scroll = self.music_dropdown_scroll
+            y_pos += track_h + 16
 
-                list_h = max(item_h, min(len(names), visible_rows) * item_h)
-                list_rect = pygame.Rect(btn_rect.x, btn_rect.bottom, btn_rect.w, list_h)
-                self.ui_rects['music_dropdown_list_rect'] = list_rect
+            current_region_type = self.selected_object.get('region_type')
+            if current_region_type in ('water',):
+                # Wave/Flicker Amount slider — fraction of 8x8 chunks showing
+                # the animated patch vs. the plain (no-line) patch.
+                amount_label_text = "Wave Amount"
+                wave_label = self.font_medium.render(
+                    f"{amount_label_text}: {self.region_wave_amount}%", True, self.colors['text'])
+                screen.blit(wave_label, (self.palette_x + self.palette_padding, y_pos))
+                y_pos += 20
 
-                list_bg = pygame.Surface((list_rect.w, list_rect.h), pygame.SRCALPHA)
-                list_bg.fill((30, 30, 45, 240))
-                screen.blit(list_bg, list_rect.topleft)
-                pygame.draw.rect(screen, self.colors['accent'], list_rect, 1)
+                wtrack_x = self.palette_x + self.palette_padding
+                wtrack_y = y_pos
+                wtrack_w = self.palette_width - self.palette_padding * 2
+                wtrack_h = 14
+                wtrack_rect = pygame.Rect(wtrack_x, wtrack_y, wtrack_w, wtrack_h)
 
-                self.ui_rects['music_dropdown_items'] = []
-                self.ui_rects['music_dropdown_scroll_up'] = None
-                self.ui_rects['music_dropdown_scroll_down'] = None
+                pygame.draw.rect(screen, self.colors['input_bg'], wtrack_rect, border_radius=4)
 
-                if not names:
-                    empty_surf = self.font_small.render('<no tracks found>', True, self.colors['text_dark'])
-                    screen.blit(empty_surf, (list_rect.x + 4, list_rect.y + 4))
-                else:
-                    visible_names = names[scroll:scroll + visible_rows]
-                    for i, name in enumerate(visible_names):
-                        item_rect = pygame.Rect(list_rect.x, list_rect.y + i * item_h, list_rect.w, item_h)
-                        is_sel = name == self.music_track_text
-                        if is_sel:
-                            pygame.draw.rect(screen, self.colors['variant_selected'], item_rect)
-                        item_surf = self.font_small.render(name, True,
-                                                           self.colors['text'] if is_sel else self.colors['text_dim'])
-                        screen.blit(item_surf, (item_rect.x + 6, item_rect.y + 4))
-                        self.ui_rects['music_dropdown_items'].append((item_rect, name))
+                wfill_w = int(wtrack_w * (self.region_wave_amount / 100))
+                if wfill_w > 0:
+                    wfill_rect = pygame.Rect(wtrack_x, wtrack_y, wfill_w, wtrack_h)
+                    pygame.draw.rect(screen, self.colors['accent'], wfill_rect, border_radius=4)
 
-                    # Scroll indicators — also act as click targets, and make it
-                    # obvious the list has more items than fit on screen.
-                    if scroll > 0:
-                        up_rect = pygame.Rect(list_rect.right - 18, list_rect.y + 2, 14, 12)
-                        pygame.draw.polygon(screen, self.colors['accent'], [
-                            (up_rect.centerx, up_rect.top),
-                            (up_rect.left, up_rect.bottom),
-                            (up_rect.right, up_rect.bottom),
-                        ])
-                        self.ui_rects['music_dropdown_scroll_up'] = up_rect
-                    if scroll + visible_rows < len(names):
-                        down_rect = pygame.Rect(list_rect.right - 18, list_rect.bottom - 14, 14, 12)
-                        pygame.draw.polygon(screen, self.colors['accent'], [
-                            (down_rect.left, down_rect.top),
-                            (down_rect.right, down_rect.top),
-                            (down_rect.centerx, down_rect.bottom),
-                        ])
-                        self.ui_rects['music_dropdown_scroll_down'] = down_rect
+                pygame.draw.rect(screen, self.colors['grid'], wtrack_rect, 2, border_radius=4)
 
-            y_pos += 30
+                whandle_x = wtrack_x + wfill_w
+                whandle_rect = pygame.Rect(0, 0, 10, wtrack_h + 8)
+                whandle_rect.center = (whandle_x, wtrack_y + wtrack_h // 2)
+                pygame.draw.rect(screen, self.colors['text'], whandle_rect, border_radius=3)
+
+                self.ui_rects['region_wave_slider'] = wtrack_rect
+
+                y_pos += wtrack_h + 16
+
+                # Seed — determines which chunks lose their waves at a given
+                # Wave Amount; reroll to reshuffle the layout.
+                seed_label = self.font_medium.render("Seed:", True, self.colors['text'])
+                screen.blit(seed_label, (self.palette_x + self.palette_padding, y_pos))
+
+                seed_input_x = self.palette_x + self.palette_padding + 60
+                seed_input_y = y_pos - 3
+                seed_input_rect = pygame.Rect(seed_input_x, seed_input_y, 80, 25)
+                seed_bg_color = self.colors['input_active'] if self.region_seed_input_active else self.colors[
+                    'input_bg']
+                pygame.draw.rect(screen, seed_bg_color, seed_input_rect)
+                pygame.draw.rect(screen,
+                                 self.colors['accent'] if self.region_seed_input_active else self.colors['grid'],
+                                 seed_input_rect, 2)
+
+                seed_display = self.region_seed_text if self.region_seed_input_active else str(self.region_seed)
+                seed_text_surf = self.font_medium.render(seed_display, True, self.colors['text'])
+                seed_text_rect = seed_text_surf.get_rect(center=seed_input_rect.center)
+                screen.blit(seed_text_surf, seed_text_rect)
+
+                self.ui_rects['region_seed_input'] = seed_input_rect
+
+                reroll_rect = pygame.Rect(seed_input_rect.right + 8, seed_input_y, 60, 25)
+                pygame.draw.rect(screen, self.colors['panel_light'], reroll_rect, border_radius=4)
+                pygame.draw.rect(screen, self.colors['accent'], reroll_rect, 2, border_radius=4)
+                reroll_text = self.font_small.render("Reroll", True, self.colors['text'])
+                screen.blit(reroll_text, reroll_text.get_rect(center=reroll_rect.center))
+                self.ui_rects['region_seed_reroll'] = reroll_rect
+
+                y_pos += 30
+
+            current_style = REGION_STYLES.get(current_region_type, {})
+            num_tile_variants = max(1, current_style.get('grid_rows', 1))
+            if current_style.get('mode', 'patch') == 'tile' and num_tile_variants > 1:
+                # Static variant picker — tile-mode regions have no wave/
+                # color controls, just which of the sheet's non-animated
+                # variants a newly placed region uses. Default (slot 0) is
+                # the first variant, matching AnimatedRegion's own default.
+                # Shows the actual cropped sprite for each variant, same
+                # look as _draw_variant_selector's gate/stone/etc
+                # thumbnails, rather than plain numbered buttons. A
+                # single-frame tile sheet (grid_rows omitted or 1 — e.g. a
+                # one-off, non-square sprite with nothing to choose
+                # between) skips this picker entirely.
+                variant_label = self.font_medium.render("Variant:", True, self.colors['text'])
+                screen.blit(variant_label, (self.palette_x + self.palette_padding, y_pos))
+                y_pos += 20
+
+                variant_sprites = self._load_region_variant_sprites(current_region_type)
+                num_variants = num_tile_variants
+                btn_gap = 6
+                # Cap button size so a sheet with few variants (e.g. 2)
+                # doesn't stretch each button to fill the whole row width —
+                # buttons only shrink below this cap when there are enough
+                # variants that the full-width division would exceed it.
+                max_btn_size = 56
+                fit_w = (self.palette_width - self.palette_padding * 2 - btn_gap * (num_variants - 1)) // num_variants
+                btn_w = min(max_btn_size, fit_w)
+                btn_h = btn_w
+                variant_rects = []
+                for i in range(num_variants):
+                    btn_x = self.palette_x + self.palette_padding + i * (btn_w + btn_gap)
+                    btn_rect = pygame.Rect(btn_x, y_pos, btn_w, btn_h)
+                    selected = (self.region_variant == i)
+                    bg_color = self.colors['variant_selected'] if selected else self.colors['panel_light']
+                    pygame.draw.rect(screen, bg_color, btn_rect, border_radius=4)
+                    pygame.draw.rect(screen, self.colors['accent'], btn_rect,
+                                     3 if selected else 2, border_radius=4)
+
+                    sprite = variant_sprites[i] if i < len(variant_sprites) else None
+                    if sprite:
+                        sw, sh = sprite.get_size()
+                        max_dim = btn_w - 8
+                        scale = min(max_dim / sw, max_dim / sh)
+                        if scale != 1:
+                            sprite = pygame.transform.scale(
+                                sprite, (max(1, int(sw * scale)), max(1, int(sh * scale)))
+                            )
+                        screen.blit(sprite, sprite.get_rect(center=btn_rect.center))
+                    else:
+                        # Asset not loaded yet — fall back to a number so the
+                        # slot is still identifiable and clickable.
+                        num_text = self.font_small.render(str(i + 1), True, self.colors['text'])
+                        screen.blit(num_text, num_text.get_rect(center=btn_rect.center))
+
+                    variant_rects.append(btn_rect)
+
+                self.ui_rects['region_variant_rects'] = variant_rects
+                y_pos += btn_h + 16
+
+            # Color tint — every 'patch'-mode region supports it (water/lava/
+            # grass today, and any new 64x64 sheet added to REGION_STYLES).
+            # A hue strip + saturation/value square, plus a swatch preview.
+            # (255, 255, 255) leaves the sprite's original colors alone. The
+            # runtime only recolors the sprite's non-white pixels, so foam/
+            # highlight whites (water/lava) or the lightest grass shade stay
+            # put no matter what's picked here.
+            current_style = REGION_STYLES.get(current_region_type, {})
+            if current_style.get('mode', 'patch') == 'patch':
+                type_label = current_style.get('label', current_region_type.title())
+                # style label is like "Water Region" — swap the trailing
+                # "Region" for "Color:" so new sheets get a sensible label
+                # for free without needing their own dict entry.
+                color_label_text = type_label.replace('Region', '').strip() + " Color:" \
+                    if 'Region' in type_label else f"{type_label} Color:"
+                color_label = self.font_medium.render(color_label_text, True, self.colors['text'])
+                screen.blit(color_label, (self.palette_x + self.palette_padding, y_pos))
+
+                swatch_rect = pygame.Rect(self.palette_x + self.palette_padding + 120, y_pos - 2, 30, 18)
+                pygame.draw.rect(screen, self.region_color, swatch_rect)
+                pygame.draw.rect(screen, self.colors['grid'], swatch_rect, 2)
+
+                reset_rect = pygame.Rect(swatch_rect.right + 8, y_pos - 2, 60, 18)
+                pygame.draw.rect(screen, self.colors['panel_light'], reset_rect, border_radius=4)
+                pygame.draw.rect(screen, self.colors['accent'], reset_rect, 2, border_radius=4)
+                reset_text = self.font_small.render("Reset", True, self.colors['text'])
+                screen.blit(reset_text, reset_text.get_rect(center=reset_rect.center))
+                self.ui_rects['region_color_reset'] = reset_rect
+
+                y_pos += 26
+
+                hue, sat, val = self._region_color_hsv()
+
+                hue_w = 18
+                gap = 10
+                sv_h = 90
+                sv_x = self.palette_x + self.palette_padding
+                sv_y = y_pos
+                sv_w = self.palette_width - self.palette_padding * 2 - hue_w - gap
+                sv_rect = pygame.Rect(sv_x, sv_y, sv_w, sv_h)
+
+                sv_surf = self._get_sv_square_surface(hue, sv_w, sv_h)
+                screen.blit(sv_surf, sv_rect.topleft)
+                pygame.draw.rect(screen, self.colors['grid'], sv_rect, 2)
+
+                # Cursor ring — white on dark colors, black on light ones so
+                # it's always visible against whatever's under it.
+                sv_cursor_x = sv_rect.left + int(sat * sv_rect.width)
+                sv_cursor_y = sv_rect.top + int((1 - val) * sv_rect.height)
+                ring_color = (255, 255, 255) if val < 0.6 else (0, 0, 0)
+                pygame.draw.circle(screen, ring_color, (sv_cursor_x, sv_cursor_y), 6, 2)
+
+                self.ui_rects['region_sv_square'] = sv_rect
+
+                hue_rect = pygame.Rect(sv_rect.right + gap, sv_y, hue_w, sv_h)
+                hue_surf = self._get_hue_strip_surface(hue_w, sv_h)
+                screen.blit(hue_surf, hue_rect.topleft)
+                pygame.draw.rect(screen, self.colors['grid'], hue_rect, 2)
+
+                hue_marker_y = hue_rect.top + int(hue * hue_rect.height)
+                marker_rect = pygame.Rect(hue_rect.left - 2, hue_marker_y - 2, hue_rect.width + 4, 4)
+                pygame.draw.rect(screen, (255, 255, 255), marker_rect, 1)
+
+                self.ui_rects['region_hue_strip'] = hue_rect
+
+                y_pos += sv_h + 10
 
         instructions = [
             "Click: Select Object",

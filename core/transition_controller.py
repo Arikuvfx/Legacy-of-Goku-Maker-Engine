@@ -40,6 +40,14 @@ class TransitionController:
         # Flying transition state
         self.flying_transition_duration = 0.7
 
+        # Plain fade state — a standalone fade with no room swap or player
+        # movement, driven by the 'screen_fade' event action (see
+        # start_plain_fade()). Kept separate from the walk/flying fields
+        # above since those always imply a room change.
+        self.plain_fade_direction = None  # 'in' | 'out'
+        self.plain_fade_duration = 0.5
+        self.plain_fade_callback = None
+
     def is_transitioning(self):
         """Return True if a transition is currently in progress."""
         return self.transitioning
@@ -123,6 +131,36 @@ class TransitionController:
         self.transition_timer = 0.0
         self.flying_fade_duration = duration
 
+    def start_plain_fade(self, direction, duration=0.5, on_complete=None):
+        """Begin a standalone fade with no room swap or player movement —
+        this is what backs the 'screen_fade' event action.
+
+        Args:
+            direction:   'out' fades the screen from clear to black,
+                         'in' fades it from black to clear.
+            duration:    Length of the fade in seconds.
+            on_complete: Called with no args once the fade finishes — lets
+                         EventRunner's blocking-action contract (see
+                         event_actions.py) resume the sequence.
+
+        If a transition is already in progress, this is a no-op except for
+        immediately firing on_complete — otherwise a blocking screen_fade
+        action queued behind an active room transition would stall the
+        event sequence forever waiting for a callback that never comes.
+        """
+        if self.transitioning:
+            if on_complete:
+                on_complete()
+            return
+
+        self.transitioning = True
+        self.transition_type = 'plain_fade'
+        self.transition_phase = None
+        self.transition_timer = 0.0
+        self.plain_fade_direction = direction
+        self.plain_fade_duration = max(0.0001, duration)
+        self.plain_fade_callback = on_complete
+
     def update(self, dt, player):
         """Advance the transition state machine.
 
@@ -134,6 +172,18 @@ class TransitionController:
             return
 
         self.transition_timer += dt
+
+        # Plain fade: just track the timer and fire the completion callback
+        # when it finishes — no room swap, no player movement.
+        if self.transition_type == 'plain_fade':
+            if self.transition_timer >= self.plain_fade_duration:
+                self.transitioning = False
+                self.transition_type = None
+                callback = self.plain_fade_callback
+                self.plain_fade_callback = None
+                if callback:
+                    callback()
+            return
 
         # Flying transitions: just track the timer; movement is external
         if self.transition_type == 'flying':
@@ -234,7 +284,14 @@ class TransitionController:
 
         alpha = 0
 
-        if self.transition_type == 'flying':
+        if self.transition_type == 'plain_fade':
+            progress = min(1.0, self.transition_timer / self.plain_fade_duration)
+            if self.plain_fade_direction == 'out':
+                alpha = int(255 * progress)
+            else:  # 'in'
+                alpha = int(255 * (1.0 - progress))
+
+        elif self.transition_type == 'flying':
             # Fade to black in the first half, fade back in the second half
             progress = self.transition_timer / self.flying_fade_duration
             if progress < 0.5:

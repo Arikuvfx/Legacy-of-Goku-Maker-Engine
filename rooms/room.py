@@ -39,6 +39,14 @@ class Room:
         self.cutscene_triggers = []
         self.world_map_objects = []
         self.music_objects = []
+        self.animated_regions = []
+        self.doors = []
+        self.trigger_boxes = []
+
+        # Parallax/scrolling background image config, edited via the room
+        # editor's Background panel: {'image', 'parallax', 'scroll_x', 'scroll_y'}.
+        # Empty dict = no background image set for this room.
+        self.scrolling_bg = {}
 
         # Transient rooms are never saved to disk and hidden from the editor.
         # Used for the startup fallback room created by Game._create_default_room.

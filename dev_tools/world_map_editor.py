@@ -32,8 +32,6 @@ from typing import Optional
 
 import pygame
 
-from objects.music_object import get_available_music_tracks
-
 # ─────────────────────────────── constants ────────────────────────────────────
 
 SAVE_DIR    = os.path.join("assets", "world_maps")
@@ -458,6 +456,14 @@ class WorldMapEditor:
         self._pal_drag_start_y = 0
         self._pal_drag_tile_start_y = 0
 
+        # Real on-screen origin of the palette grid, captured each frame it's
+        # drawn (_draw_paint_panel). The panel's layout shifts vertically
+        # depending on what's drawn above it (e.g. the music row), so this
+        # must be read from the actual draw call rather than recomputed with
+        # fixed offsets — otherwise click hit-testing drifts out of sync with
+        # what's rendered.
+        self._palette_grid_origin: Optional[tuple[int, int]] = None
+
         # ── Grid visibility ───────────────────────────────────────────────────
         self.show_grid = True
 
@@ -817,8 +823,26 @@ class WorldMapEditor:
             return []
 
     def _get_music_track_names(self) -> list:
-        """Return a sorted list of track filenames from assets/audio/music/."""
-        return get_available_music_tracks()
+        """Return a sorted list of track filenames from assets/audio/music/.
+
+        Scanned directly from disk rather than imported from
+        objects/music_object.py, so the world map editor still works as a
+        standalone dev tool even if that module isn't importable (missing
+        file, no pygame.mixer/SoundEngine around, etc.) — same rationale
+        as event_editor.py's _discover_music_tracks(). Falls back to []
+        on any error; the dropdown just shows no tracks instead of
+        crashing the editor.
+        """
+        MUSIC_EXTENSIONS = ('.ogg', '.mp3', '.wav', '.it', '.xm', '.s3m', '.mod')
+        music_path = os.path.join('assets', 'audio', 'music')
+        try:
+            return sorted({
+                os.path.splitext(f)[0]
+                for f in os.listdir(music_path)
+                if f.lower().endswith(MUSIC_EXTENSIONS)
+            })
+        except Exception:
+            return []
 
     def _cancel_loc_dialog(self):
         self.loc_dialog          = False
@@ -928,8 +952,12 @@ class WorldMapEditor:
     def _palette_mouse_to_tile(self, mx: int, my: int
                                ) -> Optional[tuple[int, int]]:
         """Convert panel-relative mouse pos to palette tile coords."""
-        grid_x = self.vp_x + self.vp_w + 10 - self.palette_scroll_x
-        grid_y = TOP_BAR_H + 55 - self.palette_scroll_y
+        if self._palette_grid_origin is None:
+            # Not drawn yet this session — nothing to hit-test against.
+            return None
+        origin_x, origin_y = self._palette_grid_origin
+        grid_x = origin_x - self.palette_scroll_x
+        grid_y = origin_y - self.palette_scroll_y
         ts = self.current_tileset
         if not ts:
             return None
@@ -2572,6 +2600,7 @@ class WorldMapEditor:
         if not ts:
             surf = self.font_medium.render('No tilesets found', True, self.C['dim'])
             screen.blit(surf, (px, py))
+            self._palette_grid_origin = None
             return
 
         # Tileset name + TAB hint
@@ -2584,6 +2613,11 @@ class WorldMapEditor:
 
         # Palette grid (scrollable)
         grid_x = px;  grid_y = py
+        # Record the real, unscrolled screen origin of the grid so click
+        # hit-testing (_palette_mouse_to_tile) matches whatever ends up drawn
+        # above this panel (e.g. the music row), instead of assuming a fixed
+        # layout offset that can silently drift out of sync.
+        self._palette_grid_origin = (grid_x, grid_y)
         palette_h = self.screen_height - TOP_BAR_H - 160
         clip = pygame.Rect(grid_x - 4, grid_y, PANEL_W - 12, palette_h)
         screen.set_clip(clip)

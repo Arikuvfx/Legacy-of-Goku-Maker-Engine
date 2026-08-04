@@ -162,8 +162,10 @@ class DestructibleStone:
         if not self.active or self.is_destroying:
             return False
 
-        # Only respond to melee attacks
-        if attack_type != 'melee':
+        # Respond to melee, projectile, and genkidama attacks. Beam/masenko-style
+        # attacks aren't handled here — add another branch if stones should
+        # react to those too.
+        if attack_type not in ('melee', 'projectile', 'genkidama'):
             return False
 
         # Use pygame time if current_time not provided
@@ -186,8 +188,9 @@ class DestructibleStone:
             self.height
         )
 
-        # MeleeAttack uses 'size' instead of width/height
-        # Check if attack has a get_rect method or size attribute
+        # MeleeAttack uses 'size' instead of width/height; Projectile-style
+        # attacks (ki blasts, genkidama) use 'radius' instead.
+        # Check if attack has a get_rect method, size, or radius attribute.
         if hasattr(attack, 'get_rect'):
             attack_rect = attack.get_rect()
         elif hasattr(attack, 'size'):
@@ -196,6 +199,13 @@ class DestructibleStone:
                 attack.y - attack.size // 2,
                 attack.size,
                 attack.size
+            )
+        elif hasattr(attack, 'radius'):
+            attack_rect = pygame.Rect(
+                attack.x - attack.radius,
+                attack.y - attack.radius,
+                attack.radius * 2,
+                attack.radius * 2
             )
         else:
             # Fallback: use default size
@@ -210,7 +220,10 @@ class DestructibleStone:
         if stone_rect.colliderect(attack_rect):
             # Mark this attack as having hit this stone with current timestamp
             self.hit_by_attacks[attack_id] = current_time
-            self.take_damage(1)
+            if attack_type == 'genkidama':
+                self.take_damage(self.health)  # always lethal, regardless of stone_type
+            else:
+                self.take_damage(1)
             return True
 
         return False
@@ -315,34 +328,29 @@ class DestructibleStone:
             sprite_y = int(screen_y - scaled_height // 2)
             screen.blit(scaled_sprite, (sprite_x, sprite_y))
 
-            # Draw health indicator (for medium and big stones when damaged)
-            if self.stone_type in ['medium', 'big'] and self.health < self.max_health:
-                self._draw_health_indicator(screen, screen_x, screen_y, scaled_height)
+    def get_collision_rect(self):
+        """Return this stone's collision rect for movement-blocking, or None
+        while it's not currently solid (destroyed / mid-destruction).
 
-    def _draw_health_indicator(self, screen, screen_x, screen_y, scaled_height):
-        """Draw small health pips above stone"""
-        pip_size = int(4 * RENDER_SCALE)
-        pip_spacing = int(6 * RENDER_SCALE)
-        total_width = (self.max_health * pip_spacing) - int(2 * RENDER_SCALE)
-
-        start_x = screen_x - total_width // 2
-        pip_y = screen_y - scaled_height // 2 - int(8 * RENDER_SCALE)
-
-        for i in range(self.max_health):
-            pip_x = start_x + i * pip_spacing
-
-            if i < self.health:
-                # Full pip
-                pygame.draw.circle(screen, (100, 255, 100),
-                                   (int(pip_x), int(pip_y)), pip_size // 2)
-                pygame.draw.circle(screen, (255, 255, 255),
-                                   (int(pip_x), int(pip_y)), pip_size // 2, 1)
-            else:
-                # Empty pip
-                pygame.draw.circle(screen, (50, 50, 50),
-                                   (int(pip_x), int(pip_y)), pip_size // 2)
-                pygame.draw.circle(screen, (100, 100, 100),
-                                   (int(pip_x), int(pip_y)), pip_size // 2, 1)
+        player.py's generic obstacle-blocking check
+        (check_collision_with_obstacles) only recognizes obstacles that
+        expose get_collision_rect() — that's how CollisionObject plugs into
+        it. DestructibleStone previously only offered
+        check_collision_with_player(), which that generic loop never calls
+        (it doesn't know about this class specifically), so every stone was
+        silently skipped via hasattr() and the player walked straight
+        through them despite self.solid being True. Same rect construction
+        as check_collision_with_player/check_collision_with_attack below,
+        just exposed under the name the generic loop actually looks for.
+        """
+        if not self.active or not self.solid:
+            return None
+        return pygame.Rect(
+            self.x - self.width // 2,
+            self.y - self.height // 2,
+            self.width,
+            self.height
+        )
 
     def check_collision_with_player(self, player):
         """Check if player collides with this stone (for blocking movement)"""

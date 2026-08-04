@@ -58,6 +58,31 @@ class SpriteHUD:
         else:
             app_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.base_path = os.path.join(app_path, "assets", "ui", "hud")
+        self.attacks_path = os.path.join(app_path, "assets", "sprites", "attacks")
+
+        # Attack-icon HUD keys map to the actual attack folder ids (the same
+        # ids used in equipped_attacks / _get_allowed_ki_modes), since the
+        # icons now live at assets/attacks/<folder_id>/icon.png instead of
+        # the old flat files under assets/ui/hud.
+        self._attack_icon_folders = {
+            'attack_icon_blast':                'ki_blast',
+            'attack_icon_beam':                 'kamehameha',
+            'attack_icon_kamekameha':            'kamekameha',
+            'attack_icon_banshee_blast':          'banshee_blast',
+            'attack_icon_energy_punch':          'energy_punch',
+            'attack_icon_dragon_fist':           'dragon_fist',
+            'attack_icon_final_flash':           'final_flash',
+            'attack_icon_big_bang_kamehameha':   'big_bang_kamehameha',
+            'attack_icon_genkidama':             'genkidama',
+            'attack_icon_big_bang_attack':        'big_bang_attack',
+            'attack_icon_masenko':               'masenko',
+            'attack_icon_burning_attack':        'burning_attack',
+            'attack_icon_flame_kamehameha':      'flame_kamehameha',
+            'attack_icon_ultra_volleyball':       'ultra_volleyball_attack',
+            'attack_icon_sword':                 'energy_sword',
+            'attack_icon_instant_transmission':  'instant_transmission',
+            'attack_icon_ghost_kamikaze':         'ghost_kamikaze_attack',
+        }
 
         print(f"\n=== Loading HUD Sprites ===")
         print(f"Looking in: {self.base_path}")
@@ -70,14 +95,22 @@ class SpriteHUD:
             'transformed_ki_bar':  HUDSprite(os.path.join(self.base_path, "transformed_ki_bar.png")),
             'exp_bar':             HUDSprite(os.path.join(self.base_path, "exp_bar.png")),
             'transform_bar':       HUDSprite(os.path.join(self.base_path, "transform_bar.png")),
-            'attack_icon_blast':   HUDSprite(os.path.join(self.base_path, "attack_icon_blast.png")),
-            'attack_icon_beam':    HUDSprite(os.path.join(self.base_path, "attack_icon_beam.png")),
+            # Transformation icon is NOT affected by the attacks-folder switch.
             'transformation_icon': HUDSprite(os.path.join(self.base_path, "transformation_icon.png")),
+            # Default/fallback attack icon also stays in the HUD folder.
             'attack_icon':         HUDSprite(os.path.join(self.base_path, "attack_icon.png")),
             # Boss HP bar — background plate drawn first, fill bar cropped on top
             'boss_bar_bg':         HUDSprite(os.path.join(self.base_path, "boss_bar_bg.png")),
             'boss_bar':            HUDSprite(os.path.join(self.base_path, "boss_bar.png")),
         }
+
+        print(f"\n=== Loading Attack Icon Sprites ===")
+        print(f"Looking in: {self.attacks_path}\n")
+
+        for hud_key, folder_id in self._attack_icon_folders.items():
+            self.sprites[hud_key] = HUDSprite(
+                os.path.join(self.attacks_path, folder_id, "icon.png")
+            )
 
         print("=== HUD Loading Complete ===\n")
 
@@ -85,6 +118,9 @@ class SpriteHUD:
         self.config = {
             'frame':              {'x': 0, 'y': 0, 'w': 338, 'h': 100},
             'attack_icon':        {'x': 0, 'y': 0, 'w': 338, 'h': 100},
+            # Real per-attack icons are 64×28 native — draw at native size
+            # (scaled by sc()) instead of stretching them to fill the frame.
+            'attack_mode_icon':   {'x': 43, 'y': 26, 'w': 64, 'h': 28},
             'hp_bar':             {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 123, 'bar_end': 294},
             'ki_bar':             {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 123, 'bar_end': 294},
             'transformed_ki_bar': {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 123, 'bar_end': 294},
@@ -285,6 +321,13 @@ class SpriteHUD:
         icfg  = self.config['attack_icon']
         ix, iy = bx + sc(icfg['x']), by + sc(icfg['y'])
         iw, ih = sc(icfg['w']),       sc(icfg['h'])
+
+        # Real per-attack icons are much smaller (64×28 native) — draw them
+        # at their own size/anchor instead of the old full-frame icfg.
+        acfg  = self.config['attack_mode_icon']
+        ax, ay = bx + sc(acfg['x']), by + sc(acfg['y'])
+        aw, ah = sc(acfg['w']),       sc(acfg['h'])
+
         mode  = getattr(player, 'ki_attack_mode', 'blast')
 
         xform_opacity = 255
@@ -293,11 +336,41 @@ class SpriteHUD:
                 xform_opacity = 128  # dim the icon when transform isn't charged
 
         if mode == 'beam' and self.sprites['attack_icon_beam'].sprite:
-            self.sprites['attack_icon_beam'].draw(screen, ix, iy, iw, ih)
+            self.sprites['attack_icon_beam'].draw(screen, ax, ay, aw, ah)
+        elif mode == 'kamekameha' and self.sprites['attack_icon_kamekameha'].sprite:
+            self.sprites['attack_icon_kamekameha'].draw(screen, ax, ay, aw, ah)
+        elif mode == 'banshee_blast' and self.sprites['attack_icon_banshee_blast'].sprite:
+            self.sprites['attack_icon_banshee_blast'].draw(screen, ax, ay, aw, ah)
+        elif mode == 'energy_punch' and self.sprites['attack_icon_energy_punch'].sprite:
+            self.sprites['attack_icon_energy_punch'].draw(screen, ax, ay, aw, ah)
+        elif mode == 'dragon_fist' and self.sprites['attack_icon_dragon_fist'].sprite:
+            self.sprites['attack_icon_dragon_fist'].draw(screen, ax, ay, aw, ah)
+        elif mode == 'final_flash' and self.sprites['attack_icon_final_flash'].sprite:
+            self.sprites['attack_icon_final_flash'].draw(screen, ax, ay, aw, ah)
+        elif mode == 'big_bang_kamehameha' and self.sprites['attack_icon_big_bang_kamehameha'].sprite:
+            self.sprites['attack_icon_big_bang_kamehameha'].draw(screen, ax, ay, aw, ah)
+        elif mode == 'genkidama' and self.sprites['attack_icon_genkidama'].sprite:
+            self.sprites['attack_icon_genkidama'].draw(screen, ax, ay, aw, ah)
+        elif mode == 'big_bang_attack' and self.sprites['attack_icon_big_bang_attack'].sprite:
+            self.sprites['attack_icon_big_bang_attack'].draw(screen, ax, ay, aw, ah)
+        elif mode == 'masenko' and self.sprites['attack_icon_masenko'].sprite:
+            self.sprites['attack_icon_masenko'].draw(screen, ax, ay, aw, ah)
+        elif mode == 'burning_attack' and self.sprites['attack_icon_burning_attack'].sprite:
+            self.sprites['attack_icon_burning_attack'].draw(screen, ax, ay, aw, ah)
+        elif mode == 'flame_kamehameha' and self.sprites['attack_icon_flame_kamehameha'].sprite:
+            self.sprites['attack_icon_flame_kamehameha'].draw(screen, ax, ay, aw, ah)
+        elif mode == 'ultra_volleyball_attack' and self.sprites['attack_icon_ultra_volleyball'].sprite:
+            self.sprites['attack_icon_ultra_volleyball'].draw(screen, ax, ay, aw, ah)
+        elif mode == 'sword' and self.sprites['attack_icon_sword'].sprite:
+            self.sprites['attack_icon_sword'].draw(screen, ax, ay, aw, ah)
+        elif mode == 'instant_transmission' and self.sprites['attack_icon_instant_transmission'].sprite:
+            self.sprites['attack_icon_instant_transmission'].draw(screen, ax, ay, aw, ah)
+        elif mode == 'ghost_kamikaze_attack' and self.sprites['attack_icon_ghost_kamikaze'].sprite:
+            self.sprites['attack_icon_ghost_kamikaze'].draw(screen, ax, ay, aw, ah)
         elif mode == 'transform' and self.sprites['transformation_icon'].sprite:
             self.sprites['transformation_icon'].draw(screen, ix, iy, iw, ih, opacity=xform_opacity)
         elif mode == 'blast' and self.sprites['attack_icon_blast'].sprite:
-            self.sprites['attack_icon_blast'].draw(screen, ix, iy, iw, ih)
+            self.sprites['attack_icon_blast'].draw(screen, ax, ay, aw, ah)
         else:
             self.sprites['attack_icon'].draw(screen, ix, iy, iw, ih)
 
@@ -349,31 +422,6 @@ class SpriteHUD:
                 player.transformation.get_shine_alpha(),
                 self.sprites['transform_bar']
             )
-
-        # 7. Unspent stat points — pulsing gold circle in the corner
-        if player.stat_points > 0:
-            pulse = abs(int((time.time() * 3) % 2 - 1) * 80) + 175
-            pulse_color = (pulse, pulse, 0)
-
-            sx = bx + sc(self.config['frame']['w']) - sc(30)
-            sy = by + sc(self.config['frame']['h']) - sc(25)
-
-            base_r = sc(12)
-            for r in range(sc(18), base_r, max(1, -sc(2))):
-                alpha = 50 - (sc(18) - r) * 8
-                glow = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
-                pygame.draw.circle(glow, (*pulse_color, alpha), (r, r), r)
-                screen.blit(glow, (sx - r, sy - r))
-
-            pygame.draw.circle(screen, pulse_color,           (sx, sy), base_r)
-            pygame.draw.circle(screen, self.colors['stat_points'], (sx, sy), base_r, max(1, sc(2)))
-            pygame.draw.circle(screen, self.colors['shadow'], (sx, sy), sc(10), 1)
-
-            label = str(player.stat_points)
-            tw    = self.font_large.size(label)[0]
-            self.draw_text_with_shadow(screen, label,
-                                       sx - tw // 2, sy - sc(8),
-                                       self.font_large, (255, 255, 255))
 
         # 8. Boss HP bar — right side, bottom-aligned with player HUD.
         # Show when any alive boss is aware. The locked max HP ensures killing

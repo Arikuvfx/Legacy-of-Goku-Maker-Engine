@@ -52,7 +52,7 @@ Cutscene JSON format
 ──────────────────────────────────────────────────────────────────────────────
 """
 import pygame
-from .cutscene_actor import CutsceneActor
+from .cutscene_actor import CutsceneActor, AttackEffectVisual, create_attack_effect
 from .cutscene_camera_target import CutsceneCameraTarget
 
 # Grace period for weather fading in/out — keeps transitions smooth so
@@ -333,6 +333,14 @@ class CutsceneRuntime:
         self.overlay_speed  = 0.0   # alpha units/second (unsigned)
         self.overlay_color  = (0, 0, 0)
 
+        # Flash state — a flash ramps up to full white and back down again
+        # within its own window, so it doesn't fit the single-direction
+        # overlay_target/overlay_speed tween used by fade_in/fade_out. It's
+        # tracked separately as a start time + duration and resolved
+        # analytically (see _flash_alpha) in both update() and seek().
+        self._flash_start    = None   # elapsed time (s) the active flash fired, or None
+        self._flash_duration = 0.0
+
         # Camera target starts at the current view centre so the first pan_to
         # has a sensible origin even if no snap_to fires at t=0.
         self.camera_target = CutsceneCameraTarget(
@@ -346,6 +354,16 @@ class CutsceneRuntime:
             entity = entity_factory(actor_def)
             if entity is not None:
                 self.actors[actor_def['id']] = CutsceneActor(actor_def['id'], entity)
+
+        # Purely-visual attack-effect previews (see create_attack_effect() /
+        # AttackEffectVisual in core/cutscene_actor.py) — separate objects
+        # from the actors that cast them, spawned by _fire_attack_effect()
+        # alongside the on_spawn_attack callback. create_attack_effect()
+        # prefers the real attacks/*.py class for attack_type (real beam
+        # growth, real chain/travel shapes, ...) and only falls back to the
+        # generic AttackEffectVisual placeholder for attack_types with no
+        # real-class mapping (melee/charge, or anything unrecognized).
+        self._attack_effects: list = []
 
         # Cached room dimensions — set on first update(), consumed by seek()
         # so it can drive the camera on scrubbed frames.
@@ -383,6 +401,25 @@ class CutsceneRuntime:
         # so the runtime can request a room transition without importing game state.
         # Signature: on_change_room(room_name: str, spawn_x: None, spawn_y: None)
         self.on_change_room = None
+
+        # Identity of the most recent change_room action actually applied via
+        # on_change_room (see the re-fire block at the end of seek()). change_room
+        # is suppressed during seek()'s replay loop (_do_room's _seeking guard),
+        # so without this a change_room at t<=0 would be silently consumed by the
+        # very first seek(0.0) game.py calls right after construction — advancing
+        # action_index past it — and never actually applied. Dedupe on action
+        # identity so repeated scrubs across the same window don't reload the
+        # room over and over.
+        self._last_applied_room_action = None
+
+        # Attack-effect callback — set by the caller (e.g. game.py) after
+        # construction, same pattern as on_change_room above. Fired when a
+        # scripted 'attack' action reaches its release_delay; responsible for
+        # actually spawning the Projectile/MeleeAttack/beam effect into the
+        # game's live object lists, since the runtime has no access to those.
+        # Signature: on_spawn_attack(actor: CutsceneActor, params: dict,
+        #                            attack_action: _AttackAction)
+        self.on_spawn_attack = None
 
         # Auto-weather: set via the top-level "weather" key in the cutscene JSON.
         # The runtime handles the full fade-in/out lifecycle automatically so
@@ -446,8 +483,22 @@ class CutsceneRuntime:
         for actor in self.actors.values():
             actor.update(dt)
 
+        for effect in self._attack_effects[:]:
+            effect.update(dt, self._world_width, self._world_height)
+            if effect.finished:
+                self._attack_effects.remove(effect)
+
         # Advance the colour overlay fade.
-        if self.overlay_speed > 0:
+        if self._flash_start is not None:
+            # Flash follows its own ramp-up/ramp-down envelope over
+            # elapsed time rather than the linear overlay_speed tween.
+            f_elapsed = self.elapsed - self._flash_start
+            if f_elapsed >= self._flash_duration:
+                self.overlay_alpha = 0.0
+                self._flash_start  = None
+            else:
+                self.overlay_alpha = self._flash_alpha(f_elapsed, self._flash_duration)
+        elif self.overlay_speed > 0:
             diff = self.overlay_target - self.overlay_alpha
             step = self.overlay_speed * dt
             if abs(diff) <= step:
@@ -530,7 +581,17 @@ class CutsceneRuntime:
         """
         sorted_actors = sorted(self.actors.values(), key=lambda a: a.entity.y)
         for actor in sorted_actors:
+            # Charge-effect previews (see CutsceneActor.attack()) layer
+            # front/behind this same actor exactly like their real-gameplay
+            # counterparts do via LayerManager.
+            actor.draw_charge_effects(screen, camera, colors, behind=True)
             actor.draw(screen, camera, colors)
+            actor.draw_charge_effects(screen, camera, colors, behind=False)
+
+        # Attack-effect previews draw on top of actors — same relative
+        # layering real projectiles/beams get in normal gameplay.
+        for effect in self._attack_effects:
+            effect.draw(screen, camera, colors)
 
     def draw_weather(self, screen, screen_width, screen_height):
         """Draw the weather layer.
@@ -542,9 +603,13 @@ class CutsceneRuntime:
             self._weather.draw(screen, screen_width, screen_height)
 
     def draw_overlay(self, screen, screen_width, screen_height):
-        """Draw the invert effect and colour-fade overlay on top of everything.
+        """Draw the invert effect and colour-fade overlay above the scene.
 
-        Layering order: world → actors → weather → dialogue box → this overlay.
+        Layering order: world → actors → weather → this overlay → dialogue box
+        / HUD (drawn afterward by the caller's UI layer). Keeping the overlay
+        below the dialogue box means a fade_in/fade_out/flash/invert dims or
+        colours the scene without ever hiding dialogue text that's open at
+        the same time.
         """
         if self._invert_active:
             self._apply_invert(screen, self._invert_mode)
@@ -553,10 +618,16 @@ class CutsceneRuntime:
         if alpha <= 0:
             return
         size = (screen_width, screen_height)
-        if not hasattr(self, '_overlay_surf') or self._overlay_surf.get_size() != size:
-            self._overlay_surf = pygame.Surface(size)
-        self._overlay_surf.fill(self.overlay_color)
-        self._overlay_surf.set_alpha(min(255, alpha))
+        # Use SRCALPHA so the alpha is baked into the fill — set_alpha() does
+        # not work correctly when blitting onto a pygame.SCALED display
+        # surface (see the same fix applied to game.py's _draw_cutscene_fade,
+        # _draw_map_jump_fade, and _draw_white_flash).
+        if (not hasattr(self, '_overlay_surf')
+                or self._overlay_surf.get_size() != size
+                or not (self._overlay_surf.get_flags() & pygame.SRCALPHA)):
+            self._overlay_surf = pygame.Surface(size, pygame.SRCALPHA)
+        r, g, b = self.overlay_color
+        self._overlay_surf.fill((r, g, b, min(255, alpha)))
         screen.blit(self._overlay_surf, (0, 0))
 
     @staticmethod
@@ -617,6 +688,10 @@ class CutsceneRuntime:
         self._weather_fade_to      = 1.0
         self._weather_fade_dur     = 0.0
         self._weather_fade_elapsed = 0.0
+        # Allow a change_room at/before t=0 to fire again on this fresh
+        # play-through — see the re-fire block at the end of seek() and the
+        # docstring on _last_applied_room_action in __init__.
+        self._last_applied_room_action = None
         # Re-sort in case actions were edited since last play.
         self.pending_actions = sorted(
             self.data.get('actions', []),
@@ -624,6 +699,7 @@ class CutsceneRuntime:
         )
         for actor in self.actors.values():
             actor._tween = None
+            actor._charge_effects = []
             actor.set_animation('idle', actor.entity.direction)
 
     def seek(self, t):
@@ -639,6 +715,8 @@ class CutsceneRuntime:
         self.overlay_alpha       = 0.0
         self.overlay_target      = 0.0
         self.overlay_speed       = 0.0
+        self._flash_start        = None
+        self._flash_duration     = 0.0
         self._dialogue_paused    = False
         self._pre_dialogue_state = {}
         self._invert_active      = False
@@ -650,6 +728,7 @@ class CutsceneRuntime:
         self._weather_fade_to      = 1.0
         self._weather_fade_dur     = 0.0
         self._weather_fade_elapsed = 0.0
+        self._attack_effects       = []
 
         self.pending_actions = sorted(
             self.data.get('actions', []),
@@ -662,6 +741,7 @@ class CutsceneRuntime:
             if aid in self.actors:
                 actor = self.actors[aid]
                 actor._tween    = None
+                actor._charge_effects = []
                 actor.entity.x  = float(actor_def.get('x', 0))
                 actor.entity.y  = float(actor_def.get('y', 0))
                 actor.set_animation('idle', 'down')
@@ -669,7 +749,8 @@ class CutsceneRuntime:
         # Replay all actions up to t, tracking the most-recent of each type
         # so we can resolve the correct state afterwards.
         last_anim_time       = {aid: 0.0 for aid in self.actors}
-        last_move_start      = {}   # actor_id → timestamp the active move_to fired
+        last_move_start      = {}   # actor_id → timestamp the active move_to/fly_to fired
+        last_attack_start    = {}   # actor_id → timestamp the active attack fired
         last_overlay_action  = None
         last_shake_action    = None
         last_dialogue_action = None
@@ -677,6 +758,7 @@ class CutsceneRuntime:
         last_weather_on      = None  # most-recent weather_start / weather_fade_in
         last_weather_off     = None  # most-recent weather_stop  / weather_fade_out
         last_music_action    = None  # most-recent play_music (sound target)
+        last_room_action     = None  # most-recent change_room action at/before t
 
         self.action_index = 0
         self._seeking = True
@@ -711,17 +793,24 @@ class CutsceneRuntime:
             # world position from any still-active tween. In live playback
             # actor.update() does this every frame; here we do it manually so
             # sequential move_to calls don't all start from the original spawn point.
-            if atype in ('move_to', 'fly_to', 'set_animation', 'face') and target in self.actors:
+            if atype in ('move_to', 'fly_to', 'set_animation', 'face', 'attack') and target in self.actors:
                 actor = self.actors[target]
                 if actor._tween:
-                    prev_start      = last_move_start.get(target, 0.0)
-                    elapsed_in_prev = action['time'] - prev_start
-                    tw   = actor._tween
-                    prog = min(1.0, elapsed_in_prev / tw.duration) if tw.duration > 0 else 1.0
-                    actor.entity.x = tw.start_x + (tw.end_x - tw.start_x) * prog
-                    actor.entity.y = tw.start_y + (tw.end_y - tw.start_y) * prog
-                    if prog >= 1.0:
-                        actor._tween = None  # clear finished tween before the next action runs
+                    from .cutscene_actor import _AttackAction as _AA
+                    if isinstance(actor._tween, _AA):
+                        # Attack tweens don't move x/y — just let whatever action
+                        # is about to fire replace them; nothing to resolve here.
+                        actor._tween = None
+                        actor._charge_effects = []
+                    else:
+                        prev_start      = last_move_start.get(target, 0.0)
+                        elapsed_in_prev = action['time'] - prev_start
+                        tw   = actor._tween
+                        prog = min(1.0, elapsed_in_prev / tw.duration) if tw.duration > 0 else 1.0
+                        actor.entity.x = tw.start_x + (tw.end_x - tw.start_x) * prog
+                        actor.entity.y = tw.start_y + (tw.end_y - tw.start_y) * prog
+                        if prog >= 1.0:
+                            actor._tween = None  # clear finished tween before the next action runs
 
             self._execute_action(action)
             self.action_index = i + 1
@@ -735,6 +824,13 @@ class CutsceneRuntime:
                         self.camera_target._tweens[-1]['fire_time'] = action['time']
                 elif atype == 'shake':
                     last_shake_action = action
+            elif target == 'room':
+                if atype == 'change_room':
+                    # change_room is a no-op during this replay loop (see
+                    # _do_room's _seeking guard) — just remember the most
+                    # recent one so it can be applied for real below, once
+                    # _seeking is False.
+                    last_room_action = action
             elif target == 'screen':
                 if atype in ('fade_in', 'fade_out', 'set_overlay', 'flash'):
                     last_overlay_action = action
@@ -762,13 +858,18 @@ class CutsceneRuntime:
                 # resolve for it after scrubbing (same as it staying silent
                 # during the loop above via the _seeking guard in _do_sound).
             elif target in self.actors:
-                if atype in ('set_animation', 'move_to', 'fly_to', 'face'):
+                if atype in ('set_animation', 'move_to', 'fly_to', 'face', 'attack'):
                     last_anim_time[target] = action['time']
                 if atype in ('move_to', 'fly_to'):
                     last_move_start[target] = action['time']
                 elif atype in ('teleport', 'set_animation', 'face',
                                'set_character', 'set_costume'):
                     last_move_start.pop(target, None)
+                if atype == 'attack':
+                    last_attack_start[target] = action['time']
+                elif atype in ('teleport', 'set_animation', 'face', 'move_to',
+                               'fly_to', 'set_character', 'set_costume'):
+                    last_attack_start.pop(target, None)
 
         self._seeking = False
 
@@ -790,6 +891,23 @@ class CutsceneRuntime:
                 # Cut instantly rather than fading — we just jumped straight
                 # to t, there's no in-progress fade to animate through.
                 self.sound_manager.stop_music(fade_out=False)
+
+        # ── Room: actually apply whatever change_room should be active at t ────
+        # change_room was suppressed during the replay loop above (like
+        # play_music/play_sfx), but unlike those one-shot side effects, a
+        # change_room at t<=0 that's never resolved here is lost forever: the
+        # very first seek(0.0) game.py calls right after constructing the
+        # runtime would consume the action (advance action_index past it)
+        # without ever calling on_change_room. Re-fire it for real now that
+        # _seeking is False, deduped on action identity so repeated scrubs
+        # across the same window don't reload the room over and over.
+        if (last_room_action is not None
+                and last_room_action is not self._last_applied_room_action
+                and callable(self.on_change_room)):
+            room_name = last_room_action.get('params', {}).get('room_name', '').strip()
+            if room_name:
+                self._last_applied_room_action = last_room_action
+                self.on_change_room(room_name, None, None)
 
         # ── Dialogue: never open a box while scrubbing ────────────────────────
         # show() is suppressed during the replay loop (via _seeking). Here we
@@ -847,26 +965,55 @@ class CutsceneRuntime:
             atype  = oa.get('type', '')
             t_fire = oa['time']
             params = oa.get('params', {})
+            # For each type: if the fade/flash window has already elapsed,
+            # settle to its resting value with speed=0 (nothing left to
+            # animate). Otherwise, in addition to setting the correct alpha
+            # for this instant, restore overlay_target/overlay_speed so that
+            # live playback (update()) can keep animating the tween forward
+            # from here — without this, scrubbing to a mid-fade moment and
+            # then hitting Play left the overlay frozen at that alpha forever,
+            # since update()'s tween step only runs while overlay_speed > 0.
             if atype == 'fade_in':
                 dur = params.get('duration', 1.0)
                 elapsed = t - t_fire
-                self.overlay_alpha = (0.0 if elapsed >= dur
-                                      else 255.0 * (1.0 - elapsed / dur) if dur > 0 else 0.0)
-                self.overlay_speed = 0.0
+                self.overlay_color  = tuple(params.get('color', [0, 0, 0]))
+                if elapsed >= dur:
+                    self.overlay_alpha  = 0.0
+                    self.overlay_target = 0.0
+                    self.overlay_speed  = 0.0
+                else:
+                    self.overlay_alpha  = 255.0 * (1.0 - elapsed / dur) if dur > 0 else 0.0
+                    self.overlay_target = 0.0
+                    self.overlay_speed  = 255.0 / dur if dur > 0 else 9999.0
             elif atype == 'fade_out':
                 dur = params.get('duration', 1.0)
                 elapsed = t - t_fire
-                self.overlay_alpha = (255.0 if elapsed >= dur
-                                      else 255.0 * (elapsed / dur) if dur > 0 else 255.0)
-                self.overlay_speed = 0.0
+                self.overlay_color  = tuple(params.get('color', [0, 0, 0]))
+                if elapsed >= dur:
+                    self.overlay_alpha  = 255.0
+                    self.overlay_target = 255.0
+                    self.overlay_speed  = 0.0
+                else:
+                    self.overlay_alpha  = 255.0 * (elapsed / dur) if dur > 0 else 255.0
+                    self.overlay_target = 255.0
+                    self.overlay_speed  = 255.0 / dur if dur > 0 else 9999.0
             elif atype == 'flash':
                 dur = params.get('duration', 0.3)
                 elapsed = t - t_fire
-                self.overlay_color = (255, 255, 255)
-                self.overlay_alpha = (0.0 if elapsed >= dur
-                                      else 255.0 * (1.0 - elapsed / dur) if dur > 0 else 0.0)
-                self.overlay_speed = 0.0
-            # set_overlay: _execute_action already wrote the correct alpha.
+                self.overlay_color  = tuple(params.get('color', [255, 255, 255]))
+                self.overlay_target = 0.0
+                self.overlay_speed  = 0.0   # flash isn't driven by the linear tween
+                if elapsed >= dur:
+                    self.overlay_alpha = 0.0
+                    self._flash_start  = None
+                else:
+                    self.overlay_alpha   = self._flash_alpha(elapsed, dur)
+                    # Store the actual fire time (not t) so update() computes
+                    # the same elapsed-since-fire value if playback resumes.
+                    self._flash_start    = t_fire
+                    self._flash_duration = dur
+            # set_overlay: _execute_action already wrote the correct alpha,
+            # and it has no time-based tween to resume (overlay_speed stays 0).
 
         # ── Invert: activate if t is inside the effect's time window ──────────
         if last_invert_action is not None:
@@ -958,32 +1105,119 @@ class CutsceneRuntime:
         # ── Actors: resolve tween positions and advance sprites to t ──────────
         for aid, actor in self.actors.items():
             if actor._tween:
-                tw               = actor._tween
-                action_start     = last_move_start.get(aid, t)
-                elapsed_in_tween = t - action_start
-                progress         = (min(1.0, elapsed_in_tween / tw.duration)
-                                    if tw.duration > 0 else 1.0)
+                tw = actor._tween
+                from .cutscene_actor import _AttackAction as _AA
+                if isinstance(tw, _AA):
+                    # Attack tweens hold a pose rather than moving x/y — resolve
+                    # elapsed/fired analytically but never re-fire on_release
+                    # here (that would spawn the effect on every scrub).
+                    action_start     = last_attack_start.get(aid, t)
+                    elapsed_in_tween = t - action_start
+                    if elapsed_in_tween >= tw.duration:
+                        actor._tween = None
+                        actor._charge_effects = []
+                        actor.set_animation('idle', actor.entity.direction)
+                        last_anim_time[aid] = action_start + tw.duration
+                    else:
+                        tw.elapsed = elapsed_in_tween
+                        tw.fired   = elapsed_in_tween >= tw.release_delay
 
-                actor.entity.x = tw.start_x + (tw.end_x - tw.start_x) * progress
-                actor.entity.y = tw.start_y + (tw.end_y - tw.start_y) * progress
+                        # tw.fired doesn't spawn anything on its own during a
+                        # scrub (on_release is suppressed above), so without
+                        # this, landing the scrubber anywhere between release
+                        # and the end of the pose shows the pose with no
+                        # effect at all. Build a throwaway stand-in here and
+                        # fast-forward it to match — same construction
+                        # _fire_attack_effect uses for real playback, just
+                        # never appended to on_spawn_attack's side of things
+                        # (no real projectile/collision during a scrub,
+                        # exactly like play_sfx/change_room staying silent).
+                        if tw.fired:
+                            # Real playback's _on_release swaps the pose from
+                            # charge_anim to release_anim the instant it
+                            # fires (e.g. kamehameha: 'charge' -> 'firebeam').
+                            # That swap only happens inside the on_release
+                            # callback, which this replay loop deliberately
+                            # never calls — so without this, the actor stays
+                            # stuck in its charge pose for the rest of the
+                            # scrub instead of showing the release frame.
+                            from .cutscene_actor import _ATTACK_ANIMATIONS
+                            _release_anim = _ATTACK_ANIMATIONS.get(
+                                tw.attack_type, ('melee', 'melee'))[1]
+                            actor.set_animation(_release_anim, actor.entity.direction)
 
-                if progress >= 1.0:
-                    # Tween finished before t — settle into idle.
-                    actor._tween = None
-                    actor.set_animation('idle', actor.entity.direction)
-                    last_anim_time[aid] = action_start + tw.duration
+                            # Release has already happened by this point in
+                            # the scrub — the charge glow disappears the same
+                            # instant the real attack fires (see
+                            # CutsceneActor.attack's _on_release) — mirror
+                            # that here too instead of leaving it visible for
+                            # the rest of the pose.
+                            actor._charge_effects = []
+
+                            from .cutscene_actor import create_attack_effect
+                            _p = getattr(tw, 'params', {})
+                            effect_elapsed  = elapsed_in_tween - tw.release_delay
+                            effect_duration = max(0.15, tw.duration - tw.release_delay)
+                            preview = create_attack_effect(
+                                tw.attack_type, actor.entity.x, actor.entity.y,
+                                direction=getattr(actor.entity, 'direction', 'down'),
+                                duration=_p.get('effect_duration', effect_duration),
+                                target_x=tw.target_x, target_y=tw.target_y,
+                                entity=actor.entity,
+                            )
+                            if effect_elapsed > 0:
+                                preview.update(effect_elapsed, self._world_width,
+                                               self._world_height)
+                            if not preview.finished:
+                                self._attack_effects.append(preview)
+                        else:
+                            # Still charging at this scrub position —
+                            # fast-forward whatever charge-effect(s) attack()
+                            # spawned (at elapsed=0, when this action first
+                            # fired) by the same amount. Stepped at ~60fps
+                            # rather than one big update() call for the same
+                            # reason the sprite stepping below is — several
+                            # charge effects (KamehamehaChargeEffect,
+                            # MasenkoHoldEffect, ...) advance a discrete frame
+                            # `tick` by exactly 1 per call regardless of dt
+                            # size, so one large call would only ever show
+                            # the very first build-up frame.
+                            _CE_STEP = 1.0 / 60.0
+                            remaining = elapsed_in_tween
+                            while remaining > 1e-9:
+                                step = min(_CE_STEP, remaining)
+                                for ce in actor._charge_effects:
+                                    try:
+                                        ce.update(step)
+                                    except Exception:
+                                        pass
+                                remaining -= _CE_STEP
                 else:
-                    # Tween still in progress — store elapsed so update() resumes
-                    # mid-motion rather than rewinding to the start position.
-                    actor._tween.elapsed = elapsed_in_tween
-                    # For fly tweens, recompute the visual arc offset so the
-                    # sprite appears airborne while scrubbing.
-                    from core.cutscene_actor import _FlyTween as _FT
-                    if isinstance(actor._tween, _FT):
-                        import math as _math
-                        actor._tween.fly_offset_y = (
-                            actor._tween.arc_height * _math.sin(progress * _math.pi)
-                        )
+                    action_start     = last_move_start.get(aid, t)
+                    elapsed_in_tween = t - action_start
+                    progress         = (min(1.0, elapsed_in_tween / tw.duration)
+                                        if tw.duration > 0 else 1.0)
+
+                    actor.entity.x = tw.start_x + (tw.end_x - tw.start_x) * progress
+                    actor.entity.y = tw.start_y + (tw.end_y - tw.start_y) * progress
+
+                    if progress >= 1.0:
+                        # Tween finished before t — settle into idle.
+                        actor._tween = None
+                        actor.set_animation('idle', actor.entity.direction)
+                        last_anim_time[aid] = action_start + tw.duration
+                    else:
+                        # Tween still in progress — store elapsed so update() resumes
+                        # mid-motion rather than rewinding to the start position.
+                        actor._tween.elapsed = elapsed_in_tween
+                        # For fly tweens, recompute the visual arc offset so the
+                        # sprite appears airborne while scrubbing.
+                        from core.cutscene_actor import _FlyTween as _FT
+                        if isinstance(actor._tween, _FT):
+                            import math as _math
+                            actor._tween.fly_offset_y = (
+                                actor._tween.arc_height * _math.sin(progress * _math.pi)
+                            )
 
             # Simulate sprite animation with small fixed steps rather than one
             # large dt. Most sprite systems advance only one frame per call
@@ -999,6 +1233,27 @@ class CutsceneRuntime:
                     remaining -= _STEP
 
         self.elapsed = float(t)
+
+    @staticmethod
+    def _flash_alpha(elapsed, duration):
+        """Resolve a flash's overlay alpha at `elapsed` seconds into its window.
+
+        Ramps 0 -> 255 over the first half of `duration`, then 255 -> 0 over
+        the second half — the same up/down envelope _draw_white_flash uses
+        for the genkidama hit-flash — rather than starting at full white and
+        spending the *entire* duration fading out (which made the "duration"
+        field behave like a fade_out length instead of the flash's own
+        length).
+        """
+        if duration <= 0:
+            return 0.0
+        half = duration / 2.0
+        if elapsed <= half:
+            progress = elapsed / half
+        else:
+            progress = 1.0 - (elapsed - half) / half
+        progress = max(0.0, min(1.0, progress))
+        return 255.0 * progress
 
     def _clear_camera_shake(self):
         """Zero out shake attributes on the camera object.
@@ -1103,24 +1358,41 @@ class CutsceneRuntime:
             self.overlay_color  = tuple(params.get('color', [0, 0, 0]))
             self.overlay_target = 255.0
             self.overlay_speed  = 255.0 / duration if duration > 0 else 9999.0
+            self._flash_start   = None  # a fade_out takes over the overlay from any active flash
         elif atype == 'fade_in':
             duration = params.get('duration', 1.0)
             self.overlay_color  = tuple(params.get('color', [0, 0, 0]))
+            # Force the starting point to fully opaque before tweening down.
+            # Without this, a fade_in that isn't preceded by a fade_out/
+            # set_overlay leaves overlay_alpha at its initial 0.0, so the
+            # target (also 0.0) is already "reached" and update()'s tween
+            # step no-ops on the very first frame — no black screen, no
+            # visible fade. seek() already special-cases this (it derives
+            # alpha from elapsed/duration assuming a 255 start); this makes
+            # live playback match that same assumption.
+            self.overlay_alpha  = 255.0
             self.overlay_target = 0.0
             self.overlay_speed  = 255.0 / duration if duration > 0 else 9999.0
+            self._flash_start   = None  # a fade_in takes over the overlay from any active flash
         elif atype == 'set_overlay':
             self.overlay_color  = tuple(params.get('color', [0, 0, 0]))
             self.overlay_alpha  = float(params.get('alpha', 255))
             self.overlay_target = self.overlay_alpha
             self.overlay_speed  = 0.0
+            self._flash_start   = None  # set_overlay takes over the overlay from any active flash
         elif atype == 'flash':
-            # White overlay at full opacity that fades to transparent — same
-            # mechanic as fade_in but always white regardless of params.
+            # Overlay that ramps up to full opacity and back down again over
+            # its own duration (see _flash_alpha) — not a linear fade from
+            # full opacity, which made "duration" behave like a fade_out
+            # length rather than the flash's own length. Defaults to white
+            # (the original behaviour) if no color param was saved.
             duration = params.get('duration', 0.3)
-            self.overlay_color  = (255, 255, 255)
-            self.overlay_alpha  = 255.0
-            self.overlay_target = 0.0
-            self.overlay_speed  = 255.0 / duration if duration > 0 else 9999.0
+            self.overlay_color   = tuple(params.get('color', [255, 255, 255]))
+            self.overlay_target  = 0.0
+            self.overlay_speed   = 0.0   # flash isn't driven by the linear tween
+            self._flash_start    = self.elapsed
+            self._flash_duration = duration
+            self.overlay_alpha   = self._flash_alpha(0.0, duration)
         elif atype == 'invert':
             duration = params.get('duration', 1.0)
             self._invert_active   = True
@@ -1197,10 +1469,12 @@ class CutsceneRuntime:
                 for aid, actor in self.actors.items():
                     self._pre_dialogue_state[aid] = {
                         'tween': actor._tween,
+                        'charge_effects': actor._charge_effects,
                         'anim':  getattr(actor.entity, 'current_animation_state', 'idle'),
                         'dir':   getattr(actor.entity, 'direction', 'down'),
                     }
                     actor._tween = None
+                    actor._charge_effects = []
                     actor.set_animation('idle', getattr(actor.entity, 'direction', 'down'))
                 self._dialogue_paused = True
 
@@ -1216,9 +1490,11 @@ class CutsceneRuntime:
                 # Restore the in-progress tween; elapsed was frozen so it
                 # continues exactly where it left off.
                 actor._tween = tween
+                actor._charge_effects = snap.get('charge_effects', [])
                 actor.set_animation(snap['anim'], snap['dir'])
             else:
                 actor._tween = None
+                actor._charge_effects = []
                 actor.set_animation('idle', snap['dir'])
         self._pre_dialogue_state = {}
 
@@ -1246,6 +1522,22 @@ class CutsceneRuntime:
                 arc_height=params.get('arc_height', 48.0),
                 direction=params.get('direction', None),
             )
+        elif atype == 'attack':
+            actor.attack(
+                params.get('attack_type', 'melee'),
+                direction=params.get('direction', None),
+                target_x=params.get('target_x'),
+                target_y=params.get('target_y'),
+                duration=params.get('duration', 0.6),
+                release_delay=params.get('release_delay', None),
+                on_release=lambda act, _actor=actor, _params=params:
+                    self._fire_attack_effect(_actor, _params, act),
+            )
+            # Stashed so seek()'s scrub-preview resolution (which never
+            # calls on_release, and so never sees `params` otherwise) can
+            # still honor effect_duration/growth overrides when building
+            # its throwaway stand-in effect.
+            actor._tween.params = params
         elif atype == 'set_character':
             new_char = params.get('character', '').strip()
             if new_char and hasattr(actor.entity, 'sprite'):
@@ -1260,3 +1552,36 @@ class CutsceneRuntime:
             new_costume = params.get('costume', '').strip()
             if new_costume:
                 actor.set_costume(new_costume)
+
+    def _fire_attack_effect(self, actor, params, attack_action):
+        """Fired by CutsceneActor.attack()'s on_release, at the scripted
+        release_delay. Spawns a purely-visual attack-effect preview via
+        create_attack_effect() — the real attacks/*.py class when
+        attack_type has one mapped (real beam growth/decay, real chain/
+        travel shapes), otherwise the generic AttackEffectVisual
+        placeholder — so the editor/runtime always shows *something* for a
+        scripted attack. This preview is independent of on_spawn_attack
+        (below), which is still what's responsible for spawning the *real*
+        gameplay projectile/melee/beam object; CutsceneRuntime has no
+        access to the game's live object lists itself.
+
+        Suppressed during seek() for the same reason play_sfx/change_room
+        are: these are one-shot side effects, not persistent state that
+        seeking to an arbitrary t should meaningfully resolve. Scrubbing
+        shows the attack pose but never actually spawns anything.
+        """
+        if getattr(self, '_seeking', False):
+            return
+
+        effect_duration = max(0.15, attack_action.duration - attack_action.release_delay)
+        self._attack_effects.append(create_attack_effect(
+            params.get('attack_type', 'melee'),
+            actor.entity.x, actor.entity.y,
+            direction=getattr(actor.entity, 'direction', 'down'),
+            duration=params.get('effect_duration', effect_duration),
+            target_x=attack_action.target_x, target_y=attack_action.target_y,
+            entity=actor.entity,
+        ))
+
+        if callable(self.on_spawn_attack):
+            self.on_spawn_attack(actor, params, attack_action)

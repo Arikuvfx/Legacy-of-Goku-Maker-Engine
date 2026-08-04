@@ -211,10 +211,18 @@ class CharacterSwitchMenu:
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def open(self, current_character='goku'):
+    def open(self, current_character='goku', playable_characters=None):
         self.active = True
         # Refresh from disk so characters added in the creator appear immediately.
         self.characters = self._discover_characters()
+        # Being added/discovered on disk no longer implies playable — when
+        # playable_characters is given (the save point always passes
+        # Player.playable_characters), drop anything not in it entirely
+        # rather than showing it greyed/unselectable. If omitted, fall back
+        # to _discover_characters()'s default of everyone shown.
+        if playable_characters is not None:
+            playable = set(playable_characters)
+            self.characters = [c for c in self.characters if c['id'] in playable]
         self._load_character_sprites()
         for i, char in enumerate(self.characters):
             if char['id'] == current_character:
@@ -279,14 +287,14 @@ class CharacterSwitchMenu:
                 self.selected_character += 1
                 self._reset_char_anim(self.selected_character)
 
-        elif key in (pygame.K_z, pygame.K_RETURN):
+        elif key == pygame.K_e:
             self._set_button_pressed('a')
             selected = self.characters[self.selected_character]
             if selected['unlocked']:
                 self.close()
                 return selected['id']
 
-        elif key in (pygame.K_x, pygame.K_ESCAPE):
+        elif key == pygame.K_q:
             self._set_button_pressed('b')
             self.close()
             return 'close'

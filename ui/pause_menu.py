@@ -19,7 +19,7 @@ import pygame
 import os
 from config.settings import RENDER_SCALE
 from core.bitmap_font import BitmapFont
-from dev_tools.character_creator import discover_characters
+from dev_tools.character_creator import discover_characters, load_config, resolve_portrait_path
 
 _S = max(1, RENDER_SCALE)
 
@@ -182,7 +182,13 @@ class PauseMenu:
         # Character sprite cache
         self._char_sprite_cache = {}
         self._current_char_id   = None
+        self._current_char_key  = None
         self._char_sprite       = None
+        # Which character's status is currently being previewed on the Status
+        # page. Defaults to the active player's character on open(); clicking
+        # another character's name tag switches this without changing who
+        # you're actually playing as.
+        self._viewed_char_id    = None
         self.char_name_sprites  = {}
 
         self._load_ui_sprites()
@@ -217,6 +223,12 @@ class PauseMenu:
 
         self.optionbar_empty  = _img('assets/ui/textbox/options/optionbar_empty.png')
         self.optionbar_filled = _img('assets/ui/textbox/options/optionbar_filled.png')
+
+        # Character display names (from the character creator's saved config),
+        # keyed by char_id. Populated lazily in _get_display_name() and reset
+        # whenever the roster refreshes so edits made in the character creator
+        # show up without a restart.
+        self._display_name_cache = {}
 
         # Character name tag sprites (selected / unselected variant per character).
         # Rebuilt dynamically from the roster each time the menu opens (see
@@ -312,16 +324,49 @@ class PauseMenu:
             if sel or unsel:
                 fresh[cid] = {'selected': sel, 'unselected': unsel}
         self._name_sprites = fresh
+        self._display_name_cache = {}
 
-    def _load_char_sprite(self, char_id, costume='base'):
-        if char_id in self._char_sprite_cache:
-            return self._char_sprite_cache[char_id]
+    def _get_display_name(self, char_id):
+        """
+        Return the character's display name as set in the character creator
+        (assets/characters/{char_id}.json), falling back to a title-cased
+        version of char_id if no config exists. Cached per open() so we don't
+        hit disk every frame; the cache is cleared in _refresh_name_sprites().
+        """
+        if char_id not in self._display_name_cache:
+            try:
+                name = load_config(char_id).get('display_name') or char_id.replace('_', ' ').title()
+            except Exception:
+                name = char_id.replace('_', ' ').title()
+            self._display_name_cache[char_id] = name
+        return self._display_name_cache[char_id]
+
+    def _active_transform_form(self, player):
+        """Return the bare form name (e.g. 'ssj') of the player's currently
+        active transformation, or '' if not transformed. Sourced from
+        TransformationSystem.current_transform_costume, which is a path like
+        'base/transformations/ssj' — only set while is_transformed is True.
+        """
+        tf = getattr(player, 'transformation', None)
+        if not tf or not getattr(tf, 'is_transformed', False):
+            return ''
+        full = getattr(tf, 'current_transform_costume', None) or ''
+        if '/transformations/' in full:
+            return full.split('/transformations/')[-1]
+        return ''
+
+    def _load_char_sprite(self, char_id, costume='base', form=''):
+        cache_key = (char_id, costume, form)
+        if cache_key in self._char_sprite_cache:
+            return self._char_sprite_cache[cache_key]
         surf = None
-        try:
-            surf = pygame.image.load(f'assets/portraits/{char_id}.png').convert_alpha()
-        except Exception:
-            pass
-        self._char_sprite_cache[char_id] = surf
+        path = resolve_portrait_path(char_id, costume, form)
+        if path:
+            try:
+                surf = pygame.image.load(str(path)).convert_alpha()
+            except Exception:
+                surf = None
+        self._char_sprite_cache[cache_key] = surf
         return surf
 
     # ── Open / close ──────────────────────────────────────────────────────────
@@ -343,9 +388,14 @@ class PauseMenu:
             self.button_states[btn]       = False
             self.button_press_timers[btn] = 0.0
         char_id = getattr(player, 'character', 'goku')
-        if char_id != self._current_char_id:
-            self._current_char_id = char_id
-            self._char_sprite     = self._load_char_sprite(char_id)
+        costume = getattr(player, 'costume', 'base')
+        form    = self._active_transform_form(player)
+        char_key = (char_id, costume, form)
+        if char_key != self._current_char_key:
+            self._current_char_key = char_key
+            self._current_char_id  = char_id
+            self._char_sprite      = self._load_char_sprite(char_id, costume, form)
+        self._viewed_char_id = char_id
 
     def close(self):
         self.active = False
@@ -566,6 +616,13 @@ class PauseMenu:
                     else:
                         self.options_editing    = False
                         self.options_item_index = i
+                    return None
+
+        if self.tab_index == 0:
+            for cid in self._name_sprites:
+                if _hit(f'name_tag_{cid}'):
+                    self._viewed_char_id = cid
+                    self._play_switch_sfx()
                     return None
 
         if self.tab_index == 2:
@@ -822,15 +879,17 @@ class PauseMenu:
         sprite_col_w = w // 3
         stats_x = x + sprite_col_w - 45
         stats_w = w - sprite_col_w - 6
-        char_id = getattr(player, 'character', 'unknown')
-        level   = getattr(player, 'level', 1)
+        active_char_id = getattr(player, 'character', 'unknown')
+        char_id        = self._viewed_char_id or active_char_id
+        is_active      = char_id == active_char_id
+        level          = getattr(player, 'level', 1) if is_active else None
 
         def _tint(s, c): t=s.copy(); t.fill(c,special_flags=pygame.BLEND_RGBA_MULT); return t
         def _shadow(s):  t=s.copy(); t.fill((0,0,0),special_flags=pygame.BLEND_RGBA_MULT); return t
 
-        name_surf = _tint(self.bold_font.render(char_id.upper()), (255,255,0))
+        name_surf = _tint(self.bold_font.render(self._get_display_name(char_id).upper()), (255,255,0))
         lvl_surf  = _tint(self.bold_font.render('LVL'),           (255,0,0))
-        num_surf  = _tint(self.bold_numbers_font.render(str(level)), (255,0,0))
+        num_surf  = _tint(self.bold_numbers_font.render(str(level) if is_active else '--'), (255,0,0))
 
         if self._name_sprites:
             tag_h=max(16,int(h*0.08)); gap=max(2,int(self.screen_width*0.003)); tx,ty=x-6,y-3
@@ -839,20 +898,30 @@ class PauseMenu:
                 if surf:
                     s=max(1,round(tag_h/surf.get_height()))
                     scaled=pygame.transform.scale(surf,(surf.get_width()*s,surf.get_height()*s))
-                    screen.blit(scaled,(tx,ty)); tx+=scaled.get_width()+gap
+                    screen.blit(scaled,(tx,ty))
+                    self._click_zones[f'name_tag_{cid}'] = pygame.Rect(tx,ty,scaled.get_width(),scaled.get_height())
+                    tx+=scaled.get_width()+gap
 
         name_y=y+49; gap_px=max(5,int(self.screen_width*0.005)); cx=x-6
         for surf in (name_surf,lvl_surf,num_surf):
             screen.blit(_shadow(surf),(cx+4,name_y)); screen.blit(surf,(cx,name_y)); cx+=surf.get_width()+gap_px*3
 
-        name_h=max(name_surf.get_height(),lvl_surf.get_height(),num_surf.get_height())
+        name_h=max(name_surf.get_height(),lvl_surf.get_height(),self.bold_numbers_font.get_line_height())
         content_top=y+name_h+7
         sprite_cx=x+sprite_col_w//2-30; sprite_cy=content_top+(h-(content_top-y))//2-29
 
-        if self._char_sprite:
+        if is_active:
+            portrait_sprite = self._char_sprite
+        else:
+            try:
+                preview_costume = load_config(char_id).get('costume', 'base')
+            except Exception:
+                preview_costume = 'base'
+            portrait_sprite = self._load_char_sprite(char_id, preview_costume)
+        if portrait_sprite:
             avail_w=sprite_col_w-8; avail_h=h-(content_top-y)-8
-            int_scale=max(1,int(min(avail_w/self._char_sprite.get_width(),avail_h/self._char_sprite.get_height())))
-            portrait=pygame.transform.scale(self._char_sprite,(self._char_sprite.get_width()*int_scale,self._char_sprite.get_height()*int_scale))
+            int_scale=max(1,int(min(avail_w/portrait_sprite.get_width(),avail_h/portrait_sprite.get_height())))
+            portrait=pygame.transform.scale(portrait_sprite,(portrait_sprite.get_width()*int_scale,portrait_sprite.get_height()*int_scale))
             screen.blit(portrait,portrait.get_rect(center=(sprite_cx,sprite_cy)))
         else:
             r=sprite_col_w//3
@@ -903,20 +972,43 @@ class PauseMenu:
             screen.blit(_yellow(self.stats_font.render(f'{label}:')),(right_col_x+32,ry))
             screen.blit(_grey(self.stats_numbers_font.render(str(val))),(right_col_x+270,ry))
 
-        hp,max_hp=getattr(player,'hp',0),getattr(player,'max_hp',1)
-        ki,max_ki=int(getattr(player,'ki',0)),int(getattr(player,'max_ki',1))
-        exp=getattr(player,'exp',0); exp_nxt=getattr(player,'exp_to_next_level',0)
-        zenie=getattr(player,'zenie',0); t=int(play_time)
-        hh,rem=divmod(t,3600); mm,ss=divmod(rem,60)
+        if is_active:
+            hp,max_hp=getattr(player,'hp',0),getattr(player,'max_hp',1)
+            ki,max_ki=int(getattr(player,'ki',0)),int(getattr(player,'max_ki',1))
+            exp=getattr(player,'exp',0); exp_nxt=getattr(player,'exp_to_next_level',0)
+            zenie=getattr(player,'zeni',0); t=int(play_time)
+            hh,rem=divmod(t,3600); mm,ss=divmod(rem,60)
+            time_str=f'{hh:02d}:{mm:02d}:{ss:02d}'
+            right_stats=[('STR',stats.get('strength',stats.get('str',0))),
+                         ('POW',stats.get('ki_power',stats.get('pow',0))),
+                         ('END',stats.get('vitality',stats.get('end',0))),
+                         ('SPD',stats.get('speed',   stats.get('spd',0)))]
+        else:
+            # Previewing a character you're not currently playing as — no live
+            # save data exists for them yet, so fall back to their base stats
+            # from the character creator config instead of fabricating numbers.
+            # NOTE: reuse the exact same label strings as the active branch
+            # (STR/POW/END/SPD) rather than new ones like "DEF"/"KI RGN" —
+            # the stats bitmap font only has glyphs proven out for the labels
+            # already used elsewhere in this menu, and introducing untested
+            # letters/wider strings here previously garbled the row.
+            try:
+                cstats = load_config(char_id).get('stats', {})
+            except Exception:
+                cstats = {}
+            max_hp=cstats.get('max_hp',1); max_ki=cstats.get('max_ki',1)
+            hp,ki=max_hp,max_ki
+            exp='--'; exp_nxt='--'; zenie='--'; time_str='--:--:--'
+            right_stats=[('STR',cstats.get('power',0)),
+                         ('POW',cstats.get('ki_regen',0)),
+                         ('END',cstats.get('defense',0)),
+                         ('SPD',cstats.get('speed',0))]
 
         draw_row('HP:',f'{hp}/{max_hp}'); draw_row('EP:',f'{ki}/{max_ki}')
         draw_row('XP:',str(exp)); draw_row('NXT LVL:',str(exp_nxt))
-        draw_row('ZENIE:',str(zenie)); draw_row('TIME:',f'{hh:02d}:{mm:02d}:{ss:02d}')
+        draw_row('ZENIE:',str(zenie)); draw_row('TIME:',time_str)
         draw_div()
-        for row,(lbl,val) in enumerate([('STR',stats.get('strength',stats.get('str',0))),
-                                         ('POW',stats.get('ki_power',stats.get('pow',0))),
-                                         ('END',stats.get('vitality',stats.get('end',0))),
-                                         ('SPD',stats.get('speed',   stats.get('spd',0)))]):
+        for row,(lbl,val) in enumerate(right_stats):
             draw_right_stat(lbl,val,row)
 
     # ── Equip page ────────────────────────────────────────────────────────────

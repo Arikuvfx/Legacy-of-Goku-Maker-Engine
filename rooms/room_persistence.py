@@ -32,9 +32,12 @@ class RoomPersistence:
                 'entities':             self._serialize_entities(room),
                 'flying_pads':          self._serialize_flying_pads(room),
                 'save_points':          self._serialize_save_points(room),
-                'cutscene_triggers':     self._serialize_cutscene_triggers(room),
                 'world_map_objects':     self._serialize_world_map_objects(room),
-                'music_objects':         self._serialize_music_objects(room),
+                'music_track':           getattr(room, 'music_track', ''),
+                'animated_regions':      self._serialize_animated_regions(room),
+                'doors':                 self._serialize_doors(room),
+                'trigger_boxes':         self._serialize_trigger_boxes(room),
+                'scrolling_bg':          self._serialize_scrolling_bg(room),
             }
             with open(self._get_room_filepath(room.name), 'w') as f:
                 json.dump(data, f, indent=2)
@@ -72,6 +75,22 @@ class RoomPersistence:
             return False
 
     # ── Serializers ───────────────────────────────────────────────────────────
+
+    def _serialize_scrolling_bg(self, room):
+        """Parallax background config set via the editor's Background panel.
+        Stored as a plain dict on the room (not a live object), so this is a
+        straight passthrough with defaults — mirrors how game.py/room_editor.py
+        read it back out with bg.get(...).
+        """
+        bg = getattr(room, 'scrolling_bg', None)
+        if not bg or not bg.get('image'):
+            return None
+        return {
+            'image':    bg.get('image', ''),
+            'parallax': bg.get('parallax', 0.5),
+            'scroll_x': bg.get('scroll_x', 0.0),
+            'scroll_y': bg.get('scroll_y', 0.0),
+        }
 
     def _serialize_tiles(self, room):
         if not getattr(room, 'tiles', None):
@@ -145,7 +164,7 @@ class RoomPersistence:
                 'height':      ent.get('height', 32),
             }
             # Optional fields — only include when present
-            for key in ('variant_type', 'variant_name', 'ai_type', 'enemy_category'):
+            for key in ('variant_type', 'variant_name', 'ai_type', 'enemy_category', 'zeni_pool'):
                 if ent.get(key):
                     d[key] = ent[key]
             if ent.get('variant_color'):
@@ -194,11 +213,6 @@ class RoomPersistence:
         return [{'x': sp.x, 'y': sp.y, 'variant': sp.variant}
                 for sp in room.save_points]
 
-    def _serialize_cutscene_triggers(self, room):
-        if not getattr(room, 'cutscene_triggers', None):
-            return []
-        return [t.to_dict() for t in room.cutscene_triggers]
-
     def _serialize_world_map_objects(self, room):
         if not getattr(room, 'world_map_objects', None):
             return []
@@ -208,23 +222,37 @@ class RoomPersistence:
         from objects.world_map import WorldMapObject
         return [WorldMapObject.from_dict(o) for o in data]
 
-    def _serialize_music_objects(self, room):
-        if not getattr(room, 'music_objects', None):
+    def _serialize_doors(self, room):
+        if not getattr(room, 'doors', None):
             return []
-        return [o.to_dict() for o in room.music_objects]
+        return [d.to_dict() for d in room.doors]
 
-    def deserialize_music_objects(self, data):
-        from objects.music_object import MusicObject
-        return [MusicObject.from_dict(o) for o in data]
+    def deserialize_doors(self, data):
+        from objects.door_object import Door
+        return [Door.from_dict(d) for d in data]
+
+    def _serialize_trigger_boxes(self, room):
+        if not getattr(room, 'trigger_boxes', None):
+            return []
+        return [b.to_dict() for b in room.trigger_boxes]
+
+    def deserialize_trigger_boxes(self, data):
+        from objects.trigger_box import TriggerBox
+        return [TriggerBox.from_dict(d) for d in data]
+
+    def _serialize_animated_regions(self, room):
+        if not getattr(room, 'animated_regions', None):
+            return []
+        return [r.to_dict() for r in room.animated_regions]
+
+    def deserialize_animated_regions(self, data, room_name):
+        from objects.animated_region import AnimatedRegion
+        return [AnimatedRegion.from_dict(d, room_name) for d in data]
 
     def deserialize_save_points(self, save_points_data):
         from objects.save_point import SavePoint
         return [SavePoint(x=d['x'], y=d['y'], variant=d.get('variant', 'big'))
                 for d in save_points_data]
-
-    def deserialize_cutscene_triggers(self, data, room_name):
-        from objects.cutscene_trigger import CutsceneTrigger
-        return [CutsceneTrigger.from_dict(d, room_name) for d in data]
 
     # ── Deserializers ─────────────────────────────────────────────────────────
 
@@ -316,6 +344,16 @@ class RoomPersistence:
             out.append(ent)
         return out
 
+
+    def deserialize_scrolling_bg(self, bg_data):
+        if not bg_data:
+            return {}
+        return {
+            'image':    bg_data.get('image', ''),
+            'parallax': bg_data.get('parallax', 0.5),
+            'scroll_x': bg_data.get('scroll_x', 0.0),
+            'scroll_y': bg_data.get('scroll_y', 0.0),
+        }
 
     def deserialize_flying_pads(self, pads_data):
         from objects.flying_pad import FlyingPad, FlyingPadWaypoint
@@ -410,9 +448,12 @@ class RoomManagerWithPersistence:
         room.entities            = self.persistence.deserialize_entities(data['entities'])            if data.get('entities')            else []
         room.flying_pads         = self.persistence.deserialize_flying_pads(data['flying_pads'])      if data.get('flying_pads')         else []
         room.save_points         = self.persistence.deserialize_save_points(data['save_points'])      if data.get('save_points')         else []
-        room.cutscene_triggers   = self.persistence.deserialize_cutscene_triggers(data['cutscene_triggers'], room_name) if data.get('cutscene_triggers') else []
         room.world_map_objects   = self.persistence.deserialize_world_map_objects(data['world_map_objects']) if data.get('world_map_objects') else []
-        room.music_objects       = self.persistence.deserialize_music_objects(data['music_objects'])      if data.get('music_objects')       else []
+        room.music_track         = data.get('music_track', '')
+        room.animated_regions    = self.persistence.deserialize_animated_regions(data['animated_regions'], room_name) if data.get('animated_regions') else []
+        room.doors               = self.persistence.deserialize_doors(data['doors'])              if data.get('doors')               else []
+        room.trigger_boxes       = self.persistence.deserialize_trigger_boxes(data['trigger_boxes']) if data.get('trigger_boxes') else []
+        room.scrolling_bg        = self.persistence.deserialize_scrolling_bg(data.get('scrolling_bg'))
 
         existing = self.get_room_by_name(room_name)
         if existing:

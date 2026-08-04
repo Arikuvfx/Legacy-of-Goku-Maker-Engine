@@ -1,6 +1,174 @@
 import pygame
 import pygame.gfxdraw
 
+from core.zeni_system import pool_keys as _zeni_pool_keys
+
+
+def _build_enemy_catalogue():
+    """Standalone builder for the 'Enemies' / 'Enemy Bosses' portions of the
+    entity catalogue, factored out of EntityEditor._build_entity_catalogue()
+    so the roster can be read without instantiating a full EntityEditor
+    (which needs a live pygame display / screen size). EntityEditor itself
+    calls this too, so there's a single source of truth for what enemies
+    exist — see discover_enemy_ids() below for the id-only view other
+    modules (e.g. the event editor's spawn_enemies action) actually want.
+    """
+    return {
+        # ── Normal Enemies ───────────────────────────────────────────────
+        'Enemies': [
+            {
+                'id': 'tiger_bandit',
+                'name': 'Tiger_bandit',
+                'sprite': None,
+                'width': 32, 'height': 32,
+                'entity_type': 'enemy',
+                'enemy_category': 'melee',  # Mark as melee type
+                'has_variants': True,
+                'variants': [
+                    {'type': 'default', 'name': 'Default', 'color': (220, 60, 60)},
+                ],
+                'default_variant': 'default',
+            },
+            {
+                'id': 'shooter',
+                'name': 'Shooter (Ranged)',
+                'sprite': None,
+                'width': 32, 'height': 32,
+                'entity_type': 'enemy',
+                'enemy_category': 'shooter',  # Mark as shooter type
+                'has_variants': True,
+                'variants': [
+                    {'type': 'default', 'name': 'Thrower', 'color': (100, 120, 220)},
+                    {'type': 'gunner', 'name': 'Gunner', 'color': (180, 80, 80)},
+                    {'type': 'rocketlauncher', 'name': 'Rocket Launcher', 'color': (200, 120, 40)},
+                ],
+                'default_variant': 'default',
+            },
+        ],
+        # ── Boss Enemies ─────────────────────────────────────────────────
+        'Enemy Bosses': [
+            {
+                'id': 'pui_pui',
+                'name': 'Pui Pui',
+                'sprite': None,
+                'width': 64, 'height': 64,
+                'entity_type': 'boss',
+                'enemy_category': 'melee',
+                'has_variants': True,
+                'variants': [
+                    {'type': 'default', 'name': 'Default', 'color': (180, 50, 180)},
+                ],
+                'default_variant': 'default',
+            },
+            {
+                'id': 'android_17',
+                'name': 'Android 17',
+                'sprite': None,
+                'width': 32, 'height': 32,
+                'entity_type': 'boss',
+                'enemy_category': 'shooter',
+                'has_variants': True,
+                'variants': [
+                    {'type': 'default', 'name': 'Default', 'color': (50, 180, 220)},
+                ],
+                'default_variant': 'default',
+            },
+            {
+                'id': 'android_18',
+                'name': 'Android 18',
+                'sprite': None,
+                'width': 32, 'height': 32,
+                'entity_type': 'boss',
+                'enemy_category': 'shooter',
+                'has_variants': True,
+                'variants': [
+                    {'type': 'default', 'name': 'Default', 'color': (220, 180, 50)},
+                ],
+                'default_variant': 'default',
+            },
+        ],
+    }
+
+
+def discover_enemy_ids():
+    """All placeable enemy/boss ids (regular enemies + bosses), sourced from
+    the same catalogue EntityEditor's palette uses (_build_enemy_catalogue()
+    above), so this list never drifts out of sync with what actually exists.
+    Used by other dev tools (e.g. the event editor's spawn_enemies action
+    picker) that need the enemy roster without pulling in a full
+    EntityEditor instance. Returns a sorted list, deduped, no 'any' blank
+    entry (unlike EntityEditor._get_enemy_ids(), which prefixes one for its
+    own filter dropdown) — callers that want a blank/"none" option can add
+    their own placeholder."""
+    catalogue = _build_enemy_catalogue()
+    ids = set()
+    for cat_key in ('Enemies', 'Enemy Bosses'):
+        for entity in catalogue.get(cat_key, []):
+            eid = entity.get('id', '')
+            if eid:
+                ids.add(eid)
+    return sorted(ids)
+
+
+def discover_boss_ids():
+    """Boss-only ids, sourced from the same catalogue as discover_enemy_ids()
+    above but filtered to entity_type == 'boss' (the 'Enemy Bosses' category)
+    — i.e. it deliberately excludes regular (non-boss) enemies, unlike
+    discover_enemy_ids()'s combined list. Used by the event editor's Boss HP
+    condition picker: BossEnemy.boss_id (see entities/boss_enemy.py) only
+    ever gets set for entries in this narrower list, so a regular enemy id
+    wouldn't ever match a live boss_hp_lookup/boss_hp_value_lookup anyway.
+    Returns a sorted, deduped list."""
+    catalogue = _build_enemy_catalogue()
+    ids = {entity.get('id', '') for entity in catalogue.get('Enemy Bosses', [])
+           if entity.get('id') and entity.get('entity_type') == 'boss'}
+    return sorted(ids)
+
+
+def _build_npc_catalogue():
+    """Standalone builder for the 'NPCs' portion of the entity catalogue,
+    factored out of EntityEditor._build_entity_catalogue() for the same
+    reason as _build_enemy_catalogue() above: so the roster can be read
+    without instantiating a full EntityEditor. Still does the filesystem
+    variant scan (assets/sprites/npc/generic/variants) since that's how
+    NPC skins are actually discovered — see discover_npc_ids() below for
+    the id-only view other modules want."""
+    import os
+    npc_variants = [{'type': 'default', 'name': 'Default', 'color': (50, 150, 200)}]
+    variants_dir = 'assets/sprites/npc/generic/variants'
+    if os.path.isdir(variants_dir):
+        for v in sorted(os.listdir(variants_dir)):
+            if os.path.isdir(os.path.join(variants_dir, v)) and v != 'default':
+                npc_variants.append({'type': v, 'name': v.replace('_', ' ').title(), 'color': (50, 150, 200)})
+
+    return {
+        'NPCs': [
+            {
+                'id': 'generic',
+                'name': 'Generic NPC',
+                'sprite': None,
+                'width': 32, 'height': 32,
+                'entity_type': 'npc',
+                'has_variants': True,
+                'variants': npc_variants,
+                'default_variant': 'default',
+            },
+        ],
+    }
+
+
+def discover_npc_ids():
+    """All placeable NPC ids, sourced from the same catalogue EntityEditor's
+    palette uses (_build_npc_catalogue() above), so this list never drifts
+    out of sync with what actually exists. Used by other dev tools (e.g.
+    the event editor's spawn_npc action) that need the NPC roster without
+    pulling in a full EntityEditor instance. Returns a sorted, deduped list
+    — just ['generic'] today, but keeps working if more NPC entities are
+    ever added to the catalogue."""
+    catalogue = _build_npc_catalogue()
+    ids = {entity.get('id', '') for entity in catalogue.get('NPCs', []) if entity.get('id')}
+    return sorted(ids)
+
 
 class EntityEditor:
     """
@@ -53,6 +221,7 @@ class EntityEditor:
         'npc_color': (50, 150, 200),
         'enemy_color': (220, 60, 60),
         'boss_color': (180, 50, 180),
+        'critter_color': (120, 190, 90),
     }
 
     # ── Mission objective metadata (mirrors mission_manager constants) ────────
@@ -96,7 +265,7 @@ class EntityEditor:
         self.scroll_offset = 0
 
         # Tab order also controls top-to-bottom render order
-        self.category_keys = ['NPCs', 'Enemies', 'Enemy Bosses']
+        self.category_keys = ['NPCs', 'Enemies', 'Enemy Bosses', 'Critters']
 
         # Populated by _build_entity_catalogue(); structure: {category: [entity_dict, ...]}
         self.categories: dict[str, list[dict]] = {k: [] for k in self.category_keys}
@@ -119,6 +288,13 @@ class EntityEditor:
         self.selected_ai_type = 'easy'
         self.hover_ai_type_idx = -1
 
+        # ── Zeni drop pool (enemy / boss only) ──────────────────────────────
+        # Options come straight from core.zeni_system so this list can never
+        # drift out of sync with the actual drop tables.
+        self.zeni_pools = _zeni_pool_keys()
+        self.selected_zeni_pool = self.zeni_pools[0]
+        self.hover_zeni_pool_idx = -1
+
         self.npc_modes    = ['static', 'moving']
         self.npc_facings  = ['down', 'up', 'left', 'right']
         self.selected_npc_mode   = 'static'
@@ -137,6 +313,7 @@ class EntityEditor:
             'entity_rects': [],
             'variant_rects': [],
             'ai_type_rects': [],
+            'zeni_pool_rects': [],
             'npc_mode_rects': [],
             'npc_facing_rects': [],
             'npc_dialogue_rects': [],
@@ -166,6 +343,30 @@ class EntityEditor:
     # Entity catalogue
     # =========================================================================
 
+    @staticmethod
+    def _resolve_critter_frame_size(critter_id, variant_type, default_w, default_h):
+        """Read {folder}/sprite_size.txt for a critter, checking the variant
+        folder first then the flat folder — same lookup order sprite_system's
+        CritterSpriteLoader uses at runtime. Falls back to (default_w,
+        default_h) if no sprite_size.txt exists, so a critter with no config
+        file yet still gets a sane placeholder size.
+        """
+        import os
+        candidates = [
+            f"assets/sprites/critters/{critter_id}/variants/{variant_type}/sprite_size.txt",
+            f"assets/sprites/critters/{critter_id}/sprite_size.txt",
+        ]
+        for path in candidates:
+            if os.path.isfile(path):
+                try:
+                    with open(path) as f:
+                        text = f.read().strip().lower()
+                    w, h = text.split('x')
+                    return int(w), int(h)
+                except Exception:
+                    pass
+        return default_w, default_h
+
     def _build_entity_catalogue(self):
         """
         Populate self.categories with the master list of placeable entities.
@@ -176,97 +377,58 @@ class EntityEditor:
         """
 
         # ── NPCs ─────────────────────────────────────────────────────────────
-        import os
-        npc_variants = [{'type': 'default', 'name': 'Default', 'color': (50, 150, 200)}]
-        variants_dir = 'assets/sprites/npc/generic/variants'
-        if os.path.isdir(variants_dir):
-            for v in sorted(os.listdir(variants_dir)):
-                if os.path.isdir(os.path.join(variants_dir, v)) and v != 'default':
-                    npc_variants.append({'type': v, 'name': v.replace('_', ' ').title(), 'color': (50, 150, 200)})
+        # Sourced from the module-level _build_npc_catalogue() so this
+        # roster and discover_npc_ids() (used by e.g. the event editor's
+        # spawn_npc picker) can never drift apart.
+        self.categories['NPCs'] = _build_npc_catalogue()['NPCs']
 
-        self.categories['NPCs'] = [
-            {
-                'id': 'generic',
-                'name': 'Generic NPC',
-                'sprite': None,
-                'width': 32, 'height': 32,
-                'entity_type': 'npc',
-                'has_variants': True,
-                'variants': npc_variants,
-                'default_variant': 'default',
-            },
-        ]
+        # ── Enemies / Enemy Bosses ──────────────────────────────────────────
+        # Sourced from the module-level _build_enemy_catalogue() so this
+        # roster and discover_enemy_ids() (used by e.g. the event editor's
+        # spawn_enemies picker) can never drift apart.
+        enemy_catalogue = _build_enemy_catalogue()
+        self.categories['Enemies'] = enemy_catalogue['Enemies']
+        self.categories['Enemy Bosses'] = enemy_catalogue['Enemy Bosses']
 
-        # ── Normal Enemies ───────────────────────────────────────────────────
-        self.categories['Enemies'] = [
-            {
-                'id': 'tiger_bandit',
-                'name': 'Tiger_bandit',
-                'sprite': None,
-                'width': 32, 'height': 32,
-                'entity_type': 'enemy',
-                'enemy_category': 'melee',  # Mark as melee type
-                'has_variants': True,
-                'variants': [
-                    {'type': 'default', 'name': 'Default', 'color': (220, 60, 60)},
-                ],
-                'default_variant': 'default',
-            },
-            {
-                'id': 'shooter',
-                'name': 'Shooter (Ranged)',
-                'sprite': None,
-                'width': 32, 'height': 32,
-                'entity_type': 'enemy',
-                'enemy_category': 'shooter',  # Mark as shooter type
-                'has_variants': True,
-                'variants': [
-                    {'type': 'default', 'name': 'Thrower', 'color': (100, 120, 220)},
-                    {'type': 'gunner', 'name': 'Gunner', 'color': (180, 80, 80)},
-                    {'type': 'rocketlauncher', 'name': 'Rocket Launcher', 'color': (200, 120, 40)},
-                ],
-                'default_variant': 'default',
-            },
-        ]
+        # ── Critters (ambient wildlife — no hitbox, no AI, no dialogue) ────────
+        squirrel_w, squirrel_h = self._resolve_critter_frame_size('squirrel', 'default', 16, 16)
+        bird_w, bird_h = self._resolve_critter_frame_size('bird', 'default', 16, 16)
+        butterfly_w, butterfly_h = self._resolve_critter_frame_size('butterfly', 'default', 16, 16)
 
-        # ── Boss Enemies ─────────────────────────────────────────────────────
-        self.categories['Enemy Bosses'] = [
+        self.categories['Critters'] = [
             {
-                'id': 'pui_pui',
-                'name': 'Pui Pui',
+                'id': 'squirrel',
+                'name': 'Squirrel',
                 'sprite': None,
-                'width': 64, 'height': 64,
-                'entity_type': 'boss',
-                'enemy_category': 'melee',
+                'width': squirrel_w, 'height': squirrel_h,
+                'entity_type': 'critter',
                 'has_variants': True,
                 'variants': [
-                    {'type': 'default', 'name': 'Default', 'color': (180, 50, 180)},
+                    {'type': 'default', 'name': 'Default', 'color': (150, 100, 60)},
                 ],
                 'default_variant': 'default',
             },
             {
-                'id': 'android_17',
-                'name': 'Android 17',
+                'id': 'bird',
+                'name': 'Bird',
                 'sprite': None,
-                'width': 32, 'height': 32,
-                'entity_type': 'boss',
-                'enemy_category': 'shooter',
+                'width': bird_w, 'height': bird_h,
+                'entity_type': 'critter',
                 'has_variants': True,
                 'variants': [
-                    {'type': 'default', 'name': 'Default', 'color': (50, 180, 220)},
+                    {'type': 'default', 'name': 'Default', 'color': (100, 150, 220)},
                 ],
                 'default_variant': 'default',
             },
             {
-                'id': 'android_18',
-                'name': 'Android 18',
+                'id': 'butterfly',
+                'name': 'Butterfly',
                 'sprite': None,
-                'width': 32, 'height': 32,
-                'entity_type': 'boss',
-                'enemy_category': 'shooter',
+                'width': butterfly_w, 'height': butterfly_h,
+                'entity_type': 'critter',
                 'has_variants': True,
                 'variants': [
-                    {'type': 'default', 'name': 'Default', 'color': (220, 180, 50)},
+                    {'type': 'default', 'name': 'Default', 'color': (230, 150, 200)},
                 ],
                 'default_variant': 'default',
             },
@@ -328,6 +490,12 @@ class EntityEditor:
             f"assets/sprites/enemies/{entity_id}/variants/{variant_type}/idle.png",
             f"assets/sprites/enemies/{entity_id}/idle.png",
             f"assets/sprites/enemies/boss/{entity_id}/idle.png",
+            # Critter paths — idle.png first, falling back to flying.png since
+            # butterflies (and similar always-airborne critters) have no idle.
+            f"assets/sprites/critters/{entity_id}/variants/{variant_type}/idle.png",
+            f"assets/sprites/critters/{entity_id}/idle.png",
+            f"assets/sprites/critters/{entity_id}/variants/{variant_type}/flying.png",
+            f"assets/sprites/critters/{entity_id}/flying.png",
         ]
         path = next((p for p in candidates if os.path.exists(p)), None)
         if path is None:
@@ -336,7 +504,9 @@ class EntityEditor:
             sheet = pygame.image.load(path).convert_alpha()
             sheet_w = sheet.get_width()
             sheet_h = sheet.get_height()
-            num_rows = 4
+            # flying.png sheets (butterflies, birds) are always 8-directional;
+            # everything else on these candidate paths is the 4-dir layout.
+            num_rows = 8 if path.endswith('flying.png') else 4
             frame_h = sheet_h // num_rows
             frame_w = w if 0 < w <= sheet_w else frame_h
             frame = sheet.subsurface(pygame.Rect(0, 0, frame_w, frame_h))
@@ -379,6 +549,14 @@ class EntityEditor:
             pts = [(cx, cy - r), (cx + r, cy), (cx, cy + r), (cx - r, cy)]
             pygame.draw.polygon(surf, light, pts)
             pygame.draw.polygon(surf, dark, pts, 2)
+
+        elif entity_type == 'critter':
+            # Small, soft, no outline — reads as "harmless ambient wildlife"
+            # rather than something placed to fight or talk to.
+            cx, cy = w // 2, h // 2
+            r = max(2, min(w, h) // 3)
+            pygame.draw.circle(surf, color, (cx, cy), r)
+            pygame.draw.circle(surf, light, (cx, cy), max(1, r // 2))
 
         return surf
 
@@ -465,6 +643,13 @@ class EntityEditor:
         for entry in self.ui_rects.get('ai_type_rects', []):
             if entry['rect'].collidepoint(mx, my):
                 self.hover_ai_type_idx = entry['index']
+                break
+
+        # Zeni pool hover
+        self.hover_zeni_pool_idx = -1
+        for entry in self.ui_rects.get('zeni_pool_rects', []):
+            if entry['rect'].collidepoint(mx, my):
+                self.hover_zeni_pool_idx = entry['index']
                 break
 
         # NPC mode hover
@@ -617,6 +802,13 @@ class EntityEditor:
                     if self._is_rocket_launcher_selected():
                         return True
                     self.selected_ai_type = entry['ai_type']
+                    return True
+
+            # ── Zeni pool selector click ───────────────────────────────────
+            for entry in self.ui_rects.get('zeni_pool_rects', []):
+                if entry['rect'].collidepoint(mouse_pos):
+                    self.selected_zeni_pool = entry['zeni_pool']
+                    print(f"DEBUG click: selected_zeni_pool -> {self.selected_zeni_pool!r}")
                     return True
 
             # ── NPC mode selector click ────────────────────────────────────
@@ -802,13 +994,7 @@ class EntityEditor:
     def _get_enemy_ids(self) -> list:
         """Return sorted list of all enemy/boss IDs from the entity catalogue,
         prefixed with '' meaning 'any enemy'."""
-        ids = set()
-        for cat_key in ('Enemies', 'Enemy Bosses'):
-            for entity in self.categories.get(cat_key, []):
-                eid = entity.get('id', '')
-                if eid:
-                    ids.add(eid)
-        return [''] + sorted(ids)
+        return [''] + discover_enemy_ids()
 
     def _get_npc_instance_ids(self) -> list:
         """Return list of (instance_id, label) tuples for every NPC placed in
@@ -1041,6 +1227,15 @@ class EntityEditor:
             else:
                 ai_type = self.selected_ai_type
 
+        # Embed the zeni drop pool for enemies/bosses so it survives however
+        # on_entity_placed's callback signature saves the entity (mirrors
+        # the NPC settings embed below, rather than the ai_type positional-
+        # arg dance above — there's no equivalent "new signature" slot for
+        # it, so this is the one path room_editor needs to read).
+        if self.selected_entity and self.selected_entity.get('entity_type') in ['enemy', 'boss']:
+            self.selected_entity['_zeni_pool'] = self.selected_zeni_pool
+            print(f"DEBUG place: embedding _zeni_pool={self.selected_zeni_pool!r}")
+
         # Embed NPC settings into entity dict before callback
         if self.selected_entity and self.selected_entity.get('entity_type') == 'npc':
             self.selected_entity['_npc_mode']   = self.selected_npc_mode
@@ -1109,7 +1304,7 @@ class EntityEditor:
             return
 
         # clear hit-rect cache each frame
-        self.ui_rects = {'category_rects': [], 'entity_rects': [], 'variant_rects': [], 'ai_type_rects': [], 'npc_mode_rects': [], 'npc_facing_rects': [], 'npc_dialogue_rects': []}
+        self.ui_rects = {'category_rects': [], 'entity_rects': [], 'variant_rects': [], 'ai_type_rects': [], 'zeni_pool_rects': [], 'npc_mode_rects': [], 'npc_facing_rects': [], 'npc_dialogue_rects': []}
 
         self._draw_palette_background(screen)
         self._draw_title(screen)
@@ -1457,6 +1652,53 @@ class EntityEditor:
                     })
 
                 y += button_height + 12
+
+            # Zeni Pool selector — always shown for enemies/bosses regardless
+            # of the rocket-launcher AI lock above (drop pool is independent
+            # of AI type).
+            zp_label = self.font_small.render("Zeni Pool:", True, self.COLORS['text_dim'])
+            screen.blit(zp_label, (self.palette_x + self.palette_padding, y))
+            y += 18
+
+            zp_button_width = 60
+            zp_button_height = 24
+            zp_button_gap = 6
+            zbx = self.palette_x + self.palette_padding
+
+            for i, zeni_pool in enumerate(self.zeni_pools):
+                button_rect = pygame.Rect(
+                    zbx + i * (zp_button_width + zp_button_gap), y,
+                    zp_button_width, zp_button_height,
+                )
+
+                is_selected = (zeni_pool == self.selected_zeni_pool)
+                is_hover = (self.hover_zeni_pool_idx == i)
+
+                if is_selected:
+                    bg_color = self.COLORS['variant_selected']
+                elif is_hover:
+                    bg_color = self.COLORS['panel_light']
+                else:
+                    bg_color = self.COLORS['panel']
+                pygame.draw.rect(screen, bg_color, button_rect, border_radius=4)
+
+                border_color = self.COLORS['accent'] if is_selected else self.COLORS['grid']
+                border_width = 2 if is_selected else 1
+                pygame.draw.rect(screen, border_color, button_rect, border_width, border_radius=4)
+
+                text_color = self.COLORS['text'] if is_selected else self.COLORS['text_dim']
+                # 'tier1' -> 'T1', etc. — keeps the label readable at this button width.
+                short_label = zeni_pool.replace('tier', 'T')
+                text = self.font_small.render(short_label, True, text_color)
+                screen.blit(text, text.get_rect(center=button_rect.center))
+
+                self.ui_rects['zeni_pool_rects'].append({
+                    'rect': button_rect,
+                    'zeni_pool': zeni_pool,
+                    'index': i,
+                })
+
+            y += zp_button_height + 12
 
         # NPC Mode + Facing selectors (only shown when an NPC is selected)
         if self.selected_entity and self.selected_entity.get('entity_type') == 'npc':

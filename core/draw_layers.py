@@ -63,10 +63,12 @@ class LayerManager:
 
     def __init__(self):
         self.drawable_objects: List[DrawableObject] = []
+        self._drawable_ids: set = set()   # id(obj) mirror of drawable_objects for O(1) add_object dedup
         self.debug_mode = False
         self._shadow_sprite = None
         self._shadow_sprite_big = None
         self._shadow_cache: dict = {}   # (width, big) -> scaled Surface
+        self._shadow_eligible_cache: dict = {}   # class -> bool, see _draw_shadow
         self._load_shadow()
         self._silhouette_black = None
         self._silhouette_alpha = None
@@ -110,8 +112,17 @@ class LayerManager:
 
     def _draw_shadow(self, screen, obj, camera):
         """Draw a ground shadow centred under the entity's feet."""
-        type_name = type(obj).__name__
-        if not any(t in type_name for t in self._SHADOW_TYPES):
+        cls = type(obj)
+        casts_shadow = self._shadow_eligible_cache.get(cls)
+        if casts_shadow is None:
+            # Only computed once per class ever, not once per object per
+            # frame — with a few thousand non-shadow-casting objects (e.g.
+            # a zeni pickup pile) in play, the old type(obj).__name__ +
+            # substring-scan on every single one, every frame, added up.
+            type_name = cls.__name__
+            casts_shadow = any(t in type_name for t in self._SHADOW_TYPES)
+            self._shadow_eligible_cache[cls] = casts_shadow
+        if not casts_shadow:
             return
 
         use_big = getattr(obj, 'shadow_size', 'small') == 'big'
@@ -128,23 +139,33 @@ class LayerManager:
         feet_y = (obj.y * RENDER_SCALE) - camera.y + (entity_height * RENDER_SCALE) // 2.25
         feet_y += getattr(obj, 'shadow_y_offset', 0)
 
-        sx = int(feet_x - shadow_surf.get_width()  // 2)
-        sy = int(feet_y - shadow_surf.get_height() // 2)
+        # round() rather than int()/truncation — with camera.x/camera.y now
+        # snapped to whole pixels in Camera.update(), the only remaining
+        # sub-pixel input here is the entity's own world position, and
+        # round() lines the shadow up a bit more consistently frame to
+        # frame than floor-toward-zero truncation did.
+        sx = round(feet_x - shadow_surf.get_width()  // 2)
+        sy = round(feet_y - shadow_surf.get_height() // 2)
         screen.blit(shadow_surf, (sx, sy))
 
     def add_object(self, obj: DrawableObject):
         """Register an object for rendering this frame."""
-        if obj not in self.drawable_objects:
+        oid = id(obj)
+        if oid not in self._drawable_ids:
+            self._drawable_ids.add(oid)
             self.drawable_objects.append(obj)
 
     def remove_object(self, obj: DrawableObject):
         """Drop an object from the render queue."""
-        if obj in self.drawable_objects:
+        oid = id(obj)
+        if oid in self._drawable_ids:
+            self._drawable_ids.discard(oid)
             self.drawable_objects.remove(obj)
 
     def clear(self):
         """Wipe the render queue — call at the start of each draw pass."""
         self.drawable_objects.clear()
+        self._drawable_ids.clear()
 
     def draw_all(self, screen, camera, colors, render_scale=1):
         """
@@ -292,15 +313,49 @@ class LayeredDrawMixin:
 
 def get_beam_layer(beam_direction: str, player_direction: str) -> int:
     """
-    Pick the right layer for a beam based on which way it's travelling.
-    Down = in front of everything, up = behind player, sideways = same level.
+    Pick the right layer for a fired beam.
+
+    down/left/right: the beam should always draw in front of the player
+    AND any enemy it's hitting, so it gets EFFECTS_FRONT (draws above
+    everything).
+
+    up: the beam travels away from the camera, behind the player's own
+    back/head, so it should NOT sit in front of the player the way the
+    other directions do. But it should still land in front of an enemy
+    positioned further up the screen. A flat "always behind" layer
+    (EFFECTS_BEHIND) can't do both at once — it would also hide the beam
+    behind any enemy it's hitting. Instead, 'up' shares DrawLayer.PLAYER
+    (0), the same Y-sorted bucket the player and enemies use. BeamAttack's
+    own get_sort_key() then sorts it by its actual spawn y, which is
+    already offset ABOVE the player (see _DIRECTION_SPAWN_OFFSETS['up'] in
+    player.py), so it naturally lands behind the player's Y-sort position
+    while still landing in front of enemies further away/up the screen.
     """
-    if beam_direction == 'down':
-        return DrawLayer.EFFECTS_FRONT
-    elif beam_direction == 'up':
-        return DrawLayer.EFFECTS_BEHIND
-    else:
+    if beam_direction == 'up':
         return DrawLayer.PLAYER
+    return DrawLayer.EFFECTS_FRONT
+
+
+def get_dragon_fist_layer(direction: str) -> int:
+    """
+    Pick the right layer for a thrown Dragon Fist.
+
+    down: the head and chain reach out toward the camera, in front of
+    the player's own body, so this stays EFFECTS_FRONT — same as melee.
+
+    up/left/right: the head and chain extend across or behind the
+    player's own sprite from the camera's point of view (up: away from
+    camera, behind the back; left/right: crossing in front of the
+    torso), so these should draw behind the player instead. Unlike
+    get_beam_layer's 'up' case, there's no enemy-occlusion concern to
+    balance here — Dragon Fist is a held melee-range attack, not a
+    projectile that also needs to land in front of something further
+    away — so a flat EFFECTS_BEHIND is enough rather than sharing the
+    Y-sorted PLAYER bucket.
+    """
+    if direction == 'down':
+        return DrawLayer.EFFECTS_FRONT
+    return DrawLayer.EFFECTS_BEHIND
 
 
 def get_dynamic_layer_for_object(obj_y: float, reference_y: float,

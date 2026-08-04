@@ -29,6 +29,40 @@ class MeleeAttack:
         """Sort key for the layer manager (fixed layer, no y-sorting)."""
         return (self.draw_layer, 0)
 
+    def get_rect(self):
+        """World-space hitbox for this swing, in front of the player along
+        self.direction — mirrors the swish arc drawn in draw() (same
+        `offset` reach, same `size` length), just in world units instead
+        of the screen-space pixels draw() uses.
+
+        Without this, anything checking collision against a MeleeAttack
+        (e.g. DestructibleStone.check_collision_with_attack) falls back to
+        treating it as a plain `size`-wide box CENTERED ON (self.x, self.y)
+        — the player's own raw anchor point — with no regard for
+        self.direction at all. That fallback hitbox sits wherever the
+        player's anchor happens to be relative to whatever it's swinging
+        at, rather than actually reaching out in front of the player, so
+        it connects or misses based on incidental anchor placement instead
+        of the direction actually being swung.
+        """
+        offset = 15  # Same reach used by draw()'s swish arc.
+        if self.direction == 'up':
+            return pygame.Rect(self.x - self.size // 2, self.y - offset - self.size,
+                                self.size, self.size)
+        elif self.direction == 'down':
+            return pygame.Rect(self.x - self.size // 2, self.y + offset,
+                                self.size, self.size)
+        elif self.direction == 'left':
+            return pygame.Rect(self.x - offset - self.size, self.y - self.size // 2,
+                                self.size, self.size)
+        elif self.direction == 'right':
+            return pygame.Rect(self.x + offset, self.y - self.size // 2,
+                                self.size, self.size)
+        # Unknown direction: fall back to a box centered on the anchor,
+        # same as the old default everything used to get unconditionally.
+        return pygame.Rect(self.x - self.size // 2, self.y - self.size // 2,
+                            self.size, self.size)
+
     def update(self, dt):
         """
         Advance the attack timer and deactivate when the duration is up.
@@ -83,4 +117,3 @@ class MeleeAttack:
             start_y = screen_y - self.size // 2
             end_x   = screen_x + offset + self.size
             end_y   = screen_y + self.size // 2
-

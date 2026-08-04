@@ -18,6 +18,8 @@ import random
 from attacks import Projectile
 from config.settings import *
 from core.camera import Camera
+from core.flag_manager import FlagManager
+from core.event_actions import EventRunner
 from core.game_config import GameConfig
 from core.transformation_system import TransformationSystem
 from core.transition_controller import TransitionController
@@ -26,23 +28,31 @@ from dev_tools.npc_config import NPCConfigMenu
 from dev_tools.transition_config import TransitionConfigMenu
 from entities.enemy import Enemy
 from attacks.bomb_projectile import BombProjectile, ExplosionEffect
+from attacks.burning_attack import BurningAttack, BurningChargeEffect, BurningHitEffect
+from attacks.genkidama import GenkidamaBlast, GenkidamaHitEffect
+from attacks.instant_transmission import InstantTransmissionSelector, InstantTransmissionStrike
 from attacks.bullet_projectile import bullet_projectile
 from attacks.rocket_projectile import rocket_projectile
+from attacks.ultra_volleyball_attack import UltraVolleyballAttack
+from attacks.big_bang_attack import BigBangAttackBlast, BigBangDestructionBurst
+from attacks.beam import BeamAttack
 from entities.npc import NPC
 from entities.player import Player
 from objects.room_transition import RoomTransition
 from rooms.room_manager import RoomManager
-from ui.dialogue import DialogueBox
+from ui.dialogue import DialogueBox, DialogueChoiceMenu
+from ui.spam_qte import SpamQTEBar
 from ui.hud import UI
 from ui.notifications import LevelUpNotification
 from ui.damage_number import DamageNumberManager
 from core.sound_engine import SoundEngine, SoundManager, AudioAssetLoader
 from ui.sprite_hud import SpriteHUD
-from core.draw_layers import LayerManager
+from core.draw_layers import LayerManager, DrawLayer
 from dev_tools.sprite_editor import SpriteEditor
 from dev_tools.room_editor.room_editor import RoomEditor
 from objects.collision_object import CollisionObjectManager
 from objects.level_gate import LevelGate
+from config.utils.gate_font import get_gate_font
 from objects.flying_pad import FlyingPad
 from core.flypad_controller import FlyingController
 from objects.save_point import SavePoint, SavePointMenu, SavePointManager
@@ -66,6 +76,69 @@ if sys.platform == 'win32':
             _ctypes.windll.user32.SetProcessDPIAware()    # Legacy fallback
         except Exception:
             pass   # If both calls fail, just carry on — it's cosmetic only
+
+
+class _LevelUpPlayerSpriteDrawable:
+    """Stand-in for the player while the level-up animation plays.
+
+    Registered with the LayerManager using the exact same draw_layer and
+    fixed (non-Y-sorted) get_sort_key() that LayerIntegrationHelper.
+    setup_player() gives the real player — see core/draw_layers.py. That
+    means it slots into precisely the spot the player would occupy in the
+    y-sort, so NPCs/enemies/foreground tiles keep drawing in front of or
+    behind it correctly instead of the animation always landing on top of
+    everything (which was the previous behavior, when it was blitted
+    directly after layer_manager.draw_all() instead of going through it).
+
+    The class name deliberately contains "Player" — LayerManager._draw_shadow
+    checks type(obj).__name__ against _SHADOW_TYPES, and only draws a ground
+    shadow for matching classes. That gives this the player's normal shadow
+    during the animation instead of none. shadow_size/shadow_width/
+    shadow_y_offset are forwarded from the real player so the shadow matches
+    exactly (falling back to _draw_shadow's own defaults if the player
+    doesn't set one of them).
+    """
+
+    def __init__(self, game):
+        self._game = game
+        self.draw_layer = DrawLayer.PLAYER
+        self.y_sort = False
+        self.active = True
+
+    @property
+    def x(self):
+        return self._game.player.x
+
+    @property
+    def y(self):
+        return self._game.player.y
+
+    @property
+    def width(self):
+        return self._game.player.width
+
+    @property
+    def height(self):
+        return self._game.player.height
+
+    @property
+    def shadow_size(self):
+        return getattr(self._game.player, 'shadow_size', 'small')
+
+    @property
+    def shadow_width(self):
+        return getattr(self._game.player, 'shadow_width', self._game.player.width)
+
+    @property
+    def shadow_y_offset(self):
+        return getattr(self._game.player, 'shadow_y_offset', 0)
+
+    def get_sort_key(self):
+        return (self.draw_layer, 0)
+
+    def draw(self, screen, camera, colors):
+        self._game._draw_levelup_sprite(screen, camera, colors)
+
 
 
 class Game:
@@ -136,9 +209,21 @@ class Game:
             character=starting_character,
             game_config=self.game_config,
         )
-        self.player.update_derived_stats()
+        # Apply the character creator's saved config (stats, equipped attacks,
+        # ki mode, and whether this character has any transformations) to the
+        # live player right away. Previously equipped_attacks/has_transformation
+        # were only ever set inside _reload_attack_config(), and nothing called
+        # that until the character creator had been opened and closed once —
+        # so on a fresh launch the player had no equipped attacks and
+        # 'transform' wasn't offered as a ki mode until then.
         self.player.transformation = TransformationSystem(self.player, self.game_config)
         self.player.in_transition  = False
+        self._reload_attack_config(starting_character)
+        # Switchable roster for the save point's "Switch Characters" menu.
+        # Being "added" (on disk / discover_characters()) no longer implies
+        # playable — only starting_character is switchable to start; the rest
+        # are unlocked via the 'character_list' event action.
+        self.player.playable_characters = [starting_character]
 
         # Defensive defaults — some older save files may not have these attributes.
         if not hasattr(self.player, 'hurt_tint'):
@@ -152,6 +237,11 @@ class Game:
         self.sprite_hud            = SpriteHUD(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.dialogue_box          = DialogueBox(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.dialogue_box.set_player(self.player)
+        self.dialogue_choice_menu  = DialogueChoiceMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
+        # Bottom-middle mash-E-or-Q QTE bar (see ui/spam_qte.py) — armed by
+        # the 'spam_qte' event action, same "one shared instance, started/
+        # stopped by Game" shape as dialogue_box/dialogue_choice_menu above.
+        self.spam_qte_bar          = SpamQTEBar()
         self.level_up_notification = LevelUpNotification(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.flying_controller     = FlyingController(SCREEN_WIDTH, SCREEN_HEIGHT)
 
@@ -183,7 +273,7 @@ class Game:
         )
 
         # ── Active cutscene runtime ───────────────────────────────────────────
-        # Set when a CutsceneTrigger fires; None the rest of the time.
+        # Set while a cutscene is playing; None the rest of the time.
         self.active_cutscene_runtime = None
         self.dt = 0.0
 
@@ -196,6 +286,11 @@ class Game:
         self._csf_alpha   = 0.0
         self._csf_speed   = 255.0 / _FADE_DUR      # alpha units per second
         self._csf_pending = None
+
+        # Callback fired once the currently-playing cutscene finishes.
+        # Only set by the 'play_cutscene' EventRunner action (blocking) so
+        # its action sequence can resume afterwards.
+        self._cutscene_on_finished = None
 
         # Map-jump screen fade — begins once the player drifts fully off the top
         # of the camera view.  Separate from _csf_* so cutscenes are unaffected.
@@ -222,6 +317,13 @@ class Game:
         self._mjf_flying_frame_idx   = 0
         self._mjf_flying_frame_timer = 0.0
         self._MJF_FLY_FRAME_DUR      = 0.12           # seconds per animation frame
+        # Eased throttle (0.0-1.0) multiplying MAP_SPD/ROTATE_SPD each frame —
+        # ramps toward 1.0 while any flight key is held and back toward 0.0
+        # on release, instead of snapping straight to full speed/stop. That
+        # instant on/off is what read as too fast/twitchy compared to
+        # Buu's Fury's smoother accel/decel feel.
+        self._mjf_fly_throttle       = 0.0
+        self._MJF_THROTTLE_RATE      = 2.5            # higher = snappier ramp
         # Focal length for the Mode 7 ground plane.
         # Controls the perceived camera altitude / viewing angle.
         # Lower  → shallower angle, strong perspective (ground rushes toward horizon).
@@ -234,25 +336,53 @@ class Game:
 
         # ── Active game-object lists ──────────────────────────────────────────
         self.projectiles          = []
+        self.ultra_volleyballs    = []   # Active UltraVolleyballAttack instances
         self.melee_attacks        = []
+        self.cutscene_beams       = []   # BeamAttack instances fired by scripted 'firebeam' cutscene actions
         self.bombs                = []   # BombProjectiles from Shooter enemies
+        self.masenko_projectiles  = []   # MasenkoProjectiles thrown by the player
         self.enemy_bullets        = []   # bullet_projectiles from Gunner enemies
         self.enemy_rockets        = []   # rocket_projectiles from RocketLauncher enemies
         self.enemy_kiblasts       = []   # Projectiles from kiblast-style enemies (e.g. Android 17/18)
         self.explosions           = []   # Active ExplosionEffect instances
+        self.genkidama_hit_effects = []  # Active GenkidamaHitEffect instances
+        self.burning_hit_effects  = []  # Active BurningHitEffect instances
+        # Kept separate from self.projectiles (unlike a regular Projectile
+        # or GenkidamaBlast) specifically so it never gets swept into that
+        # list's generic 'projectile' collision handling below, which
+        # deactivates on the first hit — BigBangAttackBlast pierces
+        # instead (see its own docstring and the dedicated per-enemy
+        # collision block in _update_enemies()).
+        self.big_bang_attacks = []              # Active BigBangAttackBlast instances
+        self.big_bang_destruction_effects = []  # Active BigBangDestructionBurst instances
+        self._white_flash_timer   = 0.0  # counts down from _WHITE_FLASH_DURATION
+        self._WHITE_FLASH_DURATION = 1  # seconds — genkidama impact flash + hitstop
+
+        # Instant Transmission — non-None only while the player is actively
+        # targeting (Q held in that mode). See _update_instant_transmission.
+        self.it_selector = None
         self.enemies              = []
         self.npcs                 = []
+        self.critters = []  # ambient wildlife: squirrels, birds, butterflies
         self.destructible_stones  = []
         self.collision_objects    = []
         self.room_transitions     = []
         self.level_gates          = []
+        self.doors                = []
         self.flying_pads          = []
         self.world_map_objects = []
-        self.music_objects        = []   # room's placed Music object (0 or 1); invisible, sets BGM only
+        self.music_track          = ''   # current room's persisted BGM track; set via trigger box room_music actions
+        self.trigger_boxes        = []   # room's placed trigger box zones (see core/event system)
+        self.zeni_pickups         = []   # dropped-zeni world pickups; see _update_zeni_pickups
 
         # ── Performance caches ────────────────────────────────────────────────
         # key: (room_name, is_background) → pre-baked tile Surface
         self._room_tile_surfaces: dict = {}
+        # (room_name, bg) -> list of Tile instances that are animated and were
+        # therefore excluded from the baked surface above; drawn dynamically
+        # every frame instead. Populated as a side effect of
+        # _build_room_tile_surface() and evicted alongside it.
+        self._animated_tile_lists: dict = {}
         self._dirty_tile_rooms:   set  = set()   # rooms pending a surface rebuild
         # key: font_size → pygame.Font  (avoids allocating a Font every frame)
         self._font_cache: dict = {}
@@ -272,6 +402,18 @@ class Game:
         self.pause_menu            = PauseMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.pause_menu.set_sound_engine(self.sound_engine)
         self.play_time             = 0.0   # total seconds spent in gameplay
+
+        # ── Event timers (timer_start/timer_pause/timer_stop actions) ─────────
+        # key: timer_id → {'remaining': float seconds, 'running': bool}
+        # The most recently started/resumed timer becomes the one shown on the
+        # HUD — matches the "one clock on screen at a time" use case these
+        # event actions are meant for (challenge/escape timers, etc.).
+        self.timers: dict = {}
+        self._active_timer_id = None
+        # 'spam_qte' event action state — stashed on_complete for the
+        # currently-running bar (see _handle_spam_qte_action/_update_spam_qte).
+        # None whenever self.spam_qte_bar.active is False.
+        self._event_spam_qte_on_complete = None
         self.nearby_save_point     = None
         self.nearby_world_map_obj  = None   # WorldMapObject the player can currently interact with
 
@@ -280,6 +422,11 @@ class Game:
         self.is_test_mode           = False
         self.test_room_backup       = None
         self._test_mission_snapshot = None
+        self._test_flag_snapshot    = None
+        self._test_wm_hidden_snapshot = None  # pre-test copy of self._wm_hidden_locations,
+                                               # restored on exit so 'world_map_location'
+                                               # add/remove actions fired during a room
+                                               # test don't permanently affect the map
 
         # ── Editor callbacks ──────────────────────────────────────────────────
         # Ensure the object editor exists before we try to hook into it.
@@ -300,10 +447,10 @@ class Game:
         oe.on_flying_pad_placed        = self._on_flying_pad_placed
         oe.on_save_point_placed        = self._on_save_point_placed
         oe.on_save_point_deleted       = self._on_save_point_deleted
-        oe.on_cutscene_trigger_placed  = self._on_cutscene_trigger_placed
-        oe.on_cutscene_trigger_deleted = self._on_cutscene_trigger_deleted
-        oe.on_music_placed             = self._on_music_placed
-        oe.on_music_deleted            = self._on_music_deleted
+        oe.on_trigger_box_placed       = self._on_trigger_box_placed
+        oe.on_trigger_box_deleted      = self._on_trigger_box_deleted
+        if hasattr(oe, 'set_sound_manager'):
+            oe.set_sound_manager(self.sound_manager)
 
         # Tile-change hook is installed lazily in draw() once tileset_editor exists.
         self._tile_change_hook_installed = False
@@ -320,7 +467,116 @@ class Game:
         # ── Mission system ────────────────────────────────────────────────────
         self.mission_manager          = MissionManager()
         self._active_mission_dialogue = None   # tracks current mission convo state
+        self._event_dialogue_active   = False  # True while an event-triggered dialogue_box action owns the box
         self.pause_menu.set_mission_manager(self.mission_manager)
+
+        # ── Level-up sequence ─────────────────────────────────────────────────
+        # Freezes the world, spins the player through a full facing rotation,
+        # plays the character's levelup.png animation twice, then chains the
+        # two "reached level / stat points" dialogue boxes. See
+        # _start_levelup_sequence() / _update_levelup_sequence().
+        self._levelup_active     = False        # True for the whole sequence — freezes enemies/npcs/player input
+        self._levelup_state      = None         # 'turning' | 'playing_anim' | None (dialogue phase)
+        self._LEVELUP_TURN_SEQUENCE = ['right', 'down', 'left', 'up',
+                                        'right', 'down', 'left', 'up',
+                                        'right', 'down']
+        self._levelup_turn_idx   = 0
+        self._levelup_turn_timer = 0.0
+        self._LEVELUP_TURN_DURATION = 0.12       # seconds per facing change
+
+        self._levelup_anim_frames        = []
+        self._levelup_anim_idx           = 0
+        self._levelup_anim_timer         = 0.0
+        self._levelup_anim_loops         = 0
+        self._LEVELUP_ANIM_LOOPS_TARGET  = 2      # play the animation twice
+        self._LEVELUP_ANIM_FRAME_DURATION = 0.4
+        self._levelup_anim_scaled_cache  = {}
+        self._levelup_drawable = _LevelUpPlayerSpriteDrawable(self)
+
+        # Snapshot of who/what leveled up, captured at trigger time so the
+        # dialogue text and sprite folder stay correct even if something
+        # about the player changes while the world is frozen.
+        self._levelup_char_at_trigger        = None
+        self._levelup_level_at_trigger       = 1
+        self._levelup_stat_points_at_trigger = 0
+
+        # ── Flag system ────────────────────────────────────────────────────────
+        # map_name -> {location name, ...} currently hidden by the
+        # 'world_map_location' event action. The pin itself (x/y/room/icon/
+        # height) always comes from assets/world_maps/<map>.json — this only
+        # tracks which already-placed pins are toggled off.
+        self._wm_hidden_locations = {}
+
+        self.flag_manager = FlagManager()
+        self.flag_manager.register_live_lookup('boss_hp_lookup', self._lookup_boss_hp_percent)
+        self.flag_manager.register_live_lookup('boss_hp_value_lookup', self._lookup_boss_hp_value)
+        self.flag_manager.register_live_lookup('player_has_skill', lambda skill_id: skill_id in getattr(self.player, 'equipped_attacks', []))
+        self.flag_manager.register_live_lookup('player_stat', lambda stat_name: getattr(self.player, 'stats', {}).get(stat_name))
+        self.flag_manager.register_live_lookup('player_character', lambda: getattr(self.player, 'character', None))
+        self.flag_manager.register_live_lookup('player_zeni', lambda: getattr(self.player, 'zeni', 0))
+        # player_has_item assumes self.player.inventory is a flat list of item_id
+        # strings (matches the .append(item)/.append(item_id) calls elsewhere) —
+        # flag if your inventory actually stores dicts/objects instead.
+        self.flag_manager.register_live_lookup('player_has_item', lambda item_id: getattr(self.player, 'inventory', []).count(item_id))
+        self.flag_manager.register_live_lookup('player_timer_remaining', lambda timer_id: self.timers.get(timer_id, {}).get('remaining'))
+        # bar_values already lives on FlagManager itself (set_bar_percent(),
+        # called every frame by _update_spam_qte) — this lookup just exposes
+        # it to check_bar()/live_check() the same way every other lookup
+        # exposes Game-owned state.
+        self.flag_manager.register_live_lookup('player_bar_percent', self.flag_manager.get_bar_percent)
+        # player_resource not wired — need the real health/energy/transformation_gauge attr names.
+        self.flag_manager.set_names_refresh_callback(self._get_flag_condition_names)
+
+        # Give the room editor a FlagManager so its object editor's "Edit
+        # Event" button (conditions + actions on trigger boxes / cutscene
+        # triggers) actually enables. RoomEditor.set_flag_manager() handles
+        # the fact that object_editor is lazy-initialized (None until Room
+        # Editor is opened for the first time) — don't reach into
+        # room_editor.object_editor directly here, it may not exist yet.
+        self.room_editor.set_flag_manager(self.flag_manager)
+
+        # Scope the event editor's 'skill' action add/remove pickers to
+        # whichever character is currently being played, so 'add' only
+        # offers skills this character doesn't have yet and 'remove' only
+        # offers what it actually has equipped. Re-synced in
+        # _switch_character() and whenever the Room Editor is (re)opened,
+        # since the player's character can change after this initial call.
+        self._sync_event_editor_character()
+        # Same idea, for the change_map action's room dropdown/Set Spawn
+        # preview — see _sync_event_editor_rooms().
+        self._sync_event_editor_rooms()
+
+        # ── Event / action system ───────────────────────────────────────────────
+        # Register the handlers Game can already back with real subsystems.
+        # See core/event_actions.py's module docstring for the rest — each of
+        # your other subsystems (dialogue, player stats/inventory, sound,
+        # cutscenes, room transitions, enemy spawning...) needs one
+        # self.event_runner.register_handler(...) call once its real method
+        # names are known.
+        self.event_runner = EventRunner()
+        self.event_runner.register_handler('set_custom_variable', self._handle_set_custom_variable_action)
+        self.event_runner.register_handler('world_map_location', self._handle_world_map_location_action)
+        self.event_runner.register_handler('dialogue_box', self._handle_dialogue_box_action, blocking=True)
+        self.event_runner.register_handler('dialogue_choice', self._handle_dialogue_choice_action)
+        self.event_runner.register_handler('timer_start', self._handle_timer_start_action)
+        self.event_runner.register_handler('timer_pause', self._handle_timer_pause_action)
+        self.event_runner.register_handler('timer_stop', self._handle_timer_stop_action)
+        self.event_runner.register_handler('zeni', self._handle_zeni_action)
+        self.event_runner.register_handler('level', self._handle_level_action)
+        self.event_runner.register_handler('exp', self._handle_exp_action)
+        self.event_runner.register_handler('stat', self._handle_stat_action)
+        self.event_runner.register_handler('resource', self._handle_resource_action)
+        self.event_runner.register_handler('skill', self._handle_skill_action)
+        self.event_runner.register_handler('character_list', self._handle_character_list_action)
+        self.event_runner.register_handler('screen_fade', self._handle_screen_fade_action, blocking=True)
+        self.event_runner.register_handler('screen_shake', self._handle_screen_shake_action)
+        self.event_runner.register_handler('spam_qte', self._handle_spam_qte_action, blocking=True)
+        self.event_runner.register_handler('weather', self._handle_weather_action)
+        self.event_runner.register_handler('room_music', self._handle_room_music_action)
+        self.event_runner.register_handler('play_sound', self._handle_play_sound_action)
+        self.event_runner.register_handler('change_map', self._handle_change_map_action, blocking=True)
+        self.event_runner.register_handler('set_player_location', self._handle_set_player_location_action)
+        self.event_runner.register_handler('play_cutscene', self._handle_play_cutscene_action, blocking=True)
 
         # Create the default starting room (a fresh transient "green dev" room).
         self._create_default_room()
@@ -336,6 +592,17 @@ class Game:
         # ── Transition / fade system ──────────────────────────────────────────
         self.transition_controller = TransitionController(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.flying_controller.set_transition_controller(self.transition_controller)
+
+        # ── Ambient room weather ─────────────────────────────────────────────
+        # Driven by the 'weather' event action. Separate from a cutscene's own
+        # weather system (core/cutscene_runtime.py's weather_start/weather_stop
+        # actions) — reuses that module's _WeatherEffect class so the art and
+        # fade timings match, but this instance persists outside cutscenes.
+        self.room_weather               = None
+        self._room_weather_fade_from    = 0.0
+        self._room_weather_fade_to      = 0.0
+        self._room_weather_fade_dur     = 0.0
+        self._room_weather_fade_elapsed = 0.0
 
         self.sound_manager.set_context('exploration')
 
@@ -429,6 +696,21 @@ class Game:
                 # 'open_skills' stub — wire up when the skills menu is ready
                 continue
 
+            # Spam QTE ('spam_qte' event action) — while a bar is active it
+            # owns E/Q entirely (queues a press for the bar instead of
+            # firing melee/ki-blast) and swallows every other input too, so
+            # nothing else can run mid-QTE. Placed below the pause menu so
+            # the player can still pause out, same as the dialogue/menu
+            # overlays below.
+            if self.spam_qte_bar.active:
+                if event.type == pygame.KEYDOWN and event.key in (pygame.K_e, pygame.K_q):
+                    self.spam_qte_bar.register_press()
+                continue
+
+            if self.dialogue_choice_menu.active:
+                self.dialogue_choice_menu.handle_input(event)
+                continue
+
             if self.save_point_menu.active:
                 result = self.save_point_menu.handle_input(event)
                 if result == 'save':
@@ -437,7 +719,13 @@ class Game:
                 elif result == 'switch_characters':
                     self.save_point_menu.close()
                     current_character = getattr(self.player, 'character', 'goku')
-                    self.character_switch_menu.open(current_character)
+                    # Since player.update() is frozen for the duration the menu
+                    # is open (see the main update loop), snap to plain idle
+                    # now — otherwise the player could be left showing
+                    # idle_transition/idle_wait (or any other state) frozen
+                    # mid-animation for as long as the menu stays open.
+                    self.player.enter_idle()
+                    self.character_switch_menu.open(current_character, self.player.playable_characters)
                 continue
 
             if self.npc_config_menu.active:
@@ -506,6 +794,8 @@ class Game:
                     if self.is_test_mode:
                         self._exit_test_mode()
                     self.room_editor.toggle()
+                    self._sync_event_editor_character()
+                    self._sync_event_editor_rooms()
                 elif result == 'open_sprite_editor':
                     self.dev_menu.active = False
                     self.sprite_editor.toggle()
@@ -518,7 +808,6 @@ class Game:
                 elif result == 'open_character_creator':
                     self.dev_menu.active = False
                     self.character_creator.toggle()
-                continue
 
             # ── Normal gameplay input ─────────────────────────────────────────
             # Only reached when no overlay is active.
@@ -533,11 +822,81 @@ class Game:
 
             elif event.type == pygame.KEYUP:
                 if self.ui.current_screen == 'game':
+                    if event.key == pygame.K_f:
+                        self.player.stop_blocking()
+                    # Charged Melee: releasing E cancels the wind-up if it
+                    # hasn't finished yet (same "early release cancels"
+                    # shape as the energy sword charge). Doesn't touch the
+                    # lunge/spin action itself once that's started — that
+                    # runs to completion regardless of key state, like the
+                    # sword spin's own free duration.
+                    if event.key == pygame.K_e:
+                        self.player.is_e_pressed = False
+                        if self.player.is_charging_melee:
+                            self.player.cancel_charging_melee()
                     # Release the beam charge when Q is lifted without having fired.
                     if event.key == pygame.K_q:
                         self.player.is_q_pressed = False
                         if self.player.is_charging_beam and not self.player.is_firing_beam:
                             self.player.stop_beam()
+                        elif self.player.is_charging_kamekameha and not self.player.is_firing_kamekameha:
+                            self.player.stop_kamekameha()
+                        elif self.player.is_charging_banshee_blast and not self.player.is_firing_banshee_blast:
+                            self.player.stop_banshee_blast()
+                        elif self.player.is_charging_final_flash and not self.player.is_firing_final_flash:
+                            self.player.stop_final_flash()
+                        elif self.player.is_charging_big_bang_kamehameha and not self.player.is_firing_big_bang_kamehameha:
+                            self.player.stop_big_bang_kamehameha()
+                        # Genkidama fires on release, at whatever state was reached.
+                        elif self.player.is_charging_genkidama:
+                            blast = self.player.release_genkidama()
+                            if blast:
+                                self.projectiles.append(blast)
+                                self.sound_manager.play_sfx(random.choice(('kiblast1', 'kiblast2')))
+                        # Big Bang Attack also fires on release, but always the
+                        # same single blast (see release_big_bang_attack()) —
+                        # appended to its own big_bang_attacks list rather than
+                        # self.projectiles, since it pierces instead of being
+                        # consumed on the first hit (see _update_enemies()'s
+                        # dedicated collision block for it).
+                        elif self.player.is_charging_big_bang_attack:
+                            blast = self.player.release_big_bang_attack()
+                            if blast:
+                                self.big_bang_attacks.append(blast)
+                                self.sound_manager.play_sfx(random.choice(('kiblast1', 'kiblast2')))
+                        # Burning attack fires on release too, same as genkidama.
+                        elif self.player.is_charging_burning:
+                            burning = self.player.release_burning()
+                            if burning:
+                                self.projectiles.append(burning)
+                                self.sound_manager.play_sfx(random.choice(('kiblast1', 'kiblast2')))
+                        # Flame Kamehameha now charges on hold like beam/burning
+                        # (see start_charging_flame_kamehameha/
+                        # update_flame_kamehameha_charge/fire_flame_kamehameha_auto
+                        # in player.py) — releasing Q either cancels the charge
+                        # before it completes, or ends the fired attack outright
+                        # (no decay sweep either way, see
+                        # FlameKamehamehaAttack.stop()).
+                        elif self.player.is_charging_flame_kamehameha or self.player.current_flame_kamehameha:
+                            self.player.stop_flame_kamehameha()
+                        # Masenko always throws on release, at the indicator's position.
+                        elif self.player.is_charging_masenko:
+                            masenko = self.player.throw_masenko()
+                            if masenko:
+                                self.masenko_projectiles.append(masenko)
+                                self.sound_manager.play_sfx(random.choice(('kiblast1', 'kiblast2')))
+                        # Energy sword: releasing early cancels the draw. Once the
+                        # charge finishes it auto-starts the (free, fixed-length)
+                        # spin, which isn't tied to the key at all — nothing to
+                        # do here in that case.
+                        elif self.player.is_charging_sword:
+                            self.player.stop_charging_sword()
+                        # Instant Transmission teleports to every selected
+                        # enemy in pick order, then back home, on release.
+                        elif self.player.is_targeting_it:
+                            targets = self.it_selector.selected_enemies if self.it_selector else []
+                            self.player.begin_teleport_sequence(targets)
+                            self.it_selector = None
 
     def _handle_game_keydown(self, event):
         """Key-down events during normal gameplay.
@@ -549,9 +908,29 @@ class Game:
           Arrows  — move; double-tap a direction to start running
           Shift   — hold to run
           E       — interact / melee / advance dialogue
-          Q       — ki blast (blast mode) or begin beam charge (beam mode)
-          TAB     — cycle ki mode: blast → beam → transform → blast
-          X       — trigger transformation (transform mode, when fully charged)
+          F       — hold to block: no other actions, damage halved,
+                    knockback reduced to a 1px nudge, no hurt animation/flash
+          Q       — ki blast (blast mode), begin beam charge (beam mode),
+                    begin Kamekameha charge (kamekameha mode), begin
+                    Banshee Blast charge (banshee_blast mode), begin
+                    Final Flash charge (final_flash mode), begin Big Bang
+                    Kamehameha charge (big_bang_kamehameha mode), begin
+                    genkidama charge (genkidama mode), begin Big Bang
+                    Attack charge (big_bang_attack mode — single fixed
+                    power level, unlike genkidama's escalating one), begin
+                    masenko charge (masenko mode), begin flame kamehameha
+                    charge (flame_kamehameha mode), throw an instant Energy
+                    Punch (energy_punch mode, no charge-up), begin
+                    drawing the energy sword (sword mode) — completing the
+                    draw auto-starts a short free spin — or launch the
+                    Dragon Fist (dragon_fist mode, no charge-up, held for
+                    as long as Q stays down), or summon the Ghost
+                    Kamikaze Attack (ghost_kamikaze mode, no charge-up —
+                    plays out entirely on its own afterward, see
+                    Player.start_ghost_kamikaze)
+          TAB     — cycle ki mode: blast → beam → kamekameha → banshee_blast → final_flash → big_bang_kamehameha → genkidama → big_bang_attack → masenko → burning → flame_kamehameha → ultra_volleyball → sword → energy_punch → dragon_fist → ghost_kamikaze → instant_transmission → transform → blast
+          X       — trigger transformation (transform mode, when fully charged),
+                    or detransform if already transformed
         """
         if event.key == pygame.K_F1:
             self.dev_menu.toggle()
@@ -566,15 +945,90 @@ class Game:
         elif event.key == pygame.K_ESCAPE:
             self.pause_menu.open(self.player)
 
+        elif event.key == pygame.K_f:
+            self.player.start_blocking()
+
         elif event.key == pygame.K_q:
             # Q fires a ki blast or begins charging a beam, depending on the current mode.
             self.player.is_q_pressed = True
             if self.player.ki_attack_mode == 'blast':
                 self.player.shoot_blast()
+            elif self.player.ki_attack_mode == 'ultra_volleyball_attack':
+                # Instant fire, no charge-up — reuses the same kiblast
+                # throw animation as a regular blast (see
+                # shoot_ultra_volleyball()), just spawning a
+                # UltraVolleyballAttack instead of a Projectile.
+                self.player.shoot_ultra_volleyball()
             elif self.player.ki_attack_mode == 'beam':
                 self.player.start_charging_beam()
+            elif self.player.ki_attack_mode == 'kamekameha':
+                self.player.start_charging_kamekameha()
+            elif self.player.ki_attack_mode == 'banshee_blast':
+                # Same hold-to-charge/auto-fire shape as beam/kamekameha —
+                # see _update_banshee_blast/_grow_banshee_blast below.
+                self.player.start_charging_banshee_blast()
+            elif self.player.ki_attack_mode == 'final_flash':
+                self.player.start_charging_final_flash()
+            elif self.player.ki_attack_mode == 'big_bang_kamehameha':
+                # Same hold-to-charge/auto-fire shape as beam/kamekameha/
+                # final_flash — BigBangKamehamehaAttack reuses BeamAttack's
+                # pipeline wholesale, so it's driven the same way (see
+                # _update_big_bang_kamehameha/_grow_big_bang_kamehameha
+                # below), not flame_kamehameha's fixed-chain shape.
+                self.player.start_charging_big_bang_kamehameha()
+            elif self.player.ki_attack_mode == 'genkidama':
+                self.player.start_charging_genkidama()
+            elif self.player.ki_attack_mode == 'big_bang_attack':
+                # Same hold-to-charge/fire-on-release shape as genkidama
+                # (see start_charging_big_bang_attack()), just with a
+                # single fixed power level instead of an escalating one —
+                # see BigBangAttackChargeEffect's docstring. Releasing Q
+                # is handled in the KEYUP handler below.
+                self.player.start_charging_big_bang_attack()
+            elif self.player.ki_attack_mode == 'masenko':
+                self.player.start_charging_masenko()
+            elif self.player.ki_attack_mode == 'burning_attack':
+                self.player.start_charging_burning()
+            elif self.player.ki_attack_mode == 'flame_kamehameha':
+                # Holds Q to charge (charging_flame_kamehameha.png, via
+                # KamehamehaChargeEffect) then auto-fires once fully charged —
+                # same hold-to-charge/auto-fire shape as beam/burning. See the
+                # KEYUP handler above for how releasing early cancels it.
+                self.player.start_flame_kamehameha()
+            elif self.player.ki_attack_mode == 'sword':
+                self.player.start_charging_sword()
+            elif self.player.ki_attack_mode == 'dragon_fist':
+                # Instant on press, no charge-up — held for as long as Q
+                # stays down (see Player.start_dragon_fist/update_dragon_fist).
+                # Releasing Q is handled generically below (is_q_pressed
+                # goes False, which update_dragon_fist() checks itself,
+                # same shape as the beam's own Ki-drain tick) — nothing
+                # extra needed in the KEYUP handler.
+                self.player.start_dragon_fist()
+            elif self.player.ki_attack_mode == 'energy_punch':
+                # Instant strike, no charge — see player.energy_punch() and
+                # Game._update_energy_punch for the hit-check every frame
+                # while it plays out.
+                self.player.energy_punch()
+            elif self.player.ki_attack_mode == 'instant_transmission':
+                if self.player.start_targeting_instant_transmission():
+                    w, h = self.logical_surface.get_size()
+                    self.it_selector = InstantTransmissionSelector(w, h)
+            elif self.player.ki_attack_mode == 'ghost_kamikaze_attack':
+                # Instant on press, no charge-up, no hold-to-release either
+                # — the whole creation → hold → attack sequence runs on
+                # its own afterward (see Player.start_ghost_kamikaze and
+                # Game._update_ghost_kamikaze). Nothing needed in the
+                # KEYUP handler.
+                self.player.start_ghost_kamikaze()
 
         elif event.key == pygame.K_e:
+            # Tracked so Player.update() can tell, once the normal melee
+            # swing finishes, whether E is still held (roll into the
+            # charged-melee wind-up — see start_charging_melee()) or not
+            # (return to idle as before). See the KEYUP handler for the
+            # release side, which also cancels an in-progress charge.
+            self.player.is_e_pressed = True
             self._handle_interact()
 
         elif event.key == pygame.K_TAB:
@@ -585,11 +1039,18 @@ class Game:
                 self.player.ki_attack_mode = modes[(idx + 1) % len(modes)]
 
         elif event.key == pygame.K_x:
-            # X triggers a transformation when the system is charged and ready.
-            if (self.player.ki_attack_mode == 'transform'
-                    and self.player.transformation
-                    and self.player.transformation.is_ready):
-                self.player.transformation.start_transform()
+            # X triggers a transformation when charged and ready, and reverses
+            # an active transformation back to base form when already
+            # transformed. Ignored mid-transition (is_transforming /
+            # is_untransforming) so a repeat press can't restart the
+            # animation partway through.
+            ts = self.player.transformation
+            if (self.player.ki_attack_mode == 'transform' and ts
+                    and not ts.is_transforming and not ts.is_untransforming):
+                if ts.is_transformed:
+                    ts.start_untransform()
+                elif ts.is_ready:
+                    ts.start_transform()
 
         elif event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN):
             # Double-tapping a direction key starts a run.
@@ -617,16 +1078,15 @@ class Game:
         if self.nearby_save_point and not self.dialogue_box.active and not self.save_point_menu.active:
             if self.nearby_save_point.variant == 'big':
                 self.save_point_menu.open()
-                # Opening the menu suppresses _update_player_movement() for as
-                # long as it stays open (see the update() gating around
-                # save_point_menu.active), and that function is the only place
-                # that snaps 'walk'/'run' back to 'idle'. Without this, a
-                # player who interacts mid-run stays frozen on a run/walk
-                # frame for the entire time the menu is open. Mirror the same
-                # snap-to-idle logic here so the animation resolves correctly.
+                # Opening the menu suppresses _update_player_movement() and now
+                # player.update() itself for as long as it stays open (see the
+                # update() gating around save_point_menu.active). Without a
+                # snap-to-idle here, a player who interacts mid-run, or right
+                # as idle_transition/idle_wait kicked in, would stay frozen on
+                # that frame for the entire time the menu is open.
                 self.player.is_running = False
                 if not self.player.is_transitioning:
-                    if self.player.current_animation_state in ('walk', 'run'):
+                    if self.player.current_animation_state in ('walk', 'run', 'idle_transition', 'idle_wait'):
                         self.player.enter_idle()
             return
 
@@ -738,6 +1198,7 @@ class Game:
             # they used to leave. _mjf_last_entry_entity is set at landing time
             # when the entity name is definitively known.
             self._mjf_origin_entity = getattr(self, '_mjf_last_entry_entity', '')
+            print(f"[world_map_music] _on_exit callback firing for map '{new_map_name}'")
             self._apply_world_map_music(new_map_name)
             if self._mjf_alpha >= 255.0:
                 self._mjf_state  = 'fade_in'
@@ -753,6 +1214,10 @@ class Game:
         # Reset the fade so a repeated jump always starts from transparent.
         self._mjf_alpha  = 0.0
         self._mjf_active = False
+        # Departure cue for leaving into the world map via this object —
+        # same sound as flying off a flying pad, if you've already got
+        # that one wired into FlyingController.start_flight.
+        self.sound_manager.play_sfx('flyoff')
         self.player.start_map_jump()
 
     def _start_npc_dialogue(self, npc):
@@ -861,6 +1326,11 @@ class Game:
             self.dialogue_box._chars_shown = len(self.dialogue_box.current_text)
             return
 
+        # ── Event-triggered dialogue (from the Event Editor's action list) ─────
+        if self._event_dialogue_active:
+            self.dialogue_box.hide()
+            return
+
         # ── Plain NPC flow (no mission) ───────────────────────────────────────
         if self._active_mission_dialogue is None:
             if not self.nearby_npc:
@@ -935,6 +1405,169 @@ class Game:
         portrait_key   = self._npc_portrait_key(npc)
         self.dialogue_box.show(line, "NPC", is_final, None, portrait_key=portrait_key)
 
+    def _show_level_up_if_pending(self):
+        """Consume Player.pending_level_up if it's set — kicks off the
+        level-up sequence (freeze, turn, animate, dialogue) and plays
+        levelup.wav, so every level-up gets both regardless of which call
+        site (mission XP reward vs. enemy-kill XP) triggered it. Safe to
+        call unconditionally; no-op if nothing is actually pending."""
+        if not self.player.pending_level_up:
+            return
+        self.player.pending_level_up = False
+        self.sound_manager.play_sfx('levelup')
+        self._start_levelup_sequence()
+
+    def _start_levelup_sequence(self):
+        """Kick off the level-up cutscene: freeze enemies/NPCs/player input,
+        spin the player through a full facing rotation, play the character's
+        levelup.png animation twice, then chain the two level-up dialogue
+        boxes ("reached level X!" -> "currently has N stat points.").
+
+        Snapshots character/level/stat_points at trigger time so the
+        dialogue text stays correct even though the world is frozen for the
+        whole sequence (nothing else should be able to change them, but this
+        matches the same defensive snapshotting used elsewhere, e.g. locked
+        boss max HP in sprite_hud.py).
+        """
+        self._levelup_char_at_trigger        = self.player.character
+        self._levelup_level_at_trigger       = self.player.level
+        self._levelup_stat_points_at_trigger = self.player.stat_points
+
+        self._levelup_active     = True
+        self._levelup_state      = 'turning'
+        self._levelup_turn_idx   = 0
+        self._levelup_turn_timer = 0.0
+
+        # Snap to idle facing the first direction in the turn sequence so
+        # there's no stray walk/run frame carried in from before leveling up
+        # — same fix _handle_dialogue_box_action() applies for NPC/event
+        # dialogue starting mid-walk.
+        if self.player.current_animation_state in ('walk', 'run'):
+            self.player.enter_idle()
+        self.player.is_running = False
+        self.player.direction = self._LEVELUP_TURN_SEQUENCE[0]
+        self.player.sprite.set_animation('idle', self.player.direction)
+
+        self._load_levelup_char_frames()
+
+    def _load_levelup_char_frames(self):
+        """Load levelup.png from the current character's own sprite folder
+        (assets/sprites/characters/<character>/<costume>/levelup.png via
+        self.player.sprite.base_path) and slice it into frames matching the
+        player's normal sprite size — same convention as start_map_jump()'s
+        map_jump.png loader in player.py.
+
+        Assumes one row of frames, each player.width x player.height (32x32
+        by default) — let me know if the sheet is laid out differently.
+        """
+        self._levelup_anim_frames       = []
+        self._levelup_anim_idx          = 0
+        self._levelup_anim_timer        = 0.0
+        self._levelup_anim_loops        = 0
+        self._levelup_anim_scaled_cache = {}
+
+        path = f'{self.player.sprite.base_path}/levelup.png'
+        try:
+            sheet   = pygame.image.load(path).convert_alpha()
+            frame_w = self.player.width
+            frame_h = self.player.height
+            num_frames = max(1, sheet.get_width() // frame_w)
+            self._levelup_anim_frames = [
+                sheet.subsurface(pygame.Rect(i * frame_w, 0, frame_w, frame_h))
+                for i in range(num_frames)
+            ]
+        except Exception as e:
+            # Sheet not found — sequence still runs (just skips straight to
+            # dialogue once turning finishes) so nothing hard-crashes.
+            print(f'[levelup] could not load {path}: {e}')
+
+    def _update_levelup_sequence(self, dt):
+        """Advance the turning / character-animation phases of the level-up
+        sequence. No-op once the sequence has handed off to the dialogue
+        boxes (self._levelup_state is None at that point) — self._levelup_active
+        stays True through both boxes purely to keep the world frozen; see
+        _end_levelup_sequence()."""
+        if not self._levelup_active or self._levelup_state is None:
+            return
+
+        if self._levelup_state == 'turning':
+            self._levelup_turn_timer += dt
+            if self._levelup_turn_timer >= self._LEVELUP_TURN_DURATION:
+                self._levelup_turn_timer -= self._LEVELUP_TURN_DURATION
+                self._levelup_turn_idx += 1
+                if self._levelup_turn_idx >= len(self._LEVELUP_TURN_SEQUENCE):
+                    self._levelup_state = 'playing_anim'
+                    if not self._levelup_anim_frames:
+                        # Sheet missing — nothing to animate, go straight to dialogue.
+                        self._finish_levelup_animation()
+                else:
+                    new_dir = self._LEVELUP_TURN_SEQUENCE[self._levelup_turn_idx]
+                    self.player.direction = new_dir
+                    self.player.sprite.set_animation('idle', new_dir)
+
+        elif self._levelup_state == 'playing_anim':
+            self._levelup_anim_timer += dt
+            if self._levelup_anim_timer >= self._LEVELUP_ANIM_FRAME_DURATION:
+                self._levelup_anim_timer -= self._LEVELUP_ANIM_FRAME_DURATION
+                self._levelup_anim_idx += 1
+                if self._levelup_anim_idx >= len(self._levelup_anim_frames):
+                    self._levelup_anim_idx = 0
+                    self._levelup_anim_loops += 1
+                    if self._levelup_anim_loops >= self._LEVELUP_ANIM_LOOPS_TARGET:
+                        self._finish_levelup_animation()
+
+    def _finish_levelup_animation(self):
+        """Turning + animation are done — show the first of the two
+        level-up dialogue boxes. self._levelup_active stays True (world
+        stays frozen) until _end_levelup_sequence() fires after the second
+        box closes."""
+        self._levelup_state = None
+        name = self._levelup_char_at_trigger.replace('_', ' ').title()
+        text = f"{name} has reached level {self._levelup_level_at_trigger}!"
+        self.dialogue_box.show(
+            text, name, True, None,
+            on_close=self._show_levelup_stat_points_dialogue,
+        )
+
+    def _show_levelup_stat_points_dialogue(self):
+        name = self._levelup_char_at_trigger.replace('_', ' ').title()
+        text = f"{name} currently has {self._levelup_stat_points_at_trigger} stat points."
+        self.dialogue_box.show(
+            text, name, True, None,
+            on_close=self._end_levelup_sequence,
+        )
+
+    def _end_levelup_sequence(self):
+        """Second dialogue box closed — unfreeze the world."""
+        self._levelup_active = False
+        self.player.enter_idle()
+
+    def _draw_levelup_sprite(self, screen, camera, colors):
+        """Blit the current levelup.png animation frame at the player's
+        screen position. Signature matches DrawableObject.draw() so this
+        can be called by the layer manager like any other sprite — see
+        _LevelUpPlayerSpriteDrawable, which registers this with the same
+        draw_layer/get_sort_key the player itself uses, so NPCs/enemies/
+        foreground tiles correctly draw in front of or behind it instead
+        of it always landing on top."""
+        frames = self._levelup_anim_frames
+        if not frames:
+            return
+        idx = min(self._levelup_anim_idx, len(frames) - 1)
+        sw  = self.player.width  * RENDER_SCALE
+        sh  = self.player.height * RENDER_SCALE
+
+        # Pre-scaled-frame cache — same source frame always scales to the
+        # same size, so scale once per frame index instead of every draw().
+        scaled = self._levelup_anim_scaled_cache.get(idx)
+        if scaled is None:
+            scaled = pygame.transform.scale(frames[idx], (sw, sh))
+            self._levelup_anim_scaled_cache[idx] = scaled
+
+        cx = int(self.player.x * RENDER_SCALE - camera.x)
+        cy = int(self.player.y * RENDER_SCALE - camera.y)
+        screen.blit(scaled, (cx - sw // 2, cy - sh // 2))
+
     def _apply_mission_rewards(self, rewards: dict):
         """Credit XP and items from a completed mission to the player."""
         if not rewards:
@@ -942,9 +1575,7 @@ class Game:
         xp = rewards.get('xp', 0)
         if xp:
             self.player.gain_exp(xp, self.game_config)
-            if self.player.pending_level_up:
-                self.level_up_notification.show(self.player.level, self.player.stat_points)
-                self.player.pending_level_up = False
+            self._show_level_up_if_pending()
         for item_entry in rewards.get('items', []):
             item_id = item_entry.get('item_id', '')
             count   = int(item_entry.get('count', 1))
@@ -990,10 +1621,34 @@ class Game:
         # Clear all active entities and projectiles before entering test mode.
         self._clear_active_entities()
 
+        # If the player was mid-way through (or fully inside) the world-map
+        # flying sequence when "Test Room" was triggered, force it back to
+        # neutral. update() checks self._mjf_state before anything else each
+        # frame and, while it's 'flying'/'fade_in'/etc, routes straight into
+        # _update_map_flying() and returns — completely bypassing normal
+        # room gameplay. Without this reset, everything below (player
+        # position, camera, current_room) gets set correctly but the player
+        # stays visibly stuck on the world map, since update() never even
+        # reaches the code that would show them in the test room.
+        self._mjf_state  = None
+        self._mjf_active = False
+        self._mjf_alpha  = 0.0
+        self.camera.locked = False
+        self.player.is_map_jumping  = False
+        self.player.map_jump_moving = False
+        self.player.on_map_jump_exit = None
+
         self.is_test_mode                = True
         self._create_comprehensive_test_backup()
         self._test_mission_snapshot      = self.mission_manager.snapshot()
         self.mission_manager.block_saves = True   # prevent test progress reaching disk
+        self._test_flag_snapshot         = self.flag_manager.snapshot()
+        self.flag_manager.block_saves    = True   # prevent test progress reaching disk
+        # Snapshot which world-map pins are currently hidden, so a
+        # world_map_location 'add'/'remove' action fired while testing this
+        # room doesn't permanently show/hide a pin on the real map — see
+        # the restore in _exit_test_mode().
+        self._test_wm_hidden_snapshot    = {k: set(v) for k, v in self._wm_hidden_locations.items()}
 
         self.room_manager.current_room = room
         self.current_room              = room
@@ -1196,17 +1851,38 @@ class Game:
             for obj in room.world_map_objects:
                 self.world_map_objects.append(WorldMapObject.from_dict(obj.to_dict()))
 
-        # Music object — copy so test mode doesn't mutate the editor original
-        self.music_objects = []
-        if hasattr(room, 'music_objects') and room.music_objects:
-            from objects.music_object import MusicObject
-            for obj in room.music_objects:
-                self.music_objects.append(MusicObject.from_dict(obj.to_dict()))
+        # Room music track — a plain string, so no copy needed to keep test
+        # mode from mutating the editor original.
+        self.music_track = getattr(room, 'music_track', '')
         self._apply_room_music(room)
+
+        # Trigger boxes — copy so test mode doesn't latch (once=True) the
+        # editor originals' `triggered` flag.
+        self.trigger_boxes = []
+        if hasattr(room, 'trigger_boxes') and room.trigger_boxes:
+            from objects.trigger_box import TriggerBox
+            for box in room.trigger_boxes:
+                self.trigger_boxes.append(TriggerBox.from_dict(box.to_dict()))
+
+        # Doors — copy so test mode doesn't mutate the editor originals.
+        # to_dict()/from_dict() round-trips is_open for permanent doors, so a
+        # door already opened in the editor's own state (if any) carries over.
+        # First, close out any non-permanent door left open in the room we're
+        # leaving — those live-mode Door instances are shared with RoomManager
+        # (see _load_room_objects below), so without this they'd still show
+        # open the next time that room is entered.
+        for door in getattr(self, 'doors', []):
+            door.close()
+        self.doors = []
+        if hasattr(room, 'doors') and room.doors:
+            from objects.door_object import Door
+            for door in room.doors:
+                self.doors.append(Door.from_dict(door.to_dict()))
 
         # Entities (enemies and NPCs)
         self.enemies = []
         self.npcs    = []
+        self.critters = []  # ambient wildlife: squirrels, birds, butterflies
         self._spawn_room_entities(room)
 
         # Clear all in-flight projectiles and attacks.
@@ -1220,10 +1896,23 @@ class Game:
         if not self.is_test_mode or not self.test_room_backup:
             return
 
-        # Whatever music the test room started (via its Music object, a
-        # cutscene's play_music action, etc.) otherwise just keeps playing
-        # forever — nothing re-applies a context/room track on exiting test
-        # mode. Cut it instantly here so dropping back into the room editor
+        # Same reasoning as the reset in _handle_test_room: if the player
+        # flew into the world map during the test itself and then pressed F2
+        # to exit, leaving _mjf_state set would keep update() routing into
+        # _update_map_flying() and bypassing normal gameplay/the room editor
+        # even after is_test_mode goes back to False below.
+        self._mjf_state  = None
+        self._mjf_active = False
+        self._mjf_alpha  = 0.0
+        self.camera.locked = False
+        self.player.is_map_jumping  = False
+        self.player.map_jump_moving = False
+        self.player.on_map_jump_exit = None
+
+        # Whatever music the test room started (via its persisted music
+        # track, a cutscene's play_music action, etc.) otherwise just keeps
+        # playing forever — nothing re-applies a context/room track on
+        # exiting test mode. Cut it instantly here so dropping back into the room editor
         # is silent right away, with no fade-out lag.
         self.sound_manager.stop_music(fade_out=False)
 
@@ -1291,6 +1980,25 @@ class Game:
             self.mission_manager.save()
             self._test_mission_snapshot = None
 
+        self.flag_manager.block_saves = False
+        if self._test_flag_snapshot is not None:
+            self.flag_manager.restore(self._test_flag_snapshot)
+            self.flag_manager.save()
+            self._test_flag_snapshot = None
+
+        # Restore world-map pin visibility to pre-test state, so any
+        # world_map_location 'add'/'remove' action that fired during the
+        # test doesn't stick around once you're back in the room editor.
+        if self._test_wm_hidden_snapshot is not None:
+            self._wm_hidden_locations = self._test_wm_hidden_snapshot
+            self._test_wm_hidden_snapshot = None
+            # Bust the cached location list (and whatever else keys off it)
+            # so a currently-open flying-map view re-derives from the
+            # restored hidden set instead of whatever test mode toggled.
+            for attr in ('_wm_locations', '_wm_entities', '_wm_vehicle_cache'):
+                if hasattr(self, attr):
+                    delattr(self, attr)
+
         self._clear_active_entities()
         self.destructible_stones = []
         self.collision_objects   = []
@@ -1329,13 +2037,24 @@ class Game:
         self.room_transitions    = room.room_transitions[:]    if hasattr(room, 'room_transitions')    and room.room_transitions    else []
         self.save_points         = room.save_points[:]         if hasattr(room, 'save_points')         and room.save_points         else []
         self.world_map_objects   = room.world_map_objects[:]   if hasattr(room, 'world_map_objects')   and room.world_map_objects   else []
-        self.music_objects       = room.music_objects[:]       if hasattr(room, 'music_objects')       and room.music_objects       else []
+        self.music_track         = getattr(room, 'music_track', '')
+        self.trigger_boxes       = room.trigger_boxes[:]       if hasattr(room, 'trigger_boxes')       and room.trigger_boxes       else []
+        # Close out any non-permanent door left open in the room we're leaving
+        # — a non-permanent door stays open as long as the player is in its
+        # room, but should be closed again by the time they come back.
+        for door in getattr(self, 'doors', []):
+            door.close()
+        # Shallow copy — same Door instances as room.doors, not fresh copies —
+        # so a permanent door's is_open flag survives leaving and re-entering
+        # this room later in the same session.
+        self.doors                = room.doors[:]              if hasattr(room, 'doors')               and room.doors               else []
         self._apply_room_music(room)
 
 
         # Spawn entities.
         self.enemies = []
         self.npcs    = []
+        self.critters = []  # ambient wildlife: squirrels, birds, butterflies
         self._spawn_room_entities(room)
 
         # Clear in-flight projectiles left over from the previous room.
@@ -1442,6 +2161,7 @@ class Game:
         from entities.enemy import Enemy
         from entities.boss_enemy import BossEnemy
         from entities.npc import NPC
+        from entities.critter import Critter
 
         # Build the obstacle list used to resolve spawn-time collisions (Fail-safe 2).
         spawn_obstacles = (
@@ -1483,6 +2203,29 @@ class Game:
                     npc.has_sprite = False
                 self.npcs.append(npc)
 
+            elif entity_type == 'critter':
+                critter_id = data.get('id', 'squirrel')
+                wander_radius = data.get('wander_radius', 32)
+                critter_width = data.get('width', 16)
+                critter_height = data.get('height', 16)
+                critter = Critter(x, y, critter_type=critter_id, variant=variant_type,
+                                  width=critter_width, height=critter_height,
+                                  wander_radius=wander_radius)
+                critter.active = True
+
+                try:
+                    from core.sprite_system import create_critter_sprite
+                    critter.sprite     = create_critter_sprite(critter_id, variant_type,
+                                                                critter.width, critter.height)
+                    critter.has_sprite = critter.sprite is not None
+                except Exception:
+                    critter.has_sprite = False
+
+                # No _push_out_of_obstacles call — critters have no hitbox and
+                # are never checked against obstacles, so there's nothing to
+                # push out of.
+                self.critters.append(critter)
+
             elif entity_type == 'boss':
                 boss        = BossEnemy(x, y, boss_id=enemy_id, variant=variant_type)
                 boss.active = True
@@ -1492,6 +2235,8 @@ class Game:
             elif entity_type == 'enemy':
                 ai_type        = data.get('ai_type', 'easy')
                 enemy_category = data.get('enemy_category', 'melee')
+                zeni_pool      = data.get('zeni_pool', 'tier1')
+                print(f"DEBUG spawning enemy id={enemy_id} zeni_pool={zeni_pool!r} raw_data_keys={list(data.keys())}")
 
                 # Map variant to the correct projectile type for shooter enemies.
                 if variant_type == 'gunner':
@@ -1503,7 +2248,7 @@ class Game:
 
                 enemy        = Enemy(x, y, enemy_type=enemy_id, variant=variant_type,
                                      ai_type=ai_type, enemy_category=enemy_category,
-                                     shooter_style=shooter_style)
+                                     shooter_style=shooter_style, zeni_pool=zeni_pool)
                 enemy.active = True
                 self._push_out_of_obstacles(enemy, spawn_obstacles)
                 self.enemies.append(enemy)
@@ -1534,17 +2279,28 @@ class Game:
         """Clear enemies, NPCs, and all projectile/attack lists."""
         self.enemies = []
         self.npcs    = []
+        self.critters = []  # ambient wildlife: squirrels, birds, butterflies
         self._clear_projectiles()
 
     def _clear_projectiles(self):
         """Remove all in-flight projectiles and visual effects."""
         self.projectiles   = []
+        self.ultra_volleyballs = []
         self.melee_attacks = []
+        self.cutscene_beams = []
         self.bombs         = []
+        self.masenko_projectiles = []
         self.enemy_bullets = []
         self.enemy_rockets = []
         self.enemy_kiblasts = []
         self.explosions    = []
+        self.genkidama_hit_effects = []
+        self.burning_hit_effects  = []
+        self.big_bang_attacks = []
+        self.big_bang_destruction_effects = []
+        self.zeni_pickups   = []
+        self._white_flash_timer = 0.0
+        self.it_selector = None
         self.dmg_numbers.clear()  # Wipe leftover popups on room transition
 
     # ── Editor callbacks ──────────────────────────────────────────────────────
@@ -1607,6 +2363,622 @@ class Game:
             if pad not in self.flying_pads:
                 self.flying_pads.append(pad)
 
+    def _lookup_boss_hp_percent(self, boss_id):
+        """FlagManager.boss_hp_lookup — 0-100 float for the currently active
+        boss with this id, or None if it isn't spawned right now."""
+        for enemy in self.enemies:
+            if getattr(enemy, 'boss_id', None) == boss_id and getattr(enemy, 'active', False):
+                max_hp = getattr(enemy, 'max_hp', 0)
+                if not max_hp:
+                    return None
+                return max(0.0, min(100.0, 100.0 * getattr(enemy, 'hp', 0) / max_hp))
+        return None
+
+    def _lookup_boss_hp_value(self, boss_id):
+        """FlagManager.boss_hp_value_lookup — raw current HP for the
+        currently active boss with this id, or None if it isn't spawned
+        right now. Counterpart to _lookup_boss_hp_percent above, for
+        conditions authored against an absolute HP threshold rather than
+        a percentage (e.g. "boss HP < 500")."""
+        for enemy in self.enemies:
+            if getattr(enemy, 'boss_id', None) == boss_id and getattr(enemy, 'active', False):
+                return getattr(enemy, 'hp', None)
+        return None
+
+    def _collect_known_timer_ids(self):
+        """Every timer_id referenced anywhere — currently-running timers
+        plus any timer_start/timer_pause/timer_stop action authored on a
+        trigger box in any room (including ones nested inside a
+        dialogue_choice option's own action list) — so the Timer condition
+        picker can offer "already made" timers instead of making the user
+        retype the id by hand."""
+        ids = set(self.timers.keys())
+
+        def _scan(actions):
+            for action in actions or []:
+                if not isinstance(action, dict):
+                    continue
+                if action.get('type') in ('timer_start', 'timer_pause', 'timer_stop'):
+                    timer_id = action.get('timer_id')
+                    if timer_id:
+                        ids.add(timer_id)
+                for value in action.values():
+                    if isinstance(value, list):
+                        for item in value:
+                            if isinstance(item, dict) and item.get('actions'):
+                                _scan(item.get('actions'))
+
+        for room in self.room_manager.rooms:
+            for box in getattr(room, 'trigger_boxes', None) or []:
+                _scan(getattr(box, 'actions', None))
+
+        return ids
+
+    def _collect_known_bar_ids(self):
+        """Every spam/timing bar id referenced anywhere — FlagManager's own
+        bar_values (already-reported bars, live or historical) plus any
+        spam_qte action's qte_id authored on a trigger box in any room
+        (including nested dialogue_choice option action lists) — same
+        "already made" convenience as _collect_known_timer_ids() above,
+        for the Spam/Timing Bar condition picker."""
+        ids = set(self.flag_manager.bar_values.keys())
+        if self.spam_qte_bar.qte_id:
+            ids.add(self.spam_qte_bar.qte_id)
+
+        def _scan(actions):
+            for action in actions or []:
+                if not isinstance(action, dict):
+                    continue
+                if action.get('type') == 'spam_qte':
+                    qte_id = action.get('qte_id')
+                    if qte_id:
+                        ids.add(qte_id)
+                for value in action.values():
+                    if isinstance(value, list):
+                        for item in value:
+                            if isinstance(item, dict) and item.get('actions'):
+                                _scan(item.get('actions'))
+
+        for room in self.room_manager.rooms:
+            for box in getattr(room, 'trigger_boxes', None) or []:
+                _scan(getattr(box, 'actions', None))
+
+        return ids
+
+    def _get_flag_condition_names(self):
+        """FlagEditor.names_refresh_callback — real, current name lists for
+        the condition builder's dropdowns. Extend the empty lists here as
+        the engine grows id registries for items/actors/missions/attacks/
+        bosses/POIs (see the item_lookup wiring above for the pattern)."""
+        return {
+            'room_names': sorted(r.name for r in self.room_manager.rooms),
+            'timer_names': sorted(self._collect_known_timer_ids()),
+            'bar_names': sorted(self._collect_known_bar_ids()),
+            # TODO: item_names, actor_names, mission_names, attack_names,
+            # enemy_names, boss_names, poi_names once those id lists exist
+            # somewhere central — condition rows for those kinds show
+            # "(no X yet)" and are skipped until then, so this is safe to
+            # leave empty in the meantime.
+        }
+
+    def _handle_set_custom_variable_action(self, var_name, mode, value=None):
+        """EventRunner handler for the 'set_custom_variable' action — maps
+        straight onto FlagManager's own variable store, so no other subsystem
+        needs to know about it."""
+        if mode == 'set':
+            self.flag_manager.set_variable(var_name, value)
+        elif mode == 'add':
+            self.flag_manager.add_variable(var_name, value)
+        elif mode == 'remove':
+            self.flag_manager.remove_variable(var_name)
+
+    def _handle_world_map_location_action(self, mode, map_name, name):
+        """EventRunner handler for the 'world_map_location' action — show or
+        hide a pin that's already placed on this map in the World Map
+        Editor (matched by its 'name' field). The pin's own data (x, y,
+        room, icon, height) always comes from
+        assets/world_maps/<map_name>.json; this just tracks which
+        already-placed pins are currently hidden."""
+        hidden = self._wm_hidden_locations.setdefault(map_name, set())
+        if mode == 'remove':
+            hidden.add(name)
+        elif mode == 'add':
+            hidden.discard(name)
+
+        if getattr(self, '_active_world_map_name', '') == map_name and hasattr(self, '_wm_locations'):
+            self._apply_wm_location_overrides(map_name)
+
+    def _apply_wm_location_overrides(self, map_name):
+        """Re-derive self._wm_locations from assets/world_maps/<map_name>.json,
+        filtering out any pins currently hidden via the 'world_map_location'
+        event action, and store the result back on self._wm_locations (the
+        cache the flying-scene renderer reads from)."""
+        import json as _json, os as _os
+        try:
+            with open(_os.path.join('assets', 'world_maps', f'{map_name}.json')) as _f:
+                _base = _json.load(_f).get('locations', [])
+        except Exception:
+            _base = []
+        hidden = self._wm_hidden_locations.get(map_name, set())
+        self._wm_locations = [l for l in _base if l.get('name') not in hidden]
+
+    def _handle_dialogue_box_action(self, on_complete, speaker_type, text, speaker_name=None, portrait=None):
+        """EventRunner handler for the 'dialogue_box' action. Single line,
+        closed on player input — see _advance_npc_dialogue()'s event branch."""
+        # Snap the player to idle so walking into the trigger box doesn't
+        # leave the walk/run animation frozen on screen during the dialogue
+        # — same fix _start_npc_dialogue() applies for NPC conversations.
+        if self.player.current_animation_state in ('walk', 'run'):
+            self.player.enter_idle()
+        self.player.is_running = False
+
+        name = speaker_name or ('Narrator' if speaker_type == 'narrator' else '')
+        self._event_dialogue_active = True
+        self.dialogue_box.show(text, name, True, None, portrait_key=portrait,
+                                on_close=lambda: self._on_event_dialogue_closed(on_complete))
+
+    def _on_event_dialogue_closed(self, on_complete):
+        self._event_dialogue_active = False
+        on_complete()
+
+    def _handle_dialogue_choice_action(self, prompt, options, on_choice):
+        """EventRunner handler for the 'dialogue_choice' action. `options`
+        is the raw [{'text':..., 'actions':[...]}] list from event_actions —
+        the runner itself splices the picked option's actions back into the
+        sequence, so all we do here is show the menu and forward whichever
+        index the player picked."""
+        if self.player.current_animation_state in ('walk', 'run'):
+            self.player.enter_idle()
+        self.player.is_running = False
+
+        labels = [opt.get('text', '') for opt in (options or [])]
+        self._event_dialogue_active = True
+        self.dialogue_choice_menu.open(
+            labels, prompt=prompt or "",
+            on_choice=lambda index: self._on_event_choice_made(on_choice, index))
+
+    def _on_event_choice_made(self, on_choice, index):
+        self._event_dialogue_active = False
+        on_choice(index)
+
+    def _handle_timer_start_action(self, timer_id, duration):
+        """EventRunner handler for the 'timer_start' action — (re)starts a
+        countdown under `timer_id` from `duration` seconds and makes it the
+        one shown on the HUD. Non-blocking: fires and the action sequence
+        continues immediately."""
+        self.timers[timer_id] = {
+            'remaining': max(0.0, float(duration)),
+            'running':   True,
+        }
+        self._active_timer_id = timer_id
+        # Flag trigger counterpart to the action itself — see
+        # FlagManager.mark_timer_started()'s docstring. Without this,
+        # any "Flag Is Set: timer_started:<id>" condition can never
+        # become true, since nothing else ever sets that flag.
+        self.flag_manager.mark_timer_started(timer_id)
+
+    def _handle_timer_pause_action(self, timer_id):
+        """EventRunner handler for the 'timer_pause' action — freezes the
+        countdown in place without resetting it. A later timer_start on the
+        same id resumes/restarts it."""
+        timer = self.timers.get(timer_id)
+        if timer:
+            timer['running'] = False
+            self.flag_manager.mark_timer_paused(timer_id)
+
+    def _handle_timer_stop_action(self, timer_id):
+        """EventRunner handler for the 'timer_stop' action — ends and hides
+        the timer entirely."""
+        self.timers.pop(timer_id, None)
+        if self._active_timer_id == timer_id:
+            self._active_timer_id = None
+        self.flag_manager.mark_timer_ended(timer_id)
+
+    def _handle_zeni_action(self, mode, amount):
+        """EventRunner handler for the 'zeni' action — mode: 'set' | 'add' | 'remove'.
+        Mirrors the direct player.zeni mutation done elsewhere (e.g. the
+        zeni-pickup collection code), just routed through the event system.
+        Clamped at 0 so 'remove' can't push zeni negative."""
+        current = getattr(self.player, 'zeni', 0)
+        if mode == 'set':
+            new_value = amount
+        elif mode == 'add':
+            new_value = current + amount
+        elif mode == 'remove':
+            new_value = current - amount
+        else:
+            return
+        self.player.zeni = max(0, new_value)
+
+    def _handle_level_action(self, mode, amount, character_id=None):
+        """EventRunner handler for the 'level' action — mode: 'set' | 'add' | 'remove'.
+        Player only tracks a single active character's level right now (no
+        per-character roster/save data exists yet — see Player.character),
+        so if character_id is given and doesn't match the currently active
+        character, this is a no-op rather than silently applying to the
+        wrong character. Clamped to [1, game_config.max_level] and recomputes
+        exp_to_next_level the same way Player.level_up() does, so the XP bar
+        doesn't go stale after a manual level change."""
+        if character_id and getattr(self.player, 'character', None) != character_id:
+            return
+        current = self.player.level
+        if mode == 'set':
+            new_value = amount
+        elif mode == 'add':
+            new_value = current + amount
+        elif mode == 'remove':
+            new_value = current - amount
+        else:
+            return
+        self.player.level = max(1, min(new_value, self.game_config.max_level))
+        self.player.exp_to_next_level = self.game_config.get_xp_for_level(self.player.level)
+
+    def _handle_exp_action(self, mode, amount, character_id=None):
+        """EventRunner handler for the 'exp' action — mode: 'set' | 'add' | 'remove'.
+        Same active-character guard as 'level' (see _handle_level_action) —
+        no-op if character_id doesn't match the currently active character,
+        since there's no per-character exp storage yet either.
+
+        'add' routes through Player.gain_exp(), which already handles
+        cascading level-ups the same way killing an enemy does (see
+        game.py's XP-reward call site). 'set'/'remove' just adjust the raw
+        exp pool without cascading, consistent with 'set' not cascading
+        for the zeni/level actions either."""
+        if character_id and getattr(self.player, 'character', None) != character_id:
+            return
+        if mode == 'add':
+            self.player.gain_exp(amount, self.game_config)
+            return
+        current = self.player.exp
+        if mode == 'set':
+            new_value = amount
+        elif mode == 'remove':
+            new_value = current - amount
+        else:
+            return
+        self.player.exp = max(0, new_value)
+
+    def _handle_stat_action(self, mode, stat_name, amount, character_id=None):
+        """EventRunner handler for the 'stat' action — mode: 'set' | 'add' | 'remove'.
+        Same active-character guard as 'level'/'exp'. stat_name must be one
+        of Player.stats' keys (strength, ki_power, vitality, energy, speed,
+        defense, ki_regen) — anything else is a no-op rather than crashing
+        the sequence on a KeyError. Clamped to [1, game_config.max_stat_value]
+        like apply_stat_point() clamps manually-spent points, then calls
+        update_derived_stats() so max_hp/max_ki/ki_regen_interval stay in
+        sync with the new stat block (same as apply_stat_point does)."""
+        if character_id and getattr(self.player, 'character', None) != character_id:
+            return
+        if stat_name not in self.player.stats:
+            return
+        current = self.player.stats[stat_name]
+        if mode == 'set':
+            new_value = amount
+        elif mode == 'add':
+            new_value = current + amount
+        elif mode == 'remove':
+            new_value = current - amount
+        else:
+            return
+        self.player.stats[stat_name] = max(1, min(new_value, self.game_config.max_stat_value))
+        self.player.update_derived_stats()
+
+    def _handle_resource_action(self, mode, resource_name, amount):
+        """EventRunner handler for the 'resource' action — mode: 'set' | 'add' | 'remove'.
+        resource_name: 'health' | 'energy' | 'transformation_gauge'.
+
+        health -> player.hp (clamped to [0, max_hp]), energy -> player.ki
+        (clamped to [0, max_ki]) — same attrs used throughout player.py's
+        combat code.
+
+        transformation_gauge is NOT wired — same gap flagged in this file's
+        own comment above the (also-unwired) 'player_resource' live lookup:
+        "need the real health/energy/transformation_gauge attr names."
+        TransformationSystem's source isn't available here to confirm the
+        actual attribute, so this is a no-op for that resource rather than
+        guessing at a name and silently touching the wrong thing. Tell me
+        the real attribute on self.player.transformation and I'll wire it
+        the same way as health/energy.
+        """
+        if resource_name == 'health':
+            current, cap = self.player.hp, self.player.max_hp
+        elif resource_name == 'energy':
+            current, cap = self.player.ki, self.player.max_ki
+        elif resource_name == 'transformation_gauge':
+            return  # not wired yet — see docstring above
+        else:
+            return
+
+        if mode == 'set':
+            new_value = amount
+        elif mode == 'add':
+            new_value = current + amount
+        elif mode == 'remove':
+            new_value = current - amount
+        else:
+            return
+        new_value = max(0, min(new_value, cap))
+
+        if resource_name == 'health':
+            self.player.hp = new_value
+        elif resource_name == 'energy':
+            self.player.ki = new_value
+
+    def _handle_skill_action(self, mode, skill_id):
+        """EventRunner handler for the 'skill' action — mode: 'add' | 'remove'.
+        Skills/attacks are just entries in player.equipped_attacks (a flat
+        list of skill_id strings, same shape the 'player_has_skill' live
+        lookup already assumes). 'add' is idempotent — no duplicate entries
+        if the skill's already equipped."""
+        equipped = getattr(self.player, 'equipped_attacks', None)
+        if equipped is None:
+            return
+        if mode == 'add':
+            if skill_id not in equipped:
+                equipped.append(skill_id)
+        elif mode == 'remove':
+            if skill_id in equipped:
+                equipped.remove(skill_id)
+
+    def _handle_character_list_action(self, mode, character_id):
+        """EventRunner handler for the 'character_list' action — mode: 'add' | 'remove'.
+        Governs player.playable_characters, the switchable roster shown in the
+        save point's "Switch Characters" menu. Being "added" (on disk, see
+        character_creator.discover_characters()) no longer implies playable —
+        'add' unlocks character_id for switching, 'remove' revokes it. No-op
+        if character_id isn't a real added character, so a stale event can't
+        unlock something that doesn't exist."""
+        if character_id not in character_creator.discover_characters():
+            return
+        roster = self.player.playable_characters
+        if mode == 'add':
+            if character_id not in roster:
+                roster.append(character_id)
+        elif mode == 'remove':
+            if character_id in roster:
+                roster.remove(character_id)
+
+    def _handle_screen_shake_action(self, intensity, duration=0.3):
+        """EventRunner handler for the 'screen_shake' action. Non-blocking —
+        just kicks off Camera.start_shake() and the sequence continues
+        immediately; the shake itself decays over its own duration via
+        Camera.update(), same as the other start_shake() call sites."""
+        self.camera.start_shake(intensity=intensity, duration=duration)
+
+    def _handle_spam_qte_action(self, on_complete, qte_id=None, fill_per_press=0.08,
+                                 drain_rate=0.15, start_progress=0.0):
+        """EventRunner handler for the 'spam_qte' action — blocking. Arms
+        the bottom-middle mash-E-or-Q bar (see ui/spam_qte.py) and stashes
+        on_complete; _update_spam_qte() fires it the frame the bar fills.
+        No fail state — the sequence simply waits however long it takes."""
+        self._event_spam_qte_on_complete = on_complete
+        self.spam_qte_bar.start(qte_id=qte_id, fill_per_press=fill_per_press,
+                                 drain_rate=drain_rate, start_progress=start_progress)
+        # Report the starting percent immediately so a condition checked the
+        # same frame (e.g. right after this action in the sequence) already
+        # sees it, rather than waiting one frame for _update_spam_qte.
+        if qte_id:
+            self.flag_manager.set_bar_percent(qte_id, self.spam_qte_bar.progress * 100)
+
+    def _update_spam_qte(self, dt):
+        """Advance the spam QTE bar, mirror its live progress into
+        FlagManager (set_bar_percent — also latches the 'bar_reached:
+        <qte_id>:<0|50|100>' flags and feeds check_bar()), and fire its
+        stored on_complete the instant it fills. No-op whenever no
+        spam_qte action is running."""
+        if not self.spam_qte_bar.active:
+            return
+        completed = self.spam_qte_bar.update(dt)
+        if self.spam_qte_bar.qte_id:
+            self.flag_manager.set_bar_percent(self.spam_qte_bar.qte_id, self.spam_qte_bar.progress * 100)
+        if completed:
+            on_complete = self._event_spam_qte_on_complete
+            self._event_spam_qte_on_complete = None
+            if on_complete:
+                on_complete()
+
+    def _handle_weather_action(self, mode, weather_type=None):
+        """EventRunner handler for the 'weather' action — mode: 'set' | 'stop'.
+        Ambient room weather, independent of a cutscene's own weather system
+        (core/cutscene_runtime.py's weather_start/weather_stop actions) —
+        reuses that module's _WeatherEffect class so the art and fade timings
+        match. 'set' cross-fades to weather_type (or just resumes the
+        fade-in from its current opacity if it's already the active type);
+        'stop' fades whatever's currently active out. Actual per-frame
+        advancement happens in _update_room_weather()."""
+        from core.cutscene_runtime import _WeatherEffect, _WEATHER_START_FADE_IN, _WEATHER_STOP_FADE_OUT
+        if mode == 'set':
+            if self.room_weather is None or self.room_weather.weather_type != weather_type:
+                self.room_weather            = _WeatherEffect(weather_type)
+                self.room_weather.opacity    = 0.0
+                self._room_weather_fade_from = 0.0
+            else:
+                self._room_weather_fade_from = self.room_weather.opacity
+            self._room_weather_fade_to      = 1.0
+            self._room_weather_fade_dur     = _WEATHER_START_FADE_IN
+            self._room_weather_fade_elapsed = 0.0
+        elif mode == 'stop':
+            if self.room_weather is not None:
+                self._room_weather_fade_from    = self.room_weather.opacity
+                self._room_weather_fade_to      = 0.0
+                self._room_weather_fade_dur     = _WEATHER_STOP_FADE_OUT
+                self._room_weather_fade_elapsed = 0.0
+
+    def _update_room_weather(self, dt):
+        """Advance ambient room weather and its opacity tween — mirrors
+        CutsceneRuntime._tick_weather_fade(). Paused while a cutscene is
+        playing, since a cutscene drives its own separate weather instead."""
+        if self.room_weather is None or self.active_cutscene_runtime:
+            return
+        self.room_weather.update(dt)
+        if self._room_weather_fade_dur > 0.0:
+            self._room_weather_fade_elapsed = min(
+                self._room_weather_fade_dur, self._room_weather_fade_elapsed + dt)
+            t     = self._room_weather_fade_elapsed / self._room_weather_fade_dur
+            eased = t * t * (3.0 - 2.0 * t)  # smoothstep
+            self.room_weather.opacity = (self._room_weather_fade_from
+                + (self._room_weather_fade_to - self._room_weather_fade_from) * eased)
+            if self._room_weather_fade_elapsed >= self._room_weather_fade_dur:
+                self._room_weather_fade_dur = 0.0
+                if self._room_weather_fade_to <= 0.0:
+                    self.room_weather = None
+
+    def _handle_room_music_action(self, mode, track=None):
+        """EventRunner handler for the 'room_music' action — mode: 'set' | 'stop'.
+
+        Writes the change back onto the *current room's* persisted
+        `music_track` string and saves it, so the track keeps playing on
+        every future entry into this room too — not just this one time.
+
+        'set'  — replaces the room's music_track with `track` and applies
+                 it immediately via _apply_room_music (which already no-ops
+                 if that track is already playing).
+        'stop' — actually stops whatever music is currently playing (no
+                 matter how it was started — a room's persisted track, a
+                 direct play_music() call, a cutscene, etc.) AND clears the
+                 room's persisted music_track so future entries don't force
+                 a track back on. Stop means stop; it doesn't ask for a
+                 specific track to stop.
+
+        Guarded to skip the (potentially expensive) room mutation/save when
+        the room's persisted music is already in the requested state — the
+        stop_music() call itself is cheap and safe to call redundantly, so it
+        always runs. RoomPersistence.save_room() is a synchronous full JSON
+        dump of the whole room — there's no dirty-flag batching underneath it
+        despite game.py's update() comment suggesting otherwise
+        (flush_dirty_rooms doesn't actually exist on RoomManagerWithPersistence).
+        Without this guard, a repeat-fire trigger box (once=False) with a
+        room_music action covering ground the player stands on would call
+        this — and therefore save_room() — every single frame it overlaps,
+        which is what was causing the walking stutter.
+        """
+        if not self.current_room:
+            return
+
+        existing = getattr(self.current_room, 'music_track', '')
+
+        if mode == 'set':
+            if not track:
+                return
+            if existing == track:
+                self._apply_room_music(self.current_room)  # cheap no-op if already playing
+                return
+            self.music_track = track
+            self.current_room.music_track = track
+            self._apply_room_music(self.current_room)
+
+        elif mode == 'stop':
+            # Always actually stop the music — regardless of whether this
+            # room has a persisted track, and regardless of what track (if
+            # any) is currently playing.
+            self.sound_manager.stop_music()
+            if not existing:
+                return  # Already no track persisted for this room — nothing to save.
+            self.music_track = ''
+            self.current_room.music_track = ''
+
+        self.room_manager.save_room(self.current_room)
+
+    def _handle_play_sound_action(self, sound_id):
+        """EventRunner handler for the 'play_sound' action. Non-blocking —
+        fires the one-shot sfx and the sequence continues immediately,
+        same as _handle_screen_shake_action. Routes through
+        self.sound_manager.play_sfx(), which is exactly what
+        SoundEngine.play_sound() ends up doing — the same call every other
+        sfx site (footsteps, melee, impacts, ...) uses, so sound_id here
+        should match one of the stems AudioAssetLoader loaded from
+        assets/audio/sfx/ (any subfolder)."""
+        self.sound_manager.play_sfx(sound_id)
+
+    def _handle_screen_fade_action(self, on_complete, direction, duration=0.5):
+        """EventRunner handler for the 'screen_fade' action — direction:
+        'in' | 'out'. Blocking — routes to TransitionController's standalone
+        plain fade (see start_plain_fade()), which fires on_complete once the
+        fade finishes so the sequence resumes."""
+        self.transition_controller.start_plain_fade(direction, duration, on_complete)
+
+    def _handle_change_map_action(self, on_complete, room_name, spawn_x=None, spawn_y=None, wait=True):
+        """EventRunner handler for the 'change_map' action — was missing
+        entirely (no register_handler call for it), so trigger boxes fired
+        the action but nothing ever happened.
+
+        Swaps the active room to room_name and repositions the player at
+        (spawn_x, spawn_y), reusing the same fade-to-black bridge as the
+        room-transition zones (_check_room_transitions) and the cutscene
+        runtime's change_room callback (_cutscene_change_room) so the room
+        doesn't just pop into view. Falls back to the target room's centre
+        if spawn_x/spawn_y weren't set (mirrors the world-map landing
+        sequence's fallback).
+
+        'wait' — True: the action sequence resumes once the room has
+        actually swapped (right as the fade-out completes), then the
+        fade-in plays out in the background. False: the sequence resumes
+        immediately and the whole fade-out/swap/fade-in happens in the
+        background without holding anything up — same "wait" semantics as
+        the other actions that expose it (e.g. play_character_animation).
+        """
+        def _do_swap():
+            target_room = self.room_manager.get_room_by_name(room_name)
+            if not target_room:
+                print(f'[Game] change_map: room not found: {room_name}')
+                if wait:
+                    on_complete()
+                return
+
+            # Sync editor tiles into the room object (same as test-mode start
+            # and _cutscene_change_room).
+            te = getattr(self.room_editor, 'tileset_editor', None)
+            if te and room_name in getattr(te, 'room_tiles', {}):
+                target_room.tiles = te.room_tiles[room_name][:]
+            elif not hasattr(target_room, 'tiles'):
+                target_room.tiles = []
+
+            self.room_manager.current_room = target_room
+            self.current_room              = target_room
+            if self.is_test_mode:
+                self._load_room_objects_as_copies(target_room)
+            else:
+                self._load_room_objects(target_room)
+
+            _spawn_x = spawn_x if spawn_x is not None else target_room.width  / 2
+            _spawn_y = spawn_y if spawn_y is not None else target_room.height / 2
+            self.player.x = _spawn_x
+            self.player.y = _spawn_y
+
+            # Re-centre the camera on the new spawn, clamped to room bounds
+            # — same math as _handle_flying_room_transition.
+            self.camera.x = max(0, int(_spawn_x * RENDER_SCALE) - self.camera.screen_width  // 2)
+            self.camera.y = max(0, int(_spawn_y * RENDER_SCALE) - self.camera.screen_height // 2)
+            self.camera.x = min(self.camera.x, target_room.width  * RENDER_SCALE - SCREEN_WIDTH)
+            self.camera.y = min(self.camera.y, target_room.height * RENDER_SCALE - SCREEN_HEIGHT)
+
+            self.mission_manager.on_room_entered(room_name)
+            self.flag_manager.mark_room_visited(room_name)
+
+            self.transition_controller.start_plain_fade('in', 0.3, None)
+            if wait:
+                on_complete()
+
+        self.transition_controller.start_plain_fade('out', 0.3, _do_swap)
+        if not wait:
+            on_complete()
+
+    def _handle_set_player_location_action(self, x, y):
+        """EventRunner handler for the 'set_player_location' action — same
+        gap as change_map (missing register_handler call), but a much
+        simpler case: no room swap, just an instant reposition of the
+        player within the *current* room. No fade, no on_complete — the
+        camera doesn't need to be re-centred by hand either, since
+        Camera.update() already re-follows the player every frame.
+
+        rotation was dropped from the schema (ACTION_SCHEMA in
+        event_editor.py) — Player has no facing/rotation concept this
+        action could plausibly drive, so it was a dead field."""
+        if not self.current_room:
+            return
+        self.player.x = max(0, min(x, self.current_room.width))
+        self.player.y = max(0, min(y, self.current_room.height))
+
     def _on_save_point_placed(self, save_point):
         """Sync game list when a save point is placed in the editor."""
         if save_point not in self.save_points:
@@ -1617,65 +2989,100 @@ class Game:
         if save_point in self.save_points:
             self.save_points.remove(save_point)
 
-    def _on_cutscene_trigger_placed(self, trigger, room_name):
-        """Persist the room whenever a cutscene trigger is placed in the editor."""
+    def _on_trigger_box_placed(self, box, room_name):
+        """Sync game list when a trigger box is placed OR edited in the
+        editor, and persist so it isn't lost.
+
+        This callback fires both when a brand-new box is placed and when
+        an existing box's conditions/actions are edited via
+        TriggerBox.open_event_editor() — there's no separate "edited"
+        signal. If the box already exists in the live self.trigger_boxes
+        list (matched by box_id), refresh its conditions/actions in place
+        rather than appending a duplicate — this is also what makes edits
+        show up immediately even while self.is_test_mode is True, since
+        test mode runs its own copied TriggerBox objects (see
+        _load_room_objects_as_copies) that wouldn't otherwise pick up
+        changes made to a different box object of the same id."""
+        if self.current_room and self.current_room.name == room_name:
+            existing = next((b for b in self.trigger_boxes if b.box_id == box.box_id), None)
+            if existing is not None:
+                existing.conditions = box.conditions
+                existing.actions = box.actions
+            elif not self.is_test_mode:
+                self.trigger_boxes.append(box)
+
         room = self.room_manager.get_room_by_name(room_name)
         if room:
+            if not hasattr(room, 'trigger_boxes') or room.trigger_boxes is None:
+                room.trigger_boxes = []
+            if box not in room.trigger_boxes:
+                room.trigger_boxes.append(box)
             self.room_manager.save_room(room)
 
-    def _on_cutscene_trigger_deleted(self, trigger, room_name):
-        """Persist the room whenever a cutscene trigger is deleted in the editor."""
-        room = self.room_manager.get_room_by_name(room_name)
-        if room:
-            self.room_manager.save_room(room)
+    def _on_trigger_box_deleted(self, box, room_name):
+        """Sync game list when a trigger box is removed in the editor.
 
-    def _on_music_placed(self, music_obj, room_name):
-        """Sync game list when a Music object is placed in the editor, and
-        persist so the track choice isn't lost. If it was placed in the room
-        currently being viewed/tested, apply it immediately."""
-        if not self.is_test_mode and self.current_room and self.current_room.name == room_name:
-            self.music_objects = [music_obj]
-            self._apply_room_music(self.current_room)
+        room_music's 'set' mode writes the track onto the *room's* persisted
+        music_track field (see _handle_room_music_action) so it survives
+        future room entries — that field is deliberately decoupled from any
+        one trigger box. But that means deleting the box that originally set
+        it did nothing to that field: room.music_track just sat there
+        forever, so _apply_room_music() kept reapplying that track on every
+        future entry (and across saves) even with no box left to set it.
 
-        room = self.room_manager.get_room_by_name(room_name)
-        if room:
-            self.room_manager.save_room(room)
-
-    def _on_music_deleted(self, music_obj, room_name):
-        """Sync game list when a Music object is removed in the editor.
-
-        Per design, removing the room's Music object does NOT stop or change
-        whatever is currently playing — it just means this room no longer
-        specifies a track for future room entries.
+        Fix: if the deleted box had a room_music 'set' action whose track
+        matches the room's current persisted music_track, and no *other*
+        remaining trigger box in the room also sets that same track, clear
+        music_track (mirroring the 'stop' branch of
+        _handle_room_music_action) and stop it if it's what's currently
+        playing. If another box still sets the same track, leave it alone —
+        that box is still a valid source for it.
         """
-        if not self.is_test_mode and self.current_room and self.current_room.name == room_name:
-            if music_obj in self.music_objects:
-                self.music_objects.remove(music_obj)
+        if box in self.trigger_boxes:
+            self.trigger_boxes.remove(box)
 
         room = self.room_manager.get_room_by_name(room_name)
         if room:
+            deleted_tracks = {
+                a.get('track') for a in getattr(box, 'actions', []) or []
+                if a.get('type') == 'room_music' and a.get('mode') == 'set' and a.get('track')
+            }
+            existing_track = getattr(room, 'music_track', '')
+            if deleted_tracks and existing_track in deleted_tracks:
+                remaining_boxes = getattr(room, 'trigger_boxes', None) or []
+                still_owned = any(
+                    a.get('type') == 'room_music' and a.get('mode') == 'set'
+                    and a.get('track') == existing_track
+                    for other in remaining_boxes
+                    for a in (getattr(other, 'actions', []) or [])
+                )
+                if not still_owned:
+                    room.music_track = ''
+                    if self.music_track == existing_track:
+                        self.music_track = ''
+                    if self.current_room is room and self.sound_engine.current_music == existing_track:
+                        self.sound_manager.stop_music()
+
             self.room_manager.save_room(room)
 
     def _apply_room_music(self, room):
-        """Apply the given room's Music object, if any, to the currently playing track.
+        """Apply the given room's persisted music track, if any, to the
+        currently playing track.
 
-        Design rule: if the room has no Music object placed, do nothing —
+        Design rule: if the room has no music track set, do nothing —
         whatever track is already playing keeps playing uninterrupted.
         """
         if not room:
             return
 
-        music_objs = getattr(room, 'music_objects', None)
-        if not music_objs:
-            return  # No Music object placed — keep whatever is already playing
-
-        track = music_objs[0].track
+        track = getattr(room, 'music_track', '')
         if not track:
-            return  # Music object placed but no track chosen yet — leave music as-is
+            return  # No track set for this room — leave music as-is
 
         if track == self.sound_engine.current_music:
             return  # Already playing this track — avoid restarting it on every room entry
 
+        print(f"[room_music] switching to '{track}' for room '{getattr(room, 'name', '?')}'")
         self.sound_manager.play_music(track)
 
     def _apply_world_map_music(self, map_name):
@@ -1689,6 +3096,7 @@ class Game:
         stores a track stem, ready to hand straight to play_music().
         """
         if not map_name:
+            print("[world_map_music] no map_name given — skipping")
             return
 
         import json as _json
@@ -1698,16 +3106,24 @@ class Game:
         try:
             with open(path) as f:
                 data = _json.load(f)
-        except Exception:
+        except Exception as e:
+            print(f"[world_map_music] could not open {path}: {e}")
             return  # No saved map data yet — leave music as-is
 
         track = data.get('music', '')
         if not track:
+            print(f"[world_map_music] '{map_name}' has no music set — leaving current track alone")
             return  # No track set for this map — keep whatever is already playing
 
         if track == self.sound_engine.current_music:
+            print(f"[world_map_music] '{track}' already current_music — skipping restart")
             return  # Already playing this track — avoid restarting it on re-entry
 
+        if track not in self.sound_engine.music_tracks:
+            print(f"[world_map_music] WARNING: '{track}' (set for map '{map_name}') "
+                  f"is not in sound_engine.music_tracks — was it loaded from assets/audio/music?")
+
+        print(f"[world_map_music] switching to '{track}' for map '{map_name}'")
         self.sound_manager.play_music(track)
 
     def _sync_player_from_cutscene(self, runtime):
@@ -1776,29 +3192,241 @@ class Game:
                 if hasattr(self.player.sprite, 'set_animation'):
                     self.player.sprite.set_animation(current_anim, final_direction)
 
+    def _cutscene_spawn_attack(self, actor, params, attack_action):
+        """Wired into CutsceneRuntime.on_spawn_attack — fires when a scripted
+        'attack' action reaches its release_delay. Spawns the real visual
+        effect into the same live object lists the actual gameplay attacks
+        use, so cutscene attacks render identically to in-game ones.
+
+        `actor` is the CutsceneActor that performed the attack (its wrapped
+        entity gives us x/y/direction); `params` is the action's raw params
+        dict from the cutscene JSON; `attack_action` is the _AttackAction
+        instance (carries target_x/target_y if the action aimed at a point).
+
+        kiblast/melee/firebeam all construct their effect objects using the
+        same classes/signatures the real spawn sites in this file use:
+        Projectile(x + ox, y + oy, direction) (same offset
+        get_blast_spawn_position() applies for the pending_blast=='ready'
+        block), entity.melee_attack() (same as the KEYUP handler's
+        self.player.melee_attack(), since a 'player'-type cutscene actor's
+        entity IS a real entities.player.Player), and a directly-
+        instantiated, similarly offset BeamAttack(x + ox, y + oy, direction)
+        (attacks/beam.py) for firebeam, since there's no player charge state
+        to route through mid-cutscene. 'charge' stays a no-op — it's just
+        the wind-up pose.
+
+        Unlike normal gameplay attacks, none of self.projectiles/
+        melee_attacks/cutscene_beams get routed through self.layer_manager
+        during a cutscene (that pass is skipped entirely while
+        active_cutscene_runtime is set) — see the cutscene draw branch
+        near draw_actors(), which draws these three lists directly instead.
+        """
+        attack_type = params.get('attack_type', 'melee')
+        entity      = actor.entity
+        x, y        = entity.x, entity.y
+        direction   = getattr(entity, 'direction', 'down')
+
+        # Real gameplay never spawns a kiblast/beam at the caster's raw x/y —
+        # it nudges the spawn point per-direction first (see
+        # Player._get_spawn_offset(), used by get_blast_spawn_position() and
+        # fire_beam_auto() etc.) so the effect originates roughly where the
+        # character's hands are instead of dead-center on their body.
+        # core.cutscene_actor duplicates that same offset table (see its
+        # _spawn_offset()) so this reads identically whether `entity` is the
+        # real self.player or a throwaway enemy/NPC cutscene actor without a
+        # Player instance's own _get_spawn_offset() to call.
+        from core.cutscene_actor import _spawn_offset
+        ox, oy = _spawn_offset(direction)
+
+        if attack_type == 'kiblast':
+            self.projectiles.append(Projectile(x + ox, y + oy, direction))
+            self.sound_manager.play_sfx(random.choice(('kiblast1', 'kiblast2')))
+
+        elif attack_type == 'melee':
+            # A cutscene 'player'-type actor's entity is a real
+            # entities.player.Player instance (see CutsceneEditor.
+            # _entity_factory) — the exact same class self.player is — so
+            # it already has melee_attack(), and calling it here builds a
+            # real MeleeAttack the same way the KEYUP handler does at
+            # self.player.melee_attack() (see _handle_action_key above).
+            # Non-player actors (enemies/NPCs/bosses) don't have this
+            # method, so this quietly no-ops for them rather than crashing
+            # a whole cutscene over a mis-set attack_type.
+            if hasattr(entity, 'melee_attack'):
+                melee = entity.melee_attack()
+                if melee:
+                    melee.hit_something = False
+                    self.melee_attacks.append(melee)
+
+        elif attack_type == 'firebeam':
+            # Fires a plain BeamAttack (attacks/beam.py's default
+            # attack_name='kamehameha') directly from the actor's current
+            # position/direction, bypassing the player's own hold-to-
+            # charge state machine entirely — cutscenes don't have a
+            # button being held, they just have a scripted release moment.
+            # Tracked in self.cutscene_beams (ticked/wall-obstructed/drawn
+            # alongside every other cutscene-attack list — see Game.update()
+            # and the cutscene draw branch) rather than self.player.
+            # current_beam, since `entity` here is the throwaway cutscene
+            # actor, not the real self.player.
+            beam = BeamAttack(x + ox, y + oy, direction)
+            # Held fully open for (duration - release_delay) — i.e. for as
+            # long as attack_action's pose still has left to play after the
+            # release moment — then closes itself back down. Falls back to
+            # a short default hold if the action didn't specify a duration,
+            # so a beam still reads as a beam instead of flickering open
+            # for a single frame.
+            hold_time = params.get('duration', 0.0) - params.get('release_delay', 0.0)
+            beam._cutscene_release_timer = hold_time if hold_time > 0 else 0.4
+            self.cutscene_beams.append(beam)
+            self.sound_manager.play_sfx('beam')
+
+        elif attack_type == 'charge':
+            # 'charge' is typically just the wind-up pose with no effect of
+            # its own — left as a no-op unless you want a charge particle/
+            # sfx here.
+            pass
+
+        # Optional cosmetic-only damage resolution: only fires if the action
+        # explicitly opted in and gave an aim point. Deliberately bypasses
+        # the normal collision loop — it resolves directly against a named
+        # target actor rather than reproducing hitbox/i-frame/death logic
+        # for a system (cutscene actors) that doesn't otherwise run it.
+        if params.get('deal_damage') and attack_action.target_x is not None:
+            target_actor = self._find_cutscene_actor_near(
+                attack_action.target_x, attack_action.target_y)
+            if target_actor is not None and hasattr(target_actor.entity, 'take_damage'):
+                # TODO: pick a real damage amount — e.g. from params.get('damage', ...)
+                # or from the attacker's stats, however this game computes it elsewhere.
+                target_actor.entity.take_damage(params.get('damage', 0))
+
+    def _find_cutscene_actor_near(self, x, y, max_dist=48.0):
+        """Return the live CutsceneActor whose entity is closest to (x, y),
+        within max_dist world units, or None. Used to resolve an 'attack'
+        action's target_x/target_y into an actual actor for deal_damage.
+        """
+        runtime = self.active_cutscene_runtime
+        if runtime is None:
+            return None
+        best_actor = None
+        best_dist  = max_dist
+        for a in runtime.actors.values():
+            dx = a.entity.x - x
+            dy = a.entity.y - y
+            dist = math.hypot(dx, dy)
+            if dist <= best_dist:
+                best_dist  = dist
+                best_actor = a
+        return best_actor
+
+    def _update_trigger_boxes(self, dt):
+        """Check the current room's trigger boxes against the player each
+        frame and fire the corresponding flag when one triggers.
+
+        Trigger boxes are lightweight — no cooldown/state-machine tick
+        needed like cutscene triggers, just a per-frame overlap (and, for
+        KeyTriggerBox, interact-key) check via TriggerBox.check().
+        """
+        if not self.trigger_boxes or not self.player:
+            return
+
+        keys = pygame.key.get_pressed()
+        for box in self.trigger_boxes:
+            if box.should_fire(self.player, keys_pressed=keys,
+                                evaluate_conditions=self.flag_manager.evaluate_conditions):
+                self.flag_manager.mark_box_triggered(box.box_id)
+                if box.actions:
+                    self.event_runner.run_sequence(box.actions)
+
+    def _switch_active_room(self, room_name):
+        """Swap the active room to `room_name`, re-syncing its tiles/objects
+        and notifying the mission/flag managers, same as a normal room
+        transition. Returns True on success, False if the room doesn't exist.
+
+        Shared by the cutscene runtime's change_room action and by the
+        cutscene launch path, which uses it to jump to a cutscene's
+        authored home room (the top-level "room" key in the cutscene JSON)
+        before spawning actors.
+        """
+        target_room = self.room_manager.get_room_by_name(room_name)
+        if not target_room:
+            return False
+
+        # ── Sync editor tiles into the room object (same as test-mode start) ──
+        te = getattr(self.room_editor, 'tileset_editor', None)
+        if te and room_name in getattr(te, 'room_tiles', {}):
+            target_room.tiles = te.room_tiles[room_name][:]
+        elif not hasattr(target_room, 'tiles'):
+            target_room.tiles = []
+
+        self.room_manager.current_room = target_room
+        self.current_room = target_room
+        if self.is_test_mode:
+            self._load_room_objects_as_copies(target_room)
+        else:
+            self._load_room_objects(target_room)
+        self.mission_manager.on_room_entered(room_name)
+        self.flag_manager.mark_room_visited(room_name)
+        return True
+
     def _update_cutscene_triggers(self, dt):
         """Tick the active cutscene runtime, or check for new trigger fires.
 
         Fade state machine
         ──────────────────
         'fade_out' → alpha rises to 255 (screen goes black)
-                   → on reaching 255, instantiate the runtime and switch to 'start'
-        'start'    → one frame at full black so the first cutscene frame is hidden
-                   → immediately enter 'fade_in'
-        'fade_in'  → alpha falls to 0 (screen becomes clear)
+                   → on reaching 255, switch to 'start'
+        'start'    → runtime is constructed (and, if needed, the room switch
+                     happens) here. If we arrived via 'fade_out' the screen
+                     is already fully black, so this heavy lifting happens
+                     hidden and we continue into 'fade_in'. If no room
+                     switch was needed we got here directly with alpha still
+                     at 0 — nothing to hide, so we skip 'fade_in' and clear
+                     the state immediately (unchanged instant-launch path).
+        'fade_in'  → alpha falls to 0 (screen becomes clear) while the
+                     cutscene plays underneath
                    → on reaching 0, clear _csf_state; cutscene runs normally
         None       → normal cutscene playback, or no cutscene active
 
         When the cutscene finishes we kick off the fade-in leg.
         """
-        # ── Start frame: launch runtime immediately (no fade) ─────────────────
+        # ── Fade-out: hide the screen before doing a (possibly slow) room
+        # switch, so any loading hitch happens behind black instead of in
+        # full view. Only entered when the cutscene's home room differs
+        # from the current one — see _start_cutscene. ───────────────────────
+        if self._csf_state == 'fade_out':
+            self._csf_alpha = min(255.0, self._csf_alpha + self._csf_speed * dt)
+            if self._csf_alpha >= 255.0:
+                self._csf_alpha = 255.0
+                self._csf_state = 'start'
+            return
+
+        # ── Start frame: launch runtime, hidden behind black if we just
+        # faded out, or immediately if no room switch was needed ──────────
         if self._csf_state == 'start':
-            data              = self._csf_pending
-            self._csf_pending = None
-            self._csf_state   = None
-            self._csf_alpha   = 0.0
+            data               = self._csf_pending
+            self._csf_pending  = None
+            _faded_out_first   = self._csf_alpha >= 254.0
+            if not _faded_out_first:
+                self._csf_alpha = 0.0
             if data is not None:
                 try:
+                    # Switch to the cutscene's authored home room (top-level
+                    # "room" key) before spawning anything, so actor/camera
+                    # coordinates line up with what's on screen. This mirrors
+                    # CutsceneEditor._get_current_room(), which uses the same
+                    # key as the base room for preview — but nothing on the
+                    # runtime side previously read it, so a cutscene fired
+                    # from a room other than its authored one played out
+                    # against the wrong tiles with no visible actors. A
+                    # change_room action later in the timeline still takes
+                    # over normally once it fires.
+                    _base_room_name = (data.get('room') or '').strip()
+                    if _base_room_name and (not self.current_room
+                                             or self.current_room.name != _base_room_name):
+                        if not self._switch_active_room(_base_room_name):
+                            print(f'[Game] cutscene base room not found: {_base_room_name}')
+
                     from core.cutscene_runtime import CutsceneRuntime
                     self.active_cutscene_runtime = CutsceneRuntime(
                         data,
@@ -1815,27 +3443,11 @@ class Game:
                         """Callback wired into the cutscene runtime's change_room
                         action: swaps the active room, re-syncs its tiles/objects,
                         and notifies the mission manager the new room was entered."""
-                        target_room = self.room_manager.get_room_by_name(room_name)
-                        if not target_room:
+                        if not self._switch_active_room(room_name):
                             print(f'[Game] change_room: room not found: {room_name}')
-                            return
-
-                        # ── Sync editor tiles into the room object (same as test-mode start) ──
-                        te = getattr(self.room_editor, 'tileset_editor', None)
-                        if te and room_name in getattr(te, 'room_tiles', {}):
-                            target_room.tiles = te.room_tiles[room_name][:]
-                        elif not hasattr(target_room, 'tiles'):
-                            target_room.tiles = []
-
-                        self.room_manager.current_room = target_room
-                        self.current_room = target_room
-                        if self.is_test_mode:
-                            self._load_room_objects_as_copies(target_room)
-                        else:
-                            self._load_room_objects(target_room)
-                        self.mission_manager.on_room_entered(room_name)
 
                     self.active_cutscene_runtime.on_change_room = _cutscene_change_room
+                    self.active_cutscene_runtime.on_spawn_attack = self._cutscene_spawn_attack
                     self.active_cutscene_runtime.seek(0.0)
 
                     # After seek() resets actor positions to their scripted spawn,
@@ -1930,11 +3542,30 @@ class Game:
 
                     self.sprite_hud._hud_slide_out = True
                     self.sprite_hud._hud_slide_in  = False
+
+                    # If we hid the room switch/construction behind a
+                    # fade-out, fade back in now that it's ready. Otherwise
+                    # this was an instant launch (no room switch needed) —
+                    # keep that path exactly as fast as before.
+                    self._csf_state = 'fade_in' if _faded_out_first else None
                 except Exception as e:
                     print(f'[Game] failed to start cutscene: {e}')
                     import traceback; traceback.print_exc()
                     self.active_cutscene_runtime = None
+                    self._csf_state = None
+                    self._csf_alpha = 0.0
+            else:
+                self._csf_state = None
             return
+
+        # ── Fade-in: screen clears back to normal while the cutscene, now
+        # constructed, plays underneath. Falls through (no early return) so
+        # playback still ticks on the same frame. ───────────────────────────
+        if self._csf_state == 'fade_in':
+            self._csf_alpha = max(0.0, self._csf_alpha - self._csf_speed * dt)
+            if self._csf_alpha <= 0.0:
+                self._csf_alpha = 0.0
+                self._csf_state = None
 
         # ── Normal cutscene playback ──────────────────────────────────────────
         if self.active_cutscene_runtime:
@@ -1971,53 +3602,101 @@ class Game:
                 self.sprite_hud._hud_slide_out     = False
                 self.sprite_hud._hud_slide_in      = True
                 self.camera._lerp_active           = True
+
+                # Resume a blocking play_cutscene action's sequence, if one
+                # is waiting on this cutscene (see _start_cutscene/
+                # _handle_play_cutscene_action).
+                _cb = self._cutscene_on_finished
+                self._cutscene_on_finished = None
+                if _cb:
+                    _cb()
             return
 
-        # ── No cutscene running — check trigger zones ─────────────────────────
-        oe = getattr(self.room_editor, 'object_editor', None)
-        if not oe or not self.current_room:
-            return
+    def _load_cutscene_data(self, cutscene_id):
+        """Load cutscene JSON by id, or None (with a console message) on failure.
 
-        trigger_mgr = getattr(oe, 'cutscene_trigger_manager', None)
-        if not trigger_mgr:
-            return
-
-        # Tick per-trigger cooldowns so a fired trigger can't re-fire immediately.
-        trigger_mgr.update(self.current_room.name, dt)
-
-        # Check whether the player is standing in any trigger zone.
-        fired_id = trigger_mgr.check_player(self.current_room.name, self.player)
-        if not fired_id:
-            return
-
-        # Load the cutscene data -- prefer the editor's live in-memory copy when it
-        # has this cutscene open, so unsaved edits (e.g. a freshly-added change_room
-        # action) are visible immediately during testing without requiring a manual save.
-        cutscene_data = None
+        Prefers the cutscene editor's live in-memory copy when it has this
+        cutscene open, so unsaved edits (e.g. a freshly-added change_room
+        action) are visible immediately during testing without requiring a
+        manual save. Used by the 'play_cutscene' EventRunner action.
+        """
         ce = getattr(self, 'cutscene_editor', None)
         if (ce
-                and getattr(ce, 'cutscene_name', '') == fired_id
+                and getattr(ce, 'cutscene_name', '') == cutscene_id
                 and ce.cutscene_data):
-            cutscene_data = ce.cutscene_data
+            return ce.cutscene_data
 
+        import os, json
+        cutscene_path = os.path.join('data', 'cutscenes', f'{cutscene_id}.json')
+        if not os.path.exists(cutscene_path):
+            print(f'[Game] cutscene file not found: {cutscene_path}')
+            return None
+        try:
+            with open(cutscene_path) as f:
+                return json.load(f)
+        except Exception as e:
+            print(f'[Game] failed to load cutscene "{cutscene_id}": {e}')
+            import traceback; traceback.print_exc()
+            return None
+
+    def _start_cutscene(self, cutscene_data, on_finished=None):
+        """Queue cutscene_data to launch.
+
+        Launches instantly (no fade) when the cutscene plays out in the
+        room the player is already standing in. If the cutscene's
+        authored home room (top-level "room" key) differs from the
+        current room, a room switch has to happen before the runtime can
+        be built — that involves loading tiles/objects and can hitch for
+        a noticeable moment on a room visited for the first time — so in
+        that case we fade to black first (see _update_cutscene_triggers'
+        'fade_out' handling) and do the heavy lifting behind the fade,
+        then fade back in once the runtime is ready.
+
+        `on_finished`, if given, is called with no arguments once the
+        cutscene runtime reports finished (see the 'normal cutscene
+        playback' branch above). Used by the 'play_cutscene' action so a
+        blocking action sequence can resume once the cutscene ends.
+
+        Refuses to stomp on a cutscene that's already running or queued —
+        callers should check for that themselves if they need different
+        behavior (e.g. queuing instead of dropping).
+        """
+        if self.active_cutscene_runtime is not None or self._csf_state is not None:
+            print('[Game] _start_cutscene: a cutscene is already active/pending, ignoring')
+            if on_finished:
+                on_finished()
+            return False
+
+        base_room_name    = (cutscene_data.get('room') or '').strip()
+        needs_room_switch = bool(base_room_name and (not self.current_room
+                                                       or self.current_room.name != base_room_name))
+
+        self._csf_pending          = cutscene_data
+        self._csf_alpha            = 0.0
+        self._csf_state            = 'fade_out' if needs_room_switch else 'start'
+        self._cutscene_on_finished = on_finished
+        return True
+
+    def _handle_play_cutscene_action(self, on_complete, cutscene_id):
+        """EventRunner handler for the 'play_cutscene' action — was missing
+        entirely (no register_handler call for it, same gap as change_map
+        and set_player_location had), so a trigger box configured with a
+        play_cutscene action fired the action but nothing ever happened.
+
+        Blocking: on_complete isn't called until the cutscene actually
+        finishes, so any actions after this one in the same sequence wait
+        for the cutscene to play out first.
+        """
+        cutscene_data = self._load_cutscene_data(cutscene_id)
         if cutscene_data is None:
-            import os, json
-            cutscene_path = os.path.join('data', 'cutscenes', f'{fired_id}.json')
-            if not os.path.exists(cutscene_path):
-                print(f'[Game] cutscene file not found: {cutscene_path}')
-                return
-            try:
-                with open(cutscene_path) as f:
-                    cutscene_data = json.load(f)
-            except Exception as e:
-                print(f'[Game] failed to load cutscene "{fired_id}": {e}')
-                import traceback; traceback.print_exc()
-                return
+            on_complete()
+            return
 
-        # Start the cutscene on the next frame (no fade-out, direct launch).
-        self._csf_pending = cutscene_data
-        self._csf_alpha   = 0.0
-        self._csf_state   = 'start'
+        started = self._start_cutscene(cutscene_data, on_finished=on_complete)
+        if not started:
+            # _start_cutscene already called on_finished (== on_complete) in
+            # this case, so nothing left to do.
+            pass
 
     def _draw_cutscene_fade(self, surface):
         """Draw the cutscene black-fade overlay if a fade is in progress.
@@ -2052,6 +3731,35 @@ class Game:
             self._mjf_surf = pygame.Surface((w, h), pygame.SRCALPHA)
         self._mjf_surf.fill((0, 0, 0, min(255, alpha)))
         surface.blit(self._mjf_surf, (0, 0))
+
+    def _draw_white_flash(self, surface):
+        """Draw the brief screen-wide white flash triggered when a genkidama
+        connects with something (see _trigger_genkidama_hit). Ramps from
+        no white -> fully white over the first half of
+        _WHITE_FLASH_DURATION, then back down to no white over the second
+        half. No-op once decayed.
+        """
+        if self._white_flash_timer <= 0:
+            return
+        w, h = surface.get_size()
+
+        elapsed = self._WHITE_FLASH_DURATION - self._white_flash_timer
+        half = self._WHITE_FLASH_DURATION / 2
+        if elapsed <= half:
+            progress = elapsed / half            # 0 -> 1, ramping up to full white
+        else:
+            progress = 1.0 - (elapsed - half) / half   # 1 -> 0, ramping back down
+        progress = max(0.0, min(1.0, progress))
+
+        alpha = int(255 * progress)
+        if alpha <= 0:
+            return
+        # Same SRCALPHA approach as _draw_map_jump_fade — set_alpha() doesn't
+        # work correctly when blitting onto a pygame.SCALED display surface.
+        if not hasattr(self, '_white_flash_surf') or self._white_flash_surf.get_size() != (w, h):
+            self._white_flash_surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        self._white_flash_surf.fill((255, 255, 255, alpha))
+        surface.blit(self._white_flash_surf, (0, 0))
 
     # ── World-map flying helpers ──────────────────────────────────────────────
 
@@ -2307,6 +4015,10 @@ class Game:
             up    = keys[pygame.K_UP]
             down  = keys[pygame.K_DOWN]
 
+            _throttle_target = 1.0 if (up or down or left or right) else 0.0
+            self._mjf_fly_throttle += ((_throttle_target - self._mjf_fly_throttle)
+                                        * min(1.0, dt * self._MJF_THROTTLE_RATE))
+
             # Direction determines sprite row:
             # up/down = forward/backward, left/right = banking turn.
             # Left/right alone inherits the last vertical direction:
@@ -2342,8 +4054,8 @@ class Game:
             # angle increment looks much faster.  Scale speed down with altitude so
             # the visual rotation rate feels consistent regardless of height.
             _alt = getattr(self, '_mjf_altitude', 0.5)
-            ROTATE_SPD = 1.8 * dt * (1.0 - 0.75 * _alt)
-            MAP_SPD    = self._MJF_FLY_SPEED * 1.8 * dt
+            ROTATE_SPD = 1.8 * dt * (1.0 - 0.75 * _alt) * self._mjf_fly_throttle
+            MAP_SPD    = self._MJF_FLY_SPEED * 1.8 * dt * self._mjf_fly_throttle
 
             if up or down:
                 self._mjf_moving_backward = down and not up
@@ -2613,6 +4325,7 @@ class Game:
                     self._mjf_landing_done     = False
                     self._load_map_land_sprite()
                     self.mission_manager.on_room_entered(_target_room_name)
+                    self.flag_manager.mark_room_visited(_target_room_name)
                     self._mjf_alpha = 255.0   # start fully black; fade_in counts down to 0
                     self._mjf_state = 'landing_fade_in'
 
@@ -2885,14 +4598,15 @@ class Game:
             _active_map    = getattr(self, '_active_world_map_name', '')
             _locs = getattr(self, '_wm_locations', None)
             if _locs is None and _active_map:
-                import json as _jl, os as _osl
-                try:
-                    with open(_osl.path.join('assets', 'world_maps',
-                                             f'{_active_map}.json')) as _fl:
-                        _locs = _jl.load(_fl).get('locations', [])
-                    self._wm_locations = _locs
-                except Exception:
-                    _locs = []
+                # Route through the overrides helper (same as the location-
+                # billboard lazy-load below) instead of reading the JSON
+                # directly — otherwise pins hidden via the 'world_map_location'
+                # event action reappear because this sets self._wm_locations
+                # first, unfiltered, and the real filtered load later in this
+                # function sees hasattr(self, '_wm_locations') already True
+                # and skips itself.
+                self._apply_wm_location_overrides(_active_map)
+                _locs = self._wm_locations
             _ppt_x = texture.get_width()  / 362
             _ppt_y = texture.get_height() / 263
 
@@ -3286,7 +5000,7 @@ class Game:
                         print(f'[world_map] could not load world_map_loc.png: {e}')
                         self._world_map_loc_sprite = None
 
-                if self._world_map_loc_sprite and self._wm_locations:
+                if self._world_map_loc_sprite and getattr(self, '_wm_locations', None):
                     _loc_size = 4 * RENDER_SCALE
                     _loc_spr  = pygame.transform.scale(
                         self._world_map_loc_sprite, (_loc_size, _loc_size)
@@ -3322,12 +5036,15 @@ class Game:
                     with open(_os.path.join('assets', 'world_maps',
                                             f'{_active_map}.json')) as _f:
                         _ld = _json.load(_f)
-                    self._wm_locations = _ld.get('locations', [])
                     # Load entities from the same file (avoid a second open)
                     if not hasattr(self, '_wm_entities'):
                         self._wm_entities = _ld.get('entities', [])
                 except Exception:
                     pass
+                # Apply through the overrides helper (re-reads the file, but
+                # keeps this the single source of truth for add/remove pins
+                # queued by the 'world_map_location' event action).
+                self._apply_wm_location_overrides(_active_map)
 
         # Load entity list once (in case locations were already loaded without them)
         if not hasattr(self, '_wm_entities'):
@@ -3775,27 +5492,179 @@ class Game:
     def _get_allowed_ki_modes(self) -> tuple:
         """Return the ordered tuple of ki-attack modes this character can cycle through.
 
-        Derived directly from player.equipped_attacks:
-          - 'ki_blast' in equipped  → blast mode available
-          - any other attack equipped → beam mode available
-          - transform is always appended last
+        Derived directly from player.equipped_attacks — each attack folder id
+        maps explicitly to the mode it unlocks:
+          - 'ki_blast'   in equipped → blast mode available
+          - 'kamehameha' in equipped → beam mode available
+          - 'kamekameha' in equipped → kamekameha mode available
+          - 'banshee_blast' in equipped → banshee_blast mode available
+          - 'final_flash' in equipped → final_flash mode available
+          - 'big_bang_kamehameha' in equipped → big_bang_kamehameha mode available
+          - 'genkidama'  in equipped → genkidama mode available
+          - 'big_bang_attack' in equipped → big_bang_attack mode available
+          - 'masenko'    in equipped → masenko mode available
+          - 'flame_kamehameha' in equipped → flame_kamehameha mode available
+          - 'ultra_volleyball_attack' in equipped → ultra_volleyball mode available
+          - 'energy_sword' in equipped → sword mode available
+          - 'energy_punch' in equipped → energy_punch mode available
+          - 'dragon_fist' in equipped → dragon_fist mode available
+          - 'ghost_kamikaze' in equipped → ghost_kamikaze mode available
+          - 'instant_transmission' in equipped → instant_transmission mode available
+          - transform is appended last, but only if this character actually
+            has at least one transformation configured in the character
+            creator (player.has_transformation — set in _reload_attack_config
+            from cfg["transformations"])
 
-        Falls back to ('blast', 'transform') when no config has been loaded yet.
+        Falls back to blast-only (plus transform, if the character has one)
+        when no config has been loaded yet.
         """
         equipped = getattr(self.player, 'equipped_attacks', [])
+        has_transform = getattr(self.player, 'has_transformation', False)
 
         modes: list[str] = []
         if 'ki_blast' in equipped:
             modes.append('blast')
-        if any(a != 'ki_blast' for a in equipped):
+        if 'kamehameha' in equipped:
             modes.append('beam')
+        if 'kamekameha' in equipped:
+            modes.append('kamekameha')
+        if 'banshee_blast' in equipped:
+            modes.append('banshee_blast')
+        if 'final_flash' in equipped:
+            modes.append('final_flash')
+        if 'big_bang_kamehameha' in equipped:
+            modes.append('big_bang_kamehameha')
+        if 'genkidama' in equipped:
+            modes.append('genkidama')
+        if 'big_bang_attack' in equipped:
+            modes.append('big_bang_attack')
+        if 'masenko' in equipped:
+            modes.append('masenko')
+        if 'burning_attack' in equipped:
+            modes.append('burning_attack')
+        if 'flame_kamehameha' in equipped:
+            modes.append('flame_kamehameha')
+        if 'ultra_volleyball_attack' in equipped:
+            modes.append('ultra_volleyball_attack')
+        if 'energy_sword' in equipped:
+            modes.append('sword')
+        if 'energy_punch' in equipped:
+            modes.append('energy_punch')
+        if 'dragon_fist' in equipped:
+            modes.append('dragon_fist')
+        if 'ghost_kamikaze_attack' in equipped:
+            modes.append('ghost_kamikaze_attack')
+        if 'instant_transmission' in equipped:
+            modes.append('instant_transmission')
 
-        # Always include transform so the player can still power up.
-        modes.append('transform')
+        if has_transform:
+            modes.append('transform')
+
+        if modes:
+            return tuple(modes)
 
         # If nothing was equipped at all, keep blast as the default so the
         # game is still playable before any config file has been saved.
-        return tuple(modes) if len(modes) > 1 else ('blast', 'transform')
+        return ('blast', 'transform') if has_transform else ('blast',)
+
+    def _sync_event_editor_character(self):
+        """Tell the Room Editor's object editor (if it exists yet) which
+        character is currently being played, so its event editor's 'skill'
+        action pickers stay accurate — see ObjectEditor.set_current_character().
+        object_editor is lazy-initialized, hence the existence check (same
+        pattern used elsewhere for it, e.g. _on_save_point_placed callers).
+
+        Passes a live getter for player.equipped_attacks (not just the
+        character id) since runtime 'skill' actions mutate that list
+        in-place — a one-time snapshot would go stale the moment a skill
+        was added/removed without another explicit re-sync."""
+        oe = getattr(self.room_editor, 'object_editor', None)
+        if oe is not None:
+            oe.set_current_character(
+                getattr(self.player, 'character', None),
+                get_equipped_skills=lambda: getattr(self.player, 'equipped_attacks', []),
+            )
+
+    def _sync_event_editor_rooms(self):
+        """Tell the Room Editor's object editor (if it exists yet) which
+        rooms actually exist right now, so its event editor's change_map
+        'room_name' dropdown and 'Set Spawn' preview reflect the real,
+        current room list/sizes instead of ActionSequenceBuilder's
+        on-disk-only fallback discovery — see
+        ActionSequenceBuilder.set_known_rooms(). Same lazy-init existence
+        check as _sync_event_editor_character() above; also guarded on the
+        passthrough actually existing on ObjectEditor, since that's a
+        small forwarding method (mirroring its existing
+        set_current_character() one) that needs to be added there.
+        object_editor is lazy-initialized, hence both checks."""
+        oe = getattr(self.room_editor, 'object_editor', None)
+        if oe is not None and hasattr(oe, 'set_known_rooms'):
+            room_dims = {room.name: (room.width, room.height) for room in self.room_manager.rooms}
+            oe.set_known_rooms(sorted(room_dims.keys()), room_dims)
+        if oe is not None and hasattr(oe, 'set_room_preview_provider'):
+            oe.set_room_preview_provider(self._render_room_tile_preview)
+
+    def _render_room_tile_preview(self, room_name):
+        """ActionSequenceBuilder's Set Spawn overlay's room_preview_provider
+        callable — renders every placed tile for room_name onto an
+        offscreen surface sized to the room's full world extent (at
+        RENDER_SCALE, background pass then foreground pass, same ordering/
+        animation-frame lookup as TilesetEditor.draw_tiles()).
+
+        Deliberately NOT just calling tileset_editor.draw_tiles() itself:
+        that method culls tiles against TilesetEditor.screen_width/height
+        (the live game window), which would wrongly clip this preview for
+        any room bigger than the window. This walks tile data directly
+        instead, using the same public per-tile lookups draw_tiles() uses,
+        just without that screen-bounds cull — safe since our surface is
+        already sized to exactly the room's extent.
+
+        Also deliberately NOT relying on tileset_editor.room_tiles[room_name]
+        alone: RoomEditor only lazily populates that cache for whichever
+        room is currently open in the room viewer (see
+        RoomEditor._enter_view_room()) — for any other room (which is the
+        common case here, since you're picking a spawn in a room you're
+        not currently standing in/editing), it'd be empty even though the
+        room clearly has tiles. Falls back to the Room object's own raw
+        tiles (room.tiles, the same source _enter_view_room() itself loads
+        from) when the room isn't the one actively being edited.
+
+        Returns None if the room doesn't exist or has no tiles at all, so
+        the overlay falls back to its plain grid rectangle."""
+        te = self.room_editor.tileset_editor
+        room = self.room_manager.get_room_by_name(room_name)
+        if room is None:
+            return None
+
+        if room_name in te.room_tiles and te.room_tiles[room_name]:
+            tiles = te.room_tiles[room_name]
+        else:
+            try:
+                from dev_tools.room_editor.room_editor_tools.tileset_editor import Tile
+            except Exception:
+                return None
+            raw = getattr(room, 'tiles', None) or []
+            tiles = [Tile.from_dict(t) if isinstance(t, dict) else t for t in raw]
+
+        if not tiles:
+            return None
+
+        surf_w = max(1, int(room.width * RENDER_SCALE))
+        surf_h = max(1, int(room.height * RENDER_SCALE))
+        surf = pygame.Surface((surf_w, surf_h))
+        surf.fill((40, 40, 55))
+
+        tick_ms = pygame.time.get_ticks()
+        for tile in sorted(tiles, key=lambda t: t.layer):
+            tileset = te.tileset_manager.get_tileset(tile.tileset_name)
+            if not tileset:
+                continue
+            disp_x, disp_y = tileset.get_animated_coords(tile.tile_x, tile.tile_y, tick_ms)
+            scaled_tile = tileset.get_scaled_tile_surface(disp_x, disp_y, RENDER_SCALE)
+            if not scaled_tile:
+                continue
+            surf.blit(scaled_tile, (int(tile.x * RENDER_SCALE), int(tile.y * RENDER_SCALE)))
+        return surf
 
     def _reload_attack_config(self, character_id):
         """(Re-)apply character_id's saved attack config to the live player:
@@ -3807,6 +5676,49 @@ class Game:
 
         self.player.equipped_attacks = list(atk.get('equipped_attacks', []))
         self.player.ki_mode_config   = atk.get('ki_attack_mode', 'blast')
+
+        # Charged Melee style — whether holding the melee button lunges
+        # forward or spins in place once fully charged (see
+        # Player.release_charged_melee()). Always available (unlike the
+        # equipped/TAB-cycled attacks above); this only picks which variant
+        # plays.
+        self.player.charged_melee_style = atk.get('charged_melee_style', 'lunge')
+
+        # Transform is only offered as a ki mode if the costume this character
+        # is CURRENTLY wearing actually has a transformation set up for it —
+        # not just if *some* costume on this character has one. Transformation
+        # entries are stored with costume = "{owning_costume}/transformations/{form}",
+        # so scope the check to entries owned by cfg['costume'].
+        _current_costume = cfg.get('costume', '')
+        _transform_prefix = f"{_current_costume}/transformations/"
+        self.player.has_transformation = any(
+            t.get('costume', '').startswith(_transform_prefix)
+            for t in cfg.get('transformations', [])
+        )
+
+        # Sync character-creator stats → player.stats so ki_regen (and any
+        # other stat) takes effect the moment the creator saves.
+        _cc_stats = cfg.get('stats', {})
+        _stat_map = {
+            'power':    'strength',
+            'defense':  'defense',
+            'speed':    'speed',
+            'ki_regen': 'ki_regen',
+        }
+        changed = False
+        for cc_key, player_key in _stat_map.items():
+            if cc_key in _cc_stats and player_key in self.player.stats:
+                self.player.stats[player_key] = _cc_stats[cc_key]
+                changed = True
+        if changed:
+            self.player.update_derived_stats()
+        # max_hp / max_ki are direct values in the creator
+        if 'max_hp' in _cc_stats:
+            self.player.max_hp = _cc_stats['max_hp']
+            self.player.hp     = min(self.player.hp, self.player.max_hp)
+        if 'max_ki' in _cc_stats:
+            self.player.max_ki = _cc_stats['max_ki']
+            self.player.ki     = min(self.player.ki, self.player.max_ki)
 
         # Keep ki_attack_mode valid for whatever's now equipped — prevents
         # being left in e.g. beam mode after a character loses beam attacks.
@@ -3827,6 +5739,7 @@ class Game:
             'level': self.player.level,
             'stats': self.player.stats.copy(),
             'inventory': self.player.inventory.copy(),
+            'zeni': getattr(self.player, 'zeni', 0),
             'direction': self.player.direction,
             'current_animation_state': getattr(self.player, 'current_animation_state', 'idle'),  # capture BEFORE swap
         }
@@ -3847,6 +5760,10 @@ class Game:
 
         # Apply the character's attack config so only equipped attacks are usable.
         self._reload_attack_config(character_id)
+
+        # Keep the event editor's skill pickers scoped to whoever's now
+        # being played — see _sync_event_editor_character().
+        self._sync_event_editor_character()
 
     # ── Flying-controller callbacks ───────────────────────────────────────────
 
@@ -3874,6 +5791,7 @@ class Game:
         self.camera.x = max(0, min(self.camera.x, target_room.width  * RENDER_SCALE - SCREEN_WIDTH))
         self.camera.y = max(0, min(self.camera.y, target_room.height * RENDER_SCALE - SCREEN_HEIGHT))
         self.mission_manager.on_room_entered(target_room_name)
+        self.flag_manager.mark_room_visited(target_room_name)
 
     def _handle_flying_complete(self):
         """Called when the flying sequence ends.
@@ -3904,9 +5822,41 @@ class Game:
             self._wm_entity_anim_t = 0.0
         self._wm_entity_anim_t += dt
 
+        # Flush any rooms marked dirty by save_room() (object placement/deletion
+        # callbacks) — batched here instead of writing to disk on every single
+        # call, which used to hitch the editor on every collision/music click.
+        if hasattr(self.room_manager, 'flush_dirty_rooms'):
+            self.room_manager.flush_dirty_rooms(dt=dt)
+
         # When the room editor is open, skip all game simulation — only tick the editor.
         if self.room_editor.active:
+            self._sync_event_editor_rooms()
             self.room_editor.update(dt, self._get_logical_mouse_pos())
+            return
+
+        # Genkidama impact hitstop — the world freezes completely for the
+        # duration of the white flash. Only the flash timer itself and the
+        # hit-flash visuals keep advancing; player, enemies, projectiles,
+        # everything else holds perfectly still until it ends.
+        if self._white_flash_timer > 0:
+            self._white_flash_timer = max(0.0, self._white_flash_timer - dt)
+            for hit_fx in self.genkidama_hit_effects[:]:
+                hit_fx.update(dt)
+                if not hit_fx.active:
+                    self.genkidama_hit_effects.remove(hit_fx)
+            for hit_fx in self.burning_hit_effects[:]:
+                hit_fx.update(dt)
+                if not hit_fx.active:
+                    self.burning_hit_effects.remove(hit_fx)
+            return
+
+        # Instant Transmission — the world freezes entirely (enemies, NPCs,
+        # projectiles, everything) only while the player is actively aiming
+        # (holding the button, picking targets). Once they let go and the
+        # teleport hops actually begin, the world keeps running normally —
+        # enemies can move and act while the player blinks around them.
+        if self.player.is_targeting_it:
+            self._update_instant_transmission(dt)
             return
 
         enemies_defeated_this_frame = 0
@@ -3914,6 +5864,7 @@ class Game:
         # Always tick UI overlays even when gameplay is paused.
         self.character_switch_menu.update(dt)
         self.save_point_menu.update(dt)
+        self.dialogue_choice_menu.update(dt)
         self.pause_menu.update(dt)
 
         if self.ui.current_screen == 'game':
@@ -3927,16 +5878,69 @@ class Game:
 
             # Accumulate play time only while unpaused and no overlay is blocking.
             if not self.save_point_menu.active and not self.character_switch_menu.active \
-                    and not self.pause_menu.active:
+                    and not self.pause_menu.active and not self.dialogue_choice_menu.active:
                 self.play_time += dt
 
-            # Player movement is also suppressed during cutscenes and NPC dialogue.
+                # Tick down any running event timers in lockstep with play
+                # time — frozen by the same menus/overlays so a paused game
+                # never bleeds seconds off a challenge timer.
+                if self.timers:
+                    for timer in self.timers.values():
+                        if timer['running'] and timer['remaining'] > 0:
+                            timer['remaining'] = max(0.0, timer['remaining'] - dt)
+
+                # Advance the spam QTE bar in lockstep with play time too —
+                # frozen by the same menus/overlays so a paused game can't
+                # be used to stall out (or accidentally drain) the bar.
+                self._update_spam_qte(dt)
+
+            # Player movement is also suppressed during cutscenes, NPC
+            # dialogue, and while an Instant Transmission hop sequence is
+            # driving position directly (arrow-key input would otherwise
+            # fight with each hop's teleport).
             if not self.save_point_menu.active and not self.character_switch_menu.active \
                     and not self.pause_menu.active and not self.active_cutscene_runtime \
-                    and not self.dialogue_box.active:
+                    and not self.dialogue_box.active and not self.dialogue_choice_menu.active \
+                    and not self.player.is_teleporting_it and not self.spam_qte_bar.active \
+                    and not self._levelup_active:
                 self._update_player_movement(dt)
 
-            self.player.update(dt)
+            # The character switch menu and save point menu should freeze the
+            # player entirely — not just movement input. Letting player.update(dt)
+            # keep running here would still tick idle_timer forward and let
+            # idle_transition/idle_wait kick in while either menu is open
+            # (only _update_player_movement above was gated before). The
+            # dialogue choice menu gets the same treatment.
+            if not self.character_switch_menu.active and not self.save_point_menu.active \
+                    and not self.dialogue_choice_menu.active and not self._levelup_active:
+                self.player.update(dt)
+
+            # Level-up sequence — drives the player's facing turns and the
+            # levelup.png animation directly, so it needs to keep ticking
+            # even while player.update(dt) itself is frozen just above.
+            self._update_levelup_sequence(dt)
+
+            # Advance the Instant Transmission hop sequence itself. This now
+            # runs alongside the normal (unfrozen) world update — the world
+            # only freezes during target aiming above, not during the hops.
+            if self.player.is_teleporting_it:
+                arrived_enemy = self.player.update_it_teleport(dt)
+                if arrived_enemy is not None:
+                    self._apply_instant_transmission_damage(arrived_enemy)
+                # One teleport.wav per hop — including the final trip back
+                # home, which arrived_enemy above never reports since
+                # there's no enemy to land on. See Player.
+                # pop_pending_it_teleport_hop()/update_it_teleport().
+                if self.player.pop_pending_it_teleport_hop():
+                    self.sound_manager.play_sfx('teleport')
+
+            # Ghost Kamikaze — its creation/hold/attack lifecycle needs the
+            # room's enemy list to pick a target at the moment the hold
+            # resolves, which Player doesn't have access to on its own
+            # (same reasoning as Instant Transmission's targeting above),
+            # so it's ticked centrally here rather than from inside
+            # Player.update(). See GhostKamikazeAttack's own docstring.
+            self._update_ghost_kamikaze(dt)
 
             # Tick the map-jump fade-out.  Start once the player's sprite has
             # fully cleared the top of the camera; ramp alpha to full black.
@@ -3962,6 +5966,8 @@ class Game:
                     self._mjf_needs_pin_correction = True
                     self._mjf_origin_room   = self.current_room.name if self.current_room else ''
                     self._mjf_origin_entity = getattr(self, '_mjf_last_entry_entity', '')
+                    print(f"[world_map_music] fast-path firing for map "
+                          f"'{getattr(self, '_active_world_map_name', '')}'")
                     self._apply_world_map_music(getattr(self, '_active_world_map_name', ''))
                     self._mjf_state  = 'fade_in'
                     self._mjf_active = False
@@ -3984,9 +5990,36 @@ class Game:
                 self.sound_manager.play_sfx(random.choice(('kiblast1', 'kiblast2')))
                 self.player.pending_blast = None
 
+            # Spawn the Ultra Volleyball attack when the (shared kiblast)
+            # throw animation completes — same release-frame timing as the
+            # regular blast poll above, tracked independently via
+            # pending_ultra_volleyball so firing one never consumes the other.
+            if self.player.pending_ultra_volleyball == 'ready':
+                spawn_x, spawn_y = self.player.get_blast_spawn_position()
+                self.ultra_volleyballs.append(UltraVolleyballAttack(
+                    spawn_x, spawn_y, self.player.direction,
+                    end_frame_width=8, end_frame_height=4,
+                    middle_frame_width=8, middle_frame_height=4,
+                    decay_frame_width=8, decay_frame_height=4,
+                ))
+                self.sound_manager.play_sfx(random.choice(('kiblast1', 'kiblast2')))
+                self.player.pending_ultra_volleyball = None
+
+            # Charged Melee: spawn a hit every charged_melee_hit_interval
+            # seconds while the lunge/spin is playing out. Reuses the exact
+            # same MeleeAttack pipeline (collision, sfx, cleanup) as a
+            # regular tap-melee swing — see
+            # Player.pop_pending_charged_melee_hit()/update_charged_melee_action().
+            charged_melee_hit = self.player.pop_pending_charged_melee_hit()
+            if charged_melee_hit:
+                self.melee_attacks.append(charged_melee_hit)
+
             # Screen transition update.
             if self.transition_controller.is_transitioning():
                 self.transition_controller.update(dt, self.player)
+
+            # Ambient room weather (event-driven, see 'weather' action).
+            self._update_room_weather(dt)
 
             # Flying controller update.
             if self.flying_controller.is_active():
@@ -3999,6 +6032,20 @@ class Game:
             # Cutscene trigger detection and runtime tick.
             self._update_cutscene_triggers(dt)
 
+            # Trigger box overlap/key-press detection.
+            #
+            # Gated on the *current* _mjf_state/_mjf_active rather than relying
+            # solely on the top-of-frame early-return above: that check only
+            # takes effect starting next frame, but _mjf_state can flip to
+            # 'fade_in' (and _apply_world_map_music() can fire) partway through
+            # THIS frame's update — see the fade-out tick block earlier in this
+            # method. Without this guard, a still-live (e.g. always_run,
+            # once=False) room-music trigger box would fire again later in that
+            # same frame and immediately re-apply the room's track, stomping
+            # the world map music that was just switched to a few lines above.
+            if self._mjf_state is None and not self._mjf_active:
+                self._update_trigger_boxes(dt)
+
             # Walk-based room transition detection (skip during fade).
             if not self.transition_controller.is_transitioning():
                 self._check_room_transitions()
@@ -4007,12 +6054,71 @@ class Game:
 
             # Beam charge and auto-fire mechanics.
             self._update_beam(dt)
+            self._update_kamekameha(dt)
+            self._update_banshee_blast(dt)
+            self._update_final_flash(dt)
+            self._update_big_bang_kamehameha(dt)
+            self._update_flame_kamehameha(dt)
 
             # Player projectiles.
             for projectile in self.projectiles[:]:
                 projectile.update(self.current_room.width, self.current_room.height, dt)
                 if not projectile.active:
                     self.projectiles.remove(projectile)
+
+            # Scripted 'firebeam' cutscene attacks — spawned via
+            # _cutscene_spawn_attack into self.cutscene_beams. Ticked here
+            # unconditionally (not gated on active_cutscene_runtime) so a
+            # beam fired right as a cutscene ends still finishes growing/
+            # decaying out normally instead of freezing mid-flight.
+            for beam in self.cutscene_beams[:]:
+                for wall in self.collision_objects:
+                    distance = wall.get_beam_block_distance(beam)
+                    if distance is not None:
+                        beam.report_obstruction(distance)
+
+                # _cutscene_release_timer (set in _cutscene_spawn_attack) is
+                # how much longer the beam stays fully out before closing
+                # back up — mirrors the scripted attack action's pose
+                # duration. Not present on any other BeamAttack, so this is
+                # only ever read/decremented for cutscene-fired ones.
+                release_timer = getattr(beam, '_cutscene_release_timer', None)
+                if release_timer is not None and not beam.decaying:
+                    release_timer -= dt
+                    if release_timer <= 0:
+                        beam.start_decay()
+                    else:
+                        beam._cutscene_release_timer = release_timer
+
+                beam.update(dt)
+                if not beam.active:
+                    self.cutscene_beams.remove(beam)
+
+            # Big Bang Attack — kept in its own list rather than
+            # self.projectiles (see where it's appended in the KEYUP
+            # handler) since it pierces instead of being consumed on the
+            # first hit; the collision block for it is its own dedicated
+            # continuous-contact check further down, same shape as
+            # dragon_fist. The only way one of these ever ends up
+            # inactive here is from reaching its own MAX_DISTANCE or
+            # leaving the room (see BigBangAttackBlast.update()) — never
+            # from a hit — so spawning the destruction burst exactly
+            # here, right as it's pruned, is the correct single place to
+            # do it (see spawn_destruction_burst()'s own docstring).
+            for blast in self.big_bang_attacks[:]:
+                blast.update(self.current_room.width, self.current_room.height, dt)
+                if not blast.active:
+                    self.big_bang_attacks.remove(blast)
+                    self.big_bang_destruction_effects.append(blast.spawn_destruction_burst())
+
+            # Ultra Volleyball attacks — fixed 3-segment chains that travel
+            # on their own (unlike a beam, no charge/hold state to drive
+            # here); each despawns itself once it reaches its fixed
+            # travel_distance, or gets deactivated below on enemy contact.
+            for ultra_volleyball in self.ultra_volleyballs[:]:
+                ultra_volleyball.update(dt)
+                if not ultra_volleyball.active:
+                    self.ultra_volleyballs.remove(ultra_volleyball)
 
             # Melee attacks.
             for melee in self.melee_attacks[:]:
@@ -4022,14 +6128,38 @@ class Game:
                         self.sound_manager.play_sfx(random.choice(('melee1', 'melee2')))
                     self.melee_attacks.remove(melee)
 
-            # Enemy AI, combat resolution, and defeat handling.
-            enemies_defeated_this_frame = self._update_enemies(dt)
+            # Enemy AI, combat resolution, and defeat handling — frozen
+            # while any dialogue box is up (plain NPC/event dialogue via
+            # dialogue_box, or the dialogue_choice_menu), same reasoning as
+            # player movement being suppressed below: nothing should be
+            # able to sneak up on or hit the player while they're reading.
+            if not self.dialogue_box.active and not self.dialogue_choice_menu.active \
+                    and not self._levelup_active:
+                enemies_defeated_this_frame = self._update_enemies(dt)
+            else:
+                for enemy in self.enemies:
+                    self._freeze_actor_to_idle(enemy)
+
+            # Grow/decay the beam now that enemies have moved (and reported
+            # any beam-blocking contact) this frame — see _grow_beam()
+            # docstring for why this has to come after _update_enemies().
+            self._grow_beam(dt)
+            self._grow_kamekameha(dt)
+            self._grow_banshee_blast(dt)
+            self._grow_final_flash(dt)
+            self._grow_big_bang_kamehameha(dt)
 
             # Enemy projectile systems.
             self._update_bombs(dt)
             self._update_enemy_bullets(dt)
             self._update_enemy_rockets(dt)
             self._update_enemy_kiblasts(dt)
+
+            # Player's masenko projectiles.
+            self._update_masenko_projectiles(dt)
+
+            # Dropped zeni pickups — hop/settle, magnet toward player, collect.
+            self._update_zeni_pickups(dt)
 
             # Tick damage number popups.
             self.dmg_numbers.update(dt)
@@ -4040,8 +6170,46 @@ class Game:
                 if not explosion.active:
                     self.explosions.remove(explosion)
 
-            # NPC interaction detection.
-            self._update_npcs(dt)
+            # Genkidama hit-flash visuals keep playing out after the hitstop
+            # ends too, in case the animation outlasts the freeze itself.
+            # (The white flash timer's own countdown happens exclusively in
+            # the hitstop gate at the top of update() — not here.)
+            for hit_fx in self.genkidama_hit_effects[:]:
+                hit_fx.update(dt)
+                if not hit_fx.active:
+                    self.genkidama_hit_effects.remove(hit_fx)
+
+            # Burning attack hit-impact visuals — a short one-shot playing
+            # out at the point of impact, no hitstop/white-flash involved.
+            for hit_fx in self.burning_hit_effects[:]:
+                hit_fx.update(dt)
+                if not hit_fx.active:
+                    self.burning_hit_effects.remove(hit_fx)
+
+            # Big Bang Attack's destruction burst — the scattered,
+            # staggered brown_destruction puffs left behind once a blast
+            # reaches MAX_DISTANCE (see BigBangDestructionBurst). No
+            # hitstop/white-flash involved here either.
+            for burst in self.big_bang_destruction_effects[:]:
+                burst.update(dt)
+                if not burst.active:
+                    self.big_bang_destruction_effects.remove(burst)
+
+            # NPC interaction detection — frozen while any dialogue box is
+            # up, same as enemy AI above, so an NPC doesn't wander off or
+            # change facing mid-conversation.
+            if not self.dialogue_box.active and not self.dialogue_choice_menu.active \
+                    and not self._levelup_active:
+                self._update_npcs(dt)
+            else:
+                for npc in self.npcs:
+                    self._freeze_actor_to_idle(npc)
+
+            # Ambient wildlife — no interaction detection needed, just tick them.
+            # Frozen during the level-up sequence too, so it reads as "everything
+            # stops" rather than just enemies/NPCs.
+            if not self._levelup_active:
+                self._update_critters(dt)
 
             # Dialogue box animation.
             self.dialogue_box.update(dt)
@@ -4057,6 +6225,9 @@ class Game:
 
             # Level gates.
             self._update_gates(dt)
+
+            # Doors — proximity open/close.
+            self._update_doors(dt)
 
             # Transformation system (tracks energy and applies power-up state).
             # Frozen during cutscenes so ki doesn't drain while the player is
@@ -4096,6 +6267,7 @@ class Game:
                 self.character_creator.update(dt)
                 return
             if self.room_editor.active:
+                self._sync_event_editor_rooms()
                 self.room_editor.update(dt, self._get_logical_mouse_pos())
                 return
 
@@ -4108,18 +6280,32 @@ class Game:
     def _update_player_movement(self, dt):
         """Read directional input, move the player, and resolve collisions.
 
-        Movement is suppressed while a flying sequence is active.
+        Movement is suppressed while a flying sequence is active. While the
+        flame kamehameha is firing, the same movement-key input steers its
+        tip (see FlameKamehamehaAttack.set_control_input) instead of
+        walking the player, since player.move() no-ops during the attack.
         Collision order: stones → gates → walls → NPCs.
         """
         keys       = pygame.key.get_pressed()
         dx = dy    = 0
         is_running = keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] or self.player.is_running
+        # While spinning the energy sword, movement is allowed (can_move()
+        # special-cases it) but capped to normal walking speed regardless
+        # of run being held.
+        if self.player.is_spinning_sword:
+            is_running = False
 
         # Build a movement direction vector from the arrow keys.
         if keys[pygame.K_LEFT]  and not keys[pygame.K_RIGHT]: dx = -1
         elif keys[pygame.K_RIGHT] and not keys[pygame.K_LEFT]: dx = 1
         if keys[pygame.K_UP]    and not keys[pygame.K_DOWN]:  dy = -1
         elif keys[pygame.K_DOWN] and not keys[pygame.K_UP]:   dy = 1
+
+        # While the flame kamehameha is firing, player.move() is a no-op
+        # (can_act() is False), so redirect this frame's raw movement
+        # input to steering the chain's tip instead of walking the player.
+        if self.player.is_firing_flame_kamehameha and self.player.current_flame_kamehameha:
+            self.player.current_flame_kamehameha.set_control_input(dx, dy)
 
         if dx == 0 and dy == 0:
             # No directional input — snap back to idle.
@@ -4206,6 +6392,7 @@ class Game:
                             self._load_room_objects(target_room)
                         self.player.is_transitioning = False
                         self.mission_manager.on_room_entered(target_room_name)
+                        self.flag_manager.mark_room_visited(target_room_name)
 
                 self.player.is_transitioning = True
                 self.transition_controller.start_transition(
@@ -4214,7 +6401,11 @@ class Game:
                 break
 
     def _update_beam(self, dt):
-        """Tick beam charging and auto-fire once fully charged."""
+        """Tick beam charging and auto-fire once fully charged.
+
+        Growth/obstruction handling now lives in _grow_beam(dt), called
+        later in update() after _update_enemies() — see that method for why.
+        """
         if self.player.is_charging_beam:
             self.player.update_beam_charge(dt)
 
@@ -4225,11 +6416,173 @@ class Game:
                 self.player.current_beam = beam
                 self.sound_manager.play_sfx('beam')
 
-        # Expire the beam when the player stops firing.
+    def _update_kamekameha(self, dt):
+        """Tick Kamekameha charging and auto-fire once fully charged.
+        Mirrors _update_beam(dt) exactly, against the Kamekameha's separate
+        state.
+        """
+        if self.player.is_charging_kamekameha:
+            self.player.update_kamekameha_charge(dt)
+
+        if (not self.player.is_firing_kamekameha
+                and self.player.kamekameha_charge_time >= self.player.kamekameha_charge_required):
+            kamekameha = self.player.fire_kamekameha_auto()
+            if kamekameha:
+                self.player.current_kamekameha = kamekameha
+                self.sound_manager.play_sfx('beam')
+
+    def _grow_kamekameha(self, dt):
+        """Report obstructions and grow/decay the current Kamekameha.
+        Mirrors _grow_beam(dt) exactly — see that method's docstring for why
+        this runs after _update_enemies(dt).
+        """
+        if self.player.current_kamekameha:
+            for wall in self.collision_objects:
+                distance = wall.get_beam_block_distance(self.player.current_kamekameha)
+                if distance is not None:
+                    self.player.current_kamekameha.report_obstruction(distance)
+
+            self.player.current_kamekameha.update(dt)
+            if not self.player.current_kamekameha.active:
+                self.player.current_kamekameha = None
+
+    def _update_banshee_blast(self, dt):
+        """Tick Banshee Blast charging and auto-fire once fully charged.
+        Mirrors _update_beam(dt)/_update_kamekameha(dt) exactly, against
+        the Banshee Blast's separate state.
+        """
+        if self.player.is_charging_banshee_blast:
+            self.player.update_banshee_blast_charge(dt)
+
+        if (not self.player.is_firing_banshee_blast
+                and self.player.banshee_blast_charge_time >= self.player.banshee_blast_charge_required):
+            banshee_blast = self.player.fire_banshee_blast_auto()
+            if banshee_blast:
+                self.player.current_banshee_blast = banshee_blast
+                self.sound_manager.play_sfx('beam')
+
+    def _grow_banshee_blast(self, dt):
+        """Report obstructions and grow/decay the current Banshee Blast.
+        Mirrors _grow_beam(dt)/_grow_kamekameha(dt) exactly — see
+        _grow_beam(dt)'s docstring for why this runs after _update_enemies().
+        """
+        if self.player.current_banshee_blast:
+            for wall in self.collision_objects:
+                distance = wall.get_beam_block_distance(self.player.current_banshee_blast)
+                if distance is not None:
+                    self.player.current_banshee_blast.report_obstruction(distance)
+
+            self.player.current_banshee_blast.update(dt)
+            if not self.player.current_banshee_blast.active:
+                self.player.current_banshee_blast = None
+
+    def _update_flame_kamehameha(self, dt):
+        """Tick the flame kamehameha and clear it once it stops.
+
+        Charging itself (the charging_flame_kamehameha.png hold effect and
+        the auto-fire-when-ready check) is entirely handled inside
+        player.update() via update_flame_kamehameha_charge()/
+        fire_flame_kamehameha_auto() — see player.py — since it's driven by
+        current_animation_state there, same as beam's charge tick. All this
+        method does is advance the already-fired FlameKamehamehaAttack
+        (which is a fixed-length chain, fully "grown" the instant it's
+        created — no _grow_ companion method needed) and clear it once
+        stop() has ended it.
+        """
+        if self.player.current_flame_kamehameha:
+            self.player.current_flame_kamehameha.update(dt)
+            if not self.player.current_flame_kamehameha.active:
+                self.player.current_flame_kamehameha = None
+
+    def _grow_beam(self, dt):
+        """Report obstructions and grow/decay the current beam.
+
+        Deliberately called AFTER _update_enemies(dt) rather than back-to-back
+        with _update_beam(dt): enemies move (including any beam-driven
+        knockback push) inside _update_enemies(), and report their blocking
+        distance to the beam as part of that same call. If we grew the beam
+        first and let enemies move/report afterward, this frame's growth
+        would always be capped using LAST frame's (pre-move) enemy position —
+        a one-frame-stale cap that let the beam_rect drift out of overlap
+        with the enemy for a frame, showing the normal tip and a gap before
+        growth caught back up. Growing the beam after enemies (and after
+        their post-push position is already reported) means the cap always
+        reflects this frame's true position — the tip stays glued to the
+        enemy with no lag. Wall obstructions don't move, so their ordering
+        relative to this call never mattered, but reporting them here too
+        keeps everything in one place.
+        """
         if self.player.current_beam:
+            for wall in self.collision_objects:
+                distance = wall.get_beam_block_distance(self.player.current_beam)
+                if distance is not None:
+                    self.player.current_beam.report_obstruction(distance)
+
             self.player.current_beam.update(dt)
-            if not self.player.is_firing_beam:
+            if not self.player.current_beam.active:
                 self.player.current_beam = None
+
+    def _update_final_flash(self, dt):
+        """Tick Final Flash charging and auto-fire once fully charged.
+        Mirrors _update_beam(dt) exactly, against the beam's separate state.
+        """
+        if self.player.is_charging_final_flash:
+            self.player.update_final_flash_charge(dt)
+
+        if (not self.player.is_firing_final_flash
+                and self.player.final_flash_charge_time >= self.player.final_flash_charge_required):
+            final_flash = self.player.fire_final_flash_auto()
+            if final_flash:
+                self.player.current_final_flash = final_flash
+                self.sound_manager.play_sfx('final_flash')
+
+    def _grow_final_flash(self, dt):
+        """Report obstructions and grow/decay the current Final Flash.
+        Mirrors _grow_beam(dt) exactly — see that method's docstring for why
+        this runs after _update_enemies(dt).
+        """
+        if self.player.current_final_flash:
+            for wall in self.collision_objects:
+                distance = wall.get_beam_block_distance(self.player.current_final_flash)
+                if distance is not None:
+                    self.player.current_final_flash.report_obstruction(distance)
+
+            self.player.current_final_flash.update(dt)
+            if not self.player.current_final_flash.active:
+                self.player.current_final_flash = None
+
+    def _update_big_bang_kamehameha(self, dt):
+        """Tick Big Bang Kamehameha charging and auto-fire once fully charged.
+        Mirrors _update_final_flash(dt)/_update_beam(dt) exactly, against the
+        beam's separate state — BigBangKamehamehaAttack reuses BeamAttack's
+        growing/tiling/decay pipeline wholesale (see
+        attacks/big_bang_kamehameha.py), so it's driven the same
+        hold-to-charge/auto-fire way, not flame_kamehameha's fixed-chain shape.
+        """
+        if self.player.is_charging_big_bang_kamehameha:
+            self.player.update_big_bang_kamehameha_charge(dt)
+
+        if (not self.player.is_firing_big_bang_kamehameha
+                and self.player.big_bang_kamehameha_charge_time >= self.player.big_bang_kamehameha_charge_required):
+            big_bang_kamehameha = self.player.fire_big_bang_kamehameha_auto()
+            if big_bang_kamehameha:
+                self.player.current_big_bang_kamehameha = big_bang_kamehameha
+                self.sound_manager.play_sfx('big_bang_kamehameha')
+
+    def _grow_big_bang_kamehameha(self, dt):
+        """Report obstructions and grow/decay the current Big Bang Kamehameha.
+        Mirrors _grow_final_flash(dt)/_grow_beam(dt) exactly — see
+        _grow_beam's docstring for why this runs after _update_enemies(dt).
+        """
+        if self.player.current_big_bang_kamehameha:
+            for wall in self.collision_objects:
+                distance = wall.get_beam_block_distance(self.player.current_big_bang_kamehameha)
+                if distance is not None:
+                    self.player.current_big_bang_kamehameha.report_obstruction(distance)
+
+            self.player.current_big_bang_kamehameha.update(dt)
+            if not self.player.current_big_bang_kamehameha.active:
+                self.player.current_big_bang_kamehameha = None
 
     def _play_melee_hit_sfx(self):
         """Randomly pick one of the two melee-connect swing sounds."""
@@ -4262,8 +6615,38 @@ class Game:
                 )
 
             for melee in self.melee_attacks:
-                if melee.active and enemy.check_collision_with_attack(melee, 'melee'):
+                if not melee.active:
+                    continue
+                # An encased enemy (see Enemy.encase(), set by
+                # UltraVolleyballAttack contact below) is immune to normal
+                # melee damage — check_collision_with_attack no-ops for it
+                # entirely (see that method's guard). A melee landing on
+                # the casing instead triggers the roll via
+                # try_trigger_roll(), which deals no damage itself; only
+                # the eventual collision impact does (see Enemy._end_roll).
+                if enemy.is_encased:
+                    if enemy.try_trigger_roll(melee):
+                        melee.hit_something = True
+                        self._play_melee_hit_sfx()
+                        self.camera.start_shake(intensity=8, duration=0.2)
+                    continue
+                if enemy.check_collision_with_attack(melee, 'melee'):
                     melee.hit_something = True
+                    self._play_melee_hit_sfx()
+                    self._play_impact_sfx()
+                    self.dmg_numbers.spawn(
+                        enemy.x, enemy.y - enemy.height // 2,
+                        enemy.last_damage_dealt, variant='enemy',
+                    )
+
+            if self.player.is_punching:
+                # No separate attack object — the player itself is passed in
+                # as `attack` since this is just a plain "how close is the
+                # nearest enemy right now" radius test around the player's
+                # own position (see enemy.py's 'energy_punch' branch), unlike
+                # beam/kamekameha which check against a spawned attack
+                # object's own position.
+                if enemy.check_collision_with_attack(self.player, 'energy_punch'):
                     self._play_melee_hit_sfx()
                     self._play_impact_sfx()
                     self.dmg_numbers.spawn(
@@ -4274,10 +6657,24 @@ class Game:
             for projectile in self.projectiles:
                 if projectile.active and enemy.check_collision_with_attack(projectile, 'projectile'):
                     projectile.active = False
+                    if isinstance(projectile, GenkidamaBlast):
+                        self._trigger_genkidama_hit(projectile.x, projectile.y)
+                    elif isinstance(projectile, BurningAttack):
+                        enemy.stun(projectile.stun_duration, projectile.direction)
+                        self._trigger_burning_hit(enemy.x, enemy.y)
                     self.dmg_numbers.spawn(
                         enemy.x, enemy.y - enemy.height // 2,
                         enemy.last_damage_dealt, variant='enemy',
                     )
+
+            # Ultra Volleyball — on contact, encase() the enemy instead of
+            # damaging/pushing it (see enemy.py's 'ultra_volleyball' branch
+            # of check_collision_with_attack), then consume the attack the
+            # same way a regular projectile is consumed on hit.
+            for ultra_volleyball in self.ultra_volleyballs:
+                if ultra_volleyball.active and enemy.check_collision_with_attack(ultra_volleyball, 'ultra_volleyball_attack'):
+                    ultra_volleyball.active = False
+
 
             if self.player.current_beam:
                 if enemy.check_collision_with_attack(self.player.current_beam, 'beam'):
@@ -4286,19 +6683,156 @@ class Game:
                         enemy.last_damage_dealt, variant='enemy',
                     )
 
+            if self.player.current_kamekameha:
+                if enemy.check_collision_with_attack(self.player.current_kamekameha, 'beam'):
+                    self.dmg_numbers.spawn(
+                        enemy.x, enemy.y - enemy.height // 2,
+                        enemy.last_damage_dealt, variant='enemy',
+                    )
+
+            if self.player.current_banshee_blast:
+                if enemy.check_collision_with_attack(self.player.current_banshee_blast, 'beam'):
+                    self.dmg_numbers.spawn(
+                        enemy.x, enemy.y - enemy.height // 2,
+                        enemy.last_damage_dealt, variant='enemy',
+                    )
+
+            if self.player.current_final_flash:
+                if enemy.check_collision_with_attack(self.player.current_final_flash, 'beam'):
+                    self.dmg_numbers.spawn(
+                        enemy.x, enemy.y - enemy.height // 2,
+                        enemy.last_damage_dealt, variant='enemy',
+                    )
+
+            # BigBangKamehamehaAttack reuses BeamAttack's rect/length
+            # attributes wholesale (see attacks/big_bang_kamehameha.py), so
+            # — unlike flame_kamehameha below — it collides as plain 'beam'
+            # rather than needing its own collision type.
+            if self.player.current_big_bang_kamehameha:
+                if enemy.check_collision_with_attack(self.player.current_big_bang_kamehameha, 'beam'):
+                    self.dmg_numbers.spawn(
+                        enemy.x, enemy.y - enemy.height // 2,
+                        enemy.last_damage_dealt, variant='enemy',
+                    )
+
+            # FlameKamehamehaAttack is a fixed 3-segment chain, not a
+            # stretching beam_rect, so it's given its own collision type
+            # ('flame_kamehameha') rather than being passed off as 'beam' —
+            # reusing 'beam' would assume rect/length attributes this attack
+            # doesn't have. See enemy.py's 'flame_kamehameha' branch of
+            # check_collision_with_attack: it hits-tests against the
+            # chain's current world bounding box (which follows the
+            # player-steered tip) and pushes/damages the same way 'beam'
+            # does on contact.
+            if self.player.current_flame_kamehameha:
+                if enemy.check_collision_with_attack(self.player.current_flame_kamehameha, 'flame_kamehameha'):
+                    self.dmg_numbers.spawn(
+                        enemy.x, enemy.y - enemy.height // 2,
+                        enemy.last_damage_dealt, variant='enemy',
+                    )
+
+            # DragonFistAttack is a bending, spring-damped chain (not a
+            # fixed straight-line one like flame_kamehameha above), so it
+            # gets its own collision type ('dragon_fist') too — reusing
+            # 'flame_kamehameha' would test one bounding box around the
+            # whole chain, which could span empty space between segments
+            # on a curve. See enemy.py's 'dragon_fist' branch of
+            # check_collision_with_attack: it tests every individual
+            # piece (attack.get_segment_rects()) against the enemy, and
+            # pushes/damages the same continuous per-frame way 'beam'/
+            # 'flame_kamehameha' do on contact.
+            if self.player.current_dragon_fist:
+                if enemy.check_collision_with_attack(self.player.current_dragon_fist, 'dragon_fist'):
+                    self.dmg_numbers.spawn(
+                        enemy.x, enemy.y - enemy.height // 2,
+                        enemy.last_damage_dealt, variant='enemy',
+                    )
+
+            # Ghost Kamikaze — one hit per homing ghost, single instance
+            # apiece rather than the continuous per-frame push beam/
+            # dragon_fist use: each ghost is its own small hitbox
+            # (get_homing_ghosts() filters out any still-spawning/idling/
+            # already-impacted ghost, see GhostKamikazeAttack), and on a
+            # hit it switches straight to its brown_destruction animation
+            # (trigger_impact()) instead of lingering to hit again. Backed
+            # by enemy.py's 'ghost_kamikaze_attack' branch of
+            # check_collision_with_attack — a plain single-hit rect check
+            # against attack.get_collision_rect(), same shape as the
+            # 'ultra_volleyball_attack' branch there, not a continuous
+            # push like 'beam'/'dragon_fist'.
+            if self.player.current_ghost_kamikaze:
+                for ghost in self.player.current_ghost_kamikaze.get_homing_ghosts():
+                    if enemy.check_collision_with_attack(ghost, 'ghost_kamikaze_attack'):
+                        ghost.trigger_impact()
+                        self.dmg_numbers.spawn(
+                            enemy.x, enemy.y - enemy.height // 2,
+                            enemy.last_damage_dealt, variant='enemy',
+                        )
+
+            # Big Bang Attack — pierces rather than being consumed on
+            # hit (see BigBangAttackBlast's own docstring), so this is a
+            # continuous per-frame check like 'beam'/'dragon_fist' above,
+            # not a single-hit one like ghost_kamikaze/ultra_volleyball —
+            # nothing here deactivates the blast; it keeps traveling and
+            # can go on to hit something else. An enemy's own
+            # take_damage() i-frames are what keep this from restacking
+            # damage every frame of overlap. Iterates self.big_bang_attacks
+            # directly rather than self.projectiles, since it's kept in
+            # its own list for exactly this reason (see where it's
+            # appended in the KEYUP handler).
+            for blast in self.big_bang_attacks:
+                if blast.active and enemy.check_collision_with_attack(blast, 'big_bang_attack'):
+                    self.dmg_numbers.spawn(
+                        enemy.x, enemy.y - enemy.height // 2,
+                        enemy.last_damage_dealt, variant='enemy',
+                    )
+
+            # Energy sword spin — omnidirectional hitbox around the player,
+            # persists across many frames like the beam does above, so
+            # per-enemy hit ticking is gated by the effect itself
+            # (can_hit/register_hit) rather than re-damaging every frame.
+            # NOTE: requires a 'sword' branch in enemy.check_collision_with_attack
+            # — see the energy_sword.py delivery notes.
+            if self.player.energy_sword_spin:
+                sword = self.player.energy_sword_spin
+                if sword.can_hit(enemy) and enemy.check_collision_with_attack(sword, 'sword'):
+                    sword.register_hit(enemy)
+                    self._play_melee_hit_sfx()
+                    self._play_impact_sfx()
+                    self.dmg_numbers.spawn(
+                        enemy.x, enemy.y - enemy.height // 2,
+                        enemy.last_damage_dealt, variant='enemy',
+                    )
+
+            # Zeni drop — enemy.zeni_drop is rolled once in Enemy.take_damage()
+            # at the moment the killing blow lands (see its init comment in
+            # enemy.py), so pickups pop out immediately rather than waiting
+            # for the death animation to finish. Consumed and cleared here
+            # the same frame it's set; spawns world pickups (see ZeniPickup)
+            # that hop away from the player, instead of crediting the player
+            # straight away — collection happens in _update_zeni_pickups.
+            if enemy.zeni_drop:
+                from core.zeni_system import spawn_zeni_pickups
+                _dx = enemy.x - self.player.x
+                _dy = enemy.y - self.player.y
+                _dist = math.hypot(_dx, _dy)
+                _direction = (_dx / _dist, _dy / _dist) if _dist > 0 else (1.0, 0.0)
+                self.zeni_pickups.extend(
+                    spawn_zeni_pickups(enemy.zeni_drop, enemy.x, enemy.y, _direction))
+                enemy.zeni_drop = None
+
             if not enemy.active:
                 defeated   += 1
                 xp_reward   = enemy.get_xp_reward(self.game_config)
                 self.player.gain_exp(xp_reward, self.game_config)
 
-                if self.player.pending_level_up:
-                    self.level_up_notification.show(self.player.level, self.player.stat_points)
-                    self.player.pending_level_up = False
+                self._show_level_up_if_pending()
 
                 # Notify the mission manager of the kill with enemy type and room.
                 enemy_id  = getattr(enemy, 'enemy_type', getattr(enemy, 'boss_id', ''))
                 room_name = self.current_room.name if self.current_room else ''
                 self.mission_manager.on_enemy_killed(enemy_id, room_name)
+                self.flag_manager.mark_enemy_defeated(enemy_id)
 
                 self.enemies.remove(enemy)
 
@@ -4367,6 +6901,74 @@ class Game:
             if not bomb.active:
                 self.bombs.remove(bomb)
 
+    def _zeni_cull_rect(self):
+        """(left, top, right, bottom) world-space rect the camera can
+        currently see, padded by _zeni_cull_margin. Shared by the draw-time
+        visibility filter and _update_zeni_pickups' cheap off-screen path
+        below, so the two can never disagree about what's "on screen"."""
+        _zeni_cull_margin = 100
+        cam_left   = self.camera.x / RENDER_SCALE - _zeni_cull_margin
+        cam_top    = self.camera.y / RENDER_SCALE - _zeni_cull_margin
+        cam_right  = (self.camera.x + self.camera.screen_width)  / RENDER_SCALE + _zeni_cull_margin
+        cam_bottom = (self.camera.y + self.camera.screen_height) / RENDER_SCALE + _zeni_cull_margin
+        return cam_left, cam_top, cam_right, cam_bottom
+
+    def _update_zeni_pickups(self, dt):
+        # A big pile is almost entirely coins sitting off-screen — either
+        # already settled there, or still "flying" but scattered far off
+        # camera from the moment they spawn (see spawn_zeni_pickups' spread,
+        # which grows with drop size). Neither case needs the real update():
+        # they can't be collected (the player has to be near the camera)
+        # and aren't drawn (see the cull filter in the draw pass), so all
+        # that matters is aging them correctly. Routing both off-screen
+        # cases through the cheap paths below — instead of the full
+        # update(), which does the same trig/collision work whether or not
+        # anyone can see it — is what fixes the FPS hit both once a pile
+        # has settled AND while it's still landing. See ZeniPickup.age_only
+        # and .fast_forward_offscreen for what each skips.
+        cam_left, cam_top, cam_right, cam_bottom = self._zeni_cull_rect()
+
+        still_active = []
+        for pickup in self.zeni_pickups:
+            offscreen = not (cam_left <= pickup.x <= cam_right
+                              and cam_top <= pickup.y <= cam_bottom)
+            if offscreen and pickup.is_settled:
+                pickup.age_only(dt)
+            elif offscreen:
+                pickup.fast_forward_offscreen(dt)
+            else:
+                pickup.update(dt, self.player)
+                if pickup.collected:
+                    self.player.zeni = getattr(self.player, 'zeni', 0) + pickup.value
+                    self.sound_manager.play_sfx('zeni')
+            if pickup.active:
+                still_active.append(pickup)
+        self.zeni_pickups = still_active
+
+    def _update_masenko_projectiles(self, dt):
+        """Tick in-flight masenko balls thrown by the player. On detonation,
+        apply AoE damage to enemies via enemy.check_collision_with_attack's
+        'masenko' branch (a radius check against EXPLOSION_RADIUS, separate
+        from the rect-based melee/projectile/beam branches), then hand the
+        visual explosion off to the shared self.explosions list.
+        """
+        for proj in self.masenko_projectiles[:]:
+            proj.update(dt)
+
+            if proj.pending_explosion is not None:
+                for enemy in self.enemies:
+                    if enemy.active and enemy.check_collision_with_attack(proj, 'masenko'):
+                        self.dmg_numbers.spawn(
+                            enemy.x, enemy.y - enemy.height // 2,
+                            enemy.last_damage_dealt, variant='enemy',
+                        )
+                if proj.pending_explosion not in self.explosions:
+                    self.explosions.append(proj.pending_explosion)
+                proj.pending_explosion = None
+
+            if not proj.active:
+                self.masenko_projectiles.remove(proj)
+
     def _update_enemy_bullets(self, dt):
         """Tick all Gunner bullets, check player collision, and prune spent ones."""
         for bullet in self.enemy_bullets[:]:
@@ -4384,7 +6986,8 @@ class Game:
                     dx, dy = bullet.dx, bullet.dy
 
                 self.player.take_damage(bullet.damage, dx, dy)
-                self.player.hurt_tint = 1.0
+                if not self.player.is_blocking:
+                    self.player.hurt_tint = 1.0
                 bullet.active         = False
                 self._play_impact_sfx()
                 self.dmg_numbers.spawn(
@@ -4401,7 +7004,8 @@ class Game:
             rocket.update(self.current_room.width, self.current_room.height, dt)
 
             if rocket.check_collision_with_player(self.player):
-                self.player.hurt_tint = 1.0
+                if not self.player.is_blocking:
+                    self.player.hurt_tint = 1.0
 
             if not rocket.active:
                 self.enemy_rockets.remove(rocket)
@@ -4424,7 +7028,8 @@ class Game:
                         dx /= dist
                         dy /= dist
                     self.player.take_damage(damage, dx, dy)
-                    self.player.hurt_tint = 1.0
+                    if not self.player.is_blocking:
+                        self.player.hurt_tint = 1.0
                     blast.active = False
                     self._play_impact_sfx()
                     self.dmg_numbers.spawn(
@@ -4462,6 +7067,20 @@ class Game:
 
         return f"npc_{npc_id}{suffix}"
 
+    def _freeze_actor_to_idle(self, actor):
+        """Snap a moving enemy/NPC to its idle animation while its AI
+        update is being skipped (dialogue box or choice menu on screen) —
+        mirrors how the player itself is snapped to idle when dialogue
+        takes over (see _handle_dialogue_box_action). Uses getattr/hasattr
+        throughout since not every actor necessarily exposes these, and
+        this runs every frame the freeze is in effect so it must be a
+        harmless no-op once already idle."""
+        if getattr(actor, 'current_animation_state', None) in ('walk', 'run') \
+                and hasattr(actor, 'enter_idle'):
+            actor.enter_idle()
+        if hasattr(actor, 'is_running'):
+            actor.is_running = False
+
     def _update_npcs(self, dt):
         """Tick all NPCs and record whichever one is currently in interaction range."""
         self.nearby_npc = None
@@ -4470,6 +7089,18 @@ class Game:
             # Only update nearby_npc once — first in-range NPC wins.
             if self.nearby_npc is None and npc.can_interact(self.player):
                 self.nearby_npc = npc
+
+    def _update_critters(self, dt):
+        """Tick all ambient wildlife (squirrels, birds, butterflies...).
+
+        No player argument, no nearby-interaction bookkeeping — critters
+        never react to the player, so there's nothing to track here beyond
+        advancing each one's own wander/animation state.
+        """
+        for critter in self.critters:
+            if not critter.active:
+                continue
+            critter.update(dt, self.current_room.width, self.current_room.height)
 
     def _update_save_points(self, dt):
         """Tick save points and record whichever one the player is standing near."""
@@ -4500,6 +7131,7 @@ class Game:
             if not obj.active:
                 continue
 
+            in_range = False
             if obj.variant == 'world_map':
                 # Flat map: player walks onto it — overlap test.
                 obj_rect = _pg.Rect(
@@ -4508,28 +7140,157 @@ class Game:
                     obj.width,
                     obj.height,
                 )
-                if player_rect.colliderect(obj_rect):
-                    self.nearby_world_map_obj = obj
-                    break
+                in_range = player_rect.colliderect(obj_rect)
 
             elif obj.variant == 'world_map_sign':
                 # Sign: proximity radius, same pattern as NPCs.
                 dx = self.player.x - obj.x
                 dy = self.player.y - obj.y
-                if (dx * dx + dy * dy) <= _SIGN_INTERACT_RADIUS ** 2:
-                    self.nearby_world_map_obj = obj
-                    break
+                in_range = (dx * dx + dy * dy) <= _SIGN_INTERACT_RADIUS ** 2
+
+            if not in_range:
+                continue
+
+            if not getattr(obj, 'map_name', ''):
+                # Object editor now blocks placing these without a map
+                # selected (see ObjectEditor._is_object_disabled), but a
+                # room saved before that check can still have one lying
+                # around. Interacting with it would silently no-op — the
+                # Mode7 loader falls back to a placeholder PNG and
+                # _apply_world_map_music() bails on the empty name with no
+                # visible symptom beyond "nothing happens". Surface it
+                # instead of pretending this is a working travel point.
+                if not getattr(self, '_warned_empty_wmo_ids', None):
+                    self._warned_empty_wmo_ids = set()
+                obj_key = id(obj)
+                if obj_key not in self._warned_empty_wmo_ids:
+                    self._warned_empty_wmo_ids.add(obj_key)
+                    print(f"[world_map] WorldMapObject at ({obj.x}, {obj.y}) in "
+                          f"'{self.current_room.name if self.current_room else '?'}' has no "
+                          f"map_name set — re-open it in the Object Editor and pick a map.")
+                continue
+
+            self.nearby_world_map_obj = obj
+            break
 
     def _update_stones(self, dt):
-        """Tick destructible stones, check melee hits, and remove anything destroyed."""
+        """Tick destructible stones, check melee/projectile hits, and remove
+        anything destroyed."""
         for stone in self.destructible_stones[:]:
             stone.update(dt)
             for melee in self.melee_attacks:
                 if melee.active and stone.check_collision_with_attack(melee, 'melee'):
                     melee.hit_something = True
                     self._play_melee_hit_sfx()
+            for projectile in self.projectiles:
+                if not projectile.active:
+                    continue
+                collision_type = 'genkidama' if isinstance(projectile, GenkidamaBlast) else 'projectile'
+                if stone.check_collision_with_attack(projectile, collision_type):
+                    projectile.active = False
+                    if isinstance(projectile, GenkidamaBlast):
+                        self._trigger_genkidama_hit(projectile.x, projectile.y)
             if not stone.active:
                 self.destructible_stones.remove(stone)
+
+    def _trigger_genkidama_hit(self, x, y):
+        """Spawn the hit-flash effect and kick off the screen white-flash
+        when a GenkidamaBlast connects with an enemy or destructible object."""
+        self.genkidama_hit_effects.append(GenkidamaHitEffect(x, y))
+        self._white_flash_timer = self._WHITE_FLASH_DURATION
+
+    def _trigger_burning_hit(self, x, y):
+        """Spawn the impact effect when a BurningAttack connects with an
+        enemy. No screen white-flash/hitstop here — that's a genkidama-only
+        beat; the burning attack's payoff is the stun, not a freeze."""
+        self.burning_hit_effects.append(BurningHitEffect(x, y))
+
+    def _update_instant_transmission(self, dt):
+        """Drive Instant Transmission while the world is frozen for target
+        aiming (holding the button, moving the cursor, picking targets).
+
+        player.update() runs here so the player keeps animating/holding
+        their pose while everything else (enemies, NPCs, projectiles, etc.)
+        holds completely still. Once the button is released and the actual
+        teleport hops begin, this function is no longer used — the world
+        resumes normally and the hop sequence is advanced from the regular
+        per-frame update path instead (see update()).
+        """
+        self.player.update(dt)
+
+        # Keep the camera following the player while aiming — same call
+        # used during normal gameplay.
+        if not self.active_cutscene_runtime:
+            self.camera.update(self.player, self.current_room.width, self.current_room.height, dt)
+
+        if self.player.is_targeting_it and self.it_selector is not None:
+            self.it_selector.update(dt)
+
+            keys = pygame.key.get_pressed()
+            dx = dy = 0
+            if keys[pygame.K_LEFT] and not keys[pygame.K_RIGHT]:
+                dx = -1
+            elif keys[pygame.K_RIGHT] and not keys[pygame.K_LEFT]:
+                dx = 1
+            if keys[pygame.K_UP] and not keys[pygame.K_DOWN]:
+                dy = -1
+            elif keys[pygame.K_DOWN] and not keys[pygame.K_UP]:
+                dy = 1
+            if dx or dy:
+                self.it_selector.move(dx, dy, dt)
+
+            # Hover-select — mark any enemy the cursor is currently over.
+            # Each enemy can only be picked once per charge (try_select
+            # handles that internally).
+            for enemy in self.enemies:
+                if not getattr(enemy, 'active', True):
+                    continue
+                enemy_w = getattr(enemy, 'width', 32)
+                enemy_h = getattr(enemy, 'height', 32)
+                screen_x = (enemy.x * RENDER_SCALE) - self.camera.x
+                screen_y = (enemy.y * RENDER_SCALE) - self.camera.y
+                enemy_rect = pygame.Rect(
+                    screen_x - (enemy_w * RENDER_SCALE) / 2,
+                    screen_y - (enemy_h * RENDER_SCALE) / 2,
+                    enemy_w * RENDER_SCALE,
+                    enemy_h * RENDER_SCALE,
+                )
+                self.it_selector.try_select(enemy, enemy_rect)
+
+    def _apply_instant_transmission_damage(self, enemy):
+        """Deal the Instant Transmission teleport-strike's damage to `enemy`.
+
+        NOTE: this relies on Enemy.check_collision_with_attack supporting
+        an 'instant_transmission' attack_type branch — add one there
+        (mirroring how destructible stones got a 'genkidama' branch) if
+        it doesn't already exist; without it, this safely does nothing
+        rather than crashing.
+        """
+        if not getattr(enemy, 'active', True):
+            return
+        strike = InstantTransmissionStrike(enemy.x, enemy.y)
+        if enemy.check_collision_with_attack(strike, 'instant_transmission'):
+            self.dmg_numbers.spawn(
+                enemy.x, enemy.y - enemy.height // 2,
+                enemy.last_damage_dealt, variant='enemy',
+            )
+
+    def _update_ghost_kamikaze(self, dt):
+        """Tick the player's active GhostKamikazeAttack, if any, with the
+        room's current enemy list — needed only at the moment its hold
+        phase resolves (see GhostKamikazeAttack._resolve()/_pick_target()).
+        Drops the reference once the attack finishes (all 3 ghosts done
+        with their destruction animation), mirroring how Player itself
+        clears current_beam/current_dragon_fist/etc. once .active goes
+        False, just centralized here since this object needs an
+        enemies argument Player.update() doesn't pass through.
+        """
+        ghost_kamikaze = self.player.current_ghost_kamikaze
+        if ghost_kamikaze is None:
+            return
+        ghost_kamikaze.update(dt, self.enemies)
+        if not ghost_kamikaze.active:
+            self.player.current_ghost_kamikaze = None
 
     def _update_gates(self, dt):
         """Tick level gates, enforce level requirements, check attack hits, and remove destroyed ones."""
@@ -4564,8 +7325,59 @@ class Game:
                             beam._hit_gates = set()
                         beam._hit_gates.add(gate)
 
+            if self.player.current_kamekameha:
+                kamekameha = self.player.current_kamekameha
+                if gate not in getattr(kamekameha, '_hit_gates', set()):
+                    if gate.check_collision_with_attack(kamekameha, 'beam', self.player):
+                        if not hasattr(kamekameha, '_hit_gates'):
+                            kamekameha._hit_gates = set()
+                        kamekameha._hit_gates.add(gate)
+
+            if self.player.current_banshee_blast:
+                banshee_blast = self.player.current_banshee_blast
+                if gate not in getattr(banshee_blast, '_hit_gates', set()):
+                    if gate.check_collision_with_attack(banshee_blast, 'beam', self.player):
+                        if not hasattr(banshee_blast, '_hit_gates'):
+                            banshee_blast._hit_gates = set()
+                        banshee_blast._hit_gates.add(gate)
+
+            if self.player.current_final_flash:
+                final_flash = self.player.current_final_flash
+                if gate not in getattr(final_flash, '_hit_gates', set()):
+                    if gate.check_collision_with_attack(final_flash, 'beam', self.player):
+                        if not hasattr(final_flash, '_hit_gates'):
+                            final_flash._hit_gates = set()
+                        final_flash._hit_gates.add(gate)
+
+            if self.player.current_big_bang_kamehameha:
+                big_bang_kamehameha = self.player.current_big_bang_kamehameha
+                if gate not in getattr(big_bang_kamehameha, '_hit_gates', set()):
+                    if gate.check_collision_with_attack(big_bang_kamehameha, 'beam', self.player):
+                        if not hasattr(big_bang_kamehameha, '_hit_gates'):
+                            big_bang_kamehameha._hit_gates = set()
+                        big_bang_kamehameha._hit_gates.add(gate)
+
+            # See the matching NOTE in _update_enemies — 'flame_kamehameha'
+            # is its own collision type, needs a branch added in
+            # LevelGate.check_collision_with_attack to actually connect.
+            if self.player.current_flame_kamehameha:
+                flame = self.player.current_flame_kamehameha
+                if gate not in getattr(flame, '_hit_gates', set()):
+                    if gate.check_collision_with_attack(flame, 'flame_kamehameha', self.player):
+                        if not hasattr(flame, '_hit_gates'):
+                            flame._hit_gates = set()
+                        flame._hit_gates.add(gate)
+
             if not gate.active:
                 self.level_gates.remove(gate)
+
+    def _update_doors(self, dt):
+        """Tick doors — open on player proximity and play that door's sound;
+        non-permanent doors then stay open until the player leaves the room
+        (see _load_room_objects/_load_room_objects_as_copies, which close
+        them out on the way to the next room)."""
+        for door in self.doors:
+            door.update(self.player, self.sound_manager)
 
     # ── Draw ──────────────────────────────────────────────────────────────────
 
@@ -4693,18 +7505,84 @@ class Game:
         # its own actor layer separately).
         if not self.active_cutscene_runtime:
             self.layer_manager.clear()
-            # During landing_fade_in the landing animation replaces the normal
-            # player sprite — omit the player here so only one sprite is visible.
-            _player_objs = [] if self._mjf_state == 'landing_fade_in' else [self.player]
-            for obj in (self.projectiles + _player_objs + self.enemies + self.npcs
-                        + self.destructible_stones + self.level_gates
-                        + self.bombs + self.explosions + self.flying_pads
-                        + self.save_points + self.world_map_objects):
+            # During landing_fade_in (world-map descent) or the level-up
+            # animation phase, a special animation replaces the normal
+            # player sprite. For landing, no sprite goes into the layered
+            # list at all (it's drawn separately below, same as before).
+            # For level-up, _levelup_drawable takes the player's spot in
+            # the layered list — same draw_layer/sort_key as the player —
+            # so it still y-sorts correctly against NPCs/enemies/tiles
+            # instead of always drawing on top of them.
+            if self._mjf_state == 'landing_fade_in':
+                _player_objs = []
+            elif self._levelup_state == 'playing_anim':
+                _player_objs = [self._levelup_drawable]
+            else:
+                _player_objs = [self.player]
+            # Cull zeni pickups outside the camera viewport — a pile can be in
+            # the thousands, and each on-screen one costs blit/set_alpha
+            # calls, so skipping the off-screen ones is a real win.
+            # Same rect _update_zeni_pickups uses for its own off-screen
+            # fast path, so draw and update always agree on what's visible.
+            _cam_left, _cam_top, _cam_right, _cam_bottom = self._zeni_cull_rect()
+            _visible_zeni_pickups = [
+                p for p in self.zeni_pickups
+                if _cam_left <= p.x <= _cam_right and _cam_top <= p.y <= _cam_bottom
+            ]
+
+            for obj in (self.projectiles + self.ultra_volleyballs + _player_objs + self.enemies + self.npcs
+                        + self.critters
+                        + self.destructible_stones + self.level_gates + self.doors
+                        + self.bombs + self.explosions + self.genkidama_hit_effects
+                        + self.burning_hit_effects + self.flying_pads
+                        + self.save_points + self.world_map_objects
+                        + self.masenko_projectiles + _visible_zeni_pickups
+                        + self.big_bang_attacks + self.big_bang_destruction_effects):
                 self.layer_manager.add_object(obj)
             for melee in self.melee_attacks:
                 self.layer_manager.add_object(melee)
             if self.player.current_beam:
                 self.layer_manager.add_object(self.player.current_beam)
+            if self.player.current_charge_effect:
+                self.layer_manager.add_object(self.player.current_charge_effect)
+            if self.player.current_kamekameha:
+                self.layer_manager.add_object(self.player.current_kamekameha)
+            if self.player.current_kamekameha_charge_effect:
+                self.layer_manager.add_object(self.player.current_kamekameha_charge_effect)
+            if self.player.current_banshee_blast:
+                self.layer_manager.add_object(self.player.current_banshee_blast)
+            if self.player.current_banshee_blast_charge_effect:
+                self.layer_manager.add_object(self.player.current_banshee_blast_charge_effect)
+            if self.player.current_final_flash:
+                self.layer_manager.add_object(self.player.current_final_flash)
+            if self.player.current_big_bang_kamehameha:
+                self.layer_manager.add_object(self.player.current_big_bang_kamehameha)
+            if self.player.current_big_bang_kamehameha_charge_effect:
+                self.layer_manager.add_object(self.player.current_big_bang_kamehameha_charge_effect)
+            if self.player.current_flame_kamehameha:
+                self.layer_manager.add_object(self.player.current_flame_kamehameha)
+            if self.player.current_flame_kamehameha_charge_effect:
+                self.layer_manager.add_object(self.player.current_flame_kamehameha_charge_effect)
+            if self.player.current_final_flash_charge_effect:
+                self.layer_manager.add_object(self.player.current_final_flash_charge_effect)
+            if self.player.genkidama_charge_effect:
+                self.layer_manager.add_object(self.player.genkidama_charge_effect)
+            if self.player.current_big_bang_charge:
+                self.layer_manager.add_object(self.player.current_big_bang_charge)
+            if self.player.masenko_indicator:
+                self.layer_manager.add_object(self.player.masenko_indicator)
+            if self.player.masenko_hold_effect:
+                self.layer_manager.add_object(self.player.masenko_hold_effect)
+            if self.player.burning_charge_effect:
+                self.layer_manager.add_object(self.player.burning_charge_effect)
+            if self.player.current_sword_charge_effect:
+                self.layer_manager.add_object(self.player.current_sword_charge_effect)
+            if self.player.energy_sword_spin:
+                self.layer_manager.add_object(self.player.energy_sword_spin)
+            if self.player.current_dragon_fist:
+                self.layer_manager.add_object(self.player.current_dragon_fist)
+            if self.player.current_ghost_kamikaze:
+                self.layer_manager.add_object(self.player.current_ghost_kamikaze)
 
             # Enemy bullets, rockets, and ki-blasts are not y-sorted — draw them directly.
             for bullet in self.enemy_bullets:
@@ -4730,8 +7608,25 @@ class Game:
         # foreground tiles (trees, buildings, tile.layer >= 0) correctly occlude actors
         # standing behind them, matching the layering seen in the cutscene editor.
         elif self.active_cutscene_runtime and not self.pause_menu.active:
-            _cs_colors = {'WHITE': (255, 255, 255), 'RED': (220, 60, 60)}
+            _cs_colors = {
+                'WHITE': (255, 255, 255), 'RED': (220, 60, 60),
+                'CYAN': (80, 220, 220), 'YELLOW': (255, 220, 80),
+            }
             self.active_cutscene_runtime.draw_actors(self.logical_surface, self.camera, _cs_colors)
+
+            # Scripted attacks spawned via _cutscene_spawn_attack (kiblast/
+            # melee/firebeam) live in the same lists the normal gameplay
+            # loop uses (self.projectiles, self.melee_attacks,
+            # self.cutscene_beams), but the layer_manager pass above is
+            # skipped entirely during cutscenes — without drawing them here
+            # too they'd update/collide invisibly. Drawn directly (no
+            # y-sort) same as enemy_bullets/rockets/kiblasts above.
+            for projectile in self.projectiles:
+                projectile.draw(self.logical_surface, self.camera, self.colors)
+            for melee in self.melee_attacks:
+                melee.draw(self.logical_surface, self.camera, self.colors)
+            for beam in self.cutscene_beams:
+                beam.draw(self.logical_surface, self.camera, self.colors)
 
         # Flying pad path previews — editor-only overlay drawn after the layer pass.
         if self.dev_menu.active or self.room_editor.active:
@@ -4762,16 +7657,23 @@ class Game:
         if self.active_cutscene_runtime and not self.pause_menu.active:
             w, h = self.logical_surface.get_size()
             self.active_cutscene_runtime.draw_weather(self.logical_surface, w, h)
+        elif self.room_weather is not None and not self.pause_menu.active:
+            w, h = self.logical_surface.get_size()
+            self.room_weather.draw(self.logical_surface, w, h)
 
-        if not self.dev_menu.active:
-            self._draw_ui(self.dt)
-
-        # Cutscene colour/invert overlay — must sit on top of everything (tiles, actors,
-        # weather, dialogue) so fades and flash effects cover the full screen.
-        # draw_actors() was already called before the foreground tile layer above.
+        # Cutscene colour/invert overlay (screen fades, flash, invert) is drawn
+        # BEFORE the UI layer (dialogue box, HUD, menus) so a fade_in/fade_out/
+        # flash/invert never hides an open dialogue box — the dialogue reads on
+        # top of the fade instead of disappearing underneath it. It still sits
+        # above the world, actors, and weather, all of which were already drawn
+        # above (draw_actors() was already called before the foreground tile
+        # layer above).
         if self.active_cutscene_runtime and not self.pause_menu.active:
             w, h = self.logical_surface.get_size()
             self.active_cutscene_runtime.draw_overlay(self.logical_surface, w, h)
+
+        if not self.dev_menu.active:
+            self._draw_ui(self.dt)
 
         # Dev tools — always drawn last so they sit on top of everything.
         self.sprite_editor.draw(self.logical_surface)
@@ -4794,6 +7696,76 @@ class Game:
         # With pygame.SCALED the display handles window-resize scaling in hardware —
         # just flip; no manual surface scale needed.
         pygame.display.flip()
+
+    def _get_timer_glyphs(self):
+        """Lazy-load the event timer's bitmap font from assets/ui/fonts/timer,
+        same convention as pause_menu.py's FlatBitmapFont: skip any glyph
+        file that isn't present rather than raising."""
+        if not hasattr(self, '_timer_glyphs'):
+            import os
+            self._timer_glyphs = {}
+            folder = os.path.join('assets', 'ui', 'fonts', 'timer')
+            names = {'0': '0.png', '1': '1.png', '2': '2.png', '3': '3.png',
+                      '4': '4.png', '5': '5.png', '6': '6.png', '7': '7.png',
+                      '8': '8.png', '9': '9.png', ':': 'colon.png'}
+            for ch, fname in names.items():
+                path = os.path.join(folder, fname)
+                if not os.path.exists(path):
+                    continue
+                try:
+                    self._timer_glyphs[ch] = pygame.image.load(path).convert_alpha()
+                except Exception as e:
+                    print(f"_get_timer_glyphs: could not load {path}: {e}")
+        return self._timer_glyphs
+
+    def _render_timer_text(self, text, color):
+        """Compose `text` edge-to-edge from the timer bitmap font, tinted to
+        `color` via BLEND_RGBA_MULT (matches pause_menu.py's _tint/_shadow
+        convention) — outline stays black since black * anything = black."""
+        glyphs = self._get_timer_glyphs()
+        surfs = [glyphs[ch].copy() for ch in text if ch in glyphs]
+        for s in surfs:
+            s.fill(color, special_flags=pygame.BLEND_RGBA_MULT)
+        w = sum(s.get_width() for s in surfs)
+        h = max((s.get_height() for s in surfs), default=0)
+        out = pygame.Surface((max(w, 1), max(h, 1)), pygame.SRCALPHA)
+        x = 0
+        for s in surfs:
+            out.blit(s, (x, 0))
+            x += s.get_width()
+        return out
+
+    def _draw_event_timer(self, screen):
+        """Top-right HUD readout for the active event timer (timer_start/
+        timer_pause/timer_stop actions). Uses the individual-file pixel
+        font in assets/ui/fonts/timer, rendered in yellow with a black
+        outline for readability, formatted as seconds:milliseconds."""
+        timer = self.timers.get(self._active_timer_id) if self._active_timer_id else None
+        if not timer or timer['remaining'] <= 0:
+            return
+
+        total = timer['remaining']
+        secs  = int(total)
+        ms    = int(round((total - secs) * 1000))
+        if ms >= 1000:
+            ms = 999
+        hundredths = min(ms // 10, 99)
+        text = f"{secs}:{hundredths:02d}"
+
+        scale = 1.5 * RENDER_SCALE
+        pad   = int(10 * RENDER_SCALE)
+        tx    = SCREEN_WIDTH - pad
+        ty    = pad
+
+        outline = self._render_timer_text(text, (0, 0, 0))
+        outline = pygame.transform.scale(
+            outline, (int(outline.get_width() * scale), int(outline.get_height() * scale)))
+        screen.blit(outline, outline.get_rect(topright=(tx + 2, ty + 2)))
+
+        label = self._render_timer_text(text, self.colors['YELLOW'])
+        label = pygame.transform.scale(
+            label, (int(label.get_width() * scale), int(label.get_height() * scale)))
+        screen.blit(label, label.get_rect(topright=(tx, ty)))
 
     def _get_font(self, size: int) -> pygame.font.Font:
         """Cached font lookup — avoids allocating a new Font object every frame."""
@@ -4839,10 +7811,13 @@ class Game:
             return
         if None in self._dirty_tile_rooms:
             self._room_tile_surfaces.clear()
+            self._animated_tile_lists.clear()
         else:
             for room in self._dirty_tile_rooms:
                 self._room_tile_surfaces.pop((room, True),  None)
                 self._room_tile_surfaces.pop((room, False), None)
+                self._animated_tile_lists.pop((room, True),  None)
+                self._animated_tile_lists.pop((room, False), None)
         self._dirty_tile_rooms.clear()
 
     def _build_room_tile_surface(self, room_name: str, bg: bool) -> pygame.Surface:
@@ -4886,6 +7861,7 @@ class Game:
         )
 
         tileset_mgr = te.tileset_manager
+        animated_tiles = []
         for tile in sorted(tiles, key=lambda t: t.layer):
             # When the editor's "Hide other layers" mode is on, only bake tiles
             # that belong to the layer currently being edited.
@@ -4898,11 +7874,692 @@ class Game:
             tileset = tileset_mgr.get_tileset(tile.tileset_name)
             if not tileset or not tileset.image:
                 continue
+
+            # Animated tiles are excluded from the static bake — they're drawn
+            # fresh every frame by _draw_animated_tile_overlay() instead, since
+            # a static surface can't show a cycling frame.
+            if tileset.is_tile_animated(tile.tile_x, tile.tile_y):
+                animated_tiles.append(tile)
+                continue
+
             scaled = tileset.get_scaled_tile_surface(tile.tile_x, tile.tile_y, RENDER_SCALE)
             if scaled:
                 surf.blit(scaled, (int(tile.x * RENDER_SCALE), int(tile.y * RENDER_SCALE)))
 
+        self._animated_tile_lists[(room_name, bg)] = animated_tiles
         return surf
+
+    def _draw_animated_tile_overlay(self, target_surface: 'pygame.Surface', room_name: str,
+                                     bg: bool, camera_x: int, camera_y: int):
+        """Blit the small set of animated tiles (water, flags, rotors, etc.) on top
+        of the baked static surface for this room/layer.
+
+        Kept separate from the baked surface because those tiles cycle frames
+        every tick and can't be pre-rendered once. Cost stays O(animated tiles)
+        regardless of total room tile count, since everything static is still
+        a single cached blit.
+        """
+        animated_tiles = self._animated_tile_lists.get((room_name, bg))
+        if not animated_tiles:
+            return
+
+        te = getattr(self.room_editor, 'tileset_editor', None)
+        if not te:
+            return
+
+        tick_ms = pygame.time.get_ticks()
+        tileset_mgr = te.tileset_manager
+
+        for tile in animated_tiles:
+            tileset = tileset_mgr.get_tileset(tile.tileset_name)
+            if not tileset or not tileset.image:
+                continue
+
+            screen_x = (tile.x * RENDER_SCALE) - camera_x
+            screen_y = (tile.y * RENDER_SCALE) - camera_y
+
+            scaled_width = tileset.tile_width * RENDER_SCALE
+            scaled_height = tileset.tile_height * RENDER_SCALE
+            sw, sh = target_surface.get_size()
+            if not (-scaled_width <= screen_x <= sw and -scaled_height <= screen_y <= sh):
+                continue
+
+            disp_x, disp_y = tileset.get_animated_coords(tile.tile_x, tile.tile_y, tick_ms)
+            scaled = tileset.get_scaled_tile_surface(disp_x, disp_y, RENDER_SCALE)
+            if scaled:
+                target_surface.blit(scaled, (int(screen_x), int(screen_y)))
+
+    def _load_region_sheet(self, sprite_name: str, frame_size: int, grid_rows: int = 1, frame_h: int = None):
+        """Load (and cache) the frame strip/grid a water/grass/dirt region
+        draws from.
+
+        Authored in the standalone Sprite Editor as a single PNG at
+        assets/tilesets/animated_tiles/<sprite_name>.png: frame_size wide x
+        frame_h tall cells, `grid_rows` rows tall (default 1 — a plain
+        left-to-right strip, frame count = sheet width // frame_size),
+        columns = sheet width // frame_size either way. Returned as a flat
+        list in row-major order (row 0's cols left-to-right, then row 1's,
+        ...), same as every other animation in the codebase reads a frame
+        strip when grid_rows=1.
+
+        `frame_h` defaults to `frame_size` (a square frame) when omitted,
+        which is every 'patch'-mode sheet: water/lava/grass all use
+        frame_size=64, grid_rows=1 — each frame is itself a grid of
+        sub-patches (8x8 patches of 8px for water/lava, 4x4 patches of 16px
+        for grass), and the runtime crops the patch at
+        (world_x % 64, world_y % 64) out of whichever frame is playing.
+
+        Dirt (mode='tile') is the one sheet that passes `frame_h`
+        explicitly (even though its 24x24 frames are square in this case,
+        the two are conceptually independent for 'tile' sheets), and
+        it's a vertical strip (grid_rows=4, one variant per row) instead
+        of the horizontal strips every 'patch' sheet uses. `grid_rows` > 1
+        is otherwise only relevant to the retired 'checkerboard' mode (see
+        REGION_STYLES and _draw_animated_regions_overlay).
+
+        Frames are pre-scaled to RENDER_SCALE once here so the per-chunk draw
+        loop is a plain blit with no repeated scaling cost. Falls back to a
+        single solid-color frame_size x frame_h frame if the file is
+        missing, so a missing/renamed asset never crashes the game.
+        """
+        frame_h = frame_size if frame_h is None else frame_h
+
+        if not hasattr(self, '_region_sheet_cache'):
+            self._region_sheet_cache = {}
+        cache_key = (sprite_name, frame_size, grid_rows, frame_h)
+        if cache_key in self._region_sheet_cache:
+            return self._region_sheet_cache[cache_key]
+
+        import os
+
+        path = os.path.join('assets', 'tilesets', 'animated_tiles', f'{sprite_name}.png')
+        raw = None
+        if os.path.isfile(path):
+            try:
+                raw = pygame.image.load(path).convert_alpha()
+            except (pygame.error, OSError) as e:
+                print(f'[animated_region] could not load {path}: {e}')
+
+        if raw is None:
+            print(f"[animated_region] sheet not found at {path} — using placeholder")
+            raw = pygame.Surface((frame_size, frame_h * grid_rows), pygame.SRCALPHA)
+            if 'water' in sprite_name:
+                fallback_color = (0, 120, 255, 160)
+            elif 'lava' in sprite_name:
+                fallback_color = (255, 90, 20, 160)
+            elif 'dirt' in sprite_name:
+                fallback_color = (120, 80, 40, 160)
+            else:
+                fallback_color = (60, 170, 40, 160)
+            raw.fill(fallback_color)
+
+        num_cols = max(1, raw.get_width() // frame_size)
+        raw_frames = [
+            raw.subsurface((col * frame_size, row * frame_h, frame_size, frame_h))
+            for row in range(grid_rows)
+            for col in range(num_cols)
+        ]
+
+        if RENDER_SCALE != 1:
+            size = (frame_size * RENDER_SCALE, frame_h * RENDER_SCALE)
+            frames = [pygame.transform.scale(f, size) for f in raw_frames]
+        else:
+            frames = [f.copy() for f in raw_frames]
+
+        self._region_sheet_cache[cache_key] = frames
+        return frames
+
+    def _get_scroll_tiled_frames(self, sprite_name: str, frame_size: int, color: tuple, frames: list,
+                                  key_suffix: str = ''):
+        """For patch-mode sprites with a continuous 'scroll', returns
+        (cached) copies of `frames` tiled 2x2. A scrolling crop window's
+        start position can land anywhere in [0, frame_size) rather than
+        snapping to a chunk boundary, so start + chunk_size can spill past
+        the plain frame's right/bottom edge. Tiling the frame into a
+        (2*frame_size)x(2*frame_size) canvas first means that spill always
+        lands on the tile's own repeated copy instead of empty space —
+        no wraparound math needed at crop time. Cached per
+        (sprite_name, frame_size, color) alongside the tint cache, since
+        it's already scaled-and-tinted `frames` being tiled here."""
+        if not hasattr(self, '_region_scroll_tile_cache'):
+            self._region_scroll_tile_cache = {}
+        key = (sprite_name, frame_size, color, key_suffix)
+        cached = self._region_scroll_tile_cache.get(key)
+        if cached is not None:
+            return cached
+
+        scaled_size = frame_size * RENDER_SCALE
+        tiled = []
+        for f in frames:
+            canvas = pygame.Surface((scaled_size * 2, scaled_size * 2), pygame.SRCALPHA)
+            canvas.blit(f, (0, 0))
+            canvas.blit(f, (scaled_size, 0))
+            canvas.blit(f, (0, scaled_size))
+            canvas.blit(f, (scaled_size, scaled_size))
+            tiled.append(canvas)
+
+        self._region_scroll_tile_cache[key] = tiled
+        return tiled
+
+    def _load_region_plain_frame(self, sprite_name: str, frame_size: int):
+        """Load (and cache) the 'no waves' variant of a patch-mode sheet —
+        drawn for chunks the wave-amount slider has turned off.
+
+        Preferred source: a hand-drawn
+        assets/tilesets/animated_tiles/<sprite_name>_plain.png, same layout
+        as the animated sheet's frame 0 but with no lines/dots. Draw one of
+        these for a clean result.
+
+        Fallback (used automatically if that file doesn't exist): takes
+        frame 0 of the animated sheet and flattens any near-white pixel (the
+        wave lines and foam dots) to a flat sampled base color. This is a
+        threshold heuristic, not real art — anti-aliased edges around the
+        original lines can leave faint fringing. Fine to preview with; swap
+        in real art for a clean final look.
+        """
+        if not hasattr(self, '_region_plain_cache'):
+            self._region_plain_cache = {}
+        cache_key = (sprite_name, frame_size)
+        if cache_key in self._region_plain_cache:
+            return self._region_plain_cache[cache_key]
+
+        import os
+
+        folder = os.path.join('assets', 'tilesets', 'animated_tiles')
+        override_path = os.path.join(folder, f'{sprite_name}_plain.png')
+        # Water's sheet has a second highlight shade (90C8F8) baked in
+        # alongside its wave-line whites — this needs flattening on the
+        # plain frame no matter which source it came from, or wave_amount=0
+        # still shows a ring of lighter blue where the highlight used to be.
+        extra_colors = [(0x90, 0xC8, 0xF8)] if 'water' in sprite_name else None
+        raw = None
+        if os.path.isfile(override_path):
+            try:
+                raw = pygame.image.load(override_path).convert_alpha()
+                if extra_colors:
+                    # threshold=256 disables the near-white pass (nothing can
+                    # exceed 255) — hand-drawn override art is assumed to
+                    # already be clean of wave lines, so only the highlight
+                    # shade gets flattened here.
+                    raw = self._strip_near_white(raw, threshold=256, extra_colors=extra_colors)
+            except (pygame.error, OSError) as e:
+                print(f'[animated_region] could not load {override_path}: {e}')
+
+        if raw is None:
+            sheet_path = os.path.join(folder, f'{sprite_name}.png')
+            source = None
+            if os.path.isfile(sheet_path):
+                try:
+                    source = pygame.image.load(sheet_path).convert_alpha()
+                except (pygame.error, OSError) as e:
+                    print(f'[animated_region] could not load {sheet_path}: {e}')
+
+            if source is None:
+                raw = pygame.Surface((frame_size, frame_size), pygame.SRCALPHA)
+                if 'lava' in sprite_name:
+                    raw.fill((255, 90, 20, 160))
+                else:
+                    raw.fill((0, 120, 255, 160))
+            else:
+                frame0 = source.subsurface((0, 0, frame_size, frame_size)).copy()
+                raw = self._strip_near_white(frame0, extra_colors=extra_colors)
+
+        scaled = raw
+        if RENDER_SCALE != 1:
+            size = (frame_size * RENDER_SCALE, frame_size * RENDER_SCALE)
+            scaled = pygame.transform.scale(raw, size)
+
+        self._region_plain_cache[cache_key] = scaled
+        return scaled
+
+    @staticmethod
+    def _strip_near_white(surface: 'pygame.Surface', threshold: int = 200,
+                           extra_colors: list = None, extra_tolerance: int = 20) -> 'pygame.Surface':
+        """Flattens near-white pixels (wave lines/foam dots) in `surface` to
+        a flat color sampled from the rest of the image. See
+        _load_region_plain_frame for the fringing caveat — this is a
+        stand-in for real art, not a substitute.
+
+        `extra_colors` are additional exact-ish RGB shades to flatten
+        alongside near-white — e.g. water's 90C8F8 highlight, which isn't
+        white enough to trip the near-white threshold on its own but should
+        disappear the same way in the 'no waves' plain frame. A pixel
+        within `extra_tolerance` (per-channel max difference) of any listed
+        color is treated the same as near-white."""
+        import numpy as np
+
+        rgb = pygame.surfarray.array3d(surface)
+        alpha = pygame.surfarray.array_alpha(surface)
+
+        is_white = (rgb[:, :, 0] > threshold) & (rgb[:, :, 1] > threshold) & (rgb[:, :, 2] > threshold)
+
+        is_extra = np.zeros(is_white.shape, dtype=bool)
+        if extra_colors:
+            rgb_int = rgb.astype(np.int16)
+            for color in extra_colors:
+                diff = np.abs(rgb_int - np.array(color, dtype=np.int16))
+                is_extra |= diff.max(axis=2) <= extra_tolerance
+
+        to_flatten = is_white | is_extra
+        opaque = alpha > 10
+        keep_opaque = opaque & ~to_flatten
+
+        if keep_opaque.any():
+            base_color = rgb[keep_opaque].mean(axis=0).astype(np.uint8)
+        else:
+            base_color = np.array([0, 120, 255], dtype=np.uint8)
+
+        result = surface.copy()
+        result_rgb = pygame.surfarray.pixels3d(result)
+        mask = to_flatten & opaque
+        result_rgb[mask] = base_color
+        del result_rgb  # release the surface lock
+        return result
+
+    def _get_tinted_frames(self, sprite_name: str, frame_size: int, color: tuple, frames: list, key_suffix: str = '',
+                            white_threshold: int = 200):
+        """Return (cached) tinted copies of `frames` for a given color.
+
+        Each non-white, opaque pixel keeps the *shape* of its own HSL
+        lightness relative to the sprite's other pixels (so shading/
+        highlight patterns like the water base vs. its 90C8F8 highlight
+        stay visually distinct) but that lightness is scaled by how light
+        or dark the picked `color` itself is, so picking a dark color
+        actually darkens the result instead of just changing hue/
+        saturation while silently keeping the art's original brightness.
+        Hue and saturation are replaced with `color`'s outright — the same
+        technique GIMP's "Colorize" tool uses, extended with this
+        lightness scaling. Lightness (max+min)/2 is used rather than HSV
+        "value" (just max(R,G,B)): this water art uses both 58A8F8 (base)
+        and 90C8F8 (a lighter highlight shade), and those two colors share
+        the same peak blue channel (248), so preserving `max` alone made
+        them collapse onto the identical output color once hue/saturation
+        got replaced — the highlight silently disappeared into the base
+        after tinting. Lightness differs between them (0.66 vs 0.77), so it
+        keeps that highlight detail visible under any tint color.
+
+        This is also deliberately NOT a channel multiply — a multiply only
+        behaves like a clean "colorize" when the base art is grayscale, and
+        this water art's base color is itself a saturated blue, so
+        multiplying it by another hue would just multiply two colors
+        together (e.g. picking red would zero out the G/B channels of an
+        already-blue pixel, giving a dark muddy result instead of clean red
+        water).
+
+        Near-white pixels (foam / wave-line highlights) are left completely
+        untouched, so picking e.g. red only shifts the blueish body of the
+        water and doesn't wash the white foam into the tint color too.
+        Cached per (sprite, frame_size, color) since the same combo repeats
+        across every chunk of every region using it.
+        """
+        if not hasattr(self, '_region_tint_cache'):
+            self._region_tint_cache = {}
+        key = (sprite_name, frame_size, color, key_suffix)
+        cached = self._region_tint_cache.get(key)
+        if cached is not None:
+            return cached
+
+        import colorsys
+        import numpy as np
+
+        hue, target_lightness, sat = colorsys.rgb_to_hls(color[0] / 255.0, color[1] / 255.0, color[2] / 255.0)
+        # 0.5 lightness is "neutral" (a fully-saturated pure hue with no
+        # tint-driven brightening/darkening) — scale each pixel's own
+        # lightness relative to that midpoint so picking a near-black or
+        # near-white swatch pulls the whole sprite darker/lighter, while a
+        # mid-lightness pick like a pure hue reproduces the old
+        # preserve-original-lightness behavior (scale == 1).
+        lightness_scale = target_lightness / 0.5
+
+        def _hls_component(m1, m2, h):
+            """Vectorized version of colorsys._v — m1/m2 are per-pixel
+            arrays, h is a fixed scalar hue offset."""
+            h = h % 1.0
+            if h < 1 / 6:
+                return m1 + (m2 - m1) * h * 6
+            elif h < 0.5:
+                return m2
+            elif h < 2 / 3:
+                return m1 + (m2 - m1) * (2 / 3 - h) * 6
+            return m1
+
+        tinted = []
+        for f in frames:
+            t = f.copy()
+            rgb = pygame.surfarray.pixels3d(t)
+            alpha = pygame.surfarray.array_alpha(t)
+
+            is_white = (rgb[:, :, 0] > white_threshold) & (rgb[:, :, 1] > white_threshold) & (rgb[:, :, 2] > white_threshold)
+            opaque = alpha > 10
+            recolor_mask = opaque & ~is_white
+
+            if recolor_mask.any():
+                px = rgb[recolor_mask].astype(np.float32) / 255.0
+                lightness = (px.max(axis=-1) + px.min(axis=-1)) / 2  # each pixel's own lightness...
+                lightness = np.clip(lightness * lightness_scale, 0.0, 1.0)  # ...scaled toward the picked color's
+
+                if sat == 0.0:
+                    recolored = np.stack([lightness, lightness, lightness], axis=-1)
+                else:
+                    m2 = np.where(lightness <= 0.5, lightness * (1 + sat), lightness + sat - lightness * sat)
+                    m1 = 2 * lightness - m2
+                    r = _hls_component(m1, m2, hue + 1 / 3)
+                    g = _hls_component(m1, m2, hue)
+                    b = _hls_component(m1, m2, hue - 1 / 3)
+                    recolored = np.stack([r, g, b], axis=-1)
+
+                recolored = np.clip(recolored * 255, 0, 255).astype(np.uint8)
+                rgb[recolor_mask] = recolored
+
+            del rgb  # release the surface lock
+            tinted.append(t)
+
+        self._region_tint_cache[key] = tinted
+        return tinted
+
+    @staticmethod
+    def _region_chunk_roll(chunk_col: int, chunk_row: int, seed: int) -> float:
+        """Deterministic pseudo-random value in [0, 100) for a tile grid
+        position + seed. Same seed always reproduces the same wave layout;
+        changing the seed reshuffles which chunks show waves."""
+        n = (chunk_col * 374761393 + chunk_row * 668265263 + seed * 2246822519) & 0xFFFFFFFF
+        n = (n ^ (n >> 13)) * 1274126177 & 0xFFFFFFFF
+        n = n ^ (n >> 16)
+        return (n & 0xFFFFFFFF) / 0xFFFFFFFF * 100
+
+    def _draw_animated_regions_overlay(self, target_surface: 'pygame.Surface', room_name: str,
+                                        camera_x: int, camera_y: int):
+        """Fill every placed water/grass/lava AnimatedRegion algorithmically —
+        the box-and-controller pattern, rather than placing individual tiles
+        by hand. One live playback mode, picked per region_type via
+        REGION_STYLES:
+
+        'patch' (water, lava, grass): each frame is a frame_size x frame_size
+        image containing a grid of chunk_size patches (water/lava: 64x64
+        frame, 8x8 patches of 8px each; grass: 64x64 frame, 4x4 patches of
+        16px each). The runtime crawls the region in chunk_size world-space
+        steps and, for each step, crops the patch at
+        (world_x % frame_size, world_y % frame_size) out of whichever frame
+        is currently playing (frame advances on a shared clock, so the whole
+        region plays in sync). Which frame plays next is picked by the
+        style's 'anim' setting — water/grass loop straight through their
+        strip, lava ping-pongs back and forth for a 1-2-3-2-1-2-3 flicker.
+        Separately, the style's 'scroll' setting can continuously slide the
+        sample window every chunk crops from, in fractional pixels per
+        second — lava uses this to flow down-right, independent of the
+        frame flicker. (A chunk-quantized jump instead of a continuous
+        offset would just swap in an unrelated patch each step and read as
+        extra flicker rather than motion, so this has to stay
+        sub-chunk-smooth.)
+
+        'tile' (dirt): no sub-patches, no time-based playback. Each of the
+        sheet's grid_rows frames is one complete, static frame_w x frame_h
+        tile (dirt: 24x24, 4 variants stacked vertically). A placed
+        region's 'variant' index picks which single frame it shows —
+        editor-selectable per region, defaulting to 0 — and the runtime
+        just tiles that one frame edge-to-edge, snapped to a global
+        frame_w x frame_h grid so neighboring dirt regions still line up
+        at their shared border.
+
+        'checkerboard' — RETIRED. Grass used to use this (each frame IS the
+        whole tile, no sub-patch cropping); the branch is kept commented
+        out below in case it's needed again, alongside the retired
+        REGION_STYLES entry in animated_region.py.
+
+        Only chunks/tiles intersecting the camera view (plus padding, so
+        nothing pops in at the screen border) are drawn either way, so cost
+        is proportional to what's on screen, not to how large the region is.
+        """
+        room = self.room_manager.get_room_by_name(room_name)
+        if not room:
+            return
+
+        regions = getattr(room, 'animated_regions', None)
+        if not regions:
+            return
+
+        from objects.animated_region import REGION_STYLES
+
+        PAD = 64  # extra world-px past the camera edge so chunks don't pop in
+        default_fps = 6   # matches the default fps used by the tileset's own animated tiles
+        tick_ms = pygame.time.get_ticks()
+        sw, sh = target_surface.get_size()
+
+        # Visible bounds (+ padding) in the same unscaled world/tile-unit
+        # space region.x/.y live in.
+        view_left   = (camera_x / RENDER_SCALE) - PAD
+        view_top    = (camera_y / RENDER_SCALE) - PAD
+        view_right  = ((camera_x + sw) / RENDER_SCALE) + PAD
+        view_bottom = ((camera_y + sh) / RENDER_SCALE) + PAD
+
+        for region in regions:
+            if not getattr(region, 'active', True):
+                continue
+
+            style = REGION_STYLES.get(region.region_type, {})
+            sprite_name = style.get('sheet', region.region_type)
+            mode = style.get('mode', 'patch')
+            grid_rows = max(1, style.get('grid_rows', 1))
+
+            if mode == 'tile':
+                # Non-square, non-animated sheet (dirt): frame_w/frame_h
+                # instead of a single square frame_size, and no chunk_size
+                # sub-patch cropping at all.
+                frame_w = style.get('frame_w', style.get('frame_size', 64))
+                frame_h = style.get('frame_h', frame_w)
+                frames = self._load_region_sheet(sprite_name, frame_w, grid_rows, frame_h=frame_h)
+                frame_size_key = (frame_w, frame_h)  # cache-key stand-in for tint/opacity helpers below
+            else:
+                frame_size = style.get('frame_size', 64)
+                chunk_size = style.get('chunk_size', 8)
+                frames = self._load_region_sheet(sprite_name, frame_size, grid_rows)
+                frame_size_key = frame_size
+
+            if not frames:
+                continue
+
+            # Wave Amount is a water-only control now — lava and grass
+            # always play the full animation regardless of any stored
+            # value (e.g. from before this was restricted to water).
+            wave_amount = getattr(region, 'wave_amount', 100) if region.region_type == 'water' else 100
+            seed = getattr(region, 'seed', 0)
+            plain_frame = None
+            if mode == 'patch' and wave_amount < 100:
+                plain_frame = self._load_region_plain_frame(sprite_name, frame_size)
+
+            # (255, 255, 255) = original art colors, untouched. Anything else
+            # replaces the hue/saturation of the sprite's base (non-white)
+            # pixels with that color while keeping each pixel's own HSL
+            # lightness (so shading/highlights — including subtly lighter
+            # shades like 90C8F8 alongside the 58A8F8 base — stay visually
+            # distinct after tinting), leaving white foam/highlight pixels
+            # alone, via cached tinted copies so the same color/sprite combo
+            # is only computed once.
+            color = tuple(getattr(region, 'color', (255, 255, 255)))
+            if color != (255, 255, 255):
+                frames = self._get_tinted_frames(sprite_name, frame_size_key, color, frames)
+                if plain_frame is not None:
+                    plain_frame = self._get_tinted_frames(
+                        sprite_name, frame_size_key, color, [plain_frame], key_suffix='_plain'
+                    )[0]
+
+            # 0-100 editor slider -> 0-255 surface alpha. Set on every frame
+            # this region might use (cheap — at most a handful), since the
+            # same cached frame objects are shared across regions/instances
+            # and each region can have its own opacity.
+            alpha_value = max(0, min(255, round(getattr(region, 'opacity', 100) / 100 * 255)))
+            for f in frames:
+                f.set_alpha(alpha_value)
+            if plain_frame is not None:
+                plain_frame.set_alpha(alpha_value)
+
+            # Clip the region to the camera view before chunking it.
+            rx0 = max(region.x, view_left)
+            ry0 = max(region.y, view_top)
+            rx1 = min(region.x + region.width,  view_right)
+            ry1 = min(region.y + region.height, view_bottom)
+            if rx0 >= rx1 or ry0 >= ry1:
+                continue
+
+            if mode == 'patch':
+                # Snap the starting corner down to the nearest chunk boundary.
+                chunk_x0 = int(rx0 // chunk_size) * chunk_size
+                chunk_y0 = int(ry0 // chunk_size) * chunk_size
+
+                scaled_chunk = chunk_size * RENDER_SCALE
+
+                anim = style.get('anim', 'loop')
+                num_frames = len(frames)
+                fps = style.get('fps', default_fps)
+                step = int(tick_ms * fps / 1000)
+                if anim == 'pingpong' and num_frames > 1:
+                    # Bounces forward then back across the strip instead of
+                    # cycling straight through: 0,1,...,N-1,N-2,...,1,0,1,...
+                    period = 2 * (num_frames - 1)
+                    pos = step % period
+                    frame_idx = pos if pos < num_frames else period - pos
+                else:
+                    frame_idx = step % num_frames
+
+                scroll_px_x, scroll_px_y = style.get('scroll', (0, 0))
+                scrolling = scroll_px_x != 0 or scroll_px_y != 0
+
+                if scrolling:
+                    # Continuous sub-chunk offset (unscaled world pixels),
+                    # decoupled from the frame_idx flicker above so the two
+                    # motions don't compound into "just faster flicker".
+                    t = tick_ms / 1000.0
+                    # Sampling further into the texture makes the displayed
+                    # content appear to move the opposite way (advancing
+                    # the sample point right makes the pattern drift left
+                    # on screen), so subtract to get apparent motion in the
+                    # (positive x, positive y) = down-right direction that
+                    # positive scroll_px values are meant to represent.
+                    offset_x = (-(t * scroll_px_x)) % frame_size
+                    offset_y = (-(t * scroll_px_y)) % frame_size
+                    frame = self._get_scroll_tiled_frames(sprite_name, frame_size, color, frames)[frame_idx]
+                    if plain_frame is not None:
+                        plain_frame = self._get_scroll_tiled_frames(
+                            sprite_name, frame_size, color, [plain_frame], key_suffix='_plain'
+                        )[0]
+                else:
+                    offset_x = offset_y = 0
+                    frame = frames[frame_idx]
+
+                cy = chunk_y0
+                while cy < ry1:
+                    src_y = ((cy % frame_size) + offset_y) * RENDER_SCALE
+                    row = cy // chunk_size
+                    cx = chunk_x0
+                    while cx < rx1:
+                        col = cx // chunk_size
+
+                        if wave_amount >= 100:
+                            source = frame
+                        elif wave_amount <= 0:
+                            source = plain_frame
+                        else:
+                            roll = self._region_chunk_roll(col, row, seed)
+                            source = frame if roll < wave_amount else plain_frame
+
+                        src_x = int(((cx % frame_size) + offset_x) * RENDER_SCALE)
+                        screen_x = (cx * RENDER_SCALE) - camera_x
+                        screen_y = (cy * RENDER_SCALE) - camera_y
+                        target_surface.blit(
+                            source, (int(screen_x), int(screen_y)),
+                            (src_x, int(src_y), scaled_chunk, scaled_chunk)
+                        )
+                        cx += chunk_size
+                    cy += chunk_size
+
+            elif mode == 'tile':
+                # No sub-patches, no time-based playback — this region shows
+                # exactly one static frame, fixed by its own 'variant' index
+                # (editor-selectable, default 0 = the sheet's first row).
+                variant_idx = max(0, min(len(frames) - 1, getattr(region, 'variant', 0)))
+                frame = frames[variant_idx]
+
+                # Snap to a *global* frame_w x frame_h grid (not relative to
+                # this region's x/y) so two adjacent dirt regions still tile
+                # seamlessly across their shared border, same idea as the
+                # 'patch' branch snapping chunk_x0/chunk_y0 to world space.
+                tile_x0 = int(rx0 // frame_w) * frame_w
+                tile_y0 = int(ry0 // frame_h) * frame_h
+
+                # Unlike 'patch' chunks (a handful of px, so any overhang
+                # past the region edge is invisible), a 24x24 dirt tile is
+                # big enough that letting it hang past the box would be
+                # obviously wrong — so edge tiles get cropped to rx0/ry0/
+                # rx1/ry1 (already the region-bounds-intersect-camera-view
+                # rect computed above) rather than blit in full.
+                cy = tile_y0
+                while cy < ry1:
+                    tile_top = max(cy, ry0)
+                    tile_bottom = min(cy + frame_h, ry1)
+                    if tile_bottom > tile_top:
+                        src_y = int((tile_top - cy) * RENDER_SCALE)
+                        src_h = int((tile_bottom - tile_top) * RENDER_SCALE)
+                        screen_y = (tile_top * RENDER_SCALE) - camera_y
+
+                        cx = tile_x0
+                        while cx < rx1:
+                            tile_left = max(cx, rx0)
+                            tile_right = min(cx + frame_w, rx1)
+                            if tile_right > tile_left:
+                                src_x = int((tile_left - cx) * RENDER_SCALE)
+                                src_w = int((tile_right - tile_left) * RENDER_SCALE)
+                                screen_x = (tile_left * RENDER_SCALE) - camera_x
+                                target_surface.blit(
+                                    frame, (int(screen_x), int(screen_y)),
+                                    (src_x, src_y, src_w, src_h)
+                                )
+                            cx += frame_w
+                    cy += frame_h
+
+            # else:  # 'checkerboard' — RETIRED. Grass now uses 'patch' mode
+            # like water/lava (see REGION_STYLES above); kept here commented
+            # out in case the checkerboard approach is needed again.
+            #
+            #     num_frames = len(frames)
+            #     frames_per_batch = max(1, style.get('frames_per_batch', 4))
+            #     batch_swap_ms = max(1, style.get('batch_swap_ms', 1500))
+            #     cols_per_row = max(1, num_frames // grid_rows)  # 2 * frames_per_batch, normally
+            #
+            #     # Which batch row of the sheet is active is a single global
+            #     # choice for the whole region — every batch_swap_ms it flips
+            #     # for every tile at once, so the whole field sways together
+            #     # instead of each tile/row flickering independently.
+            #     active_batch = int(tick_ms // batch_swap_ms) % grid_rows
+            #     batch_row_offset = active_batch * cols_per_row
+            #
+            #     cy = chunk_y0
+            #     while cy < ry1:
+            #         row = cy // chunk_size
+            #         # Within the active batch's row, tile-row position picks
+            #         # one of two frames_per_batch-wide column groups baked
+            #         # side by side into that row (group 0: cols
+            #         # 0..frames_per_batch-1, group 1: cols
+            #         # frames_per_batch..2*frames_per_batch-1). Mirrored
+            #         # rather than straight alternation — 1,2,2,1,1,2,2,1...
+            #         # — so a 4-row cycle where rows 0 & 3 use group 0 and
+            #         # rows 1 & 2 use group 1.
+            #         row_in_cycle = row % 4
+            #         group_idx = 1 if row_in_cycle in (1, 2) else 0
+            #         row_group_offset = frames_per_batch * group_idx
+            #
+            #         cx = chunk_x0
+            #         while cx < rx1:
+            #             col = cx // chunk_size
+            #             col_frame = col % frames_per_batch  # cycles across columns, left to right
+            #             frame_idx = (batch_row_offset + row_group_offset + col_frame) % num_frames
+            #             frame = frames[frame_idx]
+            #
+            #             screen_x = (cx * RENDER_SCALE) - camera_x
+            #             screen_y = (cy * RENDER_SCALE) - camera_y
+            #             target_surface.blit(frame, (int(screen_x), int(screen_y)))
+            #
+            #             cx += chunk_size
+            #         cy += chunk_size
 
     def _draw_scrolling_background(self, dt):
         """Draw the current room's scrolling background image, if it has one.
@@ -4993,6 +8650,13 @@ class Game:
         surf = self._room_tile_surfaces[key]
 
         self.logical_surface.blit(surf, (-int(self.camera.x), -int(self.camera.y)))
+        self._draw_animated_tile_overlay(
+            self.logical_surface, room_name, bg, int(self.camera.x), int(self.camera.y)
+        )
+        if bg:
+            self._draw_animated_regions_overlay(
+                self.logical_surface, room_name, int(self.camera.x), int(self.camera.y)
+            )
 
     def blit_room_tiles(self, screen: 'pygame.Surface', room_name: str,
                         camera_x: int, camera_y: int, bg: bool):
@@ -5013,6 +8677,9 @@ class Game:
         surf = self._room_tile_surfaces.get(key)
         if surf:
             screen.blit(surf, (-camera_x, -camera_y))
+            self._draw_animated_tile_overlay(screen, room_name, bg, camera_x, camera_y)
+            if bg:
+                self._draw_animated_regions_overlay(screen, room_name, camera_x, camera_y)
 
     def _draw_tile(self, tile):
         """Blit a single tile at its world position. Mostly used for one-off debug draws."""
@@ -5125,16 +8792,22 @@ class Game:
 
     def _draw_ui(self, dt):
         """Draw all UI elements that appear on top of the game world."""
+        # Screen-covering fades are drawn first so they sit *behind* the
+        # dialogue box, HUD, and menus below. Drawing them last (as before)
+        # meant a room-transition wipe or the cutscene launch/end black fade
+        # would paint over an open dialogue box and hide it entirely.
+        self.transition_controller.draw(self.logical_surface)
+        self._draw_cutscene_fade(self.logical_surface)
+
         self.npc_config_menu.draw(self.logical_surface, self.colors)
         self.dialogue_box.draw(self.logical_surface, self.colors)
         self.save_point_menu.draw(self.logical_surface)
+        self.dialogue_choice_menu.draw(self.logical_surface)
         self.character_switch_menu.draw(self.logical_surface)
         self.pause_menu.draw(self.logical_surface, self.player, self.play_time)
-        self.level_up_notification.draw(self.logical_surface, self.colors)
+        self.level_up_notification.draw(self.logical_surface, self.colors, sprite_hud=self.sprite_hud, player=self.player)
 
         self.transition_config_menu.draw(self.logical_surface)
-        self.transition_controller.draw(self.logical_surface)
-        self._draw_cutscene_fade(self.logical_surface)
 
         # HUD slide animation — slides in/out when entering/leaving game mode.
         # Suppressed entirely during the world-map flying/landing sequence so the
@@ -5165,6 +8838,16 @@ class Game:
                     self.sprite_hud._hud_slide_in = False
             self.sprite_hud.draw(self.logical_surface, self.player, enemies=self.enemies, dt=dt)
 
+        # Event timer readout (timer_start/pause/stop actions) — top-right,
+        # drawn whenever a timer is active regardless of HUD slide state.
+        if self.ui.current_screen == 'game' and not _in_map_sequence:
+            self._draw_event_timer(self.logical_surface)
+
+        # Spam QTE bar (bottom-middle mash-E-or-Q, 'spam_qte' action) — same
+        # slide-independent treatment as the event timer above.
+        if self.ui.current_screen == 'game' and not _in_map_sequence:
+            self.spam_qte_bar.draw(self.logical_surface, render_scale=RENDER_SCALE)
+
         # Full-screen overlays for main menu and sub-screens.
         if self.ui.current_screen == 'main_menu':
             self.ui.draw_main_menu(self.logical_surface, self.colors)
@@ -5174,6 +8857,17 @@ class Game:
             self.ui.draw_inventory_screen(self.logical_surface, self.player, self.colors)
         elif self.ui.current_screen == 'options':
             self.ui.draw_options_screen(self.logical_surface, self.colors)
+
+        # Instant Transmission targeting overlay — enemy markers + the
+        # cursor itself, drawn on top of the HUD like the flashes below.
+        if self.player.is_targeting_it and self.it_selector is not None:
+            self.it_selector.draw_markers(self.logical_surface, self.camera)
+            self.it_selector.draw_cursor(self.logical_surface)
+
+        # Genkidama impact flash — drawn on top of the HUD like the map-jump
+        # fade below, just not as the very last thing (map-jump fade should
+        # still win out if both ever happen at once).
+        self._draw_white_flash(self.logical_surface)
 
         # Map-jump fade drawn dead last so it covers every UI element including
         # the HUD — otherwise the HUD renders on top and the fade looks incomplete.
@@ -5195,8 +8889,8 @@ class Game:
         collision_manager  = oe.collision_manager
         transition_manager = oe.transition_manager
         gate_manager       = oe.gate_manager
+        door_manager       = oe.door_manager
         flying_pad_manager = oe.flying_pad_manager
-        music_manager       = oe.music_manager
 
         for room in self.room_manager.rooms:
             if hasattr(room, 'spawn_points') and room.spawn_points:
@@ -5219,13 +8913,16 @@ class Game:
                 room.level_gates = []
             gate_manager.gates[room.name] = room.level_gates
 
+            if not hasattr(room, 'doors'):
+                room.doors = []
+            door_manager.doors[room.name] = room.doors
+
             if not hasattr(room, 'save_points'):
                 room.save_points = []
             self.save_point_manager.save_points[room.name] = room.save_points
 
-            if not hasattr(room, 'music_objects'):
-                room.music_objects = []
-            music_manager.music_objects[room.name] = room.music_objects
+            if not hasattr(room, 'music_track'):
+                room.music_track = ''
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 

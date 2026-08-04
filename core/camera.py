@@ -23,9 +23,27 @@ class Camera:
         self.x = 0
         self.y = 0
 
-        # Post-cutscene lerp blend state
-        self._lerp_active  = False
-        self._lerp_speed   = 5.0   # higher = faster blend (good range: 3–8)
+        # Internal, un-rounded camera position. The exponential ease below
+        # needs a continuous float to accumulate against each frame — if we
+        # fed it the rounded/shaken self.x/self.y instead, snapping to whole
+        # pixels every frame would re-inject noise into the ease itself.
+        # self.x/self.y (set at the end of update()) become the *rendered*
+        # position: this true position plus shake, rounded once, so every
+        # consumer (player sprite, shadow, anything calling camera.apply)
+        # works off the exact same integer offset instead of each
+        # independently truncating a moving sub-pixel value.
+        self._true_x = 0.0
+        self._true_y = 0.0
+
+        # Smooth-follow state — the camera always eases toward the target
+        # rather than snapping to it. This is what gives walking/running a
+        # slight, deliberate follow-lag that catches up once the player
+        # stops. _lerp_active is kept only so external code (e.g. the
+        # cutscene runtime) can still force an instant snap for one frame
+        # when it needs to reposition the camera directly; day-to-day
+        # gameplay follow no longer depends on it being toggled on.
+        self._lerp_active  = True
+        self._lerp_speed   = 4.0   # higher = faster catch-up (good range: 3–8)
 
         # When True the camera position is frozen — the player is no longer tracked.
         # Used during the world-map jump sequence so the camera doesn't follow
@@ -89,31 +107,48 @@ class Camera:
         desired_y = target_screen_y - self.screen_height // 2
 
         if self._lerp_active and dt > 0:
+            # Exponential ease toward the target. This is what produces the
+            # deliberate follow-lag while walking/running — the camera keeps
+            # chasing a moving target, so the gap never closes until the
+            # player actually stops. Left permanently on (not deactivated
+            # once "close enough") so it applies to ordinary gameplay, not
+            # just the moment right after a cutscene.
+            #
+            # This eases against _true_x/_true_y (not the rounded, shaken
+            # self.x/self.y) so the accumulator stays a clean float from
+            # frame to frame — rounding it here would make the ease chase a
+            # jittery, pixel-snapped target instead of a smooth one.
             t = 1.0 - (1.0 / (1.0 + self._lerp_speed * dt))
-            new_x = self.x + (desired_x - self.x) * t
-            new_y = self.y + (desired_y - self.y) * t
-            # Stop lerping once we're close enough
-            if abs(desired_x - new_x) < 0.5 and abs(desired_y - new_y) < 0.5:
-                self._lerp_active = False
-            self.x = new_x + self.shake_offset_x
-            self.y = new_y + self.shake_offset_y
+            self._true_x = self._true_x + (desired_x - self._true_x) * t
+            self._true_y = self._true_y + (desired_y - self._true_y) * t
         else:
-            self.x = desired_x + self.shake_offset_x
-            self.y = desired_y + self.shake_offset_y
+            self._true_x = desired_x
+            self._true_y = desired_y
 
-        # Clamp to room bounds, or centre for rooms smaller than the screen.
+        # Clamp the true (un-shaken) position to room bounds, or centre for
+        # rooms smaller than the screen.
         world_screen_width  = world_width  * RENDER_SCALE
         world_screen_height = world_height * RENDER_SCALE
 
         if world_screen_width <= self.screen_width:
-            self.x = (world_screen_width - self.screen_width) // 2 + self.shake_offset_x
+            self._true_x = (world_screen_width - self.screen_width) // 2
         else:
-            self.x = max(0, min(self.x, world_screen_width - self.screen_width))
+            self._true_x = max(0, min(self._true_x, world_screen_width - self.screen_width))
 
         if world_screen_height <= self.screen_height:
-            self.y = (world_screen_height - self.screen_height) // 2 + self.shake_offset_y
+            self._true_y = (world_screen_height - self.screen_height) // 2
         else:
-            self.y = max(0, min(self.y, world_screen_height - self.screen_height))
+            self._true_y = max(0, min(self._true_y, world_screen_height - self.screen_height))
+
+        # Rendered position: shake added on top of the true position, then
+        # snapped to a whole pixel exactly once, here. Every consumer
+        # (player sprite, ground shadow, tile draws, camera.apply(), ...)
+        # now works from the same integer camera offset each frame instead
+        # of each independently truncating a continuously-drifting float —
+        # that mismatch (not the shake or the ease itself) was what made
+        # the shadow appear to jitter relative to the player while moving.
+        self.x = round(self._true_x + self.shake_offset_x)
+        self.y = round(self._true_y + self.shake_offset_y)
 
     def apply(self, x, y):
         """
