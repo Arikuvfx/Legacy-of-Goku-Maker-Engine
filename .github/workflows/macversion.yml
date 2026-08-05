@@ -1,8 +1,5 @@
 name: Build macOS App
 
-# Lets you trigger this manually from the Actions tab on GitHub.
-# (You can add "push" here later if you want it to build automatically
-# every time you push code — but manual is safer while you're testing.)
 on:
   workflow_dispatch:
 
@@ -11,17 +8,17 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      # 1. Pull your repo's code onto the runner
+      
       - name: Check out code
         uses: actions/checkout@v4
 
-      # 2. Install Python
+      
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      # 3. Install your project's dependencies + PyInstaller
+     
       - name: Install dependencies
         run: |
           pip install --upgrade pip
@@ -29,15 +26,11 @@ jobs:
           pip install pyinstaller
           pip install Pillow
 
-      # 4. Build the Mac app
-      #    --windowed = no terminal window pops up (good for a GUI game)
-      #    --onefile  = single bundled executable
-      #    Change "game.py" below if your entry point script has a
-      #    different name.
+      
       - name: Build with PyInstaller
         run: pyinstaller --onefile --noconsole --icon=icon.ico main.py
 
-      # 5. Upload the result so you can download it from the Actions tab
+      
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
