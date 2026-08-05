@@ -30,12 +30,48 @@ class _BitmapFont:
         for ch, fname in special.items():
             self._try_load(ch, fname)
 
+    @staticmethod
+    def _trim_left_bearing(surf):
+        """Crop transparent columns off the left of a glyph.
+
+        Font sheets often give each letter a different left pad (e.g. 'T'
+        has more empty space than 'i'). Without trimming, a dialogue line
+        that starts with a tight glyph appears further left than one that
+        starts with a padded glyph — the classic "second row is more to
+        the left" look. Trimming once at load makes every line's first
+        ink pixel share the same x origin.
+        """
+        w, h = surf.get_size()
+        if w <= 1 or h <= 0:
+            return surf
+        # Scan left → right for the first column with any visible pixel.
+        left = 0
+        found = False
+        for x in range(w):
+            for y in range(h):
+                if surf.get_at((x, y))[3] > 0:
+                    left = x
+                    found = True
+                    break
+            if found:
+                break
+        if not found or left == 0:
+            return surf
+        # Keep at least 1 px width.
+        new_w = w - left
+        if new_w < 1:
+            return surf
+        return surf.subsurface((left, 0, new_w, h)).copy()
+
     def _try_load(self, char, filename):
         path = os.path.join(self.folder, filename)
         if not os.path.exists(path):
             return
         try:
             img = pygame.image.load(path).convert_alpha()
+            # Trim before scaling so the crop is in source-pixel units and
+            # the scaled result stays sharp under integer scale factors.
+            img = self._trim_left_bearing(img)
             if self.scale != 1:
                 img = pygame.transform.scale(img, (
                     int(img.get_width()  * self.scale),
@@ -83,6 +119,7 @@ class DialogueBox:
         self.received_item = None
 
         self._portrait_key   = None
+        self._is_narrator    = False
         self._portrait_cache = {}
         self._player_ref     = None   # set via set_player() after construction
 
@@ -144,31 +181,39 @@ class DialogueBox:
     def _has_bitmap_font(self):
         return bool(self._font_upper.glyphs or self._font_lower.glyphs or self._font_numbers.glyphs)
 
-    # Descender glyphs (p, q, g) need a downward nudge so they sit on the baseline
-    _DESCENDER_OFFSETS = {'p': 10, 'q': 10, 'g': 10, 'y': 15}
+    # Extra downward nudge for descender glyphs so their bottoms clear the
+    # baseline the same way as in the source font sheets. Tweak these if
+    # p/q/g/y sit too high or low relative to other letters.
+    _DESCENDER_OFFSETS = {'p': 15, 'q': 15, 'g': 15, 'y': 15}
 
     def _render_text_line(self, screen, text, x, y, color=(255, 255, 255), spacing=1):
-        """Blit a mixed-case line bottom-aligned to a shared baseline."""
-        max_h = 0
-        for ch in text:
-            font = (self._font_numbers if ch.isdigit() else self._font_upper if (ch.isupper() or not ch.isalpha()) else self._font_lower)
-            if ch in font.glyphs:
-                max_h = max(max_h, font.glyphs[ch].get_height())
+        """Blit a mixed-case line bottom-aligned to the *shared* font baseline.
 
+        Uses the global line height (tallest glyph across the whole font), not
+        the tallest glyph on *this* line. Per-line max_h made rows with only
+        short lowercase sit higher than rows that contained a capital — the
+        second row looked "weirdly aligned" next to the first.
+        """
+        base_h = self._line_height()
         cx = x
         for ch in text:
-            font = (self._font_numbers if ch.isdigit() else self._font_upper if (ch.isupper() or not ch.isalpha()) else self._font_lower)
+            font = (self._font_numbers if ch.isdigit()
+                    else self._font_upper if (ch.isupper() or not ch.isalpha())
+                    else self._font_lower)
             if ch in font.glyphs:
                 g = font.glyphs[ch].copy()
                 g.fill(color, special_flags=pygame.BLEND_RGBA_MULT)
-                oy = max_h - g.get_height() + self._DESCENDER_OFFSETS.get(ch, 0)
+                oy = base_h - g.get_height() + self._DESCENDER_OFFSETS.get(ch, 0)
                 screen.blit(g, (cx, y + oy))
                 cx += g.get_width() + spacing
             elif ch == ' ':
                 cx += int(6 * max(1, _S))
 
     def _line_height(self):
-        lh = max(self._font_upper.line_height(), self._font_lower.line_height(), self._font_numbers.line_height())
+        """Tallest glyph across upper/lower/number sheets — the shared baseline
+        every dialogue line is measured against."""
+        lh = max(self._font_upper.line_height(), self._font_lower.line_height(),
+                 self._font_numbers.line_height())
         return lh if lh > 0 else self._fallback.get_linesize()
 
     def _text_width(self, text, spacing=1):
@@ -211,12 +256,18 @@ class DialogueBox:
         ssj_path = os.path.join('assets', 'portraits', f'{ssj_key}.png')
         return ssj_key if os.path.exists(ssj_path) else key
 
-    def show(self, text, npc_name="NPC", is_final=False, item=None, portrait_key=None, on_close=None):
+    def show(self, text, npc_name="NPC", is_final=False, item=None, portrait_key=None,
+             on_close=None, is_narrator=False):
+        """is_narrator=True floats the box in the vertical middle of the
+        screen (true narration lines only). Everything else — portrait
+        speech, and portrait-less info lines like level-up notices —
+        stays anchored at the bottom like a normal speaker box."""
         self.current_text  = text
         self.npc_name      = npc_name
         self.is_final      = is_final
         self.received_item = item
         self._portrait_key = self._resolve_portrait_key(portrait_key)
+        self._is_narrator  = is_narrator
         self._on_close      = on_close
         if not self.active:
             self.active   = True
@@ -255,30 +306,52 @@ class DialogueBox:
         key = self._resolve_portrait_key(portrait_key) if portrait_key else None
         if key:
             surf = self._load_portrait(key)
-            if surf:
-                portrait_w = int(surf.get_width() * box_h / surf.get_height())
+            if surf and surf.get_height() > 0:
+                # Same integer scale as draw() so layout matches on-screen pixels.
+                ps = max(1, round(box_h / surf.get_height()))
+                portrait_w = surf.get_width() * ps
 
         pad   = max(6, int(box_w * 0.04))
         max_w = box_w - (8 + pad) * 2
         return box_w, box_h, portrait_w, max_w
 
     def wrap_text(self, text, max_w=None, spacing=4, portrait_key=None):
-        """Word-wrap *text* to *max_w* pixels. Same algorithm draw() uses."""
+        """Word-wrap *text* to *max_w* pixels. Same algorithm draw() uses.
+
+        Hard newlines ('\\n' from the cutscene editor's dialogue text field)
+        become forced line breaks. Leading/trailing spaces on each visual
+        line are stripped so a wrapped row never starts further left/right
+        than its neighbours because of accidental whitespace.
+        """
         if max_w is None:
             _, _, _, max_w = self._box_layout(portrait_key)
-        lines    = []
-        cur_line = []
-        for word in text.split(' '):
-            test = ' '.join(cur_line + [word])
-            tw   = self._text_width(test, spacing) if self._has_bitmap_font() else self._fallback.size(test)[0]
-            if tw <= max_w:
-                cur_line.append(word)
-            else:
+        lines = []
+
+        def _width(s):
+            if self._has_bitmap_font():
+                return self._text_width(s, spacing)
+            return self._fallback.size(s)[0]
+
+        # Split on hard breaks first, then soft-wrap each paragraph.
+        for paragraph in (text or '').split('\n'):
+            words = [w for w in paragraph.split(' ') if w != '']
+            if not words:
+                lines.append('')
+                continue
+            cur_line = []
+            for word in words:
+                test = word if not cur_line else ' '.join(cur_line + [word])
+                if _width(test) <= max_w:
+                    cur_line.append(word)
+                    continue
                 if cur_line:
                     lines.append(' '.join(cur_line))
+                    cur_line = []
+                # Single word wider than the box — put it on its own line
+                # rather than looping forever; draw will simply clip.
                 cur_line = [word]
-        if cur_line:
-            lines.append(' '.join(cur_line))
+            if cur_line:
+                lines.append(' '.join(cur_line))
         return lines
 
     def fits_box(self, text, portrait_key=None, max_lines=None):
@@ -336,24 +409,40 @@ class DialogueBox:
             box_w, box_h = int(self.screen_width * 0.6), target_h
             scaled_box = None
 
-        box_y = self.screen_height - box_h - max(60, int(self.screen_height * 0.08))
+        # True narrator lines float in the vertical middle of the screen
+        # instead of the usual bottom-anchored speaker position. Portrait
+        # boxes and portrait-less "info" boxes (e.g. level-up notices) both
+        # stay bottom-anchored — only explicit narration centers.
+        is_narrator = self._is_narrator
+        if is_narrator:
+            box_y = (self.screen_height - box_h) // 2
+        else:
+            box_y = self.screen_height - box_h - max(60, int(self.screen_height * 0.08))
 
-        # Portrait (optional)
+        # Portrait (optional) — integer nearest-neighbour scale so every
+        # source pixel maps to the same number of dest pixels (avoids the
+        # "some columns thinner than others" look from non-integer scale).
         portrait_surf = None
         portrait_w    = 0
+        portrait_draw = None
         if self._portrait_key:
             portrait_surf = self._load_portrait(self._portrait_key)
-        if portrait_surf:
-            portrait_w = int(portrait_surf.get_width() * box_h / portrait_surf.get_height())
+        if portrait_surf and portrait_surf.get_height() > 0:
+            ps = max(1, round(box_h / portrait_surf.get_height()))
+            portrait_w = portrait_surf.get_width() * ps
+            portrait_h = portrait_surf.get_height() * ps
+            portrait_draw = pygame.transform.scale(
+                portrait_surf, (portrait_w, portrait_h))
 
         total_w    = portrait_w + box_w
         start_x    = (self.screen_width - total_w) // 2
-        box_x      = start_x + portrait_w
 
         temp = pygame.Surface((total_w, box_h), pygame.SRCALPHA)
 
-        if portrait_surf:
-            temp.blit(pygame.transform.scale(portrait_surf, (portrait_w, box_h)), (0, 0))
+        if portrait_draw is not None:
+            # Centre vertically if integer scale didn't land exactly on box_h.
+            py = (box_h - portrait_draw.get_height()) // 2
+            temp.blit(portrait_draw, (0, py))
 
         if scaled_box:
             temp.blit(scaled_box, (portrait_w, 0))
@@ -365,36 +454,83 @@ class DialogueBox:
         if self._state == 'open':
             pad      = max(6, int(box_w * 0.04))
             lh       = self._line_height()
+            # Horizontal gap between glyphs (also used by wrap_text).
             spacing  = 4
+            # Extra pixels between successive lines. Raise this if rows feel
+            # cramped; lower it if they feel too far apart.
+            line_gap = 20
+            # Vertical offset applied to the whole text block after it's
+            # positioned (negative pulls it up toward the top border).
+            # Always applied — for portrait boxes it offsets the fixed
+            # top-anchored start; for centered no-portrait boxes it offsets
+            # the computed center point. All rows share the same baseline
+            # math, so this only shifts the whole block — not row 2
+            # relative to row 1.
+            top_nudge = -5
             max_w    = box_w - (8 + pad) * 2
             visible  = self.current_text[:self._chars_shown]
 
-            lines = self.wrap_text(visible, max_w, spacing)
+            lines = self.wrap_text(visible, max_w, spacing)[:self.MAX_LINES]
 
-            ty = pad - 7
-            for line in lines[:self.MAX_LINES]:
-                tx = portrait_w + 8 + pad
-                if self._has_bitmap_font():
-                    self._render_text_line(temp, line, tx, ty, spacing=spacing)
+            # Boxes with no portrait (narrator lines and portrait-less info
+            # lines like level-up notices) get a full-width box, so instead
+            # of the speaker layout — left-aligned text hugging the top,
+            # next to/after the portrait — the block is centred as a whole:
+            # horizontally per-line within the box, and vertically as a
+            # block within the box height. This is purely a text-layout
+            # concern and is independent of `is_narrator` (which only
+            # controls whether the box itself floats mid-screen or sits
+            # bottom-anchored).
+            no_portrait = not self._portrait_key
+
+            # Same left edge for every row — never per-line adjusted.
+            text_left = portrait_w + 8 + pad
+            ty = pad + top_nudge
+
+            if no_portrait and lines:
+                block_h = len(lines) * lh + max(0, len(lines) - 1) * line_gap
+                ty = (box_h - block_h) // 2 + top_nudge
+
+            for line in lines:
+                # Guard against any residual leading whitespace so row 2
+                # can't drift left/right relative to row 1.
+                line = line.lstrip()
+                if no_portrait:
+                    line_w = (self._text_width(line, spacing) if self._has_bitmap_font()
+                              else self._fallback.size(line)[0])
+                    line_x = portrait_w + max(0, (box_w - line_w) // 2)
                 else:
-                    temp.blit(self._fallback.render(line, True, colors['WHITE']), (tx, ty))
-                ty += lh + 2
+                    line_x = text_left
+                if self._has_bitmap_font():
+                    self._render_text_line(temp, line, line_x, ty, spacing=spacing)
+                else:
+                    temp.blit(self._fallback.render(line, True, colors['WHITE']),
+                              (line_x, ty))
+                ty += lh + line_gap
 
-        # Pixelated scale-in effect: downscale to a low-res version then upscale back
-        PIXEL_STEPS = 6
-        draw_w = max(1, int(total_w * progress))
-        draw_h = max(1, int(box_h  * progress))
-        lo_w   = max(1, int(total_w / PIXEL_STEPS * max(1, round(progress * PIXEL_STEPS))))
-        lo_h   = max(1, int(box_h   / PIXEL_STEPS * max(1, round(progress * PIXEL_STEPS))))
-
-        final = pygame.transform.scale(
-            pygame.transform.scale(temp, (lo_w, lo_h)),
-            (draw_w, draw_h)
-        )
-
-        screen.blit(final,
-                    (start_x + (total_w - draw_w) // 2,
-                     box_y   + (box_h   - draw_h) // 2))
+        # Open/close presentation.
+        #
+        # Fully open/closed progress → blit 1:1. The old path always ran
+        # temp through a double pygame.transform.scale (down to lo_w then
+        # back up to draw_w). At progress≈1, integer truncation made
+        # lo_w = total_w - 1 (or similar), so every open frame was a
+        # non-integer upscale — classic "some pixel rows/cols thinner
+        # than others" artifact on the box art and portrait.
+        #
+        # During the transition, only discrete step sizes are used and
+        # the surface is scaled once to that exact size (no second stretch
+        # to a mismatched continuous size), so pixels stay uniform.
+        if progress >= 0.999:
+            screen.blit(temp, (start_x, box_y))
+        else:
+            PIXEL_STEPS = 6
+            step = max(1, min(PIXEL_STEPS, int(round(progress * PIXEL_STEPS))))
+            draw_w = max(1, (total_w * step) // PIXEL_STEPS)
+            draw_h = max(1, (box_h  * step) // PIXEL_STEPS)
+            final = pygame.transform.scale(temp, (draw_w, draw_h))
+            screen.blit(final,
+                        (start_x + (total_w - draw_w) // 2,
+                         box_y   + (box_h   - draw_h) // 2))
 
 
 class DialogueChoiceMenu:

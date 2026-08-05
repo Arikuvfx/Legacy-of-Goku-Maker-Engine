@@ -511,29 +511,41 @@ class Player:
 
         # Charged Melee — holding E (rather than tapping it) rolls the
         # normal melee swing into a wind-up once it finishes: frame 0 of
-        # charged_melee.png held for charged_melee_charge_required seconds
-        # while the sprite blinks white (see update_charged_melee_charge(),
-        # draw()'s flash_white pass), then either a forward lunge (same
-        # shape as Dragon Fist's opening lunge — see
-        # _advance_charged_melee_lunge) or a rooted spin (no movability,
-        # like the energy sword spin — can_act()/can_move() already block
-        # movement via is_attacking, so no extra code is needed for that
-        # case), depending on charged_melee_style. That's set per-character
-        # from the character creator (see Game._reload_attack_config).
-        # Whichever style plays, it's the SAME charged_melee.png sheet
-        # continuing past frame 0 — no separate charge/action effect
-        # objects. Hits during the action are just regular MeleeAttack
-        # instances spawned every charged_melee_hit_interval seconds (see
+        # charged_melee.png held while the sprite glows white (see
+        # update_charged_melee_charge(), draw()'s flash_white pass), then
+        # either a forward lunge (same shape as Dragon Fist's opening
+        # lunge — see _advance_charged_melee_lunge) or a rooted spin (no
+        # movability, like the energy sword spin — can_act()/can_move()
+        # already block movement via is_attacking, so no extra code is
+        # needed for that case), depending on charged_melee_style. That's
+        # set per-character from the character creator (see
+        # Game._reload_attack_config). Whichever style plays, it's the
+        # SAME charged_melee.png sheet continuing past frame 0 — no
+        # separate charge/action effect objects. Hits during the action
+        # are just regular MeleeAttack instances spawned every
+        # charged_melee_hit_interval seconds (see
         # pop_pending_charged_melee_hit()), reusing melee's existing
         # collision/sfx/cleanup pipeline in game.py wholesale instead of a
         # bespoke hitbox.
+        #
+        # The charge itself is release-driven, not a timer: the wind-up
+        # animation loops for as long as E stays held, and the white
+        # overlay ramps 0 -> full opacity over charged_melee_charge_required
+        # seconds. Letting go of E before that overlay has reached full
+        # opacity at least once just cancels the charge (same as before).
+        # Once it HAS reached full opacity once, charged_melee_ready flips
+        # on for good and the overlay starts breathing (full -> 0 -> full,
+        # see charged_melee_pulse_period) so it's obvious the charge is
+        # "banked" — letting go of E any time after that is what actually
+        # triggers the lunge/spin via release_charged_melee(). There is no
+        # auto-fire: holding past the first peak just keeps it looping.
         self.is_e_pressed = False
         self.is_charging_melee = False
         self.charged_melee_charge_time = 0.0
-        self.charged_melee_charge_required = 1.0     # seconds
-        self.charged_melee_flash_timer = 0.0
-        self.charged_melee_flash_interval = 0.1      # blink rate while charging
-        self.charged_melee_flash_on = False
+        self.charged_melee_charge_required = 0.2    # seconds to first full-opacity peak
+        self.charged_melee_pulse_period = 0.3        # seconds per breathe cycle once ready
+        self.charged_melee_flash_amount = 0.0        # 0.0-1.0 current white-overlay opacity
+        self.charged_melee_ready = False              # True once the overlay has peaked once — release now fires the attack instead of cancelling
         self.is_charged_melee_active = False         # True through the whole lunge/spin action
         self.charged_melee_style = 'lunge'           # 'lunge' | 'spin'
         self.charged_melee_lunge_duration = 0.3      # seconds
@@ -546,6 +558,13 @@ class Player:
 
         # Blast is queued here and spawned once the kiblast animation finishes
         self.pending_blast = None
+
+        # Set when Q is tapped again while a blast throw is still mid-animation
+        # (can_act() is False then, so shoot_blast() would otherwise just no-op
+        # and eat the input). Consumed by _advance_blast_or_idle() alongside
+        # is_q_pressed, so rapidly spamming Q chains into the same barrage that
+        # holding Q down does, instead of dropping taps that land mid-throw.
+        self.blast_input_buffered = False
 
         # Ultra Volleyball reuses the same kiblast throw animation as a
         # regular blast (see shoot_ultra_volleyball()) but is tracked with
@@ -963,12 +982,14 @@ class Player:
         # by the animation-state machine and the player would be stuck forever.
         self.is_attacking = False
         self.pending_blast = None
+        self.blast_input_buffered = False
         self.pending_ultra_volleyball = None
         self.is_charging_burning = False
         self.burning_charge_effect = None
         self.is_charging_melee = False
         self.is_charged_melee_active = False
-        self.charged_melee_flash_on = False
+        self.charged_melee_flash_amount = 0.0
+        self.charged_melee_ready = False
 
         self.sprite.set_animation('hurt', self.direction)
         self.current_animation_state = 'hurt'
@@ -998,61 +1019,94 @@ class Player:
 
     def start_charging_melee(self):
         """Begin the charged-melee wind-up: hold frame 0 of
-        charged_melee.png for charged_melee_charge_required seconds while
-        the sprite blinks white (see update_charged_melee_charge()), then
-        auto-release into the lunge or spin (see release_charged_melee()).
-        is_attacking stays True the whole time — same can_act()/can_move()
-        lockout as the regular melee swing, just longer.
+        charged_melee.png, looping, for as long as E stays held, while the
+        white overlay ramps up (see update_charged_melee_charge()).
+        Letting go of E is what triggers release_charged_melee() — but
+        only once the overlay has reached full opacity at least once (see
+        charged_melee_ready); letting go earlier cancels instead. is_attacking
+        stays True the whole time — same can_act()/can_move() lockout as
+        the regular melee swing, just longer.
 
         Called from the 'melee' animation-state branch in update() when
         the normal swing finishes with E still held (see is_e_pressed).
         """
         self.is_charging_melee = True
         self.charged_melee_charge_time = 0.0
-        self.charged_melee_flash_timer = 0.0
-        self.charged_melee_flash_on = False
+        self.charged_melee_flash_amount = 0.0
+        self.charged_melee_ready = False
 
         if self.sprite.has_animation('charged_melee_hold', self.direction):
             self.sprite.set_animation('charged_melee_hold', self.direction)
         self.current_animation_state = 'charged_melee_charge'
 
     def update_charged_melee_charge(self, dt):
-        """Advance the charge timer/blink and auto-release once fully
-        charged — or cancel back to idle if E is released early (mirrors
-        the energy sword charge's early-release-cancels behavior)."""
+        """Advance the white-overlay ramp/pulse and react to E's state.
+
+        E released:
+          - if the overlay has reached full opacity at least once
+            (charged_melee_ready) -> release into the lunge/spin.
+          - otherwise -> cancel back to idle early (mirrors the energy
+            sword charge's early-release-cancels behavior).
+
+        E still held: keep looping the wind-up animation and advance the
+        overlay — ramping 0 -> 1 the first time, then breathing 1 -> 0 -> 1
+        on repeat once ready, with no auto-fire either way.
+        """
         if not self.is_e_pressed:
-            self.cancel_charging_melee()
+            if self.charged_melee_ready:
+                self.release_charged_melee()
+            else:
+                self.cancel_charging_melee()
             return
 
         self.charged_melee_charge_time += dt
-        self.charged_melee_flash_timer += dt
-        if self.charged_melee_flash_timer >= self.charged_melee_flash_interval:
-            self.charged_melee_flash_timer -= self.charged_melee_flash_interval
-            self.charged_melee_flash_on = not self.charged_melee_flash_on
 
-        if self.charged_melee_charge_time >= self.charged_melee_charge_required:
-            self.release_charged_melee()
+        if not self.charged_melee_ready:
+            # First ramp: 0 -> 1 opacity over charged_melee_charge_required
+            # seconds. Reaching 1.0 here is the ONE-TIME "fully charged"
+            # moment — from here on, letting go of E fires the attack.
+            progress = self.charged_melee_charge_time / self.charged_melee_charge_required
+            if progress >= 1.0:
+                self.charged_melee_flash_amount = 1.0
+                self.charged_melee_ready = True
+            else:
+                self.charged_melee_flash_amount = progress
+        else:
+            # Already peaked once — keep the overlay breathing (full -> 0 ->
+            # full) so it stays obvious the charge is ready while E is
+            # still held, for however long the player keeps holding it.
+            period = self.charged_melee_pulse_period
+            half = period / 2
+            phase = (self.charged_melee_charge_time - self.charged_melee_charge_required) % period
+            if phase <= half:
+                self.charged_melee_flash_amount = 1.0 - (phase / half)
+            else:
+                self.charged_melee_flash_amount = (phase - half) / half
 
     def cancel_charging_melee(self):
-        """E released before the charge finished — drop it and return to idle."""
+        """E released before the overlay ever reached full opacity — drop
+        the charge and return to idle."""
         self.is_charging_melee = False
         self.is_attacking = False
-        self.charged_melee_flash_on = False
+        self.charged_melee_flash_amount = 0.0
+        self.charged_melee_ready = False
         if self.current_animation_state == 'charged_melee_charge':
             self.enter_idle()
 
     def release_charged_melee(self):
-        """Charge finished — play the rest of charged_melee.png (frame 1
-        onward) while either lunging forward or spinning in place, per
-        charged_melee_style. No movement code is needed for the spin case:
-        is_attacking stays True, so can_act()/can_move() already block the
-        player from moving on their own — same "rooted" feel as the energy
-        sword spin has without needing a can_move() exception, unlike
-        Dragon Fist/the sword spin which explicitly opt back INTO movement.
+        """E released after the overlay reached full opacity at least once
+        — play the rest of charged_melee.png (frame 1 onward) while either
+        lunging forward or spinning in place, per charged_melee_style. No
+        movement code is needed for the spin case: is_attacking stays
+        True, so can_act()/can_move() already block the player from
+        moving on their own — same "rooted" feel as the energy sword spin
+        has without needing a can_move() exception, unlike Dragon
+        Fist/the sword spin which explicitly opt back INTO movement.
         """
         self.is_charging_melee = False
         self.is_charged_melee_active = True
-        self.charged_melee_flash_on = False
+        self.charged_melee_flash_amount = 0.0
+        self.charged_melee_ready = False
         self.charged_melee_action_timer = (
             self.charged_melee_lunge_duration if self.charged_melee_style == 'lunge'
             else self.charged_melee_spin_duration
@@ -1103,7 +1157,8 @@ class Player:
         self.is_charging_melee = False
         self.is_charged_melee_active = False
         self.is_attacking = False
-        self.charged_melee_flash_on = False
+        self.charged_melee_flash_amount = 0.0
+        self.charged_melee_ready = False
         if self.current_animation_state == 'charged_melee_action':
             self.enter_idle()
 
@@ -1128,6 +1183,13 @@ class Player:
     def shoot_blast(self):
         """Queue a ki blast — the projectile spawns once the kiblast animation finishes."""
         if not self.can_act() or self.attack_cooldown > 0:
+            # Still mid-throw from a previous blast? Buffer this tap so a
+            # rapid spam of Q keeps the barrage going once the current throw
+            # finishes — mirrors the continue-firing behaviour
+            # _advance_blast_or_idle() already gives when Q is simply held.
+            if (self.is_attacking and self.ki_attack_mode == 'blast'
+                    and self.current_animation_state in ('kiblast', 'kiblast_hold')):
+                self.blast_input_buffered = True
             return
 
         ki_cost = self.get_current_ki_cost()
@@ -1181,7 +1243,14 @@ class Player:
         """
         ki_cost = self.get_current_ki_cost()
 
-        if (self.is_q_pressed and self._can_continue_blast_hold()
+        # Keep the barrage going either because Q is still physically held
+        # down, or because it was tapped again mid-throw (spammed) and that
+        # tap got buffered by shoot_blast() since can_act() was False at the
+        # time. Consume the buffered tap now — it's a one-shot request.
+        keep_firing = self.is_q_pressed or self.blast_input_buffered
+        self.blast_input_buffered = False
+
+        if (keep_firing and self._can_continue_blast_hold()
                 and self.ki_attack_mode == 'blast' and self.ki >= ki_cost):
             # Use the CURRENT hold frame for this shot (2 on the first hold-fire
             # shot), then flip it for next time: 2, 1, 2, 1, ...
@@ -2731,6 +2800,7 @@ class Player:
         self.is_charging_beam  = False
         self.is_firing_beam    = False
         self.pending_blast     = None
+        self.blast_input_buffered = False
         self.is_q_pressed      = False
         self.current_beam      = None
         self.current_charge_effect = None
@@ -2933,25 +3003,27 @@ class Player:
         self.is_charging_beam = False
         self.is_firing_beam = False
         self.pending_blast = None
+        self.blast_input_buffered = False
         self.pending_ultra_volleyball = None
         self.is_q_pressed = False
         self.current_beam = None
         self.current_charge_effect = None
         self.is_punching = False
         self.punch_timer = 0
-        # Charged melee (charge-up blink or lunge/spin) — without this,
+        # Charged melee (charge-up glow/pulse or lunge/spin) — without this,
         # is_charging_melee/is_charged_melee_active stay True after we set
         # current_animation_state = 'hurt' below, and the safety-fallback
         # at the end of update() (which exists precisely to keep these
         # ticking if current_animation_state ever drifts away from
         # 'charged_melee_charge'/'charged_melee_action') immediately calls
         # update_charged_melee_charge()/update_charged_melee_action() again
-        # this same frame — which can auto-release the charge or continue
+        # this same frame — which can release/cancel the charge or continue
         # the lunge and stomp 'hurt' right back to 'charged_melee_action'
         # before the hurt animation ever gets a chance to show.
         self.is_charging_melee = False
         self.is_charged_melee_active = False
-        self.charged_melee_flash_on = False
+        self.charged_melee_flash_amount = 0.0
+        self.charged_melee_ready = False
         self.is_charging_kamekameha = False
         self.is_firing_kamekameha = False
         self.current_kamekameha = None
@@ -3708,6 +3780,6 @@ class Player:
             return
 
         tint = getattr(self, 'hurt_tint', 0.0)
-        flash_white = getattr(self, 'charged_melee_flash_on', False)
+        flash_white = getattr(self, 'charged_melee_flash_amount', 0.0)
         self.sprite.draw(screen, self.x, self.y, camera, scale=RENDER_SCALE,
                          hurt_tint=tint, flash_white=flash_white)

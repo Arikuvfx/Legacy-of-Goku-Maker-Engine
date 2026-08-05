@@ -378,7 +378,9 @@ class SpriteHUD:
         hp = self.config['hp_bar']
         self.draw_bar_simple(screen, bx + sc(hp['x']), by + sc(hp['y']),
                              sc(hp['w']), sc(hp['h']),
-                             player.hp, player.max_hp, self.sprites['hp_bar'])
+                             player.hp, player.max_hp, self.sprites['hp_bar'],
+                             bar_start_x=sc(hp.get('bar_start', 0)),
+                             bar_end_x=sc(hp.get('bar_end', hp['w'])))
 
         # 4. Ki bar (always draw the base bar, then overlay transformed bar if needed)
         ki = self.config['ki_bar']

@@ -125,36 +125,67 @@ def discover_boss_ids():
     return sorted(ids)
 
 
+NPC_SPRITES_ROOT = 'assets/sprites/npc'
+
+
+def _scan_npc_variants(npc_dir):
+    """Scan a single NPC's asset folder (e.g. assets/sprites/npc/<id>) for a
+    variants/ subfolder and return the variant list for it. Always includes
+    a 'default' variant first, even if the folder itself has no variants/
+    subdirectory (in that case 'default' just means "use idle.png directly
+    from npc_dir", which _load_idle_down_sprite already falls back to)."""
+    import os
+    variants = [{'type': 'default', 'name': 'Default', 'color': (50, 150, 200)}]
+    variants_dir = os.path.join(npc_dir, 'variants')
+    if os.path.isdir(variants_dir):
+        for v in sorted(os.listdir(variants_dir)):
+            if os.path.isdir(os.path.join(variants_dir, v)) and v != 'default':
+                variants.append({'type': v, 'name': v.replace('_', ' ').title(), 'color': (50, 150, 200)})
+    return variants
+
+
 def _build_npc_catalogue():
     """Standalone builder for the 'NPCs' portion of the entity catalogue,
     factored out of EntityEditor._build_entity_catalogue() for the same
     reason as _build_enemy_catalogue() above: so the roster can be read
-    without instantiating a full EntityEditor. Still does the filesystem
-    variant scan (assets/sprites/npc/generic/variants) since that's how
-    NPC skins are actually discovered — see discover_npc_ids() below for
-    the id-only view other modules want."""
-    import os
-    npc_variants = [{'type': 'default', 'name': 'Default', 'color': (50, 150, 200)}]
-    variants_dir = 'assets/sprites/npc/generic/variants'
-    if os.path.isdir(variants_dir):
-        for v in sorted(os.listdir(variants_dir)):
-            if os.path.isdir(os.path.join(variants_dir, v)) and v != 'default':
-                npc_variants.append({'type': v, 'name': v.replace('_', ' ').title(), 'color': (50, 150, 200)})
+    without instantiating a full EntityEditor.
 
-    return {
-        'NPCs': [
-            {
-                'id': 'generic',
-                'name': 'Generic NPC',
-                'sprite': None,
-                'width': 32, 'height': 32,
-                'entity_type': 'npc',
-                'has_variants': True,
-                'variants': npc_variants,
-                'default_variant': 'default',
-            },
-        ],
-    }
+    NPCs are discovered dynamically: every subfolder of
+    assets/sprites/npc/ becomes a placeable NPC, using the folder name as
+    both its id and (title-cased) display name. Dropping a new folder in
+    there — e.g. assets/sprites/npc/blacksmith/ — is all that's needed to
+    make it show up in the palette; no code changes required. Each NPC's
+    own variants/ subfolder is scanned the same way (see
+    _scan_npc_variants() above). If assets/sprites/npc/ doesn't exist yet,
+    or has no subfolders, we fall back to a single placeholder 'generic'
+    entry so the palette is never empty and old projects keep working."""
+    import os
+
+    npc_ids = []
+    if os.path.isdir(NPC_SPRITES_ROOT):
+        for entry in sorted(os.listdir(NPC_SPRITES_ROOT)):
+            if os.path.isdir(os.path.join(NPC_SPRITES_ROOT, entry)):
+                npc_ids.append(entry)
+
+    if not npc_ids:
+        npc_ids = ['generic']
+
+    npcs = []
+    for npc_id in npc_ids:
+        npc_dir = os.path.join(NPC_SPRITES_ROOT, npc_id)
+        variants = _scan_npc_variants(npc_dir)
+        npcs.append({
+            'id': npc_id,
+            'name': npc_id.replace('_', ' ').title() if npc_id != 'generic' else 'Generic NPC',
+            'sprite': None,
+            'width': 32, 'height': 32,
+            'entity_type': 'npc',
+            'has_variants': True,
+            'variants': variants,
+            'default_variant': 'default',
+        })
+
+    return {'NPCs': npcs}
 
 
 def discover_npc_ids():
@@ -163,8 +194,8 @@ def discover_npc_ids():
     out of sync with what actually exists. Used by other dev tools (e.g.
     the event editor's spawn_npc action) that need the NPC roster without
     pulling in a full EntityEditor instance. Returns a sorted, deduped list
-    — just ['generic'] today, but keeps working if more NPC entities are
-    ever added to the catalogue."""
+    reflecting whatever folders currently exist under assets/sprites/npc/
+    (or just ['generic'] if that folder is empty/missing)."""
     catalogue = _build_npc_catalogue()
     ids = {entity.get('id', '') for entity in catalogue.get('NPCs', []) if entity.get('id')}
     return sorted(ids)

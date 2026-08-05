@@ -90,7 +90,9 @@ _ACTION_PARAMS = {
                       ('color', 'Color', 'color')],
     'invert':        [('duration', 'Duration (s)', 'float'),
                       ('mode', 'Mode', 'invert_mode')],
-    'dialogue':      [('portrait', 'Character', 'portrait'), ('text', 'Text', 'str')],
+    # portrait '' (shown as "narrator") = no face art — full-width text box.
+    # Any other value is a key under assets/portraits/{key}.png.
+    'dialogue':      [('portrait', 'Portrait', 'portrait'), ('text', 'Text', 'str')],
     'weather_start': [('weather_type', 'Weather Type', 'weather_type'),
                       ('speed',        'Speed (px/s)',  'float'),
                       ('alpha',        'Alpha (0-255)', 'float')],
@@ -820,10 +822,20 @@ class CutsceneEditor:
           field_key — a key in _form_params, or 'time' for _form_time_buf
           actor_key — 'id' for the actor-add form's Actor ID buffer
 
-        Return/Tab/Esc always clear focus without committing a value.
+        Tab/Esc always clear focus. Return clears focus for single-line
+        fields; for the dialogue text field it inserts a hard newline
+        (Discord-style multiline) instead, so the designer can break lines
+        without leaving the box. OK still commits via the form button.
         """
         key = event.key
-        if key in (pygame.K_RETURN, pygame.K_TAB, pygame.K_ESCAPE):
+        is_dialogue_text = (field_key == 'text' and self._form_type == 'dialogue')
+
+        if key in (pygame.K_TAB, pygame.K_ESCAPE):
+            self._new_name_focus = False
+            self._form_focus     = None
+            self._actor_focus    = None
+            return
+        if key == pygame.K_RETURN and not is_dialogue_text:
             self._new_name_focus = False
             self._form_focus     = None
             self._actor_focus    = None
@@ -843,9 +855,19 @@ class CutsceneEditor:
         if key == pygame.K_BACKSPACE:
             buf = buf[:-1]
             self._text_limit_hit = False
+        elif key == pygame.K_RETURN and is_dialogue_text:
+            # Hard line break — still subject to the dialogue box capacity.
+            new_buf = buf + '\n'
+            if (self.dialogue_box is not None
+                    and not self.dialogue_box.fits_box(
+                        new_buf, portrait_key=self._form_params.get('portrait') or None)):
+                self._text_limit_hit = True
+                return
+            buf = new_buf
+            self._text_limit_hit = False
         elif event.unicode and event.unicode.isprintable():
             new_buf = buf + event.unicode
-            if (field_key == 'text' and self._form_type == 'dialogue'
+            if (is_dialogue_text
                     and self.dialogue_box is not None
                     and not self.dialogue_box.fits_box(
                         new_buf, portrait_key=self._form_params.get('portrait') or None)):
@@ -1744,6 +1766,29 @@ class CutsceneEditor:
         self._form_type = pool[(idx + delta) % len(pool)]
         self._reset_form_params()
 
+    def _place_dropdown_rect(self, btn_rect, pop_w, pop_h):
+        """Return the popup Rect for a field dropdown, anchored under
+        *btn_rect* like before, but clamped so it can never spill past the
+        bottom of the window and — critically — never past the top edge of
+        the timeline panel (screen_height - _BOTTOM_H).
+
+        Without this, a field low in a long/tall form (e.g. the actor-add
+        form once several actor tracks have pushed it down, or any action
+        form field near the bottom of the inspector) would open its dropdown
+        at btn_rect.bottom + 2 regardless of where that lands, and since
+        dropdowns are drawn last (on top of everything, including the
+        timeline), the popup would visibly cover the timeline. If it doesn't
+        fit below, flip it to open upward from the button instead.
+        """
+        safe_bottom = self.screen_height - _BOTTOM_H
+        if btn_rect.bottom + 2 + pop_h <= safe_bottom:
+            y = btn_rect.bottom + 2
+        else:
+            # Not enough room below — open upward instead.
+            y = max(0, btn_rect.top - 2 - pop_h)
+        x = _clamp(btn_rect.x, 0, max(0, self.screen_width - pop_w))
+        return pygame.Rect(x, y, pop_w, pop_h)
+
     def _open_portrait_dropdown(self, btn_name):
         import os, glob
         portraits_dir = os.path.join('assets', 'portraits')
@@ -1757,8 +1802,7 @@ class CutsceneEditor:
             visible = min(8, len(keys))
             pop_h   = visible * item_h + 8
             pop_w   = max(btn_rect.width, 160)
-            self._portrait_dropdown_rect = pygame.Rect(
-                btn_rect.x, btn_rect.bottom + 2, pop_w, pop_h)
+            self._portrait_dropdown_rect = self._place_dropdown_rect(btn_rect, pop_w, pop_h)
         self._portrait_dropdown_open = True
 
     def _discover_player_characters(self):
@@ -1792,8 +1836,7 @@ class CutsceneEditor:
             visible = min(8, len(keys))
             pop_h   = visible * item_h + 8
             pop_w   = max(btn_rect.width, 160)
-            self._character_dropdown_rect = pygame.Rect(
-                btn_rect.x, btn_rect.bottom + 2, pop_w, pop_h)
+            self._character_dropdown_rect = self._place_dropdown_rect(btn_rect, pop_w, pop_h)
         self._character_dropdown_open = True
 
     def _discover_costumes_for_actor(self, actor_id: str) -> list:
@@ -1872,8 +1915,7 @@ class CutsceneEditor:
             visible = min(8, len(keys))
             pop_h   = visible * item_h + 8
             pop_w   = max(btn_rect.width, 160)
-            self._costume_dropdown_rect = pygame.Rect(
-                btn_rect.x, btn_rect.bottom + 2, pop_w, pop_h)
+            self._costume_dropdown_rect = self._place_dropdown_rect(btn_rect, pop_w, pop_h)
         self._costume_dropdown_open = True
 
     def _actor_asset_ids(self, atype):
@@ -1909,8 +1951,7 @@ class CutsceneEditor:
             visible = min(8, len(keys))
             pop_h   = visible * item_h + 8
             pop_w   = max(btn_rect.width, 160)
-            self._etype_dropdown_rect = pygame.Rect(
-                btn_rect.x, btn_rect.bottom + 2, pop_w, pop_h)
+            self._etype_dropdown_rect = self._place_dropdown_rect(btn_rect, pop_w, pop_h)
         self._etype_dropdown_open = True
 
     def _sync_actor_etype_default(self):
@@ -1959,8 +2000,7 @@ class CutsceneEditor:
             visible = min(8, len(keys))
             pop_h   = visible * item_h + 8
             pop_w   = max(btn_rect.width, 160)
-            self._sound_dropdown_rect = pygame.Rect(
-                btn_rect.x, btn_rect.bottom + 2, pop_w, pop_h)
+            self._sound_dropdown_rect = self._place_dropdown_rect(btn_rect, pop_w, pop_h)
         self._sound_dropdown_open = True
 
     def _preview_sound(self):
@@ -2952,19 +2992,33 @@ class CutsceneEditor:
         self._draw_timeline(screen, tl)
 
         # ── 6. Dialogue box ────────────────────────────────────────────────────
-        # The DialogueBox positions itself relative to screen_width/screen_height.
-        # To keep it inside the viewport (and at the correct relative position),
-        # we draw it onto a full-screen-sized offscreen surface, then scale that
-        # down to the viewport dimensions and blit only into the viewport rect.
+        # DialogueBox sizes itself from screen_width/screen_height (integer
+        # frame scale, pixel-perfect). Drawing at full game resolution then
+        # pygame.transform.scale-ing down into the smaller viewport reintroduced
+        # the uneven-pixel-row artifact we fixed in dialogue.py — non-integer
+        # scale maps some source rows to N dest pixels and others to N+1.
+        #
+        # Instead, temporarily tell the box the viewport's size so it builds
+        # at the size it will actually occupy, then blit 1:1. Capacity checks
+        # (fits_box / wrap_text) still use the real game resolution because
+        # we only swap the dimensions for this draw call.
         if self.dialogue_box and getattr(self.dialogue_box, 'active', False):
-            _dlg_colors = {'WHITE': (255, 255, 255), 'RED': (220, 60, 60)}
-            _dlg_surf = pygame.Surface(
-                (self.screen_width, self.screen_height), pygame.SRCALPHA)
-            _dlg_surf.fill((0, 0, 0, 0))
-            self.dialogue_box.draw(_dlg_surf, _dlg_colors)
             vp = self._vp_rect
-            _dlg_scaled = pygame.transform.scale(_dlg_surf, (vp.width, vp.height))
-            screen.blit(_dlg_scaled, (vp.x, vp.y))
+            _dlg_colors = {
+                'WHITE': (255, 255, 255), 'RED': (220, 60, 60),
+                'DARK_GRAY': (40, 40, 40), 'CYAN': (80, 220, 220),
+            }
+            _ow = self.dialogue_box.screen_width
+            _oh = self.dialogue_box.screen_height
+            self.dialogue_box.screen_width  = vp.width
+            self.dialogue_box.screen_height = vp.height
+            try:
+                _dlg_surf = pygame.Surface((vp.width, vp.height), pygame.SRCALPHA)
+                self.dialogue_box.draw(_dlg_surf, _dlg_colors)
+                screen.blit(_dlg_surf, (vp.x, vp.y))
+            finally:
+                self.dialogue_box.screen_width  = _ow
+                self.dialogue_box.screen_height = _oh
 
         # Portrait dropdown overlay — drawn last so it sits on top of everything
         if self._portrait_dropdown_open and self._portrait_dropdown_rect:
@@ -2983,7 +3037,8 @@ class CutsceneEditor:
                 if actual >= len(self._portrait_dropdown_items):
                     break
                 key   = self._portrait_dropdown_items[actual]
-                label = key if key else '(none)'
+                # Empty string = no portrait = narrator-style (full-width text box).
+                label = key if key else 'narrator'
                 iy    = dr.y + 4 + i * item_h
                 ir    = pygame.Rect(dr.x + 1, iy, dr.width - 2, item_h)
                 if key == cur_val:
@@ -3511,6 +3566,15 @@ class CutsceneEditor:
         W  = lp.width - 16
         scroll = getattr(self, '_left_scroll', 0)
 
+        # Clip everything drawn in this panel to its own bounds. Without
+        # this, a long LAYERS list (many actor tracks) followed by the
+        # actor-add form could grow past lp.bottom — which sits exactly on
+        # the timeline panel's top edge — and bleed its fields/buttons into
+        # the timeline's screen region (and any dropdown opened from one of
+        # those low fields is drawn on top of everything, visibly covering
+        # the timeline).
+        screen.set_clip(lp)
+
         # ── Section: Room ──────────────────────────────────────────────────────
         self._draw_section_header(screen, x, y, W, 'ROOM')
         y += 20
@@ -3593,12 +3657,19 @@ class CutsceneEditor:
             self._draw_divider(screen, x, y, W); y += 8
             y = self._draw_actor_form(screen, x, y, W)
 
+        screen.set_clip(None)
+
     # ── Right panel (Inspector / Properties) ──────────────────────────────────
 
     def _draw_right_panel(self, screen, rp):
         x = rp.x + 10
         y = rp.y + 8
         W = rp.width - 20
+
+        # Same reasoning as _draw_left_panel: clip so a long action form
+        # (many params) can't bleed its fields past rp.bottom into the
+        # timeline's screen region.
+        screen.set_clip(rp)
 
         self._draw_section_header(screen, x, y, W, 'INSPECTOR')
         y += 22
@@ -3636,6 +3707,8 @@ class CutsceneEditor:
                         screen.blit(kl, (x, y))
                         screen.blit(vl, (x + 60, y))
                         y += 16
+
+        screen.set_clip(None)
 
     # ── Actor add form ─────────────────────────────────────────────────────────
 
@@ -3720,7 +3793,14 @@ class CutsceneEditor:
             if hint in ('dir', 'anim', 'anim_player', 'anim_enemy', 'portrait',
                         'invert_mode', 'weather_type', 'scroll_dir', 'character', 'costume',
                         'music_track', 'sfx_name', 'bool', 'attack_type', 'color'):
-                empty_label = '(none)' if hint in ('music_track', 'sfx_name') else 'auto'
+                # portrait '' = no face = narrator-style dialogue (full-width text).
+                # music/sfx '' = no selection yet. Everything else falls back to 'auto'.
+                if hint == 'portrait':
+                    empty_label = 'narrator'
+                elif hint in ('music_track', 'sfx_name'):
+                    empty_label = '(none)'
+                else:
+                    empty_label = 'auto'
                 display_buf = buf if buf != '' else empty_label
                 if hint == 'color':
                     # Reserve a swatch on the right showing the actual RGB
@@ -3758,10 +3838,17 @@ class CutsceneEditor:
                     screen, x + W - 20, y, 20, 22, '>', _C['highlight'])
                 y += 30
             else:
-                y = self._draw_text_field(screen, x, y, W, key, buf,
-                                          self._form_focus == key, form_key=key)
-                if key == 'text' and self._form_type == 'dialogue' and self.dialogue_box is not None:
-                    y = self._draw_dialogue_capacity_hint(screen, x, y, W, buf)
+                # Dialogue text grows downward like Discord's composer so the
+                # designer can read the full line without horizontal scrolling.
+                if key == 'text' and self._form_type == 'dialogue':
+                    y = self._draw_growing_text_field(
+                        screen, x, y, W, key, buf,
+                        self._form_focus == key, form_key=key)
+                    if self.dialogue_box is not None:
+                        y = self._draw_dialogue_capacity_hint(screen, x, y, W, buf)
+                else:
+                    y = self._draw_text_field(screen, x, y, W, key, buf,
+                                              self._form_focus == key, form_key=key)
                 if key in ('x', 'y') and self._form_type in (
                         'pan_to', 'snap_to', 'move_to', 'fly_to', 'teleport'):
                     # Only draw the viewport-pick button once (after the first of x/y)
@@ -3860,10 +3947,10 @@ class CutsceneEditor:
                          (label_end_x, ruler_y + _TL_RULER_H),
                          (tl.right, ruler_y + _TL_RULER_H), 1)
 
-        # Clip time area — bottom edge is the panel's own bottom, not
-        # ruler_y + tl.height (which over-extends past tl.bottom by
-        # _TL_HDR_H and let scrolled rows bleed past the panel edge).
-        screen.set_clip(pygame.Rect(label_end_x, ruler_y, time_area_w, tl.bottom - ruler_y))
+        # Clip the ruler strip on its own (x-clip for horizontal scroll,
+        # y-bounded to just the ruler band) so tick-drawing below can't
+        # touch the row area or vice versa.
+        screen.set_clip(pygame.Rect(label_end_x, ruler_y, time_area_w, _TL_RULER_H))
 
         # Tick marks at 0.5s intervals, labels every 1s
         step = 0.5
@@ -3882,6 +3969,13 @@ class CutsceneEditor:
             t = round(t + step, 3)
 
         # ── Track rows ─────────────────────────────────────────────────────────
+        # Separate clip starting at tracks_y, NOT ruler_y — this is the fix.
+        # The old clip started at ruler_y and ran to tl.bottom, covering both
+        # the ruler band AND the row area in one rect. That let scrolled-up
+        # rows (e.g. the first row, Camera/Screen) draw past tracks_y into
+        # the ruler band, where nothing clipped them out, so they visibly
+        # painted over the ruler/ticks whenever _tl_scroll_y > 0.
+        screen.set_clip(pygame.Rect(label_end_x, tracks_y, time_area_w, tl.bottom - tracks_y))
         rows    = self._tl_visible_rows()
         actions = self.cutscene_data.get('actions', [])
 
@@ -3982,6 +4076,10 @@ class CutsceneEditor:
                              (tl.right, row_y + _TL_ROW_H - 1), 1)
 
         # ── Playhead ───────────────────────────────────────────────────────────
+        # This one legitimately spans the full ruler+rows height (it's a
+        # single deliberate element, not a row that can drift out of place
+        # from scrolling), so restore the full-height clip just for it.
+        screen.set_clip(pygame.Rect(label_end_x, ruler_y, time_area_w, tl.bottom - ruler_y))
         ph_x = label_end_x + self._tl_playhead_t * time_zoom - scroll_x
         if label_end_x <= ph_x <= tl.right:
             pygame.draw.line(screen, _C['playhead'],
@@ -4115,12 +4213,17 @@ class CutsceneEditor:
 
     def _draw_text_field(self, screen, x, y, W, _id, buf, focused,
                          form_key=None, actor_key=None):
-        """Draw a text input field and register it for click + keyboard routing.
+        """Draw a single-line text input field and register it for click + keyboard routing.
 
         Registers two entries each frame:
           self._btns[f'_field_{_id}']      → the hit rect for _handle_btn
           self._field_meta[f'_field_{_id}'] → (form_key, actor_key) so
               _handle_btn knows which buffer to send keypresses to.
+
+        Long text is clipped to the field width so it never spills into the
+        panel or neighbouring widgets. The view keeps the right end (caret)
+        visible while typing — same as a normal single-line input — and
+        prefixes an ellipsis when the start is cut off.
 
         Returns the Y coordinate immediately below the field (for flow layout).
         """
@@ -4128,14 +4231,143 @@ class CutsceneEditor:
         col = _C['accent'] if focused else _C['border']
         pygame.draw.rect(screen, _C['highlight'], r, border_radius=3)
         pygame.draw.rect(screen, col, r, 1, border_radius=3)
+
+        pad = 5
+        max_w = max(1, W - pad * 2)
         display = buf + ('|' if focused else '')
         t = self.font_small.render(display, True, _C['white'])
-        screen.blit(t, (r.x + 5, r.y + (24 - t.get_height()) // 2))
+        if t.get_width() > max_w:
+            # Trim from the left until (ellipsis + remainder) fits so the
+            # caret / end of the string stays visible.
+            ellipsis = '…'
+            cut = display
+            while cut and self.font_small.size(ellipsis + cut)[0] > max_w:
+                cut = cut[1:]
+            t = self.font_small.render(ellipsis + cut, True, _C['white'])
+        text_y = r.y + (24 - t.get_height()) // 2
+        prev_clip = screen.get_clip()
+        screen.set_clip(pygame.Rect(r.x + pad, r.y, max_w, r.height))
+        screen.blit(t, (r.x + pad, text_y))
+        screen.set_clip(prev_clip)
 
         field_btn_name = f'_field_{_id}'
         self._btns[field_btn_name] = r
         self._field_meta[field_btn_name] = (form_key, actor_key)
         return y + 26
+
+    def _wrap_field_lines(self, text, max_w):
+        """Word-wrap *text* to fit *max_w* pixels using font_small.
+
+        Preserves explicit '\\n' hard breaks. Oversized single words are
+        hard-broken character-by-character so nothing can ever exceed max_w.
+        Always returns at least one line (empty string when *text* is empty).
+        """
+        if max_w < 1:
+            max_w = 1
+        font = self.font_small
+        lines = []
+        paragraphs = text.split('\n') if text is not None else ['']
+        if not paragraphs:
+            paragraphs = ['']
+        for pi, paragraph in enumerate(paragraphs):
+            if paragraph == '':
+                lines.append('')
+                continue
+            words = paragraph.split(' ')
+            current = ''
+            for wi, word in enumerate(words):
+                # Preserve runs of spaces between words (split keeps empties
+                # only at edges for consecutive spaces, so rejoin with ' ').
+                candidate = word if current == '' else current + ' ' + word
+                if font.size(candidate)[0] <= max_w:
+                    current = candidate
+                    continue
+                if current != '':
+                    lines.append(current)
+                    current = ''
+                # Word alone is wider than the field — hard-break it.
+                if font.size(word)[0] <= max_w:
+                    current = word
+                else:
+                    chunk = ''
+                    for ch in word:
+                        if font.size(chunk + ch)[0] <= max_w:
+                            chunk += ch
+                        else:
+                            if chunk:
+                                lines.append(chunk)
+                            chunk = ch
+                    current = chunk
+            lines.append(current)
+        return lines if lines else ['']
+
+    def _draw_growing_text_field(self, screen, x, y, W, _id, buf, focused,
+                                 form_key=None, actor_key=None,
+                                 min_lines=2, max_lines=None):
+        """Discord-style multiline text box that grows downward as content wraps.
+
+        Used for the dialogue action's text param so long lines stay readable
+        inside the inspector instead of overflowing a single-line field.
+        Height tracks the wrapped line count (clamped to [min_lines, max_lines]);
+        max_lines defaults to the dialogue box's MAX_LINES when available so the
+        editor field never shows more than the in-game box can hold.
+
+        Enter inserts a hard newline (see _handle_text_field); Tab/Esc blur.
+        """
+        pad_x = 6
+        pad_y = 4
+        line_h = max(14, self.font_small.get_height() + 2)
+        max_w = max(1, W - pad_x * 2)
+
+        if max_lines is None:
+            if self.dialogue_box is not None:
+                max_lines = max(2, int(getattr(self.dialogue_box, 'MAX_LINES', 4)))
+            else:
+                max_lines = 6
+        max_lines = max(min_lines, max_lines)
+
+        # Wrap the raw buffer; caret is drawn on the last visual line only
+        # when focused (append '|' to the last wrapped line for simplicity).
+        lines = self._wrap_field_lines(buf or '', max_w)
+        # If the buffer ends with a trailing newline, wrap_field_lines already
+        # produced an empty last line — keep it so the caret sits on a new row.
+        n_content = len(lines)
+        n_rows = _clamp(n_content, min_lines, max_lines)
+        box_h = pad_y * 2 + n_rows * line_h
+
+        r = pygame.Rect(x, y, W, box_h)
+        col = _C['accent'] if focused else _C['border']
+        pygame.draw.rect(screen, _C['highlight'], r, border_radius=3)
+        pygame.draw.rect(screen, col, r, 1, border_radius=3)
+
+        prev_clip = screen.get_clip()
+        screen.set_clip(pygame.Rect(r.x + pad_x, r.y + pad_y, max_w, n_rows * line_h))
+
+        # If content exceeds the visible row budget, show the bottom-most lines
+        # so the caret / latest typing stays in view (Discord does the same).
+        start = max(0, n_content - n_rows)
+        visible = lines[start:start + n_rows]
+        # Pad with blank rows up to min_lines so an empty box still looks tall.
+        while len(visible) < n_rows:
+            visible.append('')
+
+        for i, line in enumerate(visible):
+            draw = line
+            # Caret on the last *content* line (or the padded empty last row
+            # when the buffer ends with '\\n' / is empty).
+            is_last_visible = (i == len(visible) - 1)
+            showing_tail = (start + i == n_content - 1) or (n_content == 0 and is_last_visible)
+            if focused and showing_tail:
+                draw = line + '|'
+            t = self.font_small.render(draw, True, _C['white'])
+            screen.blit(t, (r.x + pad_x, r.y + pad_y + i * line_h))
+
+        screen.set_clip(prev_clip)
+
+        field_btn_name = f'_field_{_id}'
+        self._btns[field_btn_name] = r
+        self._field_meta[field_btn_name] = (form_key, actor_key)
+        return y + box_h + 4
 
     def _draw_dialogue_capacity_hint(self, screen, x, y, W, buf):
         """Small 'lines used' readout under the dialogue text field, so the

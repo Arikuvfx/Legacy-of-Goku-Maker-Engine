@@ -460,16 +460,18 @@ class AnimatedSprite:
         self._scaled_frame_cache[id(frame)] = scaled
         return scaled
 
-    def draw(self, screen, x, y, camera=None, scale=1.0, hurt_tint=0.0, flash_white=False):
+    def draw(self, screen, x, y, camera=None, scale=1.0, hurt_tint=0.0, flash_white=0.0):
         """Draw the current frame at world position (x, y).
 
         hurt_tint is a 0.0-1.0 value that adds red via BLEND_RGB_ADD —
         this keeps transparent pixels clean instead of drawing a coloured box.
 
-        flash_white is the same idea but a flat white add, on/off rather
-        than graduated — used for Player.charged_melee_flash_on's blink
-        during the charged-melee wind-up. Stacks with hurt_tint if both are
-        ever true at once (unlikely, but neither excludes the other).
+        flash_white is the same idea but a flat white add — a 0.0-1.0
+        opacity used for Player.charged_melee_flash_amount's ramp/pulse
+        during the charged-melee wind-up (0 = no glow, 1 = full glow).
+        A plain bool still works (True behaves like 1.0). Stacks with
+        hurt_tint if both are ever active at once (unlikely, but neither
+        excludes the other).
 
         Note: `scale` is accepted for backwards compatibility but isn't used —
         on-screen size is driven entirely by RENDER_SCALE plus this sprite's
@@ -524,22 +526,24 @@ class AnimatedSprite:
 
             frame = self._get_scaled_frame(frame)
 
-            # Hurt tint / charged-melee flash: add colour to each pixel's RGB,
+            # Hurt tint / charged-melee glow: add colour to each pixel's RGB,
             # alpha untouched → no square artifact. Only copy when actually
-            # flashing, so the common case (neither active) just blits the
+            # active, so the common case (neither active) just blits the
             # cached scaled surface directly with no copy at all.
-            if hurt_tint > 0 or flash_white:
+            if hurt_tint > 0 or flash_white > 0:
                 frame = frame.copy()
                 if hurt_tint > 0:
                     red_amount = int(hurt_tint * 180)
                     frame.fill((red_amount, 0, 0), special_flags=pygame.BLEND_RGB_ADD)
-                if flash_white:
-                    # Was a flat (255, 255, 255) add, which drives every pixel
-                    # straight to pure white — effectively a 100%-opaque flash
-                    # with none of the sprite's detail showing through. Scale
-                    # it down the same way hurt_tint does above, landing in
-                    # the ~50-70% range instead.
-                    white_amount = int(0.65 * 255)
+                if flash_white > 0:
+                    # A flat (255, 255, 255) add at full strength drives every
+                    # pixel straight to pure white — effectively a 100%-opaque
+                    # flash with none of the sprite's detail showing through.
+                    # Scale it down the same way hurt_tint does above (landing
+                    # in the ~0-65% range), then further scale by flash_white
+                    # itself so the glow actually ramps/pulses in and out
+                    # instead of snapping on at a fixed strength.
+                    white_amount = int(min(1.0, flash_white) * 0.65 * 255)
                     frame.fill((white_amount, white_amount, white_amount), special_flags=pygame.BLEND_RGB_ADD)
 
             offset_x = self._scaled_width // 2

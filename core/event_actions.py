@@ -195,6 +195,16 @@ def skill(mode, skill_id):
     return {'type': 'skill', 'mode': mode, 'skill_id': skill_id}
 
 
+def transformation(mode, form_id):
+    """mode: 'add' | 'remove'. Grants/revokes one of the current character's
+    configured transformation forms (a costume with a
+    "{owning_costume}/transformations/{form}" entry, set up in the
+    character creator) — mirrors skill() above: a flat unlock list the
+    runtime gates transformability against, not a new transform of its
+    own. form_id is just the "{form}" tail of that costume path."""
+    return {'type': 'transformation', 'mode': mode, 'form_id': form_id}
+
+
 def set_player_character(character_id, skin_id=None):
     return {'type': 'set_player_character', 'character_id': character_id, 'skin_id': skin_id}
 
@@ -309,7 +319,7 @@ def set_custom_variable(var_name, mode, value=None):
 ACTION_TYPES = [
     'dialogue_box', 'set_portrait', 'dialogue_choice',
     'timer_start', 'timer_pause', 'timer_stop',
-    'zeni', 'item', 'level', 'exp', 'stat', 'resource', 'skill',
+    'zeni', 'item', 'level', 'exp', 'stat', 'resource', 'skill', 'transformation',
     'set_player_character', 'set_player_skin', 'character_list',
     'screen_fade', 'screen_shake', 'spam_qte', 'weather', 'room_music', 'play_sound',
     'play_character_animation', 'save_game', 'change_map',

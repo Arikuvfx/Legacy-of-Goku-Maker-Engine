@@ -2683,7 +2683,6 @@ class RoomEditor:
             self.object_editor.draw_animated_regions(zoom_surf, cam_x, cam_y)
             self.object_editor.draw_flying_pads(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_save_points(zoom_surf, cam_x, cam_y, self.colors)
-            self.object_editor.draw_music_objects(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_world_map_objects(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_level_gates(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_doors(zoom_surf, cam_x, cam_y, self.colors)

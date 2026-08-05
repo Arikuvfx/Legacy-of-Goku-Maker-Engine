@@ -1461,6 +1461,10 @@ class CutsceneRuntime:
                     speaker,
                     True, None,
                     portrait_key=portrait_key,
+                    # No portrait = narrator-style line in this format (see
+                    # cutscene_editor.py's "empty portrait = narrator" convention)
+                    # — float it mid-screen like the rest of the game does.
+                    is_narrator=(portrait_key is None),
                 )
                 self._active_dialogue_key = (self.elapsed, params.get('text', ''))
                 # Freeze the cutscene: snapshot every actor's state, idle them

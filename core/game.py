@@ -567,6 +567,7 @@ class Game:
         self.event_runner.register_handler('stat', self._handle_stat_action)
         self.event_runner.register_handler('resource', self._handle_resource_action)
         self.event_runner.register_handler('skill', self._handle_skill_action)
+        self.event_runner.register_handler('transformation', self._handle_transformation_action)
         self.event_runner.register_handler('character_list', self._handle_character_list_action)
         self.event_runner.register_handler('screen_fade', self._handle_screen_fade_action, blocking=True)
         self.event_runner.register_handler('screen_shake', self._handle_screen_shake_action)
@@ -824,16 +825,21 @@ class Game:
                 if self.ui.current_screen == 'game':
                     if event.key == pygame.K_f:
                         self.player.stop_blocking()
-                    # Charged Melee: releasing E cancels the wind-up if it
-                    # hasn't finished yet (same "early release cancels"
-                    # shape as the energy sword charge). Doesn't touch the
-                    # lunge/spin action itself once that's started — that
-                    # runs to completion regardless of key state, like the
-                    # sword spin's own free duration.
+                    # Charged Melee: releasing E either fires the lunge/spin
+                    # (if the white overlay has already reached full opacity
+                    # once — see charged_melee_ready) or cancels the wind-up
+                    # early (same "early release cancels" shape as the
+                    # energy sword charge) if it hasn't peaked yet. Doesn't
+                    # touch the lunge/spin action itself once that's
+                    # started — that runs to completion regardless of key
+                    # state, like the sword spin's own free duration.
                     if event.key == pygame.K_e:
                         self.player.is_e_pressed = False
                         if self.player.is_charging_melee:
-                            self.player.cancel_charging_melee()
+                            if self.player.charged_melee_ready:
+                                self.player.release_charged_melee()
+                            else:
+                                self.player.cancel_charging_melee()
                     # Release the beam charge when Q is lifted without having fired.
                     if event.key == pygame.K_q:
                         self.player.is_q_pressed = False
@@ -1045,8 +1051,9 @@ class Game:
             # is_untransforming) so a repeat press can't restart the
             # animation partway through.
             ts = self.player.transformation
-            if (self.player.ki_attack_mode == 'transform' and ts
-                    and not ts.is_transforming and not ts.is_untransforming):
+            if (self.player.ki_attack_mode == 'transform'
+                    and getattr(self.player, 'has_transformation', False)
+                    and ts and not ts.is_transforming and not ts.is_untransforming):
                 if ts.is_transformed:
                     ts.start_untransform()
                 elif ts.is_ready:
@@ -2515,6 +2522,7 @@ class Game:
         name = speaker_name or ('Narrator' if speaker_type == 'narrator' else '')
         self._event_dialogue_active = True
         self.dialogue_box.show(text, name, True, None, portrait_key=portrait,
+                                is_narrator=(speaker_type == 'narrator'),
                                 on_close=lambda: self._on_event_dialogue_closed(on_complete))
 
     def _on_event_dialogue_closed(self, on_complete):
@@ -2719,6 +2727,36 @@ class Game:
         elif mode == 'remove':
             if skill_id in equipped:
                 equipped.remove(skill_id)
+
+    def _handle_transformation_action(self, mode, form_id):
+        """EventRunner handler for the 'transformation' action — mode:
+        'add' | 'remove'. Mirrors _handle_skill_action above: player.
+        unlocked_transformations is a flat list of form-id strings (see
+        _transformation_form_id() / _reload_attack_config()'s
+        initialization of it), gating which of the current character's
+        configured transformation forms (costumes with a
+        "{owning_costume}/transformations/{form}" entry) are actually
+        available to trigger. 'add' is idempotent — no duplicate entries
+        if the form's already unlocked.
+
+        Unlike _handle_skill_action, a grant/revoke here can change
+        whether the COSTUME the player is currently wearing offers a
+        transformation at all, so this re-runs that gate immediately via
+        _refresh_transformation_gate() rather than waiting for the next
+        costume/character switch. It deliberately does NOT call
+        _reload_attack_config() again, which would also reset
+        equipped_attacks/ki_mode_config from disk and stomp any runtime
+        'skill' grants already applied this session."""
+        unlocked = getattr(self.player, 'unlocked_transformations', None)
+        if unlocked is None:
+            return
+        if mode == 'add':
+            if form_id not in unlocked:
+                unlocked.append(form_id)
+        elif mode == 'remove':
+            if form_id in unlocked:
+                unlocked.remove(form_id)
+        self._refresh_transformation_gate()
 
     def _handle_character_list_action(self, mode, character_id):
         """EventRunner handler for the 'character_list' action — mode: 'add' | 'remove'.
@@ -5666,6 +5704,80 @@ class Game:
             surf.blit(scaled_tile, (int(tile.x * RENDER_SCALE), int(tile.y * RENDER_SCALE)))
         return surf
 
+    @staticmethod
+    def _transformation_form_id(costume_path):
+        """Given a transformation entry's 'costume' field
+        ("{owning_costume}/transformations/{form}", see
+        _reload_attack_config()), return just the "{form}" tail — the id
+        player.unlocked_transformations and the 'transformation' event
+        action's form_id key off of. Returns '' if costume_path doesn't
+        look like a transformation entry at all. Mirrors
+        core/event_editor.py's module-level _transformation_form_id(),
+        which the event editor's transformation_id picker uses to build
+        its dropdown from the same on-disk config — keep the two in sync
+        if this parsing ever changes."""
+        marker = '/transformations/'
+        if marker not in (costume_path or ''):
+            return ''
+        return costume_path.split(marker, 1)[1]
+
+    def _refresh_transformation_gate(self, cfg=None):
+        """Recompute player.has_transformation for whichever costume the
+        player is CURRENTLY wearing, and detransform if it's no longer
+        available. Split out of _reload_attack_config() so
+        _handle_transformation_action()'s grant/revoke can re-run just
+        this gate immediately without also resetting equipped_attacks/
+        ki_mode_config from disk (which would stomp any runtime 'skill'
+        grants already applied this session).
+
+        cfg is the character-creator config dict for the currently played
+        character (character_creator.load_config(self.player.character))
+        — pass it when the caller already has it (as _reload_attack_config
+        does) to avoid loading it twice; loaded fresh from disk otherwise.
+
+        Transform is only offered as a ki mode if the costume the player
+        is CURRENTLY wearing actually has a transformation set up for it —
+        not just if *some* costume on this character has one — AND that
+        form is currently in player.unlocked_transformations.
+        Transformation entries are stored with costume =
+        "{owning_costume}/transformations/{form}", so scope the check to
+        entries owned by cfg['costume'].
+        """
+        if cfg is None:
+            cfg = character_creator.load_config(self.player.character)
+
+        _current_costume = cfg.get('costume', '')
+        _transform_prefix = f"{_current_costume}/transformations/"
+        _unlocked = getattr(self.player, 'unlocked_transformations', None) or []
+        self.player.has_transformation = any(
+            t.get('costume', '').startswith(_transform_prefix)
+            and self._transformation_form_id(t.get('costume', '')) in _unlocked
+            for t in cfg.get('transformations', [])
+        )
+
+        # If the costume now active doesn't have an unlocked transformation
+        # configured, fully deactivate the skill rather than just hiding it
+        # from the TAB cycle. Without this, a transformed/transforming state
+        # left over from a costume/form that DID have one keeps pointing the
+        # sprite loader at "{costume}/transformations/{form}" frames that
+        # don't exist/aren't unlocked for the new costume — which is what
+        # shows up as a stuck purple placeholder cube and freezes the
+        # character (see start_transform()/the sprite fallback in
+        # core/sprite_system.py).
+        if not self.player.has_transformation:
+            ts = getattr(self.player, 'transformation', None)
+            if ts is not None and (ts.is_transformed or ts.is_transforming or ts.is_untransforming):
+                ts.is_transformed            = False
+                ts.is_transforming           = False
+                ts.is_untransforming         = False
+                ts.current_transform_costume = None
+
+                if getattr(self.player, 'costume', 'base') != 'base':
+                    from core.sprite_system import create_character_sprite
+                    self.player.sprite  = create_character_sprite(
+                        self.player.character, 'base', 32, 32)
+                    self.player.costume = 'base'
+
     def _reload_attack_config(self, character_id):
         """(Re-)apply character_id's saved attack config to the live player:
         equipped attacks and ki mode. Used both when swapping to a different
@@ -5684,17 +5796,29 @@ class Game:
         # plays.
         self.player.charged_melee_style = atk.get('charged_melee_style', 'lunge')
 
-        # Transform is only offered as a ki mode if the costume this character
-        # is CURRENTLY wearing actually has a transformation set up for it —
-        # not just if *some* costume on this character has one. Transformation
-        # entries are stored with costume = "{owning_costume}/transformations/{form}",
-        # so scope the check to entries owned by cfg['costume'].
-        _current_costume = cfg.get('costume', '')
-        _transform_prefix = f"{_current_costume}/transformations/"
-        self.player.has_transformation = any(
-            t.get('costume', '').startswith(_transform_prefix)
+        # Every transformation form configured anywhere on this character
+        # (across all its costumes), keyed by form id (see
+        # _transformation_form_id() below) — the pool the 'transformation'
+        # event action's add/remove (_handle_transformation_action())
+        # mutates. Defaults to fully unlocked so a character with no
+        # explicit lock/unlock events behaves exactly as it did before
+        # this action existed. Reset on every reload (character switch or
+        # picking up character-creator edits), same as equipped_attacks
+        # above — a runtime grant/revoke doesn't persist across switching
+        # away from this character and back, same semantics as runtime
+        # skill grants.
+        self.player.unlocked_transformations = [
+            self._transformation_form_id(t.get('costume', ''))
             for t in cfg.get('transformations', [])
-        )
+            if self._transformation_form_id(t.get('costume', ''))
+        ]
+
+        # Recompute has_transformation (and detransform if it's no longer
+        # available) for the costume this character is currently wearing —
+        # split out into its own method so a 'transformation' action can
+        # re-run just this part later without resetting equipped_attacks/
+        # ki_mode_config above. See _refresh_transformation_gate().
+        self._refresh_transformation_gate(cfg=cfg)
 
         # Sync character-creator stats → player.stats so ki_regen (and any
         # other stat) takes effect the moment the creator saves.
@@ -8649,14 +8773,22 @@ class Game:
             self._room_tile_surfaces[key] = self._build_room_tile_surface(room_name, bg)
         surf = self._room_tile_surfaces[key]
 
-        self.logical_surface.blit(surf, (-int(self.camera.x), -int(self.camera.y)))
-        self._draw_animated_tile_overlay(
-            self.logical_surface, room_name, bg, int(self.camera.x), int(self.camera.y)
-        )
+        # Animated regions (layer -100) are meant to be the floor everything
+        # else sits on. The baked "bg" surface bundles EVERY negative tile
+        # layer (-100 through -1) into a single blit — there's no per-layer
+        # separation inside it — so the region has to be drawn BEFORE that
+        # surface. Drawing it after (the old order) put it on top of the
+        # whole bg bucket regardless of a tile's individual layer value,
+        # which is why -100/-99 tiles were still ending up underneath it.
         if bg:
             self._draw_animated_regions_overlay(
                 self.logical_surface, room_name, int(self.camera.x), int(self.camera.y)
             )
+
+        self.logical_surface.blit(surf, (-int(self.camera.x), -int(self.camera.y)))
+        self._draw_animated_tile_overlay(
+            self.logical_surface, room_name, bg, int(self.camera.x), int(self.camera.y)
+        )
 
     def blit_room_tiles(self, screen: 'pygame.Surface', room_name: str,
                         camera_x: int, camera_y: int, bg: bool):
@@ -8676,10 +8808,13 @@ class Game:
             self._room_tile_surfaces[key] = self._build_room_tile_surface(room_name, bg)
         surf = self._room_tile_surfaces.get(key)
         if surf:
-            screen.blit(surf, (-camera_x, -camera_y))
-            self._draw_animated_tile_overlay(screen, room_name, bg, camera_x, camera_y)
+            # See _draw_room_tiles for why this has to go before the bg blit:
+            # the baked surface bundles every negative tile layer together,
+            # so the region overlay must sit underneath it, not on top.
             if bg:
                 self._draw_animated_regions_overlay(screen, room_name, camera_x, camera_y)
+            screen.blit(surf, (-camera_x, -camera_y))
+            self._draw_animated_tile_overlay(screen, room_name, bg, camera_x, camera_y)
 
     def _draw_tile(self, tile):
         """Blit a single tile at its world position. Mostly used for one-off debug draws."""

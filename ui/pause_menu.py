@@ -967,10 +967,13 @@ class PauseMenu:
             sb_y=cy_start+40
             screen.blit(top_s,(sb_x,sb_y)); screen.blit(mid_s,(sb_x,sb_y+tip_h)); screen.blit(bot_s,(sb_x,sb_y+tip_h+mid_h))
 
+        right_edge = x + w - 8  # right boundary of the content area — values right-align to this
+
         def draw_right_stat(label,val,row):
             ry=cy_start+48+row*lh
             screen.blit(_yellow(self.stats_font.render(f'{label}:')),(right_col_x+32,ry))
-            screen.blit(_grey(self.stats_numbers_font.render(str(val))),(right_col_x+270,ry))
+            val_surf = _grey(self.stats_numbers_font.render(str(val)))
+            screen.blit(val_surf,(right_edge - val_surf.get_width(),ry))
 
         if is_active:
             hp,max_hp=getattr(player,'hp',0),getattr(player,'max_hp',1)

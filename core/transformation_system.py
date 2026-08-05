@@ -126,22 +126,32 @@ class TransformationSystem:
         Returns True if transformation animation started
         """
         if self.is_ready and not self.is_transformed and not self.is_transforming:
+            character = getattr(self.player.sprite, 'character', 'goku')
+
+            # Resolve the sprite folder for this transformation from the character
+            # config BEFORE committing to any state change. This replaces the old
+            # hardcoded 'ssj' costume string — SSJ is a transformation, not a
+            # costume, and its folder is defined in the character's JSON under
+            # "transformations[n].costume", scoped to whichever costume is
+            # currently worn.
+            transform_costume = self._resolve_transform_costume(character)
+            if not transform_costume:
+                # The active costume has no transformation registered — nothing
+                # to transform into. Bail out here rather than starting the
+                # transform animation and having nowhere to land (leaves the
+                # player stuck on a placeholder sprite).
+                return False
+
             self.is_transforming = True
             self.is_ready = False
             self.transform_animation_progress = 0.0  # Reset animation progress
 
             # Store original sprite info
             if not self.original_character:
-                self.original_character = getattr(self.player.sprite, 'character', 'goku')
+                self.original_character = character
                 self.original_costume = getattr(self.player.sprite, 'costume', 'base')
 
-            # Resolve the sprite folder for this transformation from the character config.
-            # This replaces the old hardcoded 'ssj' costume string — SSJ is a
-            # transformation, not a costume, and its folder is defined in the
-            # character's JSON under "transformations[n].costume".
-            self.current_transform_costume = self._resolve_transform_costume(
-                self.original_character
-            )
+            self.current_transform_costume = transform_costume
 
             # Set transformation animation
             self.player.sprite.set_animation('transform', self.player.direction)
@@ -245,7 +255,7 @@ class TransformationSystem:
         self.transform_animation_progress = 0.0
         self.current_transform_costume = None
 
-    def _resolve_transform_costume(self, char_id: str) -> str:
+    def _resolve_transform_costume(self, char_id: str):
         """Return the costume path for the player's active transformation.
 
         Sourced from assets/characters/{char_id}.json — the same config
@@ -270,19 +280,33 @@ class TransformationSystem:
         from dev_tools import character_creator
 
         cfg = character_creator.load_config(char_id)
+
+        # Scope to the costume this character is CURRENTLY configured to
+        # wear — the same cfg["costume"] field game.py's has_transformation
+        # check uses to decide whether "transform" is even offered as a ki
+        # mode. Previously this took transformations[0] unconditionally,
+        # so a character with a transformation on one costume but not
+        # another would resolve to whichever costume's transformation
+        # happened to be registered first — not necessarily the one
+        # actually being worn — pointing the sprite loader at frames that
+        # don't exist for the active costume (the stuck purple placeholder
+        # cube / freeze).
+        active_costume = cfg.get("costume") or "base"
+        prefix = f"{active_costume}/transformations/"
+
         transformations = cfg.get("transformations", [])
-        if transformations:
-            costume = transformations[0].get("costume")
-            if costume:
+        for t in transformations:
+            costume = t.get("costume")
+            if costume and costume.startswith(prefix):
                 return costume
 
-        # Fallback: no transformations registered in the config (e.g. an old
-        # project whose sprites were never run through sync_transformations()).
-        # Scan the filesystem directly as a last resort so this doesn't just
-        # silently fail — this mirrors discover_transformations()'s nested path.
+        # Fallback: no transformation registered in the config for the
+        # active costume (e.g. an old project whose sprites were never run
+        # through sync_transformations()). Scan the filesystem directly as
+        # a last resort, scoped the same way — this mirrors
+        # discover_transformations()'s nested path.
         import os
-        base_costume = cfg.get("costume") or "base"
-        transforms_dir = f"assets/sprites/player/{char_id}/{base_costume}/transformations"
+        transforms_dir = f"assets/sprites/player/{char_id}/{active_costume}/transformations"
         if os.path.isdir(transforms_dir):
             entries = sorted(
                 e for e in os.listdir(transforms_dir)
@@ -290,9 +314,14 @@ class TransformationSystem:
                 and not e.startswith(".")
             )
             if entries:
-                return f"{base_costume}/transformations/{entries[0]}"
+                return f"{active_costume}/transformations/{entries[0]}"
 
-        return "ssj"  # legacy last-resort fallback
+        # Nothing found for the active costume — return None rather than
+        # guessing a hardcoded folder name that may not exist for this
+        # character. start_transform() treats this as "nothing to
+        # transform into" and aborts instead of starting an animation with
+        # nowhere to land.
+        return None
 
     def add_progress(self, amount):
         """Manually add progress (for special events, items, etc)"""

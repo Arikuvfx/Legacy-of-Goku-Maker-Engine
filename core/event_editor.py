@@ -117,6 +117,50 @@ def _discover_costume_ids(character_id):
         return []
 
 
+def _transformation_form_id(costume_path):
+    """Given a transformation entry's 'costume' field
+    ("{owning_costume}/transformations/{form}", per game.py's
+    _reload_attack_config()), return just the "{form}" tail — the id the
+    'transformation' event action's add/remove and player.
+    unlocked_transformations key off of. Returns '' if costume_path
+    doesn't look like a transformation entry at all."""
+    marker = '/transformations/'
+    if marker not in (costume_path or ''):
+        return ''
+    return costume_path.split(marker, 1)[1]
+
+
+def _discover_transformation_ids(character_id):
+    """Transformation form ids configured anywhere on a SPECIFIC character
+    (across all its costumes), sourced from that character's saved config
+    (assets/characters/{id}.json, via character_creator's
+    load_config()['transformations'] — the same list game.py's
+    _reload_attack_config() reads to compute has_transformation). Scoped
+    per-character like _discover_costume_ids() above rather than global
+    like _discover_skill_ids(), since transformation forms are authored
+    per costume, not shared across the roster. Same best-effort
+    fallback-import pattern as the other _discover_* helpers; returns []
+    if character_id is falsy or nothing can be loaded."""
+    if not character_id:
+        return []
+    try:
+        from dev_tools.character_creator import load_config
+    except Exception:
+        try:
+            from character_creator import load_config
+        except Exception:
+            return []
+    try:
+        cfg = load_config(character_id)
+        return sorted({
+            _transformation_form_id(t.get('costume', ''))
+            for t in cfg.get('transformations', [])
+            if _transformation_form_id(t.get('costume', ''))
+        })
+    except Exception:
+        return []
+
+
 def _discover_animation_ids(character_id):
     """Base animation ids for a SPECIFIC character (e.g. 'idle', 'walk',
     'attack'), sourced from the character creator's own filesystem scan
@@ -406,6 +450,7 @@ def _placeholder_for(field_name, field_kind, kind=None):
         'flag_picker': '<select flag>',
         'char_picker': '<select character>',
         'skill_picker': '<select skill>',
+        'transformation_picker': '<select transformation>',
         'skin_picker': '<select skin>',
         'animation_picker': '<select animation>',
         'portrait_picker': '<select portrait>',
@@ -1244,6 +1289,7 @@ ACTION_SCHEMA = {
                  ('resource_name', 'choice', ['health', 'energy', 'transformation_gauge']),
                  ('amount', 'number', None)],
     'skill': [('mode', 'choice', ['add', 'remove']), ('skill_id', 'skill_picker', None)],
+    'transformation': [('mode', 'choice', ['add', 'remove']), ('form_id', 'transformation_picker', None)],
     'set_player_character': [('character_id', 'char_picker', None), ('skin_id', 'skin_picker', None)],
     'set_player_skin': [('skin_id', 'skin_picker', None)],
     'character_list': [('mode', 'choice', ['add', 'remove']), ('character_id', 'char_picker', None)],
@@ -1364,6 +1410,7 @@ class ActionSequenceBuilder:
         self._known_cutscenes = []
         self._open_skill_dropdown = None      # (row_index, field_name) whose skill picker is open
         self._known_skills = []
+        self._open_transformation_dropdown = None  # (row_index, field_name) whose transformation picker is open
         # Which character's equipped-skill list backs the skill_id picker's
         # 'add'/'remove' options — set externally via set_current_character()
         # (e.g. by the room editor, from self.player.character) since this
@@ -1378,6 +1425,15 @@ class ActionSequenceBuilder:
         # disk) would show stale data — skills added at runtime wouldn't
         # show up as equipped, and the 'add' filter wouldn't exclude them.
         self._get_equipped_skills = None
+        # Same idea as _get_equipped_skills, but for the transformation
+        # picker's 'add'/'remove' options — a callable returning the LIVE
+        # unlocked-forms list (e.g. lambda: self.player.
+        # unlocked_transformations), also supplied via
+        # set_current_character(). Falls back to treating every configured
+        # form as unlocked (see _transformation_choices_for_row()) when
+        # unset, matching the default-fully-unlocked behavior in
+        # game.py's _reload_attack_config().
+        self._get_unlocked_transformations = None
         # Which room the 'x' position_picker for set_player_location should
         # preview/place against — set externally via set_current_room()
         # (e.g. by the room editor/trigger box editor, from the room the
@@ -1425,7 +1481,8 @@ class ActionSequenceBuilder:
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
-    def set_current_character(self, character_id, get_equipped_skills=None):
+    def set_current_character(self, character_id, get_equipped_skills=None,
+                               get_unlocked_transformations=None):
         """Tell this builder which character's equipped-skill list should
         back the skill_id picker's 'add'/'remove' options — see
         _current_character_id/_get_equipped_skills in __init__ and
@@ -1434,9 +1491,16 @@ class ActionSequenceBuilder:
         whenever the host knows who it's authoring for; safe to call every
         frame the event editor is open, not just once, since equipped
         skills can change live while it's open (e.g. from a triggered
-        event testing itself)."""
+        event testing itself).
+
+        get_unlocked_transformations is the same idea for the
+        transformation_picker — pass e.g. lambda: self.player.
+        unlocked_transformations so 'remove' rows only offer forms
+        actually unlocked right now, same rationale as
+        get_equipped_skills. See _transformation_choices_for_row()."""
         self._current_character_id = character_id
         self._get_equipped_skills = get_equipped_skills
+        self._get_unlocked_transformations = get_unlocked_transformations
 
     def set_current_room(self, room_name):
         """Tell this builder which room set_player_location's 'x' position
@@ -1522,6 +1586,47 @@ class ActionSequenceBuilder:
         available = [s for s in self._known_skills if s not in equipped]
         return available, '(all skills equipped)'
 
+    def _transformation_choices_for_row(self, row_index):
+        """Return (names, placeholder) for the transformation form_id
+        picker on a given row, scoped to that row's 'mode' — same shape
+        as _skill_choices_for_row() above, but forms are per-character
+        (like costumes) rather than a shared global roster (like skills),
+        so both branches start from _discover_transformation_ids(current
+        character) instead of a cached self._known_* list:
+          - 'remove' → only forms currently unlocked for
+            self._current_character_id (prefers the live
+            get_unlocked_transformations() callback over "every
+            configured form", since a runtime 'transformation' action's
+            grants/revokes are never written back to the character
+            creator's saved config — same rationale as
+            _get_equipped_skills. Falls back to treating every configured
+            form as unlocked when no callback is set, matching
+            game.py's default-fully-unlocked behavior).
+          - 'add'    → configured forms the character does NOT already
+            have unlocked (so picking one can't silently no-op).
+        Needs the current character to filter correctly; if none is set,
+        that's surfaced via the placeholder rather than silently falling
+        back to an unscoped list (there isn't one to fall back to)."""
+        row = self.rows[row_index] if 0 <= row_index < len(self.rows) else None
+        mode = row['params'].get('mode') if row else None
+
+        if not self._current_character_id:
+            return [], '(no character set)'
+
+        configured = _discover_transformation_ids(self._current_character_id)
+
+        if self._get_unlocked_transformations is not None:
+            unlocked = list(self._get_unlocked_transformations() or [])
+        else:
+            unlocked = configured
+
+        if mode == 'remove':
+            return unlocked, '(no transformations unlocked)'
+
+        # mode == 'add' (or unset/default)
+        available = [f for f in configured if f not in unlocked]
+        return available, '(all transformations unlocked)'
+
     def _costume_choices_for_row(self, row_index):
         """Return (names, placeholder) for the skin_id picker on a given
         row. Costumes are per-character, so unlike the skill picker there's
@@ -1605,6 +1710,7 @@ class ActionSequenceBuilder:
         self._known_cutscenes = _discover_cutscene_ids()
         self._open_skill_dropdown = None
         self._known_skills = _discover_skill_ids()
+        self._open_transformation_dropdown = None
         self._open_skin_dropdown = None
         self._open_animation_dropdown = None
         self._known_weather_types = _discover_weather_types()
@@ -1975,6 +2081,18 @@ class ActionSequenceBuilder:
             self._open_skill_dropdown = None
             return
 
+        # Transformation picker dropdown open
+        if self._open_transformation_dropdown is not None:
+            for rect, name in self._rects.get('transformation_dropdown_items', []):
+                if rect.collidepoint(mouse_pos):
+                    row_index, field_name = self._open_transformation_dropdown
+                    if 0 <= row_index < len(self.rows):
+                        self.rows[row_index]['params'][field_name] = name
+                    self._open_transformation_dropdown = None
+                    return
+            self._open_transformation_dropdown = None
+            return
+
         # Skin/costume picker dropdown open
         if self._open_skin_dropdown is not None:
             for rect, name in self._rects.get('skin_dropdown_items', []):
@@ -2113,6 +2231,7 @@ class ActionSequenceBuilder:
                 self._open_npc_dropdown = None
                 self._open_cutscene_dropdown = None
                 self._open_skill_dropdown = None
+                self._open_transformation_dropdown = None
                 self._open_skin_dropdown = None
                 self._open_animation_dropdown = None
                 self._open_weather_dropdown = None
@@ -2218,6 +2337,14 @@ class ActionSequenceBuilder:
                     picker_btn = row_rects.get('skill_dropdown_btn_' + field_name)
                     if picker_btn and picker_btn.collidepoint(mouse_pos):
                         self._open_skill_dropdown = (row_index, field_name)
+                        self._open_type_dropdown_row = None
+                    else:
+                        self._active_field = (row_index, field_name)
+                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
+                elif field_kind == 'transformation_picker':
+                    picker_btn = row_rects.get('transformation_dropdown_btn_' + field_name)
+                    if picker_btn and picker_btn.collidepoint(mouse_pos):
+                        self._open_transformation_dropdown = (row_index, field_name)
                         self._open_type_dropdown_row = None
                     else:
                         self._active_field = (row_index, field_name)
@@ -2390,6 +2517,12 @@ class ActionSequenceBuilder:
                         pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
+                    elif field_kind == 'transformation_picker':
+                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
+                        row_rects['transformation_dropdown_btn_' + field_name] = btn_rect
+                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        arrow = self.font_small.render('v', True, colors['text_dim'])
+                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
                     elif field_kind == 'skin_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['skin_dropdown_btn_' + field_name] = btn_rect
@@ -2469,7 +2602,7 @@ class ActionSequenceBuilder:
                         display = self._active_text if active else row['params'].get(field_name, '')
                         if not active and display == '':
                             display = _placeholder_for(field_name, field_kind) \
-                                if field_kind in ('portrait_picker', 'char_picker', 'enemy_picker', 'npc_picker', 'cutscene_picker', 'skill_picker', 'skin_picker', 'animation_picker', 'weather_picker', 'music_picker', 'sound_picker', 'room_picker', 'world_map_picker', 'wm_location_picker') else '<%s>' % field_name
+                                if field_kind in ('portrait_picker', 'char_picker', 'enemy_picker', 'npc_picker', 'cutscene_picker', 'skill_picker', 'transformation_picker', 'skin_picker', 'animation_picker', 'weather_picker', 'music_picker', 'sound_picker', 'room_picker', 'world_map_picker', 'wm_location_picker') else '<%s>' % field_name
                     fclip = pygame.Rect(field_rect.x + 4, field_rect.y, field_rect.w - 8, field_rect.h)
                     screen.set_clip(fclip)
                     text_surf = self.font_small.render(str(display), True, colors['text'])
@@ -2534,6 +2667,11 @@ class ActionSequenceBuilder:
                 real, placeholder = self._skill_choices_for_row(row_index)
                 names = real or [placeholder]
                 self._draw_skill_dropdown(screen, x, cur_y, row_index)
+                cur_y += len(names[:8]) * 22
+            elif self._open_transformation_dropdown is not None and self._open_transformation_dropdown[0] == row_index:
+                real, placeholder = self._transformation_choices_for_row(row_index)
+                names = real or [placeholder]
+                self._draw_transformation_dropdown(screen, x, cur_y, row_index)
                 cur_y += len(names[:8]) * 22
             elif self._open_skin_dropdown is not None and self._open_skin_dropdown[0] == row_index:
                 real, placeholder = self._costume_choices_for_row(row_index)
@@ -3189,6 +3327,30 @@ class ActionSequenceBuilder:
             if real:
                 items.append((item_rect, name))
         self._rects['skill_dropdown_items'] = items
+
+    def _draw_transformation_dropdown(self, screen, x, list_y, row_index):
+        """Transformation form list depends on the row's own 'mode', via
+        _transformation_choices_for_row(): 'remove' shows only what
+        self._current_character_id actually has unlocked (so you can't
+        pick a form to remove that was never unlocked); 'add' shows only
+        forms configured on that character that aren't unlocked yet (so
+        you can't pick one that's already unlocked)."""
+        colors = self.colors
+        items = []
+        list_w = 180
+        real, placeholder = self._transformation_choices_for_row(row_index)
+        names = real or [placeholder]
+        visible = names[:8]
+        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
+        pygame.draw.rect(screen, colors['panel_light'], list_rect)
+        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        for i, name in enumerate(visible):
+            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
+            label = self.font_small.render(name, True, colors['text'])
+            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
+            if real:
+                items.append((item_rect, name))
+        self._rects['transformation_dropdown_items'] = items
 
     def _draw_skin_dropdown(self, screen, x, list_y, row_index):
         """Skin/costume list depends on which character it's scoped to, via
