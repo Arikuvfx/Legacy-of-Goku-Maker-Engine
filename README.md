@@ -1,6 +1,32 @@
 # Legacy-of-Goku-Maker-Engine
 This is a WIP LOG Series Maker Engine with the goal to have an easy engine to use to make fan games of the Legacy of Goku Series, developed by Ariku but being an open source project.
 
+Version 0.1.5
+
+```
+Changes/Additions:
+- added animated regions
+- added level up notification and hud icon
+- added trigger object
+- added flag system -> conditions <-> actions
+- removed music object (obsolete)
+- removed cutscene trigger ((obsolete)
+- added all of Buu's Fury attacks
+- added zeni drops by enemies
+- added charged attacks
+- added blocking
+- added door object
+- added timer
+- added more sounds
+- adjusted speed of animations to closer match original games
+- probably added other stuff I forgot about.
+
+Major Bugfixes:
+- fixed performance issues
+- too much.
+````
+
+
 Version 0.1.0 - Hotfix
 
 ```
