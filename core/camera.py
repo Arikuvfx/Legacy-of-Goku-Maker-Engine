@@ -45,6 +45,17 @@ class Camera:
         self._lerp_active  = True
         self._lerp_speed   = 4.0   # higher = faster catch-up (good range: 3–8)
 
+        # True until the camera has positioned itself at least once. _true_x/
+        # _true_y start at (0, 0) above — the top-left corner — because the
+        # camera has no target yet at construction time. Without this flag,
+        # the *first* update() call would ease from that (0, 0) origin all
+        # the way to the target's actual position, visibly sliding in from
+        # the corner instead of appearing on the target immediately (most
+        # noticeable at game start, but the same gap can appear any time
+        # code repositions the target without also calling snap()). The flag
+        # forces exactly one instant, non-eased positioning, then clears.
+        self._needs_snap = True
+
         # When True the camera position is frozen — the player is no longer tracked.
         # Used during the world-map jump sequence so the camera doesn't follow
         # the player off-screen.
@@ -68,6 +79,22 @@ class Camera:
         self.shake_intensity = intensity
         self.shake_duration  = duration
         self.shake_timer     = duration
+
+    def snap(self):
+        """
+        Force the *next* update() call to position the camera on its target
+        instantly, bypassing the smooth-follow ease for one frame.
+
+        Call this any time the target has just been placed or moved
+        directly (game start, room spawn, save load, teleport) rather than
+        hand-computing and assigning camera.x/camera.y yourself — a manual
+        assignment only sets the rendered position for one frame, but
+        leaves _true_x/_true_y stale, so the very next tracked update()
+        would lerp from that old internal position back up to the correct
+        one, reproducing the same corner-to-target slide this exists to
+        prevent.
+        """
+        self._needs_snap = True
 
     def update(self, target, world_width, world_height, dt=0):
         """
@@ -106,7 +133,7 @@ class Camera:
         desired_x = target_screen_x - self.screen_width  // 2
         desired_y = target_screen_y - self.screen_height // 2
 
-        if self._lerp_active and dt > 0:
+        if self._lerp_active and dt > 0 and not self._needs_snap:
             # Exponential ease toward the target. This is what produces the
             # deliberate follow-lag while walking/running — the camera keeps
             # chasing a moving target, so the gap never closes until the
@@ -124,6 +151,7 @@ class Camera:
         else:
             self._true_x = desired_x
             self._true_y = desired_y
+            self._needs_snap = False
 
         # Clamp the true (un-shaken) position to room bounds, or centre for
         # rooms smaller than the screen.

@@ -2,6 +2,11 @@ import os
 import pygame
 import pygame.gfxdraw
 
+from core.items import (
+    get_items_by_category, CATEGORY_SUPPLIES, CATEGORY_STORY_ITEMS, CATEGORY_EQUIP_BODY,
+    CATEGORY_EQUIP_HANDS, CATEGORY_EQUIP_FEET, CATEGORY_EQUIP_ACCESSORY,
+)
+
 
 class EditorToolbar:
     """
@@ -24,6 +29,30 @@ class EditorToolbar:
       • call toolbar.handle_mousemotion(pos) on MOUSEMOTION
       • call toolbar.handle_scroll(direction) on scroll-wheel events
       • call toolbar.sync_from_room(room.scrolling_bg) when the active room changes
+
+    Item panel
+    ----------
+    Clicking the 'Items' tool button opens a floating panel that lists every
+    consumable and equip item defined in core/items.py (grouped by category,
+    per ITEM_CATEGORY_LABELS), so designers can browse what exists and see
+    its icon/description. Clicking a thumbnail SELECTS that item (highlighted
+    border, panel closes) and clicking the same thumbnail again deselects it.
+
+    The current selection is exposed via get_selected_item_id() (returns ''
+    when nothing's selected) and can be cleared with clear_selected_item().
+    EditorToolbar itself never places anything — this is just "what item is
+    armed right now"; a caller such as ObjectEditor reads it and decides
+    what a world click does with it (e.g. clicking a placed chest while an
+    item is selected assigns that item as the chest's loot). The 'Items'
+    tool button gets a lit border whenever a selection is active, the same
+    way the 'Background' button glows when a background image is set, so
+    the armed state is visible even with the panel closed.
+
+    Equip-item sprites live in a subfolder of ITEM_SPRITE_DIR rather than
+    directly in it (e.g. assets/sprites/items/equipment/body/*.png) — see
+    ITEM_CATEGORY_SUBDIRS. Adding a new equip category later means adding
+    both a ITEM_CATEGORY_LABELS entry and, if its sprites live in a
+    subfolder, an ITEM_CATEGORY_SUBDIRS entry.
     """
 
     # ── Background panel constants ────────────────────────────────────────────
@@ -35,6 +64,29 @@ class EditorToolbar:
     SLIDER_H     = 14
     SLIDER_TRACK = 6
     SCROLL_MAX   = 400.0   # ±px/s range for scroll_x and scroll_y
+
+    # ── Item panel constants ────────────────────────────────────────────────
+    ITEM_SPRITE_DIR = os.path.join('assets', 'sprites', 'items')
+    ITEM_THUMB_SIZE  = 72
+    ITEM_THUMB_PAD   = 10
+    ITEM_COLS        = 5
+    ITEM_PANEL_W     = ITEM_COLS * (ITEM_THUMB_SIZE + ITEM_THUMB_PAD) + ITEM_THUMB_PAD + 16
+    ITEM_CATEGORY_LABELS = {
+        CATEGORY_SUPPLIES:    'Supplies',
+        CATEGORY_STORY_ITEMS: 'Story Items',
+        CATEGORY_EQUIP_BODY:      'Equipment (Body)',
+        CATEGORY_EQUIP_HANDS:     'Equipment (Hands)',
+        CATEGORY_EQUIP_FEET:      'Equipment (Feet)',
+        CATEGORY_EQUIP_ACCESSORY: 'Equipment (Accessory)',
+    }
+    # Categories whose sprites live in a subfolder of ITEM_SPRITE_DIR rather
+    # than directly in it (e.g. assets/sprites/items/equipment/body/*.png).
+    ITEM_CATEGORY_SUBDIRS = {
+        CATEGORY_EQUIP_BODY:      os.path.join('equipment', 'body'),
+        CATEGORY_EQUIP_HANDS:     os.path.join('equipment', 'hands'),
+        CATEGORY_EQUIP_FEET:      os.path.join('equipment', 'feet'),
+        CATEGORY_EQUIP_ACCESSORY: os.path.join('equipment', 'accessories'),
+    }
 
     def __init__(self, screen_width, screen_height):
         self.screen_width  = screen_width
@@ -80,16 +132,26 @@ class EditorToolbar:
             {'id': 'settings',   'label': 'Room',       'icon': self._create_settings_icon,   'tooltip': 'Room properties'},
             {'id': 'weather',    'label': 'Weather',    'icon': self._create_weather_icon,    'tooltip': 'Add weather effects'},
             {'id': 'background', 'label': 'Background', 'icon': self._create_background_icon, 'tooltip': 'Set scrolling background (assets/bg)'},
+            {'id': 'map_paint',  'label': 'Map',         'icon': self._create_map_paint_icon,  'tooltip': 'Paint the Scouter minimap shape (F6)'},
         ]
 
         # Right-side action buttons
         self.actions = [
+            {'id': 'grid', 'label': 'Grid: 16px', 'icon': self._create_grid_icon, 'tooltip': 'Placement grid: 16px — click to cycle (Off / 8px / 16px)', 'color': (150, 220, 150)},
             {'id': 'zoom', 'label': 'Zoom', 'icon': self._create_zoom_icon, 'tooltip': 'Zoom to fit whole room',  'color': (100, 200, 255)},
             {'id': 'test', 'label': 'Test', 'icon': self._create_play_icon, 'tooltip': 'Test room (F5)',          'color': self.colors['success']},
             {'id': 'save', 'label': 'Save', 'icon': self._create_save_icon, 'tooltip': 'Save room (Ctrl+S)',      'color': self.colors['accent']},
         ]
 
         self.zoom_active = False
+
+        # ── Placement grid state ────────────────────────────────────────────
+        # Quick, global "snap grid" size shared by tile painting and object /
+        # entity placement & repositioning. 0 == no grid (free placement).
+        # Cycled via the 'Grid' action button (or read with get_grid_size()).
+        self.grid_sizes      = [0, 8, 16]
+        self.grid_size_index = 2  # default 16px, matches prior always-on snap behaviour
+        self._sync_grid_label()
 
         # Hover tracking
         self.hover_tool   = None
@@ -127,6 +189,18 @@ class EditorToolbar:
         self._bg_clear_rect   = pygame.Rect(0, 0, 0, 0)
         self._bg_scan_done    = False
 
+        # ── Item panel state ───────────────────────────────────────────────────
+        self.item_panel_open  = False
+        self._item_sections:  list = []   # [(label, [item_id, ...]), ...]
+        self._item_icons:     dict = {}   # item_id → Surface | None
+        self._item_scroll     = 0
+        self._item_hover      = ''        # hovered item_id
+        self._item_rects:     dict = {}   # item_id → Rect (grid cell, for hover/tooltip)
+        self._item_panel_rect = pygame.Rect(0, 0, 0, 0)
+        self._item_grid_rect  = pygame.Rect(0, 0, 0, 0)
+        self._items_scan_done = False
+        self.selected_item_id = ''  # item id currently armed for placement/assignment, '' = none
+
     # =========================================================================
     # Public API
     # =========================================================================
@@ -148,6 +222,50 @@ class EditorToolbar:
         result['scroll_y'] = self._bg_scroll_y
         result['parallax'] = self._bg_parallax
         return result
+
+    def get_selected_item_id(self) -> str:
+        """The item id currently armed via the Items panel, or '' if none.
+        Callers (e.g. ObjectEditor) use this to decide what a world click
+        should do — assigning it as a chest's loot, etc."""
+        return self.selected_item_id
+
+    def clear_selected_item(self):
+        """Disarm the current item selection, e.g. after a caller consumes
+        it or the user presses ESC."""
+        self.selected_item_id = ''
+
+    def get_grid_size(self) -> int:
+        """Current placement/snap grid size in world pixels. 0 means no grid
+        (free placement). Shared by tile painting and object/entity
+        placement & repositioning — callers should snap to this value
+        wherever they currently hard-code a fixed tile size for that
+        purpose."""
+        return self.grid_sizes[self.grid_size_index]
+
+    def set_grid_size(self, size: int):
+        """Explicitly set the placement grid size, snapping to the nearest
+        supported value (0 / 8 / 16) if given something else."""
+        if size in self.grid_sizes:
+            self.grid_size_index = self.grid_sizes.index(size)
+        else:
+            self.grid_size_index = min(
+                range(len(self.grid_sizes)),
+                key=lambda i: abs(self.grid_sizes[i] - size)
+            )
+        self._sync_grid_label()
+
+    def _cycle_grid_size(self):
+        self.grid_size_index = (self.grid_size_index + 1) % len(self.grid_sizes)
+        self._sync_grid_label()
+
+    def _sync_grid_label(self):
+        size = self.grid_sizes[self.grid_size_index]
+        label = 'Grid: Off' if size == 0 else f'Grid: {size}px'
+        for a in self.actions:
+            if a['id'] == 'grid':
+                a['label']   = label
+                a['tooltip'] = f'Placement grid: {"Off" if size == 0 else f"{size}px"} — click to cycle (Off / 8px / 16px)'
+                break
 
     def update(self, dt, mouse_pos):
         self.anim_timer   += dt
@@ -188,6 +306,14 @@ class EditorToolbar:
                     self._bg_hover = fname
                     break
 
+        # Hover detection inside item panel
+        if self.item_panel_open:
+            self._item_hover = ''
+            for iid, rect in self._item_rects.items():
+                if rect.collidepoint(mouse_pos):
+                    self._item_hover = iid
+                    break
+
     def handle_click(self, mouse_pos) -> "str | None":
         """
         Returns a token string or None.
@@ -209,6 +335,28 @@ class EditorToolbar:
                 self.bg_panel_open = False
             return None
 
+        # Item panel intercepts all clicks when open. Clicking a thumbnail
+        # arms/disarms that item (see get_selected_item_id) and closes the
+        # panel; clicking elsewhere inside the panel is a no-op; clicking
+        # outside it just closes the panel without changing the selection.
+        if self.item_panel_open:
+            for item_id, rect in self._item_rects.items():
+                if rect.collidepoint(mouse_pos):
+                    self.selected_item_id = '' if item_id == self.selected_item_id else item_id
+                    self.item_panel_open = False
+                    # Hand control back to the 'objects' tool so world
+                    # clicks route to ObjectEditor again — arming an item
+                    # is only useful if the click that follows can reach
+                    # ObjectEditor.handle_input (e.g. to hit a chest).
+                    # Without this, current_tool stays 'items' (set when
+                    # the Items button was first clicked) and nothing in
+                    # the world is interactable afterward.
+                    self.current_tool = 'objects'
+                    return 'item_selected' if self.selected_item_id else 'item_deselected'
+            if not self._item_panel_rect.collidepoint(mouse_pos):
+                self.item_panel_open = False
+            return None
+
         # Tool buttons
         tool_start_x = self.padding
         for i, tool in enumerate(self.tools):
@@ -216,10 +364,18 @@ class EditorToolbar:
                             self.padding, self.tool_size, self.tool_size)
             if r.collidepoint(mouse_pos):
                 if tool['id'] == 'background':
+                    self.item_panel_open = False
                     self.bg_panel_open = not self.bg_panel_open
                     if self.bg_panel_open:
                         self._ensure_bg_scanned()
                     return 'background_toggle'
+                if tool['id'] == 'items':
+                    self.bg_panel_open = False
+                    self.item_panel_open = not self.item_panel_open
+                    if self.item_panel_open:
+                        self._ensure_items_scanned()
+                    self.current_tool = tool['id']
+                    return 'items_toggle'
                 self.current_tool = tool['id']
                 return tool['id']
 
@@ -232,6 +388,8 @@ class EditorToolbar:
             if r.collidepoint(mouse_pos):
                 if action['id'] == 'zoom':
                     self.zoom_active = not self.zoom_active
+                elif action['id'] == 'grid':
+                    self._cycle_grid_size()
                 return f"action_{action['id']}"
 
         return None
@@ -275,6 +433,9 @@ class EditorToolbar:
         if (self.bg_panel_open
                 and self._bg_grid_rect.collidepoint(pygame.mouse.get_pos())):
             self._bg_scroll = max(0, self._bg_scroll - direction * 80)
+        if (self.item_panel_open
+                and self._item_grid_rect.collidepoint(pygame.mouse.get_pos())):
+            self._item_scroll = max(0, self._item_scroll - direction * 80)
 
     # =========================================================================
     # Drawing
@@ -315,6 +476,10 @@ class EditorToolbar:
         # Background panel (always on top)
         if self.bg_panel_open:
             self._draw_bg_panel(screen)
+
+        # Item panel (always on top)
+        if self.item_panel_open:
+            self._draw_item_panel(screen)
 
     # =========================================================================
     # Background panel — internal
@@ -553,6 +718,181 @@ class EditorToolbar:
         self._bg_slider_rects[key] = track
 
     # =========================================================================
+    # Item panel — internal
+    # =========================================================================
+
+    def _ensure_items_scanned(self):
+        """Build the category → item-id sections shown in the panel. Only
+        needs to run once — ITEMS is static data, not something that changes
+        while the editor is open."""
+        if self._items_scan_done:
+            return
+        self._items_scan_done = True
+        self._item_sections = []
+        for category, label in self.ITEM_CATEGORY_LABELS.items():
+            by_cat = get_items_by_category(category)
+            if by_cat:
+                self._item_sections.append((label, category, list(by_cat.keys())))
+
+    def _load_item_icon(self, item_id, category=None):
+        if item_id in self._item_icons:
+            return self._item_icons[item_id]
+        subdir = self.ITEM_CATEGORY_SUBDIRS.get(category, '')
+        try:
+            img = pygame.image.load(
+                os.path.join(self.ITEM_SPRITE_DIR, subdir, f'{item_id}.png')).convert_alpha()
+            iw, ih = img.get_size()
+            size  = self.ITEM_THUMB_SIZE - 16
+            scale = min(size / iw, size / ih)
+            self._item_icons[item_id] = pygame.transform.scale(
+                img, (max(1, int(iw * scale)), max(1, int(ih * scale))))
+        except Exception:
+            self._item_icons[item_id] = None
+        return self._item_icons[item_id]
+
+    def _draw_item_panel(self, screen):
+        """Browse view of every consumable/equip item in core/items.py,
+        grouped by category. Hovering an icon shows its name, effect text,
+        and description at the bottom; clicking one arms it for placement
+        (see get_selected_item_id) and closes the panel."""
+        from core.items import get_item
+
+        SW, SH  = screen.get_size()
+        PANEL_H = SH - self.height - 20
+        PX = (SW - self.ITEM_PANEL_W) // 2
+        PY = self.height + 10
+
+        self._item_panel_rect = pygame.Rect(PX, PY, self.ITEM_PANEL_W, PANEL_H)
+
+        # Drop shadow
+        shadow = pygame.Surface((self.ITEM_PANEL_W + 8, PANEL_H + 8), pygame.SRCALPHA)
+        shadow.fill((0, 0, 0, 90))
+        screen.blit(shadow, (PX - 4, PY - 4))
+
+        # Panel body
+        pygame.draw.rect(screen, self.colors['panel'],
+                         self._item_panel_rect, border_radius=8)
+        pygame.draw.rect(screen, self.colors['accent'],
+                         self._item_panel_rect, 2, border_radius=8)
+
+        # Title
+        title_s = self.font_large.render('Items', True, self.colors['accent'])
+        screen.blit(title_s, (PX + 12, PY + 10))
+        if self.selected_item_id:
+            _sel_data = get_item(self.selected_item_id)
+            _sel_name = _sel_data['name'] if _sel_data else self.selected_item_id
+            sub_text = f'Selected: {_sel_name} — click again to deselect'
+        else:
+            sub_text = 'Click an item to select it, then click a chest to add it as loot.'
+        sub_s = self.font_small.render(sub_text, True, self.colors['text_dim'])
+        screen.blit(sub_s, (PX + 12, PY + 34))
+
+        # Reserve space at the bottom for the hovered item's description
+        DESC_H = 46
+        grid_top    = PY + 56
+        grid_bottom = PY + PANEL_H - DESC_H - 8
+        grid_rect   = pygame.Rect(PX, grid_top, self.ITEM_PANEL_W, grid_bottom - grid_top)
+        self._item_grid_rect = grid_rect
+
+        old_clip = screen.get_clip()
+        screen.set_clip(grid_rect)
+
+        self._item_rects = {}
+        row_h = self.ITEM_THUMB_SIZE + self.ITEM_THUMB_PAD + 14  # + name label
+        cy    = grid_top + self.ITEM_THUMB_PAD - self._item_scroll
+
+        if not self._item_sections:
+            no_s = self.font_medium.render('No items defined', True, self.colors['text_dim'])
+            screen.blit(no_s, (PX + 12, grid_top + 12))
+        else:
+            for label, category, item_ids in self._item_sections:
+                # Section header
+                hdr_s = self.font_medium.render(label, True, self.colors['text'])
+                screen.blit(hdr_s, (PX + self.ITEM_THUMB_PAD, cy))
+                cy += 22
+
+                col = 0
+                for item_id in item_ids:
+                    cx = PX + self.ITEM_THUMB_PAD + col * (self.ITEM_THUMB_SIZE + self.ITEM_THUMB_PAD)
+                    cell = pygame.Rect(cx, cy, self.ITEM_THUMB_SIZE, self.ITEM_THUMB_SIZE)
+                    self._item_rects[item_id] = cell
+
+                    is_hov = item_id == self._item_hover
+                    is_sel = item_id == self.selected_item_id
+                    if is_sel:
+                        border, bw = self.colors['tool_selected'], 3
+                    elif is_hov:
+                        border, bw = self.colors['accent'], 2
+                    else:
+                        border, bw = self.colors['panel_border'], 1
+
+                    cell_bg = (45, 40, 15) if is_sel else (18, 18, 32)
+                    pygame.draw.rect(screen, cell_bg, cell, border_radius=4)
+                    pygame.draw.rect(screen, border, cell, bw, border_radius=4)
+
+                    icon = self._load_item_icon(item_id, category)
+                    if icon:
+                        screen.blit(icon, icon.get_rect(center=cell.center))
+                    else:
+                        q = self.font_medium.render('?', True, self.colors['text_dim'])
+                        screen.blit(q, q.get_rect(center=cell.center))
+
+                    item_data = get_item(item_id)
+                    name = item_data['name'] if item_data else item_id
+                    lbl_color = (self.colors['tool_selected'] if is_sel
+                                 else self.colors['accent'] if is_hov
+                                 else self.colors['text_dim'])
+                    lbl  = self.font_small.render(name, True, lbl_color)
+                    lbl_rect = lbl.get_rect(midtop=(cell.centerx, cell.bottom + 2))
+                    if lbl_rect.width > self.ITEM_THUMB_SIZE:
+                        lbl = self.font_small.render(name[:10] + '…', True, lbl_color)
+                        lbl_rect = lbl.get_rect(midtop=(cell.centerx, cell.bottom + 2))
+                    screen.blit(lbl, lbl_rect)
+
+                    col += 1
+                    if col >= self.ITEM_COLS:
+                        col = 0
+                        cy += row_h
+                if col != 0:
+                    cy += row_h
+                cy += 10  # gap before next section header
+
+        max_scroll = max(0, cy + self._item_scroll - (grid_top + self.ITEM_THUMB_PAD) - grid_rect.height)
+        self._item_scroll = min(self._item_scroll, max_scroll)
+
+        screen.set_clip(old_clip)
+
+        # Scroll indicator dots on right edge
+        if max_scroll > 0:
+            n = 8
+            dot_x = PX + self.ITEM_PANEL_W - 6
+            for d in range(n):
+                dot_y  = grid_rect.top + int(grid_rect.height * d / max(1, n - 1))
+                ratio  = self._item_scroll / max(1, max_scroll)
+                active = abs(d / max(1, n - 1) - ratio) < 0.15
+                pygame.gfxdraw.filled_circle(
+                    screen, dot_x, dot_y, 3,
+                    self.colors['accent'] if active else self.colors['panel_border'])
+
+        # ── Hovered item description strip ──────────────────────────────────
+        desc_rect = pygame.Rect(PX + 8, PY + PANEL_H - DESC_H, self.ITEM_PANEL_W - 16, DESC_H - 6)
+        pygame.draw.line(screen, self.colors['panel_border'],
+                         (PX + 8, desc_rect.top - 4), (PX + self.ITEM_PANEL_W - 8, desc_rect.top - 4))
+
+        if self._item_hover:
+            item_data = get_item(self._item_hover)
+            if item_data:
+                name_s = self.font_medium.render(item_data['name'], True, self.colors['accent'])
+                screen.blit(name_s, (desc_rect.x, desc_rect.y))
+                desc_text = item_data.get('effect_text') or item_data.get('description', '')
+                desc_s = self.font_small.render(desc_text, True, self.colors['text_dim'])
+                screen.blit(desc_s, (desc_rect.x, desc_rect.y + 20))
+        else:
+            hint = self.font_small.render('Hover an item to see its effect.',
+                                          True, self.colors['text_dim'])
+            screen.blit(hint, (desc_rect.x, desc_rect.y + 8))
+
+    # =========================================================================
     # Toolbar drawing helpers
     # =========================================================================
 
@@ -574,6 +914,13 @@ class EditorToolbar:
 
         # Background-tool button glows when a background is active
         if tool['id'] == 'background' and self._bg_selected:
+            bdr_col = self.colors['accent']
+            bdr_w   = max(bdr_w, 2)
+
+        # Items-tool button glows when an item is armed for placement, same
+        # convention as the background button above — visible even with the
+        # panel closed, since the selection persists after it auto-closes.
+        if tool['id'] == 'items' and self.selected_item_id:
             bdr_col = self.colors['accent']
             bdr_w   = max(bdr_w, 2)
 
@@ -746,6 +1093,41 @@ class EditorToolbar:
         pygame.draw.line(surf, (255, 255, 255), (24, 6), (30, 6), 2)
         pygame.draw.line(surf, (255, 255, 255), (30, 6), (28, 4), 2)
         pygame.draw.line(surf, (255, 255, 255), (30, 6), (28, 8), 2)
+        return surf
+
+    def _create_map_paint_icon(self):
+        """A small blob outline (mirrors the Scouter minimap's cyan-outline
+        style) with a paintbrush corner accent, so the tool reads as
+        'paint the map' rather than 'view the map'."""
+        surf = pygame.Surface((32, 32), pygame.SRCALPHA)
+        blob = [(6, 20), (6, 12), (10, 8), (18, 8), (22, 12), (22, 18),
+                (18, 22), (12, 22)]
+        pygame.gfxdraw.filled_polygon(surf, blob, (40, 90, 255))
+        pygame.gfxdraw.aapolygon(surf, blob, (100, 200, 255))
+        pygame.draw.line(surf, (255, 215, 0), (21, 21), (28, 28), 3)
+        pygame.gfxdraw.filled_circle(surf, 28, 28, 2, (255, 215, 0))
+        return surf
+
+    def _create_grid_icon(self):
+        """A simple 3x3 grid, with the active cell count reflected by how
+        many divisions are drawn (Off draws a dashed/faded grid instead)."""
+        surf = pygame.Surface((32, 32), pygame.SRCALPHA)
+        size = self.grid_sizes[self.grid_size_index] if hasattr(self, 'grid_sizes') else 16
+        if size == 0:
+            # "No grid" — a dashed outline, faded, with a diagonal slash
+            col = (140, 140, 150)
+            pygame.draw.rect(surf, col, (5, 5, 22, 22), 2)
+            pygame.draw.line(surf, (255, 120, 120), (6, 26), (26, 6), 2)
+        else:
+            col = (150, 220, 150)
+            divisions = 2 if size == 16 else 4  # fewer, bigger cells for 16px
+            pygame.draw.rect(surf, col, (5, 5, 22, 22), 2)
+            step = 22 / divisions
+            for i in range(1, divisions):
+                x = int(5 + i * step)
+                pygame.draw.line(surf, col, (x, 5), (x, 27), 1)
+                y = int(5 + i * step)
+                pygame.draw.line(surf, col, (5, y), (27, y), 1)
         return surf
 
     def _create_zoom_icon(self):

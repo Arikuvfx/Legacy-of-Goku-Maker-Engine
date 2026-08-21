@@ -189,6 +189,16 @@ class FlagManager:
         register_live_lookup('boss_hp_lookup', self._lookup_boss_hp_percent)."""
         self._live_lookups[name] = callback
 
+    def get_live_value(self, lookup_name, *args):
+        """Call a registered live lookup directly and return its raw value
+        (None if unregistered). Unlike evaluate()/live_check(), this isn't a
+        True/False condition check — it's for callers that want the actual
+        number to display, e.g. MissionManager reading 'player_has_item' to
+        show "2/3" progress on a bring_item objective instead of just
+        met/not-met."""
+        lookup = self._live_lookups.get(lookup_name)
+        return lookup(*args) if lookup else None
+
     def set_names_refresh_callback(self, callback):
         """Wire up FlagEditor's dropdown-name source, e.g.
         flag_manager.set_names_refresh_callback(self._get_flag_condition_names)."""

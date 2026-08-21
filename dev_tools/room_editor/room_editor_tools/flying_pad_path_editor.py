@@ -145,6 +145,22 @@ class FlyingPadPathEditor:
         clamped_y = max(0, min(y, self.room_height))
         return clamped_x, clamped_y
 
+    def _is_at_room_boundary(self, x: int, y: int) -> bool:
+        """Whether (x, y) is close enough to a room edge to trigger a
+        room-boundary waypoint. Pulled out into its own method (instead of
+        being inlined at each call site) so subclasses with a different
+        notion of "edge" — e.g. NimbusCloudPathEditor, whose camera is
+        locked and so can only ever reach a boundary that's actually
+        visible — can override it in one place.
+        """
+        boundary_threshold = 10
+        return (
+                x <= boundary_threshold or
+                x >= self.room_width - boundary_threshold or
+                y <= boundary_threshold or
+                y >= self.room_height - boundary_threshold
+        )
+
     def handle_input(self, event, mouse_world_x: int, mouse_world_y: int,
                      world_width: int, world_height: int) -> Optional[str]:
         """
@@ -207,14 +223,7 @@ class FlyingPadPathEditor:
                 clamped_x, clamped_y = self._clamp_to_room_bounds(mouse_world_x, mouse_world_y)
 
                 # Check if clicking at ROOM boundary (using clamped coordinates)
-                boundary_threshold = 10
-
-                at_boundary = (
-                        clamped_x <= boundary_threshold or
-                        clamped_x >= self.room_width - boundary_threshold or
-                        clamped_y <= boundary_threshold or
-                        clamped_y >= self.room_height - boundary_threshold
-                )
+                at_boundary = self._is_at_room_boundary(clamped_x, clamped_y)
 
                 if at_boundary:
                     # Set spawn point on the pending boundary waypoint
@@ -261,14 +270,7 @@ class FlyingPadPathEditor:
                 clamped_x, clamped_y = self._clamp_to_room_bounds(mouse_world_x, mouse_world_y)
 
                 # Check if clicking at ROOM boundary (using clamped coordinates)
-                boundary_threshold = 10
-
-                at_boundary = (
-                        clamped_x <= boundary_threshold or
-                        clamped_x >= self.room_width - boundary_threshold or
-                        clamped_y <= boundary_threshold or
-                        clamped_y >= self.room_height - boundary_threshold
-                )
+                at_boundary = self._is_at_room_boundary(clamped_x, clamped_y)
 
                 if at_boundary and len(self.available_rooms) > 0:
                     # Add boundary waypoint and enter config mode
@@ -485,13 +487,7 @@ class FlyingPadPathEditor:
                 preview_y = (self.preview_mouse_y * render_scale) - camera.y
 
                 # Check if at boundary
-                boundary_threshold = 10
-                at_boundary = (
-                        self.preview_mouse_x <= boundary_threshold or
-                        self.preview_mouse_x >= self.room_width - boundary_threshold or
-                        self.preview_mouse_y <= boundary_threshold or
-                        self.preview_mouse_y >= self.room_height - boundary_threshold
-                )
+                at_boundary = self._is_at_room_boundary(self.preview_mouse_x, self.preview_mouse_y)
 
                 # Draw preview waypoint
                 if at_boundary and len(self.available_rooms) > 0:
@@ -525,13 +521,7 @@ class FlyingPadPathEditor:
         preview_y = (self.preview_mouse_y * render_scale) - camera.y
 
         # Check if at boundary
-        boundary_threshold = 10
-        at_boundary = (
-                self.preview_mouse_x <= boundary_threshold or
-                self.preview_mouse_x >= self.room_width - boundary_threshold or
-                self.preview_mouse_y <= boundary_threshold or
-                self.preview_mouse_y >= self.room_height - boundary_threshold
-        )
+        at_boundary = self._is_at_room_boundary(self.preview_mouse_x, self.preview_mouse_y)
 
         # Choose color based on boundary status
         if at_boundary and len(self.available_rooms) > 0:
@@ -795,13 +785,7 @@ class FlyingPadPathEditor:
         preview_y = (clamped_y * render_scale) - camera.y
 
         # Check if at boundary
-        boundary_threshold = 10
-        at_boundary = (
-                clamped_x <= boundary_threshold or
-                clamped_x >= self.room_width - boundary_threshold or
-                clamped_y <= boundary_threshold or
-                clamped_y >= self.room_height - boundary_threshold
-        )
+        at_boundary = self._is_at_room_boundary(clamped_x, clamped_y)
 
         # Choose color based on whether at boundary
         if at_boundary:

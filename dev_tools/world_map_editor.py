@@ -8,16 +8,20 @@ Features
 * Create / switch between multiple named world maps (2896 × 2104 tiles).
 * Paint 8 × 8 tiles from any tileset found in assets/tilesets/world_map/.
 * Place named "location" pins on the map and assign them to in-game rooms.
+* Paint the Scouter WORLD MAP silhouette directly (Scouter mode) — a
+  designer-authored land mask, same idea as the room editor's Map Paint
+  tool, instead of inferring land/water from the tile art's color palette.
 * Ctrl+S saves; maps are stored as JSON in assets/world_maps/.
 
 Controls (viewport)
 -------------------
-  Left-drag          Paint tiles (paint mode)
-  Right-drag         Erase tiles (paint mode)
+  Left-drag          Paint tiles (paint mode) / paint silhouette (scouter mode)
+  Right-drag         Erase tiles (paint mode) / erase silhouette (scouter mode)
   Left-click         Place / select location pin (location mode)
   Middle-drag        Pan camera
   Scroll wheel       Zoom in / out
   TAB                Cycle tilesets (paint mode)
+  [ / ]              Shrink / grow brush (scouter mode)
   G                  Toggle grid
   Ctrl+S             Save current map
   F2 / Escape        Close editor
@@ -135,6 +139,15 @@ class WorldMap:
         self.entities:  list[WMEntity]   = []
         self.music      = ''   # track stem to play during the mode7 flying scene ('' = none)
 
+        # Designer-painted Scouter WORLD MAP silhouette — set of (tx, ty)
+        # map-tile cells, same coordinate space as WMTile positions. This is
+        # NOT derived from the tile art (see Scouter mode / game.py's
+        # _build_world_map_scouter_surface for why): the designer paints the
+        # land shape once, directly, the same way room.map_paint is painted
+        # in the room editor's Map Paint tool. Not per-frame — the
+        # silhouette doesn't change when the map's animated frame does.
+        self.scouter_paint: set[tuple[int, int]] = set()
+
     # ── frame helpers ──────────────────────────────────────────────────────────
 
     @property
@@ -178,6 +191,7 @@ class WorldMap:
             'locations': [loc.to_dict() for loc in self.locations],
             'entities':  [e.to_dict() for e in self.entities],
             'music':     self.music,
+            'scouter_paint': sorted([list(c) for c in self.scouter_paint]),
         }
 
     @staticmethod
@@ -206,6 +220,7 @@ class WorldMap:
             wm.locations.append(WMLocation.from_dict(ld))
         for ed in d.get('entities', []):
             wm.entities.append(WMEntity.from_dict(ed))
+        wm.scouter_paint = {tuple(c) for c in d.get('scouter_paint', [])}
         return wm
 
 
@@ -416,7 +431,10 @@ class WorldMapEditor:
         self.zoom_idx = ZOOM_DEFAULT
 
         # ── Mode ──────────────────────────────────────────────────────────────
-        self.mode = 'paint'   # 'paint' | 'location' | 'entity'
+        self.mode = 'paint'   # 'paint' | 'location' | 'entity' | 'scouter'
+
+        # ── Scouter paint (silhouette for the Scouter's WORLD MAP screen) ──────
+        self.scouter_brush = 1   # brush size in map tiles per side: 1/2/4/8
 
         # ── Entity editing ────────────────────────────────────────────────────
         self.entity_selected_idx: Optional[int]        = None   # selected entity in the list
@@ -495,6 +513,10 @@ class WorldMapEditor:
 
         # Reference to the game's RoomManager (set externally via set_room_manager)
         self.room_manager = None
+
+        # Optional callable(map_name) the host (Game) can set to hear about
+        # saves — see _save_current_map. None = editor runs standalone.
+        self.on_save = None
 
         # ── Map music dropdown (always visible in the panel, any mode) ────────
         self.music_dropdown_open          = False
@@ -634,6 +656,16 @@ class WorldMapEditor:
         with open(path, 'w') as f:
             json.dump(wm.to_dict(), f, indent=2)
         print(f"[WorldMapEditor] Saved '{wm.name}'")
+        # Let the host (Game) know this map's JSON just changed on disk, so
+        # it can drop any cached render of it — e.g. the Scouter's WORLD_MAP
+        # surface and the Mode7 flying-scene texture — instead of keeping a
+        # stale image around until the game process restarts. Optional: the
+        # editor works standalone (no host) without this being set.
+        if self.on_save is not None:
+            try:
+                self.on_save(wm.name)
+            except Exception as e:
+                print(f"[WorldMapEditor] on_save callback failed: {e}")
 
     def _load_tilesets(self):
         self.tilesets = []
@@ -654,6 +686,9 @@ class WorldMapEditor:
         for fname in sorted(os.listdir(ICON_DIR)):
             if fname.lower().endswith('.png'):
                 self.icon_names.append(os.path.splitext(fname)[0])
+        if not self.icon_names:
+            print(f"[WorldMapEditor] no .png files found in {ICON_DIR} — "
+                  f"new locations will have no icon assigned by default")
 
     def _get_icon(self, stem: str, size: int) -> Optional[pygame.Surface]:
         """Return a Surface for icon *stem* scaled to *size*×*size*; cached."""
@@ -663,7 +698,14 @@ class WorldMapEditor:
             try:
                 raw = pygame.image.load(path).convert_alpha()
                 self._icon_cache[key] = pygame.transform.smoothscale(raw, (size, size))
-            except Exception:
+            except Exception as e:
+                # Previously swallowed silently, which made a broken/missing
+                # icon indistinguishable from "no icon assigned" — a pin
+                # would just render as a plain circle either way. Log once
+                # per (stem, size) so the real cause (bad path, corrupt
+                # file, wrong stem) is visible instead of guessable.
+                print(f"[WorldMapEditor] failed to load icon '{stem}' "
+                      f"from {path}: {e}")
                 self._icon_cache[key] = None
         return self._icon_cache[key]
 
@@ -745,6 +787,37 @@ class WorldMapEditor:
         wm = self.current_map
         if wm:
             wm.tiles.pop((tx, ty), None)
+
+    # ─────────────────────── scouter paint helpers ────────────────────────────
+
+    def _scouter_brush_cells(self, tx: int, ty: int) -> set[tuple[int, int]]:
+        """Map-tile cells covered by the scouter brush centered at (tx, ty),
+        clipped to map bounds."""
+        b = self.scouter_brush
+        half = b // 2
+        cells = set()
+        for dy in range(b):
+            for dx in range(b):
+                ptx = tx - half + dx
+                pty = ty - half + dy
+                if 0 <= ptx < MAP_TILE_W and 0 <= pty < MAP_TILE_H:
+                    cells.add((ptx, pty))
+        return cells
+
+    def _scouter_paint_at(self, tx: int, ty: int):
+        wm = self.current_map
+        if wm:
+            wm.scouter_paint.update(self._scouter_brush_cells(tx, ty))
+
+    def _scouter_erase_at(self, tx: int, ty: int):
+        wm = self.current_map
+        if wm:
+            wm.scouter_paint.difference_update(self._scouter_brush_cells(tx, ty))
+
+    def _scouter_cycle_brush(self, direction: int):
+        sizes = (1, 2, 4, 8)
+        i = sizes.index(self.scouter_brush) if self.scouter_brush in sizes else 0
+        self.scouter_brush = sizes[max(0, min(len(sizes) - 1, i + direction))]
 
     # ─────────────────────── location helpers ────────────────────────────────
 
@@ -862,6 +935,7 @@ class WorldMapEditor:
             [dict(frame) for frame in wm._frames],    # list of shallow-copied frame dicts
             wm.frame_idx,                              # restore the active frame too
             [copy.copy(loc) for loc in wm.locations],
+            set(wm.scouter_paint),
         ))
         if len(self._undo_stack) > self._MAX_UNDO:
             self._undo_stack.pop(0)
@@ -871,10 +945,11 @@ class WorldMapEditor:
         wm = self.current_map
         if not wm or not self._undo_stack:
             return
-        frames_snap, frame_idx_snap, locs_snap = self._undo_stack.pop()
-        wm._frames    = frames_snap
-        wm.frame_idx  = max(0, min(frame_idx_snap, len(wm._frames) - 1))
-        wm.locations  = locs_snap
+        frames_snap, frame_idx_snap, locs_snap, scouter_snap = self._undo_stack.pop()
+        wm._frames       = frames_snap
+        wm.frame_idx     = max(0, min(frame_idx_snap, len(wm._frames) - 1))
+        wm.locations     = locs_snap
+        wm.scouter_paint = scouter_snap
         if self.selected_loc not in wm.locations:
             self.selected_loc = None
 
@@ -1009,6 +1084,12 @@ class WorldMapEditor:
             if event.key == pygame.K_g:
                 self.show_grid = not self.show_grid
                 return None
+            if event.key == pygame.K_LEFTBRACKET and self.mode == 'scouter':
+                self._scouter_cycle_brush(-1)
+                return None
+            if event.key == pygame.K_RIGHTBRACKET and self.mode == 'scouter':
+                self._scouter_cycle_brush(+1)
+                return None
 
         elif event.type == pygame.MOUSEBUTTONDOWN:
             mx, my = event.pos
@@ -1092,6 +1173,17 @@ class WorldMapEditor:
                         if hit:
                             self.selected_loc = hit
                             self._open_loc_dialog(is_new=False, loc=hit)
+                elif self.mode == 'scouter':
+                    if event.button == 1:
+                        self._push_undo()
+                        self.is_painting = True
+                        self._last_paint_cell = (tx, ty)
+                        self._scouter_paint_at(tx, ty)
+                    elif event.button == 3:
+                        self._push_undo()
+                        self.is_erasing = True
+                        self._last_paint_cell = (tx, ty)
+                        self._scouter_erase_at(tx, ty)
                 elif self.mode == 'entity':
                     if self.entity_placing:
                         if event.button == 1:
@@ -1145,13 +1237,19 @@ class WorldMapEditor:
                 tx, ty = self._screen_to_tile(mx, my)
                 if (tx, ty) != self._last_paint_cell:
                     self._last_paint_cell = (tx, ty)
-                    self._place_tiles(tx, ty)
+                    if self.mode == 'scouter':
+                        self._scouter_paint_at(tx, ty)
+                    else:
+                        self._place_tiles(tx, ty)
 
             elif self.is_erasing and self._in_viewport(mx, my):
                 tx, ty = self._screen_to_tile(mx, my)
                 if (tx, ty) != self._last_paint_cell:
                     self._last_paint_cell = (tx, ty)
-                    self._erase_tile(tx, ty)
+                    if self.mode == 'scouter':
+                        self._scouter_erase_at(tx, ty)
+                    else:
+                        self._erase_tile(tx, ty)
 
             elif self._pal_drag_active:
                 self._handle_palette_drag(my)
@@ -1237,6 +1335,10 @@ class WorldMapEditor:
                 self.entity_room_dropdown_open = False
             elif key == 'btn_mode_entity':
                 self.mode = 'entity'
+            elif key == 'btn_mode_scouter':
+                self.mode = 'scouter'
+                self._entity_stop_placing()
+                self.entity_room_dropdown_open = False
             elif key == 'btn_zoom_in':
                 mx2, my2 = self.vp_x + self.vp_w // 2, self.vp_y + self.vp_h // 2
                 self._scroll_event(mx2, my2, +1)
@@ -1324,6 +1426,19 @@ class WorldMapEditor:
                 self._pal_drag_start_y = my
         elif self.mode == 'entity':
             self._handle_entity_panel_click(mx, my, button)
+        elif self.mode == 'scouter':
+            if button != 1:
+                return
+            for size in (1, 2, 4, 8):
+                rect = self.ui.get(f'btn_scouter_brush_{size}')
+                if rect and rect.collidepoint(mx, my):
+                    self.scouter_brush = size
+                    return
+            clr_rect = self.ui.get('btn_scouter_clear')
+            if clr_rect and clr_rect.collidepoint(mx, my) and wm:
+                self._push_undo()
+                wm.scouter_paint = set()
+                return
         elif self.mode == 'location':
             # Delete button sits inside row rect — check it first.
             # Double-click on a row opens the edit dialog.
@@ -1728,6 +1843,42 @@ class WorldMapEditor:
             off_y = cam_yi % ds
             screen.blit(self._vp_grid_surf, (self.vp_x - off_x, self.vp_y - off_y))
 
+        # ── Scouter paint overlay ───────────────────────────────────────────
+        # Only shown while the tool is active — dims the tile art underneath
+        # (same rationale as the room editor's Map Paint tool) so the
+        # painted silhouette reads clearly, then previews it with the same
+        # fill/outline coloring the in-game Scouter uses (see
+        # game.py's _build_world_map_scouter_surface) so what's painted
+        # here looks close to what it'll actually look like there.
+        if self.mode == 'scouter':
+            dim = pygame.Surface((self.vp_w, self.vp_h), pygame.SRCALPHA)
+            dim.fill((10, 10, 20, 120))
+            screen.blit(dim, (self.vp_x, self.vp_y))
+
+            cells = wm.scouter_paint
+            if cells:
+                # Matches game.py's _build_world_map_scouter_surface: outline
+                # 39FF39, interior black. The interior is drawn with a little
+                # visible alpha here (rather than true black) so a designer
+                # can still see what's painted against the dimmed backdrop —
+                # in-game it's solid black and blends into the background.
+                OUTLINE = (57, 255, 57, 220)
+                FILL    = (57, 255, 57, 45)
+                ov = pygame.Surface((self.vp_w, self.vp_h), pygame.SRCALPHA)
+                for oty in range(sty, ety):
+                    osy = oty * ds - cam_yi
+                    for otx in range(stx, etx):
+                        if (otx, oty) not in cells:
+                            continue
+                        osx = otx * ds - cam_xi
+                        is_border = (
+                            (otx - 1, oty) not in cells or (otx + 1, oty) not in cells
+                            or (otx, oty - 1) not in cells or (otx, oty + 1) not in cells
+                        )
+                        pygame.draw.rect(ov, OUTLINE if is_border else FILL,
+                                         (osx, osy, ds, ds))
+                screen.blit(ov, (self.vp_x, self.vp_y))
+
         # Map boundary rect
         bx = self.vp_x - cam_xi
         by = self.vp_y - cam_yi
@@ -1735,10 +1886,25 @@ class WorldMapEditor:
                          (bx, by, MAP_TILE_W * ds, MAP_TILE_H * ds), 2)
 
         # Location pins
+        # Height offset scaling: loc.height is a raw 0–2000 value representing
+        # a normalized altitude fraction for the Mode7 flying scene (height/2000
+        # = 0.0–1.0 altitude), NOT a pixel count. Using it as a literal pixel
+        # offset (as this used to) meant any real height value shot the pin
+        # far above its tile — hundreds to ~2000px — which almost always
+        # landed outside the viewport's clip rect, especially when zoomed out
+        # where the whole map is only a few hundred pixels tall. Since the
+        # entire pin draw is gated on clip.collidepoint(cx, cy), the pin
+        # simply vanished. Scale it down to a small, zoom-relative visual cue
+        # instead (same idea _draw_height_preview already uses via INNER_H),
+        # and cap it so a pin never travels more than a few tiles' worth of
+        # pixels from its own tile regardless of height or zoom level.
+        HEIGHT_VISUAL_SCALE = 0.05
         for loc in wm.locations:
             px, py = self._tile_to_screen(loc.x, loc.y)
             cx = int(px + ds / 2)
-            cy = int(py + ds / 2) - getattr(loc, 'height', 0)
+            height_px = min(int(getattr(loc, 'height', 0) * HEIGHT_VISUAL_SCALE),
+                             ds * 4)
+            cy = int(py + ds / 2) - height_px
             if clip.collidepoint(cx, cy):
                 color = (self.C['pin_sel'] if loc is self.selected_loc
                          else self.C['pin'])
@@ -1902,7 +2068,7 @@ class WorldMapEditor:
         # ── Map tabs (scrollable) ─────────────────────────────────────────────
         # Reserve space on the right for frame controls (~180 px) and the mode/
         # zoom buttons (~160 px) so tabs never collide with them.
-        TAB_AREA_RIGHT = self.vp_w - 360
+        TAB_AREA_RIGHT = self.vp_w - 434
         # Each tab = name label + 18 px padding + 18 px × delete button.
         TAB_DELETE_W = 18
         ARROW_W      = 20
@@ -2042,6 +2208,17 @@ class WorldMapEditor:
                     self.font_medium.render('Paint', True, self.C['text']).get_rect(center=pnt_rect.center))
         self.ui['btn_mode_paint'] = pnt_rect
 
+        right_x -= 78
+        sct_rect = pygame.Rect(right_x, 6, 74, TOP_BAR_H - 12)
+        bg_sct = (self.C['btn_active'] if self.mode == 'scouter'
+                  else self.C['btn_hover'] if sct_rect.collidepoint(mx2, my2) and my2 < TOP_BAR_H
+                  else self.C['btn'])
+        pygame.draw.rect(screen, bg_sct, sct_rect, border_radius=4)
+        pygame.draw.rect(screen, self.C['panel_border'], sct_rect, 1, border_radius=4)
+        screen.blit(self.font_medium.render('Scouter', True, self.C['text']),
+                    self.font_medium.render('Scouter', True, self.C['text']).get_rect(center=sct_rect.center))
+        self.ui['btn_mode_scouter'] = sct_rect
+
     # ── right panel ───────────────────────────────────────────────────────────
 
     def _draw_panel(self, screen: pygame.Surface):
@@ -2060,6 +2237,8 @@ class WorldMapEditor:
             self._draw_paint_panel(screen, px, py)
         elif self.mode == 'entity':
             self._draw_entity_panel(screen, px, py)
+        elif self.mode == 'scouter':
+            self._draw_scouter_panel(screen, px, py)
         else:
             self._draw_location_panel(screen, px, py)
 
@@ -2657,6 +2836,67 @@ class WorldMapEditor:
             'Right-drag: erase',
             'Mid-drag: pan',
             'Scroll: zoom / palette',
+            'G: toggle grid',
+            'Ctrl+S: save',
+            'F2 / Esc: close',
+        ]
+        for line in instructions:
+            s = self.font_small.render(line, True, self.C['dim'])
+            screen.blit(s, (self.vp_x + self.vp_w + 10, inst_y))
+            inst_y += 18
+
+    def _draw_scouter_panel(self, screen: pygame.Surface, px: int, py: int):
+        wm = self.current_map
+        mx, my = pygame.mouse.get_pos()
+
+        title = self.font_medium.render('Scouter Paint', True, self.C['text'])
+        screen.blit(title, (px, py));  py += 22
+        for line in ('Paints the silhouette shown on', "the Scouter's WORLD MAP screen —"):
+            s = self.font_small.render(line, True, self.C['dim'])
+            screen.blit(s, (px, py));  py += 16
+        py += 8
+
+        label = self.font_small.render('Brush size', True, self.C['dim'])
+        screen.blit(label, (px, py));  py += 20
+        bx = px
+        for size in (1, 2, 4, 8):
+            w = 42
+            rect = pygame.Rect(bx, py, w, 26)
+            active = (self.scouter_brush == size)
+            hover  = rect.collidepoint(mx, my)
+            bg = (self.C['btn_active'] if active
+                  else self.C['btn_hover'] if hover
+                  else self.C['btn'])
+            pygame.draw.rect(screen, bg, rect, border_radius=4)
+            pygame.draw.rect(screen, self.C['accent'] if active else self.C['panel_border'],
+                             rect, 1, border_radius=4)
+            s = self.font_small.render(str(size), True, self.C['text'])
+            screen.blit(s, s.get_rect(center=rect.center))
+            self.ui[f'btn_scouter_brush_{size}'] = rect
+            bx += w + 6
+        py += 34
+
+        count = len(wm.scouter_paint) if wm else 0
+        cnt_surf = self.font_small.render(f'{count} cells painted', True, self.C['dim'])
+        screen.blit(cnt_surf, (px, py));  py += 24
+
+        clr_rect = pygame.Rect(px, py, 104, 26)
+        hover = clr_rect.collidepoint(mx, my)
+        pygame.draw.rect(screen, self.C['danger'] if hover else self.C['btn'],
+                         clr_rect, border_radius=4)
+        pygame.draw.rect(screen, self.C['panel_border'], clr_rect, 1, border_radius=4)
+        clr_surf = self.font_small.render('Clear all', True, self.C['text'])
+        screen.blit(clr_surf, clr_surf.get_rect(center=clr_rect.center))
+        self.ui['btn_scouter_clear'] = clr_rect
+
+        # Instructions at bottom of panel (matches _draw_paint_panel's layout)
+        inst_y = self.screen_height - 150
+        instructions = [
+            'Left-drag: paint',
+            'Right-drag: erase',
+            '[ / ]: brush size',
+            'Mid-drag: pan',
+            'Scroll: zoom',
             'G: toggle grid',
             'Ctrl+S: save',
             'F2 / Esc: close',

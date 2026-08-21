@@ -376,7 +376,8 @@ class CutsceneRuntime:
         self._active_dialogue_key = None
 
         # Dialogue-pause state: while a box is open, elapsed stops and actors
-        # idle. Playback resumes the moment the box is dismissed.
+        # hold their current pose (no forced idle). Playback resumes the
+        # moment the box is dismissed.
         self._dialogue_paused      = False
         self._pre_dialogue_state: dict = {}  # snapshot of actor tweens taken at pause time
 
@@ -1467,8 +1468,11 @@ class CutsceneRuntime:
                     is_narrator=(portrait_key is None),
                 )
                 self._active_dialogue_key = (self.elapsed, params.get('text', ''))
-                # Freeze the cutscene: snapshot every actor's state, idle them
-                # all, then stop advancing time until the box is dismissed.
+                # Freeze the cutscene: snapshot every actor's state and stop
+                # advancing time until the box is dismissed. Actors keep
+                # whatever pose they were already in — a walk, an attack pose,
+                # etc. — rather than being forced to idle, so opening a text
+                # box mid-action doesn't visibly snap the character out of it.
                 self._pre_dialogue_state = {}
                 for aid, actor in self.actors.items():
                     self._pre_dialogue_state[aid] = {
@@ -1479,7 +1483,6 @@ class CutsceneRuntime:
                     }
                     actor._tween = None
                     actor._charge_effects = []
-                    actor.set_animation('idle', getattr(actor.entity, 'direction', 'down'))
                 self._dialogue_paused = True
 
     def _resume_from_dialogue(self):
@@ -1499,7 +1502,7 @@ class CutsceneRuntime:
             else:
                 actor._tween = None
                 actor._charge_effects = []
-                actor.set_animation('idle', snap['dir'])
+                actor.set_animation(snap['anim'], snap['dir'])
         self._pre_dialogue_state = {}
 
     def _do_actor(self, actor, atype, params):
@@ -1556,6 +1559,8 @@ class CutsceneRuntime:
             new_costume = params.get('costume', '').strip()
             if new_costume:
                 actor.set_costume(new_costume)
+        elif atype == 'set_shadow':
+            actor.set_shadow_visible(params.get('visible', True))
 
     def _fire_attack_effect(self, actor, params, attack_action):
         """Fired by CutsceneActor.attack()'s on_release, at the scripted

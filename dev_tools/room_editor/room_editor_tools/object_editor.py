@@ -12,12 +12,16 @@ from objects.animated_region import AnimatedRegion, AnimatedRegionManager, draw_
 from objects.level_gate import LevelGate, LevelGateManager
 from objects.room_transition import RoomTransition, RoomTransitionManager, TransitionConfigDialog
 from objects.flying_pad import FlyingPad, FlyingPadManager
+from objects.nimbus_cloud import NimbusCloud, NimbusCloudManager
 from objects.save_point import SavePoint, SavePointManager
 from objects.world_map import WorldMapObject, WorldMapObjectManager
 from objects.door_object import Door, DoorManager
+from objects.chest_object import Chest, ChestManager
+from core.items import get_item
 from objects.trigger_box import (OverlapTriggerBox, KeyTriggerBox, TriggerBoxManager,
                                  draw_trigger_box)
 from dev_tools.room_editor.room_editor_tools.flying_pad_path_editor import FlyingPadPathEditor
+from dev_tools.room_editor.room_editor_tools.nimbus_cloud_path_editor import NimbusCloudPathEditor
 from core.event_editor import EventEditorWindow
 
 
@@ -141,6 +145,14 @@ class ObjectEditor:
         self.on_flying_pad_placed = None
         self.on_flying_pad_deleted = None
 
+        # ── Nimbus cloud ──────────────────────────────────────────────────────
+        self.nimbus_cloud_manager = NimbusCloudManager()
+        self.nimbus_cloud_path_editor = NimbusCloudPathEditor(screen_width, screen_height)
+        self.placing_nimbus_cloud = False
+        self.pending_nimbus_cloud = None
+        self.on_nimbus_cloud_placed = None
+        self.on_nimbus_cloud_deleted = None
+
         # ── Save points ───────────────────────────────────────────────────────
         self.save_point_manager = SavePointManager()
         self.on_save_point_placed = None
@@ -162,6 +174,20 @@ class ObjectEditor:
         _door_sounds = Door.list_door_sounds() or Door.DEFAULT_SOUND_NAMES
         self.door_sound_options = _door_sounds
         self.door_sound_text = _door_sounds[0]  # editor toggle — applies to the next door placed
+
+        # ── Chests ────────────────────────────────────────────────────────────
+        self.chest_manager = ChestManager()
+        self.on_chest_placed = None
+        self.on_chest_deleted = None
+        # Fired when loot is assigned/stacked on an already-placed chest.
+        # Separate from on_chest_placed so undo wiring does not treat loot
+        # edits as brand-new object_add entries.
+        self.on_chest_loot_changed = None
+
+        # Loot is no longer picked at placement time. Every new chest starts
+        # empty (item_id=''); loot is assigned afterward by selecting an
+        # item in the toolbar's Items panel and clicking a placed chest —
+        # see _try_assign_chest_loot, called from handle_input.
 
         # Requires a FlagManager (see set_flag_manager) to actually build the
         # conditions/actions popup; without one the "Edit Event" button stays
@@ -253,6 +279,12 @@ class ObjectEditor:
             {'type': 'buu', 'name': 'Buu', 'sprite': None}
         ]
 
+        # Nimbus cloud has only a single sprite on disk (no per-type
+        # variants like flying pads/chests/doors), so its palette icon is
+        # loaded directly from a throwaway NimbusCloud instance below
+        # instead of going through the variant system.
+        self.nimbus_cloud_sprite = NimbusCloud(0, 0).sprite
+
         # Door variants are discovered from assets/sprites/structures/door/ at
         # startup (one sheet per type — see Door.list_door_types()) rather
         # than hardcoded here, so dropping in a new sheet is enough to make
@@ -263,6 +295,18 @@ class ObjectEditor:
         self.door_variants = [
             {'type': t, 'name': t.replace('_', ' ').title(), 'sprite': None}
             for t in _door_types
+        ]
+
+        # Chest variants are likewise discovered from assets/objects/chest/
+        # (one two-frame closed/open sheet per skin) rather than hardcoded —
+        # dropping a new PNG in that folder is enough to make it show up
+        # here. Falls back to a single 'wood' entry if the folder is
+        # empty/missing so the editor still has something to place (Chest
+        # itself falls back to a placeholder sprite for it).
+        _chest_types = Chest.list_chest_types() or ['wood']
+        self.chest_variants = [
+            {'type': t, 'name': t.replace('_', ' ').title(), 'sprite': None}
+            for t in _chest_types
         ]
 
         self.categories = {
@@ -302,6 +346,14 @@ class ObjectEditor:
                     'has_variants': True,
                     'variants': self.flying_pad_variants,
                     'default_variant': 'stone1'
+                },
+                {
+                    'id': 'nimbus_cloud',
+                    'name': 'Nimbus Cloud',
+                    'sprite': self.nimbus_cloud_sprite,
+                    'width': 30,
+                    'height': 23,
+                    'object_type': 'nimbus_cloud',
                 },
                 {
                     'id': 'save_point',
@@ -350,7 +402,17 @@ class ObjectEditor:
                 },
             ],
             'Interactive': [
-                {'id': 'chest_1', 'name': 'Treasure Chest', 'sprite': None, 'width': 24, 'height': 20},
+                {
+                    'id': 'chest',
+                    'name': 'Treasure Chest',
+                    'sprite': None,
+                    'width': 24,
+                    'height': 20,
+                    'object_type': 'chest',
+                    'has_variants': True,
+                    'variants': self.chest_variants,
+                    'default_variant': self.chest_variants[0]['type']
+                },
                 {'id': 'door_1', 'name': 'Door', 'sprite': None, 'width': 16, 'height': 32},
                 {'id': 'switch_1', 'name': 'Switch', 'sprite': None, 'width': 16, 'height': 16},
             ]
@@ -460,6 +522,12 @@ class ObjectEditor:
         self.current_room_name = ""
 
         # Placement options
+        # grid_snap_size is the quick placement grid shared with the room
+        # editor's toolbar Grid control (0 = off, otherwise the snap size in
+        # world pixels — typically 8 or 16). grid_snap is kept as a
+        # backward-compatible bool alias (True whenever a size is set) for
+        # any code/UI that just wants an on/off reading.
+        self.grid_snap_size = TILE_SIZE
         self.grid_snap = True
         self.show_grid = True
 
@@ -483,11 +551,17 @@ class ObjectEditor:
         self._panel_tab_h = 72
         self._hover_panel_toggle = False
 
+        # Set via set_toolbar() below; read (via getattr-guarded access) to
+        # find out whether an item is armed in the Items panel for the
+        # chest-loot-assignment flow — see _try_assign_chest_loot.
+        self.toolbar = None
+
     def set_toolbar(self, toolbar):
         """Set the toolbar reference and pass it to sub-editors that need to hide it"""
         self.toolbar = toolbar
         # Pass toolbar to flying pad path editor so it can hide it during editing
         self.flying_pad_path_editor.set_toolbar(toolbar)
+        self.nimbus_cloud_path_editor.set_toolbar(toolbar)
 
     def set_sound_manager(self, sound_manager):
         """Give the editor a SoundManager (anything with .play_sfx(name)) so
@@ -746,6 +820,15 @@ class ObjectEditor:
                         variant['height'] = door.height
                         variant['sprite'] = door.closed_sprite.copy()
 
+                    elif obj['object_type'] == 'chest':
+                        # Width/height come straight off the closed frame
+                        # (half the sheet — see Chest._load_sprites), same
+                        # deal as doors above.
+                        chest = Chest(0, 0, variant['type'], opened=False)
+                        variant['width'] = chest.width
+                        variant['height'] = chest.height
+                        variant['sprite'] = chest.closed_sprite.copy()
+
                     elif obj['object_type'] == 'level_gate':
                         gate = LevelGate(0, 0, variant['type'], 1)
                         # Store per-variant dimensions so the preview scales correctly
@@ -888,6 +971,25 @@ class ObjectEditor:
 
                 obj['sprite'] = sprite
 
+    def set_grid_snap_size(self, size: int):
+        """Set the placement/snap grid size (0 = off, otherwise the snap
+        size in world pixels). Called by the room editor each frame to
+        mirror the toolbar's quick Grid control, and safe to call directly
+        too. Keeps the legacy `grid_snap` bool in sync for any code/UI that
+        just wants an on/off reading."""
+        self.grid_snap_size = max(0, int(size))
+        self.grid_snap = self.grid_snap_size > 0
+
+    def _toggle_grid_snap(self):
+        """G key: toggle snapping on/off without losing the last chosen
+        grid size (8px / 16px) — flips back and forth between 0 and
+        whatever size was last active."""
+        if self.grid_snap_size > 0:
+            self._last_grid_snap_size = self.grid_snap_size
+            self.set_grid_snap_size(0)
+        else:
+            self.set_grid_snap_size(getattr(self, '_last_grid_snap_size', TILE_SIZE) or TILE_SIZE)
+
     def toggle(self):
         """Open or close the object editor"""
         self.active = not self.active
@@ -907,6 +1009,9 @@ class ObjectEditor:
             self.flying_pad_path_editor.close()
             self.pending_flying_pad = None
             self.placing_flying_pad = False
+            self.nimbus_cloud_path_editor.close()
+            self.pending_nimbus_cloud = None
+            self.placing_nimbus_cloud = False
             self.placing_trigger_box = False
             self.preview_trigger_box = None
             self.trigger_box_id_input_active = False
@@ -948,19 +1053,21 @@ class ObjectEditor:
             if distance < max(spawn.width, spawn.height) / 2:
                 return spawn, 'spawn'
 
-        # Check collision walls
+        # Check collision walls. Iterate back-to-front (most recently placed
+        # first) since draw_collision_objects draws the list front-to-back —
+        # the last item in the list is the one rendered on top. Walls are
+        # frequently placed overlapping/adjacent to each other (e.g. to build
+        # a corridor), and picking the first (oldest/bottom) match instead of
+        # the last (newest/topmost, visually-clicked) one meant a right-click
+        # could silently delete a hidden wall underneath while the one you
+        # actually clicked stayed put — indistinguishable since both render
+        # as the same red overlay — requiring a second click to finish the
+        # job.
         collision_objs = self.collision_manager.get_collision_objects(self.current_room_name)
-        for collision_obj in collision_objs:
+        for collision_obj in reversed(collision_objs):
             if (collision_obj.x <= world_x <= collision_obj.x + collision_obj.width and
                     collision_obj.y <= world_y <= collision_obj.y + collision_obj.height):
                 return collision_obj, 'collision'
-
-        # Check water/grass regions
-        regions = self.animated_region_manager.get_regions(self.current_room_name)
-        for region in regions:
-            if (region.x <= world_x <= region.x + region.width and
-                    region.y <= world_y <= region.y + region.height):
-                return region, 'animated_region'
 
         # Check room transitions
         transitions = self.transition_manager.get_transitions(self.current_room_name)
@@ -984,11 +1091,24 @@ class ObjectEditor:
             if distance < max(pad.width, pad.height) / 2:
                 return pad, 'flying_pad'
 
+        # Check nimbus clouds
+        clouds = self.nimbus_cloud_manager.get_clouds(self.current_room_name)
+        for cloud in clouds:
+            distance = ((cloud.x - world_x) ** 2 + (cloud.y - world_y) ** 2) ** 0.5
+            if distance < max(cloud.width, cloud.height) / 2:
+                return cloud, 'nimbus_cloud'
+
         # Check doors
         for door in self.door_manager.get_doors(self.current_room_name):
             distance = ((door.x - world_x) ** 2 + (door.y - world_y) ** 2) ** 0.5
             if distance < max(door.width, door.height) / 2:
                 return door, 'door'
+
+        # Check chests
+        for chest in self.chest_manager.get_chests(self.current_room_name):
+            distance = ((chest.x - world_x) ** 2 + (chest.y - world_y) ** 2) ** 0.5
+            if distance < max(chest.width, chest.height) / 2:
+                return chest, 'chest'
 
         # Check level gates
         gates = self.gate_manager.get_gates(self.current_room_name)
@@ -1015,6 +1135,21 @@ class ObjectEditor:
             if (box.x <= world_x <= box.x + box.width and
                     box.y <= world_y <= box.y + box.height):
                 return box, 'trigger_box'
+
+        # Check water/grass/etc regions LAST — regions tend to be large,
+        # ground-level fills that other system boxes (trigger boxes,
+        # collision, doors, etc.) get placed on top of. If regions were
+        # checked earlier, clicking on a spot where a region overlaps one
+        # of those boxes would always hit the region first, forcing it to
+        # be deleted/moved before the box underneath could be selected or
+        # edited. Checking regions last means any other box "wins" the
+        # click when they overlap, and a region is only picked when
+        # nothing else is there.
+        regions = self.animated_region_manager.get_regions(self.current_room_name)
+        for region in regions:
+            if (region.x <= world_x <= region.x + region.width and
+                    region.y <= world_y <= region.y + region.height):
+                return region, 'animated_region'
 
         return None, None
 
@@ -1067,6 +1202,17 @@ class ObjectEditor:
             if hasattr(self, 'on_flying_pad_deleted') and self.on_flying_pad_deleted:
                 self.on_flying_pad_deleted(obj, self.current_room_name)
 
+        elif obj_type == 'nimbus_cloud':
+            self.nimbus_cloud_manager.remove_cloud(self.current_room_name, obj)
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(self.current_room_name)
+                if room and hasattr(room, 'nimbus_clouds'):
+                    if obj in room.nimbus_clouds:
+                        room.nimbus_clouds.remove(obj)
+
+            if hasattr(self, 'on_nimbus_cloud_deleted') and self.on_nimbus_cloud_deleted:
+                self.on_nimbus_cloud_deleted(obj, self.current_room_name)
+
         elif obj_type == 'transition':
             self.transition_manager.remove_transition(self.current_room_name, obj)
             if self.room_manager:
@@ -1097,6 +1243,16 @@ class ObjectEditor:
 
             if hasattr(self, 'on_door_deleted') and self.on_door_deleted:
                 self.on_door_deleted(obj, self.current_room_name)
+
+        elif obj_type == 'chest':
+            self.chest_manager.remove_chest(self.current_room_name, obj)
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(self.current_room_name)
+                if room and hasattr(room, 'chests') and obj in room.chests:
+                    room.chests.remove(obj)
+
+            if hasattr(self, 'on_chest_deleted') and self.on_chest_deleted:
+                self.on_chest_deleted(obj, self.current_room_name)
 
         elif obj_type == 'gate':
             self.gate_manager.remove_gate(self.current_room_name, obj)
@@ -1185,6 +1341,76 @@ class ObjectEditor:
 
         return False
 
+    def _try_assign_chest_loot(self, mouse_pos):
+        """If the toolbar has an item armed (Items panel selection) and the
+        click landed on a placed chest, assign that loot to it and report
+        the click as consumed. Clicking the same chest again with the same
+        item stacks the quantity (up to 99); picking a different item
+        replaces whatever loot the chest had and resets quantity to 1.
+        Returns True if the click was consumed here.
+
+        Does NOT call on_chest_placed — that callback is wired to push an
+        object_add undo entry, so reusing it for loot edits made Ctrl+Z
+        delete the whole chest. Loot mutations go through on_chest_loot_changed
+        instead (optional; room data is already live since the chest object
+        is mutated in place).
+        """
+        if not self.toolbar:
+            print("[LOOT DEBUG] no toolbar on object_editor!")
+            return False
+        selected_item_id = getattr(self.toolbar, 'selected_item_id', '')
+        if not selected_item_id:
+            print("[LOOT DEBUG] no item armed (object_editor's view)")
+            return False
+        if self._is_in_palette(mouse_pos[0], mouse_pos[1]):
+            print("[LOOT DEBUG] click swallowed by _is_in_palette")
+            return False
+
+        # Prefer a generous AABB hit test over the centre-distance check used
+        # by _check_object_at_position — loot assignment is easy to miss on a
+        # small chest, and a miss used to fall through into normal placement.
+        chest = self._chest_at_world(self.mouse_world_x, self.mouse_world_y)
+        print(f"[LOOT DEBUG] chest lookup in room={self.current_room_name!r}: "
+              f"found={chest is not None} candidates={len(self.chest_manager.get_chests(self.current_room_name))}")
+        if chest is None:
+            return False
+
+        if chest.item_id == selected_item_id:
+            print(
+                f"[LOOT DEBUG] set chest.item_id={chest.item_id!r} qty={chest.item_qty} on chest at ({chest.x},{chest.y})")
+            chest.item_qty = min(99, getattr(chest, 'item_qty', 1) + 1)
+        else:
+            chest.item_id = selected_item_id
+            chest.item_qty = 1
+
+        if getattr(self, 'on_chest_loot_changed', None):
+            self.on_chest_loot_changed(chest, self.current_room_name)
+
+        return True
+
+    def _chest_at_world(self, world_x, world_y):
+        """Return the chest under (world_x, world_y), or None.
+
+        Uses the chest's full axis-aligned bounds (with a small pad) rather
+        than a centre-distance radius so corner/edge clicks still count —
+        important for the loot-assignment flow where a miss must not place
+        a new object.
+        """
+        if not self.current_room_name:
+            return None
+        pad = 4  # world units of forgiveness around the sprite
+        for chest in self.chest_manager.get_chests(self.current_room_name):
+            hw = max(chest.width, 1) / 2 + pad
+            hh = max(chest.height, 1) / 2 + pad
+            if (chest.x - hw <= world_x <= chest.x + hw and
+                    chest.y - hh <= world_y <= chest.y + hh):
+                return chest
+        return None
+
+    def _item_armed(self):
+        """True when the toolbar Items panel has an item selected for loot assignment."""
+        return bool(self.toolbar and getattr(self.toolbar, 'selected_item_id', ''))
+
     def _is_level_input_clicked(self, mouse_pos):
         """Check if the level input box was clicked"""
         if not self.selected_object or not isinstance(self.selected_object, dict):
@@ -1223,9 +1449,8 @@ class ObjectEditor:
         """Check if the mouse is hovering over the palette"""
         if not self.palette_visible:
             return False
-        return (mouse_x >= self.palette_x and
-                mouse_y >= self.palette_y and
-                mouse_y <= self.palette_y + self.palette_height)
+        return (self.palette_x <= mouse_x <= self.palette_x + self.palette_width and
+                self.palette_y <= mouse_y <= self.palette_y + self.palette_height)
 
     def _handle_palette_click(self, mouse_pos):
         """Handle clicks inside the palette"""
@@ -1268,8 +1493,44 @@ class ObjectEditor:
                         self.selected_variant = None
                 return
 
+    # Minimum center-to-center distance (world units) allowed between two
+    # point-placed objects of the same kind. Placing with nothing to stop
+    # you from clicking on top of an existing object silently stacks a new,
+    # fully-simulated copy underneath it — invisible to the eye but not to
+    # the CPU: every stacked stone/gate/chest/etc. is a real entry in
+    # room.collision_objects / obstacles and gets checked every frame for
+    # the rest of the room's life. A room with a few dozen "visible" objects
+    # secretly holding hundreds of duplicates is where the creeping in-game
+    # slowdown reported by players actually comes from.
+    _MIN_PLACEMENT_SPACING = 10
+
+    def _too_close_to_existing(self, x, y, existing_objects, min_distance=None):
+        """True if (x, y) lands within min_distance of any object already
+        in existing_objects. Call this right before appending a new
+        point-placed object so repeat clicks on (near) the same spot are a
+        no-op instead of piling up an invisible duplicate.
+        """
+        if not existing_objects:
+            return False
+        if min_distance is None:
+            min_distance = self._MIN_PLACEMENT_SPACING
+        min_distance_sq = min_distance * min_distance
+        for obj in existing_objects:
+            ox = getattr(obj, 'x', None)
+            oy = getattr(obj, 'y', None)
+            if ox is None or oy is None:
+                continue
+            if (x - ox) ** 2 + (y - oy) ** 2 <= min_distance_sq:
+                return True
+        return False
+
     def _place_object(self, camera_x, camera_y, room_name):
         """Actually place the selected object in the world"""
+        # Hard stop: an armed item means "assign loot", never "place object".
+        # selected_object often still points at Chest from the palette, so
+        # without this a missed loot click silently stamps a second chest.
+        if self._item_armed():
+            return
         if not self.selected_object or not isinstance(self.selected_object, dict):
             return
 
@@ -1295,6 +1556,13 @@ class ObjectEditor:
             variant = self.selected_variant or self._get_current_variant(self.selected_object)
             stone_type = variant['type'] if variant else 'medium'
 
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(room_name)
+                if room and self._too_close_to_existing(
+                        self.preview_x, self.preview_y,
+                        getattr(room, 'destructible_stones', None)):
+                    return
+
             stone = DestructibleStone(
                 int(self.preview_x),
                 int(self.preview_y),
@@ -1313,6 +1581,12 @@ class ObjectEditor:
 
 
         elif self.selected_object.get('object_type') == 'flying_pad':
+            existing_pads = None
+            if self.room_manager:
+                _room = self.room_manager.get_room_by_name(room_name)
+                existing_pads = getattr(_room, 'flying_pads', None) if _room else None
+            if self._too_close_to_existing(self.preview_x, self.preview_y, existing_pads):
+                return
 
             # Get selected variant
             variant = self.selected_variant or self._get_current_variant(self.selected_object)
@@ -1355,7 +1629,84 @@ class ObjectEditor:
                 room_height
             )
 
+        elif self.selected_object.get('object_type') == 'nimbus_cloud':
+            existing_clouds = None
+            if self.room_manager:
+                _room = self.room_manager.get_room_by_name(room_name)
+                existing_clouds = getattr(_room, 'nimbus_clouds', None) if _room else None
+            if self._too_close_to_existing(self.preview_x, self.preview_y, existing_clouds):
+                return
+
+            # Get selected variant
+            variant = self.selected_variant or self._get_current_variant(self.selected_object)
+            cloud_type = variant['type'] if variant and 'type' in variant else 'white'
+
+            # Create nimbus cloud
+            cloud = NimbusCloud(int(self.preview_x), int(self.preview_y), cloud_type)
+
+            # Add the first waypoint at the cloud's position automatically
+            from objects.nimbus_cloud import NimbusCloudWaypoint
+            initial_waypoint = NimbusCloudWaypoint(int(self.preview_x), int(self.preview_y), is_boundary=False)
+            cloud.waypoints = [initial_waypoint]
+
+            # Store cloud temporarily
+            self.pending_nimbus_cloud = cloud
+            self.placing_nimbus_cloud = True
+
+            # origin_room must be the placement room, not whatever room the
+            # path editor is in when the user hits Save. Return rides key
+            # off this; if it is the destination, boarding there reverses
+            # toward the destination again (stuck in room B after reload).
+            cloud.origin_room = room_name
+            cloud.current_room = room_name
+
+            # Capture the room-editor's current live view — this is the
+            # frame NimbusCloudPathEditor is about to lock the first leg
+            # to (see the "open path editor" call below). Persisting it on
+            # the cloud itself lets runtime playback recreate that exact
+            # frame on a return ride back into this room, matching how the
+            # leg was authored instead of falling back to the generic
+            # top-anchored formula every other leg uses.
+            cloud.origin_camera_x = camera_x
+            cloud.origin_camera_y = camera_y
+
+            # Get available rooms list
+            available_rooms = []
+            if self.room_manager:
+                available_rooms = self.room_manager.get_room_names()
+
+            # Get current room dimensions
+            room_width = 2400
+            room_height = 1800
+
+            if self.room_manager:
+                current_room = self.room_manager.get_room_by_name(room_name)
+                if current_room:
+                    room_width = current_room.width
+                    room_height = current_room.height
+
+            # Open path editor WITH ROOM DIMENSIONS and the current view —
+            # the cloud's path editor locks its camera to whatever's on
+            # screen right now for this first leg, rather than following a
+            # free-panning camera like the flying pad editor does.
+            self.nimbus_cloud_path_editor.open(
+                cloud,
+                room_name,
+                available_rooms,
+                room_width,
+                room_height,
+                camera_x=camera_x,
+                camera_y=camera_y
+            )
+
         elif self.selected_object.get('object_type') == 'save_point':
+            existing_save_points = None
+            if self.room_manager:
+                _room = self.room_manager.get_room_by_name(room_name)
+                existing_save_points = getattr(_room, 'save_points', None) if _room else None
+            if self._too_close_to_existing(self.preview_x, self.preview_y, existing_save_points):
+                return
+
             # Get selected variant
             variant = self.selected_variant or self._get_current_variant(self.selected_object)
             sp_variant = variant['type'] if variant and 'type' in variant else 'big'
@@ -1372,13 +1723,23 @@ class ObjectEditor:
                 if room:
                     if not hasattr(room, 'save_points'):
                         room.save_points = []
-                    room.save_points.append(save_point)
+                    # See chest placement above: save_point_manager's list is
+                    # aliased to room.save_points, so avoid a duplicate append.
+                    if save_point not in room.save_points:
+                        room.save_points.append(save_point)
 
             # Notify game
             if self.on_save_point_placed:
                 self.on_save_point_placed(save_point)
 
         elif self.selected_object.get('object_type') == 'world_map_object':
+            existing_wm_objects = None
+            if self.room_manager:
+                _room = self.room_manager.get_room_by_name(room_name)
+                existing_wm_objects = getattr(_room, 'world_map_objects', None) if _room else None
+            if self._too_close_to_existing(self.preview_x, self.preview_y, existing_wm_objects):
+                return
+
             variant = self.selected_variant or self._get_current_variant(self.selected_object)
             variant_type = variant['type'] if variant and 'type' in variant else 'world_map'
             map_name = self.world_map_name_text
@@ -1391,12 +1752,22 @@ class ObjectEditor:
                 if room:
                     if not hasattr(room, 'world_map_objects'):
                         room.world_map_objects = []
-                    room.world_map_objects.append(obj)
+                    # See chest placement above: world_map_manager's list is
+                    # aliased to room.world_map_objects, so avoid a duplicate append.
+                    if obj not in room.world_map_objects:
+                        room.world_map_objects.append(obj)
 
             if self.on_world_map_placed:
                 self.on_world_map_placed(obj, room_name)
 
         elif self.selected_object.get('object_type') == 'door':
+            existing_doors = None
+            if self.room_manager:
+                _room = self.room_manager.get_room_by_name(room_name)
+                existing_doors = getattr(_room, 'doors', None) if _room else None
+            if self._too_close_to_existing(self.preview_x, self.preview_y, existing_doors):
+                return
+
             variant = self.selected_variant or self._get_current_variant(self.selected_object)
             door_type = variant['type'] if variant and 'type' in variant else self.door_variants[0]['type']
 
@@ -1415,12 +1786,55 @@ class ObjectEditor:
                 if room:
                     if not hasattr(room, 'doors'):
                         room.doors = []
-                    room.doors.append(door)
+                    # See chest placement above: door_manager's list is
+                    # aliased to room.doors, so avoid a duplicate append.
+                    if door not in room.doors:
+                        room.doors.append(door)
 
             if hasattr(self, 'on_door_placed') and self.on_door_placed:
                 self.on_door_placed(door, room_name)
 
+        elif self.selected_object.get('object_type') == 'chest':
+            existing_chests = None
+            if self.room_manager:
+                _room = self.room_manager.get_room_by_name(room_name)
+                existing_chests = getattr(_room, 'chests', None) if _room else None
+            if self._too_close_to_existing(self.preview_x, self.preview_y, existing_chests):
+                return
+
+            variant = self.selected_variant or self._get_current_variant(self.selected_object)
+            chest_type = variant['type'] if variant and 'type' in variant else self.chest_variants[0]['type']
+
+            # Chests are always placed empty now — loot is assigned
+            # afterward by selecting an item in the toolbar's Items panel
+            # and clicking the placed chest (see _try_assign_chest_loot).
+            chest = Chest(int(self.preview_x), int(self.preview_y), chest_type)
+
+            self.chest_manager.add_chest(room_name, chest)
+
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(room_name)
+                if room:
+                    if not hasattr(room, 'chests'):
+                        room.chests = []
+                    # chest_manager.chests[room_name] and room.chests are the
+                    # same underlying list (aliased in _sync_room_to_editor),
+                    # so add_chest() above already appended this chest here.
+                    # Guard against a second append, same as the redo path.
+                    if chest not in room.chests:
+                        room.chests.append(chest)
+
+            if hasattr(self, 'on_chest_placed') and self.on_chest_placed:
+                self.on_chest_placed(chest, room_name)
+
         elif self.selected_object.get('object_type') == 'level_gate':
+            existing_gates = None
+            if self.room_manager:
+                _room = self.room_manager.get_room_by_name(room_name)
+                existing_gates = getattr(_room, 'level_gates', None) if _room else None
+            if self._too_close_to_existing(self.preview_x, self.preview_y, existing_gates):
+                return
+
             # Get selected variant or default
             variant = self.selected_variant or self._get_current_variant(self.selected_object)
             gate_type = variant['type'] if variant and 'type' in variant else 'stone'
@@ -1439,10 +1853,27 @@ class ObjectEditor:
                 if room:
                     if not hasattr(room, 'level_gates'):
                         room.level_gates = []
-                    room.level_gates.append(gate)
+                    # See chest placement above: gate_manager's list is
+                    # aliased to room.level_gates, so avoid a duplicate append.
+                    if gate not in room.level_gates:
+                        room.level_gates.append(gate)
 
             if hasattr(self, 'on_gate_placed') and self.on_gate_placed:
                 self.on_gate_placed(gate, room_name)
+
+    def _draw_assign_highlight(self, screen, camera_x, camera_y):
+        """Green pulsing outline around the hovered chest when an item is
+        armed in the toolbar — signals "click to add loot", the assign
+        counterpart to _draw_delete_highlight's red delete pulse."""
+        chest = self.hovered_object
+        screen_x = (chest.x * RENDER_SCALE) - camera_x
+        screen_y = (chest.y * RENDER_SCALE) - camera_y
+        scaled_width = int(chest.width * RENDER_SCALE)
+
+        pulse = int(20 + 10 * abs(pygame.time.get_ticks() % 1000 - 500) / 500)
+        pygame.draw.circle(screen, self.colors['success'],
+                           (int(screen_x), int(screen_y)),
+                           scaled_width // 2 + pulse, 3)
 
     def _draw_delete_highlight(self, screen, camera_x, camera_y):
         """Draw red outline around object that's about to be deleted"""
@@ -1493,12 +1924,38 @@ class ObjectEditor:
         if not self.preview_collision:
             return
 
-        collision_obj = CollisionObject(
+        new_rect = pygame.Rect(
             int(self.preview_collision.x),
             int(self.preview_collision.y),
             int(self.preview_collision.width),
             int(self.preview_collision.height),
-            room_name
+        )
+
+        # Collision walls are checked against every frame for the rest of
+        # the room's life (see CollisionObjectManager / obstacles), so a
+        # near-zero drag that lands almost exactly on top of an existing
+        # wall would otherwise stack an invisible, redundant obstacle on
+        # every click. Skip the append when the new rect is (almost)
+        # entirely already covered by an existing wall — legitimate walls
+        # placed edge-to-edge only partially overlap and are unaffected.
+        if self.room_manager and new_rect.width > 0 and new_rect.height > 0:
+            room = self.room_manager.get_room_by_name(room_name)
+            existing_walls = getattr(room, 'collision_objects', None) if room else None
+            if existing_walls:
+                new_area = new_rect.width * new_rect.height
+                for wall in existing_walls:
+                    wall_rect = pygame.Rect(
+                        int(getattr(wall, 'x', 0)), int(getattr(wall, 'y', 0)),
+                        int(getattr(wall, 'width', 0)), int(getattr(wall, 'height', 0)),
+                    )
+                    overlap = new_rect.clip(wall_rect)
+                    overlap_area = overlap.width * overlap.height
+                    if new_area > 0 and overlap_area / new_area >= 0.9:
+                        self.preview_collision = None
+                        return
+
+        collision_obj = CollisionObject(
+            new_rect.x, new_rect.y, new_rect.width, new_rect.height, room_name
         )
 
         if self.room_manager:
@@ -1710,10 +2167,11 @@ class ObjectEditor:
         objects like trigger boxes."""
         marker_size = 16
         if self.grid_snap:
-            tile_left = int(self.mouse_world_x / TILE_SIZE) * TILE_SIZE
-            tile_top = int(self.mouse_world_y / TILE_SIZE) * TILE_SIZE
-            x = tile_left + TILE_SIZE // 2 - marker_size // 2
-            y = tile_top + TILE_SIZE // 2 - marker_size // 2
+            snap = self.grid_snap_size
+            tile_left = int(self.mouse_world_x / snap) * snap
+            tile_top = int(self.mouse_world_y / snap) * snap
+            x = tile_left + snap // 2 - marker_size // 2
+            y = tile_top + snap // 2 - marker_size // 2
         else:
             x = int(self.mouse_world_x - marker_size // 2)
             y = int(self.mouse_world_y - marker_size // 2)
@@ -1810,6 +2268,12 @@ class ObjectEditor:
             return
 
         self.current_room_name = room_name
+        # Deselect palette object while an item is armed so a world
+        # click can only assign loot, never place a duplicate chest.
+        if self._item_armed() and self.selected_object is not None:
+            self.selected_object = None
+            self.selected_variant = None
+            self.showing_variants_for = None
         mouse_pos = pygame.mouse.get_pos()
 
         # Handle transition config dialog
@@ -1932,6 +2396,102 @@ class ObjectEditor:
 
             return
 
+        # Handle nimbus cloud path editor
+        if self.nimbus_cloud_path_editor.active:
+            result = self.nimbus_cloud_path_editor.handle_input(
+                event,
+                int(self.mouse_world_x),
+                int(self.mouse_world_y),
+                self.room_manager.current_room.width if self.room_manager.current_room else WORLD_WIDTH,
+                self.room_manager.current_room.height if self.room_manager.current_room else WORLD_HEIGHT
+            )
+
+            # Path editor finished — commit the nimbus cloud and return to the original room
+            if result and result.startswith('save:'):
+                parts = result.split(':')
+                return_room_name = parts[1] if len(parts) > 1 else ""
+                should_create_return_cloud = parts[2] == "return_pad" if len(parts) > 2 else False
+
+                if self.pending_nimbus_cloud:
+                    # Register under the placement room (origin_room), not
+                    # whatever room the path editor reports on save (often
+                    # the destination after a boundary spawn is placed).
+                    cloud_room_name = (
+                        getattr(self.pending_nimbus_cloud, 'origin_room', '') or return_room_name
+                    )
+
+                    self.nimbus_cloud_manager.add_cloud(cloud_room_name, self.pending_nimbus_cloud)
+
+                    # NOTE: add_cloud() above already appended into
+                    # nimbus_cloud_manager.nimbus_clouds[cloud_room_name].
+                    # game.py's _sync_spawn_manager_with_rooms() aliases that
+                    # manager list to be the SAME list object as
+                    # room.nimbus_clouds, so appending to room.nimbus_clouds
+                    # here too would add this cloud twice into one shared
+                    # list (visually: two clouds stacked on top of each
+                    # other). Point room.nimbus_clouds AT the manager's list
+                    # instead — a no-op reassignment once already aliased,
+                    # and what keeps a brand-new room's list wired up to the
+                    # manager the first time a cloud is placed in it.
+                    if self.room_manager:
+                        room = self.room_manager.get_room_by_name(cloud_room_name)
+                        if room:
+                            room.nimbus_clouds = self.nimbus_cloud_manager.nimbus_clouds[cloud_room_name]
+
+                    if hasattr(self, 'on_nimbus_cloud_placed') and self.on_nimbus_cloud_placed:
+                        self.on_nimbus_cloud_placed(self.pending_nimbus_cloud, cloud_room_name)
+
+                    # If the user ticked "create return cloud", mirror the cloud at the path's end point
+                    if should_create_return_cloud and len(self.pending_nimbus_cloud.waypoints) > 0:
+                        last_wp = self.pending_nimbus_cloud.waypoints[-1]
+                        return_cloud_x = last_wp.x
+                        return_cloud_y = last_wp.y
+                        return_cloud_room = cloud_room_name
+                        for i in range(len(self.pending_nimbus_cloud.waypoints) - 1, -1, -1):
+                            wp = self.pending_nimbus_cloud.waypoints[i]
+                            if wp.is_boundary and wp.target_room:
+                                return_cloud_room = wp.target_room
+                                if getattr(wp, 'spawn_x', None) is not None and getattr(wp, 'spawn_y', None) is not None:
+                                    return_cloud_x = wp.spawn_x
+                                    return_cloud_y = wp.spawn_y
+                                break
+
+                        return_cloud = NimbusCloud(return_cloud_x, return_cloud_y, self.pending_nimbus_cloud.cloud_type)
+                        return_cloud.waypoints = self.pending_nimbus_cloud.waypoints.copy()
+                        return_cloud.is_return_pad = True
+                        return_cloud.source_room = cloud_room_name
+                        return_cloud.origin_room = return_cloud_room
+                        return_cloud.current_room = return_cloud_room
+
+                        original_id = id(self.pending_nimbus_cloud)
+                        return_id = id(return_cloud)
+                        self.pending_nimbus_cloud.linked_pad_id = return_id
+                        return_cloud.linked_pad_id = original_id
+
+                        self.nimbus_cloud_manager.add_cloud(return_cloud_room, return_cloud)
+
+                        # Same reasoning as above — reference, don't re-append.
+                        if self.room_manager:
+                            ret_room = self.room_manager.get_room_by_name(return_cloud_room)
+                            if ret_room:
+                                ret_room.nimbus_clouds = self.nimbus_cloud_manager.nimbus_clouds[return_cloud_room]
+
+                self.pending_nimbus_cloud = None
+                self.placing_nimbus_cloud = False
+
+                return f'return_to_room:{return_room_name}'
+
+            elif result and result.startswith('cancel:'):
+                return_room_name = result.split(':', 1)[1]
+                self.pending_nimbus_cloud = None
+                self.placing_nimbus_cloud = False
+                return f'return_to_room:{return_room_name}'
+
+            elif result and result.startswith('transition:'):
+                return result
+
+            return
+
         # Handle the Event Editor popup (blocks everything else while open)
         if self.event_editor is not None and self.event_editor.active:
             self.event_editor.handle_input(event)
@@ -2002,6 +2562,20 @@ class ObjectEditor:
 
                 # Check if clicking on the door sound picker or its Preview button
                 if self._is_door_sound_ui_clicked(mouse_pos):
+                    return
+
+                # Assigning loot to an existing chest via the toolbar's
+                # Items panel selection takes priority over normal
+                # placement/selection — a click in the world while an item
+                # is armed always means "drop this item in that chest".
+                # If the click misses every chest, still consume the world
+                # click: falling through to normal placement would stamp a
+                # brand-new empty object (e.g. another chest) because
+                # selected_object stays set from the Objects palette.
+                # Palette / settings-panel clicks must still pass through
+                # so the designer can switch tools or clear selection.
+                if self._item_armed() and not self._is_in_palette(mouse_pos[0], mouse_pos[1]):
+                    self._try_assign_chest_loot(mouse_pos)
                     return
 
                 # Handle trigger box property clicks
@@ -2167,7 +2741,10 @@ class ObjectEditor:
                 if self._is_in_palette(mouse_pos[0], mouse_pos[1]):
                     self._handle_palette_click(mouse_pos)
                 else:
-                    # Click in world to place object
+                    # Click in world to place object — blocked while an item
+                    # is armed for chest-loot assignment (see _item_armed).
+                    if self._item_armed():
+                        return
                     if self.selected_object and not self._is_object_disabled(self.selected_object):
                         if self.selected_object.get('is_collision', False):
                             self.placing_collision = True
@@ -2283,7 +2860,7 @@ class ObjectEditor:
                 return
 
             if event.key == pygame.K_g:
-                self.grid_snap = not self.grid_snap
+                self._toggle_grid_snap()
             elif event.key == pygame.K_h:
                 self.show_grid = not self.show_grid
             elif event.key == pygame.K_ESCAPE or event.key == pygame.K_F3:
@@ -2336,8 +2913,9 @@ class ObjectEditor:
                 spawn_height = getattr(self.pending_transition_for_spawn, 'spawn_height',
                                        getattr(self.pending_transition_for_spawn, 'height', 32))
                 # Snap top-left to tile grid, then convert to center for the preview system
-                grid_x = int(self.mouse_world_x / TILE_SIZE) * TILE_SIZE
-                grid_y = int(self.mouse_world_y / TILE_SIZE) * TILE_SIZE
+                snap = self.grid_snap_size
+                grid_x = int(self.mouse_world_x / snap) * snap
+                grid_y = int(self.mouse_world_y / snap) * snap
                 self.transition_spawn_preview_x = grid_x + spawn_width // 2
                 self.transition_spawn_preview_y = grid_y + spawn_height // 2
             else:
@@ -2354,8 +2932,9 @@ class ObjectEditor:
         # replaced with a live game object before reading dict keys.
         if self.selected_object and isinstance(self.selected_object, dict):
             if self.grid_snap:
-                grid_x = int(self.mouse_world_x / TILE_SIZE) * TILE_SIZE + TILE_SIZE // 2
-                grid_y = int(self.mouse_world_y / TILE_SIZE) * TILE_SIZE + TILE_SIZE // 2
+                snap = self.grid_snap_size
+                grid_x = int(self.mouse_world_x / snap) * snap + snap // 2
+                grid_y = int(self.mouse_world_y / snap) * snap + snap // 2
                 self.preview_x = grid_x
                 self.preview_y = grid_y
             else:
@@ -2370,18 +2949,19 @@ class ObjectEditor:
         # snapping or free-dragging from the stored anchor to the current mouse pos.
         if self.placing_collision:
             if self.grid_snap:
-                snap_start_x = int(self.collision_start_x / TILE_SIZE) * TILE_SIZE
-                snap_start_y = int(self.collision_start_y / TILE_SIZE) * TILE_SIZE
-                snap_end_x = int(self.mouse_world_x / TILE_SIZE) * TILE_SIZE
-                snap_end_y = int(self.mouse_world_y / TILE_SIZE) * TILE_SIZE
+                snap = self.grid_snap_size
+                snap_start_x = int(self.collision_start_x / snap) * snap
+                snap_start_y = int(self.collision_start_y / snap) * snap
+                snap_end_x = int(self.mouse_world_x / snap) * snap
+                snap_end_y = int(self.mouse_world_y / snap) * snap
 
                 min_x = min(snap_start_x, snap_end_x)
                 min_y = min(snap_start_y, snap_end_y)
                 max_x = max(snap_start_x, snap_end_x)
                 max_y = max(snap_start_y, snap_end_y)
 
-                width = max(TILE_SIZE, max_x - min_x + TILE_SIZE)
-                height = max(TILE_SIZE, max_y - min_y + TILE_SIZE)
+                width = max(snap, max_x - min_x + snap)
+                height = max(snap, max_y - min_y + snap)
             else:
                 end_x = self.mouse_world_x
                 end_y = self.mouse_world_y
@@ -2404,18 +2984,19 @@ class ObjectEditor:
 
         if self.placing_animated_region:
             if self.grid_snap:
-                snap_start_x = int(self.animated_region_start_x / TILE_SIZE) * TILE_SIZE
-                snap_start_y = int(self.animated_region_start_y / TILE_SIZE) * TILE_SIZE
-                snap_end_x = int(self.mouse_world_x / TILE_SIZE) * TILE_SIZE
-                snap_end_y = int(self.mouse_world_y / TILE_SIZE) * TILE_SIZE
+                snap = self.grid_snap_size
+                snap_start_x = int(self.animated_region_start_x / snap) * snap
+                snap_start_y = int(self.animated_region_start_y / snap) * snap
+                snap_end_x = int(self.mouse_world_x / snap) * snap
+                snap_end_y = int(self.mouse_world_y / snap) * snap
 
                 min_x = min(snap_start_x, snap_end_x)
                 min_y = min(snap_start_y, snap_end_y)
                 max_x = max(snap_start_x, snap_end_x)
                 max_y = max(snap_start_y, snap_end_y)
 
-                width = max(TILE_SIZE, max_x - min_x + TILE_SIZE)
-                height = max(TILE_SIZE, max_y - min_y + TILE_SIZE)
+                width = max(snap, max_x - min_x + snap)
+                height = max(snap, max_y - min_y + snap)
             else:
                 end_x = self.mouse_world_x
                 end_y = self.mouse_world_y
@@ -2444,18 +3025,19 @@ class ObjectEditor:
 
         if self.placing_trigger_box:
             if self.grid_snap:
-                snap_start_x = int(self.trigger_box_start_x / TILE_SIZE) * TILE_SIZE
-                snap_start_y = int(self.trigger_box_start_y / TILE_SIZE) * TILE_SIZE
-                snap_end_x = int(self.mouse_world_x / TILE_SIZE) * TILE_SIZE
-                snap_end_y = int(self.mouse_world_y / TILE_SIZE) * TILE_SIZE
+                snap = self.grid_snap_size
+                snap_start_x = int(self.trigger_box_start_x / snap) * snap
+                snap_start_y = int(self.trigger_box_start_y / snap) * snap
+                snap_end_x = int(self.mouse_world_x / snap) * snap
+                snap_end_y = int(self.mouse_world_y / snap) * snap
 
                 min_x = min(snap_start_x, snap_end_x)
                 min_y = min(snap_start_y, snap_end_y)
                 max_x = max(snap_start_x, snap_end_x)
                 max_y = max(snap_start_y, snap_end_y)
 
-                width = max(TILE_SIZE, max_x - min_x + TILE_SIZE)
-                height = max(TILE_SIZE, max_y - min_y + TILE_SIZE)
+                width = max(snap, max_x - min_x + snap)
+                height = max(snap, max_y - min_y + snap)
             else:
                 end_x = self.mouse_world_x
                 end_y = self.mouse_world_y
@@ -2479,18 +3061,19 @@ class ObjectEditor:
 
         if self.placing_transition:
             if self.grid_snap:
-                snap_start_x = int(self.transition_start_x / TILE_SIZE) * TILE_SIZE
-                snap_start_y = int(self.transition_start_y / TILE_SIZE) * TILE_SIZE
-                snap_end_x = int(self.mouse_world_x / TILE_SIZE) * TILE_SIZE
-                snap_end_y = int(self.mouse_world_y / TILE_SIZE) * TILE_SIZE
+                snap = self.grid_snap_size
+                snap_start_x = int(self.transition_start_x / snap) * snap
+                snap_start_y = int(self.transition_start_y / snap) * snap
+                snap_end_x = int(self.mouse_world_x / snap) * snap
+                snap_end_y = int(self.mouse_world_y / snap) * snap
 
                 min_x = min(snap_start_x, snap_end_x)
                 min_y = min(snap_start_y, snap_end_y)
                 max_x = max(snap_start_x, snap_end_x)
                 max_y = max(snap_start_y, snap_end_y)
 
-                width = max(TILE_SIZE, max_x - min_x + TILE_SIZE)
-                height = max(TILE_SIZE, max_y - min_y + TILE_SIZE)
+                width = max(snap, max_x - min_x + snap)
+                height = max(snap, max_y - min_y + snap)
             else:
                 end_x = self.mouse_world_x
                 end_y = self.mouse_world_y
@@ -2516,6 +3099,14 @@ class ObjectEditor:
         # Update flying pad path editor while it's open
         if self.flying_pad_path_editor.active:
             self.flying_pad_path_editor.update(
+                dt,
+                int(self.mouse_world_x),
+                int(self.mouse_world_y)
+            )
+
+        # Update nimbus cloud path editor while it's open
+        if self.nimbus_cloud_path_editor.active:
+            self.nimbus_cloud_path_editor.update(
                 dt,
                 int(self.mouse_world_x),
                 int(self.mouse_world_y)
@@ -2568,6 +3159,17 @@ class ObjectEditor:
         # Don't show object preview when path editor is active
         if self.flying_pad_path_editor.active:
             self.flying_pad_path_editor.draw(
+                screen,
+                self._make_camera(camera_x, camera_y),
+                RENDER_SCALE
+            )
+            return
+
+        # Don't show object preview when the nimbus cloud path editor is
+        # active either — note it ignores the live camera_x/camera_y passed
+        # in here and draws against its own locked frame instead.
+        if self.nimbus_cloud_path_editor.active:
+            self.nimbus_cloud_path_editor.draw(
                 screen,
                 self._make_camera(camera_x, camera_y),
                 RENDER_SCALE
@@ -2699,6 +3301,22 @@ class ObjectEditor:
                 screen.blit(ghost, (ghost_screen_x, ghost_screen_y))
             return
 
+        if (self.hovered_object and self.hovered_object_type == 'chest'
+                and self._item_armed()):
+            # An item is armed in the toolbar's Items panel — clicking this
+            # chest assigns loot rather than deleting it / placing a new
+            # object, so show a distinct (green, not red) highlight. Do not
+            # require selected_object to be None: the Objects palette often
+            # still has Chest (or anything) selected after arming an item.
+            self._draw_assign_highlight(screen, camera_x, camera_y)
+            return
+
+        # While an item is armed, world clicks never place — suppress the
+        # selected-object placement ghost so it doesn't look like another
+        # chest is about to drop.
+        if self._item_armed():
+            return
+
         if self.hovered_object and self.hovered_object_type and not self.selected_object:
             self._draw_delete_highlight(screen, camera_x, camera_y)
             return
@@ -2718,15 +3336,16 @@ class ObjectEditor:
         screen_y = (self.preview_y * RENDER_SCALE) - camera_y
 
         if self.grid_snap:
-            grid_screen_x = int(self.mouse_world_x / TILE_SIZE) * TILE_SIZE * RENDER_SCALE - camera_x
-            grid_screen_y = int(self.mouse_world_y / TILE_SIZE) * TILE_SIZE * RENDER_SCALE - camera_y
+            snap = self.grid_snap_size
+            grid_screen_x = int(self.mouse_world_x / snap) * snap * RENDER_SCALE - camera_x
+            grid_screen_y = int(self.mouse_world_y / snap) * snap * RENDER_SCALE - camera_y
 
-            guide_surf = pygame.Surface((TILE_SIZE * RENDER_SCALE, TILE_SIZE * RENDER_SCALE), pygame.SRCALPHA)
+            guide_surf = pygame.Surface((snap * RENDER_SCALE, snap * RENDER_SCALE), pygame.SRCALPHA)
             pygame.draw.rect(guide_surf, self.colors['snap_guide'],
-                             (0, 0, TILE_SIZE * RENDER_SCALE, TILE_SIZE * RENDER_SCALE), 2)
+                             (0, 0, snap * RENDER_SCALE, snap * RENDER_SCALE), 2)
 
-            center_x = TILE_SIZE * RENDER_SCALE // 2
-            center_y = TILE_SIZE * RENDER_SCALE // 2
+            center_x = snap * RENDER_SCALE // 2
+            center_y = snap * RENDER_SCALE // 2
             pygame.draw.line(guide_surf, self.colors['snap_guide'],
                              (center_x - 5, center_y), (center_x + 5, center_y), 2)
             pygame.draw.line(guide_surf, self.colors['snap_guide'],
@@ -2840,6 +3459,66 @@ class ObjectEditor:
         for door in self.door_manager.get_doors(self.current_room_name):
             door.draw(screen, temp_camera, colors)
 
+    def _get_chest_loot_icon(self, item_id):
+        """Same convention/cache as game.py's _get_chest_item_icon —
+        assets/sprites/items/{item_id}.png, or None if it's not on disk.
+        Used to badge chests that already have loot assigned (see
+        draw_chests) so designers can see it at a glance in the editor."""
+        if not hasattr(self, '_chest_loot_icon_cache'):
+            self._chest_loot_icon_cache = {}
+        if item_id not in self._chest_loot_icon_cache:
+            path = os.path.join('assets', 'sprites', 'items', f'{item_id}.png')
+            try:
+                self._chest_loot_icon_cache[item_id] = pygame.image.load(path).convert_alpha()
+            except (pygame.error, OSError, FileNotFoundError):
+                self._chest_loot_icon_cache[item_id] = None
+        return self._chest_loot_icon_cache[item_id]
+
+    def draw_chests(self, screen, camera_x, camera_y, colors=None):
+        """Draw chests in the current room (editor preview — always shows
+        the closed frame, since there's no player to open one in the
+        editor). Chests that already have loot assigned get a small icon
+        badge above them (with an x-qty label if more than one) so
+        designers can see what's inside without re-selecting anything —
+        loot itself is assigned by clicking a chest with an item armed in
+        the toolbar's Items panel, see ObjectEditor._try_assign_chest_loot."""
+        if not self.current_room_name:
+            return
+
+        temp_camera = self._make_camera(camera_x, camera_y)
+
+        for chest in self.chest_manager.get_chests(self.current_room_name):
+            chest.draw(screen, temp_camera, colors)
+            if chest.item_id:
+                self._draw_chest_loot_badge(screen, chest, camera_x, camera_y)
+
+    def _draw_chest_loot_badge(self, screen, chest, camera_x, camera_y):
+        """Small floating icon (+ 'xN' if qty > 1) above a chest that
+        already has loot, editor-only decoration drawn on top of the
+        chest's own sprite."""
+        screen_x = int(chest.x * RENDER_SCALE - camera_x)
+        top_y = int((chest.y - chest.height / 2) * RENDER_SCALE - camera_y)
+        badge_size = 20
+        badge_rect = pygame.Rect(0, 0, badge_size, badge_size)
+        badge_rect.midbottom = (screen_x, top_y - 4)
+
+        pygame.draw.rect(screen, (25, 25, 40), badge_rect, border_radius=4)
+        pygame.draw.rect(screen, self.colors['accent'], badge_rect, 1, border_radius=4)
+
+        icon = self._get_chest_loot_icon(chest.item_id)
+        if icon:
+            scale = min((badge_size - 4) / icon.get_width(), (badge_size - 4) / icon.get_height())
+            icon = pygame.transform.scale(
+                icon, (max(1, int(icon.get_width() * scale)), max(1, int(icon.get_height() * scale)))
+            )
+            screen.blit(icon, icon.get_rect(center=badge_rect.center))
+
+        if chest.item_qty > 1:
+            qty_surf = self.font_small.render(f'x{chest.item_qty}', True, self.colors['accent'])
+            qty_rect = qty_surf.get_rect(midtop=(badge_rect.centerx, badge_rect.bottom + 1))
+            pygame.draw.rect(screen, (25, 25, 40), qty_rect.inflate(4, 2))
+            screen.blit(qty_surf, qty_rect)
+
     def draw_spawn_points(self, screen, camera_x, camera_y):
         """Draw spawn points in the current room"""
         if not self.current_room_name:
@@ -2866,6 +3545,8 @@ class ObjectEditor:
 
         # Don't show palette when path editor is active
         if self.flying_pad_path_editor.active:
+            return
+        if self.nimbus_cloud_path_editor.active:
             return
 
         # Update hover state and always draw the toggle tab
@@ -3177,6 +3858,21 @@ class ObjectEditor:
                 # Draw path preview in editor
                 pad.draw_path_preview(screen, temp_camera, RENDER_SCALE)
 
+    def draw_nimbus_clouds(self, screen, camera_x, camera_y, colors):
+        """Draw nimbus clouds in the current room"""
+        if not self.current_room_name:
+            return
+
+        clouds = self.nimbus_cloud_manager.get_clouds(self.current_room_name)
+
+        temp_camera = self._make_camera(camera_x, camera_y)
+
+        for cloud in clouds:
+            if cloud.active:
+                cloud.draw(screen, temp_camera, colors, RENDER_SCALE)
+                # Draw path preview in editor
+                cloud.draw_path_preview(screen, temp_camera, RENDER_SCALE)
+
     def draw_save_points(self, screen, camera_x, camera_y, colors):
         """Draw save points in the current room"""
         if not self.current_room_name:
@@ -3279,7 +3975,7 @@ class ObjectEditor:
 
         y_pos = panel_y + 10
 
-        snap_text = f"Grid Snap: {'ON' if self.grid_snap else 'OFF'}"
+        snap_text = f"Grid Snap: {self.grid_snap_size}px" if self.grid_snap else "Grid Snap: OFF"
         snap_color = self.colors['success'] if self.grid_snap else self.colors['text_dim']
         snap_surf = self.font_medium.render(snap_text, True, snap_color)
         screen.blit(snap_surf, (self.palette_x + self.palette_padding, y_pos))
@@ -3790,6 +4486,7 @@ class ObjectEditor:
             "Click: Select Object",
             "Click World: Place",
             "Right-Click: Delete",
+            "Item armed + Click Chest: Add Loot",
             "ESC/F3: Close"
         ]
 

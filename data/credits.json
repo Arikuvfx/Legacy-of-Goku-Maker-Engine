@@ -1,0 +1,61 @@
+{
+  "_readme": [
+    "This file is data-only — CreditsScreen never needs code changes when you edit this.",
+    "Any key starting with '_' (like this one) is ignored by the loader — it's a comment.",
+    "Real JSON has no comment syntax, so use '_comment' / '_readme' keys instead.",
+    "",
+    "TOP-LEVEL SHAPE:",
+    "  timing: default fade_in / hold / fade_out (seconds) for every slide.",
+    "          Override per-slide by adding 'fade_in'/'hold'/'fade_out' inside that slide.",
+    "  slides: an array of slides, shown in order. Each slide is EITHER:",
+    "            - a plain array of lines (uses the default timing above), or",
+    "            - an object { 'lines': [...], 'hold': 3.5, ... } to override timing.",
+    "",
+    "LINE TYPES (each entry in a slide's line list):",
+    "  \"Some Text\"        -> name style: mixed-case font, e.g. person names.",
+    "  { \"name\": \"...\" }  -> same as above, explicit form.",
+    "  { \"role\": \"...\" }  -> role/job-title style, e.g. 'LEAD DESIGN'.",
+    "  { \"title\": \"...\" } -> big single-style heading, e.g. 'THANKS FOR PLAYING'.",
+    "  \"\"                 -> blank spacer line (adds vertical gap, renders nothing).",
+    "",
+    "MULTIPLE LINES UNDER ONE ROLE:",
+    "  Just list several name lines in a row after a { 'role': ... } line — see the",
+    "  TIMED CREDITS slide below for an example with two names under one role.",
+    "",
+    "LINE BREAKS WITHIN ONE ENTRY:",
+    "  Put '\\n' inside any string/role/title/name value to force a line break",
+    "  without adding a separate array entry, e.g. \"Line one\\nLine two\".",
+    "",
+    "COMMAS:",
+    "  Every comma (in name, role, or title lines) is automatically nudged down a",
+    "  few pixels to sit on the baseline properly — nothing to configure here."
+  ],
+
+  "timing": {
+    "fade_in":  0.8,
+    "hold":     2.5,
+    "fade_out": 0.8
+  },
+
+  "slides": [
+    [
+      "CREDITS",
+      "",
+      { "role": "Write your credits here" }
+    ],
+
+    {
+      "_comment": "Example: overriding 'hold' just for this slide, multiple names stacked under one role, and a role line using \\n to break onto two lines.",
+      "lines": [
+        "TIMED CREDITS",
+        "",
+        { "role": "Change the amount of time,\na credit is displayed" },
+        "",
+        { "role": "MULTIPLE NAMES UNDER ONE ROLE" },
+        "Jane Doe",
+        "John Smith"
+      ],
+      "hold": 3.5
+    }
+  ]
+}

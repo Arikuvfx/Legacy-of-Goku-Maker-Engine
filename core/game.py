@@ -55,13 +55,30 @@ from objects.level_gate import LevelGate
 from config.utils.gate_font import get_gate_font
 from objects.flying_pad import FlyingPad
 from core.flypad_controller import FlyingController
+from core.nimbus_controller import NimbusCloudController
 from objects.save_point import SavePoint, SavePointMenu, SavePointManager
 from ui.character_switch_menu import CharacterSwitchMenu
 from ui.pause_menu import PauseMenu
+from ui.credits_screen import CreditsScreen
+from ui.scouter_menu import ScouterMenu
+from core.items import ITEMS, spawn_item_pickup
+from core.item_effects import use_item, tick_item_buffs, equip_item, unequip_item
 from dev_tools.room_editor.room_editor_tools.mission_manager import MissionManager
 from dev_tools.cutscene_editor import CutsceneEditor
 from dev_tools.world_map_editor import WorldMapEditor
 from dev_tools import character_creator
+from dev_tools import entity_creator
+from ui.title_screen import TitleScreen
+
+# Flip to False when building an exported/player-facing release — gates the
+# F1 "skip the title screen straight into the test room" dev shortcut (see
+# Game._dev_skip_to_default_room / the game_mode == 'title' branch in
+# handle_events). Everything else about the title screen itself — New Game,
+# the intro cutscene, Quit — behaves identically either way, so this is the
+# only flag that needs flipping for now. The rest of the dev tooling
+# (DevMenu, room editor, etc.) isn't gated by this yet; that's a separate,
+# bigger "export build" pass for later.
+DEV_BUILD = True
 
 
 # Tell Windows this process is DPI-aware so it reports the true screen resolution.
@@ -194,6 +211,10 @@ class Game:
 
         # ── Core systems ──────────────────────────────────────────────────────
         self.game_config   = GameConfig()
+        # max_level is set globally via the character creator's Settings tab
+        # (character_creator.save_global_settings) rather than hardcoded —
+        # pull in whatever was last saved there, if anything.
+        self.game_config.max_level = character_creator.load_global_settings()["max_level"]
         self.sound_engine  = SoundEngine()
         self.sound_manager = SoundManager(self.sound_engine)
         AudioAssetLoader.load_from_directory(self.sound_engine)
@@ -244,6 +265,7 @@ class Game:
         self.spam_qte_bar          = SpamQTEBar()
         self.level_up_notification = LevelUpNotification(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.flying_controller     = FlyingController(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.nimbus_controller     = NimbusCloudController(SCREEN_WIDTH, SCREEN_HEIGHT)
 
         # ── Room system ───────────────────────────────────────────────────────
         self.room_manager = RoomManager()
@@ -262,7 +284,9 @@ class Game:
         self.transition_config_menu = TransitionConfigMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.world_map_editor = WorldMapEditor(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.world_map_editor.room_manager = self.room_manager
+        self.world_map_editor.on_save = self._on_world_map_saved
         self.character_creator = character_creator.CharacterCreator(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.entity_creator = entity_creator.EntityCreator(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.cutscene_editor = CutsceneEditor(
             self.room_manager,
             self.room_editor,
@@ -281,16 +305,39 @@ class Game:
         #   _csf_state:   None | 'fade_out' | 'start' | 'fade_in'
         #   _csf_alpha:   current overlay alpha (0 = transparent, 255 = full black)
         #   _csf_pending: cutscene data dict waiting to launch after fade-out
-        _FADE_DUR         = 0.4                    # seconds for each half of the fade
+        _FADE_DUR         = 1                    # seconds for each half of the fade
         self._csf_state   = None
         self._csf_alpha   = 0.0
         self._csf_speed   = 255.0 / _FADE_DUR      # alpha units per second
         self._csf_pending = None
+        self._csf_sync_player_pos = True           # see _start_cutscene's docstring
 
         # Callback fired once the currently-playing cutscene finishes.
         # Only set by the 'play_cutscene' EventRunner action (blocking) so
         # its action sequence can resume afterwards.
         self._cutscene_on_finished = None
+
+        # ── Player death sequence ───────────────────────────────────────────
+        # Kicks off the frame player.is_dead flips True (see Player.die(),
+        # called from take_damage() once hp hits 0) and fully owns input/
+        # drawing until the player dismisses the "You have died!" box.
+        #   _death_state:      None | 'anim' | 'fade' | 'box'
+        #     anim — death.png is playing (player.is_dead is already True,
+        #            so Player.update() has frozen everything but the sprite
+        #            itself); once it finishes we hold on the last frame for
+        #            _DEATH_HOLD_DURATION seconds before fading.
+        #     fade — screen ramps to solid black over _DEATH_FADE_DURATION s.
+        #     box  — fully black; the info box is up, waiting for E.
+        #   _death_hold_timer: counts up once the death animation itself has
+        #                      finished, against _DEATH_HOLD_DURATION.
+        #   _death_fade_alpha: current black-overlay alpha (0-255) — same
+        #                      SRCALPHA-surface approach as _csf_alpha/_mjf_alpha.
+        self._death_state         = None
+        self._death_hold_timer    = 0.0
+        self._death_fade_alpha    = 0.0
+        self._DEATH_HOLD_DURATION = 3.0             # seconds to hold on the last death frame
+        self._DEATH_FADE_DURATION = 1.0             # seconds for the fade-to-black
+        self._death_fade_speed    = 255.0 / self._DEATH_FADE_DURATION
 
         # Map-jump screen fade — begins once the player drifts fully off the top
         # of the camera view.  Separate from _csf_* so cutscenes are unaffected.
@@ -369,11 +416,22 @@ class Game:
         self.room_transitions     = []
         self.level_gates          = []
         self.doors                = []
+        self.chests               = []
         self.flying_pads          = []
+        self.nimbus_clouds        = []
         self.world_map_objects = []
         self.music_track          = ''   # current room's persisted BGM track; set via trigger box room_music actions
         self.trigger_boxes        = []   # room's placed trigger box zones (see core/event system)
         self.zeni_pickups         = []   # dropped-zeni world pickups; see _update_zeni_pickups
+        self.item_pickups         = []   # dropped-item world pickups; see _update_item_pickups
+        # item_ids removed from the inventory via 'drop_item:' while the pause
+        # menu is open, not yet turned into world pickups — see the
+        # pause_menu.active handling below. Flushed (and the actual
+        # ItemPickups spawned, at the player's position) the moment the menu
+        # closes, per the request that the item only appears in the world
+        # once the whole pause menu closes, not the instant Drop is confirmed.
+        self._pending_dropped_items = []
+        self.active_item_buffs    = []   # timed stat buffs from consumables (e.g. Holy Water); see systems/item_effects.py
 
         # ── Performance caches ────────────────────────────────────────────────
         # key: (room_name, is_background) → pre-baked tile Surface
@@ -383,7 +441,12 @@ class Game:
         # every frame instead. Populated as a side effect of
         # _build_room_tile_surface() and evicted alongside it.
         self._animated_tile_lists: dict = {}
-        self._dirty_tile_rooms:   set  = set()   # rooms pending a surface rebuild
+        self._dirty_tile_rooms:   set  = set()   # rooms pending a full surface rebuild
+        # room_name -> set of (grid_x, grid_y) world-space cells pending an
+        # in-place patch (single tile placed/erased). Cheaper than a full
+        # rebuild since it never reallocates the room-sized surface or
+        # re-iterates every tile in the room — see _patch_tile_cell().
+        self._dirty_tile_cells:  dict = {}
         # key: font_size → pygame.Font  (avoids allocating a Font every frame)
         self._font_cache: dict = {}
         self._scaled_tile_cache: dict = {}
@@ -399,9 +462,75 @@ class Game:
         self.save_point_manager    = SavePointManager()
         self.save_point_menu       = SavePointMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.character_switch_menu = CharacterSwitchMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
+
+        # In-game "Save Game" flow (see _start_save_flow/_update_save_flow/
+        # _draw_saving_popup) — reuses TitleScreen's own SAVE SELECT frame
+        # (see TitleScreen.open_save_overlay) plus a small "Saving..."
+        # popup drawn in front of it. self.save_flow_active freezes player
+        # input/movement for its duration, same shape as save_point_menu.active
+        # elsewhere in update().
+        self.save_flow_active       = False
+        self.save_flow_timer        = 0.0
+        self.SAVE_FLOW_POPUP_HOLD   = 1.1   # seconds "Saving..." stays up before backing out
+        # Which save slot is "current" for this play session — set once a
+        # slot is actually confirmed on the title screen (see
+        # _start_new_game/_dev_skip_to_default_room). Placeholder until a
+        # real save/load system exists (see TitleScreen._slot_has_save_data's
+        # own placeholder note) — only used so the Save Game screen scrolls
+        # to the right slot instead of always slot 0.
+        self.current_save_slot      = 0
         self.pause_menu            = PauseMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.pause_menu.set_sound_engine(self.sound_engine)
+
+        # Full-screen credits sequence, opened from the pause menu's Options
+        # tab (PauseMenu.handle_input returns 'open_credits'). Content lives
+        # entirely in data/credits.json — see CreditsScreen's docstring.
+        self.credits_screen         = CreditsScreen(SCREEN_WIDTH, SCREEN_HEIGHT)
+
+        # ── Title screen ─────────────────────────────────────────────────────
+        # Boots the player into a title screen instead of dropping them
+        # straight into gameplay. While self.game_mode == 'title',
+        # handle_events()/update()/draw() all early-return to this widget —
+        # nothing else in the engine runs until New Game or the F1 dev
+        # shortcut flips game_mode to 'playing' (see _start_new_game /
+        # _dev_skip_to_default_room below). Content (title text, which
+        # cutscene New Game plays) is data-driven from data/game_flow.json.
+        self.title_screen = TitleScreen(SCREEN_WIDTH, SCREEN_HEIGHT)
+        # Shares the pause menu's Options tab for the title screen's own
+        # OPTIONS entry (see TitleScreen._confirm_menu_selection /
+        # PauseMenu.open_options_only) — same fonts/box art/volume bars,
+        # and it already has sound wired up via set_sound_engine() a few
+        # lines above.
+        self.title_screen.set_pause_menu(self.pause_menu)
+        self.title_screen.set_sound_engine(self.sound_engine)
+        self.title_screen.set_sound_manager(self.sound_manager)
+        # Lets TitleScreen ask for each slot's save summary (or None if
+        # empty) without touching disk itself — see _get_save_slot_summary.
+        self.title_screen.set_save_data_provider(self._get_save_slot_summary)
+        self.title_screen.open()
+        self.game_mode     = 'title'   # 'title' | 'playing'
+
+        # ENTER opens this — separate overlay from the pause menu (see
+        # ui/scouter_menu.py). Mirrors the same pre-open fade-to-black /
+        # instant-black-then-fade-in-on-close transition as the pause menu
+        # (see _pause_fade_active / _open_pause_menu below and their
+        # scouter_menu counterparts, _scouter_fade_active / _open_scouter_menu).
+        self.scouter_menu          = ScouterMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.scouter_menu.set_sound_engine(self.sound_engine)
         self.play_time             = 0.0   # total seconds spent in gameplay
+
+        # Pre-pause-menu fade-to-black — mirrors the original game: ESC
+        # doesn't snap straight into the pause menu, it fades the screen to
+        # black first and only opens the menu once fully black (see the
+        # K_ESCAPE branch in _handle_game_keydown and _open_pause_menu()
+        # below). True for the duration of that fade-out so a repeated ESC
+        # press can't restart/stack it.
+        self._pause_fade_active    = False
+
+        # Same pre-open fade-out gate as _pause_fade_active, but for the
+        # ENTER-triggered scouter menu — see K_RETURN in _handle_game_keydown
+        # and _open_scouter_menu().
+        self._scouter_fade_active  = False
 
         # ── Event timers (timer_start/timer_pause/timer_stop actions) ─────────
         # key: timer_id → {'remaining': float seconds, 'running': bool}
@@ -415,7 +544,23 @@ class Game:
         # None whenever self.spam_qte_bar.active is False.
         self._event_spam_qte_on_complete = None
         self.nearby_save_point     = None
+        self.nearby_chest          = None
         self.nearby_world_map_obj  = None   # WorldMapObject the player can currently interact with
+        self.nearby_item_pickup    = None   # settled ItemPickup the player can currently interact with — see _update_item_pickups
+
+        # Chest opened but still mid pickup-pose (see _handle_interact's
+        # chest branch, _update_chest_pickup, _draw_chest_pickup_icon).
+        # None whenever no chest sequence is in progress.
+        self._pending_chest       = None
+        self._pending_chest_icon  = None
+        self._chest_icon_cache: dict = {}  # item_id -> Surface, mirrors PauseMenu._item_icon_cache
+
+        # Dropped-item pickup collected but still mid pickup-pose — same
+        # idea as _pending_chest above, see _handle_interact's item-pickup
+        # branch, _update_item_pickup_finish, _draw_item_pickup_icon.
+        self._pending_item_pickup       = None
+        self._pending_item_pickup_icon  = None
+        self._item_pickup_icon_cache: dict = {}  # item_id -> Surface, mirrors _chest_icon_cache
 
         # ── Test mode ─────────────────────────────────────────────────────────
         # Prevents save operations while a room is being previewed live.
@@ -445,6 +590,8 @@ class Game:
         oe.on_transition_deleted       = self._on_transition_deleted
         oe.on_flying_pad_deleted       = self._on_flying_pad_deleted
         oe.on_flying_pad_placed        = self._on_flying_pad_placed
+        oe.on_nimbus_cloud_deleted     = self._on_nimbus_cloud_deleted
+        oe.on_nimbus_cloud_placed      = self._on_nimbus_cloud_placed
         oe.on_save_point_placed        = self._on_save_point_placed
         oe.on_save_point_deleted       = self._on_save_point_deleted
         oe.on_trigger_box_placed       = self._on_trigger_box_placed
@@ -466,7 +613,7 @@ class Game:
 
         # ── Mission system ────────────────────────────────────────────────────
         self.mission_manager          = MissionManager()
-        self._active_mission_dialogue = None   # tracks current mission convo state
+        self._talking_npc             = None   # NPC currently running a mission-phase action list, if any
         self._event_dialogue_active   = False  # True while an event-triggered dialogue_box action owns the box
         self.pause_menu.set_mission_manager(self.mission_manager)
 
@@ -569,6 +716,8 @@ class Game:
         self.event_runner.register_handler('skill', self._handle_skill_action)
         self.event_runner.register_handler('transformation', self._handle_transformation_action)
         self.event_runner.register_handler('character_list', self._handle_character_list_action)
+        self.event_runner.register_handler('set_player_character', self._handle_set_player_character_action)
+        self.event_runner.register_handler('set_player_skin', self._handle_set_player_skin_action)
         self.event_runner.register_handler('screen_fade', self._handle_screen_fade_action, blocking=True)
         self.event_runner.register_handler('screen_shake', self._handle_screen_shake_action)
         self.event_runner.register_handler('spam_qte', self._handle_spam_qte_action, blocking=True)
@@ -578,6 +727,10 @@ class Game:
         self.event_runner.register_handler('change_map', self._handle_change_map_action, blocking=True)
         self.event_runner.register_handler('set_player_location', self._handle_set_player_location_action)
         self.event_runner.register_handler('play_cutscene', self._handle_play_cutscene_action, blocking=True)
+        self.event_runner.register_handler('item', self._handle_item_action)
+        self.event_runner.register_handler('quest', self._handle_quest_action)
+        self.event_runner.register_handler('modify_quest_variable', self._handle_modify_quest_variable_action)
+        self.event_runner.register_handler('mission', self._handle_mission_action)
 
         # Create the default starting room (a fresh transient "green dev" room).
         self._create_default_room()
@@ -590,9 +743,22 @@ class Game:
         self.flying_controller.on_flight_complete = self._handle_flying_complete
         self.flying_controller.set_sound_manager(self.sound_manager)
 
+        # ── Nimbus cloud controller callbacks ───────────────────────────────────
+        self.nimbus_controller.on_room_transition = self._handle_nimbus_room_transition
+        self.nimbus_controller.on_ride_complete   = self._handle_nimbus_ride_complete
+        self.nimbus_controller.set_sound_manager(self.sound_manager)
+        self.nimbus_controller.set_camera(self.camera)
+        # Required so mid-ride room crossings move the cloud into the destination
+        # room's manager bucket (otherwise it vanishes from the drawn list).
+        if hasattr(self.room_editor, 'object_editor') and self.room_editor.object_editor:
+            self.nimbus_controller.set_nimbus_cloud_manager(
+                self.room_editor.object_editor.nimbus_cloud_manager
+            )
+
         # ── Transition / fade system ──────────────────────────────────────────
         self.transition_controller = TransitionController(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.flying_controller.set_transition_controller(self.transition_controller)
+        self.nimbus_controller.set_transition_controller(self.transition_controller)
 
         # ── Ambient room weather ─────────────────────────────────────────────
         # Driven by the 'weather' event action. Separate from a cutscene's own
@@ -622,6 +788,387 @@ class Game:
         )
         self.room_manager.current_room = room
         self.current_room = room
+
+    # ── Title screen → gameplay ─────────────────────────────────────────────
+
+    def _load_game_flow(self):
+        """Load data/game_flow.json — see that file's own '_readme' for the
+        format. Missing file / bad JSON both just fall back to an empty
+        flow (no intro cutscene configured) rather than crashing, same
+        tolerant-of-missing-data approach as _load_cutscene_data."""
+        import os, json
+        path = os.path.join('data', 'game_flow.json')
+        if not os.path.exists(path):
+            print(f'[Game] no game_flow.json found at {path} — '
+                  f'New Game will start in the default room with no intro cutscene')
+            return {}
+        try:
+            with open(path, encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f'[Game] failed to load game_flow.json: {e}')
+            import traceback; traceback.print_exc()
+            return {}
+
+    def _start_new_game(self):
+        self.title_screen.close()
+        self.game_mode = 'playing'
+        # Remember which slot was picked on SAVE SELECT so later save-pad
+        # saves scroll to it (see TitleScreen.open_save_overlay).
+        self.current_save_slot = self.title_screen.get_selected_save_slot()
+
+        flow = self._load_game_flow()
+        cutscene_id = (flow.get('intro_cutscene') or '').strip()
+        if not cutscene_id:
+            print('[Game] no intro_cutscene configured in game_flow.json — '
+                  'starting directly in the default room')
+            return
+
+        cutscene_data = self._load_cutscene_data(cutscene_id)
+        if cutscene_data is None:
+            print(f'[Game] intro cutscene "{cutscene_id}" failed to load — '
+                  f'starting directly in the default room')
+            return
+
+        # already_faded=True: the save-select screen already faded itself
+        # to black before game.py ever got the 'new_game' signal (see
+        # title_screen.py's _exit_pending/consume_exit_signal), so this
+        # would otherwise fade out a second time on top of an already-black
+        # screen.
+        # sync_player_position=False: self.player has never actually been
+        # placed in a room yet at this point, so its x/y are just the
+        # boot-time WORLD_WIDTH//2, WORLD_HEIGHT//2 default from
+        # Game.__init__ — syncing to that would yank actor_0 off its
+        # authored position and off camera. Let it stay where the
+        # cutscene itself placed it.
+        self._start_cutscene(cutscene_data, already_faded=True, sync_player_position=False)
+
+    # ── Save / Load ──────────────────────────────────────────────────────────
+    # Slot-based save files under saves/slot_<n>.json. TitleScreen never
+    # touches disk itself — it asks Game for each slot's summary via the
+    # provider handed to set_save_data_provider() (see __init__), and
+    # relies on Game to actually restore state once a slot with data is
+    # confirmed (see consume_exit_signal()'s 'load_game' branch below).
+
+    SAVE_DIR = 'saves'
+
+    def _save_slot_path(self, slot_index):
+        import os
+        return os.path.join(self.SAVE_DIR, f'slot_{slot_index}.json')
+
+    def _write_save_slot(self, slot_index):
+        """Serializes the current game state to disk for slot_index. Called
+        once the "Saving..." popup's hold timer finishes (see
+        _update_save_flow) — previously a TODO with nothing behind it.
+
+        Player fields mirror exactly what _switch_character already
+        snapshots/restores for a character swap (x/y/hp/ki/level/stats/
+        inventory/zeni), plus the roster/current-character/costume info
+        _start_save_flow already gathers for the overlay display, plus a
+        flags/missions snapshot via FlagManager.snapshot()/MissionManager.
+        snapshot() — the same snapshot format already used for the
+        test-mode revert flow (see _handle_test_room), so it's known-good
+        JSON-serializable data rather than a guess."""
+        import os, json
+
+        ts = self.player.transformation
+        current_costume = (ts.current_transform_costume
+                            if (ts and ts.is_transformed and ts.current_transform_costume)
+                            else 'base')
+        # 'current_costume' above is for display only (see
+        # _get_save_slot_summary → TitleScreen's slot preview). The
+        # actual restorable transformation state lives in
+        # data['transformation'] below, built straight from
+        # TransformationSystem's own fields (see transformation_system.py)
+        # — is_transforming/is_untransforming are deliberately NOT among
+        # them; those are just mid-animation flags with nowhere sensible
+        # to resume from, so a save always settles to either fully
+        # transformed or fully not on load (see _start_loaded_game).
+        transform_data = None
+        if ts is not None:
+            transform_data = {
+                'is_transformed':            ts.is_transformed,
+                'current_transform_costume': ts.current_transform_costume,
+                'original_character':        ts.original_character,
+                'original_costume':          ts.original_costume,
+                'transformed_ki':            ts.transformed_ki,
+                'max_transformed_ki':        ts.max_transformed_ki,
+                'progress':                  ts.progress,
+                'is_ready':                  ts.is_ready,
+                'is_shining':                ts.is_shining,
+                'shine_timer':               ts.shine_timer,
+                'ready_notification_shown':  ts.ready_notification_shown,
+            }
+
+        data = {
+            'version':              1,
+            'saved_at':             time.time(),
+            'room_name':            self.current_room.name if self.current_room else '',
+            'player_x':             self.player.x,
+            'player_y':             self.player.y,
+            'current_character':    getattr(self.player, 'character', None),
+            'current_costume':      current_costume,
+            'playable_characters':  list(getattr(self.player, 'playable_characters', [])),
+            'play_time':            self.play_time,
+            'level':                getattr(self.player, 'level', 1),
+            'hp':                   getattr(self.player, 'hp', None),
+            'max_hp':               getattr(self.player, 'max_hp', None),
+            'ki':                   getattr(self.player, 'ki', None),
+            'max_ki':               getattr(self.player, 'max_ki', None),
+            'stats':                dict(getattr(self.player, 'stats', {}) or {}),
+            'zeni':                 getattr(self.player, 'zeni', 0),
+            'inventory':            list(getattr(self.player, 'inventory', []) or []),
+            'equipped_attacks':     list(getattr(self.player, 'equipped_attacks', []) or []),
+            'transformation':       transform_data,
+        }
+
+        # Equipment slots (body/hands/feet/accessory) — player.equipped is
+        # a plain {slot_key: item_id} dict (see pause_menu.py's
+        # EQUIP_SLOT_KEYS / _confirm_equip_action), confirmed JSON-safe.
+        # Doesn't exist as an attribute at all until the player's first
+        # equip (getattr default below), hence the None check rather than
+        # hasattr. The try/except is just a defensive net in case that
+        # shape ever changes — not expected to trigger.
+        equipped = getattr(self.player, 'equipped', None)
+        if equipped is not None:
+            try:
+                json.dumps(equipped)
+                data['equipped'] = equipped
+            except (TypeError, ValueError):
+                print('[Game] player.equipped isn\'t JSON-safe — skipped from this save '
+                      '(equipment will need its own serialization once its real shape is confirmed)')
+
+        try:
+            data['flags'] = self.flag_manager.snapshot()
+        except Exception as e:
+            print(f'[Game] failed to snapshot flags for save: {e}')
+            data['flags'] = None
+        try:
+            data['missions'] = self.mission_manager.snapshot()
+        except Exception as e:
+            print(f'[Game] failed to snapshot missions for save: {e}')
+            data['missions'] = None
+
+        try:
+            os.makedirs(self.SAVE_DIR, exist_ok=True)
+            with open(self._save_slot_path(slot_index), 'w', encoding='utf-8') as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f'[Game] failed to write save slot {slot_index}: {e}')
+            import traceback; traceback.print_exc()
+
+    def _read_save_slot(self, slot_index):
+        """Full save payload for slot_index (see _write_save_slot), or None
+        if the slot is empty/unreadable. Missing file / bad JSON both just
+        return None rather than crash — same tolerant-of-missing-data
+        approach as _load_game_flow."""
+        import os, json
+        path = self._save_slot_path(slot_index)
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f'[Game] failed to read save slot {slot_index}: {e}')
+            return None
+
+    def _get_save_slot_summary(self, slot_index):
+        """Provider callback handed to TitleScreen.set_save_data_provider —
+        called from _slot_has_save_data and the normal SAVE SELECT list
+        (see title_screen.py's _draw_save_slot_list) to decide whether to
+        draw "New Game" or this slot's actual Saga/Room/Time info, and
+        from _confirm_save_slot to decide whether A-Select should start a
+        new game or load this one. Returns None for an empty slot."""
+        data = self._read_save_slot(slot_index)
+        if data is None:
+            return None
+        return {
+            'room_name':          data.get('room_name', ''),
+            'play_time':          data.get('play_time', 0.0),
+            'characters':         list(data.get('playable_characters', [])),
+            'current_character':  data.get('current_character'),
+            'current_costume':    data.get('current_costume', 'base'),
+        }
+
+    def _start_loaded_game(self, slot_index):
+        """The "load" counterpart to _start_new_game — taken when
+        TitleScreen's SAVE SELECT confirms a slot _get_save_slot_summary
+        reported as occupied (see title_screen.py's _confirm_save_slot).
+        Restores flags/missions, the player's roster/stats/inventory, and
+        drops them back into their saved room at their saved position —
+        same room-swap plumbing _handle_flying_room_transition uses for a
+        normal mid-game room change, minus the flight-specific bits."""
+        data = self._read_save_slot(slot_index)
+
+        if data is None:
+            # Save vanished/corrupted between the menu showing it and this
+            # actually running — fall back to a fresh game on this slot
+            # rather than crash or strand the player on a black screen.
+            # _start_new_game() handles its own title_screen.close() /
+            # slot bookkeeping, so just defer to it untouched rather than
+            # half-close title_screen here first.
+            print(f'[Game] save slot {slot_index} could not be loaded — starting a new game instead')
+            self._start_new_game()
+            return
+
+        self.title_screen.close()
+        self.game_mode         = 'playing'
+        self.current_save_slot = slot_index
+
+        flags = data.get('flags')
+        if flags is not None:
+            try:
+                self.flag_manager.restore(flags)
+            except Exception as e:
+                print(f'[Game] failed to restore flags for slot {slot_index}: {e}')
+        missions = data.get('missions')
+        if missions is not None:
+            try:
+                self.mission_manager.restore(missions)
+            except Exception as e:
+                print(f'[Game] failed to restore missions for slot {slot_index}: {e}')
+
+        self.player.playable_characters = list(data.get('playable_characters') or [self.player.character])
+        self.player.inventory           = list(data.get('inventory', []))
+        self.player.zeni                = data.get('zeni', getattr(self.player, 'zeni', 0))
+        self.player.equipped_attacks    = list(data.get('equipped_attacks', getattr(self.player, 'equipped_attacks', [])))
+        # Just replay the {slot_key: item_id} dict as data — do NOT
+        # re-run core.item_effects.equip_item() for each entry. player.py
+        # documents self.stats as boosted in place ("Base stats — all
+        # start at 1; boosted through stat points"), and equip_item()
+        # applies an equipped item's stat bonus the same permanent way —
+        # so the 'stats' dict restored just below already has any
+        # equipment bonuses baked in from when this save was written.
+        # Re-calling equip_item() here would apply that bonus a second
+        # time on top of the already-boosted restored stats.
+        if data.get('equipped') is not None:
+            self.player.equipped = data['equipped']
+        self.play_time = data.get('play_time', 0.0)
+
+        saved_character = data.get('current_character')
+
+        # If the player picked a different character to load as on the
+        # title screen's SAVE SELECT list (see title_screen.py's
+        # _draw_slot_character_row show_picker branch / get_selected_
+        # character), that pick wins over whichever character this save
+        # was actually last played as — same "reads it once right after
+        # closing the title screen" pattern _start_new_game already uses
+        # for get_selected_save_slot(). Only honored if it's actually one
+        # of this save's own unlocked characters, so a stale pick from a
+        # previously-viewed slot can never load a character this save
+        # never had.
+        picked_character = self.title_screen.get_selected_character()
+        if picked_character and picked_character in (data.get('playable_characters') or []):
+            saved_character = picked_character
+
+        if saved_character and saved_character != getattr(self.player, 'character', None):
+            self._switch_character(saved_character)
+
+        # Transformation state — restored AFTER any character switch above
+        # so the transformed sprite set here doesn't get immediately
+        # clobbered by _switch_character's own base-costume sprite swap.
+        # Only the settled is_transformed boolean is honored (see
+        # _write_save_slot — is_transforming/is_untransforming were never
+        # saved), so this always lands the player either fully
+        # transformed or fully not, never mid-animation. Mirrors
+        # TransformationSystem.complete_transform()'s own end state
+        # (sprite swap + 'idle' animation) rather than replaying the
+        # transform animation itself.
+        transform_data = data.get('transformation')
+        ts = self.player.transformation
+        if ts is not None and transform_data:
+            ts.is_transforming   = False
+            ts.is_untransforming = False
+            ts.original_character = transform_data.get('original_character')
+            ts.original_costume   = transform_data.get('original_costume')
+            ts.max_transformed_ki = transform_data.get('max_transformed_ki', ts.max_transformed_ki)
+            ts.transformed_ki     = transform_data.get('transformed_ki', ts.max_transformed_ki)
+
+            if transform_data.get('is_transformed'):
+                ts.is_transformed            = True
+                ts.current_transform_costume = transform_data.get('current_transform_costume')
+                # Meter's irrelevant while transformed (see update()'s own
+                # early-return) — reset it clean rather than carry over
+                # whatever it happened to read at save time.
+                ts.progress   = 0.0
+                ts.is_ready   = False
+                ts.is_shining = False
+                ts.shine_timer = 0.0
+
+                transform_costume = ts.current_transform_costume
+                if transform_costume:
+                    from core.sprite_system import create_character_sprite
+                    character = ts.original_character or getattr(self.player, 'character', None) or 'goku'
+                    self.player.sprite = create_character_sprite(character, transform_costume, 32, 32)
+                    self.player.sprite.set_animation('idle', self.player.direction)
+                    self.player.current_animation_state = 'idle'
+                else:
+                    # No costume path saved for this transformation — can't
+                    # know which sprite to load, so don't leave the player
+                    # stuck on a placeholder; fall back to standing in base
+                    # form instead (same "nowhere to land" bailout
+                    # start_transform() itself uses).
+                    ts.is_transformed = False
+            else:
+                ts.is_transformed           = False
+                ts.progress                 = transform_data.get('progress', 0.0)
+                ts.is_ready                 = transform_data.get('is_ready', False)
+                ts.is_shining               = transform_data.get('is_shining', False)
+                ts.shine_timer              = transform_data.get('shine_timer', 0.0)
+                ts.ready_notification_shown = transform_data.get('ready_notification_shown', False)
+
+        if 'stats' in data:
+            self.player.stats = dict(data['stats'])
+        if 'level' in data:
+            self.player.level = data['level']
+        self.player.update_derived_stats()
+        if data.get('max_hp') is not None:
+            self.player.max_hp = data['max_hp']
+        if data.get('max_ki') is not None:
+            self.player.max_ki = data['max_ki']
+        if data.get('hp') is not None:
+            self.player.hp = min(data['hp'], self.player.max_hp)
+        if data.get('ki') is not None:
+            self.player.ki = min(data['ki'], self.player.max_ki)
+
+        room_name = data.get('room_name') or ''
+        room = self.room_manager.get_room_by_name(room_name) if room_name else None
+        if room is None:
+            # Saved room no longer exists (renamed/deleted since this save
+            # was written) — stay wherever the engine already has a room
+            # loaded rather than crash.
+            print(f'[Game] save slot {slot_index}: room "{room_name}" not found — staying in the current room')
+            room = self.current_room
+
+        if room is not None:
+            self.room_manager.current_room = room
+            self.current_room              = room
+            self._load_room_objects(room)
+            self.flag_manager.mark_room_visited(room.name)
+
+            self.player.x = data.get('player_x', self.player.x)
+            self.player.y = data.get('player_y', self.player.y)
+            # update(..., dt=0) rather than hand-computing camera.x/y here:
+            # dt<=0 makes update() skip the smooth-follow ease entirely, so
+            # this both positions the camera correctly *this* frame and
+            # resets its internal _true_x/_true_y to match — a plain
+            # camera.x/y assignment would only do the former, leaving the
+            # next tracked update() to lerp in from wherever the camera's
+            # internal position happened to be before the load.
+            self.camera.update(self.player, room.width, room.height, dt=0)
+
+    def _dev_skip_to_default_room(self):
+        """Dev-only shortcut (F1 while the title screen is up, gated by
+        DEV_BUILD) — jumps straight into gameplay in the existing
+        _create_default_room() test room, bypassing New Game and the
+        intro cutscene entirely. This is exactly the old pre-title-screen
+        boot behavior, kept around so iterating on gameplay doesn't mean
+        re-watching the intro cutscene on every single launch.
+        """
+        self.title_screen.close()
+        self.game_mode = 'playing'
+        self.current_save_slot = self.title_screen.get_selected_save_slot()
 
     # ── Event handling ────────────────────────────────────────────────────────
 
@@ -682,9 +1229,43 @@ class Game:
             if event.type == pygame.QUIT:
                 self.running = False
 
+            # ── Title screen ────────────────────────────────────────────────
+            # Nothing below this — no overlays, no gameplay input — runs
+            # while the title screen is up. F1 is the dev-only shortcut to
+            # skip straight to the boot-time test room (see
+            # _dev_skip_to_default_room's docstring for why this exists).
+            if self.game_mode == 'title':
+                if DEV_BUILD and event.type == pygame.KEYDOWN and event.key == pygame.K_F1:
+                    self._dev_skip_to_default_room()
+                else:
+                    result = self.title_screen.handle_input(event)
+                    # 'new_game' is NOT handled here anymore — confirming
+                    # New Game now starts a fade-to-black inside
+                    # title_screen.py first, and self.update() picks up
+                    # the actual 'new_game' signal via
+                    # title_screen.consume_exit_signal() once that fade
+                    # completes (see the game_mode == 'title' branch in
+                    # update()). 'quit' has no cutscene/fade to wait on,
+                    # so it's still handled the instant it's pressed.
+                    if result == 'quit':
+                        self.running = False
+                continue
+
             # ── Overlay priority pass ─────────────────────────────────────────
             # Each active overlay grabs the event and issues continue so nothing
             # below it processes the same input.
+
+            # Death sequence — absolute top priority. Swallows every event from
+            # the moment the death animation starts (player.is_dead True) until
+            # the game-over box is dismissed, so nothing (pause menu, attacks,
+            # dev tools) can interrupt it. Only reacts to E, and only once the
+            # box itself is showing — see _update_death_sequence for the state
+            # machine and _advance_death_box/_close_death_box for what E does.
+            if self._death_state is not None:
+                if (self._death_state == 'box' and event.type == pygame.KEYDOWN
+                        and event.key == pygame.K_e):
+                    self._advance_death_box()
+                continue
 
             if self.character_switch_menu.active:
                 result = self.character_switch_menu.handle_input(event)
@@ -692,9 +1273,100 @@ class Game:
                     self._switch_character(result)
                 continue
 
+            # Credits sequence — opened from the pause menu (still open,
+            # paused underneath) via 'open_credits'. Checked above
+            # self.pause_menu.active so the same keypress/click doesn't
+            # also get processed by the pause menu it's layered on top of.
+            if self.credits_screen.active:
+                result = self.credits_screen.handle_input(event)
+                if result == 'close':
+                    self.credits_screen.close()
+                continue
+
             if self.pause_menu.active:
-                self.pause_menu.handle_input(event)
-                # 'open_skills' stub — wire up when the skills menu is ready
+                result = self.pause_menu.handle_input(event)
+                if result == 'open_credits':
+                    self.credits_screen.open()
+                elif result and result.startswith('use_item:'):
+                    item_id = result.split(':', 1)[1]
+                    # outcome.message is deliberately not shown anywhere —
+                    # using an item from the inventory shouldn't pop up any
+                    # feedback text (see PauseMenu.flash_item_message,
+                    # still defined/available if that's ever wanted back).
+                    use_item(self.player, item_id, self.active_item_buffs)
+                elif result and result.startswith('equip_item:'):
+                    item_id = result.split(':', 1)[1]
+                    equip_item(self.player, item_id)
+                elif result and result.startswith('unequip_item:'):
+                    slot = result.split(':', 1)[1]
+                    unequip_item(self.player, slot)
+                elif result and result.startswith('drop_item:'):
+                    item_id = result.split(':', 1)[1]
+                    inventory = getattr(self.player, 'inventory', None)
+                    if inventory and item_id in inventory:
+                        inventory.remove(item_id)
+                    # Dropping the last owned copy of a currently-equipped
+                    # item leaves player.equipped pointing at something no
+                    # longer in the inventory — the equip slot list would
+                    # keep showing it as equipped (see pause_menu.py's
+                    # _draw_equip_slot_list, which reads player.equipped
+                    # directly). Only unequip once no copies remain; if the
+                    # player still owns another copy, it stays equipped.
+                    if not inventory or item_id not in inventory:
+                        equipped = getattr(self.player, 'equipped', None) or {}
+                        for slot, equipped_id in list(equipped.items()):
+                            if equipped_id == item_id:
+                                unequip_item(self.player, slot)
+                    self._pending_dropped_items.append(item_id)
+                elif result == 'close':
+                    # Pause menu just closed (see PauseMenu.close(), called
+                    # internally before this is returned) — this is the
+                    # moment anything dropped during this session actually
+                    # appears in the world, tossed out from the player's
+                    # current position/room. See spawn_item_pickup /
+                    # ItemPickup in core/items.py for the hop/bounce
+                    # animation and despawn-on-room-leave behaviour.
+                    for item_id in self._pending_dropped_items:
+                        self.item_pickups.append(
+                            spawn_item_pickup(item_id, self.player.x, self.player.y))
+                    self._pending_dropped_items = []
+                    # Mirror the original game's close transition: the menu
+                    # itself closes instantly (screen is already fully black
+                    # from the pre-open fade-out — see _open_pause_menu),
+                    # holds on that black for a beat, then fades back in to
+                    # reveal gameplay again. The hold is intentional — it's
+                    # what gives the close its weight vs. the near-instant
+                    # open. Tune _PAUSE_CLOSE_HOLD/_PAUSE_CLOSE_FADE below to
+                    # adjust the feel.
+                    _PAUSE_CLOSE_HOLD = 0.5
+                    _PAUSE_CLOSE_FADE = 0.25
+                    self.transition_controller.start_plain_fade(
+                        'in', _PAUSE_CLOSE_FADE, None, hold=_PAUSE_CLOSE_HOLD)
+                continue
+
+            if self.scouter_menu.active:
+                result = self.scouter_menu.handle_input(event)
+                if result == 'enter_scouter':
+                    # MAP -> SCOUTER transition — snapshot every on-screen
+                    # entity's frozen screen position right now (see
+                    # ScouterMenu.build_scouter_snapshot's docstring for why
+                    # this can't just be done continuously in update()).
+                    self.scouter_menu.build_scouter_snapshot(
+                        self.player, self.npcs, self.enemies, self.camera, RENDER_SCALE,
+                        self.colors, self.layer_manager)
+                elif isinstance(result, tuple) and result[0] == 'inspect':
+                    # Per-entity inspect panel isn't built yet — this is the
+                    # hook point for it. See ScouterMenu.handle_input's
+                    # docstring.
+                    _, _inspected_obj, _inspected_kind = result
+                elif result == 'close':
+                    # Same instant-black-hold-then-fade-in close transition
+                    # as the pause menu — see the pause_menu 'close' handling
+                    # just above for why the hold gives the close its weight.
+                    _SCOUTER_CLOSE_HOLD = 0.5
+                    _SCOUTER_CLOSE_FADE = 0.25
+                    self.transition_controller.start_plain_fade(
+                        'in', _SCOUTER_CLOSE_FADE, None, hold=_SCOUTER_CLOSE_HOLD)
                 continue
 
             # Spam QTE ('spam_qte' event action) — while a bar is active it
@@ -715,8 +1387,8 @@ class Game:
             if self.save_point_menu.active:
                 result = self.save_point_menu.handle_input(event)
                 if result == 'save':
-                    # TODO: implement save functionality
                     self.save_point_menu.close()
+                    self._start_save_flow()
                 elif result == 'switch_characters':
                     self.save_point_menu.close()
                     current_character = getattr(self.player, 'character', 'goku')
@@ -777,6 +1449,25 @@ class Game:
                     # equipped attacks stay stale until they visit the
                     # character-switch menu.
                     self._reload_attack_config(self.player.character)
+                    # max_level is global (Settings tab), not per-character,
+                    # so it isn't covered by _reload_attack_config above —
+                    # re-sync it here too, otherwise a change made in the
+                    # creator only takes effect on the next full game
+                    # restart, since GameConfig is only built once at launch.
+                    new_max_level = character_creator.load_global_settings()['max_level']
+                    if new_max_level != self.game_config.max_level:
+                        self.game_config.max_level = new_max_level
+                        # If the cap just got lowered below the player's
+                        # current level, pull them back down to it; either
+                        # way, exp_to_next_level needs recomputing since it
+                        # depends on self.player.level, which may have
+                        # just changed.
+                        self.player.level = min(self.player.level, new_max_level)
+                        self.player.exp_to_next_level = self.game_config.get_xp_for_level(self.player.level)
+                continue
+
+            if self.entity_creator.active:
+                self.entity_creator.handle_input(event)
                 continue
 
             if self.room_editor.active:
@@ -806,9 +1497,18 @@ class Game:
                 elif result == 'open_world_map_editor':
                     self.dev_menu.active = False
                     self.world_map_editor.toggle()
+                    # Bust the cached room->map index (see
+                    # _get_world_map_room_index) so pin edits made in this
+                    # editor session are picked up by the Scouter's World
+                    # Map section the moment the editor is closed again,
+                    # instead of needing a full restart.
+                    self._wm_room_index = None
                 elif result == 'open_character_creator':
                     self.dev_menu.active = False
                     self.character_creator.toggle()
+                elif result == 'open_entity_creator':
+                    self.dev_menu.active = False
+                    self.entity_creator.toggle()
 
             # ── Normal gameplay input ─────────────────────────────────────────
             # Only reached when no overlay is active.
@@ -938,6 +1638,21 @@ class Game:
           X       — trigger transformation (transform mode, when fully charged),
                     or detransform if already transformed
         """
+        # Dialogue boxes (NPC/event/chest/item-pickup), the level-up
+        # sequence, and the save flow all freeze player movement/update
+        # elsewhere (see the gating conditions in update()), but they were
+        # never in the handle_events() overlay-priority pass, so keydown
+        # events kept reaching this handler unfiltered — letting Q/TAB/X/F
+        # fire off ki attacks (kamehameha etc.), cycle ki mode, transform,
+        # or start blocking while one of those was up. Swallow those
+        # attack-capable keys here. E is exempted — _handle_interact()
+        # already knows how to advance/close an open dialogue box, and
+        # doesn't fall back to a melee swing while one is active.
+        _ATTACK_CAPABLE_KEYS = (pygame.K_q, pygame.K_TAB, pygame.K_x, pygame.K_f)
+        if event.key in _ATTACK_CAPABLE_KEYS and (
+                self.dialogue_box.active or self._levelup_active or self.save_flow_active):
+            return
+
         if event.key == pygame.K_F1:
             self.dev_menu.toggle()
 
@@ -949,7 +1664,26 @@ class Game:
                 self.room_editor.current_view = 'view_room'
 
         elif event.key == pygame.K_ESCAPE:
-            self.pause_menu.open(self.player)
+            # Don't jump straight into the menu — fade to black first (matches
+            # the original game), then open it once the screen is fully
+            # black. Guarded so holding/mashing ESC during the fade can't
+            # fire a second overlapping fade.
+            if not self.pause_menu.active and not self._pause_fade_active \
+                    and not self.transition_controller.is_transitioning():
+                self._pause_fade_active = True
+                self.transition_controller.start_plain_fade(
+                    'out', 0.25, self._open_pause_menu)
+
+        elif event.key == pygame.K_RETURN:
+            # Same pre-menu fade-to-black shape as ESC/pause menu below,
+            # just gated on its own flag/overlay so the two can't stomp
+            # each other if both keys get mashed at once.
+            if not self.scouter_menu.active and not self._scouter_fade_active \
+                    and not self.pause_menu.active and not self._pause_fade_active \
+                    and not self.transition_controller.is_transitioning():
+                self._scouter_fade_active = True
+                self.transition_controller.start_plain_fade(
+                    'out', 0.25, self._open_scouter_menu)
 
         elif event.key == pygame.K_f:
             self.player.start_blocking()
@@ -1071,30 +1805,51 @@ class Game:
         Priority:
           1. Nearby save point.
           2. Nearby NPC — start / advance dialogue, with mission branching.
-          3. Flying pad.
-          4. Default melee attack.
+          3. Nearby closed chest — open it.
+          4. Nearby dropped item pickup — collect it.
+          5. Flying pad.
+          6. Default melee attack.
         """
         # Don't allow interact while a flying sequence is in progress.
         if self.flying_controller.is_active():
+            return
+        # Don't allow interact while a nimbus cloud ride is in progress.
+        if self.nimbus_controller.is_active():
             return
         if self._mjf_state in ('pending_fade_in', 'fade_in', 'flying',
                                'landing_fade_out', 'landing_fade_in'):
             return
 
         # Save point takes top priority.
-        if self.nearby_save_point and not self.dialogue_box.active and not self.save_point_menu.active:
-            if self.nearby_save_point.variant == 'big':
+        if self.nearby_save_point and not self.dialogue_box.active and not self.save_point_menu.active \
+                and not self.save_flow_active:
+            # Opening the menu (or going straight into the save flow
+            # below) suppresses _update_player_movement() and
+            # player.update() itself for as long as it stays open (see
+            # the update() gating around save_point_menu.active /
+            # save_flow_active). Without a snap-to-idle here, a player
+            # who interacts mid-run, or right as idle_transition/
+            # idle_wait kicked in, would stay frozen on that frame for
+            # the entire time the menu/flow is open.
+            # This applies to both save-pad variants — 'big' vs 'small' is
+            # purely a sprite/size difference, so both need the same idle
+            # snap and the same character-switch check below.
+            self.player.is_running = False
+            if not self.player.is_transitioning:
+                if self.player.current_animation_state in ('walk', 'run', 'idle_transition', 'idle_wait'):
+                    self.player.enter_idle()
+
+            current_character = getattr(self.player, 'character', 'goku')
+            other_characters  = [c for c in self.player.playable_characters if c != current_character]
+            if other_characters:
                 self.save_point_menu.open()
-                # Opening the menu suppresses _update_player_movement() and now
-                # player.update() itself for as long as it stays open (see the
-                # update() gating around save_point_menu.active). Without a
-                # snap-to-idle here, a player who interacts mid-run, or right
-                # as idle_transition/idle_wait kicked in, would stay frozen on
-                # that frame for the entire time the menu is open.
-                self.player.is_running = False
-                if not self.player.is_transitioning:
-                    if self.player.current_animation_state in ('walk', 'run', 'idle_transition', 'idle_wait'):
-                        self.player.enter_idle()
+            else:
+                # Nothing unlocked to switch to — the Save/Switch
+                # Characters popup would only ever show one usable
+                # option, so skip it entirely and go straight into the
+                # save flow, same as picking "Save" from it would do
+                # (see the 'save' branch in handle_events()).
+                self._start_save_flow()
             return
 
         # World-map object — start the jump sequence.
@@ -1112,6 +1867,44 @@ class Game:
             self._advance_npc_dialogue()
             return
 
+        # Open a nearby closed chest. Flips the sprite to the open frame
+        # (Chest.open()) and puts the player into the pickup_item pose —
+        # loot is granted and the "You found X!" dialogue box only appears
+        # once that pose finishes (see _update_chest_pickup), so the icon
+        # has time to float up above the player's head first (see
+        # _draw_chest_pickup_icon). nearby_chest already excludes chests
+        # that are already open, so this never re-fires on the same one.
+        if self.nearby_chest and not self.dialogue_box.active:
+            chest = self.nearby_chest
+            chest.open()
+            self.nearby_chest = None
+
+            self.player.start_pickup_item()
+            self.sound_manager.play_sfx('itemget')
+            self._pending_chest = chest
+            self._pending_chest_icon = (
+                self._get_chest_item_icon(chest.item_id) if chest.item_id else None
+            )
+            return
+
+        # Pick up a nearby dropped item (see core.items.ItemPickup / the
+        # 'drop_item:' flow) — same interact-key gate and pickup pose as a
+        # chest, just above: walking over one no longer collects it on its
+        # own (see ItemPickup.update's is_player_nearby), E does. collect()
+        # removes it from the world immediately, same as a chest flipping
+        # to its opened sprite, while the actual inventory grant is
+        # deferred to _update_item_pickup_finish until the pose plays out.
+        if self.nearby_item_pickup and not self.dialogue_box.active:
+            pickup = self.nearby_item_pickup
+            pickup.collect()
+            self.nearby_item_pickup = None
+
+            self.player.start_pickup_item()
+            self.sound_manager.play_sfx('itemget')
+            self._pending_item_pickup = pickup
+            self._pending_item_pickup_icon = self._get_dropped_item_icon(pickup.item_id)
+            return
+
         # Check if the player is standing on a flying pad with waypoints.
         nearby_pad = next(
             (pad for pad in self.flying_pads
@@ -1120,6 +1913,16 @@ class Game:
         )
         if nearby_pad and len(nearby_pad.waypoints) > 0:
             self.flying_controller.start_flight(self.player, nearby_pad)
+            return
+
+        # Check if the player is standing near a nimbus cloud with waypoints.
+        nearby_cloud = next(
+            (cloud for cloud in self.nimbus_clouds
+             if cloud.active and not cloud.is_occupied and cloud.check_collision_with_player(self.player)),
+            None
+        )
+        if nearby_cloud and len(nearby_cloud.waypoints) > 0:
+            self.nimbus_controller.start_ride(self.player, nearby_cloud)
         else:
             # Default: throw a melee punch. A random melee1/melee2 swing
             # sound plays either way (hit or miss) — resolved once the
@@ -1128,6 +1931,209 @@ class Game:
             if melee:
                 melee.hit_something = False
                 self.melee_attacks.append(melee)
+
+    # ── Save Game flow (save-pad "Save") ────────────────────────────────────
+    # Reuses TitleScreen's own SAVE SELECT frame, re-labelled "Save Game"
+    # and locked down (see TitleScreen.open_save_overlay), with a small
+    # "Saving..." popup drawn in front of it. Entirely display-only —
+    # self.save_flow_active just holds it up for SAVE_FLOW_POPUP_HOLD
+    # seconds and then closes itself; the player has no control over any
+    # of it (see the update()/handle_events() gating around
+    # self.save_flow_active elsewhere in this file).
+
+    def _start_save_flow(self):
+        """Kicks off the in-game "Save Game" flow — called either straight
+        from _handle_interact (no character to switch to) or from the
+        save_point_menu's 'save' result. Opens TitleScreen's save overlay
+        scrolled to the current slot and starts the popup timer."""
+        slot_index = self.current_save_slot
+
+        # Per-slot unlocked-character sprites for the row TitleScreen draws
+        # under each slot's label. Only the active slot has real data right
+        # now — there's no per-save-file roster tracking yet (see
+        # TitleScreen._slot_has_save_data's own placeholder note), so every
+        # other slot just renders no sprites, same as it renders no
+        # "New Game" line while the overlay is active.
+        slot_characters = {slot_index: list(getattr(self.player, 'playable_characters', []))}
+
+        # Which of those characters is the one actually being played right
+        # now, and their current costume/transformation — same lookup
+        # _start_map_jump uses to pick the right sprite folder — so the
+        # save-slot row can show a live idle sprite for that one entry
+        # (see TitleScreen._get_character_idle_icon) instead of a static
+        # icon.png.
+        ts = self.player.transformation
+        current_costume = (ts.current_transform_costume
+                            if (ts and ts.is_transformed and ts.current_transform_costume)
+                            else 'base')
+
+        # Room + play time shown on the Room/Time lines that now sit
+        # where "New Game" used to (see TitleScreen._draw_save_overlay_info).
+        # current_room can be None this early/mid-transition, same
+        # "never crash on missing state" fallback used everywhere else here.
+        room_name = self.current_room.name if self.current_room else ''
+
+        self.title_screen.open_save_overlay(
+            slot_index, slot_characters,
+            current_character=getattr(self.player, 'character', None),
+            current_costume=current_costume,
+            room_name=room_name,
+            play_time=self.play_time,
+        )
+        self.save_flow_active = True
+        self.save_flow_timer  = 0.0
+
+    def _update_save_flow(self, dt):
+        """Ticks the "Saving..." popup's hold timer and closes the whole
+        flow once it's done. Called every frame from update() while
+        self.save_flow_active is set, alongside title_screen.update(dt)
+        (which just keeps its own internal clock/animations consistent —
+        the overlay itself is static, see open_save_overlay)."""
+        if not self.save_flow_active:
+            return
+        self.save_flow_timer += dt
+        if self.save_flow_timer >= self.SAVE_FLOW_POPUP_HOLD:
+            self._write_save_slot(self.current_save_slot)
+            self.title_screen.close_save_overlay()
+            self.save_flow_active = False
+            self.save_flow_timer  = 0.0
+
+    def _saving_popup_rect(self):
+        """Geometry-only half of _draw_saving_popup — returns the
+        (x, y, w, h) the "Saving..." popup box will occupy this frame,
+        without drawing anything. Split out so Game.draw() can hand this
+        rect to TitleScreen as an occlusion region *before*
+        TitleScreen.draw() renders the save-slot divider bar (see
+        TitleScreen._draw_save_slot_divider's occlusion_rect param) —
+        otherwise the divider has no way to know where the popup that's
+        about to be drawn on top of it will land."""
+        pm = self.pause_menu
+        if pm is None:
+            return None
+
+        text = 'Saving...'
+        letter_spacing = pm.menu_uppercase_font.letter_spacing
+        surfs = []
+        for ch in text:
+            font = pm.menu_uppercase_font if ch.isupper() else pm.menu_lowercase_font
+            surfs.append(font.render(ch))
+
+        max_h   = max(s.get_height() for s in surfs)
+        block_w = sum(s.get_width() for s in surfs) + letter_spacing * (len(surfs) - 1)
+        # Descenders don't affect popup_w and only add a few px to block_h
+        # (used purely for the size floor below), so a flat +8 stand-in
+        # for max_desc is close enough here — the real draw path in
+        # _draw_saving_popup computes it precisely per-glyph.
+        block_h = max_h + 8
+
+        pad_x   = max(48, int(SCREEN_WIDTH * 0.05))
+        pad_y   = max(40, int(SCREEN_HEIGHT * 0.06))
+        popup_w = max(block_w + pad_x * 2, int(SCREEN_WIDTH * 0.22)) - 100
+        popup_h = max(block_h + pad_y * 2, int(SCREEN_HEIGHT * 0.125)) - 26
+
+        # The border is drawn as a 9-slice (PauseMenu._draw_9slice_sprite,
+        # shared by every bordered box in the game) whose flat left/right
+        # edges and center fill are *stretched* — not tiled — from a
+        # narrow strip of the border texture out to popup_h. That only
+        # looks clean when popup_h's stretch factor lands on a whole
+        # number of source pixels; every other box in the game happens to,
+        # this one (thanks to the -26 above) doesn't, so the strip gets
+        # duplicated unevenly and the border reads as inconsistent pixels
+        # top-to-bottom. Snapping popup_h up to the next height where the
+        # stretch is an exact integer multiple fixes it here only —
+        # _draw_9slice_sprite itself, and every other menu that calls it,
+        # is untouched. popup_w/popup_x are left completely alone below.
+        if pm.box_sprite:
+            sh = pm.box_sprite.get_height()
+            corner_size = 20
+            ch  = min(corner_size, sh // 3)
+            sch = min(ch * 4, max(1, popup_h // 2))
+            msh = sh - 2 * ch          # source strip height that gets stretched
+            if msh > 0:
+                mh = popup_h - 2 * sch  # target height that strip stretches to
+                if mh > 0:
+                    remainder = mh % msh
+                    if remainder:
+                        popup_h += msh - remainder
+
+        frame_rect = self.title_screen.get_save_select_frame_rect()
+        if frame_rect is not None:
+            popup_x = frame_rect.x + (frame_rect.width  - popup_w) // 2
+            popup_y = frame_rect.y + (frame_rect.height - popup_h) // 2 - 33
+        else:
+            popup_x = (SCREEN_WIDTH  - popup_w) // 2
+            popup_y = (SCREEN_HEIGHT - popup_h) // 2
+
+        return pygame.Rect(popup_x, popup_y, popup_w, popup_h)
+
+    def _draw_saving_popup(self, screen):
+        """The "Saving..." popup shown in front of the Save Game screen
+        while self.save_flow_active is running — same bordered-box style
+        as PauseMenu's own item/equip-confirm popups (see
+        PauseMenu._draw_item_confirm_popup). Text uses PauseMenu's own
+        per-character uppercase_menu/lowercase_menu fonts, same trick
+        TitleScreen._new_game_surfs uses for "New Game", including the
+        same per-letter descender nudge PauseMenu's own text renderers use
+        (see e.g. PauseMenu._blit_journal_text's _desc dict) so 'g' hangs
+        below the baseline instead of sitting on it like every other
+        letter here."""
+        pm = self.pause_menu
+        if pm is None:
+            return
+
+        text = 'Saving...'
+        # Same offsets PauseMenu's own renderers use — how far below the
+        # baseline each of these needs to drop to read as a proper
+        # descender instead of a squashed-up glyph.
+        descenders = {'p': 8, 'q': 8, 'g': 8, 'y': 8, ',': 8}
+        # Same letter spacing PauseMenu's own text renderers use (see
+        # PauseMenu._blit_journal_text's char_spacing) — the raw glyphs
+        # butt up against each other with none of their own.
+        letter_spacing = pm.menu_uppercase_font.letter_spacing
+
+        surfs = []
+        for ch in text:
+            font = pm.menu_uppercase_font if ch.isupper() else pm.menu_lowercase_font
+            s = font.render(ch).copy()
+            s.fill((255, 255, 255), special_flags=pygame.BLEND_RGBA_MULT)
+            surfs.append((ch, s))
+
+        max_h    = max(s.get_height() for _, s in surfs)
+        max_desc = max((descenders.get(ch, 0) for ch, _ in surfs), default=0)
+        # Full visual block size, spacing included — this (not the raw
+        # cap-height max_h) is what actually needs to land centered in
+        # the box, since the descender on "g" and the "..." tail both
+        # extend past a plain max_h box.
+        block_w = sum(s.get_width() for _, s in surfs) + letter_spacing * (len(surfs) - 1)
+        block_h = max_h + max_desc
+
+        # Popup box geometry — same rect Game.draw() already handed
+        # TitleScreen as an occlusion region (see _saving_popup_rect)
+        # right before calling title_screen.draw(), so the divider bar
+        # underneath was already clipped around exactly this box.
+        popup_rect = self._saving_popup_rect()
+        popup_x, popup_y, popup_w, popup_h = popup_rect
+
+        drawn = pm.box_sprite and pm._draw_9slice_sprite(
+            screen, pm.box_sprite, popup_x, popup_y, popup_w, popup_h, corner_size=20
+        )
+        if not drawn:
+            pygame.draw.rect(screen, pm.border_outer, (popup_x-6, popup_y-6, popup_w+12, popup_h+12))
+            pygame.draw.rect(screen, pm.border_inner, (popup_x-3, popup_y-3, popup_w+6,  popup_h+6))
+            pygame.draw.rect(screen, pm.border_green, (popup_x-1, popup_y-1, popup_w+2,  popup_h+2))
+            pm._draw_tiled_background(screen, pygame.Rect(popup_x, popup_y, popup_w, popup_h))
+
+        # Text is centered on the full block_w/block_h (not popup_w/
+        # popup_h's own padding) so it sits centered inside the border on
+        # both axes regardless of how much floor padding got added above.
+        x = popup_x + (popup_w - block_w) // 2
+        y = popup_y + (popup_h - block_h) // 2
+        for ch, s in surfs:
+            shadow = s.copy(); shadow.fill((0, 0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+            oy = (max_h - s.get_height()) + descenders.get(ch, 0)
+            screen.blit(shadow, (x + 2, y + oy + 2))
+            screen.blit(s, (x, y + oy))
+            x += s.get_width() + letter_spacing
 
     def _start_map_jump(self):
         """Kick off the world-map jump sequence for the player.
@@ -1231,11 +2237,21 @@ class Game:
         """Begin a conversation with an NPC, routing through the mission system.
 
         Mission state routing (via mission_manager.get_npc_dialogue_state):
-          'offer'     — quest not accepted yet; show the pitch
-          'active'    — mission running; give a status/reminder line
-          'completed' — all objectives met; run reward dialogue & claim XP/items
-          'rewarded'  — fully done; show post-completion lines
+          'offer'     — quest not accepted yet; run the 'offer' action list
+          'active'    — mission running; run the 'active' action list
+          'completed' — all objectives met; run the 'completed' action list
+                        (ends in a mission('complete', ...) action — see
+                        MissionManager._migrate_legacy_dialogues)
+          'rewarded'  — fully done; run the 'rewarded' action list
           None        — plain NPC with no mission; use dialogue_config directly
+
+        Each phase is now just an action list run through the same
+        event_runner a trigger box's actions run through (dialogue_box /
+        dialogue_choice / mission / ...) instead of the old bespoke
+        _active_mission_dialogue line-by-line state machine — see
+        _handle_dialogue_box_action / _handle_dialogue_choice_action, which
+        already set self._event_dialogue_active and know how to hand
+        control back to _advance_npc_dialogue()'s event-dialogue branch.
         """
         # Hide the NPC's own indicator the moment dialogue starts.
         npc.is_talking = True
@@ -1246,85 +2262,42 @@ class Game:
             self.player.enter_idle()
         self.player.is_running = False
 
-        iid   = getattr(npc, 'instance_id', '')
+        iid = getattr(npc, 'instance_id', '')
+        # Generic bookkeeping, not mission-specific — any mission's
+        # talk_to_npc objective (or any other flag_is('npc_talked:...')
+        # condition) can gate on this NPC being talked to at all,
+        # regardless of whether *this* NPC gives a mission itself.
+        if iid:
+            self.flag_manager.mark_npc_talked(iid)
+
         state = self.mission_manager.get_npc_dialogue_state(iid) if iid else None
 
-        if state == 'offer':
+        if state is not None:
             mission = self.mission_manager.get_mission_for_npc(iid)
-            lines   = mission.get('dialogues', {}).get('offer', []) if mission else []
-            if isinstance(lines, str):
-                lines = [lines]
-            lines = lines or npc.dialogue_config.get('dialogues', ["Hello, traveler!"])
-            self._active_mission_dialogue = {
-                'npc':     npc,
-                'lines':   lines,
-                'index':   0,
-                'phase':   'offer',
-                'mission': mission,
-            }
-            self._show_mission_line()
+            actions = (mission or {}).get('dialogue_actions', {}).get(state, [])
+            self._talking_npc = npc
+            if actions:
+                self.event_runner.run_sequence(actions, on_finished=lambda: self._end_npc_talk(npc))
+            else:
+                self._end_npc_talk(npc)
+            return
 
-        elif state == 'active':
-            # Fire the talk_to_npc hook so mission tracking stays up to date.
-            self.mission_manager.on_npc_talked(iid)
-            mission = self.mission_manager.get_mission_for_npc(iid)
-            lines   = mission.get('dialogues', {}).get('active', []) if mission else []
-            if isinstance(lines, str):
-                lines = [lines]
-            lines = lines or ["Come back when you're done."]
-            self._active_mission_dialogue = {
-                'npc':     npc,
-                'lines':   lines,
-                'index':   0,
-                'phase':   'active',
-                'mission': mission,
-            }
-            self._show_mission_line()
+        # Plain NPC — use the standard dialogue system with no mission routing.
+        self._talking_npc = None
+        text, is_final, item = npc.start_dialogue()
+        if text:
+            portrait_key = self._npc_portrait_key(npc)
+            self.dialogue_box.show(text, "NPC", is_final, item, portrait_key=portrait_key)
+            if item:
+                self.player.inventory.append(item)
 
-        elif state == 'completed':
-            # All objectives done — fire the hook then offer the reward dialogue.
-            self.mission_manager.on_npc_talked(iid)
-            mission = self.mission_manager.get_mission_for_npc(iid)
-            # Check bring_item objective before finalising the mission.
-            if mission:
-                self.mission_manager.check_bring_item(mission['id'], getattr(self.player, 'inventory', []))
-            lines = mission.get('dialogues', {}).get('completed', []) if mission else []
-            if isinstance(lines, str):
-                lines = [lines]
-            lines = lines or ["Well done! Here is your reward."]
-            self._active_mission_dialogue = {
-                'npc':     npc,
-                'lines':   lines,
-                'index':   0,
-                'phase':   'claim_reward',
-                'mission': mission,
-            }
-            self._show_mission_line()
-
-        elif state == 'rewarded':
-            mission = self.mission_manager.get_mission_for_npc(iid)
-            lines   = mission.get('dialogues', {}).get('rewarded', []) if mission else []
-            if isinstance(lines, str):
-                lines = [lines]
-            lines = lines or ["Thanks again."]
-            self._active_mission_dialogue = {
-                'npc':     npc,
-                'lines':   lines,
-                'index':   0,
-                'phase':   'rewarded',
-                'mission': mission,
-            }
-            self._show_mission_line()
-
-        else:
-            # Plain NPC — use the standard dialogue system with no mission routing.
-            self._active_mission_dialogue = None
-            text, is_final, item = npc.start_dialogue()
-            if text:
-                portrait_key = self._npc_portrait_key(npc)
-                self.dialogue_box.show(text, "NPC", is_final, item, portrait_key=portrait_key)
-                if item:
-                    self.player.inventory.append(item)
+    def _end_npc_talk(self, npc):
+        """Called once a mission-phase action list (or an empty one)
+        finishes — mirrors what the old _advance_mission_dialogue's final
+        'else' branch used to do to close out the NPC's talking state."""
+        npc.is_talking             = False
+        npc.current_dialogue_index = 0
+        self._talking_npc = None
 
     def _advance_npc_dialogue(self):
         """Advance or close the active NPC dialogue box on player input."""
@@ -1333,84 +2306,26 @@ class Game:
             self.dialogue_box._chars_shown = len(self.dialogue_box.current_text)
             return
 
-        # ── Event-triggered dialogue (from the Event Editor's action list) ─────
+        # ── Event-triggered dialogue (from the Event Editor's action list,
+        # or a mission phase's action list — same mechanism now) ───────────
         if self._event_dialogue_active:
             self.dialogue_box.hide()
             return
 
         # ── Plain NPC flow (no mission) ───────────────────────────────────────
-        if self._active_mission_dialogue is None:
-            if not self.nearby_npc:
-                self.dialogue_box.hide()
-                return
-            if self.dialogue_box.is_final:
-                self.dialogue_box.hide()
-                self.nearby_npc.end_dialogue()
-            else:
-                text, is_final, item = self.nearby_npc.start_dialogue()
-                if text:
-                    portrait_key = self._npc_portrait_key(self.nearby_npc)
-                    self.dialogue_box.show(text, "NPC", is_final, item, portrait_key=portrait_key)
-                    if item:
-                        self.player.inventory.append(item)
+        if not self.nearby_npc:
+            self.dialogue_box.hide()
             return
-
-        # ── Mission dialogue flow ─────────────────────────────────────────────
-        md = self._active_mission_dialogue
-        md['index'] += 1
-
-        if md['index'] < len(md['lines']):
-            # More lines remain in this phase — just advance.
-            self._show_mission_line()
+        if self.dialogue_box.is_final:
+            self.dialogue_box.hide()
+            self.nearby_npc.end_dialogue()
         else:
-            # All lines shown — resolve the current dialogue phase.
-            npc = md['npc']
-            npc.is_talking             = False
-            npc.current_dialogue_index = 0
-
-            phase   = md.get('phase', '')
-            mission = md.get('mission')
-
-            if phase == 'offer' and mission:
-                self.mission_manager.accept_mission(mission['id'])
-                # Show 'accepted' confirmation lines if the designer configured any.
-                accepted_lines = mission.get('dialogues', {}).get('accepted', '')
-                if isinstance(accepted_lines, str):
-                    accepted_lines = [accepted_lines] if accepted_lines.strip() else []
-                if accepted_lines:
-                    # Don't hide first — transition directly so the box stays open
-                    # and show() can restart cleanly from the 'open' state.
-                    self._active_mission_dialogue = {
-                        'npc':     npc,
-                        'lines':   accepted_lines,
-                        'index':   0,
-                        'phase':   'accepted',
-                        'mission': mission,
-                    }
-                    self._show_mission_line()
-                    return   # don't clear yet — player still has lines to advance
-                self.dialogue_box.hide()
-                self._active_mission_dialogue = None
-
-            elif phase == 'claim_reward' and mission:
-                rewards = self.mission_manager.claim_reward(mission['id'])
-                self._apply_mission_rewards(rewards)
-                self.dialogue_box.hide()
-                self._active_mission_dialogue = None
-
-            else:
-                self.dialogue_box.hide()
-                self._active_mission_dialogue = None
-
-    def _show_mission_line(self):
-        """Show the current line from the active mission dialogue."""
-        md       = self._active_mission_dialogue
-        line     = md['lines'][md['index']]
-        npc      = md['npc']
-        is_final = (md['index'] >= len(md['lines']) - 1)
-        npc.is_talking = True
-        portrait_key   = self._npc_portrait_key(npc)
-        self.dialogue_box.show(line, "NPC", is_final, None, portrait_key=portrait_key)
+            text, is_final, item = self.nearby_npc.start_dialogue()
+            if text:
+                portrait_key = self._npc_portrait_key(self.nearby_npc)
+                self.dialogue_box.show(text, "NPC", is_final, item, portrait_key=portrait_key)
+                if item:
+                    self.player.inventory.append(item)
 
     def _show_level_up_if_pending(self):
         """Consume Player.pending_level_up if it's set — kicks off the
@@ -1575,20 +2490,6 @@ class Game:
         cy = int(self.player.y * RENDER_SCALE - camera.y)
         screen.blit(scaled, (cx - sw // 2, cy - sh // 2))
 
-    def _apply_mission_rewards(self, rewards: dict):
-        """Credit XP and items from a completed mission to the player."""
-        if not rewards:
-            return
-        xp = rewards.get('xp', 0)
-        if xp:
-            self.player.gain_exp(xp, self.game_config)
-            self._show_level_up_if_pending()
-        for item_entry in rewards.get('items', []):
-            item_id = item_entry.get('item_id', '')
-            count   = int(item_entry.get('count', 1))
-            for _ in range(count):
-                self.player.inventory.append(item_id)
-
     def _handle_menu_keydown(self, event):
         """Key-down events while the main menu is open."""
         if event.key == pygame.K_UP:
@@ -1688,9 +2589,13 @@ class Game:
         self.player.x = spawn_pos[0]
         self.player.y = spawn_pos[1]
 
-        # Centre the camera on the spawn position.
-        self.camera.x = max(0, self.player.x - self.camera.screen_width  // 2)
-        self.camera.y = max(0, self.player.y - self.camera.screen_height // 2)
+        # Centre the camera on the spawn position. update(..., dt=0) skips
+        # the smooth-follow ease and also resets the camera's internal
+        # true position — see the save-load comment above for why a plain
+        # camera.x/y assignment isn't enough on its own. (This also fixes
+        # a pre-existing miss here: the old math didn't multiply by
+        # RENDER_SCALE like the other spawn/load sites do.)
+        self.camera.update(self.player, room.width, room.height, dt=0)
 
         self.room_editor.active = False
 
@@ -1708,6 +2613,7 @@ class Game:
                 'destructible_stones': [],
                 'level_gates':         [],
                 'flying_pads':         [],
+                'nimbus_clouds':       [],
             }
 
             if hasattr(room, 'collision_objects'):
@@ -1730,6 +2636,14 @@ class Game:
                         'width':         pad.width,
                         'height':        pad.height,
                     })
+
+            if hasattr(room, 'nimbus_clouds'):
+                for cloud in room.nimbus_clouds:
+                    # Use the full to_dict so origin_room / origin_x/y /
+                    # origin_camera / waypoint spawn_x/y all survive the
+                    # test-mode backup. The previous hand-rolled dict dropped
+                    # them, so a test-mode exit+re-enter lost the return target.
+                    room_backup['nimbus_clouds'].append(cloud.to_dict())
 
             if hasattr(room, 'destructible_stones'):
                 for stone in room.destructible_stones:
@@ -1786,6 +2700,35 @@ class Game:
                 copy_pad.height        = pad.height
                 copy_pad.active        = True
                 self.flying_pads.append(copy_pad)
+
+        # Nimbus clouds — deep-copy so test-mode rides don't touch the editor data.
+        self.nimbus_clouds = []
+        if hasattr(room, 'nimbus_clouds') and room.nimbus_clouds:
+            from objects.nimbus_cloud import NimbusCloud, NimbusCloudWaypoint
+            for cloud in room.nimbus_clouds:
+                copy_cloud                 = NimbusCloud(cloud.x, cloud.y, cloud.cloud_type)
+                copy_cloud.origin_x        = cloud.origin_x
+                copy_cloud.origin_y        = cloud.origin_y
+                copy_cloud.waypoints       = [NimbusCloudWaypoint.from_dict(wp.to_dict()) for wp in cloud.waypoints]
+                copy_cloud.is_return_pad   = cloud.is_return_pad
+                copy_cloud.linked_pad_id   = cloud.linked_pad_id
+                copy_cloud.source_room     = cloud.source_room
+                copy_cloud.current_room    = room.name
+                # Preserve the room this cloud was originally placed in —
+                # a shuttle cloud's return-trip target depends on it (see
+                # NimbusCloud.origin_room / get_reversed_path). Without
+                # copying it across here, every test-mode reload silently
+                # resets it to "" and the same cross-room return-ride bug
+                # comes right back in test mode specifically.
+                copy_cloud.origin_room     = getattr(cloud, 'origin_room', '') or cloud.current_room
+                copy_cloud.origin_camera_x = getattr(cloud, 'origin_camera_x', 0)
+                copy_cloud.origin_camera_y = getattr(cloud, 'origin_camera_y', 0)
+                copy_cloud.width           = cloud.width
+                copy_cloud.height          = cloud.height
+                copy_cloud.rider_offset_x  = cloud.rider_offset_x
+                copy_cloud.rider_offset_y  = cloud.rider_offset_y
+                copy_cloud.active          = True
+                self.nimbus_clouds.append(copy_cloud)
 
         # Collision objects
         self.collision_objects = []
@@ -1886,6 +2829,17 @@ class Game:
             for door in room.doors:
                 self.doors.append(Door.from_dict(door.to_dict()))
 
+        # Chests — copy so test mode doesn't mutate the editor originals.
+        # to_dict()/from_dict() round-trips `opened`, so a chest already
+        # opened in the editor's own state (if any) carries over. Unlike
+        # doors, a chest has no "close on room exit" behavior to undo first
+        # — once opened it just stays opened.
+        self.chests = []
+        if hasattr(room, 'chests') and room.chests:
+            from objects.chest_object import Chest
+            for chest in room.chests:
+                self.chests.append(Chest.from_dict(chest.to_dict()))
+
         # Entities (enemies and NPCs)
         self.enemies = []
         self.npcs    = []
@@ -1950,6 +2904,17 @@ class Game:
 
             if self.room_editor.object_editor:
                 self.room_editor.object_editor.flying_pad_manager.flying_pads[room.name] = room.flying_pads
+
+            from objects.nimbus_cloud import NimbusCloud
+            room.nimbus_clouds = []
+            for d in backup.get('nimbus_clouds', []):
+                # Full from_dict restores origin_room / origin_x/y / spawn
+                # points — the hand-rolled path above dropped them and broke
+                # post-test return rides.
+                room.nimbus_clouds.append(NimbusCloud.from_dict(d))
+
+            if self.room_editor.object_editor:
+                self.room_editor.object_editor.nimbus_cloud_manager.nimbus_clouds[room.name] = room.nimbus_clouds
 
             # Rebuild destructible stones from the snapshot.
             from objects.destructible_stone import DestructibleStone
@@ -2030,6 +2995,13 @@ class Game:
             for pad in self.flying_pads:
                 pad.current_room = room.name
 
+        # Nimbus clouds — shallow copy; current_room is set on each cloud.
+        self.nimbus_clouds = []
+        if hasattr(room, 'nimbus_clouds') and room.nimbus_clouds:
+            self.nimbus_clouds = room.nimbus_clouds[:]
+            for cloud in self.nimbus_clouds:
+                cloud.current_room = room.name
+
         # Collision objects — shallow copy.
         self.collision_objects = []
         if hasattr(room, 'collision_objects') and room.collision_objects:
@@ -2055,6 +3027,9 @@ class Game:
         # so a permanent door's is_open flag survives leaving and re-entering
         # this room later in the same session.
         self.doors                = room.doors[:]              if hasattr(room, 'doors')               and room.doors               else []
+        # Chests — shallow copy, same as doors above (once opened they stay
+        # opened, so there's no "close on room exit" step needed here).
+        self.chests                = room.chests[:]             if hasattr(room, 'chests')              and room.chests              else []
         self._apply_room_music(room)
 
 
@@ -2194,9 +3169,27 @@ class Game:
                 npc.npc_id           = data.get('id', 'generic')
                 npc.instance_id      = data.get('instance_id', '')
 
+                # display_name / description come from this NPC's saved
+                # entity_creator config (assets/npcs/{id}.json), same
+                # source BossEnemy already reads from for enemies — read
+                # here rather than baked onto NPC.__init__ since (like
+                # BossEnemy) it's keyed off the id assigned at placement
+                # time, not something NPC can know about itself.
+                _npc_cfg          = entity_creator.load_config(entity_creator.KIND_NPC, npc.npc_id)
+                npc.display_name  = _npc_cfg.get('display_name') or npc.npc_id
+                npc.description   = _npc_cfg.get('description', '')
+
                 # Register the mission if this NPC has one defined inline.
+                # Stamp giver_instance_id/id from the live NPC instance
+                # (matches scan_rooms_for_missions' behavior) rather than
+                # trusting whatever was last saved on data['mission'],
+                # since instance_id is only assigned/stable once the NPC is
+                # actually placed.
                 if data.get('mission') and npc.instance_id:
-                    self.mission_manager.register_mission(data['mission'])
+                    mission_def = dict(data['mission'])
+                    mission_def['giver_instance_id'] = npc.instance_id
+                    mission_def.setdefault('id', npc.instance_id)
+                    self.mission_manager.register_mission(mission_def)
 
                 # Load the NPC sprite via the sprite system.
                 import os
@@ -2257,6 +3250,41 @@ class Game:
                                      ai_type=ai_type, enemy_category=enemy_category,
                                      shooter_style=shooter_style, zeni_pool=zeni_pool)
                 enemy.active = True
+
+                # display_name / description from this enemy's saved
+                # entity_creator config (assets/enemies/{id}.json) — same
+                # source BossEnemy already reads in its own __init__.
+                # Regular (non-boss) Enemy doesn't load its config itself,
+                # so this is applied here instead, right after construction.
+                _enemy_cfg         = entity_creator.load_config(entity_creator.KIND_ENEMY, enemy_id)
+                enemy.display_name = _enemy_cfg.get('display_name') or enemy_id
+                enemy.description  = _enemy_cfg.get('description', '')
+
+                # Apply configured STR/POW/END/SPD stats — same scheme the
+                # player uses (see character_creator.py / game.py's
+                # _stat_map). BossEnemy.__init__ already reads its own cfg
+                # for this; regular Enemy doesn't load its config itself,
+                # so it's applied here right after construction instead.
+                # Previously these sliders had no effect on non-boss
+                # enemies at all — every one used Enemy.__init__'s hardcoded
+                # defaults (150 HP / 20 END / preset attack_damage).
+                _stats = _enemy_cfg.get('stats', {})
+                if _stats:
+                    enemy.max_hp   = _stats.get('max_hp', enemy.max_hp)
+                    enemy.hp       = enemy.max_hp
+                    enemy.defense  = _stats.get('defense', enemy.defense)
+                    enemy.speed    = _stats.get('speed', enemy.speed)
+                    # Raw STR/POW — stored on the entity even though only
+                    # one of them actually drives attack_damage below, so
+                    # UI that shows both stats at once (see
+                    # ui/scouter_menu.py's _get_data_stats) has real
+                    # configured values to read instead of the Enemy.__init__
+                    # hardcoded fallback.
+                    enemy.strength = _stats.get('strength', enemy.strength)
+                    enemy.power    = _stats.get('power', enemy.power)
+                    enemy.attack_damage = (enemy.strength if enemy_category == 'melee'
+                                            else enemy.power)
+
                 self._push_out_of_obstacles(enemy, spawn_obstacles)
                 self.enemies.append(enemy)
 
@@ -2275,6 +3303,7 @@ class Game:
             + self.destructible_stones
             + self.level_gates
             + self.room_transitions
+            + self.chests
             + _solid_wm
         )
         self.player.obstacles = obstacles
@@ -2306,6 +3335,7 @@ class Game:
         self.big_bang_attacks = []
         self.big_bang_destruction_effects = []
         self.zeni_pickups   = []
+        self.item_pickups   = []   # dropped-item pickups despawn on room leave — see core.items.ItemPickup
         self._white_flash_timer = 0.0
         self.it_selector = None
         self.dmg_numbers.clear()  # Wipe leftover popups on room transition
@@ -2369,6 +3399,22 @@ class Game:
         if self.current_room and self.current_room.name == room_name:
             if pad not in self.flying_pads:
                 self.flying_pads.append(pad)
+
+    def _on_nimbus_cloud_deleted(self, cloud, room_name):
+        """Sync game list when a nimbus cloud is removed in the editor."""
+        if self.is_test_mode:
+            return
+        if self.current_room and self.current_room.name == room_name:
+            if cloud in self.nimbus_clouds:
+                self.nimbus_clouds.remove(cloud)
+
+    def _on_nimbus_cloud_placed(self, cloud, room_name):
+        """Sync game list when a nimbus cloud is placed in the editor."""
+        if self.is_test_mode:
+            return
+        if self.current_room and self.current_room.name == room_name:
+            if cloud not in self.nimbus_clouds:
+                self.nimbus_clouds.append(cloud)
 
     def _lookup_boss_hp_percent(self, boss_id):
         """FlagManager.boss_hp_lookup — 0-100 float for the currently active
@@ -2509,6 +3555,139 @@ class Game:
         hidden = self._wm_hidden_locations.get(map_name, set())
         self._wm_locations = [l for l in _base if l.get('name') not in hidden]
 
+    def _get_world_map_room_index(self):
+        """Lazily build and cache a room_name -> (map_name, locations) index
+        by scanning every assets/world_maps/*.json file once, so the
+        Scouter's World Map section can look up which map (if any) a given
+        room is pinned on without re-reading disk every frame/BFS step.
+        Feeds scouter_menu.draw()'s world_map_lookup callable — see
+        _world_map_lookup() below and
+        ui/scouter_menu.py:_resolve_world_map_attachment, which walks this
+        per room reachable from current_room via room_transitions."""
+        if getattr(self, '_wm_room_index', None) is not None:
+            return self._wm_room_index
+        import json as _json, os as _os, glob as _glob
+        index = {}
+        for path in _glob.glob(_os.path.join('assets', 'world_maps', '*.json')):
+            map_name = _os.path.splitext(_os.path.basename(path))[0]
+            try:
+                with open(path) as f:
+                    locations = _json.load(f).get('locations', [])
+            except Exception:
+                continue
+            for loc in locations:
+                room_name = loc.get('room')
+                if room_name and room_name not in index:
+                    index[room_name] = (map_name, locations)
+        self._wm_room_index = index
+        return index
+
+    def _world_map_lookup(self, room_name):
+        """callable(room_name) -> (map_name, locations) | None. Passed to
+        scouter_menu.draw() as world_map_lookup so the World Map section
+        resolves attachment transitively — a room counts as attached if
+        it, or any room it transitions with (directly or through a chain
+        of further connected rooms), is a pinned location on some map —
+        instead of only ever checking current_room in isolation."""
+        return self._get_world_map_room_index().get(room_name)
+
+    def _handle_item_action(self, mode, item_id, quantity=1):
+        """EventRunner handler for the 'item' action — mode: 'add' | 'remove'.
+        Was missing entirely (no register_handler call for it), which meant
+        the mission reward migration's item(mode='add', ...) actions (see
+        mission_manager._migrate_legacy_rewards) would silently no-op.
+        Mirrors the world item-pickup completion path (see
+        _update_item_pickup_finish) — bumps inventory plus the same
+        item_picked_up/item_count bookkeeping, so a reward-granted item
+        satisfies a collect_item mission objective exactly like a
+        ground-pickup would."""
+        inventory = getattr(self.player, 'inventory', None)
+        if inventory is None:
+            return
+        quantity = int(quantity)
+        if mode == 'add':
+            for _ in range(max(0, quantity)):
+                inventory.append(item_id)
+                self.flag_manager.mark_item_picked_up(item_id)
+                self.flag_manager.add_variable(f'item_count:{item_id}', 1)
+        elif mode == 'remove':
+            for _ in range(max(0, quantity)):
+                if item_id in inventory:
+                    inventory.remove(item_id)
+
+    def _handle_quest_action(self, mode, quest_id):
+        """EventRunner handler for the 'quest' action — mode: 'add' | 'remove'.
+        A lightweight standalone quest-flag toggle (distinct from the full
+        MissionManager) for content that just wants a "is quest X done"
+        flag to gate on — e.g. a locked door — without objectives/rewards/
+        dialogue. Mirrors FlagManager.mark_quest_finished()'s flag id, so
+        `flag_is(f'quest_finished:{quest_id}')` works as a condition
+        anywhere, and the 'mission' action's 'complete' mode below also
+        triggers this same flag for full missions."""
+        if mode == 'add':
+            self.flag_manager.mark_quest_finished(quest_id)
+        elif mode == 'remove':
+            self.flag_manager.clear(f'quest_finished:{quest_id}')
+
+    def _handle_modify_quest_variable_action(self, quest_id, variable_name, mode, value):
+        """EventRunner handler for the 'modify_quest_variable' action —
+        mode: 'set' | 'add' | 'remove'. Namespaced under the quest id so
+        two different quests can each own a variable_name like 'progress'
+        without colliding. Routes straight to FlagManager's own variable
+        store, same as 'set_custom_variable'."""
+        var_name = f'quest_var:{quest_id}:{variable_name}'
+        if mode == 'set':
+            self.flag_manager.set_variable(var_name, value)
+        elif mode == 'add':
+            self.flag_manager.add_variable(var_name, value)
+        elif mode == 'remove':
+            self.flag_manager.remove_variable(var_name)
+
+    def _handle_mission_action(self, mode, mission_id):
+        """EventRunner handler for the 'mission' action — mode:
+        'start' | 'complete' | 'fail' | 'reset'. This is the entire glue
+        between the event/action system and MissionManager: a mission
+        offer's dialogue_choice 'Accept' option ends with mission('start',
+        ...), and a mission's 'completed' dialogue phase ends with
+        mission('complete', ...) — see
+        MissionManager._migrate_legacy_dialogues for the auto-generated
+        version of both. 'complete' also runs the mission's own
+        reward_actions through this same event_runner, so rewards are just
+        more zeni()/item()/exp()/skill() actions instead of a bespoke
+        _apply_mission_rewards() code path.
+
+        Each transition also flips a flag alongside the MissionManager
+        state change — 'quest_active:<id>' / 'quest_finished:<id>' /
+        'quest_failed:<id>' — mirroring what the standalone 'quest' action
+        already does (see _handle_quest_action). Without this, nothing
+        outside MissionManager itself (a trigger box, a locked door, a
+        cutscene condition) could ever gate on "is this mission active/
+        done/failed" — flag_is('quest_finished:elder_01') now works
+        anywhere a condition can be built, not just inside the mission
+        system. 'quest_finished' reuses FlagManager.mark_quest_finished()
+        so a full mission and the lightweight standalone quest() action
+        land on the exact same flag id."""
+        if mode == 'start':
+            self.mission_manager.accept_mission(mission_id)
+            self.flag_manager.trigger(f'quest_active:{mission_id}')
+            self.flag_manager.clear(f'quest_finished:{mission_id}')
+            self.flag_manager.clear(f'quest_failed:{mission_id}')
+        elif mode == 'complete':
+            reward_actions = self.mission_manager.claim_reward(mission_id)
+            self.flag_manager.mark_quest_finished(mission_id)
+            self.flag_manager.clear(f'quest_active:{mission_id}')
+            if reward_actions:
+                self.event_runner.run_sequence(reward_actions)
+        elif mode == 'fail':
+            self.mission_manager.fail_mission(mission_id)
+            self.flag_manager.trigger(f'quest_failed:{mission_id}')
+            self.flag_manager.clear(f'quest_active:{mission_id}')
+        elif mode == 'reset':
+            self.mission_manager.reset_mission(mission_id)
+            self.flag_manager.clear(f'quest_active:{mission_id}')
+            self.flag_manager.clear(f'quest_finished:{mission_id}')
+            self.flag_manager.clear(f'quest_failed:{mission_id}')
+
     def _handle_dialogue_box_action(self, on_complete, speaker_type, text, speaker_name=None, portrait=None):
         """EventRunner handler for the 'dialogue_box' action. Single line,
         closed on player input — see _advance_npc_dialogue()'s event branch."""
@@ -2636,6 +3815,13 @@ class Game:
             return
         if mode == 'add':
             self.player.gain_exp(amount, self.game_config)
+            # Mission rewards (and any other designer-triggered exp grant)
+            # now route through this same action instead of the old
+            # Game._apply_mission_rewards, which used to call
+            # _show_level_up_if_pending() itself — keep that behavior here
+            # so a reward that crosses a level threshold still plays the
+            # level-up sequence instead of silently banking the level.
+            self._show_level_up_if_pending()
             return
         current = self.player.exp
         if mode == 'set':
@@ -2928,6 +4114,25 @@ class Game:
         assets/audio/sfx/ (any subfolder)."""
         self.sound_manager.play_sfx(sound_id)
 
+    def _open_pause_menu(self):
+        """Fires once the pre-pause fade-out (started from the K_ESCAPE
+        handler in _handle_game_keydown) reaches full black. Opens the
+        pause menu on top of that black screen — the transition_controller
+        overlay is drawn behind the pause menu (see _draw_ui) and is left
+        at full alpha rather than fading back in, so the menu sits on a
+        solid black backdrop exactly like the original game. The reverse
+        fade-in plays only once the menu is actually closed — see the
+        result == 'close' handling above."""
+        self._pause_fade_active = False
+        self.pause_menu.open(self.player)
+
+    def _open_scouter_menu(self):
+        """Fires once the pre-open fade-out (started from the K_RETURN
+        handler in _handle_game_keydown) reaches full black — mirrors
+        _open_pause_menu() above."""
+        self._scouter_fade_active = False
+        self.scouter_menu.open(self.player)
+
     def _handle_screen_fade_action(self, on_complete, direction, duration=0.5):
         """EventRunner handler for the 'screen_fade' action — direction:
         'in' | 'out'. Blocking — routes to TransitionController's standalone
@@ -2983,14 +4188,13 @@ class Game:
             self.player.x = _spawn_x
             self.player.y = _spawn_y
 
-            # Re-centre the camera on the new spawn, clamped to room bounds
-            # — same math as _handle_flying_room_transition.
-            self.camera.x = max(0, int(_spawn_x * RENDER_SCALE) - self.camera.screen_width  // 2)
-            self.camera.y = max(0, int(_spawn_y * RENDER_SCALE) - self.camera.screen_height // 2)
-            self.camera.x = min(self.camera.x, target_room.width  * RENDER_SCALE - SCREEN_WIDTH)
-            self.camera.y = min(self.camera.y, target_room.height * RENDER_SCALE - SCREEN_HEIGHT)
+            # Re-centre the camera on the new spawn, clamped to room bounds.
+            # update(..., dt=0) skips the smooth-follow ease and also resets
+            # the camera's internal true position — see the save-load
+            # comment above for why a plain camera.x/y assignment isn't
+            # enough on its own.
+            self.camera.update(self.player, target_room.width, target_room.height, dt=0)
 
-            self.mission_manager.on_room_entered(room_name)
             self.flag_manager.mark_room_visited(room_name)
 
             self.transition_controller.start_plain_fade('in', 0.3, None)
@@ -3403,7 +4607,6 @@ class Game:
             self._load_room_objects_as_copies(target_room)
         else:
             self._load_room_objects(target_room)
-        self.mission_manager.on_room_entered(room_name)
         self.flag_manager.mark_room_visited(room_name)
         return True
 
@@ -3491,48 +4694,53 @@ class Game:
                     # After seek() resets actor positions to their scripted spawn,
                     # snap the player actor to the real player's world position so
                     # any move_to tweens start from where the player actually is.
-                    _pc = getattr(self.player, 'character', None)
-                    for _adef in data.get('actors', []):
-                        if _adef.get('type') != 'player':
-                            continue
+                    # Skipped when sync_player_position=False (see _start_cutscene's
+                    # docstring) — the fresh-boot intro cutscene has no real player
+                    # position to sync from yet, so the actor stays at its authored
+                    # x/y instead of jumping to the WORLD_WIDTH//2 boot default.
+                    if self._csf_sync_player_pos:
+                        _pc = getattr(self.player, 'character', None)
+                        for _adef in data.get('actors', []):
+                            if _adef.get('type') != 'player':
+                                continue
 
-                        _live = self.active_cutscene_runtime.actors.get(_adef['id'])
-                        if not (_live and hasattr(_live, 'entity')):
-                            continue
+                            _live = self.active_cutscene_runtime.actors.get(_adef['id'])
+                            if not (_live and hasattr(_live, 'entity')):
+                                continue
 
-                        # Position/direction sync is unconditional: wherever you stood and
-                        # whichever way you faced in the room carries into the cutscene,
-                        # regardless of what character this actor is scripted to become.
-                        _live.entity.x = self.player.x
-                        _live.entity.y = self.player.y
-                        _live.entity.direction = self.player.direction
-                        _live.set_animation(
-                            getattr(self.player, 'current_animation_state', 'idle'),
-                            self.player.direction,
-                        )
-                        if _live._tween is not None:
-                            _live._tween.start_x = self.player.x
-                            _live._tween.start_y = self.player.y
-
-                        # Character/transformation overrides stay gated on the match —
-                        # don't force the player's real character onto an actor that's
-                        # deliberately authored to start as someone else.
-                        _ac = _adef.get('character')
-                        if _ac is not None and _ac != _pc:
-                            break
-                        if _pc:
-                            _live.entity.character = _pc
-
-                        _ts = self.player.transformation
-                        if _ts and _ts.is_transformed:
-                            from core.sprite_system import create_character_sprite
-                            _char = getattr(self.player, 'character', 'goku')
-                            _live.entity.sprite = create_character_sprite(_char, 'ssj', 32, 32)
-                            _live.entity.sprite.set_animation(
+                            # Position/direction sync is unconditional: wherever you stood and
+                            # whichever way you faced in the room carries into the cutscene,
+                            # regardless of what character this actor is scripted to become.
+                            _live.entity.x = self.player.x
+                            _live.entity.y = self.player.y
+                            _live.entity.direction = self.player.direction
+                            _live.set_animation(
                                 getattr(self.player, 'current_animation_state', 'idle'),
-                                _live.entity.direction,
+                                self.player.direction,
                             )
-                        break
+                            if _live._tween is not None:
+                                _live._tween.start_x = self.player.x
+                                _live._tween.start_y = self.player.y
+
+                            # Character/transformation overrides stay gated on the match —
+                            # don't force the player's real character onto an actor that's
+                            # deliberately authored to start as someone else.
+                            _ac = _adef.get('character')
+                            if _ac is not None and _ac != _pc:
+                                break
+                            if _pc:
+                                _live.entity.character = _pc
+
+                            _ts = self.player.transformation
+                            if _ts and _ts.is_transformed:
+                                from core.sprite_system import create_character_sprite
+                                _char = getattr(self.player, 'character', 'goku')
+                                _live.entity.sprite = create_character_sprite(_char, 'ssj', 32, 32)
+                                _live.entity.sprite.set_animation(
+                                    getattr(self.player, 'current_animation_state', 'idle'),
+                                    _live.entity.direction,
+                                )
+                            break
 
                     # Snapshot the player's full transformation state so that
                     # player.update() running during the cutscene (e.g. completing
@@ -3561,8 +4769,51 @@ class Game:
                     # Each tween stores a delta (not an absolute position), so we
                     # compute the absolute destination, reset the base to the player's
                     # world position, then rewrite the delta to preserve the destination.
-                    _ct     = self.active_cutscene_runtime.camera_target
-                    _px, _py = self.player.x, self.player.y
+                    _ct = self.active_cutscene_runtime.camera_target
+                    if self._csf_sync_player_pos:
+                        _px, _py = self.player.x, self.player.y
+                    else:
+                        # Fresh-boot launch (sync_player_position=False, see
+                        # _start_cutscene's docstring) — self.player.x/y is
+                        # still just the boot-time WORLD_WIDTH//2 default, so
+                        # rebasing off it would aim the camera at nothing.
+                        # Anchor on the cutscene's own player-type actor
+                        # instead (its authored spawn, already correct — see
+                        # the sync loop above, which we skipped on purpose).
+                        _anchor = None
+                        for _adef2 in data.get('actors', []):
+                            if _adef2.get('type') == 'player':
+                                _anchor = self.active_cutscene_runtime.actors.get(_adef2['id'])
+                                if _anchor:
+                                    break
+                        _px, _py = (_anchor.entity.x, _anchor.entity.y) if _anchor else (_ct.x, _ct.y)
+
+                        # camera_target itself also needs correcting, not just
+                        # the physical camera below — camera_target._tweens is
+                        # empty here (no authored camera actions in this
+                        # cutscene), so without this Camera.update() keeps
+                        # re-deriving the physical camera from camera_target's
+                        # stale pre-boot position every subsequent frame,
+                        # silently undoing the one-time snap right after it
+                        # happens (the actors-appear-top-left symptom).
+                        _ct.snap_to(_px, _py)
+
+                        # The physical camera's current position is likewise
+                        # just leftover pre-boot state (see camera_target's
+                        # own init in CutsceneRuntime.__init__, which seeds
+                        # itself from self.camera.x/y) — nothing to lerp
+                        # from, so snap it straight to frame the anchor
+                        # actor the same way a normal room entry would.
+                        self.camera.x = int(_px * RENDER_SCALE) - self.camera.screen_width  // 2
+                        self.camera.y = int(_py * RENDER_SCALE) - self.camera.screen_height // 2
+                        if self.current_room:
+                            self.camera.x = min(self.camera.x,
+                                                 self.current_room.width  * RENDER_SCALE - SCREEN_WIDTH)
+                            self.camera.y = min(self.camera.y,
+                                                 self.current_room.height * RENDER_SCALE - SCREEN_HEIGHT)
+                        self.camera.x = max(0, self.camera.x)
+                        self.camera.y = max(0, self.camera.y)
+
                     if _ct._tweens:
                         for _tw in _ct._tweens:
                             _abs_x         = _ct._base_x + _tw['delta_x']
@@ -3677,7 +4928,8 @@ class Game:
             import traceback; traceback.print_exc()
             return None
 
-    def _start_cutscene(self, cutscene_data, on_finished=None):
+    def _start_cutscene(self, cutscene_data, on_finished=None, already_faded=False,
+                         sync_player_position=True):
         """Queue cutscene_data to launch.
 
         Launches instantly (no fade) when the cutscene plays out in the
@@ -3689,6 +4941,26 @@ class Game:
         that case we fade to black first (see _update_cutscene_triggers'
         'fade_out' handling) and do the heavy lifting behind the fade,
         then fade back in once the runtime is ready.
+
+        `already_faded` — set by _start_new_game, whose caller
+        (title_screen.py's save-select confirm) has already faded the
+        screen to black itself before this ever gets called. Without
+        this we'd fade-out a second time here on top of an already-black
+        screen — this skips straight to the 'start' state at alpha=255
+        (screen already black, room switch/load still happens behind
+        it) so only the fade-in half plays once the intro cutscene's
+        runtime is ready.
+
+        `sync_player_position` — snaps the scripted player-type actor to
+        self.player's real x/y/direction (see the 'start' branch below),
+        so a cutscene triggered mid-gameplay carries over wherever you
+        were actually standing. Set to False by _start_new_game: at that
+        point the player has never been placed in any room yet, so
+        self.player.x/y are still just the boot-time WORLD_WIDTH//2,
+        WORLD_HEIGHT//2 defaults from Game.__init__ — syncing to that
+        would teleport the actor off its authored position and off
+        camera instead of leaving it where the cutscene actually placed
+        it.
 
         `on_finished`, if given, is called with no arguments once the
         cutscene runtime reports finished (see the 'normal cutscene
@@ -3710,8 +4982,13 @@ class Game:
                                                        or self.current_room.name != base_room_name))
 
         self._csf_pending          = cutscene_data
-        self._csf_alpha            = 0.0
-        self._csf_state            = 'fade_out' if needs_room_switch else 'start'
+        self._csf_sync_player_pos  = sync_player_position
+        if already_faded:
+            self._csf_alpha        = 255.0
+            self._csf_state        = 'start'
+        else:
+            self._csf_alpha        = 0.0
+            self._csf_state        = 'fade_out' if needs_room_switch else 'start'
         self._cutscene_on_finished = on_finished
         return True
 
@@ -3798,6 +5075,23 @@ class Game:
             self._white_flash_surf = pygame.Surface((w, h), pygame.SRCALPHA)
         self._white_flash_surf.fill((255, 255, 255, alpha))
         surface.blit(self._white_flash_surf, (0, 0))
+
+    def _draw_death_fade(self, surface):
+        """Draw the black fade overlay for the post-death sequence.
+
+        Same SRCALPHA-surface approach as _draw_map_jump_fade/_draw_cutscene_fade
+        above — set_alpha() doesn't work correctly on a pygame.SCALED display
+        surface. No-op once alpha is back at 0 (i.e. whenever death isn't in
+        progress at all).
+        """
+        alpha = int(self._death_fade_alpha)
+        if alpha <= 0:
+            return
+        w, h = surface.get_size()
+        if not hasattr(self, '_death_fade_surf') or self._death_fade_surf.get_size() != (w, h):
+            self._death_fade_surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        self._death_fade_surf.fill((0, 0, 0, min(255, alpha)))
+        surface.blit(self._death_fade_surf, (0, 0))
 
     # ── World-map flying helpers ──────────────────────────────────────────────
 
@@ -4362,7 +5656,6 @@ class Game:
                     self._mjf_land_speed       = 120.0   # world-units / sec — mirrors ascent feel
                     self._mjf_landing_done     = False
                     self._load_map_land_sprite()
-                    self.mission_manager.on_room_entered(_target_room_name)
                     self.flag_manager.mark_room_visited(_target_room_name)
                     self._mjf_alpha = 255.0   # start fully black; fade_in counts down to 0
                     self._mjf_state = 'landing_fade_in'
@@ -4431,6 +5724,28 @@ class Game:
                 self._mjf_flying_frame_idx = (
                     (self._mjf_flying_frame_idx + 1) % len(self._mjf_flying_frames)
                 )
+
+    def _on_world_map_saved(self, map_name: str):
+        """Called by WorldMapEditor right after it writes a map's JSON to
+        disk (see WorldMapEditor.on_save). Drops every render cached from
+        the old JSON for that map so the next frame rebuilds from what was
+        just saved, instead of showing a stale image until the game
+        restarts — this is what makes edits (tiles, and especially the
+        Scouter Paint silhouette) show up immediately back in the room.
+        """
+        if hasattr(self, '_wm_scouter_cache'):
+            self._wm_scouter_cache.pop(map_name, None)
+
+        # The Mode7 flying-scene texture is only ever built for whichever
+        # map is currently active, and lazily (see _draw_world_map_flying_scene's
+        # `if not hasattr(self, '_world_map_texture')` guard) — so if the
+        # saved map is the active one, clear those attrs too, the same way
+        # _start_map_jump does when the active map itself changes.
+        if getattr(self, '_active_world_map_name', None) == map_name:
+            for attr in ('_world_map_texture', '_world_map_tex_arr', '_wm_locations',
+                         '_wm_entities', '_wm_vehicle_cache'):
+                if hasattr(self, attr):
+                    delattr(self, attr)
 
     def _build_world_map_surface(self, map_name: str, frame_idx: int = 0):
         """Render the tile-map JSON produced by the world map editor into a single
@@ -4513,6 +5828,169 @@ class Game:
             target_h = MAP_H * 2
             print(f'[world_map] PNG not found, defaulting to {target_w}x{target_h}')
         return pygame.transform.scale(surface, (surf_w * 2, surf_h * 2))
+
+    def _build_world_map_scouter_surface(self, map_name: str, frame_idx: int = 0):
+        """Render the world map's designer-painted Scouter silhouette (see the
+        World Map editor's Scouter Paint mode) for the Scouter's WORLD_MAP
+        section.
+
+        Replaces the old automatic approach, which inferred land vs. water by
+        color-keying the tile art's palette (every water/shallow-water shade
+        followed a strict R < G < B gradient) and tracing a coastline from
+        that. That worked but was indirect and fragile -- it broke the moment
+        a tileset used a color outside the assumed gradient. This instead
+        reads painted cells straight from the map JSON's 'scouter_paint'
+        field: [gx, gy] map-tile cells the designer painted directly in the
+        editor, the same "paint the shape once, directly" approach
+        objects/map_paint.py already uses for the room-level Scouter minimap.
+        Nothing here is inferred from the tile art.
+
+        frame_idx is accepted for signature compatibility with the old
+        outline builder (and with _build_world_map_surface) but unused: the
+        painted silhouette doesn't change when the map's animated frame does.
+
+        Returns None if the map JSON is missing or has no painted cells yet,
+        so the caller can show a "not painted" message instead of a blank
+        surface. The result is cached per map name until invalidated, since
+        re-rendering it every frame the WORLD_MAP section is left open would
+        be unnecessary work.
+        """
+        import json as _json
+        import os as _os
+
+        if not hasattr(self, '_wm_scouter_cache'):
+            self._wm_scouter_cache = {}
+
+        cached = self._wm_scouter_cache.get(map_name)
+        if cached is not None:
+            return cached
+
+        path = _os.path.join('assets', 'world_maps', f'{map_name}.json')
+        try:
+            with open(path) as f:
+                data = _json.load(f)
+        except Exception as e:
+            print(f'[world_map] could not open {path}: {e}')
+            return None
+
+        raw_cells = data.get('scouter_paint', [])
+        if not raw_cells:
+            print(f'[world_map] {map_name}.json has no scouter_paint -- '
+                  f'paint it in the World Map editor\'s Scouter mode')
+            return None
+
+        cells = set()
+        for c in raw_cells:
+            try:
+                cells.add((int(c[0]), int(c[1])))
+            except (TypeError, ValueError, IndexError):
+                continue
+        if not cells:
+            return None
+
+        MAP_W = 362   # must match world_map_editor.MAP_TILE_W
+        MAP_H = 263   # must match world_map_editor.MAP_TILE_H
+        COLOR_FILL    = (0, 0, 0, 255)        # interior land -- black, only between outlines
+        COLOR_OUTLINE = (57, 255, 57, 255)    # 39FF39 -- painted outline cells
+
+        # Painted scouter_paint cells are OUTLINES only (same contract as
+        # room map_paint). Interiors are flood-filled by nesting depth so a
+        # closed coastline becomes land and nested loops stay holes.
+        #
+        # Critical: the surface is SRCALPHA with a transparent outside.
+        # Filling the whole MAP_W×MAP_H canvas with opaque black is what
+        # produced the big black square on the Scouter WORLD_MAP screen —
+        # ocean/outside must stay transparent so only the silhouette shows.
+        from collections import deque as _deque
+
+        mask = [[False] * MAP_W for _ in range(MAP_H)]
+        for gx, gy in cells:
+            if 0 <= gx < MAP_W and 0 <= gy < MAP_H:
+                mask[gy][gx] = True
+
+        region_id = [[-1] * MAP_W for _ in range(MAP_H)]
+        region_count = 0
+        border_regions = set()
+        for row in range(MAP_H):
+            for col in range(MAP_W):
+                if mask[row][col] or region_id[row][col] != -1:
+                    continue
+                rid = region_count
+                region_count += 1
+                touches_border = False
+                dq = _deque([(row, col)])
+                region_id[row][col] = rid
+                while dq:
+                    r, c = dq.popleft()
+                    if r == 0 or r == MAP_H - 1 or c == 0 or c == MAP_W - 1:
+                        touches_border = True
+                    for nr, nc in ((r - 1, c), (r + 1, c), (r, c - 1), (r, c + 1)):
+                        if (0 <= nr < MAP_H and 0 <= nc < MAP_W
+                                and not mask[nr][nc] and region_id[nr][nc] == -1):
+                            region_id[nr][nc] = rid
+                            dq.append((nr, nc))
+                if touches_border:
+                    border_regions.add(rid)
+
+        adjacency = [set() for _ in range(region_count)]
+        for row in range(MAP_H):
+            for col in range(MAP_W):
+                if not mask[row][col]:
+                    continue
+                neighbor_regions = {
+                    region_id[nr][nc]
+                    for nr, nc in ((row - 1, col), (row + 1, col),
+                                   (row, col - 1), (row, col + 1))
+                    if 0 <= nr < MAP_H and 0 <= nc < MAP_W and not mask[nr][nc]
+                }
+                for a in neighbor_regions:
+                    for b in neighbor_regions:
+                        if a != b:
+                            adjacency[a].add(b)
+
+        depth = [None] * region_count
+        dq = _deque()
+        for rid in border_regions:
+            depth[rid] = 0
+            dq.append(rid)
+        while dq:
+            rid = dq.popleft()
+            for nb in adjacency[rid]:
+                if depth[nb] is None:
+                    depth[nb] = depth[rid] + 1
+                    dq.append(nb)
+        for i in range(region_count):
+            if depth[i] is None:
+                depth[i] = 1  # sealed pocket with no path to border → filled
+
+        surface = pygame.Surface((MAP_W, MAP_H), pygame.SRCALPHA)
+        surface.fill((0, 0, 0, 0))  # fully transparent outside the silhouette
+        for row in range(MAP_H):
+            for col in range(MAP_W):
+                if mask[row][col]:
+                    surface.set_at((col, row), COLOR_OUTLINE)
+                else:
+                    rid = region_id[row][col]
+                    if rid >= 0 and depth[rid] is not None and depth[rid] % 2 == 1:
+                        surface.set_at((col, row), COLOR_FILL)
+
+        # Scale up to match the legacy PNG pipeline's size, same as
+        # _build_world_map_surface, so the WORLD_MAP section's viewport math
+        # doesn't need to special-case this surface's resolution.
+        try:
+            _png_ref = pygame.image.load('assets/map/world_map.png')
+            target_w = _png_ref.get_width() * 2
+            target_h = _png_ref.get_height() * 2
+            del _png_ref
+        except Exception:
+            target_w = MAP_W * 2
+            target_h = MAP_H * 2
+
+        # Nearest-neighbour scale so the 1px outline stays crisp; keep alpha
+        # so the transparent ocean doesn't turn into a black rectangle.
+        result = pygame.transform.scale(surface, (target_w, target_h))
+        self._wm_scouter_cache[map_name] = result
+        return result
 
     def _draw_world_map_flying_scene(self):
         """Draw the world-map flying view.
@@ -5786,8 +7264,31 @@ class Game:
         cfg = character_creator.load_config(character_id)
         atk = cfg.get('attacks', {})
 
+        # Scouter/UI-facing display name — falls back to the raw character
+        # id (e.g. "goku") if the creator's Identity tab was left blank, so
+        # a character always shows *something* other than the generic
+        # "Player" class-name fallback in ui/scouter_menu.py's
+        # _get_entity_display_name().
+        self.player.display_name = cfg.get('display_name') or character_id
+
+        # Scouter Data description panel (ui/scouter_menu.py's
+        # _get_entity_description) — same "always re-apply on reload" flow
+        # as display_name above, so editing the Identity tab's Description
+        # box and picking it back up here works for whichever character is
+        # currently being played, not just on next character switch.
+        self.player.description = cfg.get('description', '')
+
         self.player.equipped_attacks = list(atk.get('equipped_attacks', []))
         self.player.ki_mode_config   = atk.get('ki_attack_mode', 'blast')
+
+        # Ground-shadow pixel width from the character creator's "Shadow
+        # Size" slider (character_creator.py's cfg["shadow_size"], an int
+        # in px — not to be confused with Player.shadow_size, the legacy
+        # 'small'/'big' string). LayerManager._draw_shadow() reads
+        # player.shadow_width directly (falling back to player.width if
+        # unset), so without this line the slider had nowhere to go and
+        # every character always drew the same default-width shadow.
+        self.player.shadow_width = cfg.get('shadow_size', self.player.width)
 
         # Charged Melee style — whether holding the melee button lunges
         # forward or spins in place once fully charged (see
@@ -5824,9 +7325,11 @@ class Game:
         # other stat) takes effect the moment the creator saves.
         _cc_stats = cfg.get('stats', {})
         _stat_map = {
-            'power':    'strength',
-            'defense':  'defense',
-            'speed':    'speed',
+            'power':    'strength',   # STR
+            'ki_power': 'ki_power',   # POW
+            'vitality': 'vitality',   # END
+            'defense':  'defense',    # legacy/unused — combat reads 'vitality', not this
+            'speed':    'speed',      # SPD
             'ki_regen': 'ki_regen',
         }
         changed = False
@@ -5868,8 +7371,19 @@ class Game:
             'current_animation_state': getattr(self.player, 'current_animation_state', 'idle'),  # capture BEFORE swap
         }
 
+        # Use the costume configured for this character in the character
+        # creator (assets/characters/{character_id}.json's "costume" field)
+        # instead of hardcoding 'base' — otherwise every switch silently
+        # reverted the character to their base look even when they'd been
+        # set up with a different default costume. This is the same field
+        # character_switch_menu.py's _discover_characters() already reads
+        # for the roster preview, so the preview and the actual switch now
+        # agree with each other.
+        costume = character_creator.load_config(character_id).get('costume', 'base')
+
         self.player.character = character_id
-        self.player.sprite    = create_character_sprite(character_id, 'base', 32, 32)
+        self.player.costume   = costume
+        self.player.sprite    = create_character_sprite(character_id, costume, 32, 32)
 
         # Restore state so the swap is completely seamless to the player.
         for key, value in state.items():
@@ -5888,6 +7402,47 @@ class Game:
         # Keep the event editor's skill pickers scoped to whoever's now
         # being played — see _sync_event_editor_character().
         self._sync_event_editor_character()
+
+    def _handle_set_player_character_action(self, character_id, skin_id=None):
+        """EventRunner handler for the 'set_player_character' action —
+        same plumbing as picking character_id in the character-switch
+        menu (see _switch_character() above: sprite swap, attack config
+        reload, transformation gate, event-editor skill-picker sync, all
+        gameplay state like hp/ki/level/inventory/zeni preserved).
+
+        If skin_id is given, it overrides the character's configured
+        default costume — applied via _handle_set_player_skin_action()
+        AFTER the switch, since _switch_character() already resets
+        player.costume to character_id's own default."""
+        self._switch_character(character_id)
+        if skin_id:
+            self._handle_set_player_skin_action(skin_id)
+
+    def _handle_set_player_skin_action(self, skin_id):
+        """EventRunner handler for the 'set_player_skin' action — swaps
+        the CURRENTLY active character's costume/skin in place, without
+        touching character, level, stats, inventory, etc. skin_id is a
+        bare costume folder name (character_creator.py's "costume" field,
+        e.g. "default", "gi_alt") — the same kind of value
+        _switch_character() reads out of the character's config.
+
+        Mirrors just the costume-assignment/sprite-recreation half of
+        _switch_character(), then re-syncs the transformation gate since
+        which forms are available depends on which costume's transform
+        folder is currently active (see _refresh_transformation_gate())."""
+        from core.sprite_system import create_character_sprite
+
+        self.player.costume = skin_id
+        self.player.sprite  = create_character_sprite(self.player.character, skin_id, 32, 32)
+
+        # Preserve current facing/animation across the sprite swap — same
+        # reasoning as the equivalent block in _switch_character().
+        if hasattr(self.player.sprite, 'set_animation'):
+            self.player.sprite.set_animation(
+                getattr(self.player, 'current_animation_state', 'idle'),
+                self.player.direction)
+
+        self._refresh_transformation_gate()
 
     # ── Flying-controller callbacks ───────────────────────────────────────────
 
@@ -5914,12 +7469,107 @@ class Game:
         self.camera.y = max(0, (spawn_y * RENDER_SCALE) - self.camera.screen_height // 2)
         self.camera.x = max(0, min(self.camera.x, target_room.width  * RENDER_SCALE - SCREEN_WIDTH))
         self.camera.y = max(0, min(self.camera.y, target_room.height * RENDER_SCALE - SCREEN_HEIGHT))
-        self.mission_manager.on_room_entered(target_room_name)
         self.flag_manager.mark_room_visited(target_room_name)
 
     def _handle_flying_complete(self):
         """Called when the flying sequence ends.
         Player control is already restored by FlyingController.
+        """
+        pass
+
+    def _handle_nimbus_room_transition(self, target_room_name, spawn_x, spawn_y):
+        """Swap the active room mid-ride.
+
+        Called by NimbusCloudController at the midpoint of a boundary-waypoint
+        transition. Same room-swap plumbing as _handle_flying_room_transition,
+        but the camera is re-anchored to a STATIC, top-locked frame instead of
+        being centered on the spawn point — it stays there (camera.locked
+        remains True) for the whole of the new room's leg, matching how the
+        leg was authored in NimbusCloudPathEditor.
+        """
+        target_room = self.room_manager.get_room_by_name(target_room_name)
+        if not target_room:
+            return
+
+        self.room_manager.current_room = target_room
+        self.current_room              = target_room
+
+        if self.is_test_mode:
+            self._load_room_objects_as_copies(target_room)
+        else:
+            self._load_room_objects(target_room)
+
+        # _load_room_objects[_as_copies] just replaced self.nimbus_clouds
+        # wholesale with target_room's own authored clouds — it has no idea
+        # about the cloud currently being ridden, which is still whatever
+        # object nimbus_controller.cloud points to (authored in room a, or
+        # wherever a previous leg's transition last placed it). Without
+        # re-adding it here, the ridden cloud falls out of the active list:
+        # it stops being drawn and stops being reachable for the "ride it
+        # back" boarding check in _handle_interact, even though the
+        # controller keeps moving it via cloud.x/y for the rest of the leg.
+        ridden_cloud = self.nimbus_controller.cloud
+        if ridden_cloud is not None:
+            ridden_cloud.current_room = target_room_name
+            # _load_room_objects[_as_copies] rebuilds self.nimbus_clouds from
+            # target_room's own authored list every time. In normal (non-
+            # test) mode the ridden cloud IS one of those authored objects
+            # (same instance, never actually relocated between rooms' own
+            # lists), so it's already present and appending would duplicate
+            # it. In test mode, _load_room_objects_as_copies deep-copies a
+            # FRESH object from the room's authored data on every reload —
+            # a different instance from the one that's been riding — so an
+            # identity check alone (`not in`) never catches it, and BOTH the
+            # fresh copy and the ridden copy end up in the list side by
+            # side (two visible clouds). origin_room/origin_x/origin_y are
+            # stable across copies (set once at authoring, never mutated),
+            # so use that as the real identity check instead of object
+            # identity: drop any list entry that's a stand-in for the same
+            # authored cloud, then add the one actually being ridden back.
+            ridden_key = (
+                getattr(ridden_cloud, 'origin_room', ''),
+                ridden_cloud.origin_x,
+                ridden_cloud.origin_y,
+            )
+            self.nimbus_clouds = [
+                c for c in self.nimbus_clouds
+                if c is not ridden_cloud and (
+                    getattr(c, 'origin_room', ''), c.origin_x, c.origin_y
+                ) != ridden_key
+            ]
+            self.nimbus_clouds.append(ridden_cloud)
+
+        if ridden_cloud is not None and getattr(ridden_cloud, 'origin_room', '') == target_room_name:
+            # Arriving back at the room this cloud was originally placed in.
+            # NimbusCloudPathEditor locks that first leg to whatever view
+            # was on screen at placement time (origin_camera_x/y) rather
+            # than a computed top-anchored frame — every OTHER leg uses
+            # that computed frame instead (see the else branch below, and
+            # _snap_camera_to_top_anchor in the editor). Recreate that same
+            # frame here so a return ride matches how the leg was authored.
+            cam_x = max(0, min(ridden_cloud.origin_camera_x,
+                                target_room.width * RENDER_SCALE - SCREEN_WIDTH))
+            cam_y = max(0, min(ridden_cloud.origin_camera_y,
+                                target_room.height * RENDER_SCALE - SCREEN_HEIGHT))
+        else:
+            # Static, top-anchored frame — centered horizontally on the spawn
+            # point, pinned to the top of the room. Camera stays locked
+            # (NimbusCloudController keeps camera.locked = True for the whole
+            # ride) so this is a snap, never a scroll.
+            cam_x = (spawn_x * RENDER_SCALE) - self.camera.screen_width // 2
+            cam_x = max(0, min(cam_x, target_room.width * RENDER_SCALE - SCREEN_WIDTH))
+            cam_y = 0  # Top of the room.
+
+        self.camera.x = cam_x
+        self.camera.y = cam_y
+
+        self.flag_manager.mark_room_visited(target_room_name)
+
+    def _handle_nimbus_ride_complete(self):
+        """Called when the nimbus cloud ride ends.
+        Player control is already restored by NimbusCloudController; the
+        camera unlocks and resumes normal following from wherever it was
+        left (the last static frame of the final leg).
         """
         pass
 
@@ -5939,6 +7589,22 @@ class Game:
         dt             = min(dt, 4.0 / 60.0)
         self.dt        = dt
 
+        # Title screen — nothing else in the engine ticks while this is up.
+        if self.game_mode == 'title':
+            self.title_screen.update(dt)
+            # Confirming New Game on the save-select page doesn't switch
+            # scenes right away — title_screen.py fades the menu to black
+            # first (see _confirm_save_slot/_exit_pending) and only reports
+            # 'new_game' back here via consume_exit_signal() once that
+            # fade has fully completed, so the cut into the cutscene never
+            # happens before the screen is solid black.
+            result = self.title_screen.consume_exit_signal()
+            if result == 'new_game':
+                self._start_new_game()
+            elif result == 'load_game':
+                self._start_loaded_game(self.title_screen.get_selected_save_slot())
+            return
+
         # Advance the world-map entity animation clock every frame so that
         # in-room WorldMapObjects linked to entities always reflect the entity's
         # true path position, even when the world-map flying scene is not active.
@@ -5957,6 +7623,15 @@ class Game:
             self._sync_event_editor_rooms()
             self.room_editor.update(dt, self._get_logical_mouse_pos())
             return
+
+        # Player death overlay — advances the hold/fade/game-over-box state
+        # machine, but deliberately does NOT return/hijack update() the way
+        # e.g. the white-flash hitstop below does: enemies, projectiles,
+        # damage numbers, hurt-tint decay, everything keeps running normally
+        # through the whole sequence. Only the player itself is frozen, via
+        # is_dead (see Player.update()'s early return). handle_events()
+        # still swallows all input while this is active — see there.
+        self._update_death_sequence(dt)
 
         # Genkidama impact hitstop — the world freezes completely for the
         # duration of the white flash. Only the flash timer itself and the
@@ -5983,6 +7658,14 @@ class Game:
             self._update_instant_transmission(dt)
             return
 
+        # Scouter menu — the whole world freezes while it's open (matches
+        # the Scouter section's "frozen frame" requirement, and there's no
+        # reason the Map/World Map sections need gameplay ticking either).
+        # Only the menu's own animations (crosshair blink, etc.) advance.
+        if self.scouter_menu.active:
+            self.scouter_menu.update(dt)
+            return
+
         enemies_defeated_this_frame = 0
 
         # Always tick UI overlays even when gameplay is paused.
@@ -5990,6 +7673,15 @@ class Game:
         self.save_point_menu.update(dt)
         self.dialogue_choice_menu.update(dt)
         self.pause_menu.update(dt)
+        self.credits_screen.update(dt)
+
+        # The in-game "Save Game" flow (see _start_save_flow) — ticks
+        # TitleScreen's own clock (its update()/draw() otherwise only run
+        # while game_mode == 'title') plus the "Saving..." popup's hold
+        # timer.
+        if self.save_flow_active:
+            self.title_screen.update(dt)
+            self._update_save_flow(dt)
 
         if self.ui.current_screen == 'game':
             # ── World-map flying sequence ──────────────────────────────────────
@@ -6002,7 +7694,8 @@ class Game:
 
             # Accumulate play time only while unpaused and no overlay is blocking.
             if not self.save_point_menu.active and not self.character_switch_menu.active \
-                    and not self.pause_menu.active and not self.dialogue_choice_menu.active:
+                    and not self.pause_menu.active and not self.dialogue_choice_menu.active \
+                    and not self.save_flow_active:
                 self.play_time += dt
 
                 # Tick down any running event timers in lockstep with play
@@ -6018,6 +7711,12 @@ class Game:
                 # be used to stall out (or accidentally drain) the bar.
                 self._update_spam_qte(dt)
 
+                # Count down consumable stat buffs (e.g. Holy Water's +25
+                # STR/POW/END/SPD for 30s) — frozen by the same overlays as
+                # play_time/timers above so opening the pause menu can't be
+                # used to stretch a buff's duration.
+                tick_item_buffs(self.player, self.active_item_buffs, dt)
+
             # Player movement is also suppressed during cutscenes, NPC
             # dialogue, and while an Instant Transmission hop sequence is
             # driving position directly (arrow-key input would otherwise
@@ -6026,7 +7725,7 @@ class Game:
                     and not self.pause_menu.active and not self.active_cutscene_runtime \
                     and not self.dialogue_box.active and not self.dialogue_choice_menu.active \
                     and not self.player.is_teleporting_it and not self.spam_qte_bar.active \
-                    and not self._levelup_active:
+                    and not self._levelup_active and not self.save_flow_active:
                 self._update_player_movement(dt)
 
             # The character switch menu and save point menu should freeze the
@@ -6034,9 +7733,11 @@ class Game:
             # keep running here would still tick idle_timer forward and let
             # idle_transition/idle_wait kick in while either menu is open
             # (only _update_player_movement above was gated before). The
-            # dialogue choice menu gets the same treatment.
+            # dialogue choice menu — and the Save Game flow — get the same
+            # treatment.
             if not self.character_switch_menu.active and not self.save_point_menu.active \
-                    and not self.dialogue_choice_menu.active and not self._levelup_active:
+                    and not self.dialogue_choice_menu.active and not self._levelup_active \
+                    and not self.save_flow_active:
                 self.player.update(dt)
 
             # Level-up sequence — drives the player's facing turns and the
@@ -6110,7 +7811,9 @@ class Game:
             # Spawn the player's blast projectile when the throw animation completes.
             if self.player.pending_blast == 'ready':
                 spawn_x, spawn_y = self.player.get_blast_spawn_position()
-                self.projectiles.append(Projectile(spawn_x, spawn_y, self.player.direction))
+                blast = Projectile(spawn_x, spawn_y, self.player.direction)
+                blast.owner = self.player  # so damage can be rolled off the player's POW — see Enemy.check_collision_with_attack's 'projectile' branch
+                self.projectiles.append(blast)
                 self.sound_manager.play_sfx(random.choice(('kiblast1', 'kiblast2')))
                 self.player.pending_blast = None
 
@@ -6153,6 +7856,13 @@ class Game:
                     self.camera.update(self.player, self.current_room.width,
                                        self.current_room.height, dt)
 
+            # Nimbus cloud controller update. Unlike the flying controller,
+            # the camera is intentionally never ticked here — it stays
+            # static/locked for the whole ride (see NimbusCloudController and
+            # _handle_nimbus_room_transition) rather than following the player.
+            if self.nimbus_controller.is_active():
+                self.nimbus_controller.update(dt)
+
             # Cutscene trigger detection and runtime tick.
             self._update_cutscene_triggers(dt)
 
@@ -6169,6 +7879,13 @@ class Game:
             # the world map music that was just switched to a few lines above.
             if self._mjf_state is None and not self._mjf_active:
                 self._update_trigger_boxes(dt)
+
+            # Re-check every active mission's objective conditions against
+            # current flag/variable/live state — replaces the old per-event
+            # mission_manager.on_room_entered/on_enemy_killed/on_npc_talked
+            # hooks that used to be sprinkled through this file. See
+            # MissionManager.evaluate_active_missions()'s docstring.
+            self.mission_manager.evaluate_active_missions(self.flag_manager)
 
             # Walk-based room transition detection (skip during fade).
             if not self.transition_controller.is_transitioning():
@@ -6257,8 +7974,12 @@ class Game:
             # dialogue_box, or the dialogue_choice_menu), same reasoning as
             # player movement being suppressed below: nothing should be
             # able to sneak up on or hit the player while they're reading.
-            if not self.dialogue_box.active and not self.dialogue_choice_menu.active \
-                    and not self._levelup_active:
+            # Deliberately NOT frozen for the death-notice box itself (see
+            # _update_death_sequence) — the player is already fully locked
+            # out via is_dead, but the rest of the world (and whatever
+            # killed them) should keep moving right through it.
+            if (not self.dialogue_box.active or self._death_state == 'box') \
+                    and not self.dialogue_choice_menu.active and not self._levelup_active:
                 enemies_defeated_this_frame = self._update_enemies(dt)
             else:
                 for enemy in self.enemies:
@@ -6284,6 +8005,12 @@ class Game:
 
             # Dropped zeni pickups — hop/settle, magnet toward player, collect.
             self._update_zeni_pickups(dt)
+
+            # Dropped item pickups — toss/bounce/settle, collect. No cull
+            # fast-path like zeni's: there's realistically only ever a
+            # handful of these on screen at once, not a pile in the
+            # thousands, so the plain per-frame update() is cheap enough.
+            self._update_item_pickups(dt)
 
             # Tick damage number popups.
             self.dmg_numbers.update(dt)
@@ -6321,9 +8048,10 @@ class Game:
 
             # NPC interaction detection — frozen while any dialogue box is
             # up, same as enemy AI above, so an NPC doesn't wander off or
-            # change facing mid-conversation.
-            if not self.dialogue_box.active and not self.dialogue_choice_menu.active \
-                    and not self._levelup_active:
+            # change facing mid-conversation. Same death-notice exception as
+            # enemy AI above — NPCs keep going while it's up.
+            if (not self.dialogue_box.active or self._death_state == 'box') \
+                    and not self.dialogue_choice_menu.active and not self._levelup_active:
                 self._update_npcs(dt)
             else:
                 for npc in self.npcs:
@@ -6340,6 +8068,18 @@ class Game:
 
             # Save point proximity detection.
             self._update_save_points(dt)
+
+            # Chest proximity detection.
+            self._update_chests(dt)
+
+            # Advance any chest-open sequence in progress (pickup pose +
+            # floating icon) — see _handle_interact's chest branch.
+            self._update_chest_pickup(dt)
+
+            # Advance any dropped-item pickup sequence in progress — same
+            # pose + floating icon flow as chests, see _handle_interact's
+            # item-pickup branch.
+            self._update_item_pickup_finish(dt)
 
             # World-map object proximity detection.
             self._update_world_map_objects(dt)
@@ -6365,10 +8105,12 @@ class Game:
             # transformed doesn't restart the loop from the beginning.
             # NOTE: the flying pad also uses the 'aura' sfx for the duration
             # of a flight, so we must not stop it here while a flight is in
-            # progress — FlyingController owns stopping it once landed.
+            # progress — FlyingController owns stopping it once landed. The
+            # nimbus cloud controller reuses the same cue for its ride, so
+            # it's guarded here too.
             if self.player.is_transformed():
                 self.sound_manager.play_looping_sfx('aura')
-            elif not self.flying_controller.is_active():
+            elif not self.flying_controller.is_active() and not self.nimbus_controller.is_active():
                 self.sound_manager.stop_looping_sfx('aura')
 
             # Adaptive music — switch between exploration and battle tracks.
@@ -6389,6 +8131,9 @@ class Game:
                 return
             if self.character_creator.active:
                 self.character_creator.update(dt)
+                return
+            if self.entity_creator.active:
+                self.entity_creator.update(dt)
                 return
             if self.room_editor.active:
                 self._sync_event_editor_rooms()
@@ -6432,13 +8177,20 @@ class Game:
             self.player.current_flame_kamehameha.set_control_input(dx, dy)
 
         if dx == 0 and dy == 0:
-            # No directional input — snap back to idle.
-            self.player.is_running = False
-            if not self.player.is_transitioning:
-                if self.player.current_animation_state in ('walk', 'run'):
-                    self.player.enter_idle()
+            # No directional input — snap back to idle. Skipped while the
+            # nimbus controller is actively boarding/anchoring the player:
+            # it drives player.x/y directly (no keys pressed, so dx/dy are
+            # always 0 here) and sets its own walk/idle animation for that
+            # phase — letting this block fire every frame would immediately
+            # stomp the walk animation it just set back to idle before it
+            # can ever advance a frame.
+            if not self.nimbus_controller.is_active():
+                self.player.is_running = False
+                if not self.player.is_transitioning:
+                    if self.player.current_animation_state in ('walk', 'run'):
+                        self.player.enter_idle()
 
-        if (dx != 0 or dy != 0) and not self.flying_controller.is_active():
+        if (dx != 0 or dy != 0) and not self.flying_controller.is_active() and not self.nimbus_controller.is_active():
             old_x = self.player.x
             old_y = self.player.y
             self.player.move(dx, dy, is_running, self.current_room.width, self.current_room.height)
@@ -6515,7 +8267,6 @@ class Game:
                         else:
                             self._load_room_objects(target_room)
                         self.player.is_transitioning = False
-                        self.mission_manager.on_room_entered(target_room_name)
                         self.flag_manager.mark_room_visited(target_room_name)
 
                 self.player.is_transitioning = True
@@ -6728,7 +8479,7 @@ class Game:
         for enemy in self.enemies[:]:
             # Reset before update so we can detect a fresh player hit this frame
             self.player.last_damage_taken = 0
-            enemy.update(dt, self.player, self.current_room.width, self.current_room.height)
+            enemy.update(dt, self.player, self.current_room.width, self.current_room.height, game_config=self.game_config)
 
             # If the enemy's AI called player.take_damage() during update, spawn a popup
             if self.player.last_damage_taken > 0:
@@ -6754,7 +8505,7 @@ class Game:
                         self._play_melee_hit_sfx()
                         self.camera.start_shake(intensity=8, duration=0.2)
                     continue
-                if enemy.check_collision_with_attack(melee, 'melee'):
+                if enemy.check_collision_with_attack(melee, 'melee', self.game_config):
                     melee.hit_something = True
                     self._play_melee_hit_sfx()
                     self._play_impact_sfx()
@@ -6779,7 +8530,7 @@ class Game:
                     )
 
             for projectile in self.projectiles:
-                if projectile.active and enemy.check_collision_with_attack(projectile, 'projectile'):
+                if projectile.active and enemy.check_collision_with_attack(projectile, 'projectile', self.game_config):
                     projectile.active = False
                     if isinstance(projectile, GenkidamaBlast):
                         self._trigger_genkidama_hit(projectile.x, projectile.y)
@@ -6952,11 +8703,18 @@ class Game:
 
                 self._show_level_up_if_pending()
 
-                # Notify the mission manager of the kill with enemy type and room.
+                # Generic kill bookkeeping — flag_manager.mark_enemy_defeated
+                # covers "kill this specific enemy_id at least once" flag
+                # conditions; the kill_count: variable bumps below are what
+                # MissionManager's 'kill' objectives (variable_is(...) built
+                # in mission_manager.build_objective_condition) actually
+                # read — see MissionManager.evaluate_active_missions(),
+                # called once a frame from update() rather than from here.
                 enemy_id  = getattr(enemy, 'enemy_type', getattr(enemy, 'boss_id', ''))
                 room_name = self.current_room.name if self.current_room else ''
-                self.mission_manager.on_enemy_killed(enemy_id, room_name)
                 self.flag_manager.mark_enemy_defeated(enemy_id)
+                self.flag_manager.add_variable(f'kill_count:{enemy_id}', 1)
+                self.flag_manager.add_variable(f'kill_count:{enemy_id}:{room_name}', 1)
 
                 self.enemies.remove(enemy)
 
@@ -7069,6 +8827,104 @@ class Game:
                 still_active.append(pickup)
         self.zeni_pickups = still_active
 
+    def _update_item_pickups(self, dt):
+        """Tick every dropped-item pickup (see spawn_item_pickup /
+        ItemPickup in core/items.py): toss/bounce/settle while airborne.
+        Once settled, it just sits there — walking into it does NOT
+        collect it (unlike zeni); picking one up requires E while standing
+        nearby, same as opening a chest (see nearby_item_pickup /
+        _handle_interact's item-pickup branch and _update_item_pickup_finish
+        for the rest of that flow). Unlike zeni, these never age out on
+        their own either — they're wiped instead in _clear_projectiles
+        whenever the room changes (see the request: sit there until picked
+        up, or until the player leaves the room)."""
+        still_active = []
+        for pickup in self.item_pickups:
+            pickup.update(dt, self.player)
+            if pickup.active:
+                still_active.append(pickup)
+        self.item_pickups = still_active
+
+        self.nearby_item_pickup = next(
+            (p for p in self.item_pickups if p.is_settled and p.is_player_nearby),
+            None
+        )
+
+    def _get_dropped_item_icon(self, item_id):
+        """Same convention/cache shape as _get_chest_item_icon (and
+        PauseMenu._get_item_icon) — assets/sprites/items/{item_id}.png for
+        consumables/story items, or
+        assets/sprites/items/equipment/{slot}/{item_id}.png for equip
+        items, or None if it's not on disk."""
+        if item_id not in self._item_pickup_icon_cache:
+            item_data = ITEMS.get(item_id) or {}
+            slot = item_data.get('slot')
+            if slot:
+                path = f'assets/sprites/items/equipment/{slot}/{item_id}.png'
+            else:
+                path = f'assets/sprites/items/{item_id}.png'
+            try:
+                self._item_pickup_icon_cache[item_id] = pygame.image.load(path).convert_alpha()
+            except Exception:
+                self._item_pickup_icon_cache[item_id] = None
+        return self._item_pickup_icon_cache[item_id]
+
+    def _update_item_pickup_finish(self, dt):
+        """Finish the delayed item-pickup sequence once
+        Player.start_pickup_item's pose (~PICKUP_ITEM_DURATION seconds) has
+        played out — mirrors _update_chest_pickup exactly. Until then,
+        _pending_item_pickup just sits here — actually granting the item
+        back to the inventory is held back so it lands right as the player
+        drops out of the pickup pose, instead of popping in immediately
+        alongside it (see _handle_interact's item-pickup branch)."""
+        if not self._pending_item_pickup:
+            return
+        if self.player.is_picking_up_item:
+            return
+
+        pickup = self._pending_item_pickup
+        self._pending_item_pickup = None
+        self._pending_item_pickup_icon = None
+
+        inventory = getattr(self.player, 'inventory', None)
+        if inventory is not None:
+            inventory.append(pickup.item_id)
+            # Generic pickup bookkeeping — mirrors the kill-count bumps in
+            # _update_enemies. mark_item_picked_up() covers "picked this
+            # item up at least once" flag conditions; item_count: is a
+            # lifetime tally MissionManager's 'collect_item' objectives
+            # read (see mission_manager.build_objective_condition) — a
+            # bring_item objective instead reads live inventory count via
+            # check_item(), so it doesn't need this variable at all.
+            self.flag_manager.mark_item_picked_up(pickup.item_id)
+            self.flag_manager.add_variable(f'item_count:{pickup.item_id}', 1)
+        item_data = ITEMS.get(pickup.item_id, {})
+        item_name = item_data.get('name', pickup.item_id)
+        self.dialogue_box.show(f"Picked up {item_name}!", "Item", True, pickup.item_id)
+
+    def _draw_item_pickup_icon(self, screen, camera):
+        """Item icon drifting slowly upward above the player's head while
+        the pickup_item pose plays out — mirrors _draw_chest_pickup_icon
+        exactly, riding self.player.pickup_item_timer directly."""
+        if not self._pending_item_pickup or not self._pending_item_pickup_icon:
+            return
+
+        duration = max(0.001, self.player.PICKUP_ITEM_DURATION)
+        progress = min(1.0, self.player.pickup_item_timer / duration)
+
+        rise_world = 14
+        base_world_y = self.player.y - self.player.height / 2
+        icon_world_y = base_world_y - progress * rise_world
+
+        icon = self._pending_item_pickup_icon
+        scaled = pygame.transform.scale(icon, (
+            max(1, int(icon.get_width() * RENDER_SCALE)),
+            max(1, int(icon.get_height() * RENDER_SCALE)),
+        ))
+        screen_x = int(self.player.x * RENDER_SCALE - camera.x)
+        screen_y = int(icon_world_y * RENDER_SCALE - camera.y)
+        screen.blit(scaled, scaled.get_rect(midbottom=(screen_x, screen_y)))
+
     def _update_masenko_projectiles(self, dt):
         """Tick in-flight masenko balls thrown by the player. On detonation,
         apply AoE damage to enemies via enemy.check_collision_with_attack's
@@ -7098,7 +8954,7 @@ class Game:
         for bullet in self.enemy_bullets[:]:
             bullet.update(self.current_room.width, self.current_room.height, dt)
 
-            if bullet.check_collision_with_player(self.player):
+            if not self.player.is_dead and bullet.check_collision_with_player(self.player):
                 # Compute knock direction away from the bullet's origin.
                 dx   = self.player.x - bullet.x
                 dy   = self.player.y - bullet.y
@@ -7127,7 +8983,7 @@ class Game:
         for rocket in self.enemy_rockets[:]:
             rocket.update(self.current_room.width, self.current_room.height, dt)
 
-            if rocket.check_collision_with_player(self.player):
+            if not self.player.is_dead and rocket.check_collision_with_player(self.player):
                 if not self.player.is_blocking:
                     self.player.hurt_tint = 1.0
 
@@ -7139,7 +8995,7 @@ class Game:
         for blast in self.enemy_kiblasts[:]:
             blast.update(self.current_room.width, self.current_room.height, dt)
 
-            if blast.active:
+            if blast.active and not self.player.is_dead:
                 r = blast.radius
                 blast_rect = pygame.Rect(blast.x - r, blast.y - r, r * 2, r * 2)
                 player_rect = self.player.get_collision_rect()
@@ -7235,6 +9091,89 @@ class Game:
             (sp for sp in self.save_points if sp.is_player_nearby and sp.active),
             None
         )
+
+    def _update_chests(self, dt):
+        """Tick chests and record whichever one the player can currently
+        open with E. Already-opened chests are still ticked (so
+        is_player_nearby stays accurate if you stand back near one) but
+        excluded from nearby_chest since there's nothing left to interact
+        with."""
+        for chest in self.chests:
+            chest.update(dt, self.player)
+
+        self.nearby_chest = next(
+            (c for c in self.chests if c.is_player_nearby and not c.opened),
+            None
+        )
+
+    def _get_chest_item_icon(self, item_id):
+        """Same convention/cache shape as PauseMenu._get_item_icon —
+        assets/sprites/items/{item_id}.png for consumables/story items, or
+        assets/sprites/items/equipment/{slot}/{item_id}.png for equip items
+        (body/hands/feet/accessory), or None if it's not on disk."""
+        if item_id not in self._chest_icon_cache:
+            item_data = ITEMS.get(item_id) or {}
+            slot = item_data.get('slot')
+            if slot:
+                path = f'assets/sprites/items/equipment/{slot}/{item_id}.png'
+            else:
+                path = f'assets/sprites/items/{item_id}.png'
+            try:
+                self._chest_icon_cache[item_id] = pygame.image.load(path).convert_alpha()
+            except Exception:
+                self._chest_icon_cache[item_id] = None
+        return self._chest_icon_cache[item_id]
+
+    def _update_chest_pickup(self, dt):
+        """Finish the delayed chest-open sequence once Player.start_pickup_item's
+        pose (~PICKUP_ITEM_DURATION seconds) has played out. Until then,
+        _pending_chest just sits here — grant_loot() and the reward dialogue
+        are deliberately held back so they land right as the player drops
+        out of the pickup pose, instead of popping up immediately alongside
+        it (see _handle_interact's chest branch)."""
+        if not self._pending_chest:
+            return
+        if self.player.is_picking_up_item:
+            return
+
+        chest = self._pending_chest
+        self._pending_chest = None
+        self._pending_chest_icon = None
+
+        if chest.item_id:
+            chest.grant_loot(self.player)
+            item_data = ITEMS.get(chest.item_id, {})
+            item_name = item_data.get('name', chest.item_id)
+            text = (f"You found a {item_name}!" if chest.item_qty == 1
+                    else f"You found {chest.item_qty}x {item_name}!")
+            self.dialogue_box.show(text, "Chest", True, chest.item_id)
+
+    def _draw_chest_pickup_icon(self, screen, camera):
+        """Item icon drifting slowly upward above the player's head while
+        the pickup_item pose plays out. Rides self.player.pickup_item_timer
+        directly (rather than keeping a second timer here) so the float
+        always finishes exactly when the pose itself does."""
+        if not self._pending_chest or not self._pending_chest_icon:
+            return
+
+        duration = max(0.001, self.player.PICKUP_ITEM_DURATION)
+        progress = min(1.0, self.player.pickup_item_timer / duration)
+
+        # Total upward drift over the full duration, in world units —
+        # "very slowly" means most of a tile's height, not a full one.
+        rise_world = 14
+        # Where the icon starts: a bit above the player's head.
+        base_world_y = self.player.y - self.player.height / 2
+        icon_world_y = base_world_y - progress * rise_world
+
+        icon = self._pending_chest_icon
+        scaled = pygame.transform.scale(icon, (
+            max(1, int(icon.get_width() * RENDER_SCALE)),
+            max(1, int(icon.get_height() * RENDER_SCALE)),
+        ))
+        screen_x = int(self.player.x * RENDER_SCALE - camera.x)
+        screen_y = int(icon_world_y * RENDER_SCALE - camera.y)
+        screen.blit(scaled, scaled.get_rect(midbottom=(screen_x, screen_y)))
 
     def _update_world_map_objects(self, dt):
         """Tick world-map objects and resolve which one (if any) the player can interact with.
@@ -7516,6 +9455,12 @@ class Game:
           7. Foreground tile layer
           8. UI overlays (HUD, dialogue, menus, dev tools)
         """
+        # Title screen — replaces the entire frame while it's up.
+        if self.game_mode == 'title':
+            self.title_screen.draw(self.logical_surface)
+            pygame.display.flip()
+            return
+
         # Hand off completely to the room editor when it's the active view.
         if self.room_editor.active and self.room_editor.current_view == 'view_room':
             self.room_editor.draw(self.logical_surface)
@@ -7617,6 +9562,7 @@ class Game:
                 self.logical_surface.blit(bg,   trect.inflate(10, 5).topleft)
                 self.logical_surface.blit(text, trect)
 
+
         # Wire the tile-change hook lazily (tileset_editor may not exist yet in __init__).
         self._install_tile_change_hook()
 
@@ -7657,10 +9603,12 @@ class Game:
             for obj in (self.projectiles + self.ultra_volleyballs + _player_objs + self.enemies + self.npcs
                         + self.critters
                         + self.destructible_stones + self.level_gates + self.doors
+                        + self.chests
                         + self.bombs + self.explosions + self.genkidama_hit_effects
-                        + self.burning_hit_effects + self.flying_pads
+                        + self.burning_hit_effects + self.flying_pads + self.nimbus_clouds
                         + self.save_points + self.world_map_objects
                         + self.masenko_projectiles + _visible_zeni_pickups
+                        + self.item_pickups
                         + self.big_bang_attacks + self.big_bang_destruction_effects):
                 self.layer_manager.add_object(obj)
             for melee in self.melee_attacks:
@@ -7721,6 +9669,14 @@ class Game:
             # Damage number popups — drawn on top of sprites but below the HUD
             self.dmg_numbers.draw(self.logical_surface, self.camera, RENDER_SCALE)
 
+            # Chest-pickup item icon floating up above the player's head —
+            # see _handle_interact's chest branch / _update_chest_pickup.
+            self._draw_chest_pickup_icon(self.logical_surface, self.camera)
+
+            # Same, for a dropped-item pickup being collected — see
+            # _handle_interact's item-pickup branch / _update_item_pickup_finish.
+            self._draw_item_pickup_icon(self.logical_surface, self.camera)
+
             # Landing animation — replaces the normal player sprite while descending
             # into the room.  Drawn after layer_manager.draw_all (player was excluded
             # above) and before the foreground tile layer so trees/walls still occlude
@@ -7757,6 +9713,9 @@ class Game:
             for pad in self.flying_pads:
                 if pad.active:
                     pad.draw_path_preview(self.logical_surface, self.camera, RENDER_SCALE)
+            for cloud in self.nimbus_clouds:
+                if cloud.active:
+                    cloud.draw_path_preview(self.logical_surface, self.camera, RENDER_SCALE)
 
         # Foreground tile layer (same baked path as background).
         self._draw_room_tiles(bg=False)
@@ -7802,6 +9761,7 @@ class Game:
         # Dev tools — always drawn last so they sit on top of everything.
         self.sprite_editor.draw(self.logical_surface)
         self.character_creator.draw(self.logical_surface, self.dt)
+        self.entity_creator.draw(self.logical_surface, self.dt)
         self.room_editor.draw(self.logical_surface)
         self.dev_menu.draw(self.logical_surface)
         self.cutscene_editor.draw(self.logical_surface)
@@ -7912,37 +9872,129 @@ class Game:
         te = getattr(self.room_editor, 'tileset_editor', None)
         if te is None:
             return
-        te.on_tile_changed             = lambda room_name=None: self.invalidate_tile_cache(room_name)
+        te.on_tile_changed             = lambda room_name=None, cells=None: self.invalidate_tile_cache(room_name, cells)
         self._tile_change_hook_installed = True
 
-    def invalidate_tile_cache(self, room_name: str = None):
+    def invalidate_tile_cache(self, room_name: str = None, cells=None):
         """Mark a room's baked surface as stale.
 
-        Actual eviction happens once per frame in _flush_dirty_tile_rooms(),
-        not immediately, so multiple on_tile_changed calls within the same
-        frame only trigger one rebuild instead of one per mouse-motion event.
+        Actual eviction/patching happens once per frame in
+        _flush_dirty_tile_rooms(), not immediately, so multiple
+        on_tile_changed calls within the same frame collapse into minimal
+        work instead of one rebuild per mouse-motion event.
+
+        `cells`, when given, is an iterable of (grid_x, grid_y) world-space
+        cells that actually changed (e.g. a single tile placed or erased).
+        That lets the flush step patch just those spots in the existing
+        baked surface instead of throwing the whole thing away — the common
+        case while painting/erasing, and the one that used to get laggier
+        the bigger the room and the more tiles it had, since a full rebuild
+        both reallocates a room-sized surface and re-blits every tile in
+        the room on every single edit. Passing no `cells` (or room_name of
+        None) falls back to the old full-invalidate behavior, for bulk
+        operations like loading a room or toggling layer visibility, where
+        a full rebuild is unavoidable anyway.
         """
-        self._dirty_tile_rooms.add(room_name)  # None = flush everything
+        if room_name is None:
+            self._dirty_tile_rooms.add(None)  # None = flush everything
+            return
+        if cells:
+            self._dirty_tile_cells.setdefault(room_name, set()).update(cells)
+        else:
+            self._dirty_tile_rooms.add(room_name)
 
     def _flush_dirty_tile_rooms(self):
-        """Evict stale baked surfaces exactly once per frame.
+        """Apply pending tile-cache invalidations exactly once per frame.
 
         Call this at the top of the draw loop before any tile surface is
-        accessed so every draw pass works with fresh data without rebuilding
-        more than once regardless of how many events arrived this frame.
+        accessed so every draw pass works with fresh data without doing
+        more work than necessary regardless of how many events arrived
+        this frame. Full-room invalidations are handled first (and cancel
+        any pending per-cell patch for that room, since the rebuild already
+        covers it); remaining per-cell patches are then applied in place.
         """
-        if not self._dirty_tile_rooms:
+        if self._dirty_tile_rooms:
+            if None in self._dirty_tile_rooms:
+                self._room_tile_surfaces.clear()
+                self._animated_tile_lists.clear()
+                self._dirty_tile_cells.clear()
+            else:
+                for room in self._dirty_tile_rooms:
+                    self._room_tile_surfaces.pop((room, True),  None)
+                    self._room_tile_surfaces.pop((room, False), None)
+                    self._animated_tile_lists.pop((room, True),  None)
+                    self._animated_tile_lists.pop((room, False), None)
+                    self._dirty_tile_cells.pop(room, None)
+            self._dirty_tile_rooms.clear()
+
+        if self._dirty_tile_cells:
+            for room_name, cells in self._dirty_tile_cells.items():
+                for cell_x, cell_y in cells:
+                    self._patch_tile_cell(room_name, cell_x, cell_y)
+            self._dirty_tile_cells.clear()
+
+    def _patch_tile_cell(self, room_name: str, cell_x: int, cell_y: int):
+        """Redraw a single grid cell in-place on the already-baked tile
+        surfaces for `room_name`, instead of rebuilding the whole room.
+
+        Mirrors the per-tile logic in _build_room_tile_surface() but scoped
+        to one cell, so cost is O(tiles stacked on this one cell) — a small,
+        bounded number — rather than O(all tiles in the room) plus a fresh
+        room-sized Surface allocation. That's what made painting/erasing
+        get progressively laggier on bigger rooms with more tiles: every
+        single edit was paying for a full rebuild.
+
+        If a baked surface for this room/layer hasn't been built yet, there's
+        nothing to patch — it'll be built fresh (correctly) on first access.
+        """
+        te = getattr(self.room_editor, 'tileset_editor', None)
+        if not te:
             return
-        if None in self._dirty_tile_rooms:
-            self._room_tile_surfaces.clear()
-            self._animated_tile_lists.clear()
-        else:
-            for room in self._dirty_tile_rooms:
-                self._room_tile_surfaces.pop((room, True),  None)
-                self._room_tile_surfaces.pop((room, False), None)
-                self._animated_tile_lists.pop((room, True),  None)
-                self._animated_tile_lists.pop((room, False), None)
-        self._dirty_tile_rooms.clear()
+
+        tileset_mgr = te.tileset_manager
+        grid_size = te.grid_size
+        cell_tiles = [
+            t for t in te.room_tiles.get(room_name, [])
+            if t.x == cell_x and t.y == cell_y
+        ]
+        cell_tiles.sort(key=lambda t: t.layer)
+
+        for bg in (True, False):
+            key = (room_name, bg)
+            surf = self._room_tile_surfaces.get(key)
+            if surf is None:
+                continue  # nothing baked yet for this room/layer — skip
+
+            # Clear just this cell's footprint back to transparent.
+            rect = pygame.Rect(
+                int(cell_x * RENDER_SCALE), int(cell_y * RENDER_SCALE),
+                int(grid_size * RENDER_SCALE), int(grid_size * RENDER_SCALE),
+            )
+            surf.fill((0, 0, 0, 0), rect)
+
+            # Drop any stale animated-tile entries at this cell for this
+            # layer group; they'll be re-added below if still present.
+            anim_list = self._animated_tile_lists.get(key)
+            if anim_list:
+                self._animated_tile_lists[key] = [
+                    t for t in anim_list if not (t.x == cell_x and t.y == cell_y)
+                ]
+
+            for tile in cell_tiles:
+                if te.hide_other_layers and tile.layer != te.current_layer:
+                    continue
+                is_bg_tile = tile.layer < 0
+                if bg != is_bg_tile:
+                    continue
+                tileset = tileset_mgr.get_tileset(tile.tileset_name)
+                if not tileset or not tileset.image:
+                    continue
+                if tileset.is_tile_animated(tile.tile_x, tile.tile_y):
+                    self._animated_tile_lists.setdefault(key, []).append(tile)
+                    continue
+                scaled = tileset.get_scaled_tile_surface(tile.tile_x, tile.tile_y, RENDER_SCALE)
+                if scaled:
+                    surf.blit(scaled, (int(tile.x * RENDER_SCALE), int(tile.y * RENDER_SCALE)))
 
     def _build_room_tile_surface(self, room_name: str, bg: bool) -> pygame.Surface:
         """Pre-render all tiles for one layer into a single static Surface.
@@ -8940,6 +10992,16 @@ class Game:
         self.dialogue_choice_menu.draw(self.logical_surface)
         self.character_switch_menu.draw(self.logical_surface)
         self.pause_menu.draw(self.logical_surface, self.player, self.play_time)
+        self.credits_screen.draw(self.logical_surface)
+        self.scouter_menu.draw(
+            self.logical_surface, self.current_room,
+            getattr(self, '_active_world_map_name', ''),
+            getattr(self, '_wm_locations', []),
+            self._build_world_map_scouter_surface,
+            self.room_manager,
+            player=self.player,
+            world_map_lookup=self._world_map_lookup,
+        )
         self.level_up_notification.draw(self.logical_surface, self.colors, sprite_hud=self.sprite_hud, player=self.player)
 
         self.transition_config_menu.draw(self.logical_surface)
@@ -8953,7 +11015,7 @@ class Game:
             'landing_fade_out', 'landing_fade_in',
         )
         if self.ui.current_screen == 'game' and not self.character_switch_menu.active \
-                and not self.pause_menu.active and not _in_map_sequence:
+                and not self.pause_menu.active and not self.scouter_menu.active and not _in_map_sequence:
             _HUD_SLIDE_SPEED = 400
             # Derive the hidden position from the actual scaled frame height so
             # the entire HUD (including the boss bar) clears the top of the screen.
@@ -9008,6 +11070,32 @@ class Game:
         # the HUD — otherwise the HUD renders on top and the fade looks incomplete.
         self._draw_map_jump_fade(self.logical_surface)
 
+        # Death fade drawn absolute last — this needs to cover everything
+        # above, including the map-jump fade and the HUD, since dying can in
+        # principle happen while other overlays are still visually settling.
+        # The "You have died!" box (the same DialogueBox draw used for
+        # level-up notices, drawn earlier above at its normal spot in the
+        # overlay stack) gets redrawn here too, on top of the fade, so it
+        # reads on top of solid black instead of being buried under it.
+        self._draw_death_fade(self.logical_surface)
+        if self._death_state == 'box':
+            self.dialogue_box.draw(self.logical_surface, self.colors)
+
+        # In-game "Save Game" flow — TitleScreen's own SAVE SELECT frame
+        # (re-labelled and locked down, see TitleScreen.open_save_overlay)
+        # plus the "Saving..." popup in front of it. Drawn dead last, on
+        # top of literally everything else in this method (including the
+        # death fade), same as the real title screen covers the whole
+        # window when it's up.
+        if self.save_flow_active:
+            # Hand TitleScreen the popup's rect *before* it draws, so its
+            # save-slot divider bar (_draw_save_slot_divider) can clip
+            # itself around exactly where the popup is about to land —
+            # see _saving_popup_rect/set_save_popup_occlusion_rect.
+            self.title_screen.set_save_popup_occlusion_rect(self._saving_popup_rect())
+            self.title_screen.draw(self.logical_surface)
+            self._draw_saving_popup(self.logical_surface)
+
     # ── Editor / room sync ────────────────────────────────────────────────────
 
     def _sync_spawn_manager_with_rooms(self):
@@ -9026,6 +11114,7 @@ class Game:
         gate_manager       = oe.gate_manager
         door_manager       = oe.door_manager
         flying_pad_manager = oe.flying_pad_manager
+        nimbus_cloud_manager = oe.nimbus_cloud_manager
 
         for room in self.room_manager.rooms:
             if hasattr(room, 'spawn_points') and room.spawn_points:
@@ -9039,6 +11128,10 @@ class Game:
             if not hasattr(room, 'flying_pads'):
                 room.flying_pads = []
             flying_pad_manager.flying_pads[room.name] = room.flying_pads
+
+            if not hasattr(room, 'nimbus_clouds'):
+                room.nimbus_clouds = []
+            nimbus_cloud_manager.nimbus_clouds[room.name] = room.nimbus_clouds
 
             if not hasattr(room, 'room_transitions'):
                 room.room_transitions = []
@@ -9058,6 +11151,106 @@ class Game:
 
             if not hasattr(room, 'music_track'):
                 room.music_track = ''
+
+    # ── Player death sequence ────────────────────────────────────────────────
+
+    def _update_death_sequence(self, dt):
+        """Advance the post-death overlay: hold on the last frame of
+        death.png, fade the screen to black, then show the "You have died!"
+        box. Deliberately lightweight — everything else in the world (enemy
+        AI, projectiles, damage numbers, hurt-tint decay, camera) keeps
+        running through the normal update() flow around this call; only the
+        player is frozen, via is_dead (see Player.update()). No-ops on any
+        frame there's nothing to do. State machine:
+            'anim' — waiting for death.png to finish, then holding on its
+                     last frame for _DEATH_HOLD_DURATION seconds.
+            'fade' — ramping the black overlay from 0 to full alpha over
+                     _DEATH_FADE_DURATION seconds.
+            'box'  — fully black; the "You have died!" box (the same
+                     DialogueBox used for level-up notices, centered via
+                     is_narrator=True) is up, waiting for E — see
+                     _advance_death_box/_close_death_box.
+        """
+        if not self.player.is_dead and self._death_state is None:
+            return  # Nothing to do — the common case, every normal frame.
+
+        if self._death_state is None:
+            self._death_state      = 'anim'
+            self._death_hold_timer = 0.0
+
+        if self._death_state == 'anim':
+            if self.player.sprite.is_animation_finished():
+                self._death_hold_timer += dt
+                if self._death_hold_timer >= self._DEATH_HOLD_DURATION:
+                    self._death_state = 'fade'
+
+        elif self._death_state == 'fade':
+            self._death_fade_alpha = min(
+                255.0, self._death_fade_alpha + self._death_fade_speed * dt)
+            if self._death_fade_alpha >= 255.0:
+                self._death_fade_alpha = 255.0
+                self._death_state      = 'box'
+                # Same box the level-up sequence uses (DialogueBox with no
+                # portrait, on_close callback) — is_narrator=True is what
+                # centers it in the screen instead of anchoring to the
+                # bottom like normal NPC/info lines.
+                self.dialogue_box.show(
+                    "You have died!", "", True, None,
+                    on_close=self._close_death_box, is_narrator=True,
+                )
+
+        # 'box' has nothing to tick here — dialogue_box.update(dt), already
+        # called every frame in the normal gameplay update below, drives its
+        # typewriter/close animation; _advance_death_box handles E.
+
+    def _advance_death_box(self):
+        """E pressed while the "You have died!" box is up.
+
+        Same two-stage convention as _advance_npc_dialogue: the first press
+        snaps the typewriter to fully visible; the next starts the box's
+        close animation, which fires _close_death_box via the on_close
+        callback once it's fully closed (see dialogue_box.show() above).
+        """
+        if self.dialogue_box._chars_shown < len(self.dialogue_box.current_text):
+            self.dialogue_box._chars_shown = len(self.dialogue_box.current_text)
+            return
+        self.dialogue_box.hide()
+
+    def _close_death_box(self):
+        """Fired once the "You have died!" box has finished closing.
+
+        Resets the death sequence and heals the player back up so nothing
+        re-triggers it immediately, then — since there's no main menu yet —
+        drops back into editing whatever room was being tested, exactly like
+        pressing F2 to exit test mode manually (see the F2 handler in
+        _handle_game_keydown). Falls back to a plain in-room respawn if the
+        player somehow died outside of test mode.
+        """
+        self._death_state      = None
+        self._death_hold_timer = 0.0
+        self._death_fade_alpha = 0.0
+
+        self.player.is_dead = False
+        self.player.hp      = self.player.max_hp
+        self.player.enter_idle()
+
+        if self.is_test_mode:
+            self._exit_test_mode()
+            self.room_editor.active       = True
+            self.room_editor.current_view = 'view_room'
+        else:
+            # No test session running — shouldn't normally happen without a
+            # main menu, but respawn at the room's spawn point rather than
+            # leaving the player stuck wherever they died.
+            room = self.current_room
+            if room:
+                if hasattr(room, 'spawn_points') and room.spawn_points:
+                    spawn_pos = (room.spawn_points[0].x, room.spawn_points[0].y)
+                elif getattr(room, 'spawn_point', None):
+                    spawn_pos = room.spawn_point
+                else:
+                    spawn_pos = (self.player.x, self.player.y)
+                self.player.x, self.player.y = spawn_pos
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 

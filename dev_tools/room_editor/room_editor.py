@@ -20,7 +20,7 @@ from core.camera import Camera
 from config.settings import RENDER_SCALE, TILE_SIZE
 from dev_tools.room_editor.room_editor_tools.object_editor import ObjectEditor
 from dev_tools.room_editor.room_editor_tools.entity_editor import EntityEditor
-from entities.boss_enemy import BOSS_REGISTRY
+from dev_tools import entity_creator
 
 
 # How many actions we keep in each undo/redo stack before the oldest entry
@@ -94,6 +94,12 @@ class RoomEditor:
         self.flag_manager = None
         self.entity_editor = None
 
+        # Map Paint is eager-init'd like tileset_editor (not lazy like
+        # object/entity editor) since it's cheap to construct and F6 should
+        # work even if the Objects/Entities panels have never been opened.
+        from dev_tools.room_editor.room_editor_tools.map_paint_editor import MapPaintEditor
+        self.map_paint_editor = MapPaintEditor(screen_width, screen_height)
+
         from dev_tools.room_editor.room_editor_tools.editor_toolbar import EditorToolbar
         self.toolbar = EditorToolbar(screen_width, screen_height)
 
@@ -132,6 +138,7 @@ class RoomEditor:
         self._drag_start_world_x = 0.0
         self._drag_start_world_y = 0.0
         self._tile_stroke_before = None
+        self._map_paint_stroke_before = None
         self._applying_history = False
 
         self.zoom_active = False  # True when zoomed out to fit entire room
@@ -545,6 +552,20 @@ class RoomEditor:
                 self.viewing_room.animated_regions = []
             self.object_editor.animated_region_manager.regions[room_name] = self.viewing_room.animated_regions
 
+        # Sync map-paint cells into the manager. Without this, the manager
+        # starts empty for this room (it isn't a shared-reference alias,
+        # see _sync_room_to_editor's comment on the same block), so
+        # get_painted_cells() returns nothing and the very next Save
+        # overwrites room.map_paint with an empty list, wiping out any
+        # previously saved paint even if the user never touched the tool.
+        if self.map_paint_editor:
+            if not hasattr(self.viewing_room, 'map_paint'):
+                self.viewing_room.map_paint = []
+            from core.map_paint import MapPaintManager as _MPM
+            self.map_paint_editor.manager.painted_cells[room_name] = (
+                _MPM.cells_from_room_list(self.viewing_room.map_paint)
+            )
+
         if not hasattr(self.viewing_room, 'destructible_stones'):
             self.viewing_room.destructible_stones = []
 
@@ -581,6 +602,45 @@ class RoomEditor:
             if not hasattr(self.viewing_room, 'world_map_objects'):
                 self.viewing_room.world_map_objects = []
             self.object_editor.world_map_manager._objects[room_name] = self.viewing_room.world_map_objects
+
+        # Sync doors
+        if self.object_editor and hasattr(self.object_editor, 'door_manager'):
+            if not hasattr(self.viewing_room, 'doors'):
+                self.viewing_room.doors = []
+            self.object_editor.door_manager.doors[room_name] = self.viewing_room.doors
+
+        # Sync level gates
+        if self.object_editor and hasattr(self.object_editor, 'gate_manager'):
+            if not hasattr(self.viewing_room, 'level_gates'):
+                self.viewing_room.level_gates = []
+            self.object_editor.gate_manager.gates[room_name] = self.viewing_room.level_gates
+
+        # Sync flying pads
+        if self.object_editor and hasattr(self.object_editor, 'flying_pad_manager'):
+            if not hasattr(self.viewing_room, 'flying_pads'):
+                self.viewing_room.flying_pads = []
+            self.object_editor.flying_pad_manager.flying_pads[room_name] = self.viewing_room.flying_pads
+
+        # Sync nimbus clouds
+        if self.object_editor and hasattr(self.object_editor, 'nimbus_cloud_manager'):
+            if not hasattr(self.viewing_room, 'nimbus_clouds'):
+                self.viewing_room.nimbus_clouds = []
+            self.object_editor.nimbus_cloud_manager.nimbus_clouds[room_name] = self.viewing_room.nimbus_clouds
+
+        # Sync room transitions
+        if self.object_editor and hasattr(self.object_editor, 'transition_manager'):
+            if not hasattr(self.viewing_room, 'room_transitions'):
+                self.viewing_room.room_transitions = []
+            self.object_editor.transition_manager.transitions[room_name] = self.viewing_room.room_transitions
+
+        # Sync chests — without this, chests placed in a prior session are
+        # invisible in the editor (chest_manager has nothing for this room)
+        # even though viewing_room.chests holds the real data and gameplay
+        # renders them fine.
+        if self.object_editor and hasattr(self.object_editor, 'chest_manager'):
+            if not hasattr(self.viewing_room, 'chests'):
+                self.viewing_room.chests = []
+            self.object_editor.chest_manager.chests[room_name] = self.viewing_room.chests
 
         center_x = (self.viewing_room.width * RENDER_SCALE - self.screen_width) // 2
         center_y = (self.viewing_room.height * RENDER_SCALE - self.screen_height) // 2
@@ -666,6 +726,18 @@ class RoomEditor:
     def _handle_view_room_input(self, event):
         """Handle inputs while viewing/editing a room"""
 
+        # Defensive re-sync: object_editor.toolbar should always be this
+        # RoomEditor's own self.toolbar (wired once in toggle() when the
+        # object editor is first lazily created). If object_editor ends up
+        # constructed or reset through any other path, that wiring never
+        # happens and self.toolbar (armed items, etc.) becomes invisible to
+        # it — e.g. loot assignment silently no-ops because
+        # ObjectEditor._try_assign_chest_loot sees self.toolbar as None.
+        # Cheap identity check, so just enforce it every event rather than
+        # trying to track down every construction path.
+        if self.object_editor is not None and self.object_editor.toolbar is not self.toolbar:
+            self.object_editor.set_toolbar(self.toolbar)
+
         # ── Undo / Redo ───────────────────────────────────────────────────────
         if event.type == pygame.KEYDOWN:
             ctrl = pygame.key.get_mods() & pygame.KMOD_CTRL
@@ -678,6 +750,16 @@ class RoomEditor:
             # Ctrl+Shift+Z also redoes (common convention)
             if ctrl and event.key == pygame.K_z and (pygame.key.get_mods() & pygame.KMOD_SHIFT):
                 self._apply_redo()
+                return None
+            # The Save toolbar button's own tooltip has always claimed
+            # "Save room (Ctrl+S)" but no such shortcut actually existed —
+            # only clicking the button called _save_current_room(). Wiring
+            # it here for real, since this is very plausibly why painted
+            # (and possibly other) edits weren't reaching disk: the person
+            # pressed the shortcut the UI told them to use, and it did
+            # nothing.
+            if ctrl and event.key == pygame.K_s:
+                self._save_current_room()
                 return None
 
         # Check if we're in transition spawn placement mode
@@ -742,6 +824,8 @@ class RoomEditor:
                             self.object_editor.toggle()
                         if self.entity_editor and self.entity_editor.active:
                             self.entity_editor.toggle()
+                        if self.map_paint_editor and self.map_paint_editor.active:
+                            self.map_paint_editor.toggle()
                         # Clear any in-progress drag so it doesn't ghost across panels
                         self.drag_target = None
                         self.drag_target_type = None
@@ -753,6 +837,8 @@ class RoomEditor:
                             self.tileset_editor.toggle()
                         if self.entity_editor and self.entity_editor.active:
                             self.entity_editor.toggle()
+                        if self.map_paint_editor and self.map_paint_editor.active:
+                            self.map_paint_editor.toggle()
                         self.drag_target = None
                         self.drag_target_type = None
                         self.is_dragging = False
@@ -763,12 +849,29 @@ class RoomEditor:
                             self.tileset_editor.toggle()
                         if self.object_editor and self.object_editor.active:
                             self.object_editor.toggle()
+                        if self.map_paint_editor and self.map_paint_editor.active:
+                            self.map_paint_editor.toggle()
                         self.drag_target = None
                         self.drag_target_type = None
                         self.is_dragging = False
                         # Rebuild obstacles so entity placement collision checks are fresh
                         if self.entity_editor.active:
                             self._refresh_placement_obstacles()
+                elif result == 'map_paint':
+                    if self.map_paint_editor:
+                        self.map_paint_editor.current_room_name = (
+                            self.viewing_room.name if self.viewing_room else ""
+                        )
+                        self.map_paint_editor.toggle()
+                        if self.tileset_editor and self.tileset_editor.active:
+                            self.tileset_editor.toggle()
+                        if self.object_editor and self.object_editor.active:
+                            self.object_editor.toggle()
+                        if self.entity_editor and self.entity_editor.active:
+                            self.entity_editor.toggle()
+                        self.drag_target = None
+                        self.drag_target_type = None
+                        self.is_dragging = False
                 elif result == 'settings':
                     self.editing_room = self.viewing_room
                     self.current_view = 'edit'
@@ -789,6 +892,34 @@ class RoomEditor:
                     return f'test_room:{self.viewing_room.name}'
                 elif result == 'action_save':
                     self._save_current_room()
+                elif result in ('item_selected', 'item_deselected'):
+                    # Arming/disarming loot must not leave Objects "Chest"
+                    # selected — that caused a world click to place a second
+                    # empty chest when the loot hit-test missed.
+                    if self.object_editor is not None:
+                        self.object_editor.selected_object = None
+                        self.object_editor.selected_variant = None
+                        self.object_editor.showing_variants_for = None
+                        if result == 'item_selected':
+                            # Arming an item is supposed to hand world clicks
+                            # to ObjectEditor (see EditorToolbar.handle_click's
+                            # 'items' thumbnail branch), but that only flips
+                            # the toolbar's own current_tool — it never sets
+                            # object_editor.active. If the Objects panel was
+                            # never opened this session, active is still
+                            # False, the loot-assignment intercept below
+                            # never runs, and the click on the chest silently
+                            # does nothing. Force it active here (palette
+                            # hidden) so loot assignment always works
+                            # regardless of which panel was open before.
+                            self.object_editor.active = True
+                            self.object_editor.palette_visible = False
+                            if self.tileset_editor and self.tileset_editor.active:
+                                self.tileset_editor.toggle()
+                            if self.entity_editor and self.entity_editor.active:
+                                self.entity_editor.toggle()
+                    # Keep object editor active (hidden palette) so loot
+                    # assignment still receives clicks; do not toggle panels.
                 return None
 
         if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
@@ -829,8 +960,24 @@ class RoomEditor:
                     self.tileset_editor.toggle()
                 if self.object_editor and self.object_editor.active:
                     self.object_editor.toggle()
+                if self.map_paint_editor and self.map_paint_editor.active:
+                    self.map_paint_editor.toggle()
                 if self.entity_editor.active:
                     self._refresh_placement_obstacles()
+            return None
+
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_F6:  # Map Paint
+            if self.map_paint_editor:
+                self.map_paint_editor.current_room_name = (
+                    self.viewing_room.name if self.viewing_room else ""
+                )
+                self.map_paint_editor.toggle()
+                if self.tileset_editor and self.tileset_editor.active:
+                    self.tileset_editor.toggle()
+                if self.object_editor and self.object_editor.active:
+                    self.object_editor.toggle()
+                if self.entity_editor and self.entity_editor.active:
+                    self.entity_editor.toggle()
             return None
 
         # Pass input to active editor
@@ -888,10 +1035,64 @@ class RoomEditor:
 
             return None
 
+        # Pass input to the Map Paint tool — same stroke-based undo shape as
+        # the tile-painting block above (snapshot before the first
+        # down/motion of a stroke, diff and push an undo entry on release).
+        if self.map_paint_editor and self.map_paint_editor.active:
+            room_name = self.viewing_room.name if self.viewing_room else ""
+            is_mouse_down = event.type == pygame.MOUSEBUTTONDOWN and event.button in (1, 3)
+            is_mouse_up = event.type == pygame.MOUSEBUTTONUP and event.button in (1, 3)
+
+            if is_mouse_down and self._map_paint_stroke_before is None and room_name:
+                self._map_paint_stroke_before = sorted(
+                    self.map_paint_editor.manager.get_painted_cells(room_name)
+                )
+
+            self.map_paint_editor.handle_input(
+                event,
+                int(self.camera.x),
+                int(self.camera.y),
+                room_name
+            )
+
+            # Push straight back onto the live Room object after every
+            # single input, not just at stroke-end/Save — collision walls
+            # and friends get this "instantly reflected" behaviour for free
+            # because their manager holds the SAME list object room.* points
+            # to (see _sync_room_to_editor); map_paint can't alias that way
+            # (room.map_paint is a list of [x,y] pairs, the manager needs a
+            # set for fast paint/erase), so it has to be synced explicitly
+            # on every change instead of only at Save time.
+            if room_name and self.viewing_room:
+                cells = self.map_paint_editor.manager.get_painted_cells(room_name)
+                self.viewing_room.map_paint = sorted(list(c) for c in cells)
+
+            if is_mouse_up and self._map_paint_stroke_before is not None and room_name:
+                after = sorted(self.map_paint_editor.manager.get_painted_cells(room_name))
+                if after != self._map_paint_stroke_before:
+                    self._push_undo(_HistoryEntry('map_paint_stroke', {
+                        'room':   room_name,
+                        'before': self._map_paint_stroke_before,
+                        'after':  after,
+                    }))
+                self._map_paint_stroke_before = None
+
+            return None
+
         # If the object editor was closed while a placement (or selected object) was
         # still in progress, reactivate it silently with the palette hidden so that
         # clicks and ESC are routed correctly.
-        if self.object_editor and not self.object_editor.active and (
+        # Skip while an item is armed for chest-loot assignment — reactivating
+        # with selected_object still set would place a duplicate chest on click.
+        _item_armed = bool(
+            self.toolbar and getattr(self.toolbar, 'selected_item_id', '')
+        )
+        if _item_armed and self.object_editor is not None:
+            # Keep palette selection cleared for the whole arm duration.
+            self.object_editor.selected_object = None
+            self.object_editor.selected_variant = None
+            self.object_editor.showing_variants_for = None
+        if self.object_editor and not self.object_editor.active and not _item_armed and (
             self.object_editor.placing_transition or
             self.object_editor.placing_collision or
             self.object_editor.selected_object is not None
@@ -900,6 +1101,33 @@ class RoomEditor:
             self.object_editor.palette_visible = False
 
         if self.object_editor and self.object_editor.active:
+            # ── Armed-item loot intercept ─────────────────────────────────────
+            # When the toolbar has an item armed, world clicks only assign loot
+            # to an existing chest.  Consume the click here so object_editor
+            # never runs its placement path (selected_object may still be Chest).
+            if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
+                    and getattr(self.toolbar, 'selected_item_id', '')):
+                mx, my = event.pos
+                # The panel-toggle tab must stay reachable even while an
+                # item is armed — otherwise, once palette_visible gets
+                # forced False on arming (see 'item_selected' above),
+                # _is_in_palette() always reports False, this intercept
+                # swallows every click including clicks on the tab itself,
+                # and there's no way left to reopen the palette.
+                if self.object_editor._panel_toggle_rect().collidepoint((mx, my)):
+                    self.object_editor.palette_visible = not self.object_editor.palette_visible
+                    return None
+                if not self.object_editor._is_in_palette(mx, my):
+                    # Ensure world coords are current for the hit-test.
+                    world_x, world_y = self._screen_to_world(mx, my)
+                    self.object_editor.mouse_world_x = world_x
+                    self.object_editor.mouse_world_y = world_y
+                    self.object_editor.current_room_name = (
+                        self.viewing_room.name if self.viewing_room else ""
+                    )
+                    self.object_editor._try_assign_chest_loot(event.pos)
+                    return None  # never fall through to placement
+
             # ── Cutscene-trigger drag intercept ───────────────────────────────
             # When the object editor is active its placement handler fires on
             # every left-click, which would create a second trigger instead of
@@ -1118,6 +1346,24 @@ class RoomEditor:
                 path_editor.room_width = target_room.width
                 path_editor.room_height = target_room.height
 
+            # Same room-dimension sync for the nimbus cloud path editor. Its
+            # own camera-lock is recomputed independently (see
+            # NimbusCloudPathEditor._snap_camera_to_top_anchor, triggered
+            # from handle_input right as the new leg begins) — the centered
+            # self.camera.x/y set above is only transient here since
+            # update() overrides it to the locked frame every frame while
+            # this editor is active.
+            if hasattr(self.object_editor, 'nimbus_cloud_path_editor'):
+                available_rooms = self.room_manager.get_room_names()
+                nimbus_path_editor = self.object_editor.nimbus_cloud_path_editor
+
+                nimbus_path_editor.available_rooms = [
+                    r for r in available_rooms if r != target_room.name
+                ]
+                nimbus_path_editor.current_room_name = target_room.name
+                nimbus_path_editor.room_width = target_room.width
+                nimbus_path_editor.room_height = target_room.height
+
     def _finish_text_input(self):
         """Apply the text we just typed"""
         if self.editing_field is None:
@@ -1217,6 +1463,11 @@ class RoomEditor:
             pads = self.object_editor.flying_pad_manager.get_pads(self.viewing_room.name)
             self.viewing_room.flying_pads = pads
 
+        # Move nimbus clouds from editor to room
+        if self.object_editor and hasattr(self.object_editor, 'nimbus_cloud_manager'):
+            clouds = self.object_editor.nimbus_cloud_manager.get_clouds(self.viewing_room.name)
+            self.viewing_room.nimbus_clouds = clouds
+
         # Make sure destructible stones exist
         if not hasattr(self.viewing_room, 'destructible_stones'):
             self.viewing_room.destructible_stones = []
@@ -1224,6 +1475,14 @@ class RoomEditor:
         # Entities are stored directly on the room; guarantee the list exists
         if not hasattr(self.viewing_room, 'entities'):
             self.viewing_room.entities = []
+
+        # Move painted map cells from editor to room
+        if self.map_paint_editor:
+            cells = self.map_paint_editor.manager.get_painted_cells(self.viewing_room.name)
+            self.viewing_room.map_paint = sorted(list(c) for c in cells)
+        else:
+            if not hasattr(self.viewing_room, 'map_paint'):
+                self.viewing_room.map_paint = []
 
         # Move cutscene triggers from editor to room before writing to disk.
         # The manager holds the live list (shared by reference after _enter_view_room),
@@ -1288,6 +1547,16 @@ class RoomEditor:
                         room.flying_pads = pads
                         transferred_count += 1
 
+            # Nimbus clouds — always assign, even when empty, so a shuttle
+            # that has been ridden into another room does not leave a stale
+            # reference on the origin room (which would re-save it wrongly).
+            if hasattr(self.object_editor, 'nimbus_cloud_manager'):
+                for room in self.room_manager.rooms:
+                    clouds = self.object_editor.nimbus_cloud_manager.get_clouds(room.name)
+                    room.nimbus_clouds = list(clouds)
+                    if clouds:
+                        transferred_count += 1
+
             # Destructible stones
             if hasattr(self.object_editor, 'stone_manager'):
                 for room in self.room_manager.rooms:
@@ -1346,6 +1615,14 @@ class RoomEditor:
                         room.cutscene_triggers = triggers
                         transferred_count += 1
 
+        # Map paint cells
+        if self.map_paint_editor:
+            for room in self.room_manager.rooms:
+                cells = self.map_paint_editor.manager.get_painted_cells(room.name)
+                if cells:
+                    room.map_paint = sorted(list(c) for c in cells)
+                    transferred_count += 1
+
         return transferred_count
 
     def _sync_room_to_editor(self, room):
@@ -1370,6 +1647,20 @@ class RoomEditor:
                 room.collision_objects = []
             self.object_editor.collision_manager.collision_objects[room_name] = room.collision_objects
 
+        # Sync map-paint cells. Unlike collision_objects above this can't be
+        # a shared-reference alias — room.map_paint is a plain JSON list of
+        # [gx, gy] pairs (see objects/map_paint.py's save format) while the
+        # manager works in a set of tuples for fast paint/erase — so this
+        # converts explicitly on the way in, and _save_current_room /
+        # save_all_editor_data_to_rooms convert back on the way out.
+        if self.map_paint_editor:
+            if not hasattr(room, 'map_paint'):
+                room.map_paint = []
+            from core.map_paint import MapPaintManager as _MPM
+            self.map_paint_editor.manager.painted_cells[room_name] = (
+                _MPM.cells_from_room_list(room.map_paint)
+            )
+
         # Sync water/grass animated regions
         if self.object_editor and hasattr(self.object_editor, 'animated_region_manager'):
             if not hasattr(room, 'animated_regions'):
@@ -1381,6 +1672,12 @@ class RoomEditor:
             if not hasattr(room, 'flying_pads'):
                 room.flying_pads = []
             self.object_editor.flying_pad_manager.flying_pads[room_name] = room.flying_pads
+
+        # Sync nimbus clouds
+        if self.object_editor and hasattr(self.object_editor, 'nimbus_cloud_manager'):
+            if not hasattr(room, 'nimbus_clouds'):
+                room.nimbus_clouds = []
+            self.object_editor.nimbus_cloud_manager.nimbus_clouds[room_name] = room.nimbus_clouds
 
         # Sync destructible stones
         if not hasattr(room, 'destructible_stones'):
@@ -1413,6 +1710,12 @@ class RoomEditor:
             if not hasattr(room, 'doors'):
                 room.doors = []
             self.object_editor.door_manager.doors[room_name] = room.doors
+
+        # Sync chests
+        if self.object_editor and hasattr(self.object_editor, 'chest_manager'):
+            if not hasattr(room, 'chests'):
+                room.chests = []
+            self.object_editor.chest_manager.chests[room_name] = room.chests
 
         # Sync save points
         if self.object_editor and hasattr(self.object_editor, 'save_point_manager'):
@@ -1483,9 +1786,22 @@ class RoomEditor:
             self._push_undo(_HistoryEntry('object_add', {'obj': obj, 'obj_type': 'flying_pad', 'room': room}))
         oe.on_flying_pad_placed = _on_flying_pad_placed
 
+        def _on_nimbus_cloud_placed(obj, room):
+            self._push_undo(_HistoryEntry('object_add', {'obj': obj, 'obj_type': 'nimbus_cloud', 'room': room}))
+        oe.on_nimbus_cloud_placed = _on_nimbus_cloud_placed
+
         def _on_transition_placed(obj, room):
             self._push_undo(_HistoryEntry('object_add', {'obj': obj, 'obj_type': 'transition', 'room': room}))
         oe.on_transition_placed = _on_transition_placed
+
+        def _on_chest_placed(obj, room):
+            self._push_undo(_HistoryEntry('object_add', {'obj': obj, 'obj_type': 'chest', 'room': room}))
+        oe.on_chest_placed = _on_chest_placed
+
+        # Loot assignment mutates an existing chest in place.  Do NOT push
+        # object_add (that made Ctrl+Z delete the whole chest).  No undo entry
+        # for now — room data is already live on the shared chest instance.
+        oe.on_chest_loot_changed = None
 
         # ── deletions ─────────────────────────────────────────────────────────
         def _on_collision_deleted(obj, room):
@@ -1521,9 +1837,17 @@ class RoomEditor:
             self._push_undo(_HistoryEntry('object_remove', {'obj': obj, 'obj_type': 'flying_pad', 'room': room}))
         oe.on_flying_pad_deleted = _on_flying_pad_deleted
 
+        def _on_nimbus_cloud_deleted(obj, room):
+            self._push_undo(_HistoryEntry('object_remove', {'obj': obj, 'obj_type': 'nimbus_cloud', 'room': room}))
+        oe.on_nimbus_cloud_deleted = _on_nimbus_cloud_deleted
+
         def _on_transition_deleted(obj, room):
             self._push_undo(_HistoryEntry('object_remove', {'obj': obj, 'obj_type': 'transition', 'room': room}))
         oe.on_transition_deleted = _on_transition_deleted
+
+        def _on_chest_deleted(obj, room):
+            self._push_undo(_HistoryEntry('object_remove', {'obj': obj, 'obj_type': 'chest', 'room': room}))
+        oe.on_chest_deleted = _on_chest_deleted
 
     def _push_undo(self, entry: _HistoryEntry):
         """Record a new action; doing so discards the redo stack.
@@ -1631,6 +1955,19 @@ class RoomEditor:
             if callable(getattr(self.tileset_editor, 'on_tile_changed', None)):
                 self.tileset_editor.on_tile_changed(room)
 
+        # ── map paint ────────────────────────────────────────────────────────
+        elif action == 'map_paint_stroke':
+            if self.map_paint_editor is None:
+                return
+            room = data['room']
+            cells = data['after'] if forward else data['before']
+            self.map_paint_editor.manager.painted_cells[room] = {tuple(c) for c in cells}
+            # Same "instant reflect on the live Room object" requirement as
+            # the normal paint path above — undo/redo must not require a
+            # separate Save to be visible.
+            if self.viewing_room is not None and self.viewing_room.name == room:
+                self.viewing_room.map_paint = sorted(list(c) for c in cells)
+
     def _readd_object(self, obj, obj_type: str, room_name: str):
         """Re-insert a previously deleted object back into the room (for undo/redo)."""
         if not self.object_editor:
@@ -1670,6 +2007,14 @@ class RoomEditor:
                 if obj not in room.doors:
                     room.doors.append(obj)
 
+        elif obj_type == 'chest':
+            oe.chest_manager.add_chest(room_name, obj)
+            if room is not None:
+                if not hasattr(room, 'chests'):
+                    room.chests = []
+                if obj not in room.chests:
+                    room.chests.append(obj)
+
         elif obj_type == 'spawn':
             oe.spawn_manager.spawn_points[room_name] = obj
             if room is not None:
@@ -1697,6 +2042,14 @@ class RoomEditor:
                     room.flying_pads = []
                 if obj not in room.flying_pads:
                     room.flying_pads.append(obj)
+
+        elif obj_type == 'nimbus_cloud':
+            oe.nimbus_cloud_manager.add_cloud(room_name, obj)
+            if room is not None:
+                if not hasattr(room, 'nimbus_clouds'):
+                    room.nimbus_clouds = []
+                if obj not in room.nimbus_clouds:
+                    room.nimbus_clouds.append(obj)
 
         elif obj_type == 'transition':
             oe.transition_manager.add_transition(room_name, obj)
@@ -1767,10 +2120,13 @@ class RoomEditor:
             'shadow_y_offset': entity.get('shadow_y_offset', 0),
         }
 
-        # For bosses, pull shadow config directly from BOSS_REGISTRY so there's
-        # a single source of truth — no need to duplicate values in entity_editor.
+        # For bosses, pull shadow config directly from the entity config
+        # (assets/enemies/{id}.json) so there's a single source of truth —
+        # no need to duplicate values in entity_editor. Same field names
+        # BOSS_REGISTRY used to carry; entity_creator.DEFAULT_ENEMY_CONFIG
+        # now defines them, so this is a drop-in swap.
         if entity_data['entity_type'] == 'boss':
-            boss_cfg = BOSS_REGISTRY.get(entity_data['id'], {})
+            boss_cfg = entity_creator.load_config(entity_creator.KIND_ENEMY, entity_data['id'])
             entity_data['hitbox_height']   = boss_cfg.get('hitbox_height', boss_cfg.get('height', entity['height']))
             entity_data['shadow_width']    = boss_cfg.get('shadow_width', 32)
             entity_data['shadow_y_offset'] = boss_cfg.get('shadow_y_offset', 0)
@@ -1974,6 +2330,14 @@ class RoomEditor:
                 self.is_dragging = True
                 new_x = world_x + self.drag_offset_x
                 new_y = world_y + self.drag_offset_y
+                # Snap to the toolbar's quick placement grid (Off / 8px /
+                # 16px) while repositioning an already-placed object or
+                # entity, same grid the object palette uses when placing
+                # something new.
+                grid = self.toolbar.get_grid_size()
+                if grid:
+                    new_x = round(new_x / grid) * grid
+                    new_y = round(new_y / grid) * grid
                 if self.drag_target_type == 'entity':
                     self.drag_target['x'] = new_x
                     self.drag_target['y'] = new_y
@@ -2251,7 +2615,20 @@ class RoomEditor:
             self._logical_mouse_pos = mouse_pos  # cache for draw() hover checks
             self.toolbar.update(dt, mouse_pos)
 
+            # Keep the tileset editor's placement-snap grid in sync with the
+            # toolbar's quick Grid control too, same as the object editor
+            # below — painted tile stamps/erases and the grid overlay all
+            # follow it live.
+            if self.tileset_editor and hasattr(self.tileset_editor, 'set_snap_size'):
+                self.tileset_editor.set_snap_size(self.toolbar.get_grid_size())
+
             if self.object_editor and self.object_editor.active:
+                # Keep the object editor's snap grid in sync with the
+                # toolbar's quick Grid control (Off / 8px / 16px) so a
+                # change there takes effect immediately, without needing
+                # to reopen the panel.
+                if hasattr(self.object_editor, 'set_grid_snap_size'):
+                    self.object_editor.set_grid_snap_size(self.toolbar.get_grid_size())
                 self.object_editor.update(
                     dt,
                     mouse_pos,
@@ -2277,14 +2654,42 @@ class RoomEditor:
                 mouse_over_palette = self.entity_editor._mouse_in_palette(mouse_pos[0], mouse_pos[1])
 
             # Block camera movement while any text input dialogue is open
+            # — including the trigger box's Event Editor window (Conditions/
+            # Actions builder). TriggerBoxManager is just a room_name ->
+            # [boxes] registry (see trigger_box.py) and doesn't hold the
+            # EventEditorWindow itself; per that file's own docstring
+            # ("box.open_event_editor(self.event_editor)") the editor
+            # instance lives on whatever owns trigger_box_manager, i.e.
+            # object_editor — hence the direct lookup below rather than
+            # going through trigger_box_manager.
+            event_editor = getattr(self.object_editor, 'event_editor', None)
+            event_editor_active = event_editor.active if event_editor is not None else False
+
             typing_active = (
                 self.editing_field is not None or
+                event_editor_active or
                 (self.entity_editor and self.entity_editor.active and
                  self.entity_editor._dialogue_popup is not None)
             )
 
             # Only move camera if not hovering over palette and not typing
-            if not mouse_over_palette and not typing_active:
+            # — and never while the nimbus cloud path editor is open, since
+            # each of its legs is authored against one static, locked frame
+            # (see NimbusCloudPathEditor). WASD/arrow panning is suppressed
+            # entirely for the duration and the camera is pinned to whatever
+            # frame that editor has locked for the current leg instead.
+            nimbus_editor_active = (
+                self.object_editor is not None and
+                hasattr(self.object_editor, 'nimbus_cloud_path_editor') and
+                self.object_editor.nimbus_cloud_path_editor.active
+            )
+
+            if nimbus_editor_active:
+                locked_x, locked_y = self.object_editor.nimbus_cloud_path_editor.get_locked_camera_position()
+                self.camera.x = locked_x
+                self.camera.y = locked_y
+
+            elif not mouse_over_palette and not typing_active:
                 keys = pygame.key.get_pressed()
 
                 # Faster movement with shift held
@@ -2301,20 +2706,25 @@ class RoomEditor:
                     self.camera.y += speed * dt
 
             # Keep camera inside the room bounds (or centered if room is smaller than screen)
-            if self.viewing_room.width * RENDER_SCALE <= self.screen_width:
-                # Room is smaller than screen width - keep centered
-                self.camera.x = (self.viewing_room.width * RENDER_SCALE - self.screen_width) // 2
-            else:
-                # Room is larger than screen - clamp to room bounds
-                self.camera.x = max(0, min(self.camera.x, (self.viewing_room.width * RENDER_SCALE) - self.screen_width))
+            # Skipped entirely while the nimbus editor holds the camera
+            # locked — its locked position is already computed within valid
+            # room bounds, and re-clamping/re-centering here could nudge it
+            # off what was drawn during path placement.
+            if not nimbus_editor_active:
+                if self.viewing_room.width * RENDER_SCALE <= self.screen_width:
+                    # Room is smaller than screen width - keep centered
+                    self.camera.x = (self.viewing_room.width * RENDER_SCALE - self.screen_width) // 2
+                else:
+                    # Room is larger than screen - clamp to room bounds
+                    self.camera.x = max(0, min(self.camera.x, (self.viewing_room.width * RENDER_SCALE) - self.screen_width))
 
-            if self.viewing_room.height * RENDER_SCALE <= self.screen_height:
-                # Room is smaller than screen height - keep centered
-                self.camera.y = (self.viewing_room.height * RENDER_SCALE - self.screen_height) // 2
-            else:
-                # Room is larger than screen - clamp to room bounds
-                self.camera.y = max(0,
-                                    min(self.camera.y, (self.viewing_room.height * RENDER_SCALE) - self.screen_height))
+                if self.viewing_room.height * RENDER_SCALE <= self.screen_height:
+                    # Room is smaller than screen height - keep centered
+                    self.camera.y = (self.viewing_room.height * RENDER_SCALE - self.screen_height) // 2
+                else:
+                    # Room is larger than screen - clamp to room bounds
+                    self.camera.y = max(0,
+                                        min(self.camera.y, (self.viewing_room.height * RENDER_SCALE) - self.screen_height))
 
     def draw(self, screen):
         """Draw the current view"""
@@ -2360,7 +2770,10 @@ class RoomEditor:
             is_editing_flying_pad_path = (self.object_editor and
                                           hasattr(self.object_editor, 'flying_pad_path_editor') and
                                           self.object_editor.flying_pad_path_editor.active)
-            if not is_placing_spawn and not is_editing_flying_pad_path:
+            is_editing_nimbus_cloud_path = (self.object_editor and
+                                            hasattr(self.object_editor, 'nimbus_cloud_path_editor') and
+                                            self.object_editor.nimbus_cloud_path_editor.active)
+            if not is_placing_spawn and not is_editing_flying_pad_path and not is_editing_nimbus_cloud_path:
                 self.toolbar.draw(screen)
             # Mouse coords (converted for zoom space)
             mouse_sx, mouse_sy = pygame.mouse.get_pos()
@@ -2415,6 +2828,19 @@ class RoomEditor:
         # the baked surface cache — ensures deletions are visible immediately.
         if callable(self.flush_tile_cache_callback):
             self.flush_tile_cache_callback()
+
+        # Animated regions (water/grass/floor/etc.) are drawn BEFORE any
+        # tile layer so their editor-overlay tint sits underneath painted
+        # tiles rather than staining them. Any tile placed on top of a
+        # region fully covers its fill color, matching how the region
+        # actually renders at runtime (tiles/entities draw over the fill).
+        if self.object_editor:
+            self.object_editor.current_room_name = self.viewing_room.name
+            self.object_editor.draw_animated_regions(
+                screen,
+                int(self.camera.x),
+                int(self.camera.y)
+            )
 
         # Background tiles — use baked surface if available (O(1) blit),
         # fall back to per-tile loop only when the callback isn't wired.
@@ -2486,6 +2912,8 @@ class RoomEditor:
             )
 
         # --- Editor overlays always drawn above ALL tile layers ---
+        # (animated regions are the exception — drawn earlier, beneath the
+        # tile layers; see above.)
 
         # Draw collision objects
         if self.object_editor:
@@ -2495,15 +2923,19 @@ class RoomEditor:
                 int(self.camera.x),
                 int(self.camera.y)
             )
-            self.object_editor.draw_animated_regions(
-                screen,
-                int(self.camera.x),
-                int(self.camera.y)
-            )
 
         # Draw flying pads
         if self.object_editor:
             self.object_editor.draw_flying_pads(
+                screen,
+                int(self.camera.x),
+                int(self.camera.y),
+                self.colors
+            )
+
+        # Draw nimbus clouds
+        if self.object_editor:
+            self.object_editor.draw_nimbus_clouds(
                 screen,
                 int(self.camera.x),
                 int(self.camera.y),
@@ -2546,6 +2978,15 @@ class RoomEditor:
                 self.colors
             )
 
+        # Draw chests
+        if self.object_editor:
+            self.object_editor.draw_chests(
+                screen,
+                int(self.camera.x),
+                int(self.camera.y),
+                self.colors
+            )
+
         # Draw room transitions
         if self.object_editor:
             self.object_editor.draw_room_transitions(
@@ -2560,6 +3001,22 @@ class RoomEditor:
                 screen,
                 int(self.camera.x),
                 int(self.camera.y)
+            )
+
+        # Map Paint tool — dims EVERYTHING drawn above (tiles, entities,
+        # AND every editor overlay: collision boxes, spawn points, gates,
+        # doors, chests, transitions, trigger boxes) in one pass, so
+        # painted cells and the paint grid read clearly against a uniformly
+        # toned-down scene instead of clashing with still-bright object
+        # markers. Placed last, right before drag-highlight/preview cursors
+        # (which stay at full brightness since they're live paint feedback,
+        # not room content).
+        if self.map_paint_editor and self.map_paint_editor.active:
+            self.map_paint_editor.current_room_name = self.viewing_room.name
+            self.map_paint_editor.draw_dim_overlay(screen)
+            self.map_paint_editor.draw(
+                screen, int(self.camera.x), int(self.camera.y),
+                self.viewing_room.width, self.viewing_room.height
             )
 
         # Highlight selected/dragged item (no-panel mode)
@@ -2593,8 +3050,13 @@ class RoomEditor:
                                       hasattr(self.object_editor, 'flying_pad_path_editor') and
                                       self.object_editor.flying_pad_path_editor.active)
 
-        # Hide toolbar and palettes during spawn placement or flying pad path editing
-        if not is_placing_spawn and not is_editing_flying_pad_path:
+        # Check if nimbus cloud path editor is active
+        is_editing_nimbus_cloud_path = (self.object_editor and
+                                        hasattr(self.object_editor, 'nimbus_cloud_path_editor') and
+                                        self.object_editor.nimbus_cloud_path_editor.active)
+
+        # Hide toolbar and palettes during spawn placement or flying pad / nimbus cloud path editing
+        if not is_placing_spawn and not is_editing_flying_pad_path and not is_editing_nimbus_cloud_path:
             # Toolbar and palettes on top of everything
             self.toolbar.draw(screen)
 
@@ -2659,7 +3121,23 @@ class RoomEditor:
         cam_x, cam_y = 0, 0
         room_name = room.name
 
-        if self.tileset_editor:
+        # Same tile path as the normal view: prefer blit_tiles_callback
+        # (game.py's blit_room_tiles) so the baked static surface AND its
+        # animated-tile / region overlays (water, flags, rotors, etc.) get
+        # drawn — falling back to the raw tileset_editor draw only if the
+        # callback isn't wired up. Calling tileset_editor.draw_tiles()
+        # directly, as before, skipped those overlays entirely, which is
+        # why animated tiles vanished in the zoomed-out view.
+        # Animated regions draw before tiles here too, so they stay beneath
+        # painted tiles instead of tinting them (see the normal-view render
+        # path above for the full explanation).
+        if self.object_editor:
+            self.object_editor.current_room_name = room_name
+            self.object_editor.draw_animated_regions(zoom_surf, cam_x, cam_y)
+
+        if self.blit_tiles_callback:
+            self.blit_tiles_callback(zoom_surf, room_name, cam_x, cam_y, True)
+        elif self.tileset_editor:
             self.tileset_editor.draw_tiles(zoom_surf, cam_x, cam_y, room_name, layer='background')
 
         pygame.draw.rect(zoom_surf, self.colors['accent'], (0, 0, room_pw, room_ph), 3)
@@ -2674,18 +3152,21 @@ class RoomEditor:
 
         self._draw_placed_entities(zoom_surf, cam_x, cam_y)
 
-        if self.tileset_editor:
+        if self.blit_tiles_callback:
+            self.blit_tiles_callback(zoom_surf, room_name, cam_x, cam_y, False)
+        elif self.tileset_editor:
             self.tileset_editor.draw_tiles(zoom_surf, cam_x, cam_y, room_name, layer='foreground')
 
         if self.object_editor:
             self.object_editor.current_room_name = room_name
             self.object_editor.draw_collision_objects(zoom_surf, cam_x, cam_y)
-            self.object_editor.draw_animated_regions(zoom_surf, cam_x, cam_y)
             self.object_editor.draw_flying_pads(zoom_surf, cam_x, cam_y, self.colors)
+            self.object_editor.draw_nimbus_clouds(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_save_points(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_world_map_objects(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_level_gates(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_doors(zoom_surf, cam_x, cam_y, self.colors)
+            self.object_editor.draw_chests(zoom_surf, cam_x, cam_y, self.colors)
             self.object_editor.draw_room_transitions(zoom_surf, cam_x, cam_y)
 
         # Restore sub-editor and self dimensions

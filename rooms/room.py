@@ -43,6 +43,11 @@ class Room:
         self.doors = []
         self.trigger_boxes = []
 
+        # Scouter minimap silhouette painted via the room editor's Map
+        # Paint tool: a plain list of [gx, gy] cell pairs (see
+        # objects/map_paint.py and RoomPersistence._serialize_map_paint).
+        self.map_paint = []
+
         # Parallax/scrolling background image config, edited via the room
         # editor's Background panel: {'image', 'parallax', 'scroll_x', 'scroll_y'}.
         # Empty dict = no background image set for this room.

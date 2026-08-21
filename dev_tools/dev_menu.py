@@ -60,24 +60,14 @@ class DevMenu:
             {'id': 'sprite_editor',     'label': 'SPRITE EDITOR',     'icon': 'sprite'},
             {'id': 'cutscene_editor', 'label': 'CUTSCENE EDITOR', 'icon': 'cutscene'},
             {'id': 'character_creator', 'label': 'CHARACTER CREATOR', 'icon': 'character'},
+            {'id': 'entity_creator',  'label': 'ENTITY CREATOR',  'icon': 'character'},
             {'id': 'config',          'label': 'CONFIGURATION',   'icon': 'config'},
             {'id': 'close',           'label': 'CLOSE MENU',      'icon': 'close'},
         ]
 
-        # Config submenu
+        # Config submenu (contents removed for now)
         self.config_options = [
-            {'id': 'xp_config',             'label': 'XP CONFIGURATION', 'icon': 'xp'},
-            {'id': 'transformation_config', 'label': 'TRANSFORMATION',   'icon': 'transform'},
-            {'id': 'back',                  'label': 'BACK',              'icon': 'back'},
-        ]
-
-        # XP config — value_key links each entry to a live attribute on game_config
-        self.xp_config_options = [
-            {'id': 'max_level',   'label': 'Max Level',           'value_key': 'max_level'},
-            {'id': 'base_xp',     'label': 'Base XP Required',    'value_key': 'base_xp_requirement'},
-            {'id': 'xp_scaling',  'label': 'XP Scaling Factor',   'value_key': 'xp_scaling_factor'},
-            {'id': 'stat_points', 'label': 'Stat Points/Level',   'value_key': 'stat_points_per_level'},
-            {'id': 'back',        'label': 'BACK',                 'icon': 'back'},
+            {'id': 'back', 'label': 'BACK', 'icon': 'back'},
         ]
 
         # -----------------------------------------------------------------
@@ -583,9 +573,8 @@ class DevMenu:
     def _get_current_options(self):
         """Return the option list for whichever submenu is currently active."""
         return {
-            'main':      self.main_options,
-            'config':    self.config_options,
-            'xp_config': self.xp_config_options,
+            'main':   self.main_options,
+            'config': self.config_options,
         }.get(self.current_menu, [])
 
     def _handle_selection(self):
@@ -612,27 +601,16 @@ class DevMenu:
                 return 'open_cutscene_editor'
             elif option_id == 'character_creator':
                 return 'open_character_creator'
+            elif option_id == 'entity_creator':
+                return 'open_entity_creator'
             elif option_id == 'config':
                 self._enter_menu('config')
             elif option_id == 'close':
                 self.active = False
 
         elif self.current_menu == 'config':
-            if option_id == 'xp_config':
-                self._enter_menu('xp_config')
-            elif option_id == 'transformation_config':
-                pass  # TODO: implement transformation config submenu
-            elif option_id == 'back':
-                self._go_back()
-
-        elif self.current_menu == 'xp_config':
             if option_id == 'back':
                 self._go_back()
-            elif 'value_key' in selected:
-                # Open text-input mode pre-filled with the current value
-                self.editing_text = True
-                self.editing_field = selected['value_key']
-                self.text_input = str(getattr(self.config, self.editing_field, ''))
 
         return None
 
@@ -645,9 +623,9 @@ class DevMenu:
     def _go_back(self):
         """
         Navigate up one level in the menu hierarchy.
-        xp_config → config → main.
+        config → main.
         """
-        parent = {'xp_config': 'config', 'config': 'main'}
+        parent = {'config': 'main'}
         self.current_menu = parent.get(self.current_menu, 'main')
         self.selected_index = -1
         self.hover_index = -1
@@ -657,8 +635,8 @@ class DevMenu:
         return {
             'main':              'DEVELOPER MENU',
             'config':            'CONFIGURATION',
-            'xp_config':         'XP SYSTEM CONFIG',
             'room_editor':       'ROOM EDITOR',
             'world_map_editor':  'WORLD MAP EDITOR',
             'character_creator': 'CHARACTER CREATOR',
+            'entity_creator':    'ENTITY CREATOR',
         }.get(self.current_menu, 'DEV MENU')

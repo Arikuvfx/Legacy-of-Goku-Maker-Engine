@@ -116,6 +116,11 @@ _ACTION_PARAMS = {
     # 'base' to 'ssj' mid-scene. Costumes are discovered from the actor's
     # current character folder (assets/sprites/player/{character}/).
     'set_costume':   [('costume',   'Costume',   'costume')],
+    # Shows or hides this actor's ground shadow for the rest of the scene (or
+    # until another set_shadow flips it back). Useful for actors floating,
+    # flying above the ground, or standing on something that shouldn't cast
+    # the normal ground shadow.
+    'set_shadow':    [('visible', 'Visible', 'bool')],
     # Starts a music track through SoundManager.play_music(), bypassing the
     # exploration/battle/boss context map — same as a room's Music object.
     'play_music':    [('track', 'Music Track', 'music_track'),
@@ -179,7 +184,7 @@ _SCREEN_ACTIONS = ['fade_in', 'fade_out', 'flash', 'invert', 'dialogue',
 _ROOM_ACTIONS   = ['change_room']
 _SOUND_ACTIONS  = ['play_music', 'play_sfx', 'stop_music']
 _ACTOR_ACTIONS  = ['set_animation', 'move_to', 'face', 'teleport', 'fly_to',
-                   'set_character', 'set_costume', 'attack']
+                   'set_character', 'set_costume', 'attack', 'set_shadow']
 _INVERT_MODES   = ['full', 'red', 'green', 'blue', 'greyscale']
 # Fallback attack_type pool used only if discover_attacks() finds nothing on
 # disk (e.g. assets/sprites/attacks/ missing) — see _cycle_dropdown() below,
@@ -2099,7 +2104,7 @@ class CutsceneEditor:
                         actor_def = a
                         break
             pool = self._get_actor_anim_states(actor_def)
-        elif field in ('loop', 'fade_in', 'deal_damage'):
+        elif field in ('loop', 'fade_in', 'deal_damage', 'visible'):
             pool = ['True', 'False']
         elif field == 'direction' and self._form_type == 'scroll':
             pool = ['right', 'left', 'down', 'up',
@@ -2192,6 +2197,7 @@ class CutsceneEditor:
             'room_name': '', 'character': self._default_character(),
             'loop': 'True', 'fade_in': 'True', 'fade_out': 'True',
             'attack_type': (discover_attacks() or _ATTACK_TYPES)[0], 'deal_damage': 'False',
+            'visible': 'True',
         }
         if key == 'color':
             # flash defaults to a white pop; fade_in/fade_out default to a

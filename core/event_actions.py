@@ -315,6 +315,22 @@ def set_custom_variable(var_name, mode, value=None):
     return {'type': 'set_custom_variable', 'var_name': var_name, 'mode': mode, 'value': value}
 
 
+def mission(mode, mission_id):
+    """mode: 'start' | 'complete' | 'fail' | 'reset'.
+
+    The mission-system's hook into the same action language everything
+    else uses. This is what a mission-offer dialogue_choice's "Accept"
+    option ends its actions list with ('start'), and what a mission's
+    'completed' dialogue phase ends with once the reward line has played
+    ('complete'). Register this action type's handler to route straight
+    to MissionManager.accept_mission()/claim_reward()/fail_mission()/
+    reset_mission() — 'complete' should also run whatever action list is
+    stored under that mission's 'reward_actions' through this same
+    EventRunner, so rewards are just more zeni()/item()/exp()/etc. actions
+    instead of a bespoke code path."""
+    return {'type': 'mission', 'mode': mode, 'mission_id': mission_id}
+
+
 # Every action type name, for a dev-tool's action-type dropdown.
 ACTION_TYPES = [
     'dialogue_box', 'set_portrait', 'dialogue_choice',
@@ -325,4 +341,5 @@ ACTION_TYPES = [
     'play_character_animation', 'save_game', 'change_map',
     'set_player_location', 'spawn_enemies', 'spawn_npc', 'play_cutscene',
     'quest', 'modify_quest_variable', 'set_custom_variable', 'world_map_location',
+    'mission',
 ]

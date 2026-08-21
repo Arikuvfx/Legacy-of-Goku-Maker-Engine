@@ -1,70 +1,7 @@
 import pygame
 from entities.enemy import Enemy
 from core.sprite_system import create_boss_sprite
-
-
-# ---------------------------------------------------------------------------
-# Boss registry
-# Maps boss 'id' strings (from the entity editor) to their config dicts.
-# Add new bosses here — no other file needs to change.
-# ---------------------------------------------------------------------------
-BOSS_REGISTRY = {
-    'pui_pui': {
-        'hp':            200,
-        'speed':         1.4,
-        'attack_damage': 18,
-        'attack_range':  17,
-        'width':         64,
-        'height':        64,
-        'hitbox_width':  20,
-        'hitbox_height': 38,
-        'ai_type':       'advanced',
-        'enemy_category': 'melee',
-        'display_name':  'Pui Pui',
-        'shadow_size':   'small',
-        'shadow_width':  32,
-        'shadow_y_offset': 13.5,
-        'zeni_pool':     'tier3',
-    },
-    'android_17': {
-        'hp':            350,
-        'speed':         1.6,
-        'attack_damage': 14,
-        'attack_range':  200,
-        'width':         32,
-        'height':        32,
-        'hitbox_width':  18,
-        'hitbox_height': 28,
-        'ai_type':       'advanced',
-        'enemy_category': 'shooter',
-        'shooter_style': 'kiblast',
-        'projectile_sprite': 'kiblast',
-        'display_name':  'Android 17',
-        'shadow_size':   'small',
-        'shadow_width':  24,
-        'shadow_y_offset': 10.0,
-        'zeni_pool':     'tier4',
-    },
-    'android_18': {
-        'hp':            350,
-        'speed':         1.6,
-        'attack_damage': 14,
-        'attack_range':  200,
-        'width':         32,
-        'height':        32,
-        'hitbox_width':  18,
-        'hitbox_height': 28,
-        'ai_type':       'advanced',
-        'enemy_category': 'shooter',
-        'shooter_style': 'kiblast',
-        'projectile_sprite': 'kiblast',
-        'display_name':  'Android 18',
-        'shadow_size':   'small',
-        'shadow_width':  24,
-        'shadow_y_offset': 10.0,
-        'zeni_pool':     'tier4',
-    },
-}
+from dev_tools import entity_creator
 
 
 class BossEnemy(Enemy):
@@ -73,7 +10,10 @@ class BossEnemy(Enemy):
 
     Bosses share all AI logic with Enemy (easy / advanced melee / shooter)
     but are created via BossEnemy(x, y, boss_id='pui_pui') and get their
-    stats from BOSS_REGISTRY instead of the Enemy defaults.
+    stats from assets/enemies/{boss_id}.json -- the same config file (and
+    editor) a regular enemy uses, distinguished by entity_type == 'boss'.
+    No boss-specific registry lives in code anymore; adding a boss is
+    purely a data change via the entity editor.
 
     Usage (game.py)::
 
@@ -83,7 +23,8 @@ class BossEnemy(Enemy):
     """
 
     def __init__(self, x, y, boss_id='pui_pui', variant='default'):
-        cfg = BOSS_REGISTRY.get(boss_id, BOSS_REGISTRY['pui_pui'])
+        cfg = entity_creator.load_config(entity_creator.KIND_ENEMY, boss_id)
+        stats = cfg['stats']
 
         # Initialise the base Enemy with boss AI settings.
         # The sprite key re-uses the boss_id so sprite sheets can be added
@@ -103,29 +44,42 @@ class BossEnemy(Enemy):
         if cfg.get('projectile_sprite'):
             self.projectile_sprite = cfg['projectile_sprite']
 
-        self.boss_id      = boss_id
-        self.display_name = cfg['display_name']
+        self.boss_id       = boss_id
+        self.display_name  = cfg.get('display_name') or boss_id.replace('_', ' ').title()
 
-        self.hp           = cfg['hp']
-        self.max_hp       = cfg['hp']
-        self.speed        = cfg['speed']
+        self.hp             = stats['max_hp']
+        self.max_hp         = stats['max_hp']
+        self.speed          = stats['speed']
+        self.defense        = stats['defense']   # END
 
-        # width/height drive the hitbox — use the actual visible character
-        # size, not the full 64×64 spritesheet frame.
-        self.width        = cfg['hitbox_width']
-        self.height       = cfg['hitbox_height']
+        # Hitbox -- the actual visible/collidable character size, independent
+        # of the full spritesheet frame (see below).
+        self.width          = cfg['hitbox_width']
+        self.height         = cfg['hitbox_height']
 
-        # full frame size — needed for slicing the spritesheet correctly
-        self._frame_width  = cfg['width']
-        self._frame_height = cfg['height']
+        # full frame size -- needed for slicing the spritesheet correctly
+        self._frame_width   = cfg['width']
+        self._frame_height  = cfg['height']
 
-        # overwrite whatever Enemy.__init__ defaulted to
-        self.attack_damage = cfg['attack_damage']
-        self.attack_range  = cfg['attack_range']
+        # Raw STR/POW — stored on the entity even though only one of them
+        # actually drives attack_damage below, so UI that shows both stats
+        # at once (see ui/scouter_menu.py's _get_data_stats) has real
+        # configured values to read instead of Enemy.__init__'s hardcoded
+        # fallback.
+        self.strength       = stats['strength']
+        self.power          = stats['power']
 
-        # bosses spot the player from further away than regular enemies
-        self.awareness_range = 280
-        self.forget_range    = 450
+        # overwrite whatever Enemy.__init__ defaulted to — melee bosses hit
+        # with STR, shooter bosses (bomb/bullet/rocket/kiblast) hit with POW,
+        # same STR/POW split entity_creator.py's stats block uses now.
+        self.attack_damage  = (self.strength if cfg['enemy_category'] == 'melee'
+                                else self.power)
+        self.attack_range   = cfg['attack_range']
+
+        # bosses spot the player from further away than regular enemies --
+        # configurable per-boss in the entity editor rather than hardcoded.
+        self.awareness_range = cfg['awareness_range']
+        self.forget_range    = cfg['forget_range']
 
         # Mark as boss so game systems can react (XP, death events, etc.)
         self.is_boss = True
@@ -133,7 +87,7 @@ class BossEnemy(Enemy):
         self.shadow_width    = cfg.get('shadow_width', self.width)
         self.shadow_y_offset = cfg.get('shadow_y_offset', 0)
 
-        # Pending ki blast — mirrors the player's pending_blast pattern.
+        # Pending ki blast -- mirrors the player's pending_blast pattern.
         # Set to True when the kiblast animation starts; the base Enemy AI
         # reads 'ready' to know it should actually spawn the projectile.
         self.pending_blast = None

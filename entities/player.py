@@ -1,4 +1,5 @@
 import pygame
+import random
 import time
 from config.settings import (
     WORLD_WIDTH, WORLD_HEIGHT,
@@ -76,13 +77,35 @@ class Player:
         self.speed = 3 / RENDER_SCALE
         self.run_speed = 6 / RENDER_SCALE
 
-        self.hp = 100
-        self.max_hp = 100
-        self.ki = 100
-        self.max_ki = 100
-        self.level = 60
+        self.level = 1
+
+        # Max HP/EP are level-driven (see GameConfig.hp_curve_value /
+        # ep_curve_value + Player._grow_hp_ep). Without a game_config we
+        # fall back to flat 100/100 so the player can still be constructed
+        # standalone (e.g. in editor tooling).
+        if game_config:
+            self.max_hp = game_config.hp_curve_value(self.level)
+            self.max_ki = game_config.ep_curve_value(self.level)
+        else:
+            self.max_hp = 100
+            self.max_ki = 100
+        self.hp = self.max_hp
+        self.ki = self.max_ki
+
+        # Death — set the moment hp first reaches 0 (see take_damage()/
+        # die() below). Locks out all control via can_act()/can_move();
+        # game.py polls this plus sprite.is_animation_finished() to drive
+        # the post-death fade-to-black/game-over sequence (see
+        # Game._update_death_sequence).
+        self.is_dead = False
+
         self.exp = 0
-        self.exp_to_next_level = 100
+        # Lifetime XP earned — unlike self.exp (which resets down to the
+        # leftover amount every time level_up() fires), this only ever
+        # goes up, so the pause menu can show "total XP collected" rather
+        # than just however much is currently banked toward the next level.
+        self.total_exp = 0
+        self.exp_to_next_level = game_config.get_xp_for_level(self.level) if game_config else 100
         self.stat_points = 0
         self.pending_level_up = False
 
@@ -104,6 +127,15 @@ class Player:
         self.is_attacking = False
         self.attack_timer = 0
         self.attack_cooldown = 0
+
+        # Chest-opening pickup pose (see start_pickup_item()) — held for a
+        # fixed real-time duration rather than however long pickup_item.png's
+        # own frames happen to take, since it's paired with an item icon
+        # floating up above the player over the same span (see game.py's
+        # _update_chest_pickup/_draw_chest_pickup_icon).
+        self.is_picking_up_item = False
+        self.pickup_item_timer = 0.0
+        self.PICKUP_ITEM_DURATION = 1.0
 
         # Sprint footsteps — walking is silent, only running plays a sound.
         # Ticked by game.py (which owns dt) right after calling move().
@@ -143,7 +175,7 @@ class Player:
         # of self.direction. Reset via enter_idle() any time the player
         # returns to normal idle. See update()'s animation-state machine.
         self.idle_timer = 0.0
-        self.IDLE_WAIT_DELAY = 5.0
+        self.IDLE_WAIT_DELAY = 15.0
 
         # -----------------------------------------------------------------
         # Ki attack state
@@ -707,6 +739,8 @@ class Player:
 
     def can_act(self):
         """False while locked in an animation, transitioning, or knocked back."""
+        if self.is_dead:
+            return False
         if self.is_transitioning:
             return False
         if self.is_map_jumping:
@@ -732,7 +766,8 @@ class Player:
                     or self.is_casting_ghost_kamikaze or self.is_holding_ghost_kamikaze
                     or (self.current_ghost_kamikaze is not None and self.current_ghost_kamikaze.active)
                     or self.is_charging_big_bang_attack or self.is_firing_big_bang_attack
-                    or self.is_knocked_back or self.is_blocking)
+                    or self.is_knocked_back or self.is_blocking
+                    or self.is_picking_up_item)
 
     def can_move(self):
         """False during collision knockback or whenever can_act() returns False.
@@ -744,6 +779,8 @@ class Player:
         Fist, move() redirects the input entirely into steering the fist's
         head instead of moving the player (see _move_dragon_fist_head).
         """
+        if self.is_dead:
+            return False
         if self.is_transitioning:
             return False
         if self.is_map_jumping:
@@ -792,6 +829,55 @@ class Player:
         self.sprite.set_animation('idle', self.direction)
         self.current_animation_state = 'idle'
         self.idle_timer = 0.0
+
+    def die(self):
+        """Enter the death state: lose all control and play death.png once,
+        then hold on its last frame (same as any other non-looping animation
+        — see e.g. energy_punch). Called from take_damage() the instant hp
+        first reaches 0; is_dead being True is what makes can_act()/
+        can_move() start returning False. game.py owns everything after
+        that (the hold, the fade-to-black, and the game-over box) — see
+        Game._update_death_sequence.
+        """
+        if self.is_dead:
+            return
+        self.is_dead = True
+
+        # Cancel any in-progress knockback/attack state so death always
+        # renders cleanly regardless of what the player was doing when hit.
+        self.is_knocked_back          = False
+        self.is_collision_knockback   = False
+        self.is_attacking             = False
+        self.is_blocking              = False
+
+        self.sprite.set_animation('death', self.direction)
+        self.current_animation_state = 'death'
+
+    def start_pickup_item(self):
+        """Enter the item-pickup pose (pickup_item.png) — used when opening
+        a chest, held for PICKUP_ITEM_DURATION seconds before automatically
+        returning to idle (see the 'pickup_item' branch in update()).
+        can_act() is False the whole time via is_picking_up_item, same
+        lockout shape as melee/hurt/etc.
+
+        pickup_item.png only has a down-facing pose (no left/right/up
+        variants), so this always plays the 'down' row regardless of
+        self.direction — but self.direction itself is left untouched, so
+        enter_idle() (called once the pose finishes) resumes facing
+        whichever way the player was actually facing before the chest was
+        opened, not down.
+
+        game.py pairs this with an item icon floating up above the player;
+        it polls is_picking_up_item to know when the pose (and therefore
+        the float) has finished, so it can then grant the loot and show the
+        reward dialogue — see _handle_interact's chest branch and
+        _update_chest_pickup.
+        """
+        self.is_picking_up_item = True
+        self.pickup_item_timer = 0.0
+        if self.sprite.has_animation('pickup_item', 'down'):
+            self.sprite.set_animation('pickup_item', 'down')
+        self.current_animation_state = 'pickup_item'
 
     # =========================================================================
     # Collision helpers
@@ -894,7 +980,25 @@ class Player:
             elif dy != 0 and dx == 0:
                 # Pure vertical input — update facing direction
                 self.direction = 'down' if dy > 0 else 'up'
-            # Diagonal: keep the current direction to avoid sprite flipping
+            else:
+                # Diagonal: keep the current facing to avoid sprite flicker,
+                # but ONLY if that facing still corresponds to one of the two
+                # axes currently held. Otherwise the player can end up
+                # sprinting in a direction that has nothing to do with their
+                # old facing (e.g. release left, tap up+right, and keep
+                # running to the upper-right while still visually facing/
+                # animating left). When the old facing no longer matches
+                # either held axis, re-derive it — horizontal wins ties,
+                # consistent with how horizontal is treated as the primary
+                # facing axis elsewhere (flips, spawn offsets, _OCTANT_TO_CARDINAL).
+                facing_matches_input = (
+                    (self.direction == 'left'  and dx < 0) or
+                    (self.direction == 'right' and dx > 0) or
+                    (self.direction == 'up'    and dy < 0) or
+                    (self.direction == 'down'  and dy > 0)
+                )
+                if not facing_matches_input:
+                    self.direction = 'right' if dx > 0 else 'left'
 
         self.is_running = is_running
         if self.is_spinning_sword:
@@ -2927,6 +3031,16 @@ class Player:
             ignore_invulnerability: Bypass i-frames (e.g. for DoT effects).
             no_knockback:           Grant i-frames only — no physics knockback.
         """
+        if self.is_dead:
+            # Already dead — nothing can hurt a corpse. Without this,
+            # enemies still swinging at the player mid-death-sequence would
+            # keep calling this every frame; die() below already no-ops on
+            # a repeat call, but this also skips the i-frame/transform/
+            # knockback bookkeeping and (more importantly) last_damage_taken,
+            # so game.py never spawns another damage number or hurt-tint
+            # flash for a hit that landed after the player was already down.
+            return
+
         if self.invulnerable and not ignore_invulnerability:
             return
 
@@ -2943,6 +3057,12 @@ class Player:
 
         self.hp = max(0, self.hp - damage)
         self.last_damage_taken = damage  # Stored so game.py can spawn a popup
+
+        if self.hp <= 0:
+            # Dying takes over instead of any of the usual hurt/knockback
+            # handling below — see die() for what it locks down.
+            self.die()
+            return
 
         if no_knockback:
             # Just grant i-frames — the caller owns the visual feedback
@@ -3082,6 +3202,7 @@ class Player:
     def gain_exp(self, amount, game_config):
         """Add XP and trigger as many level-ups as the new total allows."""
         self.exp += amount
+        self.total_exp += amount  # Never decremented — lifetime total, see __init__.
         while self.exp >= self.exp_to_next_level and self.level < game_config.max_level:
             self.level_up(game_config)
 
@@ -3092,9 +3213,103 @@ class Player:
         self.stat_points += game_config.stat_points_per_level
         self.pending_level_up = True
         self.exp_to_next_level = game_config.get_xp_for_level(self.level)
+
+        self._grow_hp_ep(game_config)
+
         # Fully restore HP and Ki on level-up
         self.hp = self.max_hp
         self.ki = self.max_ki
+
+    def _grow_hp_ep(self, game_config):
+        """Grow max_hp/max_ki by this level's curve increment, with a small
+        random roll so two playthroughs diverge over time — mirroring the
+        Buu's Fury data, where two characters both reaching the same level
+        ended up with different max HP.
+
+        Uses an *increment* off the reference curve (curve_value(level) -
+        curve_value(level - 1)) rather than recomputing max_hp from the
+        curve directly, so the roll from each past level-up persists and
+        compounds instead of being overwritten.
+        """
+        hp_increment = game_config.hp_curve_value(self.level) - game_config.hp_curve_value(self.level - 1)
+        ep_increment = game_config.ep_curve_value(self.level) - game_config.ep_curve_value(self.level - 1)
+
+        hp_increment = max(hp_increment, game_config.hp_min_gain())
+        ep_increment = max(ep_increment, game_config.ep_min_gain())
+
+        hp_roll = random.uniform(1 - game_config.hp_variance, 1 + game_config.hp_variance)
+        ep_roll = random.uniform(1 - game_config.ep_variance, 1 + game_config.ep_variance)
+
+        cap = game_config.hp_ep_cap
+        self.max_hp = min(cap, self.max_hp + max(0.0, hp_increment) * hp_roll)
+        self.max_ki = min(cap, self.max_ki + max(0.0, ep_increment) * ep_roll)
+
+    def get_melee_damage(self, game_config, target=None, target_end=None):
+        """Roll one melee hit's damage using this player's STR against a
+        target's END (defense).
+
+        Args:
+            game_config: GameConfig — supplies the STR/END curve (see
+                         GameConfig.roll_melee_damage).
+            target:      Optional object to read target_end from —
+                         Player-shaped (has .stats['defense']) or
+                         Enemy-shaped (has a plain .defense attribute).
+                         Ignored if target_end is given explicitly.
+            target_end:  Explicit defender END, overrides *target* when
+                         both are given. Defaults to 0 if neither is given.
+
+        Returns (damage: int, is_crit: bool) — same shape as
+        GameConfig.roll_melee_damage(). Wire this into wherever melee hits
+        are currently resolved (e.g. MeleeAttack's collision handling in
+        game.py) — it's not called automatically anywhere yet.
+        """
+        if target_end is None:
+            if target is None:
+                target_end = 0
+            elif hasattr(target, 'stats'):
+                # Player-shaped target — END lives under 'vitality' (or
+                # 'end'), the actual key the pause menu's END allocator
+                # writes to — see PauseMenu._stat_key_for. NOT 'defense'.
+                target_end = target.stats.get('vitality', target.stats.get('end', 0))
+            else:
+                # Enemy-shaped target — defense is a plain attribute.
+                target_end = getattr(target, 'defense', 0)
+        strength = self.stats.get('strength', 1)
+        return game_config.roll_melee_damage(strength, target_end)
+
+    def get_incoming_melee_damage(self, raw_damage, game_config):
+        """Mitigate a flat incoming melee hit by this player's END.
+
+        Reads 'vitality' (falling back to 'end') from self.stats — the
+        same key the pause menu's END allocator actually writes to (see
+        PauseMenu._stat_key_for), NOT 'defense'. Call this on an enemy's
+        raw attack_damage/shooter_melee_damage before passing the result
+        to take_damage().
+        """
+        end_value = self.stats.get('vitality', self.stats.get('end', 0))
+        return game_config.apply_incoming_melee_mitigation(raw_damage, end_value)
+
+    def get_ki_blast_damage(self, game_config, target=None, target_end=None):
+        """Roll one ki blast hit's damage using this player's POW against
+        a target's END (defense). Mirrors get_melee_damage() — see there
+        for the target/target_end resolution rules — but has no crit
+        (ki_blast has none, per game_config.py's notes) and returns a
+        plain int rather than a (damage, is_crit) pair.
+
+        Wire this into wherever ki blast projectiles resolve a hit
+        (currently Enemy.check_collision_with_attack's 'projectile'
+        branch uses a flat 20 unless the projectile carries an
+        owner/get_ki_blast_damage — same pattern as MeleeAttack.owner).
+        """
+        if target_end is None:
+            if target is None:
+                target_end = 0
+            elif hasattr(target, 'stats'):
+                target_end = target.stats.get('vitality', target.stats.get('end', 0))
+            else:
+                target_end = getattr(target, 'defense', 0)
+        pow_stat = self.stats.get('ki_power', 1)
+        return game_config.roll_ki_blast_damage(pow_stat, target_end)
 
     def apply_stat_point(self, stat_name, game_config):
         """Spend one stat point on stat_name. Returns True if the point was spent."""
@@ -3106,18 +3321,20 @@ class Player:
         return False
 
     def update_derived_stats(self):
-        """Recalculate max_hp, max_ki, and run_speed from the current stat block.
+        """Recalculate run_speed and ki_regen from the current stat block.
 
-        Called whenever a stat point is spent. Vitality → HP, Energy → Ki.
-        ki_regen (1–255) maps to a regen interval of 30s (slow) → 1s (fast),
-        matching the character_creator's default of 30 → 10s.
+        Called whenever a stat point is spent. ki_regen (1–255) maps to a
+        regen interval of 30s (slow) → 1s (fast), matching the
+        character_creator's default of 30 → 10s.
+
+        max_hp/max_ki are NOT derived here anymore — they're level-driven
+        (see GameConfig.hp_curve_value/ep_curve_value + _grow_hp_ep).
+        Vitality and energy no longer feed HP/EP directly; they're free to
+        be repurposed for other bonuses (e.g. defense, ki cost reduction).
 
         The Speed stat intentionally has no effect here — movement speed
         (self.speed / self.run_speed) is fixed and not derived from stats.
         """
-        self.max_hp = 100 + (self.stats['vitality'] - 1) * 10
-        self.max_ki = 100 + (self.stats['energy'] - 1) * 5
-
         self.speed     = 5  / RENDER_SCALE
         self.run_speed = 10 / RENDER_SCALE
 
@@ -3231,6 +3448,26 @@ class Player:
             self.current_dragon_fist = None
             self.is_using_dragon_fist = False
             self.is_dragon_fist_lunging = False
+
+        # ------------------------------------------------------------------
+        # Death — runs exclusively for the player; only the sprite itself
+        # keeps animating. Everything ELSE in the world keeps simulating
+        # normally though — Game.update() doesn't freeze for this, only
+        # Player.update() does (see Game._update_death_sequence, called
+        # every frame alongside the normal gameplay update, not instead of
+        # it — enemies/projectiles/damage numbers/hurt-tint decay all keep
+        # running while the player sits here dead).
+        # ------------------------------------------------------------------
+        # Lets death.png play out (and then just sit on its last frame, same
+        # as any other finished non-looping animation) while every other
+        # *player* system — movement, knockback, i-frames, ki regen, charge
+        # states — stays frozen. game.py drives the hold/fade/game-over-box
+        # sequence that follows once the animation itself is done, using the
+        # normal per-frame call to this same update() (see
+        # Game._update_death_sequence) purely to keep advancing the sprite.
+        if self.is_dead:
+            self.sprite.update(dt)
+            return
 
         # ------------------------------------------------------------------
         # World-map jump sequence — runs exclusively; all other state frozen
@@ -3477,6 +3714,15 @@ class Player:
                 # Don't snap to idle until both knockback types have cleared
                 if not self.is_knocked_back and not self.is_collision_knockback:
                     self.enter_idle()
+
+        elif self.current_animation_state == 'pickup_item':
+            # Real-time timer, not sprite.is_animation_finished() — the pose
+            # is meant to hold for a fixed ~1s regardless of pickup_item.png's
+            # own frame count (see start_pickup_item()).
+            self.pickup_item_timer += dt
+            if self.pickup_item_timer >= self.PICKUP_ITEM_DURATION:
+                self.is_picking_up_item = False
+                self.enter_idle()
 
         elif self.current_animation_state == 'idle':
             # Stand-still timer — after IDLE_WAIT_DELAY seconds of plain idle,

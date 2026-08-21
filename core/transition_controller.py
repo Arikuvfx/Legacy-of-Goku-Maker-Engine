@@ -47,6 +47,7 @@ class TransitionController:
         self.plain_fade_direction = None  # 'in' | 'out'
         self.plain_fade_duration = 0.5
         self.plain_fade_callback = None
+        self.plain_fade_hold = 0.0  # seconds to hold at the starting alpha before the fade itself begins
 
     def is_transitioning(self):
         """Return True if a transition is currently in progress."""
@@ -131,17 +132,24 @@ class TransitionController:
         self.transition_timer = 0.0
         self.flying_fade_duration = duration
 
-    def start_plain_fade(self, direction, duration=0.5, on_complete=None):
+    def start_plain_fade(self, direction, duration=0.5, on_complete=None, hold=0.0):
         """Begin a standalone fade with no room swap or player movement —
         this is what backs the 'screen_fade' event action.
 
         Args:
             direction:   'out' fades the screen from clear to black,
                          'in' fades it from black to clear.
-            duration:    Length of the fade in seconds.
+            duration:    Length of the fade itself, in seconds.
             on_complete: Called with no args once the fade finishes — lets
                          EventRunner's blocking-action contract (see
                          event_actions.py) resume the sequence.
+            hold:        Seconds to hold at the starting alpha (full black
+                         for 'in', fully clear for 'out') BEFORE the fade
+                         itself starts counting down. Lets a caller pin the
+                         screen at full black for a beat — e.g. the pause
+                         menu closing — without stretching the fade's own
+                         motion into a slow crossfade. Defaults to 0 (no
+                         hold), so existing callers are unaffected.
 
         If a transition is already in progress, this is a no-op except for
         immediately firing on_complete — otherwise a blocking screen_fade
@@ -160,6 +168,7 @@ class TransitionController:
         self.plain_fade_direction = direction
         self.plain_fade_duration = max(0.0001, duration)
         self.plain_fade_callback = on_complete
+        self.plain_fade_hold = max(0.0, hold)
 
     def update(self, dt, player):
         """Advance the transition state machine.
@@ -173,10 +182,12 @@ class TransitionController:
 
         self.transition_timer += dt
 
-        # Plain fade: just track the timer and fire the completion callback
-        # when it finishes — no room swap, no player movement.
+        # Plain fade: hold at the starting alpha for plain_fade_hold seconds
+        # (if any), then track the fade itself and fire the completion
+        # callback once it finishes — no room swap, no player movement.
         if self.transition_type == 'plain_fade':
-            if self.transition_timer >= self.plain_fade_duration:
+            total = self.plain_fade_hold + self.plain_fade_duration
+            if self.transition_timer >= total:
                 self.transitioning = False
                 self.transition_type = None
                 callback = self.plain_fade_callback
@@ -285,11 +296,18 @@ class TransitionController:
         alpha = 0
 
         if self.transition_type == 'plain_fade':
-            progress = min(1.0, self.transition_timer / self.plain_fade_duration)
-            if self.plain_fade_direction == 'out':
-                alpha = int(255 * progress)
-            else:  # 'in'
-                alpha = int(255 * (1.0 - progress))
+            if self.transition_timer < self.plain_fade_hold:
+                # Still holding at the starting alpha — full black for 'in'
+                # (screen was already black when the hold began), fully
+                # clear for 'out' (nothing drawn yet).
+                alpha = 255 if self.plain_fade_direction == 'in' else 0
+            else:
+                progress = min(1.0, (self.transition_timer - self.plain_fade_hold)
+                                     / self.plain_fade_duration)
+                if self.plain_fade_direction == 'out':
+                    alpha = int(255 * progress)
+                else:  # 'in'
+                    alpha = int(255 * (1.0 - progress))
 
         elif self.transition_type == 'flying':
             # Fade to black in the first half, fade back in the second half

@@ -63,6 +63,27 @@ class MeleeAttack:
         return pygame.Rect(self.x - self.size // 2, self.y - self.size // 2,
                             self.size, self.size)
 
+    def roll_damage(self, game_config, target):
+        """Roll this swing's damage against *target*.
+
+        Uses the owner's STR and target's END (defense) — see
+        Player.get_melee_damage() / GameConfig.roll_melee_damage() for the
+        actual curve. This class only owns the hitbox/timing (per the
+        class docstring — collision detection is handled externally), so
+        call this from whatever collision code applies damage on a hit,
+        e.g.:
+
+            if melee.get_rect().colliderect(enemy.get_rect()):
+                damage, is_crit = melee.roll_damage(game_config, enemy)
+                enemy.take_damage(damage)
+
+        Returns (damage: int, is_crit: bool), or (0, False) if this
+        attack has no owner (e.g. constructed standalone/for testing).
+        """
+        if self.owner is None:
+            return 0, False
+        return self.owner.get_melee_damage(game_config, target=target)
+
     def update(self, dt):
         """
         Advance the attack timer and deactivate when the duration is up.

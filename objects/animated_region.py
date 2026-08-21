@@ -88,7 +88,7 @@ REGION_STYLES = {
     'snow': {'color': (60, 170, 40), 'label': 'Snow', 'sheet': 'spr_snow_filler',
               'mode': 'patch', 'frame_size': 64, 'chunk_size': 16, 'anim': 'loop'},
     'dirt': {'color': (120, 80, 40), 'label': 'Dirt', 'sheet': 'spr_dirt_filler',
-             'mode': 'tile', 'frame_w': 24, 'frame_h': 24, 'grid_rows': 4},
+             'mode': 'tile', 'frame_w': 72, 'frame_h': 24, 'grid_rows': 4},
     'field': {'color': (60, 170, 40), 'label': 'Field', 'sheet': 'spr_field_filler',
               'mode': 'tile', 'frame_w': 64, 'frame_h': 72},
     'stone': {'color': (60, 170, 40), 'label': 'Stone', 'sheet': 'spr_stone_filler',

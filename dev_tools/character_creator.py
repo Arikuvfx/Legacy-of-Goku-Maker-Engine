@@ -136,14 +136,19 @@ C_DIALOG_BG   = (22,  22,  32)
 DEFAULT_CONFIG: dict = {
     "id":           "",
     "display_name": "",
+    # Freeform prose shown in the Scouter Data description panel (see
+    # ui/scouter_menu.py's _get_entity_description / _draw_data_description).
+    "description":  "",
     "costume":      "default",
     "shadow_size":  32,
     "stats": {
         "max_hp":   100,
         "max_ki":   100,
-        "power":     50,
-        "defense":   50,
-        "speed":     50,
+        "power":     50,   # STR — melee damage
+        "ki_power":  50,   # POW — ki blast damage
+        "defense":   50,   # legacy/unused, kept for save-file compatibility
+        "vitality":  50,   # END — incoming melee mitigation
+        "speed":     50,   # SPD
         "ki_regen":  30,
     },
     "attacks": {
@@ -515,9 +520,14 @@ def load_config(char_id: str) -> dict:
         try:
             with open(path) as f:
                 data = json.load(f)
-            # Merge missing keys from default
+            # Merge missing keys from default. "stats"/"attacks" are excluded
+            # from the top-level update and merged separately below, so that
+            # new default keys (e.g. a stat added after this character was
+            # last saved) survive instead of being wiped out by the saved
+            # file's older, incomplete sub-dict.
             merged = copy.deepcopy(DEFAULT_CONFIG)
-            merged.update(data)
+            merged.update({k: v for k, v in data.items()
+                           if k not in ("stats", "attacks")})
             for sub in ("stats", "attacks"):
                 merged[sub].update(data.get(sub, {}))
             merged["id"] = char_id
@@ -647,6 +657,38 @@ def load_removed_characters() -> set[str]:
     """Return just the set of explicitly-deleted character IDs."""
     _order, removed = load_character_menu()
     return removed
+
+
+# ── Global game settings (not per-character) ────────────────────────
+# Things like max_level apply to the whole game/GameConfig, not to any
+# one character, so they don't belong in a character's own JSON (which
+# load_config()/save_config() manage above). They get their own small
+# sibling file instead, same rationale as MENU_FILE above.
+GLOBAL_SETTINGS_FILE = CHARACTERS_DIR.parent / "game_settings.json"
+
+DEFAULT_GLOBAL_SETTINGS = {
+    "max_level": 99,   # mirrors GameConfig.max_level's own default
+}
+
+
+def load_global_settings() -> dict:
+    """Return saved global settings, merged over the defaults so new keys
+    added later don't break existing save files. Returns the defaults
+    untouched if nothing has been saved yet."""
+    settings = copy.deepcopy(DEFAULT_GLOBAL_SETTINGS)
+    if GLOBAL_SETTINGS_FILE.exists():
+        try:
+            data = json.loads(GLOBAL_SETTINGS_FILE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                settings.update(data)
+        except Exception:
+            pass
+    return settings
+
+
+def save_global_settings(settings: dict) -> None:
+    GLOBAL_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    GLOBAL_SETTINGS_FILE.write_text(json.dumps(settings, indent=2), encoding="utf-8")
 
 
 def save_character_order(order: list[str]) -> None:
@@ -839,6 +881,152 @@ class TextInput:
             cx = clip.x + font.size(self.value[:self.cursor])[0]
             cy = self.rect.y + 4
             pygame.draw.line(surf, C_TEXT, (cx, cy), (cx, self.rect.bottom - 4))
+
+
+class TextArea:
+    """Multi-line text field with soft word-wrap, for freeform prose fields
+    like the character/entity Description — TextInput above is single-line
+    only, so this is a separate widget rather than an extension of it.
+
+    self.value is always the raw, un-wrapped string (the only thing that
+    ever gets written back into cfg["description"]); wrapping is purely a
+    draw-time concern recomputed from self.rect.w every frame via _wrap(),
+    so resizing the panel (or just re-editing) never desyncs the two.
+    Enter inserts a literal '\\n' (hard break) so an author's intentional
+    paragraph breaks survive re-wrapping instead of being swallowed into
+    one run-on paragraph. Ctrl+Enter (or Tab/Escape) defocuses instead,
+    since plain Enter is needed for line breaks.
+    """
+    H = 100   # default box height if the caller doesn't override rect.h
+
+    def __init__(self, rect: pygame.Rect, value: str = "", max_len: int = 600):
+        self.rect     = rect
+        self.value    = value
+        self.max_len  = max_len
+        self.active   = False
+        self.cursor   = len(value)
+        self._blink   = 0.0
+        self._scroll  = 0   # index of the first visible wrapped line
+
+    def handle_event(self, event: pygame.event.Event) -> bool:
+        """Returns True if value changed."""
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            self.active = self.rect.collidepoint(event.pos)
+            if self.active:
+                self.cursor = len(self.value)
+            return False
+        if not self.active:
+            return False
+        if event.type == pygame.KEYDOWN:
+            if event.key == pygame.K_BACKSPACE:
+                if self.cursor > 0:
+                    self.value  = self.value[:self.cursor-1] + self.value[self.cursor:]
+                    self.cursor -= 1
+                    return True
+            elif event.key == pygame.K_DELETE:
+                self.value = self.value[:self.cursor] + self.value[self.cursor+1:]
+                return True
+            elif event.key == pygame.K_LEFT:
+                self.cursor = max(0, self.cursor - 1)
+            elif event.key == pygame.K_RIGHT:
+                self.cursor = min(len(self.value), self.cursor + 1)
+            elif event.key == pygame.K_HOME:
+                self.cursor = 0
+            elif event.key == pygame.K_END:
+                self.cursor = len(self.value)
+            elif event.key == pygame.K_RETURN:
+                if (pygame.key.get_mods() & pygame.KMOD_CTRL):
+                    self.active = False
+                elif len(self.value) < self.max_len:
+                    self.value  = self.value[:self.cursor] + "\n" + self.value[self.cursor:]
+                    self.cursor += 1
+                    return True
+            elif event.key in (pygame.K_TAB, pygame.K_ESCAPE):
+                self.active = False
+            elif event.unicode and event.unicode.isprintable():
+                if len(self.value) < self.max_len:
+                    self.value  = self.value[:self.cursor] + event.unicode + self.value[self.cursor:]
+                    self.cursor += 1
+                    return True
+        return False
+
+    def _wrap(self, font: pygame.font.Font, width: int) -> list[tuple[str, int]]:
+        """Word-wrap self.value to `width` px, returning [(line_text,
+        start_offset_into_value), ...] so the cursor's absolute position
+        can be mapped back to a (line, x) on screen in _cursor_xy()."""
+        lines: list[tuple[str, int]] = []
+        para_start = 0
+        for para in self.value.split("\n"):
+            if para == "":
+                lines.append(("", para_start))
+            else:
+                words = para.split(" ")
+                cur, cur_start, pos = "", para_start, para_start
+                for w in words:
+                    trial = f"{cur} {w}" if cur else w
+                    if cur and font.size(trial)[0] > width:
+                        lines.append((cur, cur_start))
+                        cur, cur_start = w, pos
+                    else:
+                        cur = trial
+                    pos += len(w) + 1   # word + the space that followed it
+                lines.append((cur, cur_start))
+            para_start += len(para) + 1   # +1 for the '\n' that was split on
+        return lines or [("", 0)]
+
+    def _line_of_cursor(self, lines: list[tuple[str, int]]) -> int:
+        for i, (text, start) in enumerate(lines):
+            if start <= self.cursor <= start + len(text):
+                return i
+        return len(lines) - 1
+
+    def draw(self, surf: pygame.Surface, font: pygame.font.Font,
+             dt: float, placeholder: str = "Click to add a description...") -> None:
+        self._blink = (self._blink + dt) % 1.2
+        border_col = C_ACCENT if self.active else C_BORDER
+        pygame.draw.rect(surf, C_PANEL_DARK, self.rect, border_radius=4)
+        pygame.draw.rect(surf, border_col, self.rect, 1, border_radius=4)
+
+        pad   = 8
+        inner = self.rect.inflate(-pad * 2, -pad * 2)
+        line_h = font.get_height() + 2
+        rows_visible = max(1, inner.h // line_h)
+
+        if not self.value and not self.active:
+            ph = font.render(placeholder, True, C_TEXT_DIM)
+            surf.blit(ph, (inner.x, inner.y))
+            return
+
+        lines = self._wrap(font, inner.w)
+        cur_line = self._line_of_cursor(lines)
+        if cur_line < self._scroll:
+            self._scroll = cur_line
+        elif cur_line >= self._scroll + rows_visible:
+            self._scroll = cur_line - rows_visible + 1
+        self._scroll = max(0, min(self._scroll, max(0, len(lines) - 1)))
+
+        old_clip = surf.get_clip()
+        surf.set_clip(self.rect)
+        y = inner.y
+        for text, _ in lines[self._scroll:self._scroll + rows_visible + 1]:
+            txt = font.render(text, True, C_TEXT)
+            surf.blit(txt, (inner.x, y))
+            y += line_h
+
+        if self.active and self._blink < 0.6 and self._scroll <= cur_line < self._scroll + rows_visible:
+            text, start = lines[cur_line]
+            rel = max(0, min(self.cursor - start, len(text)))
+            cx = inner.x + font.size(text[:rel])[0]
+            cy = inner.y + (cur_line - self._scroll) * line_h
+            pygame.draw.line(surf, C_TEXT, (cx, cy), (cx, cy + line_h - 2))
+        surf.set_clip(old_clip)
+
+        # Scroll hint so it's obvious there's more text than fits.
+        if len(lines) > rows_visible:
+            more = render_text_cached(
+                font, f"{self._scroll+1}-{min(len(lines), self._scroll+rows_visible)}/{len(lines)}", C_TEXT_DIM
+            )
+            surf.blit(more, (self.rect.right - more.get_width() - 4, self.rect.y - more.get_height() - 2))
 
 
 class Slider:
@@ -1183,7 +1371,8 @@ TAB_STATS     = 1
 TAB_ATTACKS   = 2
 TAB_TRANSFORM = 3
 TAB_PREVIEW   = 4
-TAB_NAMES     = ["Identity", "Stats", "Attacks", "Transformations", "Preview"]
+TAB_SETTINGS  = 5
+TAB_NAMES     = ["Identity", "Stats", "Attacks", "Transformations", "Preview", "Settings"]
 
 
 class CharacterEditor:
@@ -1217,6 +1406,11 @@ class CharacterEditor:
         y += row_h
         self.costume_idx   = costumes.index(cfg["costume"]) if cfg["costume"] in costumes else 0
 
+        # Description box — rect is a placeholder here; _draw_identity()
+        # repositions it every frame based on where the portrait preview
+        # ends up, same pattern as name_input/shadow_slider above.
+        self.desc_input = TextArea(pygame.Rect(fx, 0, fw, TextArea.H), cfg.get("description", ""))
+
         # Preview tab — must come after costume_idx is resolved.
         # Dropdown state for the form picker shown at the top of the Preview tab.
         self.preview_form_idx         = 0       # index into _all_preview_forms()
@@ -1241,8 +1435,8 @@ class CharacterEditor:
         stats = cfg["stats"]
         y0    = panel.y + 60
         self.stat_sliders: dict[str, Slider] = {}
-        for i, key in enumerate(["max_hp", "max_ki", "power",
-                                   "defense", "speed", "ki_regen"]):
+        for i, key in enumerate(["max_hp", "max_ki", "power", "ki_power",
+                                   "defense", "vitality", "speed", "ki_regen"]):
             sy = y0 + i * row_h
             self.stat_sliders[key] = Slider(
                 pygame.Rect(fx, sy + 6, fw - 50, 20),
@@ -1410,6 +1604,7 @@ class CharacterEditor:
     # ── Sync widget values → cfg ───────────────────────────────────
     def flush(self) -> None:
         self.cfg["display_name"] = self.name_input.value.strip() or self.char_id
+        self.cfg["description"]  = self.desc_input.value.strip()
         self.cfg["costume"]      = self.costumes[self.costume_idx]
         self.cfg["shadow_size"]  = int(self.shadow_slider.value)
 
@@ -1444,6 +1639,7 @@ class CharacterEditor:
         changed = False
         if active_tab == TAB_IDENTITY:
             changed |= self.name_input.handle_event(event)
+            changed |= self.desc_input.handle_event(event)
             changed |= self.shadow_slider.handle_event(event)
         elif active_tab == TAB_STATS:
             for sl in self.stat_sliders.values():
@@ -1734,6 +1930,16 @@ class CharacterEditor:
         self.shadow_slider.draw(surf, font_sm)
         y += row_h
 
+        # ── Description — freeform prose shown in the Scouter Data panel
+        # (see ui/scouter_menu.py's _get_entity_description). Lives on the
+        # Identity tab, next to the other "who is this character" fields,
+        # rather than tucked into Stats/Attacks/Transformations. ─────────
+        y += 14
+        draw_label(surf, font_sm, "Description", lx, y + 6)
+        self.desc_input.rect = pygame.Rect(fx, y, fw, TextArea.H)
+        self.desc_input.draw(surf, font_sm, dt)
+        y += TextArea.H + row_h - 28
+
         # ── Portrait preview — cycles slowly through the base look and
         # every registered transformation, so you can sanity-check each
         # form's portrait art without leaving the Identity tab. ─────────
@@ -1747,9 +1953,11 @@ class CharacterEditor:
         LABELS = {
             "max_hp":   "Max HP",
             "max_ki":   "Max Ki",
-            "power":    "Power",
-            "defense":  "Defense",
-            "speed":    "Speed",
+            "power":    "STR (Melee)",
+            "ki_power": "POW (Ki Blast)",
+            "defense":  "Defense (legacy)",
+            "vitality": "END (Defense)",
+            "speed":    "SPD",
             "ki_regen": "Ki Regen",
         }
         y = self.panel.y + 60
@@ -2169,6 +2377,13 @@ class CharacterCreator:
         self.status_msg   = ""
         self.status_col   = C_TEXT_DIM
         self.status_timer = 0.0
+
+        # ── Global (non-per-character) settings ──────────────────────
+        self.global_settings = load_global_settings()
+        self.max_level_slider = Slider(
+            pygame.Rect(0, 0, 260, 20),   # rect.y positioned in _draw_settings
+            1, 999, self.global_settings["max_level"], step=1
+        )
 
         # Non-blocking modal dialog state. None when no dialog is open.
         # dict keys: kind ('confirm'/'input'), message, field (TextInput,
@@ -2637,6 +2852,14 @@ class CharacterCreator:
                         form = picker_list[ed.transform_costume_idx]
                         self._set_transform_preview(f"{ed._current_costume()}/transformations/{form}")
 
+        if self.active_tab == TAB_SETTINGS:
+            if self.max_level_slider.handle_event(event):
+                new_max = int(self.max_level_slider.value)
+                if new_max != self.global_settings["max_level"]:
+                    self.global_settings["max_level"] = new_max
+                    save_global_settings(self.global_settings)
+                    self._set_status(f"Max level set to {new_max}")
+
         new_sel = self.char_list.handle_event(event)
         if new_sel:
             self._switch_char(new_sel)
@@ -2745,5 +2968,33 @@ class CharacterCreator:
             )
             screen.blit(msg, msg.get_rect(center=self.editor_rect.center))
 
+        # Settings is global, not tied to whichever character is selected,
+        # so it draws independently of self.editor (and even when no
+        # character exists yet).
+        if self.active_tab == TAB_SETTINGS:
+            self._draw_settings(screen, font, font_sm)
+
         if self.dialog is not None:
             self._draw_dialog(screen, dt)
+
+    def _draw_settings(self, screen: pygame.Surface,
+                       font: pygame.font.Font, font_sm: pygame.font.Font) -> None:
+        """Global (not per-character) game settings — currently just max
+        level, persisted to GLOBAL_SETTINGS_FILE via save_global_settings()
+        and picked up by GameConfig at game startup."""
+        lx = self.editor_rect.x + 20
+        fx = self.editor_rect.x + 180
+        y  = self.editor_rect.y + 60
+
+        draw_label(screen, font_sm, "Max Level", lx, y + 6)
+        self.max_level_slider.rect.x = fx
+        self.max_level_slider.rect.y = y + 6
+        self.max_level_slider.draw(screen, font_sm)
+
+        hint = render_text_cached(
+            font_sm,
+            "Applies game-wide (all characters share the same level cap). "
+            "Takes effect next time the game starts.",
+            C_TEXT_DIM,
+        )
+        screen.blit(hint, (lx, y + 42))

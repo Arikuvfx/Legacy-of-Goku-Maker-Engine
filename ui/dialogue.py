@@ -141,7 +141,7 @@ class DialogueBox:
 
         self._load_sheet()
 
-        font_scale = 5
+        font_scale = 4
         self._font_upper   = _BitmapFont('assets/ui/fonts/uppercase', scale=font_scale)
         self._font_lower   = _BitmapFont('assets/ui/fonts/lowercase', scale=font_scale)
         self._font_numbers = _BitmapFont('assets/ui/fonts/numbers',   scale=font_scale)
@@ -537,22 +537,40 @@ class DialogueChoiceMenu:
     """Selection menu for the 'dialogue_choice' event action — an optional
     prompt line plus a vertical list of options, navigated with Up/Down
     (or W/S) and confirmed with E. Same controls/animation language as
-    objects.save_point.SavePointMenu, generalized to N options."""
+    objects.save_point.SavePointMenu, generalized to N options.
+
+    Pagination: only PAGE_SIZE real options are shown at once. If there are
+    more than PAGE_SIZE options total, the first page gets a trailing 'Next'
+    row after its real options; later pages get a trailing 'Back' row (a
+    middle page gets both — real options, then Back, then Next). Picking
+    Next/Back just flips self._page and rebuilds the displayed rows — it
+    never touches self._on_choice, so the caller (EventRunner via Game)
+    stays completely unaware pagination happened. Only picking a real
+    option calls on_choice, and always with that option's index into the
+    *original* full options list passed to open(), matching what
+    event_actions.dialogue_choice()/EventRunner expect.
+    """
+
+    PAGE_SIZE = 3
 
     def __init__(self, screen_width, screen_height):
         self.screen_width  = screen_width
         self.screen_height = screen_height
         self.active  = False
         self.prompt  = ""
-        self.options = []          # list[str]
+        self.options = []          # list[str] — labels for the CURRENT page only
         self.selected_option = 0
         self._on_choice = None
+
+        self._all_options = []     # list[str] — the full, unpaginated option list
+        self._page = 0
+        self._row_kinds = []       # parallel to self.options: ('real', idx) | ('next', None) | ('back', None)
 
         self.menu_sprite  = None
         self.arrow_sprite = None
         self._load_sprites()
 
-        font_scale = 6
+        font_scale = 4
         self._font_upper   = _BitmapFont('assets/ui/fonts/uppercase', scale=font_scale)
         self._font_lower   = _BitmapFont('assets/ui/fonts/lowercase', scale=font_scale)
         self._font_numbers = _BitmapFont('assets/ui/fonts/numbers',   scale=font_scale)
@@ -577,7 +595,7 @@ class DialogueChoiceMenu:
 
     def _load_sprites(self):
         try:
-            self.menu_sprite = pygame.image.load('assets/ui/textbox/small_box.png').convert_alpha()
+            self.menu_sprite = pygame.image.load('assets/ui/textbox/textbox.png').convert_alpha()
         except Exception:
             self.menu_sprite = None
         try:
@@ -586,7 +604,7 @@ class DialogueChoiceMenu:
             self.arrow_sprite = None
 
     # ── mixed-case rendering helpers (mirrors DialogueBox's own) ────────────
-    _DESCENDER_OFFSETS = {'p': 10, 'q': 10, 'g': 10, 'y': 15}
+    _DESCENDER_OFFSETS = {'p': 10, 'q': 10, 'g': 10, 'y': 12}
 
     def _font_for(self, ch):
         return (self._font_numbers if ch.isdigit()
@@ -611,18 +629,19 @@ class DialogueChoiceMenu:
         return max(0, w - spacing)
 
     def _render_line(self, screen, text, x, y, color, spacing=1):
-        max_h = 0
-        for ch in text:
-            font = self._font_for(ch)
-            if ch in font.glyphs:
-                max_h = max(max_h, font.glyphs[ch].get_height())
+        # Bottom-align to the *shared* font baseline (self._line_height()),
+        # not the tallest glyph on this particular line — per-line max_h
+        # made rows without a descender/tall letter sit at a different
+        # baseline than rows that had one, so the gap between rows looked
+        # inconsistent. Mirrors DialogueBox._render_text_line's fix.
+        base_h = self._line_height()
         cx = x
         for ch in text:
             font = self._font_for(ch)
             if ch in font.glyphs:
                 g = font.glyphs[ch].copy()
                 g.fill(color, special_flags=pygame.BLEND_RGBA_MULT)
-                oy = max_h - g.get_height() + self._DESCENDER_OFFSETS.get(ch, 0)
+                oy = base_h - g.get_height() + self._DESCENDER_OFFSETS.get(ch, 0)
                 screen.blit(g, (cx, y + oy))
                 cx += g.get_width() + spacing
             elif ch == ' ':
@@ -632,25 +651,67 @@ class DialogueChoiceMenu:
 
     def open(self, options, prompt="", on_choice=None):
         """options: list[str] of option labels. on_choice(index) is called
-        once the player confirms with E."""
-        self.options    = list(options)
-        self.prompt     = prompt or ""
-        self._on_choice = on_choice
-        self.selected_option = 0
+        once the player confirms with E, with that option's index into
+        this original `options` list (pagination is purely a display
+        concern and never renumbers it)."""
+        self._all_options = list(options)
+        self._page        = 0
+        self.prompt        = prompt or ""
+        self._on_choice     = on_choice
         self.active      = True
         self.is_opening  = True
         self.scale_progress = 0.0
-        self._chars_shown        = [0] * len(self.options)
         self._prompt_chars_shown = 0
         self._typewriter_timer   = 0.0
         self.typewriter_complete = False
         self.arrow_blink_timer   = 0.0
         self.arrow_visible       = True
+        self._build_page(reset_reveal=True)
 
     def close(self):
         self.active     = False
         self.is_opening  = False
         self._on_choice  = None
+
+    # ── Pagination ───────────────────────────────────────────────────────────
+
+    def _build_page(self, reset_reveal=False):
+        """Recompute self.options/self._row_kinds for self._page out of
+        self._all_options. `reset_reveal=True` restarts the typewriter (used
+        when the menu first opens); page flips via Next/Back leave it False
+        so the new page's rows appear instantly instead of re-typing."""
+        total = len(self._all_options)
+        if total <= self.PAGE_SIZE:
+            rows  = list(self._all_options)
+            kinds = [('real', i) for i in range(total)]
+        else:
+            start = self._page * self.PAGE_SIZE
+            chunk = self._all_options[start:start + self.PAGE_SIZE]
+            has_prev = self._page > 0
+            has_next = (start + self.PAGE_SIZE) < total
+
+            rows  = list(chunk)
+            kinds = [('real', start + i) for i in range(len(chunk))]
+            if has_prev:
+                rows.append('Back')
+                kinds.append(('back', None))
+            if has_next:
+                rows.append('Next')
+                kinds.append(('next', None))
+
+        self.options    = rows
+        self._row_kinds = kinds
+        self.selected_option = 0
+
+        if reset_reveal:
+            self._chars_shown        = [0] * len(self.options)
+            self._prompt_chars_shown = 0
+            self._typewriter_timer   = 0.0
+            self.typewriter_complete = False
+        else:
+            # Page flip on an already-open menu — show the new rows
+            # immediately rather than re-running the reveal animation.
+            self._chars_shown = [len(o) for o in self.options]
 
     def update(self, dt):
         if not self.active:
@@ -730,7 +791,20 @@ class DialogueChoiceMenu:
                 self.typewriter_complete = True
                 return None
             if self.options:
-                index = self.selected_option
+                kind, payload = self._row_kinds[self.selected_option]
+
+                if kind == 'next':
+                    self._page += 1
+                    self._build_page(reset_reveal=False)
+                    return None
+                if kind == 'back':
+                    self._page -= 1
+                    self._build_page(reset_reveal=False)
+                    return None
+
+                # kind == 'real' — payload is the index into the original
+                # full options list passed to open().
+                index = payload
                 cb, self._on_choice = self._on_choice, None
                 self.active     = False
                 self.is_opening = False
@@ -746,21 +820,27 @@ class DialogueChoiceMenu:
 
         scale_factor = self._ease_out_back(self.scale_progress)
 
-        _sprite_w, _sprite_h = 144, 40
+        if self.menu_sprite:
+            _sprite_w, _sprite_h = self.menu_sprite.get_size()
+        else:
+            _sprite_w, _sprite_h = 144, 40
         base_scale = max(1, int(self.screen_height * 0.24 / _sprite_h))
         lh       = self._line_height()
         pad_y    = max(24, lh // 2)
-        row_gap  = max(20, lh // 2)
+        row_gap  = 16
         row_h    = lh + row_gap
         prompt_h = (lh + row_gap) if self.prompt else 0
 
         menu_width      = _sprite_w * base_scale
         baseline_height = _sprite_h * base_scale   # comfortable height the box art was designed for
         content_height  = pad_y * 2 + prompt_h + row_h * max(1, len(self.options))
-        menu_height     = max(baseline_height, content_height)
+        # Always use the box's normal designed height — never stretch the
+        # artwork to fit taller content (that produced a visibly warped,
+        # oversized box on pages with a prompt or several options).
+        menu_height     = baseline_height
 
-        # Centre the (possibly shorter) content vertically inside the box
-        # instead of hugging the top when the baseline height wins.
+        # Centre the (possibly shorter, or slightly clipped) content
+        # vertically inside the box.
         extra_y = max(0, menu_height - content_height)
 
         current_width  = int(menu_width  * scale_factor)
@@ -783,7 +863,7 @@ class DialogueChoiceMenu:
             return
 
         menu_center_x = menu_x + current_width // 2
-        text_y = menu_y + pad_y + int(extra_y // 2 * scale_factor)
+        text_y = menu_y + pad_y + int(extra_y // 2 * scale_factor) - 4
 
         if self.prompt:
             display_prompt = self.prompt[:self._prompt_chars_shown]

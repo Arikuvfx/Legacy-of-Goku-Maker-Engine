@@ -31,13 +31,16 @@ class RoomPersistence:
                 'level_gates':          self._serialize_level_gates(room),
                 'entities':             self._serialize_entities(room),
                 'flying_pads':          self._serialize_flying_pads(room),
+                'nimbus_clouds':        self._serialize_nimbus_clouds(room),
                 'save_points':          self._serialize_save_points(room),
                 'world_map_objects':     self._serialize_world_map_objects(room),
                 'music_track':           getattr(room, 'music_track', ''),
                 'animated_regions':      self._serialize_animated_regions(room),
                 'doors':                 self._serialize_doors(room),
                 'trigger_boxes':         self._serialize_trigger_boxes(room),
+                'chests':                self._serialize_chests(room),
                 'scrolling_bg':          self._serialize_scrolling_bg(room),
+                'map_paint':             self._serialize_map_paint(room),
             }
             with open(self._get_room_filepath(room.name), 'w') as f:
                 json.dump(data, f, indent=2)
@@ -98,6 +101,17 @@ class RoomPersistence:
         return [{'x': t.x, 'y': t.y, 'tileset_name': t.tileset_name,
                  'tile_x': t.tile_x, 'tile_y': t.tile_y, 'layer': t.layer}
                 for t in room.tiles]
+
+    def _serialize_map_paint(self, room):
+        """Scouter minimap silhouette painted in the room editor's Map Paint
+        tool (see objects/map_paint.py). Already a plain list of [gx, gy]
+        pairs by the time it reaches here — room.map_paint is kept as a
+        plain list rather than a live object specifically so this is a
+        straight passthrough, same as entities/scrolling_bg."""
+        cells = getattr(room, 'map_paint', None)
+        if not cells:
+            return []
+        return [[int(c[0]), int(c[1])] for c in cells]
 
     def _serialize_collision_objects(self, room):
         if not getattr(room, 'collision_objects', None):
@@ -207,6 +221,15 @@ class RoomPersistence:
             })
         return out
 
+    def _serialize_nimbus_clouds(self, room):
+        # NimbusCloud already has a full to_dict() (waypoints incl.
+        # spawn_x/spawn_y, is_return_pad, linked_pad_id, source_room,
+        # rider offsets, cloud_type) so reuse it directly instead of
+        # hand-rolling a dict like _serialize_flying_pads does.
+        if not getattr(room, 'nimbus_clouds', None):
+            return []
+        return [c.to_dict() for c in room.nimbus_clouds]
+
     def _serialize_save_points(self, room):
         if not getattr(room, 'save_points', None):
             return []
@@ -240,6 +263,15 @@ class RoomPersistence:
         from objects.trigger_box import TriggerBox
         return [TriggerBox.from_dict(d) for d in data]
 
+    def _serialize_chests(self, room):
+        if not getattr(room, 'chests', None):
+            return []
+        return [c.to_dict() for c in room.chests]
+
+    def deserialize_chests(self, data):
+        from objects.chest_object import Chest
+        return [Chest.from_dict(d) for d in data]
+
     def _serialize_animated_regions(self, room):
         if not getattr(room, 'animated_regions', None):
             return []
@@ -261,6 +293,12 @@ class RoomPersistence:
         return [Tile(x=t['x'], y=t['y'], tileset_name=t['tileset_name'],
                      tile_x=t['tile_x'], tile_y=t['tile_y'], layer=t['layer'])
                 for t in tiles_data]
+
+    def deserialize_map_paint(self, map_paint_data):
+        """Plain [gx, gy] pairs, same shape written by _serialize_map_paint
+        — no live object type involved (see objects/map_paint.py), so this
+        is just a validated passthrough."""
+        return [[int(c[0]), int(c[1])] for c in map_paint_data]
 
     def deserialize_collision_objects(self, collision_data):
         from objects.collision_object import CollisionObject
@@ -331,7 +369,17 @@ class RoomPersistence:
         if not entities_data:
             return []
 
-        from entities.boss_enemy import BOSS_REGISTRY
+        # NOTE: BOSS_REGISTRY is imported defensively — if entities/boss_enemy.py
+        # doesn't (yet) define it (renamed, moved, or a circular-import timing
+        # issue), we fall back to an empty registry instead of taking the
+        # whole game down on startup. Boss entries just skip the geometry
+        # refresh in that case and load with whatever was last saved.
+        try:
+            from entities.boss_enemy import BOSS_REGISTRY
+        except ImportError as e:
+            print(f"Warning: could not import BOSS_REGISTRY ({e}); "
+                  f"boss entities will load without a geometry refresh.")
+            BOSS_REGISTRY = {}
         out = []
         for ent in entities_data:
             if ent.get('entity_type') == 'boss':
@@ -373,6 +421,10 @@ class RoomPersistence:
                 pad.waypoints.append(wp)
             out.append(pad)
         return out
+
+    def deserialize_nimbus_clouds(self, clouds_data):
+        from objects.nimbus_cloud import NimbusCloud
+        return [NimbusCloud.from_dict(d) for d in clouds_data]
 
 
 class RoomManagerWithPersistence:
@@ -441,18 +493,21 @@ class RoomManagerWithPersistence:
             room.spawn_point  = None
 
         room.tiles               = self.persistence.deserialize_tiles(data['tiles'])               if data.get('tiles')               else []
+        room.map_paint           = self.persistence.deserialize_map_paint(data['map_paint'])       if data.get('map_paint')           else []
         room.collision_objects   = self.persistence.deserialize_collision_objects(data['collision_objects'])   if data.get('collision_objects')   else []
         room.destructible_stones = self.persistence.deserialize_destructible_stones(data['destructible_stones']) if data.get('destructible_stones') else []
         room.room_transitions    = self.persistence.deserialize_room_transitions(data['room_transitions'])    if data.get('room_transitions')    else []
         room.level_gates         = self.persistence.deserialize_level_gates(data['level_gates'])         if data.get('level_gates')         else []
         room.entities            = self.persistence.deserialize_entities(data['entities'])            if data.get('entities')            else []
         room.flying_pads         = self.persistence.deserialize_flying_pads(data['flying_pads'])      if data.get('flying_pads')         else []
+        room.nimbus_clouds       = self.persistence.deserialize_nimbus_clouds(data['nimbus_clouds'])   if data.get('nimbus_clouds')       else []
         room.save_points         = self.persistence.deserialize_save_points(data['save_points'])      if data.get('save_points')         else []
         room.world_map_objects   = self.persistence.deserialize_world_map_objects(data['world_map_objects']) if data.get('world_map_objects') else []
         room.music_track         = data.get('music_track', '')
         room.animated_regions    = self.persistence.deserialize_animated_regions(data['animated_regions'], room_name) if data.get('animated_regions') else []
         room.doors               = self.persistence.deserialize_doors(data['doors'])              if data.get('doors')               else []
         room.trigger_boxes       = self.persistence.deserialize_trigger_boxes(data['trigger_boxes']) if data.get('trigger_boxes') else []
+        room.chests              = self.persistence.deserialize_chests(data['chests'])             if data.get('chests')              else []
         room.scrolling_bg        = self.persistence.deserialize_scrolling_bg(data.get('scrolling_bg'))
 
         existing = self.get_room_by_name(room_name)

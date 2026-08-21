@@ -12,6 +12,7 @@ import pygame
 import os
 from config.settings import RENDER_SCALE
 from core.bitmap_font import BitmapFont
+from ui.pause_menu import FlatBitmapFont
 
 _S = max(1, RENDER_SCALE)
 
@@ -42,12 +43,20 @@ class CharacterSwitchMenu:
 
         self.animation_speed = 0.15  # seconds per walk frame
 
-        font_scale = max(1, int(RENDER_SCALE))
+        # Flat constant, independent of RENDER_SCALE — matches pause_menu.py's
+        # own font_scale so bitmap-font text renders at the same on-screen
+        # size across menus instead of drifting with the current render scale.
+        font_scale = 4
         self.bitmap_font = BitmapFont(
             'assets/ui/fonts',
             letter_spacing=max(1, int(2 / RENDER_SCALE)),
             scale=font_scale
         )
+        # Same bold tab-title fonts pause_menu.py uses for its 'STATUS' /
+        # 'INVENTORY' style tab titles, so 'Switch Character' matches them
+        # exactly instead of falling back to the generic button-label font.
+        self.bold_font           = FlatBitmapFont('assets/ui/fonts/bold',          letter_spacing=max(4, int(10/RENDER_SCALE)), scale=font_scale)
+        self.bold_lowercase_font = FlatBitmapFont('assets/ui/fonts/bold_lowercase', letter_spacing=max(4, int(10/RENDER_SCALE)), scale=font_scale)
 
         # Colors
         self.bg_scanline_dark  = (0,   80,  0)
@@ -319,17 +328,21 @@ class CharacterSwitchMenu:
         self._draw_tiled_background(screen, pygame.Rect(0, 0, self.screen_width, self.screen_height))
 
         title_margin = int(self.canvas_height * 0.08)
-        self._render_text_with_shadow(
-            screen, "Switch Character",
-            (self.screen_width // 2, self.canvas_y - int(50 / _S) + title_margin),
-            anchor='center'
-        )
 
         inner_margin = int(self.canvas_height)
         inner_w = int(self.canvas_width * 1.1 - inner_margin)
         inner_h = int(self.canvas_height) // 1.4
         box_x   = self.canvas_x + (self.canvas_width - inner_w) // 2
         box_y   = self.canvas_y + title_margin
+
+        # Same font (bold_font/bold_lowercase_font) and the same distance
+        # above the border that pause_menu.py uses for its 'STATUS' /
+        # 'INVENTORY' tab titles, instead of the generic bitmap_font used
+        # for button labels.
+        btn_scale = max(2, int(self.canvas_height * 0.06))
+        title_gap = max(4, int(self.canvas_height * 0.01))
+        title_y   = box_y - btn_scale - title_gap - 16
+        self._draw_bold_title(screen, "Switch Character", box_x + inner_w // 2, title_y)
 
         sprite_drawn = self.box_sprite and self._draw_9slice_sprite(
             screen, self.box_sprite, box_x, box_y, inner_w, inner_h, corner_size=20
@@ -387,6 +400,41 @@ class CharacterSwitchMenu:
         for y in range(rect.top, rect.bottom, sh * 2):
             pygame.draw.rect(screen, self.bg_scanline_dark,  pygame.Rect(rect.left, y,      rect.width, sh))
             pygame.draw.rect(screen, self.bg_scanline_light, pygame.Rect(rect.left, y + sh, rect.width, sh))
+
+    def _draw_bold_title(self, screen, text, center_x, y):
+        """
+        Renders `text` with pause_menu.py's bold tab-title fonts: uppercase
+        letters from bold_font, lowercase from bold_lowercase_font, yellow
+        with a 1px drop shadow. Mirrors the centre tab-title block in
+        PauseMenu.draw() exactly so titles look identical across both menus.
+        """
+        # Rendering a lone ' ' through FlatBitmapFont.render() collapses to a
+        # 1x1 dummy surface (it has no glyph, so the font never picks up a
+        # height for it) — unlike pause_menu's single-word tab titles, this
+        # title has a space in it, so it needs its own fixed-width gap here.
+        space_w = int(8 * self.bold_font.scale)
+        char_surfs = []  # list of (surf_or_None, width) — None marks a space
+        for ch in text:
+            if ch == ' ':
+                char_surfs.append((None, space_w))
+                continue
+            s = (self.bold_font if ch.isupper() else self.bold_lowercase_font).render(ch)
+            s = s.copy()
+            s.fill((255, 255, 0), special_flags=pygame.BLEND_RGBA_MULT)
+            char_surfs.append((s, s.get_width()))
+
+        total_w = sum(w for _, w in char_surfs) + 5 * (len(char_surfs) - 1)
+        max_h   = max(s.get_height() for s, _ in char_surfs if s is not None)
+        x       = center_x - total_w // 2
+
+        for s, w in char_surfs:
+            if s is not None:
+                shadow = s.copy()
+                shadow.fill((0, 0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+                oy = max_h - s.get_height()
+                screen.blit(shadow, (x + 1, y + oy + 1))
+                screen.blit(s,      (x,     y + oy))
+            x += w + 5
 
     def _render_text_with_shadow(self, screen, text, position, anchor='center'):
         shadow_surf = self.bitmap_font.render(text).copy()

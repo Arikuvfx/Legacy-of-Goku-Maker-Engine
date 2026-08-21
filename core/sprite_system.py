@@ -65,10 +65,38 @@ class SpriteSheet:
         return self.get_sprite_row(direction_row, num_frames, width, height)
 
 
-class Animation:
-    """Drives a flipbook of frames at a fixed rate."""
+def _frame_has_pixels(surface):
+    """True if `surface` has at least one non-fully-transparent pixel.
 
-    def __init__(self, frames, frame_duration=0.1, loop=True, loop_tail_frames=None):
+    Used by idle-blink animations to decide whether the second frame is
+    real art or just an empty/placeholder frame — an idle sheet whose
+    second frame is blank should never blink to it, it should just sit
+    on frame 0 forever.
+    """
+    if surface is None:
+        return False
+    try:
+        return pygame.mask.from_surface(surface).count() > 0
+    except pygame.error:
+        return False
+
+
+class Animation:
+    """Drives a flipbook of frames at a fixed rate.
+
+    Normally this just advances through `frames` every `frame_duration`
+    seconds (optionally looping). Idle animations use a different,
+    "blink" mode instead (see `idle_blink` below).
+    """
+
+    # How long an idle animation rests on frame 0 before briefly blinking
+    # to frame 1. Fixed at the class level so every idle animation across
+    # every sprite type (player/enemy/npc/critter/boss) blinks on the same
+    # cadence, per spec: "the idle switches every 4 seconds shortly to the
+    # second frame. Otherwise it stays at the first frame."
+    IDLE_BLINK_INTERVAL = 4.0
+
+    def __init__(self, frames, frame_duration=0.1, loop=True, loop_tail_frames=None, idle_blink=False):
         self.frames = frames
         self.frame_duration = frame_duration
         self.loop = loop
@@ -82,7 +110,34 @@ class Animation:
         self.time_elapsed = 0
         self.finished = False
 
+        # Idle-blink mode: instead of cycling through every frame at
+        # frame_duration like a normal flipbook, hold frame 0 and only
+        # briefly cut to frame 1 every IDLE_BLINK_INTERVAL seconds (like
+        # an eye-blink), then return to frame 0. Only turns on if there's
+        # actually a usable second frame — a single-frame idle sheet, or
+        # one whose second frame is fully transparent/blank, just stays
+        # on frame 0 forever and never blinks.
+        self.idle_blink = bool(idle_blink) and len(frames) > 1 and _frame_has_pixels(frames[1])
+        self._blinking = False
+
     def update(self, dt):
+        if self.idle_blink:
+            self.time_elapsed += dt
+            if self._blinking:
+                # Currently showing the blink frame — hold it for one
+                # frame_duration, then drop back to the resting frame.
+                if self.time_elapsed >= self.frame_duration:
+                    self.time_elapsed = 0
+                    self._blinking = False
+                    self.current_frame = 0
+            else:
+                # Resting on frame 0 — wait out the blink interval.
+                if self.time_elapsed >= self.IDLE_BLINK_INTERVAL:
+                    self.time_elapsed = 0
+                    self._blinking = True
+                    self.current_frame = 1
+            return
+
         # Once finished, a plain non-looping animation just holds its last
         # frame forever — nothing left to advance. A tail-looping animation
         # is a different story: it's marked finished after its first full
@@ -128,6 +183,7 @@ class Animation:
         self.current_frame = 0
         self.time_elapsed = 0
         self.finished = False
+        self._blinking = False
 
 
 class AnimatedSprite:
@@ -218,6 +274,12 @@ class AnimatedSprite:
         key = f"{animation_name}_{direction}"
         variants = []
 
+        # Every 'idle' animation (player, enemy, npc, critter, boss — they
+        # all funnel through this one method) uses blink mode rather than
+        # cycling through its frames like a normal flipbook. See
+        # Animation.idle_blink.
+        idle_blink = (animation_name == 'idle')
+
         for variant_index in range(num_variants):
             row = (variant_index * num_directions) + direction_offset
             frames = sprite_sheet.get_all_frames(self.sprite_width, self.sprite_height, row)
@@ -225,7 +287,18 @@ class AnimatedSprite:
             if not frames:
                 continue
 
-            animation = Animation(frames, frame_duration, loop, loop_tail_frames)
+            # get_all_frames() derives frame count from the sheet's overall
+            # width, which is shared across every direction row in the file.
+            # That's correct for down/left/right (each genuinely has a second
+            # blink frame), but the up-facing idle pose only has one real
+            # frame — its second column isn't blank art (so _frame_has_pixels
+            # can't filter it out for us), it's just not meant to be shown.
+            # Simplest fix: only ever look at column 0 for 'up' idle, so
+            # there's nothing to blink OR cycle to.
+            if animation_name == 'idle' and direction == 'up':
+                frames = frames[:1]
+
+            animation = Animation(frames, frame_duration, loop, loop_tail_frames, idle_blink=idle_blink)
             variants.append(animation)
 
         if not variants:
@@ -702,6 +775,19 @@ class CharacterSpriteLoader:
         # leaves regular idle.
         sprite.load_animation('idle_transition', 'down', frame_duration=0.15, loop=False, num_variants=1)
         sprite.load_animation('idle_wait', 'down', frame_duration=0.5, loop=True, num_variants=1)
+
+        # Item-pickup pose (chest opening — see Player.start_pickup_item).
+        # pickup_item.png only has a down-facing pose, no other directions,
+        # so it's loaded direct like idle_transition/idle_wait above rather
+        # than through animations_4dir. start_pickup_item() always forces
+        # the sprite to face 'down' for this animation regardless of which
+        # way the player was actually facing; the player's own self.direction
+        # is left untouched so enter_idle() resumes facing the right way
+        # once the pose ends. loop=True so it just holds/keeps playing for
+        # however long game.py's ~1s pickup sequence lasts — the real
+        # duration is driven by Player.PICKUP_ITEM_DURATION, not this
+        # animation's own frame count.
+        sprite.load_animation('pickup_item', 'down', frame_duration=0.15, loop=True, num_variants=1)
 
         # kiblast.png is laid out as [start, right-hand throw, left-hand throw] on one row.
         # A single Q press always shows frame 0 followed by frame 1 — fixed, not random.

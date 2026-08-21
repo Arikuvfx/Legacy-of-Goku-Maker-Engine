@@ -2,6 +2,12 @@ import pygame
 import pygame.gfxdraw
 
 from core.zeni_system import pool_keys as _zeni_pool_keys
+from dev_tools import entity_creator
+
+# Accent colours used for entity-editor preview sprites, keyed by
+# entity_type — mirrors EntityEditor.COLORS['enemy_color'] / ['boss_color'].
+_ENEMY_VARIANT_COLOR = (220, 60, 60)
+_BOSS_VARIANT_COLOR  = (180, 50, 180)
 
 
 def _build_enemy_catalogue():
@@ -12,82 +18,48 @@ def _build_enemy_catalogue():
     calls this too, so there's a single source of truth for what enemies
     exist — see discover_enemy_ids() below for the id-only view other
     modules (e.g. the event editor's spawn_enemies action) actually want.
+
+    Sourced live from assets/enemies/{id}.json via entity_creator — the
+    same data the entity creator dev tool writes. There is no hardcoded
+    roster anymore: dropping a sprite folder under assets/sprites/enemies/
+    and/or saving a config in the entity creator is all it takes for an
+    enemy or boss to show up here. entity_type ('enemy' | 'boss') on each
+    config decides which of the two categories it lands in.
     """
-    return {
-        # ── Normal Enemies ───────────────────────────────────────────────
-        'Enemies': [
+    catalogue = {'Enemies': [], 'Enemy Bosses': []}
+
+    for entity_id in entity_creator.discover_all_ids(entity_creator.KIND_ENEMY):
+        cfg = entity_creator.load_config(entity_creator.KIND_ENEMY, entity_id)
+        is_boss = cfg.get('entity_type') == 'boss'
+        color = _BOSS_VARIANT_COLOR if is_boss else _ENEMY_VARIANT_COLOR
+
+        variant_ids = entity_creator.scan_variants(entity_creator.KIND_ENEMY, entity_id)
+        variants = [
             {
-                'id': 'tiger_bandit',
-                'name': 'Tiger_bandit',
-                'sprite': None,
-                'width': 32, 'height': 32,
-                'entity_type': 'enemy',
-                'enemy_category': 'melee',  # Mark as melee type
-                'has_variants': True,
-                'variants': [
-                    {'type': 'default', 'name': 'Default', 'color': (220, 60, 60)},
-                ],
-                'default_variant': 'default',
-            },
-            {
-                'id': 'shooter',
-                'name': 'Shooter (Ranged)',
-                'sprite': None,
-                'width': 32, 'height': 32,
-                'entity_type': 'enemy',
-                'enemy_category': 'shooter',  # Mark as shooter type
-                'has_variants': True,
-                'variants': [
-                    {'type': 'default', 'name': 'Thrower', 'color': (100, 120, 220)},
-                    {'type': 'gunner', 'name': 'Gunner', 'color': (180, 80, 80)},
-                    {'type': 'rocketlauncher', 'name': 'Rocket Launcher', 'color': (200, 120, 40)},
-                ],
-                'default_variant': 'default',
-            },
-        ],
-        # ── Boss Enemies ─────────────────────────────────────────────────
-        'Enemy Bosses': [
-            {
-                'id': 'pui_pui',
-                'name': 'Pui Pui',
-                'sprite': None,
-                'width': 64, 'height': 64,
-                'entity_type': 'boss',
-                'enemy_category': 'melee',
-                'has_variants': True,
-                'variants': [
-                    {'type': 'default', 'name': 'Default', 'color': (180, 50, 180)},
-                ],
-                'default_variant': 'default',
-            },
-            {
-                'id': 'android_17',
-                'name': 'Android 17',
-                'sprite': None,
-                'width': 32, 'height': 32,
-                'entity_type': 'boss',
-                'enemy_category': 'shooter',
-                'has_variants': True,
-                'variants': [
-                    {'type': 'default', 'name': 'Default', 'color': (50, 180, 220)},
-                ],
-                'default_variant': 'default',
-            },
-            {
-                'id': 'android_18',
-                'name': 'Android 18',
-                'sprite': None,
-                'width': 32, 'height': 32,
-                'entity_type': 'boss',
-                'enemy_category': 'shooter',
-                'has_variants': True,
-                'variants': [
-                    {'type': 'default', 'name': 'Default', 'color': (220, 180, 50)},
-                ],
-                'default_variant': 'default',
-            },
-        ],
-    }
+                'type': v,
+                'name': 'Default' if v == 'default' else v.replace('_', ' ').title(),
+                'color': color,
+            }
+            for v in variant_ids
+        ]
+
+        entry = {
+            'id': entity_id,
+            'name': cfg.get('display_name') or entity_id.replace('_', ' ').title(),
+            'sprite': None,
+            'width': cfg.get('width', 32), 'height': cfg.get('height', 32),
+            'entity_type': cfg.get('entity_type', 'enemy'),
+            'enemy_category': cfg.get('enemy_category', 'melee'),
+            'has_variants': True,
+            'variants': variants,
+            'default_variant': 'default',
+        }
+        catalogue['Enemy Bosses' if is_boss else 'Enemies'].append(entry)
+
+    for entries in catalogue.values():
+        entries.sort(key=lambda e: e['name'])
+
+    return catalogue
 
 
 def discover_enemy_ids():
@@ -126,22 +98,7 @@ def discover_boss_ids():
 
 
 NPC_SPRITES_ROOT = 'assets/sprites/npc'
-
-
-def _scan_npc_variants(npc_dir):
-    """Scan a single NPC's asset folder (e.g. assets/sprites/npc/<id>) for a
-    variants/ subfolder and return the variant list for it. Always includes
-    a 'default' variant first, even if the folder itself has no variants/
-    subdirectory (in that case 'default' just means "use idle.png directly
-    from npc_dir", which _load_idle_down_sprite already falls back to)."""
-    import os
-    variants = [{'type': 'default', 'name': 'Default', 'color': (50, 150, 200)}]
-    variants_dir = os.path.join(npc_dir, 'variants')
-    if os.path.isdir(variants_dir):
-        for v in sorted(os.listdir(variants_dir)):
-            if os.path.isdir(os.path.join(variants_dir, v)) and v != 'default':
-                variants.append({'type': v, 'name': v.replace('_', ' ').title(), 'color': (50, 150, 200)})
-    return variants
+_NPC_VARIANT_COLOR = (50, 150, 200)
 
 
 def _build_npc_catalogue():
@@ -150,41 +107,52 @@ def _build_npc_catalogue():
     reason as _build_enemy_catalogue() above: so the roster can be read
     without instantiating a full EntityEditor.
 
-    NPCs are discovered dynamically: every subfolder of
-    assets/sprites/npc/ becomes a placeable NPC, using the folder name as
-    both its id and (title-cased) display name. Dropping a new folder in
-    there — e.g. assets/sprites/npc/blacksmith/ — is all that's needed to
-    make it show up in the palette; no code changes required. Each NPC's
-    own variants/ subfolder is scanned the same way (see
-    _scan_npc_variants() above). If assets/sprites/npc/ doesn't exist yet,
-    or has no subfolders, we fall back to a single placeholder 'generic'
-    entry so the palette is never empty and old projects keep working."""
-    import os
-
-    npc_ids = []
-    if os.path.isdir(NPC_SPRITES_ROOT):
-        for entry in sorted(os.listdir(NPC_SPRITES_ROOT)):
-            if os.path.isdir(os.path.join(NPC_SPRITES_ROOT, entry)):
-                npc_ids.append(entry)
-
+    Sourced live from entity_creator: discover_all_ids() unions every
+    sprite-folder id under assets/sprites/npc/ with every id that has a
+    saved assets/npcs/{id}.json, so a new folder OR a new config is enough
+    to show up here — same "no code changes required" convention the old
+    sprite-only scan had, just backed by the shared discovery/config
+    helpers instead of a local re-implementation. display_name and the
+    default dialogue (used to seed the placement popup) come straight from
+    the saved config. Falls back to a single placeholder 'generic' entry
+    if nothing is configured yet, so the palette is never empty."""
+    npc_ids = entity_creator.discover_all_ids(entity_creator.KIND_NPC)
     if not npc_ids:
         npc_ids = ['generic']
 
     npcs = []
     for npc_id in npc_ids:
-        npc_dir = os.path.join(NPC_SPRITES_ROOT, npc_id)
-        variants = _scan_npc_variants(npc_dir)
+        cfg = entity_creator.load_config(entity_creator.KIND_NPC, npc_id)
+
+        variant_ids = entity_creator.scan_variants(entity_creator.KIND_NPC, npc_id)
+        variants = [
+            {
+                'type': v,
+                'name': 'Default' if v == 'default' else v.replace('_', ' ').title(),
+                'color': _NPC_VARIANT_COLOR,
+            }
+            for v in variant_ids
+        ]
+
+        display_name = cfg.get('display_name') or (
+            'Generic NPC' if npc_id == 'generic' else npc_id.replace('_', ' ').title()
+        )
+
         npcs.append({
             'id': npc_id,
-            'name': npc_id.replace('_', ' ').title() if npc_id != 'generic' else 'Generic NPC',
+            'name': display_name,
             'sprite': None,
-            'width': 32, 'height': 32,
+            'width': cfg.get('width', 32), 'height': cfg.get('height', 32),
             'entity_type': 'npc',
             'has_variants': True,
+            # Seeds the placement popup's dialogue list — see the
+            # 'world click -> place entity' NPC branch in handle_event().
+            'default_dialogue_config': dict(cfg.get('dialogue', {})),
             'variants': variants,
             'default_variant': 'default',
         })
 
+    npcs.sort(key=lambda e: e['name'])
     return {'NPCs': npcs}
 
 
@@ -487,7 +455,8 @@ class EntityEditor:
                 for variant in variants:
                     sprite = self._load_idle_down_sprite(
                         entity_id, variant['type'],
-                        entity['width'], entity['height']
+                        entity['width'], entity['height'],
+                        entity.get('entity_type', '')
                     )
                     if sprite is None:
                         sprite = self._make_entity_sprite(
@@ -506,21 +475,25 @@ class EntityEditor:
                         entity['sprite'] = variants[0]['sprite'].copy()
 
     @staticmethod
-    def _load_idle_down_sprite(entity_id, variant_type, w, h):
+    def _load_idle_down_sprite(entity_id, variant_type, w, h, entity_type=''):
         """
         Try to load the first frame of the idle-down row from the entity's
         spritesheet.  Checks NPC paths first, then enemy/boss paths.
         Returns a Surface scaled to (w, h), or None if the asset is missing.
+
+        Bosses (entity_type == 'boss') live in assets/sprites/enemies/boss/
+        instead of the flat enemies/ root — only searched there when the
+        config actually says boss, not as a blind fallback for every enemy.
         """
         import os
+        enemy_root = "assets/sprites/enemies/boss" if entity_type == 'boss' else "assets/sprites/enemies"
         candidates = [
             # NPC paths
             f"assets/sprites/npc/{entity_id}/variants/{variant_type}/idle.png",
             f"assets/sprites/npc/{entity_id}/idle.png",
             # Enemy / boss paths
-            f"assets/sprites/enemies/{entity_id}/variants/{variant_type}/idle.png",
-            f"assets/sprites/enemies/{entity_id}/idle.png",
-            f"assets/sprites/enemies/boss/{entity_id}/idle.png",
+            f"{enemy_root}/{entity_id}/variants/{variant_type}/idle.png",
+            f"{enemy_root}/{entity_id}/idle.png",
             # Critter paths — idle.png first, falling back to flying.png since
             # butterflies (and similar always-airborne critters) have no idle.
             f"assets/sprites/critters/{entity_id}/variants/{variant_type}/idle.png",
@@ -596,9 +569,15 @@ class EntityEditor:
     # =========================================================================
 
     def toggle(self):
-        """Open or close the entity editor (mirrors ObjectEditor.toggle)."""
+        """Open or close the entity editor (mirrors ObjectEditor.toggle).
+
+        Rebuilds the catalogue on open (not just once in __init__) so any
+        enemy/boss/NPC saved via the entity creator since the room editor
+        started shows up immediately, instead of requiring an app restart.
+        """
         self.active = not self.active
         if self.active:
+            self._build_entity_catalogue()
             self.selected_entity = None
             self.selected_variant = None
             self.scroll_offset = 0
@@ -918,8 +897,10 @@ class EntityEditor:
                         wx = round(wx / TILE_SIZE) * TILE_SIZE
                         wy = round(wy / TILE_SIZE) * TILE_SIZE
                     if not self._placement_blocked(wx, wy, self.selected_entity):
+                        default_cfg = self.selected_entity.get('default_dialogue_config') or {}
+                        default_dialogues = list(default_cfg.get('dialogues') or [''])
                         self._dialogue_popup = {
-                            'dialogues': [''],
+                            'dialogues': default_dialogues,
                             'active_index': 0,
                             'active_tab': 'dialogues',
                             'world_x': wx, 'world_y': wy,

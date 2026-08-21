@@ -4,7 +4,7 @@ objects/trigger_box.py — Trigger Box room objects.
 Two variants, matching the spec:
   OverlapTriggerBox — fires as soon as the player's rect overlaps the box.
   KeyTriggerBox      — fires only if the player is overlapping AND presses
-                       the interact key ("A").
+                       the interact key ("E").
 
 Both support `once=True` (fire a single time, then stay inert) or
 `once=False` (fire every frame/press the condition holds — useful for
@@ -48,12 +48,27 @@ class TriggerBox:
         self.once = once
         self.triggered = False   # latched True after firing, if once=True
 
+        # Overlap bookkeeping for once=False boxes: tracks whether the
+        # player was inside the box as of the last check, and whether the
+        # box has already fired during the *current* continuous overlap.
+        # Without this, an OverlapTriggerBox fires on every single frame
+        # the player stands in it, which — for actions like dialogue_box —
+        # re-opens the dialogue every frame and makes it impossible to
+        # close. `_fired_this_entry` is cleared the instant the player
+        # leaves the box, so a once=False box still fires again on the
+        # *next* entry, just not every frame of the same visit.
+        self.inside = False
+        self._fired_this_entry = False
+
         # When True, the box skips its overlap/key check entirely — so its
         # x/y/width/height become irrelevant to firing. Lets you drop a
         # small marker box anywhere instead of dragging/resizing one to
         # cover the whole room. Still respects `once` and any attached
         # `conditions`, so it behaves like a passive "run every frame
-        # until conditions/once say stop" trigger.
+        # until conditions/once say stop" trigger. Because it never goes
+        # through the overlap-tracking above, an always_run box keeps its
+        # original every-frame-refire behavior (needed for things like a
+        # room-music trigger that should keep re-applying each frame).
         self.always_run = always_run
 
         # Built by core.event_editor.EventEditorWindow — see
@@ -87,8 +102,10 @@ class TriggerBox:
             return False
 
         fired = True if self.always_run else self._should_fire(player, keys_pressed)
-        if fired and self.once:
-            self.triggered = True
+        if fired:
+            if self.once:
+                self.triggered = True
+            self._fired_this_entry = True
         return fired
 
     def would_fire(self, player, keys_pressed=None):
@@ -96,7 +113,13 @@ class TriggerBox:
         never latches self.triggered. Lets a caller peek at whether the box
         wants to fire before deciding — e.g. to evaluate self.conditions
         first — without spending a once-only box's one shot on a frame
-        whose conditions turn out not to hold."""
+        whose conditions turn out not to hold.
+
+        Note: this does update the box's per-frame overlap bookkeeping
+        (self.inside), since that has to track the player's real position
+        every frame regardless of whether the box ultimately fires. Only
+        self.triggered / self._fired_this_entry (the "did it actually
+        fire" latches) are left untouched here — see commit()."""
         if self.once and self.triggered:
             return False
         if self.always_run:
@@ -104,11 +127,12 @@ class TriggerBox:
         return self._should_fire(player, keys_pressed)
 
     def commit(self):
-        """Latch the once-only flag, as check() would on a successful fire.
-        Call only after would_fire() and any attached conditions have both
-        already passed."""
+        """Latch the once-only flag (and the per-entry flag), as check()
+        would on a successful fire. Call only after would_fire() and any
+        attached conditions have both already passed."""
         if self.once:
             self.triggered = True
+        self._fired_this_entry = True
 
     def should_fire(self, player, keys_pressed=None, evaluate_conditions=None):
         """The condition-aware entry point: fires only when the box's own
@@ -158,6 +182,8 @@ class TriggerBox:
     def reset(self):
         """Un-latch a once-only box, e.g. when restoring a test-mode backup."""
         self.triggered = False
+        self.inside = False
+        self._fired_this_entry = False
 
     # ── Serialization (matches the to_dict/from_dict pattern used by the
     #    rest of the room object types, e.g. FlyingPadWaypoint, Door) ────────
@@ -194,29 +220,64 @@ class TriggerBox:
 
 
 class OverlapTriggerBox(TriggerBox):
-    """Fires as soon as the player overlaps the box — no button press needed."""
+    """Fires as soon as the player overlaps the box — no button press needed.
+
+    For once=False boxes, firing is edge-triggered on *entry*: it fires the
+    frame the player transitions from outside the box to inside it, then
+    stays quiet (even though the player is still overlapping) until they
+    leave and come back. This is what lets a repeatable overlap box run a
+    one-shot action like a dialogue line each time the player walks in,
+    instead of re-firing every frame they stand there.
+
+    If self.conditions are attached and fail on the entry frame, the box
+    keeps "would_fire"-ing (and its conditions keep getting re-evaluated)
+    on every subsequent frame the player remains inside — it only stops
+    polling once it actually fires (see commit()) or the player leaves.
+    """
 
     def _should_fire(self, player, keys_pressed):
-        return self._overlaps(player)
+        now_inside = self._overlaps(player)
+        if not now_inside:
+            self.inside = False
+            self._fired_this_entry = False
+            return False
+        self.inside = True
+        return not self._fired_this_entry
 
 
 class KeyTriggerBox(TriggerBox):
     """Fires only while the player overlaps the box AND presses the interact
-    key ("A"). `interact_key` defaults to pygame's A key but can be overridden
-    to match whatever key your input config maps to "interact"."""
+    key ("E"). `interact_key` defaults to pygame's E key but can be overridden
+    to match whatever key your input config maps to "interact".
 
-    def __init__(self, box_id, x, y, width, height, once=True, interact_key=pygame.K_a,
-                 conditions=None, actions=None):
+    Firing is edge-triggered on the *key press* (not "key held"): each
+    press-while-overlapping is a separate firing attempt, so a once=False
+    box can be triggered repeatedly by pressing the key again, but holding
+    the key down doesn't spam-fire it every frame. The key state resets
+    when the player leaves the box, so a held key from a previous visit
+    can't count as a fresh press on the next entry.
+    """
+
+    def __init__(self, box_id, x, y, width, height, once=True, interact_key=pygame.K_e,
+                 conditions=None, actions=None, always_run=False):
         super().__init__(box_id, x, y, width, height, once=once,
-                          conditions=conditions, actions=actions)
+                          conditions=conditions, actions=actions,
+                          always_run=always_run)
         self.interact_key = interact_key
+        self._key_was_down = False
 
     def _should_fire(self, player, keys_pressed):
-        if not self._overlaps(player):
+        now_inside = self._overlaps(player)
+        self.inside = now_inside
+        if not now_inside:
+            self._key_was_down = False
             return False
         if keys_pressed is None:
             return False
-        return bool(keys_pressed[self.interact_key])
+        key_down = bool(keys_pressed[self.interact_key])
+        just_pressed = key_down and not self._key_was_down
+        self._key_was_down = key_down
+        return just_pressed
 
     def to_dict(self):
         data = super().to_dict()
@@ -226,7 +287,7 @@ class KeyTriggerBox(TriggerBox):
     @classmethod
     def from_dict(cls, data):
         box = super().from_dict(data)
-        box.interact_key = data.get('interact_key', pygame.K_a)
+        box.interact_key = data.get('interact_key', pygame.K_e)
         return box
 
 

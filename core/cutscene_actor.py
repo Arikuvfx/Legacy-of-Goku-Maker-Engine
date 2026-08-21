@@ -814,10 +814,11 @@ class CutsceneActor:
     """Controls a game entity during a cutscene."""
 
     def __init__(self, actor_id, entity):
-        self.actor_id = actor_id
-        self.entity   = entity
-        self._tween   = None  # active _MoveTween or _FlyTween, or None
+        self.actor_id    = actor_id
+        self.entity      = entity
+        self._tween      = None  # active _MoveTween or _FlyTween, or None
         self._charge_effects: list = []  # active charge-up visual(s) — see attack()
+        self.show_shadow = True  # toggled by the 'set_shadow' action — see set_shadow_visible()
 
     # ── Position pass-throughs ────────────────────────────────────────────────
 
@@ -843,6 +844,15 @@ class CutsceneActor:
         if isinstance(self._tween, _FlyTween):
             return self._tween.fly_offset_y
         return 0.0
+
+    def set_shadow_visible(self, visible: bool):
+        """Show or hide this actor's ground shadow.
+
+        Driven by the 'set_shadow' cutscene action (see CutsceneRuntime._do_actor
+        and the editor's _ACTOR_ACTIONS). Handy for actors floating, flying, or
+        standing on something that shouldn't have a normal ground shadow.
+        """
+        self.show_shadow = bool(visible)
 
     # ── Animation & movement API ──────────────────────────────────────────────
 
@@ -1147,6 +1157,9 @@ class CutsceneActor:
         Entities don't draw their own shadows — that's normally handled by the
         LayerManager. Since cutscene actors bypass it, we reproduce the logic here.
         """
+        if not self.show_shadow:
+            return
+
         obj = self.entity
 
         # Only shadow entity types that the LayerManager would shadow.

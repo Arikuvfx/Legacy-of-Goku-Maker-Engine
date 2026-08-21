@@ -383,6 +383,18 @@ class TilesetEditor:
         }
 
         self.grid_size = 16
+        # The tileset's native sprite pitch — every tile image is drawn at
+        # this size, so multi-cell stroke patterns must always be spaced by
+        # this value (see the offset_x/offset_y math below) no matter what
+        # the placement-snap grid is currently set to, otherwise painted
+        # tiles in a multi-tile selection would overlap or leave gaps.
+        self._native_tile_size = self.grid_size
+        # The anchor-snap grid used when deciding *where* a stamp/erase
+        # lands — this is the one driven by the room editor toolbar's Grid
+        # control (Off / 8px / 16px), kept in sync via set_snap_size().
+        # 0 means "no grid": stamps land at the exact (unsnapped) mouse
+        # position instead of the nearest grid_size multiple.
+        self.snap_size = self.grid_size
         self.room_tiles: dict[str, List[Tile]] = {}
 
         self.is_dragging = False
@@ -401,6 +413,15 @@ class TilesetEditor:
     def toggle(self):
         """Open or close the tileset editor."""
         self.active = not self.active
+
+    def set_snap_size(self, size: int):
+        """Set the placement-snap grid used for stamp/erase anchoring (0 =
+        off / pixel-precise, otherwise the snap size in world pixels).
+        Called by the room editor each frame to mirror the toolbar's quick
+        Grid control. Does not affect the native tileset pitch used to
+        space multi-cell patterns — that always stays at the sprite size
+        so painted tiles keep tiling correctly."""
+        self.snap_size = max(0, int(size))
 
     # -------------------------------------------------------------------------
     # Panel show/hide tab
@@ -800,6 +821,16 @@ class TilesetEditor:
         self.selection_end_x = tile_x
         self.selection_end_y = tile_y
 
+    def _snap_anchor(self, world_x, world_y):
+        """Snap a world position to the current placement-snap grid
+        (self.snap_size). 0 means no grid — return the raw pixel position
+        unsnapped. Shared by tile stamping, erasing, and the grid overlay
+        so they can never drift apart."""
+        if self.snap_size <= 0:
+            return int(world_x), int(world_y)
+        return (int(world_x) // self.snap_size) * self.snap_size, \
+               (int(world_y) // self.snap_size) * self.snap_size
+
     def _place_tiles(self, world_x: int, world_y: int, room_name: str):
         """Stamp the current selection pattern into the room at the snapped world position.
 
@@ -813,9 +844,9 @@ class TilesetEditor:
         if not tileset:
             return
 
-        # Snap the drop point to the nearest grid cell
-        grid_x = (world_x // self.grid_size) * self.grid_size
-        grid_y = (world_y // self.grid_size) * self.grid_size
+        # Snap the drop point to the current placement-snap grid (Off / 8px
+        # / 16px, driven by the room editor toolbar's Grid control).
+        grid_x, grid_y = self._snap_anchor(world_x, world_y)
 
         # Skip if the mouse hasn't moved to a new cell — avoids redundant
         # cache rebuilds from rapid MOUSEMOTION events on the same tile
@@ -828,13 +859,18 @@ class TilesetEditor:
 
         min_x, max_x, min_y, max_y = self._get_selection_bounds()
 
+        touched_cells = []
         for ty in range(min_y, max_y + 1):
             for tx in range(min_x, max_x + 1):
                 if tileset.is_tile_empty(tx, ty):
                     continue
 
-                offset_x = (tx - min_x) * self.grid_size
-                offset_y = (ty - min_y) * self.grid_size
+                # Multi-cell pattern spacing always uses the tileset's
+                # native sprite pitch (not the placement-snap grid) so
+                # painted tiles keep tiling seamlessly regardless of what
+                # snap size is currently active.
+                offset_x = (tx - min_x) * self._native_tile_size
+                offset_y = (ty - min_y) * self._native_tile_size
                 tile_x = grid_x + offset_x
                 tile_y = grid_y + offset_y
 
@@ -853,18 +889,20 @@ class TilesetEditor:
                     self.current_layer >= 75  # treat layer 75+ as foreground
                 )
                 self.room_tiles[room_name].append(new_tile)
+                touched_cells.append((tile_x, tile_y))
 
-        # Notify listeners (e.g. auto-save) that the room content changed
+        # Notify listeners (e.g. auto-save) that the room content changed.
+        # Pass the exact cells touched so the renderer can patch just those
+        # spots in the baked surface instead of rebuilding the whole room.
         if callable(getattr(self, 'on_tile_changed', None)):
-            self.on_tile_changed(room_name)
+            self.on_tile_changed(room_name, cells=touched_cells)
 
     def _delete_tile_at_position(self, world_x: int, world_y: int, room_name: str):
         """Remove all tiles at the snapped grid cell on the current layer."""
         if room_name not in self.room_tiles:
             return
 
-        grid_x = (world_x // self.grid_size) * self.grid_size
-        grid_y = (world_y // self.grid_size) * self.grid_size
+        grid_x, grid_y = self._snap_anchor(world_x, world_y)
 
         # Skip if still on the same cell as the last erase
         if (grid_x, grid_y) == self._last_stroke_cell:
@@ -876,9 +914,11 @@ class TilesetEditor:
             if not (tile.x == grid_x and tile.y == grid_y and tile.layer == self.current_layer)
         ]
 
-        # Notify listeners (e.g. auto-save) that the room content changed
+        # Notify listeners (e.g. auto-save) that the room content changed.
+        # Pass the exact cell touched so the renderer can patch just that
+        # spot in the baked surface instead of rebuilding the whole room.
         if callable(getattr(self, 'on_tile_changed', None)):
-            self.on_tile_changed(room_name)
+            self.on_tile_changed(room_name, cells=[(grid_x, grid_y)])
 
     def draw_tile_preview(self, screen: pygame.Surface, camera_x: int, camera_y: int):
         """Draw a semi-transparent ghost of the selected tile pattern under the cursor."""
@@ -895,8 +935,7 @@ class TilesetEditor:
 
         world_x = (mouse_x + camera_x) // RENDER_SCALE
         world_y = (mouse_y + camera_y) // RENDER_SCALE
-        grid_x = (world_x // self.grid_size) * self.grid_size
-        grid_y = (world_y // self.grid_size) * self.grid_size
+        grid_x, grid_y = self._snap_anchor(world_x, world_y)
 
         min_x, max_x, min_y, max_y = self._get_selection_bounds()
         scaled_width = tileset.tile_width * RENDER_SCALE
@@ -916,8 +955,8 @@ class TilesetEditor:
                 if not scaled_tile:
                     continue
 
-                offset_x = (tx - min_x) * self.grid_size
-                offset_y = (ty - min_y) * self.grid_size
+                offset_x = (tx - min_x) * self._native_tile_size
+                offset_y = (ty - min_y) * self._native_tile_size
                 tile_world_x = grid_x + offset_x
                 tile_world_y = grid_y + offset_y
 
@@ -1247,9 +1286,14 @@ class TilesetEditor:
 
     def draw_grid(self, screen: pygame.Surface, camera_x: int, camera_y: int,
                   room_width: int, room_height: int):
-        """Overlay a tile-aligned grid on the world viewport — only draws lines in the visible frustum."""
-        if not self.show_grid or not self.active:
+        """Overlay a grid on the world viewport matching the current
+        placement-snap size (Off / 8px / 16px) — only draws lines in the
+        visible frustum. Nothing is drawn while snapping is Off, since
+        there's no grid to show."""
+        if not self.show_grid or not self.active or self.snap_size <= 0:
             return
+
+        step = self.snap_size
 
         visible_x_start = camera_x // RENDER_SCALE
         visible_y_start = camera_y // RENDER_SCALE
@@ -1257,16 +1301,16 @@ class TilesetEditor:
         visible_y_end = (camera_y + self.screen_height) // RENDER_SCALE
 
         # Draw vertical lines
-        start_x = (visible_x_start // self.grid_size) * self.grid_size
-        for x in range(start_x, visible_x_end + self.grid_size, self.grid_size):
+        start_x = (visible_x_start // step) * step
+        for x in range(start_x, visible_x_end + step, step):
             screen_x = (x * RENDER_SCALE) - camera_x
             if -10 <= screen_x <= self.screen_width + 10:
                 pygame.draw.line(screen, self.colors['grid'][:3],
                                  (int(screen_x), 0), (int(screen_x), self.screen_height), 1)
 
         # Draw horizontal lines
-        start_y = (visible_y_start // self.grid_size) * self.grid_size
-        for y in range(start_y, visible_y_end + self.grid_size, self.grid_size):
+        start_y = (visible_y_start // step) * step
+        for y in range(start_y, visible_y_end + step, step):
             screen_y = (y * RENDER_SCALE) - camera_y
             if -10 <= screen_y <= self.screen_height + 10:
                 pygame.draw.line(screen, self.colors['grid'][:3],

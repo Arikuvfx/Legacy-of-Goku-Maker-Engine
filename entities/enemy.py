@@ -204,6 +204,14 @@ class Enemy:
         self.max_hp = 150
         self.active = True
 
+        # END/defense — mitigates incoming melee damage, see
+        # GameConfig.melee_defense_factor(). Defaults to 20 because that's
+        # the Enemy END the STR curve itself was calibrated against (see
+        # game_config.py's melee_reference_end) — an untouched enemy takes
+        # damage exactly matching the original sampled data until this is
+        # tuned per enemy_type/variant.
+        self.defense = 20
+
         self.enemy_type = enemy_type
         self.variant = variant
         self.ai_type = ai_type          # 'easy' = basic movement, 'advanced' = retreats/feints/etc.
@@ -248,6 +256,17 @@ class Enemy:
         self.attack_timer = 0
         self.attack_cooldown = 0
 
+        # Raw STR/POW values — kept alongside attack_damage (which only
+        # ever holds whichever ONE of these applies to this enemy's
+        # category) so anything that wants to display both stats at once
+        # (see ui/scouter_menu.py's _get_data_stats) has something to
+        # read. Overwritten with the real entity_creator-configured
+        # values right after construction in game.py's spawn code (and
+        # in BossEnemy.__init__ for bosses) — these are just the
+        # hardcoded fallback an Enemy is born with before that happens.
+        self.strength = 10
+        self.power = 10
+
         if self.enemy_category == 'shooter':
             self.shooter_style = shooter_style  # 'bomb' = parabolic throw, 'bullet'/'rocket' = straight
 
@@ -259,6 +278,7 @@ class Enemy:
              self.preferred_distance,
              self.attack_damage,
              self.projectile_speed) = preset
+            self.power = self.attack_damage
 
             self.projectiles = []  # Active projectiles owned by this enemy
 
@@ -312,6 +332,7 @@ class Enemy:
             self.attack_range = 15       # Very close range
             self.preferred_distance = 0  # Get as close as possible
             self.attack_damage = 10
+            self.strength = self.attack_damage
 
         # Brief pause after completing an attack before moving again
         self.wait_after_attack = 0
@@ -425,6 +446,7 @@ class Enemy:
         # Tracks the most recent damage value applied so game.py can spawn a
         # damage number popup without needing to change take_damage's return type
         self.last_damage_dealt = 0
+        self.last_hit_was_crit = False  # set on melee hits when game_config is passed in — see check_collision_with_attack
 
         self.draw_layer = DrawLayer.ENEMIES
         self.y_sort = True              # Participates in depth-sorted rendering
@@ -642,10 +664,12 @@ class Enemy:
         """
         new_x = self.x + dx * speed
         new_y = self.y + dy * speed
+        half_w = self.width // 2
+        half_h = self.height // 2
 
-        if not self.check_collision_with_obstacles(new_x, self.y) and 0 < new_x < world_width:
+        if not self.check_collision_with_obstacles(new_x, self.y) and half_w <= new_x <= world_width - half_w:
             self.x = new_x
-        if not self.check_collision_with_obstacles(self.x, new_y) and 0 < new_y < world_height:
+        if not self.check_collision_with_obstacles(self.x, new_y) and half_h <= new_y <= world_height - half_h:
             self.y = new_y
 
     def set_direction_from_movement(self, dx, dy, threshold=0.2):
@@ -911,12 +935,17 @@ class Enemy:
     # Main update loop
     # =========================================================================
 
-    def update(self, dt, player, world_width, world_height, obstacles=None):
+    def update(self, dt, player, world_width, world_height, obstacles=None, game_config=None):
         """Advance the enemy AI state machine by *dt* seconds.
 
         Handles sprite animation, bomb ticks, cooldown timers, knockback
         physics, attack resolution, and all AI behaviour branches (idle,
         chase, retreat, feint, melee rush).
+
+        game_config is optional and only used to mitigate this enemy's
+        own melee-contact damage against the player by the player's END
+        (see perform_attack()/Player.get_incoming_melee_damage) — if not
+        passed, that damage falls back to the flat, unmitigated value.
         """
         if not self.active:
             return
@@ -962,8 +991,8 @@ class Enemy:
                 self.x = new_x
             if not blocked_y:
                 self.y = new_y
-            self.x = max(0, min(self.x, world_width))
-            self.y = max(0, min(self.y, world_height))
+            self.x = max(self.width // 2, min(self.x, world_width - self.width // 2))
+            self.y = max(self.height // 2, min(self.y, world_height - self.height // 2))
 
             if self.encasement_overlay:
                 self.encasement_overlay.update(dt)
@@ -1073,8 +1102,8 @@ class Enemy:
                 self.knockback_velocity_y = 0
 
             # Clamp to room bounds
-            self.x = max(0, min(self.x, world_width))
-            self.y = max(0, min(self.y, world_height))
+            self.x = max(self.width // 2, min(self.x, world_width - self.width // 2))
+            self.y = max(self.height // 2, min(self.y, world_height - self.height // 2))
 
             # Friction — velocity decays quickly
             self.knockback_velocity_x *= 0.9
@@ -1144,7 +1173,42 @@ class Enemy:
             else:
                 # Trigger the actual hit/spawn during the last 0.4 s of the animation
                 if self.attack_timer <= 0.4:
-                    self.perform_attack(player)
+                    self.perform_attack(player, game_config)
+            return
+
+        # ------------------------------------------------------------------
+        # Dead player — nothing left to fight. Drops straight back to plain
+        # idle wandering instead of chasing, retreating, feinting, blocking,
+        # or rushing at a corpse. Placed after the is_attacking block above
+        # so a swing already mid-animation when the player died finishes out
+        # normally (harmless now that Player.take_damage() no-ops while
+        # is_dead — see player.py) rather than being cut off mid-frame.
+        # ------------------------------------------------------------------
+        if getattr(player, 'is_dead', False):
+            if self.state != 'idle':
+                self.state          = 'idle'
+                self.idle_timer     = 0
+                # Wipe any wander leg left over from before the chase —
+                # otherwise is_idle_moving/target_x/target_y can still be
+                # whatever they were pre-chase, and idle_behavior() below
+                # will either sit still on a stale 'walk' frame (if it was
+                # False, mid-wait) or start sliding toward a long-stale
+                # target without re-triggering the 'walk' animation (if it
+                # was True) — animation and motion silently fall out of
+                # sync. Forcing 'idle' now guarantees the visible frame
+                # matches "not moving yet" for at least this frame.
+                self.is_idle_moving  = False
+                self.idle_move_timer = 0
+                if self.has_sprite:
+                    self.sprite.set_animation('idle', self.direction)
+            self.is_retreating          = False
+            self.is_breathing           = False
+            self.is_feinting            = False
+            self.is_pausing_after_feint = False
+            self.is_blocking            = False
+            if self.enemy_category == 'shooter':
+                self.is_doing_melee_rush = False
+            self.idle_behavior(dt, world_width, world_height)
             return
 
         # ------------------------------------------------------------------
@@ -1164,6 +1228,15 @@ class Enemy:
             self.stuck_timer = 0
             self.pathfind_direction = None
             self.pathfind_commit_timer = 0
+            # Same stale-wander-leg problem as the dead-player branch above:
+            # is_idle_moving/target_x/target_y may still hold whatever they
+            # were the moment this enemy started chasing, long before it
+            # ended up wherever it is now. Clear them so idle_behavior()
+            # starts a fresh wait/leg instead of resuming a leg toward a
+            # now-meaningless target (which would move the enemy without
+            # ever re-arming the 'walk' animation below).
+            self.is_idle_moving = False
+            self.idle_move_timer = 0
             if self.has_sprite:
                 self.sprite.set_animation('idle', self.direction)
 
@@ -1587,12 +1660,15 @@ class Enemy:
         final_dy = dy * move_speed + sep_y * sep_strength
 
         # Apply axis-by-axis with obstacle and bounds check
+        half_w = self.width // 2
+        half_h = self.height // 2
+
         test_x = self.x + final_dx
-        if not self.check_collision_with_obstacles(test_x, self.y) and 0 < test_x < world_width:
+        if not self.check_collision_with_obstacles(test_x, self.y) and half_w <= test_x <= world_width - half_w:
             self.x = test_x
 
         test_y = self.y + final_dy
-        if not self.check_collision_with_obstacles(self.x, test_y) and 0 < test_y < world_height:
+        if not self.check_collision_with_obstacles(self.x, test_y) and half_h <= test_y <= world_height - half_h:
             self.y = test_y
 
     def retreat_behavior(self, dt, player, world_width, world_height):
@@ -1883,11 +1959,17 @@ class Enemy:
 
         return False
 
-    def perform_attack(self, player):
+    def perform_attack(self, player, game_config=None):
         """Apply hit effects or set projectile spawn flags during the attack window.
 
         Called at attack_timer <= 0.4 s (the last part of the animation) so the
         impact lands at the visual peak of the swing.
+
+        game_config, if given, mitigates the melee-contact damage below by
+        the player's END (see Player.get_incoming_melee_damage) — omitted
+        entirely for the projectile/beam spawn branches, which aren't
+        melee and were never part of the STR/END data this curve was fit
+        against.
         """
         if not self.is_attacking:
             return
@@ -1899,7 +1981,10 @@ class Enemy:
             if getattr(self, 'is_shooter_melee_attack', False):
                 if distance < self.shooter_melee_range and not self.melee_hit_this_attack:
                     kx, ky = self._direction_to_vector()
-                    player.take_damage(self.shooter_melee_damage, kx, ky)
+                    damage = self.shooter_melee_damage
+                    if game_config is not None:
+                        damage = player.get_incoming_melee_damage(damage, game_config)
+                    player.take_damage(damage, kx, ky)
                     if not player.is_blocking:
                         player.hurt_tint = 1.0
                     self.melee_hit_this_attack = True
@@ -1957,7 +2042,10 @@ class Enemy:
             # Melee — deal damage if the player is still in range
             if distance < self.attack_range and not self.melee_hit_this_attack:
                 kx, ky = self._direction_to_vector()
-                player.take_damage(self.attack_damage, kx, ky)
+                damage = self.attack_damage
+                if game_config is not None:
+                    damage = player.get_incoming_melee_damage(damage, game_config)
+                player.take_damage(damage, kx, ky)
                 if not player.is_blocking:
                     player.hurt_tint = 1.0
                 self.melee_hit_this_attack = True
@@ -2227,13 +2315,19 @@ class Enemy:
     # Collision with player attacks
     # =========================================================================
 
-    def check_collision_with_attack(self, attack, attack_type):
+    def check_collision_with_attack(self, attack, attack_type, game_config=None):
         """Test whether a player attack hits this enemy and apply damage/knockback.
 
         Returns True if a hit was registered. Being mid-knockback no longer
         blocks this outright — take_damage()'s own i-frame window (decoupled
         from is_knocked_back) is what gates repeat hits now, so an enemy can
         be damaged again while still staggered once i-frames expire.
+
+        game_config is required for attack_type == 'melee' or 'projectile'
+        to use their STR/POW-based curves — see GameConfig.roll_melee_damage
+        / roll_ki_blast_damage. Falls back to old flat values (15 melee,
+        20 projectile) if it's not passed, so callers that don't care
+        about these attack types aren't forced to pass one.
         """
         if not self.active:
             return False
@@ -2258,7 +2352,17 @@ class Enemy:
             # world units farther out than the visible swing.
             attack_rect = attack.get_rect()
             if attack_rect.colliderect(self.get_collision_rect()):
-                if not self.take_damage(15):
+                if game_config is not None and hasattr(attack, 'roll_damage'):
+                    # STR (attacker) vs. END/defense (this enemy) — see
+                    # GameConfig.roll_melee_damage. Falls back to the old
+                    # flat 15 if no game_config was passed in, or if this
+                    # isn't a real MeleeAttack (e.g. a test double without
+                    # roll_damage/owner).
+                    damage, is_crit = attack.roll_damage(game_config, self)
+                else:
+                    damage, is_crit = 15, False
+                self.last_hit_was_crit = is_crit  # so game.py can style the popup differently
+                if not self.take_damage(damage):
                     return False  # Still in i-frames — swing passes through harmlessly
 
                 dx = self.x - attack.x
@@ -2282,7 +2386,17 @@ class Enemy:
                     dx /= dist
                     dy /= dist
 
-                if not self.take_damage(20):
+                owner = getattr(attack, 'owner', None)
+                if game_config is not None and owner is not None and hasattr(owner, 'get_ki_blast_damage'):
+                    # POW (attacker) vs. END/defense (this enemy) — see
+                    # GameConfig.roll_ki_blast_damage. Falls back to the
+                    # old flat 20 if no game_config/owner was set (e.g. an
+                    # enemy-fired projectile, which carries no POW stat).
+                    damage = owner.get_ki_blast_damage(game_config, target=self)
+                else:
+                    damage = 20
+
+                if not self.take_damage(damage):
                     return False
                 self.apply_knockback(dx, dy, 250)
                 return True
