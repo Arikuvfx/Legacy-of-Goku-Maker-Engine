@@ -121,9 +121,9 @@ class SpriteHUD:
             # Real per-attack icons are 64×28 native — draw at native size
             # (scaled by sc()) instead of stretching them to fill the frame.
             'attack_mode_icon':   {'x': 43, 'y': 26, 'w': 64, 'h': 28},
-            'hp_bar':             {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 123, 'bar_end': 294},
-            'ki_bar':             {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 123, 'bar_end': 294},
-            'transformed_ki_bar': {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 123, 'bar_end': 294},
+            'hp_bar':             {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 139, 'bar_end': 310},
+            'ki_bar':             {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 124, 'bar_end': 295},
+            'transformed_ki_bar': {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 124, 'bar_end': 295},
             'exp_bar':            {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start':  19, 'bar_end': 310},
             'transform_bar':      {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start':  13, 'bar_end':  40},
             # Boss bar — sprites are 64×8 px native, scaled to match the player
