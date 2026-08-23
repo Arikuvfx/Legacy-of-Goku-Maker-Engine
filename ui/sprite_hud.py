@@ -121,10 +121,10 @@ class SpriteHUD:
             # Real per-attack icons are 64×28 native — draw at native size
             # (scaled by sc()) instead of stretching them to fill the frame.
             'attack_mode_icon':   {'x': 43, 'y': 26, 'w': 64, 'h': 28},
-            'hp_bar':             {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 139, 'bar_end': 310},
-            'ki_bar':             {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 124, 'bar_end': 295},
-            'transformed_ki_bar': {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 124, 'bar_end': 295},
-            'exp_bar':            {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start':  19, 'bar_end': 310},
+            'hp_bar':             {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 139, 'bar_end': 311},
+            'ki_bar':             {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 123, 'bar_end': 295},
+            'transformed_ki_bar': {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 123, 'bar_end': 295},
+            'exp_bar':            {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start':  19, 'bar_end': 311},
             'transform_bar':      {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start':  13, 'bar_end':  40},
             # Boss bar — sprites are 64×8 px native, scaled to match the player
             # HUD width (338 config units → same sc() factor as everything else).
@@ -400,12 +400,16 @@ class SpriteHUD:
             # Show the bar filling up during the animation
             anim = self.get_transform_animation_progress(player)
             self.draw_bar_simple(screen, tkx, tky, tkw, tkh,
-                                 anim, 1.0, self.sprites['transformed_ki_bar'])
+                                 anim, 1.0, self.sprites['transformed_ki_bar'],
+                                 bar_start_x=sc(tki_cfg.get('bar_start', 0)),
+                                 bar_end_x=sc(tki_cfg.get('bar_end', tki_cfg['w'])))
         elif is_transformed:
             t = player.transformation
             self.draw_bar_simple(screen, tkx, tky, tkw, tkh,
                                  t.transformed_ki, t.max_transformed_ki,
-                                 self.sprites['transformed_ki_bar'])
+                                 self.sprites['transformed_ki_bar'],
+                                 bar_start_x=sc(tki_cfg.get('bar_start', 0)),
+                                 bar_end_x=sc(tki_cfg.get('bar_end', tki_cfg['w'])))
 
         # 5. EXP bar
         exp = self.config['exp_bar']

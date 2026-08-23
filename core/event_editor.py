@@ -1290,6 +1290,7 @@ ACTION_SCHEMA = {
                  ('amount', 'number', None)],
     'skill': [('mode', 'choice', ['add', 'remove']), ('skill_id', 'skill_picker', None)],
     'transformation': [('mode', 'choice', ['add', 'remove']), ('form_id', 'transformation_picker', None)],
+    'charged_melee': [('mode', 'choice', ['add', 'remove'])],
     'set_player_character': [('character_id', 'char_picker', None), ('skin_id', 'skin_picker', None)],
     'set_player_skin': [('skin_id', 'skin_picker', None)],
     'character_list': [('mode', 'choice', ['add', 'remove']), ('character_id', 'char_picker', None)],

@@ -1,7 +1,6 @@
 import pygame
 import pygame.gfxdraw
 
-from core.zeni_system import pool_keys as _zeni_pool_keys
 from dev_tools import entity_creator
 
 # Accent colours used for entity-editor preview sprites, keyed by
@@ -282,18 +281,10 @@ class EntityEditor:
         self.grid_snap = True
         self.show_grid = True
 
-        # ── AI / NPC settings ────────────────────────────────────────────────
-        self.ai_types = ['easy', 'advanced']
-        self.selected_ai_type = 'easy'
-        self.hover_ai_type_idx = -1
-
-        # ── Zeni drop pool (enemy / boss only) ──────────────────────────────
-        # Options come straight from core.zeni_system so this list can never
-        # drift out of sync with the actual drop tables.
-        self.zeni_pools = _zeni_pool_keys()
-        self.selected_zeni_pool = self.zeni_pools[0]
-        self.hover_zeni_pool_idx = -1
-
+        # ── NPC settings ─────────────────────────────────────────────────────
+        # AI type and zeni drop pool used to be set per-placement here, but
+        # both now live entirely in the entity creator config (ai_type /
+        # zeni_pool on assets/enemies/{id}.json) — see entity_creator.py.
         self.npc_modes    = ['static', 'moving']
         self.npc_facings  = ['down', 'up', 'left', 'right']
         self.selected_npc_mode   = 'static'
@@ -311,8 +302,6 @@ class EntityEditor:
             'category_rects': [],
             'entity_rects': [],
             'variant_rects': [],
-            'ai_type_rects': [],
-            'zeni_pool_rects': [],
             'npc_mode_rects': [],
             'npc_facing_rects': [],
             'npc_dialogue_rects': [],
@@ -321,6 +310,8 @@ class EntityEditor:
         self.category_hover_anim = {k: 0.0 for k in self.category_keys}
 
         # Signature: on_entity_placed(entity_dict, variant|None, ai_type, world_x, world_y)
+        # ai_type is now always None here -- callbacks should read it from the
+        # entity's own config (entity_creator) instead.
         self.on_entity_placed = None
 
         # Populated from game._assign_obstacles: collisions, stones, gates, transitions
@@ -648,20 +639,6 @@ class EntityEditor:
                 self.hover_variant_idx = i
                 break
 
-        # AI type hover
-        self.hover_ai_type_idx = -1
-        for entry in self.ui_rects.get('ai_type_rects', []):
-            if entry['rect'].collidepoint(mx, my):
-                self.hover_ai_type_idx = entry['index']
-                break
-
-        # Zeni pool hover
-        self.hover_zeni_pool_idx = -1
-        for entry in self.ui_rects.get('zeni_pool_rects', []):
-            if entry['rect'].collidepoint(mx, my):
-                self.hover_zeni_pool_idx = entry['index']
-                break
-
         # NPC mode hover
         self.hover_npc_mode_idx = -1
         for entry in self.ui_rects.get('npc_mode_rects', []):
@@ -806,21 +783,6 @@ class EntityEditor:
                         return True
                 return True  # consume any click while popup is open
 
-            # ── AI type selector click ─────────────────────────────────────
-            for entry in self.ui_rects.get('ai_type_rects', []):
-                if entry['rect'].collidepoint(mouse_pos):
-                    if self._is_rocket_launcher_selected():
-                        return True
-                    self.selected_ai_type = entry['ai_type']
-                    return True
-
-            # ── Zeni pool selector click ───────────────────────────────────
-            for entry in self.ui_rects.get('zeni_pool_rects', []):
-                if entry['rect'].collidepoint(mouse_pos):
-                    self.selected_zeni_pool = entry['zeni_pool']
-                    print(f"DEBUG click: selected_zeni_pool -> {self.selected_zeni_pool!r}")
-                    return True
-
             # ── NPC mode selector click ────────────────────────────────────
             for entry in self.ui_rects.get('npc_mode_rects', []):
                 if entry['rect'].collidepoint(mouse_pos):
@@ -863,9 +825,6 @@ class EntityEditor:
                     # update main sprite so the grid thumbnail reflects choice
                     if self.selected_entity:
                         self.selected_entity['sprite'] = entry['variant']['sprite'].copy()
-                    # Rocket launcher is always easy AI - reset if user just picked it
-                    if entry['variant'].get('type') == 'rocketlauncher':
-                        self.selected_ai_type = 'easy'
                     return True
 
             # ── category tab click ─────────────────────────────────────────
@@ -1231,22 +1190,11 @@ class EntityEditor:
 
         variant = self.selected_variant or self._get_current_variant(self.selected_entity)
 
-        # Determine AI type (only for enemies and bosses)
+        # AI type and zeni drop pool are no longer set here -- both are read
+        # straight from the entity's entity_creator config (ai_type / zeni_pool
+        # in assets/enemies/{id}.json) when the enemy/boss is actually spawned.
+        # ai_type stays as a callback arg only for signature compatibility below.
         ai_type = None
-        if self.selected_entity and self.selected_entity.get('entity_type') in ['enemy', 'boss']:
-            if self._is_rocket_launcher_selected():
-                ai_type = 'easy'
-            else:
-                ai_type = self.selected_ai_type
-
-        # Embed the zeni drop pool for enemies/bosses so it survives however
-        # on_entity_placed's callback signature saves the entity (mirrors
-        # the NPC settings embed below, rather than the ai_type positional-
-        # arg dance above — there's no equivalent "new signature" slot for
-        # it, so this is the one path room_editor needs to read).
-        if self.selected_entity and self.selected_entity.get('entity_type') in ['enemy', 'boss']:
-            self.selected_entity['_zeni_pool'] = self.selected_zeni_pool
-            print(f"DEBUG place: embedding _zeni_pool={self.selected_zeni_pool!r}")
 
         # Embed NPC settings into entity dict before callback
         if self.selected_entity and self.selected_entity.get('entity_type') == 'npc':
@@ -1316,7 +1264,7 @@ class EntityEditor:
             return
 
         # clear hit-rect cache each frame
-        self.ui_rects = {'category_rects': [], 'entity_rects': [], 'variant_rects': [], 'ai_type_rects': [], 'zeni_pool_rects': [], 'npc_mode_rects': [], 'npc_facing_rects': [], 'npc_dialogue_rects': []}
+        self.ui_rects = {'category_rects': [], 'entity_rects': [], 'variant_rects': [], 'npc_mode_rects': [], 'npc_facing_rects': [], 'npc_dialogue_rects': []}
 
         self._draw_palette_background(screen)
         self._draw_title(screen)
@@ -1607,110 +1555,10 @@ class EntityEditor:
                     (self.palette_x + self.palette_padding + 120, y + 3))
         y += 30
 
-        # AI Type selector (only shown when an enemy or boss is selected)
-        if (self.selected_entity and
-                self.selected_entity.get('entity_type') in ['enemy', 'boss']):
-
-            if self._is_rocket_launcher_selected():
-                # Rocket launcher is always easy AI - show a locked indicator
-                ai_label = self.font_small.render("AI Type:", True, self.COLORS['text_dim'])
-                screen.blit(ai_label, (self.palette_x + self.palette_padding, y))
-                locked_surf = self.font_small.render(
-                    "Easy  (Rocket Launcher is always Easy)", True, self.COLORS['text_dark'])
-                screen.blit(locked_surf, (self.palette_x + self.palette_padding, y + 18))
-                y += 48
-            else:
-                ai_label = self.font_small.render("AI Type:", True, self.COLORS['text_dim'])
-                screen.blit(ai_label, (self.palette_x + self.palette_padding, y))
-                y += 18
-
-                # AI type buttons
-                button_width = 70
-                button_height = 24
-                button_gap = 8
-                bx = self.palette_x + self.palette_padding
-
-                for i, ai_type in enumerate(self.ai_types):
-                    button_x = bx + i * (button_width + button_gap)
-                    button_rect = pygame.Rect(button_x, y, button_width, button_height)
-
-                    is_selected = (ai_type == self.selected_ai_type)
-                    is_hover = (self.hover_ai_type_idx == i)
-
-                    # Background
-                    if is_selected:
-                        bg_color = self.COLORS['variant_selected']
-                    elif is_hover:
-                        bg_color = self.COLORS['panel_light']
-                    else:
-                        bg_color = self.COLORS['panel']
-                    pygame.draw.rect(screen, bg_color, button_rect, border_radius=4)
-
-                    # Border
-                    border_color = self.COLORS['accent'] if is_selected else self.COLORS['grid']
-                    border_width = 2 if is_selected else 1
-                    pygame.draw.rect(screen, border_color, button_rect, border_width, border_radius=4)
-
-                    # Text
-                    text_color = self.COLORS['text'] if is_selected else self.COLORS['text_dim']
-                    text = self.font_small.render(ai_type.capitalize(), True, text_color)
-                    screen.blit(text, text.get_rect(center=button_rect.center))
-
-                    # Store for hit-testing
-                    self.ui_rects['ai_type_rects'].append({
-                        'rect': button_rect,
-                        'ai_type': ai_type,
-                        'index': i
-                    })
-
-                y += button_height + 12
-
-            # Zeni Pool selector — always shown for enemies/bosses regardless
-            # of the rocket-launcher AI lock above (drop pool is independent
-            # of AI type).
-            zp_label = self.font_small.render("Zeni Pool:", True, self.COLORS['text_dim'])
-            screen.blit(zp_label, (self.palette_x + self.palette_padding, y))
-            y += 18
-
-            zp_button_width = 60
-            zp_button_height = 24
-            zp_button_gap = 6
-            zbx = self.palette_x + self.palette_padding
-
-            for i, zeni_pool in enumerate(self.zeni_pools):
-                button_rect = pygame.Rect(
-                    zbx + i * (zp_button_width + zp_button_gap), y,
-                    zp_button_width, zp_button_height,
-                )
-
-                is_selected = (zeni_pool == self.selected_zeni_pool)
-                is_hover = (self.hover_zeni_pool_idx == i)
-
-                if is_selected:
-                    bg_color = self.COLORS['variant_selected']
-                elif is_hover:
-                    bg_color = self.COLORS['panel_light']
-                else:
-                    bg_color = self.COLORS['panel']
-                pygame.draw.rect(screen, bg_color, button_rect, border_radius=4)
-
-                border_color = self.COLORS['accent'] if is_selected else self.COLORS['grid']
-                border_width = 2 if is_selected else 1
-                pygame.draw.rect(screen, border_color, button_rect, border_width, border_radius=4)
-
-                text_color = self.COLORS['text'] if is_selected else self.COLORS['text_dim']
-                # 'tier1' -> 'T1', etc. — keeps the label readable at this button width.
-                short_label = zeni_pool.replace('tier', 'T')
-                text = self.font_small.render(short_label, True, text_color)
-                screen.blit(text, text.get_rect(center=button_rect.center))
-
-                self.ui_rects['zeni_pool_rects'].append({
-                    'rect': button_rect,
-                    'zeni_pool': zeni_pool,
-                    'index': i,
-                })
-
-            y += zp_button_height + 12
+        # Note: AI Type and Zeni Pool used to be selectable here for enemies
+        # and bosses. Both now come entirely from the entity's entity_creator
+        # config (ai_type / zeni_pool in assets/enemies/{id}.json), so there's
+        # nothing to configure per-placement anymore.
 
         # NPC Mode + Facing selectors (only shown when an NPC is selected)
         if self.selected_entity and self.selected_entity.get('entity_type') == 'npc':
@@ -2246,16 +2094,6 @@ class EntityEditor:
     # =========================================================================
     # Internal helpers
     # =========================================================================
-
-    def _is_rocket_launcher_selected(self):
-        """Return True when the currently active variant is the rocket launcher."""
-        variant = self.selected_variant or self._get_current_variant(self.selected_entity)
-        return (
-            self.selected_entity is not None
-            and self.selected_entity.get('enemy_category') == 'shooter'
-            and variant is not None
-            and variant.get('type') == 'rocketlauncher'
-        )
 
     def _mouse_in_palette(self, mx, my):
         if not self.palette_visible:

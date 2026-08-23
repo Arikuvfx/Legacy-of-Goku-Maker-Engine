@@ -383,17 +383,15 @@ class TilesetEditor:
         }
 
         self.grid_size = 16
-        # The tileset's native sprite pitch — every tile image is drawn at
-        # this size, so multi-cell stroke patterns must always be spaced by
-        # this value (see the offset_x/offset_y math below) no matter what
-        # the placement-snap grid is currently set to, otherwise painted
-        # tiles in a multi-tile selection would overlap or leave gaps.
-        self._native_tile_size = self.grid_size
         # The anchor-snap grid used when deciding *where* a stamp/erase
         # lands — this is the one driven by the room editor toolbar's Grid
         # control (Off / 8px / 16px), kept in sync via set_snap_size().
         # 0 means "no grid": stamps land at the exact (unsnapped) mouse
         # position instead of the nearest grid_size multiple.
+        # (Multi-cell pattern spacing is unrelated to this — it always uses
+        # the active tileset's own tile_width/tile_height, read directly
+        # from the tileset in _place_tiles/draw_tile_preview, so it's
+        # correct for 8px, 16px, 32px, etc. tilesets automatically.)
         self.snap_size = self.grid_size
         self.room_tiles: dict[str, List[Tile]] = {}
 
@@ -469,7 +467,7 @@ class TilesetEditor:
         self.anim_feedback_until_ms = pygame.time.get_ticks() + duration_ms
 
     def _toggle_animate_selection(self):
-        """'A' in the palette: turn the current multi-tile selection into an
+        """'N' in the palette: turn the current multi-tile selection into an
         animation, or remove it if the selection is already animated.
 
         The anchor (the tile you actually paint into rooms) is always the
@@ -663,7 +661,7 @@ class TilesetEditor:
                 world_y = (mouse_y + camera_y) // RENDER_SCALE
                 self._delete_tile_at_position(world_x, world_y, current_room_name)
 
-            elif event.key == pygame.K_a and not ctrl_pressed:
+            elif event.key == pygame.K_n and not ctrl_pressed:
                 self._toggle_animate_selection()
 
         elif event.type == pygame.MOUSEBUTTONDOWN:
@@ -865,12 +863,13 @@ class TilesetEditor:
                 if tileset.is_tile_empty(tx, ty):
                     continue
 
-                # Multi-cell pattern spacing always uses the tileset's
-                # native sprite pitch (not the placement-snap grid) so
-                # painted tiles keep tiling seamlessly regardless of what
-                # snap size is currently active.
-                offset_x = (tx - min_x) * self._native_tile_size
-                offset_y = (ty - min_y) * self._native_tile_size
+                # Multi-cell pattern spacing always uses the tileset's own
+                # native sprite pitch (not the placement-snap grid, and not
+                # a fixed constant) so painted tiles keep tiling seamlessly
+                # for tilesets of any size (8px, 16px, 32px...) regardless
+                # of what snap size is currently active.
+                offset_x = (tx - min_x) * tileset.tile_width
+                offset_y = (ty - min_y) * tileset.tile_height
                 tile_x = grid_x + offset_x
                 tile_y = grid_y + offset_y
 
@@ -889,7 +888,12 @@ class TilesetEditor:
                     self.current_layer >= 75  # treat layer 75+ as foreground
                 )
                 self.room_tiles[room_name].append(new_tile)
-                touched_cells.append((tile_x, tile_y))
+                # Include this tile's real footprint (not a fixed grid
+                # constant) so the renderer's incremental patch clears
+                # exactly the right area — otherwise a coarser assumed
+                # size bleeds into neighboring tiles on finer tilesets
+                # (e.g. 8px) and erases their already-baked pixels.
+                touched_cells.append((tile_x, tile_y, tileset.tile_width, tileset.tile_height))
 
         # Notify listeners (e.g. auto-save) that the room content changed.
         # Pass the exact cells touched so the renderer can patch just those
@@ -909,16 +913,33 @@ class TilesetEditor:
             return
         self._last_stroke_cell = (grid_x, grid_y)
 
+        removed = [
+            tile for tile in self.room_tiles[room_name]
+            if tile.x == grid_x and tile.y == grid_y and tile.layer == self.current_layer
+        ]
+        if not removed:
+            return
+
         self.room_tiles[room_name] = [
             tile for tile in self.room_tiles[room_name]
             if not (tile.x == grid_x and tile.y == grid_y and tile.layer == self.current_layer)
         ]
 
+        # Footprint of what was actually removed (not a fixed grid constant)
+        # — same reasoning as _place_tiles: the renderer's incremental patch
+        # needs the real tile size so it clears exactly this spot and
+        # nothing on a neighboring cell. Only fall back to grid_size if the
+        # tileset can't be resolved (e.g. deleted/renamed tileset file).
+        cell_w, cell_h = self.grid_size, self.grid_size
+        removed_tileset = self.tileset_manager.get_tileset(removed[0].tileset_name)
+        if removed_tileset:
+            cell_w, cell_h = removed_tileset.tile_width, removed_tileset.tile_height
+
         # Notify listeners (e.g. auto-save) that the room content changed.
         # Pass the exact cell touched so the renderer can patch just that
         # spot in the baked surface instead of rebuilding the whole room.
         if callable(getattr(self, 'on_tile_changed', None)):
-            self.on_tile_changed(room_name, cells=[(grid_x, grid_y)])
+            self.on_tile_changed(room_name, cells=[(grid_x, grid_y, cell_w, cell_h)])
 
     def draw_tile_preview(self, screen: pygame.Surface, camera_x: int, camera_y: int):
         """Draw a semi-transparent ghost of the selected tile pattern under the cursor."""
@@ -955,8 +976,8 @@ class TilesetEditor:
                 if not scaled_tile:
                     continue
 
-                offset_x = (tx - min_x) * self._native_tile_size
-                offset_y = (ty - min_y) * self._native_tile_size
+                offset_x = (tx - min_x) * tileset.tile_width
+                offset_y = (ty - min_y) * tileset.tile_height
                 tile_world_x = grid_x + offset_x
                 tile_world_y = grid_y + offset_y
 
@@ -1129,13 +1150,13 @@ class TilesetEditor:
             sel_surf = self.font_small.render(sel_text, True, self.colors['selection'])
             screen.blit(sel_surf, (self.palette_x + 20, sel_y))
 
-            # Tell the person right here whether 'A' will animate or un-animate
+            # Tell the person right here whether 'N' will animate or un-animate
             # this exact selection — no need to remember what the dot meant.
             if not self.fps_input_active:
                 if tileset.is_tile_animated(min_x, min_y):
-                    hint_text, hint_color = "Animated \u2014 press A to remove", self.colors['accent']
+                    hint_text, hint_color = "Animated \u2014 press N to remove", self.colors['accent']
                 else:
-                    hint_text, hint_color = "Press A to animate this selection", self.colors['text_dim']
+                    hint_text, hint_color = "Press N to animate this selection", self.colors['text_dim']
                 hint_surf = self.font_small.render(hint_text, True, hint_color)
                 screen.blit(hint_surf, (self.palette_x + 20 + sel_surf.get_width() + 12, sel_y))
 

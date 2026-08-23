@@ -57,6 +57,7 @@ from objects.flying_pad import FlyingPad
 from core.flypad_controller import FlyingController
 from core.nimbus_controller import NimbusCloudController
 from objects.save_point import SavePoint, SavePointMenu, SavePointManager
+from objects.decoration_objects import Decoration
 from ui.character_switch_menu import CharacterSwitchMenu
 from ui.pause_menu import PauseMenu
 from ui.credits_screen import CreditsScreen
@@ -246,6 +247,15 @@ class Game:
         # are unlocked via the 'character_list' event action.
         self.player.playable_characters = [starting_character]
 
+        # Per-character progress store: {char_id: Player.snapshot_progress()}.
+        # Populated/read by _switch_character() so each playable character
+        # keeps its own independent level/XP/HP/KI/stats instead of all of
+        # them sharing whatever the live Player object currently holds. Not
+        # populated for starting_character here — its progress simply *is*
+        # the live player object until the first switch snapshots it (see
+        # _switch_character / _sync_active_character_progress).
+        self.player.character_progress = {}
+
         # Defensive defaults — some older save files may not have these attributes.
         if not hasattr(self.player, 'hurt_tint'):
             self.player.hurt_tint = 0.0
@@ -412,6 +422,7 @@ class Game:
         self.npcs                 = []
         self.critters = []  # ambient wildlife: squirrels, birds, butterflies
         self.destructible_stones  = []
+        self.decorations          = []  # trees, etc. — see objects/decoration_object.py
         self.collision_objects    = []
         self.room_transitions     = []
         self.level_gates          = []
@@ -585,6 +596,7 @@ class Game:
         oe = self.room_editor.object_editor
         oe.on_collision_deleted        = self._on_collision_deleted
         oe.on_stone_deleted            = self._on_stone_deleted
+        oe.on_decoration_deleted       = self._on_decoration_deleted
         oe.on_gate_deleted             = self._on_gate_deleted
         oe.on_transition_placed        = self._on_transition_placed
         oe.on_transition_deleted       = self._on_transition_deleted
@@ -715,6 +727,7 @@ class Game:
         self.event_runner.register_handler('resource', self._handle_resource_action)
         self.event_runner.register_handler('skill', self._handle_skill_action)
         self.event_runner.register_handler('transformation', self._handle_transformation_action)
+        self.event_runner.register_handler('charged_melee', self._handle_charged_melee_action)
         self.event_runner.register_handler('character_list', self._handle_character_list_action)
         self.event_runner.register_handler('set_player_character', self._handle_set_player_character_action)
         self.event_runner.register_handler('set_player_skin', self._handle_set_player_skin_action)
@@ -871,6 +884,13 @@ class Game:
         JSON-serializable data rather than a guess."""
         import os, json
 
+        # Checkpoint whoever's currently active into character_progress
+        # before serializing it below — otherwise whatever XP/levels/stats
+        # they've earned since the last character switch would never make
+        # it into character_progress (it's only written on switch) and
+        # would be lost on save/reload.
+        self._sync_active_character_progress(getattr(self.player, 'character', None))
+
         ts = self.player.transformation
         current_costume = (ts.current_transform_costume
                             if (ts and ts.is_transformed and ts.current_transform_costume)
@@ -920,6 +940,14 @@ class Game:
             'inventory':            list(getattr(self.player, 'inventory', []) or []),
             'equipped_attacks':     list(getattr(self.player, 'equipped_attacks', []) or []),
             'transformation':       transform_data,
+            # Per-character level/XP/HP/KI/stats for every character that's
+            # been played at least once this save (see Player.PROGRESS_
+            # FIELDS / snapshot_progress). The top-level 'level'/'hp'/
+            # 'stats'/etc. fields above still mirror current_character's
+            # numbers for older tooling that reads them directly — they're
+            # kept in sync with character_progress[current_character] since
+            # _sync_active_character_progress() was just called above.
+            'character_progress':  dict(getattr(self.player, 'character_progress', {}) or {}),
         }
 
         # Equipment slots (body/hands/feet/accessory) — player.equipped is
@@ -1030,6 +1058,15 @@ class Game:
                 print(f'[Game] failed to restore missions for slot {slot_index}: {e}')
 
         self.player.playable_characters = list(data.get('playable_characters') or [self.player.character])
+
+        # Per-character level/XP/HP/KI/stats (see Player.snapshot_progress /
+        # Game._switch_character). Older saves, written before per-character
+        # progression existed, won't have this key at all — a fallback entry
+        # for whichever character this save was actually played as gets
+        # synthesized from the legacy flat top-level fields a little further
+        # down, once saved_character is known.
+        self.player.character_progress = dict(data.get('character_progress') or {})
+
         self.player.inventory           = list(data.get('inventory', []))
         self.player.zeni                = data.get('zeni', getattr(self.player, 'zeni', 0))
         self.player.equipped_attacks    = list(data.get('equipped_attacks', getattr(self.player, 'equipped_attacks', [])))
@@ -1062,8 +1099,44 @@ class Game:
         if picked_character and picked_character in (data.get('playable_characters') or []):
             saved_character = picked_character
 
+        # Legacy-save fallback: pre-per-character-progression saves have no
+        # 'character_progress' entry for saved_character at all — synthesize
+        # one from the old flat top-level level/hp/stats/etc. fields so
+        # those saves still load with the numbers they were saved with,
+        # instead of falling through to a fresh level-1 start.
+        if saved_character and saved_character not in self.player.character_progress:
+            legacy_fields = ('level', 'hp', 'max_hp', 'ki', 'max_ki', 'stats')
+            if any(f in data for f in legacy_fields):
+                legacy_level = data.get('level', 1)
+                self.player.character_progress[saved_character] = {
+                    'level':             legacy_level,
+                    'exp':               data.get('exp', 0),
+                    'total_exp':         data.get('total_exp', data.get('exp', 0)),
+                    'exp_to_next_level': data.get('exp_to_next_level',
+                                                   self.game_config.get_xp_for_level(legacy_level)),
+                    'stat_points':       data.get('stat_points', 0),
+                    'pending_level_up':  data.get('pending_level_up', False),
+                    'hp':                data.get('hp', data.get('max_hp', 100)),
+                    'max_hp':            data.get('max_hp', 100),
+                    'ki':                data.get('ki', data.get('max_ki', 100)),
+                    'max_ki':            data.get('max_ki', 100),
+                    'stats':             dict(data.get('stats') or {}),
+                }
+
         if saved_character and saved_character != getattr(self.player, 'character', None):
-            self._switch_character(saved_character)
+            # sync_previous=False — the player object we're switching away
+            # from here is just Game.__init__'s fresh boot-time placeholder,
+            # not a character actually played this session, so it has
+            # nothing worth checkpointing into character_progress (and
+            # doing so would clobber a real loaded entry for that same id).
+            self._switch_character(saved_character, sync_previous=False)
+        elif saved_character:
+            # No switch needed (already the right character) — but the live
+            # player object still only has Game.__init__'s fresh boot-time
+            # numbers, so apply this character's loaded progress directly.
+            progress = self.player.character_progress.get(saved_character)
+            if progress:
+                self.player.restore_progress(progress)
 
         # Transformation state — restored AFTER any character switch above
         # so the transformed sprite set here doesn't get immediately
@@ -1118,19 +1191,12 @@ class Game:
                 ts.shine_timer              = transform_data.get('shine_timer', 0.0)
                 ts.ready_notification_shown = transform_data.get('ready_notification_shown', False)
 
-        if 'stats' in data:
-            self.player.stats = dict(data['stats'])
-        if 'level' in data:
-            self.player.level = data['level']
+        # NOTE: level/XP/HP/KI/stats are now restored above as part of
+        # per-character progress (character_progress / restore_progress),
+        # not from the flat top-level fields directly — those flat fields
+        # still exist in the save data (for older tooling / debugging) but
+        # are only *read* here as the legacy-fallback seed a few lines up.
         self.player.update_derived_stats()
-        if data.get('max_hp') is not None:
-            self.player.max_hp = data['max_hp']
-        if data.get('max_ki') is not None:
-            self.player.max_ki = data['max_ki']
-        if data.get('hp') is not None:
-            self.player.hp = min(data['hp'], self.player.max_hp)
-        if data.get('ki') is not None:
-            self.player.ki = min(data['ki'], self.player.max_ki)
 
         room_name = data.get('room_name') or ''
         room = self.room_manager.get_room_by_name(room_name) if room_name else None
@@ -1611,7 +1677,7 @@ class Game:
           F1      — dev menu toggle
           F2      — exit test mode (returns to room editor)
           ESC     — pause menu
-          Arrows  — move; double-tap a direction to start running
+          WASD    — move; double-tap a direction to start running
           Shift   — hold to run
           E       — interact / melee / advance dialogue
           F       — hold to block: no other actions, damage halved,
@@ -1630,13 +1696,13 @@ class Game:
                     drawing the energy sword (sword mode) — completing the
                     draw auto-starts a short free spin — or launch the
                     Dragon Fist (dragon_fist mode, no charge-up, held for
-                    as long as Q stays down), or summon the Ghost
+                    as long as Q stays down), summon the Ghost
                     Kamikaze Attack (ghost_kamikaze mode, no charge-up —
                     plays out entirely on its own afterward, see
-                    Player.start_ghost_kamikaze)
-          TAB     — cycle ki mode: blast → beam → kamekameha → banshee_blast → final_flash → big_bang_kamehameha → genkidama → big_bang_attack → masenko → burning → flame_kamehameha → ultra_volleyball → sword → energy_punch → dragon_fist → ghost_kamikaze → instant_transmission → transform → blast
-          X       — trigger transformation (transform mode, when fully charged),
+                    Player.start_ghost_kamikaze), or trigger a
+                    transformation (transform mode, when fully charged) —
                     or detransform if already transformed
+          TAB     — cycle ki mode: blast → beam → kamekameha → banshee_blast → final_flash → big_bang_kamehameha → genkidama → big_bang_attack → masenko → burning → flame_kamehameha → ultra_volleyball → sword → energy_punch → dragon_fist → ghost_kamikaze → instant_transmission → transform → blast
         """
         # Dialogue boxes (NPC/event/chest/item-pickup), the level-up
         # sequence, and the save flow all freeze player movement/update
@@ -1648,7 +1714,7 @@ class Game:
         # attack-capable keys here. E is exempted — _handle_interact()
         # already knows how to advance/close an open dialogue box, and
         # doesn't fall back to a melee swing while one is active.
-        _ATTACK_CAPABLE_KEYS = (pygame.K_q, pygame.K_TAB, pygame.K_x, pygame.K_f)
+        _ATTACK_CAPABLE_KEYS = (pygame.K_q, pygame.K_TAB, pygame.K_f)
         if event.key in _ATTACK_CAPABLE_KEYS and (
                 self.dialogue_box.active or self._levelup_active or self.save_flow_active):
             return
@@ -1761,6 +1827,20 @@ class Game:
                 # Game._update_ghost_kamikaze). Nothing needed in the
                 # KEYUP handler.
                 self.player.start_ghost_kamikaze()
+            elif self.player.ki_attack_mode == 'transform':
+                # Q triggers a transformation when charged and ready, and
+                # reverses an active transformation back to base form when
+                # already transformed — same trigger key as every other
+                # super attack above. Ignored mid-transition
+                # (is_transforming / is_untransforming) so a repeat press
+                # can't restart the animation partway through.
+                ts = self.player.transformation
+                if (getattr(self.player, 'has_transformation', False)
+                        and ts and not ts.is_transforming and not ts.is_untransforming):
+                    if ts.is_transformed:
+                        ts.start_untransform()
+                    elif ts.is_ready:
+                        ts.start_transform()
 
         elif event.key == pygame.K_e:
             # Tracked so Player.update() can tell, once the normal melee
@@ -1778,22 +1858,7 @@ class Game:
                 idx = modes.index(self.player.ki_attack_mode) if self.player.ki_attack_mode in modes else 0
                 self.player.ki_attack_mode = modes[(idx + 1) % len(modes)]
 
-        elif event.key == pygame.K_x:
-            # X triggers a transformation when charged and ready, and reverses
-            # an active transformation back to base form when already
-            # transformed. Ignored mid-transition (is_transforming /
-            # is_untransforming) so a repeat press can't restart the
-            # animation partway through.
-            ts = self.player.transformation
-            if (self.player.ki_attack_mode == 'transform'
-                    and getattr(self.player, 'has_transformation', False)
-                    and ts and not ts.is_transforming and not ts.is_untransforming):
-                if ts.is_transformed:
-                    ts.start_untransform()
-                elif ts.is_ready:
-                    ts.start_transform()
-
-        elif event.key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN):
+        elif event.key in (pygame.K_a, pygame.K_d, pygame.K_w, pygame.K_s):
             # Double-tapping a direction key starts a run.
             if self.player.check_double_tap(event.key):
                 self.player.is_running = True
@@ -1818,6 +1883,16 @@ class Game:
             return
         if self._mjf_state in ('pending_fade_in', 'fade_in', 'flying',
                                'landing_fade_out', 'landing_fade_in'):
+            return
+        # Level-up sequence: E should only ever advance/close the two info
+        # boxes at the end (handled by the dialogue_box.active branch
+        # below) — not fall through to a melee swing during the turning/
+        # character-animation phase, which has no dialogue box open yet.
+        # Without this, E during that phase reaches the default melee
+        # branch and sets is_attacking=True, but player.update() is frozen
+        # for the whole levelup sequence, so it never clears — leaving the
+        # player permanently stuck unable to move/act once the sequence ends.
+        if self._levelup_active and not self.dialogue_box.active:
             return
 
         # Save point takes top priority.
@@ -2462,6 +2537,14 @@ class Game:
     def _end_levelup_sequence(self):
         """Second dialogue box closed — unfreeze the world."""
         self._levelup_active = False
+        # Safety net: player.update() is frozen for the entire sequence, so
+        # if is_attacking somehow got set mid-freeze (e.g. a future change
+        # reintroduces a path that starts an attack while _levelup_active is
+        # True) it would never get cleared on its own, permanently locking
+        # can_act()/can_move() to False. Clearing it here guarantees the
+        # player always regains control once the sequence ends.
+        self.player.is_attacking = False
+        self.player.attack_cooldown = 0
         self.player.enter_idle()
 
     def _draw_levelup_sprite(self, screen, camera, colors):
@@ -2755,6 +2838,17 @@ class Game:
                 copy_stone.active     = True
                 self.destructible_stones.append(copy_stone)
 
+        # Decorations (trees, etc.) — copy so test mode doesn't mutate the
+        # editor originals. to_dict()/from_dict() round-trips everything a
+        # Decoration has (type, position, variant); there's no
+        # destructible-style health/state to carry over since decorations
+        # are purely ambient.
+        self.decorations = []
+        if hasattr(room, 'decorations') and room.decorations:
+            from objects.decoration_objects import Decoration
+            for decoration in room.decorations:
+                self.decorations.append(Decoration.from_dict(decoration.to_dict()))
+
         # Level gates
         self.level_gates = []
         if hasattr(room, 'level_gates') and room.level_gates:
@@ -3012,6 +3106,7 @@ class Game:
 
         # One-liner copies for the rest of the room object types.
         self.destructible_stones = room.destructible_stones[:] if hasattr(room, 'destructible_stones') and room.destructible_stones else []
+        self.decorations         = room.decorations[:]         if hasattr(room, 'decorations')         and room.decorations         else []
         self.level_gates         = room.level_gates[:]         if hasattr(room, 'level_gates')         and room.level_gates         else []
         self.room_transitions    = room.room_transitions[:]    if hasattr(room, 'room_transitions')    and room.room_transitions    else []
         self.save_points         = room.save_points[:]         if hasattr(room, 'save_points')         and room.save_points         else []
@@ -3301,6 +3396,7 @@ class Game:
         obstacles = (
             self.collision_objects
             + self.destructible_stones
+            + self.decorations
             + self.level_gates
             + self.room_transitions
             + self.chests
@@ -3359,6 +3455,14 @@ class Game:
         if self.current_room and self.current_room.name == room_name:
             if stone in self.destructible_stones:
                 self.destructible_stones.remove(stone)
+
+    def _on_decoration_deleted(self, decoration, room_name):
+        """Sync game list when a decoration (tree, etc.) is removed in the editor."""
+        if self.is_test_mode:
+            return
+        if self.current_room and self.current_room.name == room_name:
+            if decoration in self.decorations:
+                self.decorations.remove(decoration)
 
     def _on_gate_deleted(self, gate, room_name):
         """Sync game list when a level gate is removed in the editor."""
@@ -3913,6 +4017,22 @@ class Game:
         elif mode == 'remove':
             if skill_id in equipped:
                 equipped.remove(skill_id)
+
+    def _handle_charged_melee_action(self, mode):
+        """EventRunner handler for the 'charged_melee' action — mode:
+        'add' | 'remove'. Toggles player.charged_melee_enabled, the gate
+        Player.start_charging_melee() should check before letting a held
+        E roll into the charge wind-up (see the NOTE in
+        _reload_attack_config() below — that guard needs adding in
+        player.py, which isn't part of this action-system module).
+        Unlike _handle_skill_action/_handle_transformation_action, this
+        isn't a list of ids to add/remove from — it's a single flag, so
+        'add' just sets it True (charging allowed) and 'remove' sets it
+        False (charging blocked); anything else is a no-op."""
+        if mode == 'add':
+            self.player.charged_melee_enabled = True
+        elif mode == 'remove':
+            self.player.charged_melee_enabled = False
 
     def _handle_transformation_action(self, mode, form_id):
         """EventRunner handler for the 'transformation' action — mode:
@@ -7224,7 +7344,14 @@ class Game:
         if cfg is None:
             cfg = character_creator.load_config(self.player.character)
 
-        _current_costume = cfg.get('costume', '')
+        # Same live-vs-config-default distinction as
+        # TransformationSystem._resolve_transform_costume(): cfg['costume']
+        # is only the character creator's design-time default and does NOT
+        # reflect a runtime costume switch (_handle_set_player_skin_action
+        # only updates self.player.costume, never the on-disk config). Prefer
+        # the actual equipped costume so this gate agrees with what
+        # _resolve_transform_costume() will actually resolve to.
+        _current_costume = getattr(self.player, 'costume', None) or cfg.get('costume', '')
         _transform_prefix = f"{_current_costume}/transformations/"
         _unlocked = getattr(self.player, 'unlocked_transformations', None) or []
         self.player.has_transformation = any(
@@ -7256,11 +7383,23 @@ class Game:
                         self.player.character, 'base', 32, 32)
                     self.player.costume = 'base'
 
-    def _reload_attack_config(self, character_id):
+    def _reload_attack_config(self, character_id, sync_base_stats=True):
         """(Re-)apply character_id's saved attack config to the live player:
         equipped attacks and ki mode. Used both when swapping to a different
         character and when picking up edits made in the character creator
-        for the character currently being played."""
+        for the character currently being played.
+
+        sync_base_stats=False skips the STR/POW/END/SPD/ki_regen/max_hp/
+        max_ki sync block below — used when this is called from
+        _switch_character(), where Player.restore_progress() has *already*
+        put character_id's own current (possibly leveled-up, stat-point-
+        allocated) numbers onto the player; re-syncing base config values
+        on top of that would silently wipe out every stat point ever spent
+        on that character on every single switch back to them. The
+        character-creator "pick up my edit" call site (below, at the
+        'close' handler) still wants sync_base_stats=True — that one really
+        does mean to push a freshly-edited base config onto the currently
+        active character."""
         cfg = character_creator.load_config(character_id)
         atk = cfg.get('attacks', {})
 
@@ -7297,6 +7436,18 @@ class Game:
         # plays.
         self.player.charged_melee_style = atk.get('charged_melee_style', 'lunge')
 
+        # Charged Melee gate — whether holding E is allowed to roll into
+        # the charge wind-up at all (see the 'charged_melee' event action
+        # / _handle_charged_melee_action() above; Player.start_charging_
+        # melee() in player.py needs an
+        # `if not self.charged_melee_enabled: return`-style guard added
+        # at its top to actually enforce this — see the NOTE there).
+        # Defaults to enabled on every character load/switch, same
+        # reset-per-load semantics as equipped_attacks/
+        # unlocked_transformations below: a runtime add/remove from a
+        # trigger box doesn't persist across switching away and back.
+        self.player.charged_melee_enabled = True
+
         # Every transformation form configured anywhere on this character
         # (across all its costumes), keyed by form id (see
         # _transformation_form_id() below) — the pool the 'transformation'
@@ -7322,30 +7473,33 @@ class Game:
         self._refresh_transformation_gate(cfg=cfg)
 
         # Sync character-creator stats → player.stats so ki_regen (and any
-        # other stat) takes effect the moment the creator saves.
-        _cc_stats = cfg.get('stats', {})
-        _stat_map = {
-            'power':    'strength',   # STR
-            'ki_power': 'ki_power',   # POW
-            'vitality': 'vitality',   # END
-            'defense':  'defense',    # legacy/unused — combat reads 'vitality', not this
-            'speed':    'speed',      # SPD
-            'ki_regen': 'ki_regen',
-        }
-        changed = False
-        for cc_key, player_key in _stat_map.items():
-            if cc_key in _cc_stats and player_key in self.player.stats:
-                self.player.stats[player_key] = _cc_stats[cc_key]
-                changed = True
-        if changed:
-            self.player.update_derived_stats()
-        # max_hp / max_ki are direct values in the creator
-        if 'max_hp' in _cc_stats:
-            self.player.max_hp = _cc_stats['max_hp']
-            self.player.hp     = min(self.player.hp, self.player.max_hp)
-        if 'max_ki' in _cc_stats:
-            self.player.max_ki = _cc_stats['max_ki']
-            self.player.ki     = min(self.player.ki, self.player.max_ki)
+        # other stat) takes effect the moment the creator saves. Skipped on
+        # switch-driven reloads (see sync_base_stats docstring above) so a
+        # returning character's own leveled/allocated stats aren't stomped.
+        if sync_base_stats:
+            _cc_stats = cfg.get('stats', {})
+            _stat_map = {
+                'power':    'strength',   # STR
+                'ki_power': 'ki_power',   # POW
+                'vitality': 'vitality',   # END
+                'defense':  'defense',    # legacy/unused — combat reads 'vitality', not this
+                'speed':    'speed',      # SPD
+                'ki_regen': 'ki_regen',
+            }
+            changed = False
+            for cc_key, player_key in _stat_map.items():
+                if cc_key in _cc_stats and player_key in self.player.stats:
+                    self.player.stats[player_key] = _cc_stats[cc_key]
+                    changed = True
+            if changed:
+                self.player.update_derived_stats()
+            # max_hp / max_ki are direct values in the creator
+            if 'max_hp' in _cc_stats:
+                self.player.max_hp = _cc_stats['max_hp']
+                self.player.hp     = min(self.player.hp, self.player.max_hp)
+            if 'max_ki' in _cc_stats:
+                self.player.max_ki = _cc_stats['max_ki']
+                self.player.ki     = min(self.player.ki, self.player.max_ki)
 
         # Keep ki_attack_mode valid for whatever's now equipped — prevents
         # being left in e.g. beam mode after a character loses beam attacks.
@@ -7353,23 +7507,44 @@ class Game:
         if self.player.ki_attack_mode not in allowed:
             self.player.ki_attack_mode = allowed[0] if allowed else 'blast'
 
-    def _switch_character(self, character_id):
-        """Swap the player's sprite to character_id while keeping all gameplay state intact."""
+    def _switch_character(self, character_id, sync_previous=True):
+        """Swap the player's sprite to character_id while keeping all gameplay state intact.
+
+        Level/XP/HP/KI/stats are per-character (see Player.snapshot_progress/
+        restore_progress) — the outgoing character's numbers are stashed in
+        self.player.character_progress and the incoming character's numbers
+        are loaded back out of it (or freshly seeded from their
+        character-creator config, if this is the first time they've been
+        played). Position, inventory, zeni, and direction stay on the
+        player as before since those are shared/global, not per-character.
+
+        sync_previous=False skips checkpointing the OUTGOING character's
+        progress — used only by _start_loaded_game(), where the "outgoing"
+        player object is just Game.__init__'s fresh boot-time placeholder
+        rather than a character actually played this session, so there's
+        nothing real to save and doing so would clobber a genuine loaded
+        entry for that same character id.
+        """
         from core.sprite_system import create_character_sprite
 
-        # Snapshot current state before the swap.
+        previous_character_id = getattr(self.player, 'character', None)
+
+        # Snapshot the non-progress state before the swap (unchanged by
+        # character switching — shared across every character).
         state = {
             'x': self.player.x,
             'y': self.player.y,
-            'hp': self.player.hp,
-            'ki': self.player.ki,
-            'level': self.player.level,
-            'stats': self.player.stats.copy(),
             'inventory': self.player.inventory.copy(),
             'zeni': getattr(self.player, 'zeni', 0),
             'direction': self.player.direction,
             'current_animation_state': getattr(self.player, 'current_animation_state', 'idle'),  # capture BEFORE swap
         }
+
+        # Stash the outgoing character's level/XP/HP/KI/stats so they're
+        # exactly as-left when this character is switched back to, instead
+        # of being overwritten by whoever's switched in next.
+        if sync_previous:
+            self._sync_active_character_progress(previous_character_id)
 
         # Use the costume configured for this character in the character
         # creator (assets/characters/{character_id}.json's "costume" field)
@@ -7385,9 +7560,17 @@ class Game:
         self.player.costume   = costume
         self.player.sprite    = create_character_sprite(character_id, costume, 32, 32)
 
-        # Restore state so the swap is completely seamless to the player.
+        # Restore shared state so the swap is completely seamless to the player.
         for key, value in state.items():
             setattr(self.player, key, value)
+
+        # Load the incoming character's own progress — either picking up
+        # exactly where they were left off, or a fresh level-1 start seeded
+        # from their character-creator config if they've never been played.
+        progress = self.player.character_progress.get(character_id)
+        if progress is None:
+            progress = Player.fresh_progress_for_character(character_id, self.game_config)
+        self.player.restore_progress(progress)
 
         # The freshly created sprite doesn't know the player's pre-swap
         # facing — push it in now, or the new character defaults to facing
@@ -7396,12 +7579,26 @@ class Game:
             self.player.sprite.set_animation(
                 state['current_animation_state'], state['direction'])
 
-        # Apply the character's attack config so only equipped attacks are usable.
-        self._reload_attack_config(character_id)
+        # Apply the character's attack config so only equipped attacks are
+        # usable. sync_base_stats=False: restore_progress() just above
+        # already put this character's own current stats/HP/KI in place —
+        # see _reload_attack_config's docstring for why re-syncing base
+        # config stats here would wipe those back out.
+        self._reload_attack_config(character_id, sync_base_stats=False)
 
         # Keep the event editor's skill pickers scoped to whoever's now
         # being played — see _sync_event_editor_character().
         self._sync_event_editor_character()
+
+    def _sync_active_character_progress(self, character_id):
+        """Write the live player's current level/XP/HP/KI/stats into
+        self.player.character_progress[character_id] — i.e. checkpoint
+        whoever's currently active before either switching away from them
+        (_switch_character) or writing a save file (_write_save_slot), so
+        neither operation loses progress made since the last switch."""
+        if not character_id:
+            return
+        self.player.character_progress[character_id] = self.player.snapshot_progress()
 
     def _handle_set_player_character_action(self, character_id, skin_id=None):
         """EventRunner handler for the 'set_player_character' action —
@@ -8087,6 +8284,9 @@ class Game:
             # Destructible stones.
             self._update_stones(dt)
 
+            # Decorations (trees, etc.) — animation playback only.
+            self._update_decorations(dt)
+
             # Level gates.
             self._update_gates(dt)
 
@@ -8164,11 +8364,11 @@ class Game:
         if self.player.is_spinning_sword:
             is_running = False
 
-        # Build a movement direction vector from the arrow keys.
-        if keys[pygame.K_LEFT]  and not keys[pygame.K_RIGHT]: dx = -1
-        elif keys[pygame.K_RIGHT] and not keys[pygame.K_LEFT]: dx = 1
-        if keys[pygame.K_UP]    and not keys[pygame.K_DOWN]:  dy = -1
-        elif keys[pygame.K_DOWN] and not keys[pygame.K_UP]:   dy = 1
+        # Build a movement direction vector from the WASD keys.
+        if keys[pygame.K_a]  and not keys[pygame.K_d]: dx = -1
+        elif keys[pygame.K_d] and not keys[pygame.K_a]: dx = 1
+        if keys[pygame.K_w]    and not keys[pygame.K_s]:  dy = -1
+        elif keys[pygame.K_s] and not keys[pygame.K_w]:   dy = 1
 
         # While the flame kamehameha is firing, player.move() is a no-op
         # (can_act() is False), so redirect this frame's raw movement
@@ -9256,6 +9456,13 @@ class Game:
             if not stone.active:
                 self.destructible_stones.remove(stone)
 
+    def _update_decorations(self, dt):
+        """Advance each placed decoration's (tree, etc.) frame animation.
+        No attack/collision checks here — unlike destructible stones,
+        decorations are purely ambient and never destroyed."""
+        for decoration in self.decorations:
+            decoration.update(dt)
+
     def _trigger_genkidama_hit(self, x, y):
         """Spawn the hit-flash effect and kick off the screen white-flash
         when a GenkidamaBlast connects with an enemy or destructible object."""
@@ -9602,7 +9809,7 @@ class Game:
 
             for obj in (self.projectiles + self.ultra_volleyballs + _player_objs + self.enemies + self.npcs
                         + self.critters
-                        + self.destructible_stones + self.level_gates + self.doors
+                        + self.destructible_stones + self.decorations + self.level_gates + self.doors
                         + self.chests
                         + self.bombs + self.explosions + self.genkidama_hit_effects
                         + self.burning_hit_effects + self.flying_pads + self.nimbus_clouds
@@ -9883,14 +10090,16 @@ class Game:
         on_tile_changed calls within the same frame collapse into minimal
         work instead of one rebuild per mouse-motion event.
 
-        `cells`, when given, is an iterable of (grid_x, grid_y) world-space
-        cells that actually changed (e.g. a single tile placed or erased).
-        That lets the flush step patch just those spots in the existing
-        baked surface instead of throwing the whole thing away — the common
-        case while painting/erasing, and the one that used to get laggier
-        the bigger the room and the more tiles it had, since a full rebuild
-        both reallocates a room-sized surface and re-blits every tile in
-        the room on every single edit. Passing no `cells` (or room_name of
+        `cells`, when given, is an iterable of (grid_x, grid_y, width,
+        height) world-space cells that actually changed (e.g. a single tile
+        placed or erased), where width/height is that tile's real pixel
+        footprint from its own tileset. That lets the flush step patch just
+        those spots — sized correctly — in the existing baked surface
+        instead of throwing the whole thing away — the common case while
+        painting/erasing, and the one that used to get laggier the bigger
+        the room and the more tiles it had, since a full rebuild both
+        reallocates a room-sized surface and re-blits every tile in the
+        room on every single edit. Passing no `cells` (or room_name of
         None) falls back to the old full-invalidate behavior, for bulk
         operations like loading a room or toggling layer visibility, where
         a full rebuild is unavoidable anyway.
@@ -9929,11 +10138,11 @@ class Game:
 
         if self._dirty_tile_cells:
             for room_name, cells in self._dirty_tile_cells.items():
-                for cell_x, cell_y in cells:
-                    self._patch_tile_cell(room_name, cell_x, cell_y)
+                for cell_x, cell_y, cell_w, cell_h in cells:
+                    self._patch_tile_cell(room_name, cell_x, cell_y, cell_w, cell_h)
             self._dirty_tile_cells.clear()
 
-    def _patch_tile_cell(self, room_name: str, cell_x: int, cell_y: int):
+    def _patch_tile_cell(self, room_name: str, cell_x: int, cell_y: int, cell_w: int, cell_h: int):
         """Redraw a single grid cell in-place on the already-baked tile
         surfaces for `room_name`, instead of rebuilding the whole room.
 
@@ -9944,6 +10153,14 @@ class Game:
         get progressively laggier on bigger rooms with more tiles: every
         single edit was paying for a full rebuild.
 
+        `cell_w`/`cell_h` is the real pixel footprint of the tile that was
+        placed or erased here (from the tileset it belongs to), NOT a fixed
+        grid constant. Clearing by a generic grid size instead of the tile's
+        actual size bleeds into whatever sits at the next cell over on a
+        finer-grained tileset (e.g. clearing 16px when the tile is really
+        8px reaches into the neighboring 8px tile) and silently erases its
+        already-baked pixels without redrawing them.
+
         If a baked surface for this room/layer hasn't been built yet, there's
         nothing to patch — it'll be built fresh (correctly) on first access.
         """
@@ -9952,7 +10169,6 @@ class Game:
             return
 
         tileset_mgr = te.tileset_manager
-        grid_size = te.grid_size
         cell_tiles = [
             t for t in te.room_tiles.get(room_name, [])
             if t.x == cell_x and t.y == cell_y
@@ -9965,10 +10181,10 @@ class Game:
             if surf is None:
                 continue  # nothing baked yet for this room/layer — skip
 
-            # Clear just this cell's footprint back to transparent.
+            # Clear just this cell's real footprint back to transparent.
             rect = pygame.Rect(
                 int(cell_x * RENDER_SCALE), int(cell_y * RENDER_SCALE),
-                int(grid_size * RENDER_SCALE), int(grid_size * RENDER_SCALE),
+                int(cell_w * RENDER_SCALE), int(cell_h * RENDER_SCALE),
             )
             surf.fill((0, 0, 0, 0), rect)
 
@@ -10916,20 +11132,21 @@ class Game:
 
     def _draw_player_silhouette_if_occluded(self):
         """After the foreground tile layer is drawn, check whether any opaque
-        foreground tile pixel overlaps the player.  If so, blit a pixel-accurate
-        dark ghost so the player stays readable through walls/fences/trees.
+        foreground tile pixel — or any decoration (tree, etc.) currently
+        drawn in front of the player by Y-sort — overlaps the player. If so,
+        blit a pixel-accurate dark ghost so the player stays readable
+        through walls/fences/trees/canopies.
 
-        Tile surfaces are retrieved and scaled here, then forwarded to
-        draw_player_silhouette which builds an occlusion mask from their opaque
-        pixels.  Transparent tile borders are excluded, so the ghost only appears
-        where a genuinely solid tile sits on top of the player sprite.
+        Tile and decoration surfaces are retrieved and scaled here, then
+        forwarded to draw_player_silhouette which builds an occlusion mask
+        from their opaque pixels. Transparent borders are excluded, so the
+        ghost only appears where something genuinely solid sits on top of
+        the player sprite.
         """
         if self.active_cutscene_runtime:
             return
 
         fg_tiles = self._get_foreground_tiles()
-        if not fg_tiles:
-            return
 
         # Build the player's screen-space bounding rect.
         pw = int(self.player.width  * RENDER_SCALE)
@@ -10940,10 +11157,11 @@ class Game:
 
         te = getattr(self.room_editor, 'tileset_editor', None)
 
-        # Collect every tile whose bounding rect overlaps the player, together
-        # with its scaled surface.  draw_player_silhouette will then mask the
-        # silhouette to only the pixels those surfaces actually cover.
-        overlapping: list = []   # [(scaled_surface | None, screen_x, screen_y)]
+        # Collect every tile/decoration whose bounding rect overlaps the
+        # player, together with its scaled surface. draw_player_silhouette
+        # will then mask the silhouette to only the pixels those surfaces
+        # actually cover.
+        overlapping: list = []   # [(scaled_surface | None, screen_x, screen_y, cache_key)]
 
         for tile in fg_tiles:
             tx = int(tile.x * RENDER_SCALE - self.camera.x)
@@ -10970,6 +11188,27 @@ class Game:
 
             cache_key = (tile.tileset_name, tile.tile_x, tile.tile_y)
             overlapping.append((tile_surf, tx, ty, cache_key))
+
+        # Decorations (trees, etc.) — unlike painted foreground tiles, these
+        # are Y-sorted against the player (see Decoration's class docstring),
+        # so they don't ALWAYS draw in front. Only fold one in here when
+        # this frame's Y-sort actually put it in front of the player —
+        # matching LayerManager's own (layer, y) compare — otherwise a tree
+        # the player is standing in front of (visually correct, no occlusion
+        # needed) would incorrectly ghost the player out.
+        for decoration in self.decorations:
+            if not decoration.active:
+                continue
+            if decoration.get_sort_key() < self.player.get_sort_key():
+                continue  # drawn behind the player this frame — nothing to occlude
+
+            scaled, dx, dy = decoration.get_render_info(self.camera, RENDER_SCALE)
+            if not player_rect.colliderect(pygame.Rect(dx, dy, scaled.get_width(), scaled.get_height())):
+                continue
+
+            cache_key = ('decoration', decoration.decoration_type, decoration.variant,
+                         decoration.current_frame_index(), RENDER_SCALE)
+            overlapping.append((scaled, dx, dy, cache_key))
 
         if overlapping:
             self.layer_manager.draw_player_silhouette(
@@ -11002,7 +11241,8 @@ class Game:
             player=self.player,
             world_map_lookup=self._world_map_lookup,
         )
-        self.level_up_notification.draw(self.logical_surface, self.colors, sprite_hud=self.sprite_hud, player=self.player)
+        if not self.scouter_menu.active:
+            self.level_up_notification.draw(self.logical_surface, self.colors, sprite_hud=self.sprite_hud, player=self.player)
 
         self.transition_config_menu.draw(self.logical_surface)
 

@@ -2030,6 +2030,100 @@ class PauseMenu:
 
     # ── Status page ───────────────────────────────────────────────────────────
 
+    def _resolve_viewed_progress(self, player, char_id, is_active):
+        """LVL/XP/HP/EP/STR/POW/END/SPD to show on the Status page for
+        char_id. Each playable character now tracks its own independent
+        progress (see Game._switch_character / Player.snapshot_progress /
+        player.character_progress) instead of every character sharing one
+        set of numbers, so this resolves to real values for whoever's being
+        previewed — not just the currently active character.
+
+        Precedence:
+          1. is_active            → the live player object (source of truth
+                                     for whoever's actually being played
+                                     right now — character_progress[char_id]
+                                     is only refreshed on switch/save, so it
+                                     can lag behind mid-session).
+          2. character_progress   → char_id has been played before this
+                                     session; use their saved numbers.
+          3. character-creator    → char_id is unlocked but has never been
+             base config            switched to yet; seed the same fresh
+                                     level-1 numbers they'd get the moment
+                                     they're first switched to (see
+                                     Player.fresh_progress_for_character).
+
+        ZENIE and TIME are deliberately NOT included here — those stay
+        shared/global across every character (one wallet, one save-file
+        playtime), so callers should read player.zeni / the play_time
+        argument directly regardless of which character is being viewed.
+        """
+        if is_active:
+            stats = getattr(player, 'stats', {}) or {}
+            return {
+                'level':             getattr(player, 'level', 1),
+                'hp':                int(round(getattr(player, 'hp', 0))),
+                'max_hp':            int(round(getattr(player, 'max_hp', 1))),
+                'ki':                int(getattr(player, 'ki', 0)),
+                'max_ki':            int(getattr(player, 'max_ki', 1)),
+                # Show lifetime XP collected (total_exp) rather than
+                # player.exp, which resets down to the leftover amount on
+                # every level-up.
+                'total_exp':         getattr(player, 'total_exp', getattr(player, 'exp', 0)),
+                'exp':               getattr(player, 'exp', 0),
+                'exp_to_next_level': getattr(player, 'exp_to_next_level', 0),
+                'stats': {
+                    'strength': stats.get('strength', stats.get('str', 0)),
+                    'ki_power': stats.get('ki_power', stats.get('pow', 0)),
+                    'vitality': stats.get('vitality', stats.get('end', 0)),
+                    'speed':    stats.get('speed',    stats.get('spd', 0)),
+                },
+            }
+
+        saved = getattr(player, 'character_progress', {}).get(char_id)
+        if saved is not None:
+            stats = saved.get('stats', {}) or {}
+            return {
+                'level':             saved.get('level', 1),
+                'hp':                int(round(saved.get('hp', 0))),
+                'max_hp':            int(round(saved.get('max_hp', 1))),
+                'ki':                int(saved.get('ki', 0)),
+                'max_ki':            int(saved.get('max_ki', 1)),
+                'total_exp':         saved.get('total_exp', saved.get('exp', 0)),
+                'exp':               saved.get('exp', 0),
+                'exp_to_next_level': saved.get('exp_to_next_level', 0),
+                'stats': {
+                    'strength': stats.get('strength', 0),
+                    'ki_power': stats.get('ki_power', 0),
+                    'vitality': stats.get('vitality', 0),
+                    'speed':    stats.get('speed', 0),
+                },
+            }
+
+        # Never been played this session/save — fresh level-1 numbers
+        # seeded from the character creator's base config.
+        try:
+            cstats = load_config(char_id).get('stats', {})
+        except Exception:
+            cstats = {}
+        max_hp = cstats.get('max_hp', 1)
+        max_ki = cstats.get('max_ki', 1)
+        return {
+            'level':             1,
+            'hp':                max_hp,
+            'max_hp':            max_hp,
+            'ki':                max_ki,
+            'max_ki':            max_ki,
+            'total_exp':         0,
+            'exp':               0,
+            'exp_to_next_level': 100,  # matches Player.__init__'s own no-game_config fallback
+            'stats': {
+                'strength': cstats.get('power', 0),
+                'ki_power': cstats.get('ki_power', 0),
+                'vitality': cstats.get('vitality', 0),
+                'speed':    cstats.get('speed', 0),
+            },
+        }
+
     def _draw_status_page(self, screen, player, play_time, rect):
         x, y, w, h = rect.x, rect.y, rect.width, rect.height
         sprite_col_w = w // 3
@@ -2038,14 +2132,15 @@ class PauseMenu:
         active_char_id = getattr(player, 'character', 'unknown')
         char_id        = self._viewed_char_id or active_char_id
         is_active      = char_id == active_char_id
-        level          = getattr(player, 'level', 1) if is_active else None
+        progress       = self._resolve_viewed_progress(player, char_id, is_active)
+        level          = progress['level']
 
         def _tint(s, c): t=s.copy(); t.fill(c,special_flags=pygame.BLEND_RGBA_MULT); return t
         def _shadow(s):  t=s.copy(); t.fill((0,0,0),special_flags=pygame.BLEND_RGBA_MULT); return t
 
         name_surf = _tint(self.bold_font.render(self._get_display_name(char_id).upper()), (255,255,0))
         lvl_surf  = _tint(self.bold_font.render('LVL'),           (255,0,0))
-        num_surf  = _tint(self.bold_numbers_font.render(str(level) if is_active else '--'), (255,0,0))
+        num_surf  = _tint(self.bold_numbers_font.render(str(level)), (255,0,0))
 
         if self._name_sprites:
             tag_h=max(16,int(h*0.08)); gap=max(2,int(self.screen_width*0.003)); tx,ty=x-6,y-3
@@ -2085,7 +2180,7 @@ class PauseMenu:
             pygame.draw.circle(screen,(200,200,255),(sprite_cx,sprite_cy),r,2)
 
         bar_h=max(4,int(self.screen_height*0.008)); lh=max(20,int(self.stats_font.get_line_height()+20))
-        cy=content_top+int(h-453); stats=getattr(player,'stats',{}); _label_gap=max(3,int(self.screen_width*0.004))
+        cy=content_top+int(h-453); _label_gap=max(3,int(self.screen_width*0.004))
 
         def _yellow(s): c=s.copy(); c.fill((255,255,0),  special_flags=pygame.BLEND_RGBA_MULT); return c
         def _grey(s):   c=s.copy(); c.fill((180,180,180),special_flags=pygame.BLEND_RGBA_MULT); return c
@@ -2149,53 +2244,35 @@ class PauseMenu:
                     scaled = pygame.transform.scale(arrow,(arrow.get_width()*arr_sc,arrow.get_height()*arr_sc))
                     screen.blit(scaled,(right_col_x+32-scaled.get_width(),ry+(label_h-scaled.get_height())//2 - 2))
 
-        if is_active:
-            hp,max_hp=int(round(getattr(player,'hp',0))),int(round(getattr(player,'max_hp',1)))
-            ki,max_ki=int(getattr(player,'ki',0)),int(getattr(player,'max_ki',1))
-            # Show lifetime XP collected (total_exp) rather than player.exp,
-            # which resets down to the leftover amount on every level-up.
-            exp=getattr(player,'total_exp',getattr(player,'exp',0)); exp_nxt=getattr(player,'exp_to_next_level',0)
-            zenie=getattr(player,'zeni',0); t=int(play_time)
-            hh,rem=divmod(t,3600); mm,ss=divmod(rem,60)
-            time_str=f'{hh:02d}:{mm:02d}:{ss:02d}'
-            right_stats=[('STR',stats.get('strength',stats.get('str',0))),
-                         ('POW',stats.get('ki_power',stats.get('pow',0))),
-                         ('END',stats.get('vitality',stats.get('end',0))),
-                         ('SPD',stats.get('speed',   stats.get('spd',0)))]
-        else:
-            # Previewing a character you're not currently playing as — no live
-            # save data exists for them yet, so fall back to their base stats
-            # from the character creator config instead of fabricating numbers.
-            # NOTE: reuse the exact same label strings as the active branch
-            # (STR/POW/END/SPD) rather than new ones like "DEF"/"KI RGN" —
-            # the stats bitmap font only has glyphs proven out for the labels
-            # already used elsewhere in this menu, and introducing untested
-            # letters/wider strings here previously garbled the row.
-            try:
-                cstats = load_config(char_id).get('stats', {})
-            except Exception:
-                cstats = {}
-            max_hp=cstats.get('max_hp',1); max_ki=cstats.get('max_ki',1)
-            hp,ki=max_hp,max_ki
-            exp='--'; exp_nxt='--'; zenie='--'; time_str='--:--:--'
-            right_stats=[('STR',cstats.get('power',0)),
-                         ('POW',cstats.get('ki_regen',0)),
-                         ('END',cstats.get('defense',0)),
-                         ('SPD',cstats.get('speed',0))]
+        # LVL/XP/HP/EP/STR/POW/END/SPD are all per-character now (see
+        # _resolve_viewed_progress / Game._switch_character /
+        # Player.character_progress) — every unlocked character shows its
+        # own real numbers here, not just whichever one is currently active.
+        hp, max_hp = progress['hp'], progress['max_hp']
+        ki, max_ki = progress['ki'], progress['max_ki']
+        exp     = progress['total_exp']
+        exp_nxt = progress['exp_to_next_level']
+        pstats  = progress['stats']
+        right_stats=[('STR',pstats.get('strength',0)),
+                     ('POW',pstats.get('ki_power',0)),
+                     ('END',pstats.get('vitality',0)),
+                     ('SPD',pstats.get('speed',   0))]
+
+        # ZENIE and TIME are shared/global across every character (one
+        # wallet, one save-file playtime — not per-character), so these
+        # always reflect the live player/session regardless of who's
+        # being previewed.
+        zenie = getattr(player,'zeni',0); t=int(play_time)
+        hh,rem=divmod(t,3600); mm,ss=divmod(rem,60)
+        time_str=f'{hh:02d}:{mm:02d}:{ss:02d}'
 
         draw_row('HP:',f'{hp}/{max_hp}'); draw_row('EP:',f'{ki}/{max_ki}')
         # NXT LVL should read as "how much more XP until the next level",
         # not the flat total that level costs — exp_to_next_level is the
         # latter (it's a per-level constant set once in level_up()), so
-        # subtract off how much of it has already been earned
-        # (player.exp, which counts up from 0 each level). Only do the
-        # subtraction for the active/live player — the '--' placeholder
-        # used when previewing another character has no numeric exp to
-        # subtract from.
-        if is_active:
-            remaining_to_next = max(0, exp_nxt - getattr(player,'exp',0))
-        else:
-            remaining_to_next = exp_nxt
+        # subtract off how much of it has already been earned this level
+        # (progress['exp'], which counts up from 0 each level-up).
+        remaining_to_next = max(0, exp_nxt - progress['exp'])
         draw_row('XP:',str(exp)); draw_row('NXT LVL:',str(remaining_to_next))
         draw_row('ZENIE:',str(zenie)); draw_row('TIME:',time_str)
         draw_div()

@@ -17,6 +17,7 @@ from objects.save_point import SavePoint, SavePointManager
 from objects.world_map import WorldMapObject, WorldMapObjectManager
 from objects.door_object import Door, DoorManager
 from objects.chest_object import Chest, ChestManager
+from objects.decoration_objects import Decoration, DECORATION_STYLES
 from core.items import get_item
 from objects.trigger_box import (OverlapTriggerBox, KeyTriggerBox, TriggerBoxManager,
                                  draw_trigger_box)
@@ -136,6 +137,10 @@ class ObjectEditor:
         self.on_transition_deleted = None
         self.on_transition_placed = None
         self.on_stone_placed = None
+
+        # ── Decorations (trees, etc.) ────────────────────────────────────────
+        self.on_decoration_placed = None
+        self.on_decoration_deleted = None
 
         # ── Flying pad ────────────────────────────────────────────────────────
         self.flying_pad_manager = FlyingPadManager()
@@ -285,6 +290,13 @@ class ObjectEditor:
         # instead of going through the variant system.
         self.nimbus_cloud_sprite = NimbusCloud(0, 0).sprite
 
+        # Tree decoration's palette icon is its first animation frame. Like
+        # nimbus_cloud above, it has no per-type variants to pick between
+        # (yet — see DECORATION_STYLES['variants']), so it's loaded directly
+        # here instead of going through the has_variants/variant-picker
+        # system that gates/doors/chests use.
+        self._tree_icon_sprite = Decoration(0, 0, 'tree').frames[0]
+
         # Door variants are discovered from assets/sprites/structures/door/ at
         # startup (one sheet per type — see Door.list_door_types()) rather
         # than hardcoded here, so dropping in a new sheet is enough to make
@@ -312,7 +324,8 @@ class ObjectEditor:
         self.categories = {
             'System': [],
             'Terrain': [],
-            'Decorations': [
+            'Structures': [],
+            'Interactive': [
                 {
                     'id': 'destructible_stone',
                     'name': 'Destructible Stone',
@@ -382,13 +395,18 @@ class ObjectEditor:
                         {'type': 'world_map_sign', 'name': 'World Map Sign', 'width': 29, 'height': 32, 'sprite': None},
                     ],
                     'default_variant': 'world_map'
-                }
-            ],
-            'Structures': [
-                {'id': 'house_1', 'name': 'Small House', 'sprite': None, 'width': 64, 'height': 64},
-                {'id': 'fence_1', 'name': 'Fence', 'sprite': None, 'width': 16, 'height': 16},
-                {'id': 'sign_1', 'name': 'Sign Post', 'sprite': None, 'width': 16, 'height': 24},
-                {'id': 'well_1', 'name': 'Well', 'sprite': None, 'width': 32, 'height': 32},
+                },
+                {
+                    'id': 'chest',
+                    'name': 'Treasure Chest',
+                    'sprite': None,
+                    'width': 24,
+                    'height': 20,
+                    'object_type': 'chest',
+                    'has_variants': True,
+                    'variants': self.chest_variants,
+                    'default_variant': self.chest_variants[0]['type']
+                },
                 {
                     'id': 'door',
                     'name': 'Door',
@@ -401,21 +419,23 @@ class ObjectEditor:
                     'default_variant': self.door_variants[0]['type']
                 },
             ],
-            'Interactive': [
+            'Decorations': [
                 {
-                    'id': 'chest',
-                    'name': 'Treasure Chest',
-                    'sprite': None,
-                    'width': 24,
-                    'height': 20,
-                    'object_type': 'chest',
-                    'has_variants': True,
-                    'variants': self.chest_variants,
-                    'default_variant': self.chest_variants[0]['type']
+                    'id': 'tree',
+                    'name': 'Tree',
+                    'sprite': self._tree_icon_sprite,
+                    'width': DECORATION_STYLES['tree']['frame_w'],
+                    'height': DECORATION_STYLES['tree']['frame_h'],
+                    'object_type': 'decoration',
+                    'decoration_type': 'tree',
+                    # No has_variants here — 'tree' has exactly one variant
+                    # today (DECORATION_STYLES['tree']['variants']), so there's
+                    # nothing to pick between yet. If a second row is ever
+                    # added to tree.png, this can switch to the same
+                    # has_variants/variants/default_variant scheme doors and
+                    # chests use.
                 },
-                {'id': 'door_1', 'name': 'Door', 'sprite': None, 'width': 16, 'height': 32},
-                {'id': 'switch_1', 'name': 'Switch', 'sprite': None, 'width': 16, 'height': 16},
-            ]
+            ],
         }
 
         # Add spawn point to System category
@@ -1084,6 +1104,15 @@ class ObjectEditor:
                     if distance < max(stone.width, stone.height) / 2:
                         return stone, 'stone'
 
+        # Check decorations (trees, etc.)
+        if self.room_manager:
+            room = self.room_manager.get_room_by_name(self.current_room_name)
+            if room and hasattr(room, 'decorations'):
+                for decoration in room.decorations:
+                    distance = ((decoration.x - world_x) ** 2 + (decoration.y - world_y) ** 2) ** 0.5
+                    if distance < max(decoration.width, decoration.height) / 2:
+                        return decoration, 'decoration'
+
         # Check flying pads
         pads = self.flying_pad_manager.get_pads(self.current_room_name)
         for pad in pads:
@@ -1233,6 +1262,16 @@ class ObjectEditor:
 
             if hasattr(self, 'on_stone_deleted') and self.on_stone_deleted:
                 self.on_stone_deleted(obj, self.current_room_name)
+
+        elif obj_type == 'decoration':
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(self.current_room_name)
+                if room and hasattr(room, 'decorations'):
+                    if obj in room.decorations:
+                        room.decorations.remove(obj)
+
+            if hasattr(self, 'on_decoration_deleted') and self.on_decoration_deleted:
+                self.on_decoration_deleted(obj, self.current_room_name)
 
         elif obj_type == 'door':
             self.door_manager.remove_door(self.current_room_name, obj)
@@ -1580,6 +1619,35 @@ class ObjectEditor:
                         self.on_stone_placed(stone, room_name)
 
 
+        elif self.selected_object.get('object_type') == 'decoration':
+            from objects.decoration_objects import Decoration
+
+            decoration_type = self.selected_object.get('decoration_type', 'tree')
+
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(room_name)
+                if room and self._too_close_to_existing(
+                        self.preview_x, self.preview_y,
+                        getattr(room, 'decorations', None)):
+                    return
+
+            decoration = Decoration(
+                int(self.preview_x),
+                int(self.preview_y),
+                decoration_type
+            )
+
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(room_name)
+                if room:
+                    if not hasattr(room, 'decorations'):
+                        room.decorations = []
+                    room.decorations.append(decoration)
+
+                    if hasattr(self, 'on_decoration_placed') and self.on_decoration_placed:
+                        self.on_decoration_placed(decoration, room_name)
+
+
         elif self.selected_object.get('object_type') == 'flying_pad':
             existing_pads = None
             if self.room_manager:
@@ -1902,6 +1970,20 @@ class ObjectEditor:
                              pulse)
 
         elif obj_type in ['stone', 'transition']:
+            screen_x = (obj.x * RENDER_SCALE) - camera_x
+            screen_y = (obj.y * RENDER_SCALE) - camera_y
+            scaled_width = int(obj.width * RENDER_SCALE)
+
+            pulse = int(20 + 10 * abs(pygame.time.get_ticks() % 1000 - 500) / 500)
+            pygame.draw.circle(screen, self.colors['delete'],
+                               (int(screen_x), int(screen_y)),
+                               scaled_width // 2 + pulse, 3)
+
+        elif obj_type == 'decoration':
+            # Bottom-anchored (see Decoration's class docstring), so the
+            # pulse circle is centered on the trunk/base point rather than
+            # the sprite's vertical middle like the stone/transition case
+            # above.
             screen_x = (obj.x * RENDER_SCALE) - camera_x
             screen_y = (obj.y * RENDER_SCALE) - camera_y
             scaled_width = int(obj.width * RENDER_SCALE)
@@ -3375,14 +3457,17 @@ class ObjectEditor:
             preview_surf = scaled_sprite.copy()
             preview_surf.set_alpha(100)
 
-            # Match the anchor convention used by WorldMapObject.draw():
-            # 'world_map_sign' uses midbottom, all others use center.
-            is_sign = (
-                    self.selected_object.get('object_type') == 'world_map_object'
-                    and (self.selected_variant or {}).get('type') == 'world_map_sign'
+            # Match the anchor convention used by WorldMapObject.draw() and
+            # Decoration.get_render_info(): 'world_map_sign' and every
+            # decoration (tree, etc.) use midbottom — (preview_x, preview_y)
+            # is the base/trunk point — everything else uses center.
+            is_bottom_anchor = (
+                    (self.selected_object.get('object_type') == 'world_map_object'
+                     and (self.selected_variant or {}).get('type') == 'world_map_sign')
+                    or self.selected_object.get('object_type') == 'decoration'
             )
             preview_x = int(screen_x - scaled_width // 2)
-            preview_y = int(screen_y - scaled_height) if is_sign else int(screen_y - scaled_height // 2)
+            preview_y = int(screen_y - scaled_height) if is_bottom_anchor else int(screen_y - scaled_height // 2)
 
             screen.blit(preview_surf, (preview_x, preview_y))
 

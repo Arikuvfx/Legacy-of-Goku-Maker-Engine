@@ -351,6 +351,40 @@ class _DigitSpriteFont:
         return max(g.get_height() for g in self.glyphs.values())
 
 
+class _NameDigitSpriteFont:
+    """Loads per-digit (0-9) PNG glyphs from assets/ui/fonts/numbers,
+    keyed by the literal digit character. Used only for digits that
+    show up inside an entity's Scouter Data display name (e.g. "Android
+    19", "Cell Jr. 3") so they render in the same pixel-art family as
+    the rest of the name instead of falling through to the plain
+    pygame fallback font — see _render_data_name_word(). Unlike
+    _DigitSpriteFont (assets/ui/fonts/dmg_font), this art isn't
+    authored with an outline stroke to strip, so glyphs are loaded
+    as-is, the same plain convention _LetterSpriteFont uses."""
+
+    def __init__(self, folder):
+        self.folder = folder
+        self.glyphs = {}
+        self._load()
+
+    def _load(self):
+        if not os.path.exists(self.folder):
+            return
+        for d in '0123456789':
+            path = os.path.join(self.folder, f'{d}.png')
+            if not os.path.exists(path):
+                continue
+            try:
+                self.glyphs[d] = pygame.image.load(path).convert_alpha()
+            except Exception as e:
+                print(f'[scouter_menu] could not load {path}: {e}')
+
+    def height(self):
+        if not self.glyphs:
+            return 0
+        return max(g.get_height() for g in self.glyphs.values())
+
+
 class ScouterMenu:
     SECTION_MAP = 'map'
     SECTION_SCOUTER = 'scouter'
@@ -750,7 +784,14 @@ class ScouterMenu:
         # ---- Scouter Data section state (see SECTION_DATA) ----
         self._data_entity = None          # the inspected entity object
         self._data_kind = None            # 'player' | 'npc' | 'enemy'
-        self._data_fade = 0.0             # 0 (just entered) -> 1 (fully faded in)
+        self._data_fade = 0.0             # 0 (black) -> 1 (fully faded in)
+        # True while _data_fade is counting back DOWN to 0 after E/SPACE/
+        # click dismissed the section — see _start_exit_data_section() /
+        # update(). The actual section switch back to SCOUTER is deferred
+        # until the fade-out reaches black, mirroring how the outer menu's
+        # own close holds on black before fading back in (see Game's
+        # 'close' handling for pause_menu/scouter_menu).
+        self._data_exiting = False
 
         # ---- Data section rotating idle-sprite viewer ----
         # A standalone AnimatedSprite built fresh for whichever entity is
@@ -829,6 +870,12 @@ class ScouterMenu:
             os.path.join('assets', 'ui', 'fonts', 'scouter_stats'))
         self._data_stat_digit_font = _DigitSpriteFont(
             os.path.join('assets', 'ui', 'fonts', 'dmg_font'))
+        # Digits inside an entity's Scouter Data display name (e.g.
+        # "Android 19") — separate from _data_stat_digit_font above,
+        # which is the dmg_font popup-numbers art used for the HP/STR/
+        # POW/END stat values, not the name. See _render_data_name_word().
+        self._data_name_digit_font = _NameDigitSpriteFont(
+            os.path.join('assets', 'ui', 'fonts', 'numbers'))
         # Cache for _scaled_digit_glyph() — scaling a glyph via
         # pygame.transform.scale isn't free, and there are only ever 10
         # possible digits, so scale each one once on first use rather
@@ -871,6 +918,7 @@ class ScouterMenu:
         self._data_entity = None
         self._data_kind = None
         self._data_fade = 0.0
+        self._data_exiting = False
 
     def close(self):
         self.active = False
@@ -878,6 +926,7 @@ class ScouterMenu:
         self._data_entity = None
         self._data_kind = None
         self._data_fade = 0.0
+        self._data_exiting = False
         return 'close'
 
     def _reset_crosshair_anim(self):
@@ -914,8 +963,20 @@ class ScouterMenu:
             # *does* want to react (sfx, stat tracking, whatever) still
             # can, same contract as before.
             self._enter_data_section(result[1], result[2])
-        if self.section == self.SECTION_DATA and self._data_fade < 1.0:
-            self._data_fade = min(1.0, self._data_fade + dt / self._DATA_FADE_SECONDS)
+        if self.section == self.SECTION_DATA:
+            if self._data_exiting:
+                # Counting back down to black — same duration as the
+                # entrance fade, just run in reverse. Once it hits 0 the
+                # section is fully black, so swap back to SCOUTER right
+                # then (see _exit_data_section) rather than waiting for
+                # anything else; SCOUTER was already fully visible before
+                # Data was entered, so nothing needs to fade back in on
+                # this side — the outer black frame IS the seam.
+                self._data_fade = max(0.0, self._data_fade - dt / self._DATA_FADE_SECONDS)
+                if self._data_fade <= 0.0:
+                    self._exit_data_section()
+            elif self._data_fade < 1.0:
+                self._data_fade = min(1.0, self._data_fade + dt / self._DATA_FADE_SECONDS)
         if self.section == self.SECTION_DATA:
             self._update_data_viewer(dt)
             self._update_data_description_scroll(dt)
@@ -1252,6 +1313,7 @@ class ScouterMenu:
         self._data_entity = obj
         self._data_kind = kind
         self._data_fade = 0.0
+        self._data_exiting = False
 
         # Fresh rotating idle-viewer sprite for this entity (see
         # _build_data_viewer_sprite) — always start mid-cycle at index 0
@@ -1289,10 +1351,24 @@ class ScouterMenu:
 
         self._play('menu_move')
 
+    def _start_exit_data_section(self):
+        """Kicks off the fade-to-black on the way OUT of SECTION_DATA —
+        called from handle_input()'s SECTION_DATA branch (E/SPACE) and
+        the MOUSEBUTTONDOWN click-to-dismiss branch, instead of switching
+        section immediately. Mirrors _enter_data_section() starting the
+        fade-IN: same _DATA_FADE_SECONDS duration, just counting down
+        instead of up (see update()). No-ops if a fade-out is already
+        running so mashing E/SPACE can't restart the timer mid-fade."""
+        if self._data_exiting:
+            return
+        self._data_exiting = True
+        self._play('menu_move')
+
     def _exit_data_section(self):
-        """Back to SCOUTER browsing — see handle_input()'s SECTION_DATA
-        branch. Doesn't touch self._entities/_crosshair_x/_y, so browsing
-        resumes exactly where it left off."""
+        """Actually switches back to SCOUTER browsing — called from
+        update() once the fade-out started by _start_exit_data_section()
+        reaches black. Doesn't touch self._entities/_crosshair_x/_y, so
+        browsing resumes exactly where it left off."""
         self.section = self.SECTION_SCOUTER
         self._data_entity = None
         self._data_kind = None
@@ -1300,7 +1376,7 @@ class ScouterMenu:
         self._data_viewer_shadow = None
         self._data_viewer_shadow_ox = 0
         self._data_viewer_shadow_oy = 0
-        self._play('menu_move')
+        self._data_exiting = False
 
     def _build_data_viewer_sprite(self, obj, kind):
         """Fresh, standalone AnimatedSprite for the Data section's
@@ -1458,7 +1534,7 @@ class ScouterMenu:
             elif event.button == 1 and self.section == self.SECTION_DATA:
                 # Click anywhere dismisses the data readout, same as SPACE
                 # below — mirrors it being what opened this section.
-                self._exit_data_section()
+                self._start_exit_data_section()
             return None
 
         if event.type != pygame.KEYDOWN:
@@ -1494,7 +1570,7 @@ class ScouterMenu:
             # browsing — see _r_button_available(), which shows E's prompt
             # here for the same reason.
             if event.key in (pygame.K_SPACE, pygame.K_e):
-                self._exit_data_section()
+                self._start_exit_data_section()
 
         return None
 
@@ -1614,25 +1690,25 @@ class ScouterMenu:
         self._draw_button_prompts(surface)
 
     def _draw_chrome(self, surface):
-        # Title and bottom hint text are skipped entirely for SECTION_DATA
-        # and SECTION_MAP — the Scouter Data panel's own art (portrait
-        # frame, name plate, stat rows) fills that space and doesn't want
-        # the section label or key-hint line drawn over/around it, and the
-        # zone map is deliberately shown clean with no title/tooltip chrome.
-        if self.section in (self.SECTION_DATA, self.SECTION_MAP):
+        # Title and bottom hint text are skipped entirely for SECTION_DATA,
+        # SECTION_MAP, SECTION_WORLD_MAP, and SECTION_SCOUTER — the Scouter
+        # Data panel's own art (portrait frame, name plate, stat rows) fills
+        # that space and doesn't want the section label or key-hint line
+        # drawn over/around it, the zone map is deliberately shown clean
+        # with no title/tooltip chrome, the world map is shown the same
+        # clean way, and the Scouter crosshair-browse section is now shown
+        # clean too — no title label or key-hint line drawn over any of them.
+        if self.section in (self.SECTION_DATA, self.SECTION_MAP,
+                             self.SECTION_WORLD_MAP, self.SECTION_SCOUTER):
             return
 
         label = {
-            self.SECTION_SCOUTER: 'SCOUTER',
-            self.SECTION_WORLD_MAP: 'WORLD MAP',
             self.SECTION_DATA: 'SCOUTER DATA',
         }[self.section]
         title_surf = self._title_font.render(label, True, (255, 220, 60))
         surface.blit(title_surf, (self.screen_width // 2 - title_surf.get_width() // 2, 10))
 
         hint = {
-            self.SECTION_SCOUTER: 'Arrows/WASD/Mouse: Move    Space: Inspect    E: Back    ESC/Enter: Close',
-            self.SECTION_WORLD_MAP: 'Q: Back    ESC/Enter: Close',
             self.SECTION_DATA: 'Space/Click/E: Back    ESC/Enter: Close',
         }[self.section]
         hint_surf = self._font.render(hint, True, (200, 200, 200))
@@ -2334,7 +2410,20 @@ class ScouterMenu:
         # bind onto the partially-initialized ui package.
         from ui import scouter_room_map
 
-        cache_key = (getattr(current_room, 'group', None), current_room.name)
+        # Also keyed on id(current_room.map_paint), not just group/name:
+        # room_editor never mutates map_paint in place — every live paint
+        # stroke and every undo/redo reassigns it to a fresh list object
+        # (see room_editor.py's paint-sync blocks) — so a genuine edit
+        # changes this id even though the room name/group didn't. Same
+        # identity-based busting _draw_world_map_section already does with
+        # id(wm_surf); without it, painting more/fewer cells after the map
+        # section has already been opened once for this room just kept
+        # reusing the first render.
+        cache_key = (
+            getattr(current_room, 'group', None),
+            current_room.name,
+            id(getattr(current_room, 'map_paint', None)),
+        )
         cache = getattr(self, '_map_section_cache', None)
         if cache is None or cache[0] != cache_key:
             origins, rooms_by_name = scouter_room_map.build_zone_layout(
@@ -2444,24 +2533,32 @@ class ScouterMenu:
         # version implicitly got for free by never drawing anything larger
         # than avail_w/avail_h in the first place. Offset by crop_x0/y0
         # since `scaled` no longer starts at raw grid-coordinate 0 — this
-        # keeps ox/oy meaning exactly what they meant before the crop was
-        # added, so _draw_map_object_markers/_draw_map_player_marker below
-        # (which both position things as ox + grid_x * scale) don't need
-        # to know cropping happened at all.
+        # is what `scaled` (which is crop-relative) needs to land in the
+        # right place, but it is NOT what _draw_map_object_markers/
+        # _draw_map_player_marker want: those position things as
+        # origin + grid_x * scale using raw (uncropped) grid coordinates,
+        # so folding crop_x0/y0 into the origin they use would double
+        # count it — the offset would grow every time crop_x0/y0 changes,
+        # i.e. every time the camera pans away from the zone's edge. Kept
+        # as two separate origins so each caller gets the one that
+        # actually matches the coordinates it's feeding in.
         ox = viewport_x + avail_w // 2 - (self._map_camera_gx - crop_x0) * scale
         oy = viewport_y + avail_h // 2 - (self._map_camera_gy - crop_y0) * scale
+        marker_ox = viewport_x + avail_w // 2 - self._map_camera_gx * scale
+        marker_oy = viewport_y + avail_h // 2 - self._map_camera_gy * scale
 
         prev_clip = surface.get_clip()
         surface.set_clip(pygame.Rect(viewport_x, viewport_y, avail_w, avail_h))
 
         surface.blit(scaled, (ox, oy))
 
-        self._draw_map_object_markers(surface, origins, rooms_by_name, ox, oy, scale)
+        self._draw_map_object_markers(surface, origins, rooms_by_name,
+                                       marker_ox, marker_oy, scale)
 
         if player is not None:
             self._draw_map_player_marker(
                 surface, current_room, player, origins, rooms_by_name,
-                ox, oy, scale
+                marker_ox, marker_oy, scale
             )
 
         surface.set_clip(prev_clip)
@@ -3294,23 +3391,62 @@ class ScouterMenu:
             name = type(obj).__name__.replace('_', ' ').title()
         return str(name)
 
+    def _render_data_name_word(self, word, gap):
+        """Builds one word's glyph row left-to-right using the
+        scouter_stats letter sprites for letters and the
+        assets/ui/fonts/numbers sprites for digits, falling back
+        PER-CHARACTER (not per-word) to _data_name_font for anything
+        neither glyph set covers — apostrophes, periods, parentheses,
+        etc. Plain enemy/NPC names ("Saibaman", "Raditz") are
+        all-letters and never hit either fallback, but boss display
+        names are often dressed up ("Android 19", "Cell (Perfect
+        Form)", "King Kai's Guardian") and used to fail this whole word
+        — see _get_data_name_sprite below for the old all-or-nothing
+        behavior this replaces. Rendered in plain white regardless of
+        source, same convention as the other sprite fonts here, so the
+        caller can tint sprite glyphs and fallback glyphs together in a
+        single BLEND_RGBA_MULT pass rather than double-tinting the
+        fallback ones."""
+        glyphs = []
+        for ch in word:
+            if ch.isdigit():
+                g = self._data_name_digit_font.glyphs.get(ch)
+            else:
+                g = self._data_stat_word_font.glyphs.get(ch.lower())
+            if g is None:
+                g = self._data_name_font.render(ch, True, (255, 255, 255))
+            glyphs.append(g)
+        if not glyphs:
+            return None
+        gap_total = gap * (len(glyphs) - 1)
+        total_w = sum(g.get_width() for g in glyphs) + gap_total
+        h = max(g.get_height() for g in glyphs)
+        surf = pygame.Surface((max(1, total_w), h), pygame.SRCALPHA)
+        x = 0
+        for g in glyphs:
+            surf.blit(g, (x, h - g.get_height()))
+            x += g.get_width() + gap
+        return surf
+
     def _get_data_name_sprite(self, name):
         """Assemble `name` with the same scouter_stats letter sprites used
         for HP/STR/POW/END labels (see _get_data_stat_label_sprite), tinted
         _DATA_NAME_COLOR and scaled by _DATA_STAT_LABEL_SCALE. Words are
-        rendered individually so spaces between them don't fail the
-        letter-font lookup; returns None if any word can't be built so
-        the caller can fall back to a plain pygame font."""
+        rendered individually (see _render_data_name_word) so spaces
+        between them don't fail the letter-font lookup, and so any single
+        unsupported character within a word falls back to a plain glyph
+        for just that character rather than dropping the entire name to
+        the plain pygame font. Returns None only if `name` has no
+        characters at all, so the caller still has a last-resort fallback
+        for that edge case."""
         words = str(name).split()
         if not words:
             return None
         gap = self._DATA_STAT_GLYPH_GAP
-        parts = []
-        for word in words:
-            part = self._data_stat_word_font.render(word, gap=gap)
-            if part is None:
-                return None
-            parts.append(part)
+        parts = [self._render_data_name_word(word, gap) for word in words]
+        parts = [p for p in parts if p is not None]
+        if not parts:
+            return None
         # Gap between words ≈ four letter gaps so it reads as a space
         # rather than letter-to-letter spacing.
         word_gap = gap * 4
@@ -3476,6 +3612,32 @@ class ScouterMenu:
     # requested size that isn't an exact multiple.
     _DATA_PORTRAIT_WIDTH_PAD_PX = 7
 
+    # Vertical gap (screen px, post-scale) between the "No" / "Portrait" /
+    # "Data" lines drawn in the portrait box when an entity has no
+    # portrait art — see _draw_data_portrait(). Same figure
+    # _DATA_STAT_ROW_GAP uses for the stat rows, so the fallback message
+    # reads with the same line rhythm as the rest of the panel.
+    _DATA_NO_PORTRAIT_LINE_GAP = 12
+
+    def _draw_data_no_portrait_message(self, surface, box):
+        """"No" / "Portrait" / "Data" stacked on three centered lines,
+        drawn with the same scouter_stats/numbers sprite glyphs, white
+        color, and scale as the entity name (see _get_data_name_sprite)
+        — rather than the small plain-pygame-font single line this used
+        to be — so a missing portrait still reads as part of the same
+        pixel-art panel instead of dropping to a different font."""
+        lines = [self._get_data_name_sprite(word) for word in ('No', 'Portrait', 'Data')]
+        lines = [l for l in lines if l is not None]
+        if not lines:
+            return
+        gap = self._DATA_NO_PORTRAIT_LINE_GAP
+        total_h = sum(l.get_height() for l in lines) + gap * (len(lines) - 1)
+        y = box.centery - total_h // 2
+        for l in lines:
+            x = box.centerx - l.get_width() // 2
+            surface.blit(l, (x, y))
+            y += l.get_height() + gap
+
     def _draw_data_portrait(self, surface, obj):
         """Top-right portrait box — see _get_data_portrait_box() for how
         this rect is derived."""
@@ -3501,9 +3663,7 @@ class ScouterMenu:
                     box.y + self._DATA_PORTRAIT_NUDGE_Y)
             surface.blit(scaled, dest)
         else:
-            msg = self._font.render('No portrait', True, (150, 150, 150))
-            surface.blit(msg, (box.centerx - msg.get_width() // 2,
-                                box.centery - msg.get_height() // 2))
+            self._draw_data_no_portrait_message(surface, box)
 
     def _get_entity_description(self, obj):
         """character_creator.py and entity_creator.py now write a

@@ -191,6 +191,7 @@ class TitleScreen:
 
         self._option_hit_rects    = []   # populated by _draw_option_box, read by handle_input
         self._save_slot_hit_rects = []   # populated by _draw_save_slot_list, read by handle_input
+        self._save_lr_hit_rects   = {}   # populated by _draw_save_select, read by handle_input — {'l': Rect, 'r': Rect}
 
         # A/B/L/R "pressed" sprite flash on the SAVE SELECT page — same
         # shape as PauseMenu's own button_states/button_press_timers (see
@@ -862,6 +863,10 @@ class TitleScreen:
                 return None
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 mx, my = event.pos
+                for btn, rect in self._save_lr_hit_rects.items():
+                    if rect.collidepoint(mx, my):
+                        self._toggle_save_delete_mode(btn)
+                        return None
                 for i, rect in enumerate(self._save_slot_hit_rects):
                     if rect.collidepoint(mx, my):
                         self._save_slot_index = self._save_scroll_offset + i
@@ -911,6 +916,19 @@ class TitleScreen:
             return 'quit'
         return None
 
+    def _toggle_save_delete_mode(self, btn):
+        """Toggle "Select Game" <-> "Delete Game" on the SAVE SELECT list —
+        shared by the L/R keyboard shortcut (_handle_save_select_keydown)
+        and clicking the L/R button sprites directly (handle_input's
+        save_select MOUSEBUTTONDOWN branch, via self._save_lr_hit_rects).
+
+        btn: 'l' or 'r' — either one flips the same self._save_delete_mode
+        flag; this only decides which button sprite flashes pressed.
+        """
+        self._save_delete_mode = not self._save_delete_mode
+        self._press(btn)
+        self._play_switch_sfx()
+
     def _handle_save_select_keydown(self, key):
         """UP/DOWN move the selected save slot; the visible window
         (self._save_scroll_offset) only slides when the new selection
@@ -952,9 +970,7 @@ class TitleScreen:
             # _draw_save_select_title (title text) and
             # _draw_save_slot_list (hover color). Doesn't touch which
             # slot is selected or the scroll window.
-            self._save_delete_mode = not self._save_delete_mode
-            self._press('l' if key in _KEY_L else 'r')
-            self._play_switch_sfx()
+            self._toggle_save_delete_mode('l' if key in _KEY_L else 'r')
             return None
         if key in (pygame.K_ESCAPE, pygame.K_x):
             self._press('b')
@@ -1245,11 +1261,27 @@ class TitleScreen:
         # buttons that don't do anything. lr_y is still computed above
         # since _draw_save_select_title anchors off it either way.
         if not self._save_overlay_active:
+            l_raw = pm.button_l_pressed if self.button_states['l'] else pm.button_l
+            l_w   = int(l_raw.get_width() * (btn_scale / l_raw.get_height())) if l_raw else btn_scale
             pm._draw_button_sprite(screen, pm.button_l, pm.button_l_pressed, self.button_states['l'], box_x, lr_y, '')
             r_raw   = pm.button_r
             r_w     = int(r_raw.get_width() * (btn_scale / r_raw.get_height())) if r_raw else btn_scale
             r_btn_x = box_x + inner_w - r_w - 16
             pm._draw_button_sprite(screen, pm.button_r, pm.button_r_pressed, self.button_states['r'], r_btn_x, lr_y, '')
+
+            # Clickable bounds for the two sprites just drawn — same
+            # padding convention as the scroll-arrow hit rects below
+            # (±4px around the sprite) — read back in handle_input's
+            # save_select MOUSEBUTTONDOWN branch. No flanking label text
+            # to extend into here (unlike PauseMenu's l_tab/r_tab zones),
+            # since this screen has nothing to page between — just the
+            # Select/Delete Game toggle these buttons perform.
+            self._save_lr_hit_rects = {
+                'l': pygame.Rect(box_x - 4, lr_y - 4, l_w + 8, btn_scale + 8),
+                'r': pygame.Rect(r_btn_x - 4, lr_y - 4, r_w + 8, btn_scale + 8),
+            }
+        else:
+            self._save_lr_hit_rects = {}
 
         self._draw_save_select_title(screen, pm, box_x, inner_w, lr_y)
 

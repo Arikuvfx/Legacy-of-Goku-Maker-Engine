@@ -205,6 +205,17 @@ def transformation(mode, form_id):
     return {'type': 'transformation', 'mode': mode, 'form_id': form_id}
 
 
+def charged_melee(mode):
+    """mode: 'add' | 'remove'. Grants/revokes the current character's
+    ability to charge their melee attack at all (holding E to wind up
+    into the lunge/spin finisher — see charged_melee_style, set
+    separately in the character creator and always available regardless
+    of this gate). Unlike skill()/transformation() above, this isn't a
+    roster of ids — it's a single on/off switch, so 'add' just turns
+    charging back on and 'remove' turns it off; there's no id param."""
+    return {'type': 'charged_melee', 'mode': mode}
+
+
 def set_player_character(character_id, skin_id=None):
     return {'type': 'set_player_character', 'character_id': character_id, 'skin_id': skin_id}
 
@@ -336,6 +347,7 @@ ACTION_TYPES = [
     'dialogue_box', 'set_portrait', 'dialogue_choice',
     'timer_start', 'timer_pause', 'timer_stop',
     'zeni', 'item', 'level', 'exp', 'stat', 'resource', 'skill', 'transformation',
+    'charged_melee',
     'set_player_character', 'set_player_skin', 'character_list',
     'screen_fade', 'screen_shake', 'spam_qte', 'weather', 'room_music', 'play_sound',
     'play_character_animation', 'save_game', 'change_map',

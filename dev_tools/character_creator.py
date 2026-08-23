@@ -66,6 +66,7 @@ CHARACTERS_DIR = BASE_DIR / "assets/characters"
 ATTACKS_DIR    = BASE_DIR / "assets/sprites/attacks"   # global roster, not per-character
 HUD_ICONS_DIR  = BASE_DIR / "assets/ui/hud"            # named icon PNGs used in the HUD picker
 PORTRAITS_DIR  = BASE_DIR / "assets/portraits"         # see CharacterEditor._load_portrait()
+UNIVERSAL_DIR  = BASE_DIR / "assets/sprites/universal" # shadow.png / shadowbig.png — see LayerManager._load_shadow()
 
 
 def resolve_portrait_path(char_id: str, costume: str = "", form: str = "") -> Optional[Path]:
@@ -1141,6 +1142,65 @@ def draw_button(surf: pygame.Surface, font: pygame.font.Font,
 PREVIEW_SCALE = 2      # px scale for sprite display
 ANIM_FPS      = 8.0    # walk-cycle playback speed
 
+# ── Ground shadow (mirrors LayerManager._load_shadow / _get_scaled_shadow
+# in draw_layers.py) ─────────────────────────────────────────────────────
+# The real game shadow is a loaded sprite asset — assets/sprites/universal/
+# shadow.png (or shadowbig.png for the legacy Player.shadow_size == 'big'
+# case) — scaled to ~32% of the entity's shadow width, NOT a drawn ellipse
+# or a tinted copy of the character sprite. The character creator's Shadow
+# Size slider only ever sets shadow_width (cfg["shadow_size"] -> the numeric
+# override), never the legacy 'small'/'big' string, so the preview always
+# uses the small variant — same as every character actually does unless
+# something else in-game explicitly flips Player.shadow_size to 'big'.
+_SHADOW_SPRITE_CACHE: dict[str, pygame.Surface] = {}         # 'small'/'big' -> raw source
+_SHADOW_SCALED_CACHE: dict[tuple[str, int], pygame.Surface] = {}  # (variant, target_w) -> scaled
+
+
+def _load_shadow_sprite(big: bool = False) -> pygame.Surface:
+    """Load (and cache) the universal shadow sprite, falling back to the
+    same drawn ellipse LayerManager._load_shadow() falls back to if the
+    asset is missing — so the preview matches the real renderer exactly
+    instead of approximating its look."""
+    key = "big" if big else "small"
+    cached = _SHADOW_SPRITE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    path = UNIVERSAL_DIR / ("shadowbig.png" if big else "shadow.png")
+    surf: Optional[pygame.Surface] = None
+    if path.exists():
+        try:
+            surf = pygame.image.load(str(path)).convert_alpha()
+        except Exception:
+            surf = None
+    if surf is None:
+        w, h = (64, 20) if big else (32, 12)
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        pygame.draw.ellipse(surf, (0, 0, 0, 80), surf.get_rect())
+    _SHADOW_SPRITE_CACHE[key] = surf
+    return surf
+
+
+def get_preview_shadow(shadow_width: float, big: bool = False) -> pygame.Surface:
+    """Ground shadow scaled for the preview panel, using the exact same
+    ~32%-of-width / aspect-locked-to-source-sprite math as
+    LayerManager._get_scaled_shadow(), with PREVIEW_SCALE standing in for
+    RENDER_SCALE (the preview's walk frames are scaled the same way).
+    Cached per (variant, rounded target width) since shadow_width only
+    actually changes while the Shadow Size slider is being dragged."""
+    variant = "big" if big else "small"
+    source  = _load_shadow_sprite(big)
+    target_w = max(8, int(max(0, shadow_width) * PREVIEW_SCALE * 0.32))
+    key = (variant, target_w)
+    cached = _SHADOW_SCALED_CACHE.get(key)
+    if cached is not None:
+        return cached
+    orig_w = max(1, source.get_width())
+    orig_h = max(1, source.get_height())
+    target_h = max(4, int(orig_h * target_w / orig_w))
+    scaled = pygame.transform.scale(source, (target_w, target_h))
+    _SHADOW_SCALED_CACHE[key] = scaled
+    return scaled
+
 
 class SpritePreview:
     def __init__(self, rect: pygame.Rect):
@@ -1149,6 +1209,16 @@ class SpritePreview:
         self.frame_i = 0.0
         self._char   = ""
         self._costume= ""
+        # In-game px width of the ground shadow (character_creator.py's
+        # cfg["shadow_size"] / the Shadow Size slider on the Identity tab —
+        # this is Player.shadow_width, NOT the legacy 'small'/'big'
+        # Player.shadow_size string, which this tool never sets). Kept as a
+        # live-updatable field so dragging the slider updates the preview
+        # immediately without needing a full sprite reload.
+        self.shadow_width: float = 32
+        # Entity height in game px, for the feet_y offset — see draw().
+        # Falls back to the walk frame's own pixel height if unknown.
+        self.entity_height: Optional[int] = None
 
     def load(self, char_id: str, costume: str) -> None:
         if char_id == self._char and costume == self._costume:
@@ -1173,6 +1243,14 @@ class SpritePreview:
         if self.frames:
             self.frame_i = (self.frame_i + dt * ANIM_FPS) % len(self.frames)
 
+    def _blit_shadow(self, surf: pygame.Surface, cx: float, feet_y: float) -> None:
+        """Blit the real shadow.png asset, scaled/positioned exactly like
+        LayerManager._draw_shadow(): centred under the given feet point."""
+        shadow = get_preview_shadow(self.shadow_width)
+        sx = round(cx - shadow.get_width()  / 2)
+        sy = round(feet_y - shadow.get_height() / 2)
+        surf.blit(shadow, (sx, sy))
+
     def draw(self, surf: pygame.Surface, font_sm: pygame.font.Font) -> None:
         pygame.draw.rect(surf, C_PANEL_DARK, self.rect, border_radius=6)
         pygame.draw.rect(surf, C_BORDER,     self.rect, 1, border_radius=6)
@@ -1181,6 +1259,21 @@ class SpritePreview:
             frame = self.frames[int(self.frame_i)]
             fx = self.rect.centerx - frame.get_width() // 2
             fy = self.rect.centery - frame.get_height() // 2
+
+            # feet_y mirrors LayerManager._draw_shadow(): obj's vertical
+            # anchor (here, the frame's vertical centre, matching how the
+            # sprite is centred on obj.x/obj.y in-game) plus
+            # entity_height * RENDER_SCALE / 2.25 (PREVIEW_SCALE standing in
+            # for RENDER_SCALE here). entity_height defaults to the walk
+            # frame's own raw pixel height when the real hitbox height
+            # (Player.height) isn't known to this preview.
+            raw_h = self.entity_height if self.entity_height is not None \
+                else frame.get_height() / PREVIEW_SCALE
+            feet_y = self.rect.centery + (raw_h * PREVIEW_SCALE) / 2.25
+
+            # Shadow first (below the sprite), same draw order as
+            # LayerManager.draw_all(): "_draw_shadow just before the entity".
+            self._blit_shadow(surf, self.rect.centerx, feet_y)
             surf.blit(frame, (fx, fy))
             info = font_sm.render(
                 f"frame {int(self.frame_i)+1}/{len(self.frames)}",
@@ -1195,6 +1288,8 @@ class SpritePreview:
                 self.rect.centery - ph_h // 2,
                 ph_w, ph_h
             )
+            feet_y = self.rect.centery + (ph_h / 2.25)
+            self._blit_shadow(surf, self.rect.centerx, feet_y)
             pygame.draw.rect(surf, C_BORDER, ph, border_radius=6)
             lbl = render_text_cached(font_sm, "no sprites", C_TEXT_DIM)
             surf.blit(lbl, lbl.get_rect(centerx=self.rect.centerx,
@@ -2446,7 +2541,8 @@ class CharacterCreator:
         self.editor           = CharacterEditor(self.editor_rect, cid, self.cfg,
                                                 self.costumes, self.transform_forms,
                                                 self.available_attacks)
-        self.preview.load(cid, self.costumes[0] if self.costumes else "base")
+        self.preview.load(cid, base_costume)
+        self.preview.shadow_width = self.cfg.get("shadow_size", 32)
         if added:
             self.editor.dirty = True
             self._set_status("Detected new transformation(s) — Save to keep them")
@@ -2936,6 +3032,12 @@ class CharacterCreator:
         preview_rect_adj = pygame.Rect(PAD, self.list_rect.bottom + PAD,
                                        LIST_W, sh - FOOTER_H - self.list_rect.bottom - PAD * 2)
         self.preview.rect = preview_rect_adj
+        # Keep the preview's shadow in sync with the Identity tab's Shadow
+        # Size slider live, frame-by-frame — not just on save/flush — so
+        # dragging the slider is reflected immediately, the same way the
+        # walk-cycle sprite itself updates as the costume/form changes.
+        if self.editor:
+            self.preview.shadow_width = self.editor.shadow_slider.value
         self.preview.draw(screen, font_sm)
 
         pygame.draw.rect(screen, C_PANEL, self.editor_rect.union(

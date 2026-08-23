@@ -573,6 +573,14 @@ class Player:
         # auto-fire: holding past the first peak just keeps it looping.
         self.is_e_pressed = False
         self.is_charging_melee = False
+        # Gate checked by start_charging_melee() below — set True/False at
+        # runtime by Game._handle_charged_melee_action() (the 'charged_melee'
+        # event action, mode 'add'/'remove'), and reset to True on every
+        # character load/switch by Game._reload_attack_config(). Defaulted
+        # True here too so a Player used before that reload runs (or in a
+        # context that never calls it) still charges normally, matching
+        # charged_melee_style's "always available unless told otherwise" default.
+        self.charged_melee_enabled = True
         self.charged_melee_charge_time = 0.0
         self.charged_melee_charge_required = 0.2    # seconds to first full-opacity peak
         self.charged_melee_pulse_period = 0.3        # seconds per breathe cycle once ready
@@ -1133,7 +1141,19 @@ class Player:
 
         Called from the 'melee' animation-state branch in update() when
         the normal swing finishes with E still held (see is_e_pressed).
+
+        Gated on charged_melee_enabled (see the 'charged_melee' event
+        action / Game._handle_charged_melee_action()) — if a trigger box
+        has revoked the ability, this falls back to exactly what the
+        'melee' branch does when E isn't held: end the swing and return
+        to idle, rather than silently doing nothing and leaving
+        is_attacking stuck True.
         """
+        if not self.charged_melee_enabled:
+            self.is_attacking = False
+            self.enter_idle()
+            return
+
         self.is_charging_melee = True
         self.charged_melee_charge_time = 0.0
         self.charged_melee_flash_amount = 0.0
@@ -1211,14 +1231,25 @@ class Player:
         self.is_charged_melee_active = True
         self.charged_melee_flash_amount = 0.0
         self.charged_melee_ready = False
-        self.charged_melee_action_timer = (
+        self.charged_melee_hit_timer = 0.0
+
+        fallback_duration = (
             self.charged_melee_lunge_duration if self.charged_melee_style == 'lunge'
             else self.charged_melee_spin_duration
         )
-        self.charged_melee_hit_timer = 0.0
 
         if self.sprite.has_animation('charged_melee_action', self.direction):
             self.sprite.set_animation('charged_melee_action', self.direction)
+            # Size the action to however long charged_melee_action actually
+            # takes to play through, rather than the flat lunge/spin
+            # constants above — those are a fallback only, same convention
+            # as beam_charge_required/sword_charge_required/etc. Without
+            # this, a character whose charged_melee.png plays longer than
+            # the fallback gets cut off and snapped back to idle mid-swing.
+            self.charged_melee_action_timer = self.sprite.get_animation_duration(
+                'charged_melee_action', self.direction) or fallback_duration
+        else:
+            self.charged_melee_action_timer = fallback_duration
         self.current_animation_state = 'charged_melee_action'
 
     def update_charged_melee_action(self, dt):
@@ -3243,6 +3274,79 @@ class Player:
         cap = game_config.hp_ep_cap
         self.max_hp = min(cap, self.max_hp + max(0.0, hp_increment) * hp_roll)
         self.max_ki = min(cap, self.max_ki + max(0.0, ep_increment) * ep_roll)
+
+    # =========================================================================
+    # Per-character progress (level/XP/HP/KI/stats) — used by
+    # Game._switch_character() so each playable character keeps its own
+    # independent progression instead of all characters sharing one set of
+    # numbers. Zeni, inventory, equipment, and play_time stay global/shared
+    # across characters (see Game._switch_character / _write_save_slot) —
+    # only the fields below are considered "per-character".
+    # =========================================================================
+
+    # Field names captured/restored as one character's progress. Kept as a
+    # single tuple so snapshot_progress()/restore_progress()/the save-file
+    # round-trip in game.py can't silently drift out of sync with each other.
+    PROGRESS_FIELDS = (
+        'level', 'exp', 'total_exp', 'exp_to_next_level', 'stat_points',
+        'pending_level_up', 'hp', 'max_hp', 'ki', 'max_ki',
+    )
+
+    def snapshot_progress(self):
+        """Return a JSON-serializable dict of this player's current
+        level/XP/HP/KI/stats — i.e. everything that's tracked per-character
+        rather than shared across the whole save file."""
+        snap = {field: getattr(self, field) for field in self.PROGRESS_FIELDS}
+        snap['stats'] = dict(self.stats)
+        return snap
+
+    def restore_progress(self, snapshot):
+        """Apply a dict previously returned by snapshot_progress()."""
+        for field in self.PROGRESS_FIELDS:
+            if field in snapshot:
+                setattr(self, field, snapshot[field])
+        if 'stats' in snapshot:
+            self.stats = dict(snapshot['stats'])
+
+    @staticmethod
+    def fresh_progress_for_character(char_id, game_config=None):
+        """Build a level-1 progress snapshot (same shape as
+        snapshot_progress()) for a character that's never been played
+        before, seeded from that character's character-creator config
+        (assets/characters/{char_id}.json) instead of made-up numbers."""
+        from dev_tools import character_creator
+        try:
+            cfg = character_creator.load_config(char_id)
+        except Exception:
+            cfg = {}
+        cstats = cfg.get('stats', {})
+
+        max_hp = cstats.get('max_hp', 100)
+        max_ki = cstats.get('max_ki', 100)
+
+        stats = {
+            'strength': cstats.get('power', 1),
+            'ki_power': cstats.get('ki_power', 1),
+            'vitality': cstats.get('vitality', 1),
+            'energy':   1,
+            'speed':    cstats.get('speed', 1),
+            'defense':  cstats.get('defense', 1),
+            'ki_regen': cstats.get('ki_regen', 30),
+        }
+
+        return {
+            'level':             1,
+            'exp':               0,
+            'total_exp':         0,
+            'exp_to_next_level': game_config.get_xp_for_level(1) if game_config else 100,
+            'stat_points':       0,
+            'pending_level_up':  False,
+            'hp':                max_hp,
+            'max_hp':            max_hp,
+            'ki':                max_ki,
+            'max_ki':            max_ki,
+            'stats':             stats,
+        }
 
     def get_melee_damage(self, game_config, target=None, target_end=None):
         """Roll one melee hit's damage using this player's STR against a

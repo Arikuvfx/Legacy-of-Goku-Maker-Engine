@@ -41,6 +41,7 @@ class RoomPersistence:
                 'chests':                self._serialize_chests(room),
                 'scrolling_bg':          self._serialize_scrolling_bg(room),
                 'map_paint':             self._serialize_map_paint(room),
+                'decorations':           self._serialize_decorations(room),
             }
             with open(self._get_room_filepath(room.name), 'w') as f:
                 json.dump(data, f, indent=2)
@@ -281,6 +282,15 @@ class RoomPersistence:
         from objects.animated_region import AnimatedRegion
         return [AnimatedRegion.from_dict(d, room_name) for d in data]
 
+    def _serialize_decorations(self, room):
+        if not getattr(room, 'decorations', None):
+            return []
+        return [d.to_dict() for d in room.decorations]
+
+    def deserialize_decorations(self, data):
+        from objects.decoration_objects import Decoration
+        return [Decoration.from_dict(d) for d in data]
+
     def deserialize_save_points(self, save_points_data):
         from objects.save_point import SavePoint
         return [SavePoint(x=d['x'], y=d['y'], variant=d.get('variant', 'big'))
@@ -509,6 +519,7 @@ class RoomManagerWithPersistence:
         room.trigger_boxes       = self.persistence.deserialize_trigger_boxes(data['trigger_boxes']) if data.get('trigger_boxes') else []
         room.chests              = self.persistence.deserialize_chests(data['chests'])             if data.get('chests')              else []
         room.scrolling_bg        = self.persistence.deserialize_scrolling_bg(data.get('scrolling_bg'))
+        room.decorations         = self.persistence.deserialize_decorations(data['decorations'])   if data.get('decorations')         else []
 
         existing = self.get_room_by_name(room_name)
         if existing:

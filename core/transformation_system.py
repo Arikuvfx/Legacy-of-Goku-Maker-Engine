@@ -32,7 +32,12 @@ class TransformationSystem:
 
         # Transformation animation progress (0.0 to 1.0)
         self.transform_animation_progress = 0.0
-        self.transform_animation_duration = 1.0  # Duration in seconds (adjust to match your animation)
+        self.transform_animation_duration = 3.75  # Duration in seconds — matches the real 'transform' sprite animation length (measured ~3.5-4s). Keep this in sync if the animation's frame count/speed ever changes.
+
+        # Tracks whether we've already told the sprite to release its
+        # frame 3<->4 hold-loop for the current transform. Reset each time
+        # a new transform starts (see start_transform/reset).
+        self._hold_released = False
 
         # Transformed Ki (used while transformed)
         self.transformed_ki = 100.0
@@ -58,6 +63,16 @@ class TransformationSystem:
         if self.is_transforming:
             self.transform_animation_progress += dt / self.transform_animation_duration
             self.transform_animation_progress = min(1.0, self.transform_animation_progress)
+
+            # Once the charge timer completes, let the sprite's held
+            # animation (looping frames 3<->4, see CharacterSpriteLoader)
+            # continue on to its final frame and finish. Guarded so it only
+            # fires once per transform — release_hold() itself is already
+            # idempotent, but there's no reason to call it every frame.
+            if self.transform_animation_progress >= 1.0 and not self._hold_released:
+                self._hold_released = True
+                self.player.sprite.release_hold('transform', 'down')
+
             # Don't fill regular progress during transformation
             return
 
@@ -145,11 +160,20 @@ class TransformationSystem:
             self.is_transforming = True
             self.is_ready = False
             self.transform_animation_progress = 0.0  # Reset animation progress
+            self._hold_released = False  # Reset hold-release gate for this new transform
 
-            # Store original sprite info
-            if not self.original_character:
-                self.original_character = character
-                self.original_costume = getattr(self.player.sprite, 'costume', 'base')
+            # Store original sprite info. Always capture fresh here (not just
+            # the first time ever) — this only runs when we're not currently
+            # transformed/transforming, so there's no risk of clobbering
+            # in-progress state, and the player's character/costume may have
+            # changed (via character switch) since the last transform. A
+            # "set once" guard here previously left this stuck on whichever
+            # character the player FIRST transformed as for the rest of the
+            # session — so switching characters and transforming again would
+            # revert to the old character's sprite in complete_transform(),
+            # e.g. transforming as Gohan showing up as Goku's SSJ sprite.
+            self.original_character = character
+            self.original_costume = getattr(self.player.sprite, 'costume', 'base')
 
             self.current_transform_costume = transform_costume
 
@@ -254,6 +278,7 @@ class TransformationSystem:
         self.transformed_ki = self.max_transformed_ki
         self.transform_animation_progress = 0.0
         self.current_transform_costume = None
+        self._hold_released = False
 
     def _resolve_transform_costume(self, char_id: str):
         """Return the costume path for the player's active transformation.
@@ -291,7 +316,18 @@ class TransformationSystem:
         # actually being worn — pointing the sprite loader at frames that
         # don't exist for the active costume (the stuck purple placeholder
         # cube / freeze).
-        active_costume = cfg.get("costume") or "base"
+        # IMPORTANT: cfg["costume"] is a design-time field — whatever costume
+        # was selected in the character creator's Identity tab when the JSON
+        # was last saved. It does NOT track costume switches that happen at
+        # runtime (see Game._handle_set_player_skin_action, which only sets
+        # self.player.costume in memory and never writes back to disk). So
+        # the live-equipped costume must take priority here, or a character
+        # whose config default differs from what the player currently has
+        # equipped will always transform into the CONFIG's costume's form
+        # instead of the one actually being worn.
+        active_costume = (getattr(self.player, 'costume', None)
+                           or cfg.get("costume")
+                           or "base")
         prefix = f"{active_costume}/transformations/"
 
         transformations = cfg.get("transformations", [])

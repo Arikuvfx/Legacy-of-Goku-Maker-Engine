@@ -42,6 +42,7 @@ class Room:
         self.animated_regions = []
         self.doors = []
         self.trigger_boxes = []
+        self.decorations = []
 
         # Scouter minimap silhouette painted via the room editor's Map
         # Paint tool: a plain list of [gx, gy] cell pairs (see

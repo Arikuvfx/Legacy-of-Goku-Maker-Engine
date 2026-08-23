@@ -276,6 +276,10 @@ class RoomEditor:
         # Destructible stones
         if hasattr(self.viewing_room, 'destructible_stones'):
             obstacles += [s for s in self.viewing_room.destructible_stones if s.active and s.solid]
+        # Decorations (trees, etc.) — small trunk-only hitbox, see
+        # objects/decoration_object.py
+        if hasattr(self.viewing_room, 'decorations'):
+            obstacles += [d for d in self.viewing_room.decorations if d.active]
         # Level gates
         obstacles += self.object_editor.gate_manager.get_gates(room_name)
         # Room transitions
@@ -531,8 +535,13 @@ class RoomEditor:
         self.selected_index = room_index
         room_name = self.viewing_room.name
 
+        # Same alias-init as _sync_room_to_editor: only load from room.tiles
+        # the first time this room is opened (key not yet present). Once
+        # tileset_editor.room_tiles[room_name] exists - even as [] after a
+        # full erase - it's authoritative and must not be overwritten with
+        # the stale, un-synced data still sitting on room.tiles.
         if self.tileset_editor:
-            if room_name not in self.tileset_editor.room_tiles or not self.tileset_editor.room_tiles[room_name]:
+            if room_name not in self.tileset_editor.room_tiles:
                 from dev_tools.room_editor.room_editor_tools.tileset_editor import Tile
                 raw = self.viewing_room.tiles
                 self.tileset_editor.room_tiles[room_name] = [
@@ -568,6 +577,13 @@ class RoomEditor:
 
         if not hasattr(self.viewing_room, 'destructible_stones'):
             self.viewing_room.destructible_stones = []
+
+        # Decorations (trees, etc.) have no manager — same as destructible
+        # stones, the room's own list is the live/authoritative data, so
+        # there's nothing to sync into an object_editor manager here, just
+        # make sure the list exists.
+        if not hasattr(self.viewing_room, 'decorations'):
+            self.viewing_room.decorations = []
 
         # Sync cutscene triggers so the manager works with the room's live list.
         # Without this the manager starts empty for the room and any existing
@@ -1472,6 +1488,10 @@ class RoomEditor:
         if not hasattr(self.viewing_room, 'destructible_stones'):
             self.viewing_room.destructible_stones = []
 
+        # Make sure decorations (trees, etc.) exist
+        if not hasattr(self.viewing_room, 'decorations'):
+            self.viewing_room.decorations = []
+
         # Entities are stored directly on the room; guarantee the list exists
         if not hasattr(self.viewing_room, 'entities'):
             self.viewing_room.entities = []
@@ -1633,8 +1653,14 @@ class RoomEditor:
         room_name = room.name
 
         # Sync tiles
+        # NOTE: guard on dict-key presence only, not list truthiness. An
+        # empty list is a legitimate state (every tile on this room/layer
+        # was deleted) and must NOT be treated as "not loaded yet" -
+        # otherwise this reloads the stale, pre-deletion tiles from
+        # room.tiles (which isn't written back until save/room-switch) and
+        # silently undoes the deletion.
         if self.tileset_editor:
-            if room_name not in self.tileset_editor.room_tiles or not self.tileset_editor.room_tiles[room_name]:
+            if room_name not in self.tileset_editor.room_tiles:
                 from dev_tools.room_editor.room_editor_tools.tileset_editor import Tile
                 self.tileset_editor.room_tiles[room_name] = [
                     Tile.from_dict(t) if isinstance(t, dict) else t
@@ -1682,6 +1708,10 @@ class RoomEditor:
         # Sync destructible stones
         if not hasattr(room, 'destructible_stones'):
             room.destructible_stones = []
+
+        # Sync decorations (trees, etc.) — no manager, room's list is authoritative
+        if not hasattr(room, 'decorations'):
+            room.decorations = []
 
         # Sync entities
         if not hasattr(room, 'entities'):
@@ -1777,6 +1807,10 @@ class RoomEditor:
             self._push_undo(_HistoryEntry('object_add', {'obj': obj, 'obj_type': 'stone', 'room': room}))
         oe.on_stone_placed = _on_stone_placed
 
+        def _on_decoration_placed(obj, room):
+            self._push_undo(_HistoryEntry('object_add', {'obj': obj, 'obj_type': 'decoration', 'room': room}))
+        oe.on_decoration_placed = _on_decoration_placed
+
         def _on_save_point_placed(obj):
             room = oe.current_room_name
             self._push_undo(_HistoryEntry('object_add', {'obj': obj, 'obj_type': 'save_point', 'room': room}))
@@ -1827,6 +1861,10 @@ class RoomEditor:
         def _on_stone_deleted(obj, room):
             self._push_undo(_HistoryEntry('object_remove', {'obj': obj, 'obj_type': 'stone', 'room': room}))
         oe.on_stone_deleted = _on_stone_deleted
+
+        def _on_decoration_deleted(obj, room):
+            self._push_undo(_HistoryEntry('object_remove', {'obj': obj, 'obj_type': 'decoration', 'room': room}))
+        oe.on_decoration_deleted = _on_decoration_deleted
 
         def _on_save_point_deleted(obj):
             room = oe.current_room_name
@@ -2026,6 +2064,13 @@ class RoomEditor:
                     room.destructible_stones = []
                 if obj not in room.destructible_stones:
                     room.destructible_stones.append(obj)
+
+        elif obj_type == 'decoration':
+            if room is not None:
+                if not hasattr(room, 'decorations'):
+                    room.decorations = []
+                if obj not in room.decorations:
+                    room.decorations.append(obj)
 
         elif obj_type == 'save_point':
             oe.save_point_manager.add_save_point(room_name, obj)
@@ -2843,8 +2888,14 @@ class RoomEditor:
             )
 
         # Background tiles — use baked surface if available (O(1) blit),
-        # fall back to per-tile loop only when the callback isn't wired.
-        if self.blit_tiles_callback:
+        # fall back to per-tile loop when the callback isn't wired OR when
+        # "hide other layers" is active. The baked surface is the same
+        # single composited image gameplay uses — it has no concept of
+        # per-tile layers, so it can't honor the isolation filter. Only
+        # tileset_editor.draw_tiles() actually checks hide_other_layers /
+        # current_layer, so that path is required whenever the checkbox is on.
+        _isolating_layer = bool(self.tileset_editor and self.tileset_editor.hide_other_layers)
+        if self.blit_tiles_callback and not _isolating_layer:
             self.blit_tiles_callback(
                 screen, self.viewing_room.name,
                 int(self.camera.x), int(self.camera.y), True
@@ -2896,11 +2947,18 @@ class RoomEditor:
                 if stone.active:
                     stone.draw(screen, self.camera, self.colors)
 
+        # Draw decorations (trees, etc.)
+        if hasattr(self.viewing_room, 'decorations'):
+            for decoration in self.viewing_room.decorations:
+                if decoration.active:
+                    decoration.draw(screen, self.camera, self.colors)
+
         # Draw placed entities (NPCs / enemies / bosses)
         self._draw_placed_entities(screen, int(self.camera.x), int(self.camera.y))
 
-        # Foreground tiles — same baked path as background.
-        if self.blit_tiles_callback:
+        # Foreground tiles — same baked path as background, same
+        # hide_other_layers override (see the background block above).
+        if self.blit_tiles_callback and not _isolating_layer:
             self.blit_tiles_callback(
                 screen, self.viewing_room.name,
                 int(self.camera.x), int(self.camera.y), False
@@ -3149,6 +3207,11 @@ class RoomEditor:
             for stone in room.destructible_stones:
                 if stone.active:
                     stone.draw(zoom_surf, type('_Cam', (), {'x': 0, 'y': 0})(), self.colors)
+
+        if hasattr(room, 'decorations'):
+            for decoration in room.decorations:
+                if decoration.active:
+                    decoration.draw(zoom_surf, type('_Cam', (), {'x': 0, 'y': 0})(), self.colors)
 
         self._draw_placed_entities(zoom_surf, cam_x, cam_y)
 

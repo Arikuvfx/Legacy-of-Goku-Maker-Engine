@@ -96,7 +96,8 @@ class Animation:
     # second frame. Otherwise it stays at the first frame."
     IDLE_BLINK_INTERVAL = 4.0
 
-    def __init__(self, frames, frame_duration=0.1, loop=True, loop_tail_frames=None, idle_blink=False):
+    def __init__(self, frames, frame_duration=0.1, loop=True, loop_tail_frames=None, idle_blink=False,
+                 hold_frames=None):
         self.frames = frames
         self.frame_duration = frame_duration
         self.loop = loop
@@ -106,6 +107,19 @@ class Animation:
         # (until reset()/a new animation takes over). e.g. loop_tail_frames=2
         # on a 6-frame punch plays 0,1,2,3,4,5 then loops 4,5,4,5,4,5...
         self.loop_tail_frames = loop_tail_frames
+
+        # hold_frames=(start_idx, end_idx): once playback first reaches
+        # start_idx, instead of continuing on to the rest of the sheet it
+        # loops start_idx<->end_idx forever — like a mid-animation "charging"
+        # pause — until an external caller invokes release_hold(). At that
+        # point it resumes normal playback from wherever it was in the hold
+        # loop, through the remaining frames, and finishes as usual.
+        # e.g. hold_frames=(2, 3) on a 5-frame transform sheet plays 0,1,2,
+        # then loops 2,3,2,3,2,3... until released, then plays 4 and finishes.
+        self.hold_frames = hold_frames
+        self.holding = False
+        self._hold_released = False
+
         self.current_frame = 0
         self.time_elapsed = 0
         self.finished = False
@@ -146,6 +160,21 @@ class Animation:
         if self.finished and not self.loop and not self.loop_tail_frames:
             return
 
+        # Hold-and-loop segment: once playback reaches hold_frames[0], stop
+        # advancing past hold_frames[1] and just loop between the two until
+        # release_hold() is called externally (e.g. TransformationSystem
+        # releasing the 'transform' animation once its charge timer completes).
+        if self.hold_frames and not self._hold_released and self.current_frame >= self.hold_frames[0]:
+            self.holding = True
+            self.time_elapsed += dt
+            if self.time_elapsed >= self.frame_duration:
+                self.time_elapsed = 0
+                self.current_frame += 1
+                if self.current_frame > self.hold_frames[1]:
+                    self.current_frame = self.hold_frames[0]
+            return
+
+        self.holding = False
         self.time_elapsed += dt
 
         if self.time_elapsed >= self.frame_duration:
@@ -184,6 +213,16 @@ class Animation:
         self.time_elapsed = 0
         self.finished = False
         self._blinking = False
+        self.holding = False
+        self._hold_released = False
+
+    def release_hold(self):
+        """Let a held animation (see hold_frames) continue past its hold-loop
+        toward its final frame(s). No-op if this animation has no hold segment
+        or has already been released."""
+        self._hold_released = True
+        self.holding = False
+        self.time_elapsed = 0
 
 
 class AnimatedSprite:
@@ -246,7 +285,7 @@ class AnimatedSprite:
         return sprite
 
     def load_animation(self, animation_name, direction, frame_duration=0.1, loop=True, num_variants=1,
-                       use_8_directions=False, loop_tail_frames=None):
+                       use_8_directions=False, loop_tail_frames=None, hold_frames=None):
         """Load one directional animation from {base_path}/{animation_name}.png.
 
         Sheet rows map to directions; stacked variant blocks sit below them
@@ -255,6 +294,9 @@ class AnimatedSprite:
         loop_tail_frames: for a non-looping animation, loop just the last N
         frames forever once the full sheet has played through once (instead
         of freezing on the final frame). See Animation.loop_tail_frames.
+
+        hold_frames: (start_idx, end_idx) — loop those two frames mid-animation
+        until release_hold() is called. See Animation.hold_frames.
 
         Returns True on success, False if the file is missing or has no frames.
         """
@@ -298,7 +340,8 @@ class AnimatedSprite:
             if animation_name == 'idle' and direction == 'up':
                 frames = frames[:1]
 
-            animation = Animation(frames, frame_duration, loop, loop_tail_frames, idle_blink=idle_blink)
+            animation = Animation(frames, frame_duration, loop, loop_tail_frames, idle_blink=idle_blink,
+                                   hold_frames=hold_frames)
             variants.append(animation)
 
         if not variants:
@@ -308,18 +351,19 @@ class AnimatedSprite:
         return True
 
     def load_animation_all_directions(self, animation_name, frame_duration=0.1, loop=True, num_variants=1,
-                                      use_8_directions=False, loop_tail_frames=None):
+                                      use_8_directions=False, loop_tail_frames=None, hold_frames=None):
         """Load an animation for every direction in one shot.
 
         use_8_directions=True  → down, down_left, left, up_left, up, up_right, right, down_right
         use_8_directions=False → down, left, right, up  (legacy 4-dir)
 
         loop_tail_frames: see load_animation() — looped through to every direction.
+        hold_frames: see load_animation() — looped through to every direction.
         """
         directions, _, _ = _directions(use_8_directions)
         for direction in directions:
             self.load_animation(animation_name, direction, frame_duration, loop, num_variants, use_8_directions,
-                                loop_tail_frames)
+                                loop_tail_frames, hold_frames)
 
     def append_animation_variants(self, animation_name, source_filename, frame_duration=0.1, loop=True, num_variants=1,
                                   use_8_directions=False):
@@ -625,6 +669,20 @@ class AnimatedSprite:
             # Draw sprite centered on position
             screen.blit(frame, (screen_x - offset_x, screen_y - offset_y))
 
+    def release_hold(self, animation_name, direction):
+        """Let a held animation (see Animation.hold_frames) continue past its
+        hold-loop toward its final frame(s). No-op if that animation/direction
+        isn't loaded or has no hold segment defined."""
+        key = f"{animation_name}_{direction}"
+        if key not in self.animations:
+            return
+        anim = self.animations[key]
+        if isinstance(anim, list):
+            for variant in anim:
+                variant.release_hold()
+        else:
+            anim.release_hold()
+
     def is_animation_finished(self):
         """True when the current non-looping animation has played through all its frames."""
         if self.current_animation and self.current_animation in self.animations:
@@ -649,6 +707,30 @@ class AnimatedSprite:
                 return anim[idx].current_frame
             return -1
         return anim.current_frame
+
+    def get_animation_duration(self, animation_name, direction):
+        """Total playtime of one full playthrough (frame_count * frame_duration),
+        or 0.0 if the animation/direction isn't loaded.
+
+        Lets callers size a timer to match how long an animation actually
+        takes instead of guessing with a hardcoded constant — e.g. Player's
+        charged-melee lunge/spin action, which must stay active exactly as
+        long as 'charged_melee_action' takes to play through, the same way
+        beam_charge_required/final_flash_charge_required/etc. are sized from
+        their ChargeEffect's get_total_duration() rather than a fixed guess.
+        For a variant list, uses the first variant — variants loaded together
+        via append_animation_variants()/num_variants share the same frame
+        count and frame_duration, so any variant gives the same answer.
+        """
+        key = f"{animation_name}_{direction}"
+        if key not in self.animations:
+            return 0.0
+        anim = self.animations[key]
+        if isinstance(anim, list):
+            if not anim:
+                return 0.0
+            anim = anim[0]
+        return len(anim.frames) * anim.frame_duration
 
 
 def _load_sprite_size(folder, default_w=32, default_h=32):
@@ -755,12 +837,24 @@ class CharacterSpriteLoader:
             ('instant_transmission', 0.1, True, 1),
             ('teleport', 0.3, True, 1),
             ('blocking', 0.2, True, 1),
-            ('transform', 0.15, False, 1),
             ('untransform', 0.15, False, 1),
         ]
 
         for anim_name, duration, loop, num_variants in animations_4dir:
             sprite.load_animation_all_directions(anim_name, duration, loop, num_variants, use_8_directions=False)
+
+        # 'transform' is loaded separately (not through the generic batch
+        # above) because it needs hold_frames: the sheet plays frames 1-3
+        # normally, then holds/loops frames 3<->4 (indices 2,3) — a
+        # "charging" pause — until TransformationSystem.update() calls
+        # release_hold() once its charge timer (transform_animation_duration)
+        # completes. Only then does it play frame 5 and finish, which is what
+        # drives complete_transform() via Player's is_animation_finished()
+        # check. If your transform.png doesn't have exactly 5 frames, adjust
+        # the (2, 3) indices to match wherever the hold should sit relative
+        # to your actual frame count.
+        sprite.load_animation_all_directions('transform', 0.15, False, 1, use_8_directions=False,
+                                             hold_frames=(2, 3))
 
         # Idle-wait animations: after standing still for a while (see
         # Player.IDLE_WAIT_DELAY), the character turns to face the camera and

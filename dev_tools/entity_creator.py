@@ -192,8 +192,58 @@ def discover_configured_ids(kind: str) -> list[str]:
 
 def discover_all_ids(kind: str) -> list[str]:
     """Union of sprite-folder ids and configured ids, so newly-dropped art
-    shows up as "unconfigured" instead of being invisible."""
-    return sorted(set(discover_sprite_ids(kind)) | set(discover_configured_ids(kind)))
+    shows up as "unconfigured" instead of being invisible.
+
+    Returned in the saved custom display order for *kind* (see
+    load_entity_order()/save_entity_order(), set via the ▲/▼ controls in
+    EntityList) — same "hand-picked order, leftovers sorted at the end"
+    reconciliation character_creator.discover_characters() uses. Any id
+    not yet placed in the saved order (newly added, or before an order
+    was ever saved) is appended alphabetically."""
+    found = set(discover_sprite_ids(kind)) | set(discover_configured_ids(kind))
+    order = load_entity_order(kind)
+    ordered = [eid for eid in order if eid in found]
+    leftover = sorted(found - set(ordered))
+    return ordered + leftover
+
+
+# ── Entity list ordering (per kind) ──────────────────────────────────
+# Enemies and NPCs each get their own hand-picked display order via the
+# ▲/▼ controls in EntityList. Both orders live in one small file next to
+# assets/ (not inside assets/enemies/ or assets/npcs/) so it isn't
+# mistaken for an entity config by anything scanning those folders —
+# same rationale as character_creator.MENU_FILE.
+ENTITY_ORDER_FILE = BASE_DIR / "assets/entity_menu.json"
+
+
+def _load_entity_orders() -> dict:
+    if not ENTITY_ORDER_FILE.exists():
+        return {}
+    try:
+        data = json.loads(ENTITY_ORDER_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def load_entity_order(kind: str) -> list[str]:
+    """Return the saved custom display order for *kind* ('enemy'/'npc').
+    May be stale (reference deleted ids, omit new ones) — callers
+    reconcile against the real id list, same as discover_all_ids() does.
+    Returns [] if nothing has been saved yet."""
+    data = _load_entity_orders()
+    return [str(eid) for eid in data.get(kind, [])]
+
+
+def save_entity_order(kind: str, order: list[str]) -> None:
+    """Persist the display order for *kind*, leaving the other kind's
+    saved order untouched."""
+    data = _load_entity_orders()
+    data[kind] = order
+    ENTITY_ORDER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ENTITY_ORDER_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def scan_variants(kind: str, entity_id: str, entity_type: str = "") -> list[str]:
@@ -351,8 +401,9 @@ def _cycle_button(surf, font, rect, label, hovered=False):
 
 # ══════════════════════════════════════════════════════════════════════
 #  Entity list panel (left column) — same interaction pattern as
-#  character_creator.CharacterList, minus manual reordering (not needed
-#  here; enemies/NPCs don't have a menu order to preserve).
+#  character_creator.CharacterList, including manual reordering via the
+#  ▲/▼ controls in the reserved bottom strip. Enemies and NPCs each keep
+#  their own saved order (see load_entity_order()/save_entity_order()).
 # ══════════════════════════════════════════════════════════════════════
 class EntityList:
     ITEM_H = 32
@@ -364,22 +415,76 @@ class EntityList:
         self.selected = ""
         self.scroll = 0
 
+        # Reorder controls (▲/▼ buttons in the reserved bottom strip).
+        # order_changed is set True right after a successful move; the
+        # owner (EntityCreator) checks it each frame and is responsible
+        # for persisting self.ids via save_entity_order() and clearing
+        # the flag — same handoff CharacterList uses.
+        self.order_changed = False
+
     def set_ids(self, ids: list[str], configured: set[str], selected: str = "") -> None:
         self.ids = ids
         self.configured = configured
         self.selected = selected or (ids[0] if ids else "")
 
+    def _visible_rect(self) -> pygame.Rect:
+        """Item area, with room reserved at the bottom for the ▲/▼ strip."""
+        return pygame.Rect(self.rect.x, self.rect.y, self.rect.w, self.rect.h - 46)
+
+    def _reorder_button_rects(self) -> tuple[pygame.Rect, pygame.Rect]:
+        """Rects for the ▲ Up / ▼ Down buttons, in the strip reserved
+        below the scrollable item list."""
+        bar_y = self.rect.bottom - 38
+        half  = (self.rect.w - 16) // 2
+        btn_up   = pygame.Rect(self.rect.x + 6, bar_y, half, 28)
+        btn_down = pygame.Rect(btn_up.right + 4, bar_y, half, 28)
+        return btn_up, btn_down
+
+    def move_selected(self, delta: int) -> bool:
+        """Swap the selected entity with its neighbor delta steps away
+        (-1 = up, +1 = down). Returns True if a swap happened."""
+        if not self.selected or self.selected not in self.ids:
+            return False
+        i = self.ids.index(self.selected)
+        j = i + delta
+        if not (0 <= j < len(self.ids)):
+            return False
+        self.ids[i], self.ids[j] = self.ids[j], self.ids[i]
+        self._ensure_visible(j)
+        return True
+
+    def _ensure_visible(self, index: int) -> None:
+        """Scroll just enough so the row at `index` is on-screen."""
+        visible_count = max(1, self._visible_rect().h // self.ITEM_H)
+        if index < self.scroll:
+            self.scroll = index
+        elif index >= self.scroll + visible_count:
+            self.scroll = index - visible_count + 1
+        self.scroll = max(0, min(self.scroll, max(0, len(self.ids) - 1)))
+
     def handle_event(self, event: pygame.event.Event) -> Optional[str]:
-        if event.type == pygame.MOUSEWHEEL and self.rect.collidepoint(pygame.mouse.get_pos()):
+        visible_rect = self._visible_rect()
+        if event.type == pygame.MOUSEWHEEL and visible_rect.collidepoint(pygame.mouse.get_pos()):
             self.scroll = max(0, min(len(self.ids) - 1, self.scroll - event.y))
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             mx, my = event.pos
-            if not self.rect.collidepoint(mx, my):
+
+            btn_up, btn_down = self._reorder_button_rects()
+            if btn_up.collidepoint(mx, my):
+                if self.move_selected(-1):
+                    self.order_changed = True
+                return None
+            if btn_down.collidepoint(mx, my):
+                if self.move_selected(1):
+                    self.order_changed = True
+                return None
+
+            if not visible_rect.collidepoint(mx, my):
                 return None
             for i, eid in enumerate(self.ids):
-                item_y = self.rect.y + (i - self.scroll) * self.ITEM_H
-                item_r = pygame.Rect(self.rect.x, item_y, self.rect.w, self.ITEM_H)
-                if item_r.collidepoint(mx, my) and self.rect.collidepoint(item_r.center):
+                item_y = visible_rect.y + (i - self.scroll) * self.ITEM_H
+                item_r = pygame.Rect(visible_rect.x, item_y, visible_rect.w, self.ITEM_H)
+                if item_r.collidepoint(mx, my) and visible_rect.collidepoint(item_r.center):
                     if self.selected != eid:
                         self.selected = eid
                         return eid
@@ -389,14 +494,15 @@ class EntityList:
         pygame.draw.rect(surf, C_PANEL_DARK, self.rect, border_radius=6)
         pygame.draw.rect(surf, C_BORDER, self.rect, 1, border_radius=6)
 
+        visible_rect = self._visible_rect()
         old_clip = surf.get_clip()
-        surf.set_clip(self.rect)
-        visible = max(1, self.rect.h // self.ITEM_H)
+        surf.set_clip(visible_rect)
+        visible = max(1, visible_rect.h // self.ITEM_H)
         mx, my = pygame.mouse.get_pos()
         for i, eid in enumerate(self.ids[self.scroll:self.scroll + visible + 1]):
             real_i = self.scroll + i
-            item_y = self.rect.y + i * self.ITEM_H
-            item_r = pygame.Rect(self.rect.x, item_y, self.rect.w, self.ITEM_H)
+            item_y = visible_rect.y + i * self.ITEM_H
+            item_r = pygame.Rect(visible_rect.x, item_y, visible_rect.w, self.ITEM_H)
             hovered = item_r.collidepoint(mx, my)
             is_sel = (eid == self.selected)
             bg = C_SELECTED if is_sel else (C_HOVER if hovered else C_PANEL_DARK)
@@ -411,7 +517,24 @@ class EntityList:
 
         if not self.ids:
             msg = render_text_cached(font_sm, "No sprite folders found", C_TEXT_DIM)
-            surf.blit(msg, msg.get_rect(center=self.rect.center))
+            surf.blit(msg, msg.get_rect(center=visible_rect.center))
+
+        # ── Reorder controls ──────────────────────────────────────
+        btn_up, btn_down = self._reorder_button_rects()
+        pygame.draw.line(surf, C_BORDER,
+                         (self.rect.x + 4, btn_up.y - 6),
+                         (self.rect.right - 4, btn_up.y - 6))
+
+        idx      = self.ids.index(self.selected) if self.selected in self.ids else -1
+        can_up   = idx > 0
+        can_down = idx != -1 and idx < len(self.ids) - 1
+
+        draw_button(surf, font_sm, btn_up, "▲ Up",
+                   color=C_ACCENT if can_up else C_TEXT_DIM,
+                   hover=can_up and btn_up.collidepoint(mx, my))
+        draw_button(surf, font_sm, btn_down, "▼ Down",
+                   color=C_ACCENT if can_down else C_TEXT_DIM,
+                   hover=can_down and btn_down.collidepoint(mx, my))
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -879,9 +1002,9 @@ class EntityCreator:
         if not new_id:
             return
         if new_id not in self.ids:
-            self.ids.append(new_id)
-            self.ids.sort()
-            self.entity_list.set_ids(self.ids, self.configured, new_id)
+            self.ids.append(new_id)   # lands at the end of the display order;
+            self.entity_list.set_ids(self.ids, self.configured, new_id)  # move it with ▲/▼ if needed
+            save_entity_order(self.kind, self.ids)
         self._switch_entity(new_id)
         self.dialog = None
         self._set_status(f"Created {new_id} — remember to add its sprite folder")
@@ -899,12 +1022,21 @@ class EntityCreator:
             self.active = False
             return None
 
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_s \
+                and (event.mod & pygame.KMOD_CTRL):
+            self._do_save()
+            return None
+
         for i, rect in enumerate(self.kind_tab_rects):
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and rect.collidepoint(event.pos):
                 self._switch_kind(KIND_ENEMY if i == 0 else KIND_NPC)
                 return None
 
         new_sel = self.entity_list.handle_event(event)
+        if self.entity_list.order_changed:
+            self.entity_list.order_changed = False
+            self.ids = self.entity_list.ids
+            save_entity_order(self.kind, self.ids)
         if new_sel:
             self._switch_entity(new_sel)
             return None
