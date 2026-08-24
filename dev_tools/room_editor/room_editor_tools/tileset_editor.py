@@ -83,6 +83,7 @@ class Tileset:
         self.rows = 0
         self._tile_transparency_cache = {}
         self._scaled_cache = {}  # key: (tile_x, tile_y, scale) → pre-scaled Surface
+        self._dimmed_cache = {}  # key: (tile_x, tile_y, scale, alpha) → pre-scaled, alpha-reduced Surface
 
         # (tile_x, tile_y) anchor -> {'frames': [(tx,ty), ...], 'fps': float}
         # The anchor is whatever coordinate is painted into the room; 'frames'
@@ -251,6 +252,24 @@ class Tileset:
     def invalidate_scaled_cache(self):
         """Clear the scaled surface cache (call if the tileset image is replaced at runtime)."""
         self._scaled_cache.clear()
+        self._dimmed_cache.clear()
+
+    def get_dimmed_tile_surface(self, tile_x: int, tile_y: int, scale: int, alpha: int) -> Optional[pygame.Surface]:
+        """Return a pre-scaled tile surface at reduced alpha, creating and caching it on first call.
+
+        Built from the same cached scaled surface as get_scaled_tile_surface, so the only
+        extra per-tile-type cost is a one-time copy() + set_alpha(); nothing is redone per frame.
+        """
+        key = (tile_x, tile_y, scale, alpha)
+        if key not in self._dimmed_cache:
+            base = self.get_scaled_tile_surface(tile_x, tile_y, scale)
+            if base is None:
+                self._dimmed_cache[key] = None
+            else:
+                dimmed = base.copy()
+                dimmed.set_alpha(alpha)
+                self._dimmed_cache[key] = dimmed
+        return self._dimmed_cache[key]
 
 
 class TilesetManager:
@@ -297,6 +316,11 @@ class TilesetManager:
 class TilesetEditor:
     """Tileset palette and tile-painting editor."""
 
+    # Alpha (0-255) used to dim tiles on layers other than the active editing layer.
+    # Always on while the tile editor is active — the active layer itself is always
+    # drawn at full opacity.
+    INACTIVE_LAYER_ALPHA = 90
+
     LAYER_PRESETS = [
         ("Ground", -100),
         ("Floor Decor", -75),
@@ -332,9 +356,9 @@ class TilesetEditor:
         # ── Layer state ──────────────────────────────────────────────────────
         self.current_layer_preset_index = 0
         self.current_layer = -100
+        self.hidden_layers = set()  # layer values fully hidden via the per-layer checkbox
         self.custom_layer_value = -100
         self.delete_underlying = True
-        self.hide_other_layers = False
         self.layer_dropdown_open = False
         self.layer_input_active = False
         self.layer_input_text = ""
@@ -694,9 +718,14 @@ class TilesetEditor:
                 self.delete_underlying = not self.delete_underlying
                 return
 
-            if self._is_in_ui_rect(mouse_x, mouse_y, 'hide_layers_checkbox'):
-                self.hide_other_layers = not self.hide_other_layers
-                # Invalidate the baked tile cache so the new visibility is
+            if self._is_in_ui_rect(mouse_x, mouse_y, 'hide_layer_checkbox'):
+                # Toggles visibility of only the currently selected layer —
+                # other layers are unaffected and keep their own hidden state.
+                if self.current_layer in self.hidden_layers:
+                    self.hidden_layers.discard(self.current_layer)
+                else:
+                    self.hidden_layers.add(self.current_layer)
+                # Invalidate the baked tile cache so the visibility change is
                 # reflected immediately — without this the old surface persists.
                 if callable(getattr(self, 'on_tile_changed', None)):
                     self.on_tile_changed(current_room_name)
@@ -835,8 +864,10 @@ class TilesetEditor:
         Each tile in the multi-tile selection is offset relative to the top-left of the
         selection and placed at the corresponding grid cell. Empty (fully transparent) tiles
         in the selection are silently skipped so they don't erase valid tiles underneath.
-        If delete_underlying is on, existing tiles on the same layer and cell are removed
-        before the new tile is inserted.
+        If delete_underlying is on, existing tiles on the same layer that
+        are fully covered by the new tile are removed before it's inserted;
+        tiles only partially overlapped are left alone since part of their
+        sprite would still be visible.
         """
         tileset = self.get_current_tileset()
         if not tileset:
@@ -874,11 +905,45 @@ class TilesetEditor:
                 tile_y = grid_y + offset_y
 
                 if self.delete_underlying:
-                    # Remove any existing tile on this exact cell and layer before placing
-                    self.room_tiles[room_name] = [
-                        t for t in self.room_tiles[room_name]
-                        if not (t.x == tile_x and t.y == tile_y and t.layer == self.current_layer)
-                    ]
+                    # Remove any existing tile on this layer that the new
+                    # tile fully covers — i.e. the old tile's sprite would
+                    # be entirely hidden underneath the new one.
+                    #
+                    # This used to be an exact (t.x == tile_x and t.y ==
+                    # tile_y) match, which only works when every tile on the
+                    # layer was placed on the same snap grid. A tile stamped
+                    # in "No Grid" mode sits at an arbitrary pixel offset, so
+                    # a tile placed on top of it later with, say, a 16x16
+                    # grid essentially never lands on that exact pixel — the
+                    # old tile was never actually removed, it just got
+                    # visually covered. Deleting the new tile afterwards then
+                    # "revealed" the old one still sitting in the room data.
+                    #
+                    # A first pass used "any overlap" instead of "fully
+                    # covered", but that's too aggressive when tile sizes
+                    # differ: stamping one 16x16 tile can brush against many
+                    # 8x8 tiles without actually hiding them, and those were
+                    # getting deleted even though most of their sprite was
+                    # still visible outside the new tile's area. Requiring
+                    # full containment means only tiles that would actually
+                    # be hidden get cleared — a partially-overlapped smaller
+                    # tile stays right where it is.
+                    new_w, new_h = tileset.tile_width, tileset.tile_height
+                    kept = []
+                    for t in self.room_tiles[room_name]:
+                        if t.layer != self.current_layer:
+                            kept.append(t)
+                            continue
+                        t_tileset = self.tileset_manager.get_tileset(t.tileset_name)
+                        t_w, t_h = (t_tileset.tile_width, t_tileset.tile_height) if t_tileset else (self.grid_size, self.grid_size)
+                        fully_covered = (
+                            tile_x <= t.x and tile_y <= t.y and
+                            tile_x + new_w >= t.x + t_w and
+                            tile_y + new_h >= t.y + t_h
+                        )
+                        if not fully_covered:
+                            kept.append(t)
+                    self.room_tiles[room_name] = kept
 
                 new_tile = Tile(
                     tile_x, tile_y,
@@ -902,27 +967,56 @@ class TilesetEditor:
             self.on_tile_changed(room_name, cells=touched_cells)
 
     def _delete_tile_at_position(self, world_x: int, world_y: int, room_name: str):
-        """Remove all tiles at the snapped grid cell on the current layer."""
+        """Remove tile(s) at the given world position on the current layer.
+
+        Always hit-tests the raw click point against each tile's real
+        footprint (from its tileset's tile_width/tile_height), regardless
+        of the currently active placement-snap grid.
+
+        This used to branch on snap_size: an exact top-left match when a
+        grid was active, hit-testing only in "No Grid" mode. That broke as
+        soon as tiles of different sizes shared a layer — e.g. deleting an
+        8x8 tile while the active placement grid is 16x16 snaps the click
+        to a 16px grid line the 8x8 tile was never placed on, so it could
+        never match. The active grid is about where *new* tiles get
+        stamped; it has nothing to do with where an *existing* tile
+        actually sits, so deletion shouldn't be constrained by it at all —
+        click anywhere on a tile's visible sprite and it comes up for
+        removal, no matter what size it is or what grid you're currently
+        placing with.
+        """
         if room_name not in self.room_tiles:
             return
 
+        # Only used to de-duplicate repeated erases while dragging across
+        # the same spot — the actual match below always uses the raw,
+        # unsnapped click position.
         grid_x, grid_y = self._snap_anchor(world_x, world_y)
 
-        # Skip if still on the same cell as the last erase
+        # Skip if still on the same cell/position as the last erase
         if (grid_x, grid_y) == self._last_stroke_cell:
             return
         self._last_stroke_cell = (grid_x, grid_y)
 
-        removed = [
-            tile for tile in self.room_tiles[room_name]
-            if tile.x == grid_x and tile.y == grid_y and tile.layer == self.current_layer
-        ]
+        removed = []
+        for tile in self.room_tiles[room_name]:
+            if tile.layer != self.current_layer:
+                continue
+            removed_tileset = self.tileset_manager.get_tileset(tile.tileset_name)
+            if removed_tileset:
+                w, h = removed_tileset.tile_width, removed_tileset.tile_height
+            else:
+                w, h = self.grid_size, self.grid_size
+            if tile.x <= world_x < tile.x + w and tile.y <= world_y < tile.y + h:
+                removed.append(tile)
+
         if not removed:
             return
 
+        removed_ids = set(id(t) for t in removed)
         self.room_tiles[room_name] = [
             tile for tile in self.room_tiles[room_name]
-            if not (tile.x == grid_x and tile.y == grid_y and tile.layer == self.current_layer)
+            if id(tile) not in removed_ids
         ]
 
         # Footprint of what was actually removed (not a fixed grid constant)
@@ -930,16 +1024,21 @@ class TilesetEditor:
         # needs the real tile size so it clears exactly this spot and
         # nothing on a neighboring cell. Only fall back to grid_size if the
         # tileset can't be resolved (e.g. deleted/renamed tileset file).
-        cell_w, cell_h = self.grid_size, self.grid_size
-        removed_tileset = self.tileset_manager.get_tileset(removed[0].tileset_name)
-        if removed_tileset:
-            cell_w, cell_h = removed_tileset.tile_width, removed_tileset.tile_height
+        touched_cells = []
+        for tile in removed:
+            removed_tileset = self.tileset_manager.get_tileset(tile.tileset_name)
+            if removed_tileset:
+                cell_w, cell_h = removed_tileset.tile_width, removed_tileset.tile_height
+            else:
+                cell_w, cell_h = self.grid_size, self.grid_size
+            touched_cells.append((tile.x, tile.y, cell_w, cell_h))
 
         # Notify listeners (e.g. auto-save) that the room content changed.
-        # Pass the exact cell touched so the renderer can patch just that
-        # spot in the baked surface instead of rebuilding the whole room.
+        # Pass the exact cell(s) touched so the renderer can patch just
+        # those spots in the baked surface instead of rebuilding the whole
+        # room.
         if callable(getattr(self, 'on_tile_changed', None)):
-            self.on_tile_changed(room_name, cells=[(grid_x, grid_y, cell_w, cell_h)])
+            self.on_tile_changed(room_name, cells=touched_cells)
 
     def draw_tile_preview(self, screen: pygame.Surface, camera_x: int, camera_y: int):
         """Draw a semi-transparent ghost of the selected tile pattern under the cursor."""
@@ -998,17 +1097,27 @@ class TilesetEditor:
         """Draw all tiles for a room at the specified rendering pass ('background' or 'foreground').
 
         Tiles with layer >= 0 are drawn in the foreground pass; everything below 0 is background.
-        When hide_other_layers is on, only tiles matching current_layer are drawn.
-        Uses the tileset's scaled surface cache to avoid per-frame transform.scale() calls.
+        Layers toggled off via the "Hide this layer" checkbox (self.hidden_layers) are skipped
+        entirely. Of the remaining layers, the active editing layer (current_layer) is always
+        drawn at full opacity; every other layer is always dimmed, so surrounding layers stay
+        visible as context without obscuring what's being edited. Uses the tileset's
+        scaled/dimmed surface caches to avoid per-frame transform.scale() calls.
         """
         if room_name not in self.room_tiles:
             return
 
         tick_ms = pygame.time.get_ticks()
 
+        # If the currently-selected layer is itself hidden, there's no visible
+        # "active" layer to compare against — don't dim everything else just
+        # because the reference layer happens to be invisible.
+        active_layer_is_visible = self.current_layer not in self.hidden_layers
+
         for tile in sorted(self.room_tiles[room_name], key=lambda t: t.layer):
-            # Optionally dim everything except the active editing layer
-            if self.hide_other_layers and tile.layer != self.current_layer:
+            # Layers hidden via the per-layer checkbox are skipped entirely —
+            # unlike dimming, this is a full hide, and only ever affects the
+            # specific layer(s) the checkbox was toggled on.
+            if tile.layer in self.hidden_layers:
                 continue
 
             # Split world tiles into two draw passes so foreground tiles render on top
@@ -1035,12 +1144,20 @@ class TilesetEditor:
             # Resolve to the current animation frame (no-op for static tiles)
             disp_x, disp_y = tileset.get_animated_coords(tile.tile_x, tile.tile_y, tick_ms)
 
-            # Retrieve from cache — avoids subsurface + transform.scale every frame
-            scaled_tile = tileset.get_scaled_tile_surface(disp_x, disp_y, RENDER_SCALE)
-            if not scaled_tile:
+            # Active layer stays full-strength; every other layer is dimmed —
+            # but only while the active layer itself is actually visible.
+            # Using a cached, pre-alpha'd surface so this costs nothing extra per frame.
+            if active_layer_is_visible and tile.layer != self.current_layer:
+                draw_surface = tileset.get_dimmed_tile_surface(
+                    disp_x, disp_y, RENDER_SCALE, self.INACTIVE_LAYER_ALPHA
+                )
+            else:
+                draw_surface = tileset.get_scaled_tile_surface(disp_x, disp_y, RENDER_SCALE)
+
+            if not draw_surface:
                 continue
 
-            screen.blit(scaled_tile, (int(screen_x), int(screen_y)))
+            screen.blit(draw_surface, (int(screen_x), int(screen_y)))
 
     def draw_palette(self, screen: pygame.Surface):
         """Draw the tileset palette UI with layer controls"""
@@ -1197,17 +1314,18 @@ class TilesetEditor:
         checkbox_label = self.font_small.render("Replace tiles on same layer", True, self.colors['text_dim'])
         screen.blit(checkbox_label, (checkbox_x + 25, checkbox_y + 2))
 
-        # "Hide other layers" checkbox — dims all tiles except the active layer while editing
+        # "Hide this layer" checkbox — hides ONLY the currently selected layer
+        # (self.current_layer); other layers keep their own independent hidden state.
         hide_checkbox_y = controls_y + 25
         hide_checkbox_x = self.palette_x + 20
 
         hide_checkbox_rect = pygame.Rect(hide_checkbox_x, hide_checkbox_y, checkbox_size, checkbox_size)
-        self.ui_rects['hide_layers_checkbox'] = hide_checkbox_rect
+        self.ui_rects['hide_layer_checkbox'] = hide_checkbox_rect
 
         pygame.draw.rect(screen, self.colors['checkbox'], hide_checkbox_rect)
         pygame.draw.rect(screen, self.colors['accent'], hide_checkbox_rect, 1)
 
-        if self.hide_other_layers:
+        if self.current_layer in self.hidden_layers:
             # Draw checkmark
             pygame.draw.line(screen, self.colors['success'],
                              (hide_checkbox_x + 3, hide_checkbox_y + 9),
@@ -1216,7 +1334,7 @@ class TilesetEditor:
                              (hide_checkbox_x + 7, hide_checkbox_y + 13),
                              (hide_checkbox_x + 15, hide_checkbox_y + 5), 2)
 
-        hide_checkbox_label = self.font_small.render("Hide other layers", True, self.colors['text_dim'])
+        hide_checkbox_label = self.font_small.render("Hide this layer", True, self.colors['text_dim'])
         screen.blit(hide_checkbox_label, (hide_checkbox_x + 25, hide_checkbox_y + 2))
 
         # Layer controls — label on the right half, dropdown beside it

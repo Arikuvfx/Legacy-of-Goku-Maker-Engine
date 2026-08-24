@@ -8430,6 +8430,19 @@ class Game:
                 self.sound_manager.play_sfx('bump')
                 collision = True
 
+            # Running straight into a wall drops the sprint toggle back to a
+            # normal walk. is_running is sticky (set by double-tap, see the
+            # KEYDOWN handler) so without this the player stays in the run
+            # animation/speed indefinitely — even when knockback doesn't
+            # fire this frame (e.g. its cooldown is still active) — for as
+            # long as the wall-ward key stays held. Diagonal hits are
+            # excluded since those slide along the wall on the free axis
+            # rather than actually stopping the player (same condition used
+            # for the knockback trigger above).
+            if is_running and (self.player._blocked_x or self.player._blocked_y) \
+                    and not (dx != 0 and dy != 0):
+                self.player.is_running = False
+
             if not collision:
                 # NPC collision — use a slim hitbox at the NPC's feet to feel natural.
                 import pygame as _pg
@@ -10147,11 +10160,13 @@ class Game:
         surfaces for `room_name`, instead of rebuilding the whole room.
 
         Mirrors the per-tile logic in _build_room_tile_surface() but scoped
-        to one cell, so cost is O(tiles stacked on this one cell) — a small,
-        bounded number — rather than O(all tiles in the room) plus a fresh
-        room-sized Surface allocation. That's what made painting/erasing
-        get progressively laggier on bigger rooms with more tiles: every
-        single edit was paying for a full rebuild.
+        to one cell, so cost is close to O(tiles overlapping this one
+        region) — small in practice — rather than a fresh room-sized
+        Surface allocation. Selecting which tiles overlap does still scan
+        every tile in the room (an exact-position match was cheaper, but
+        silently missed tiles that weren't at exactly (cell_x, cell_y) —
+        see below); painting/erasing avoids the far more expensive part,
+        which is reallocating and re-blitting the whole baked surface.
 
         `cell_w`/`cell_h` is the real pixel footprint of the tile that was
         placed or erased here (from the tileset it belongs to), NOT a fixed
@@ -10169,10 +10184,33 @@ class Game:
             return
 
         tileset_mgr = te.tileset_manager
-        cell_tiles = [
-            t for t in te.room_tiles.get(room_name, [])
-            if t.x == cell_x and t.y == cell_y
-        ]
+
+        # Select every tile whose real footprint overlaps the region being
+        # patched, not just tiles whose top-left corner exactly equals
+        # (cell_x, cell_y).
+        #
+        # An exact-corner match misses two cases: a tile stamped over
+        # several smaller tiles clears a region larger than any single
+        # tile's own corner (e.g. one 16x16 tile fully covering — and thus
+        # correctly deleting — a 2x2 block of 8x8 tiles), and a tile that
+        # only partially overlaps the new one (and is intentionally left in
+        # place, still sitting in room_tiles) doesn't share that corner
+        # either. Filtering on exact position silently drops that leftover
+        # tile out of the redraw even though it's still there — it gets
+        # blanked from the cleared rectangle and never repainted. That's
+        # why it looked gone in the live editor but reappeared after Test
+        # Room, since a full rebuild there draws every tile in room_tiles
+        # unconditionally and has no such gap.
+        region_x0, region_y0 = cell_x, cell_y
+        region_x1, region_y1 = cell_x + cell_w, cell_y + cell_h
+
+        cell_tiles = []
+        for t in te.room_tiles.get(room_name, []):
+            t_tileset = tileset_mgr.get_tileset(t.tileset_name)
+            t_w, t_h = (t_tileset.tile_width, t_tileset.tile_height) if t_tileset else (cell_w, cell_h)
+            if (t.x < region_x1 and t.x + t_w > region_x0 and
+                    t.y < region_y1 and t.y + t_h > region_y0):
+                cell_tiles.append(t)
         cell_tiles.sort(key=lambda t: t.layer)
 
         for bg in (True, False):
@@ -10188,17 +10226,25 @@ class Game:
             )
             surf.fill((0, 0, 0, 0), rect)
 
-            # Drop any stale animated-tile entries at this cell for this
-            # layer group; they'll be re-added below if still present.
+            # Drop any stale animated-tile entries touching this region for
+            # this layer group; they'll be re-added below if still present.
+            # Same overlap reasoning as cell_tiles above, rather than an
+            # exact corner match.
             anim_list = self._animated_tile_lists.get(key)
             if anim_list:
-                self._animated_tile_lists[key] = [
-                    t for t in anim_list if not (t.x == cell_x and t.y == cell_y)
-                ]
+                kept_anim = []
+                for t in anim_list:
+                    t_tileset = tileset_mgr.get_tileset(t.tileset_name)
+                    t_w, t_h = (t_tileset.tile_width, t_tileset.tile_height) if t_tileset else (cell_w, cell_h)
+                    overlaps = (
+                        t.x < region_x1 and t.x + t_w > region_x0 and
+                        t.y < region_y1 and t.y + t_h > region_y0
+                    )
+                    if not overlaps:
+                        kept_anim.append(t)
+                self._animated_tile_lists[key] = kept_anim
 
             for tile in cell_tiles:
-                if te.hide_other_layers and tile.layer != te.current_layer:
-                    continue
                 is_bg_tile = tile.layer < 0
                 if bg != is_bg_tile:
                     continue
@@ -10255,11 +10301,6 @@ class Game:
         tileset_mgr = te.tileset_manager
         animated_tiles = []
         for tile in sorted(tiles, key=lambda t: t.layer):
-            # When the editor's "Hide other layers" mode is on, only bake tiles
-            # that belong to the layer currently being edited.
-            if te.hide_other_layers and tile.layer != te.current_layer:
-                continue
-
             is_bg_tile = tile.layer < 0
             if bg != is_bg_tile:
                 continue

@@ -2690,9 +2690,11 @@ class RoomEditor:
             mouse_over_palette = False
 
             # Check if mouse is hovering over an editor palette
-            # Note: the tileset editor never binds WASD so we deliberately
-            # exclude it here — camera movement should always work with WASD
-            # regardless of where the cursor sits while that panel is open.
+            # Note: the tileset editor never binds WASD (it uses the arrow
+            # keys to move the tile-selection cursor in its palette) so we
+            # deliberately exclude it here — camera movement should always
+            # work with WASD regardless of where the cursor sits while that
+            # panel is open.
             if self.object_editor and self.object_editor.active:
                 mouse_over_palette = self.object_editor._is_in_palette(mouse_pos[0], mouse_pos[1])
             elif self.entity_editor and self.entity_editor.active:
@@ -2741,13 +2743,18 @@ class RoomEditor:
                 speed = self.camera_fast_speed if (
                         keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]) else self.camera_speed
 
-                if keys[pygame.K_LEFT] or keys[pygame.K_a]:
+                # WASD only — the arrow keys are reserved for the tileset
+                # editor's tile-selection cursor (see Tileset_Editor.
+                # handle_input), so camera panning must not also respond to
+                # them or the two would move together whenever that panel
+                # is open.
+                if keys[pygame.K_a]:
                     self.camera.x -= speed * dt
-                if keys[pygame.K_RIGHT] or keys[pygame.K_d]:
+                if keys[pygame.K_d]:
                     self.camera.x += speed * dt
-                if keys[pygame.K_UP] or keys[pygame.K_w]:
+                if keys[pygame.K_w]:
                     self.camera.y -= speed * dt
-                if keys[pygame.K_DOWN] or keys[pygame.K_s]:
+                if keys[pygame.K_s]:
                     self.camera.y += speed * dt
 
             # Keep camera inside the room bounds (or centered if room is smaller than screen)
@@ -2889,12 +2896,12 @@ class RoomEditor:
 
         # Background tiles — use baked surface if available (O(1) blit),
         # fall back to per-tile loop when the callback isn't wired OR when
-        # "hide other layers" is active. The baked surface is the same
+        # the tile editor is the active tool. The baked surface is the same
         # single composited image gameplay uses — it has no concept of
-        # per-tile layers, so it can't honor the isolation filter. Only
-        # tileset_editor.draw_tiles() actually checks hide_other_layers /
-        # current_layer, so that path is required whenever the checkbox is on.
-        _isolating_layer = bool(self.tileset_editor and self.tileset_editor.hide_other_layers)
+        # per-tile layers, so it can't dim inactive ones individually. Only
+        # tileset_editor.draw_tiles() dims non-active layers (always on, by
+        # current_layer), so that path is required whenever tiles are being edited.
+        _isolating_layer = bool(self.tileset_editor and self.tileset_editor.active)
         if self.blit_tiles_callback and not _isolating_layer:
             self.blit_tiles_callback(
                 screen, self.viewing_room.name,
@@ -2947,17 +2954,47 @@ class RoomEditor:
                 if stone.active:
                     stone.draw(screen, self.camera, self.colors)
 
-        # Draw decorations (trees, etc.)
+        # Draw decorations (trees, etc.) — Y-sorted by trunk/base position
+        # (same convention gameplay uses, see game.py's decoration.get_sort_key()
+        # vs. player.get_sort_key()) so a decoration lower on screen — nearer
+        # the camera — draws on top of one higher up, instead of just
+        # layering in placement order. The live placement ghost (if a
+        # decoration is currently selected in the palette) is interleaved
+        # into this same sorted pass, so while placing, a tree dragged
+        # behind another tree previews as behind it rather than always
+        # appearing on top — see ObjectEditor.draw_decoration_preview().
         if hasattr(self.viewing_room, 'decorations'):
-            for decoration in self.viewing_room.decorations:
-                if decoration.active:
+            sorted_decorations = sorted(
+                (d for d in self.viewing_room.decorations if d.active),
+                key=lambda d: d.y
+            )
+
+            preview_y = None
+            if self.object_editor and self.object_editor.active:
+                preview_y = self.object_editor.get_pending_decoration_preview_y()
+
+            if preview_y is None:
+                for decoration in sorted_decorations:
                     decoration.draw(screen, self.camera, self.colors)
+            else:
+                preview_drawn = False
+                for decoration in sorted_decorations:
+                    if not preview_drawn and decoration.y > preview_y:
+                        self.object_editor.draw_decoration_preview(
+                            screen, int(self.camera.x), int(self.camera.y)
+                        )
+                        preview_drawn = True
+                    decoration.draw(screen, self.camera, self.colors)
+                if not preview_drawn:
+                    self.object_editor.draw_decoration_preview(
+                        screen, int(self.camera.x), int(self.camera.y)
+                    )
 
         # Draw placed entities (NPCs / enemies / bosses)
         self._draw_placed_entities(screen, int(self.camera.x), int(self.camera.y))
 
         # Foreground tiles — same baked path as background, same
-        # hide_other_layers override (see the background block above).
+        # active-tile-editor override (see the background block above).
         if self.blit_tiles_callback and not _isolating_layer:
             self.blit_tiles_callback(
                 screen, self.viewing_room.name,
@@ -3209,9 +3246,11 @@ class RoomEditor:
                     stone.draw(zoom_surf, type('_Cam', (), {'x': 0, 'y': 0})(), self.colors)
 
         if hasattr(room, 'decorations'):
-            for decoration in room.decorations:
-                if decoration.active:
-                    decoration.draw(zoom_surf, type('_Cam', (), {'x': 0, 'y': 0})(), self.colors)
+            # Same Y-sort as the normal view (no placement preview here —
+            # the zoom overview has no live editing — so just the sort).
+            for decoration in sorted(
+                    (d for d in room.decorations if d.active), key=lambda d: d.y):
+                decoration.draw(zoom_surf, type('_Cam', (), {'x': 0, 'y': 0})(), self.colors)
 
         self._draw_placed_entities(zoom_surf, cam_x, cam_y)
 

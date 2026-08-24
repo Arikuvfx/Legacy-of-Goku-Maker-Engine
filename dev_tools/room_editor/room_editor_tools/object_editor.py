@@ -1066,12 +1066,32 @@ class ObjectEditor:
 
     def _check_object_at_position(self, world_x, world_y):
         """See if there's an object at this position (for deletion)"""
+        # Collision walls and terrain regions are frequently placed
+        # overlapping one another (a collision wall running along the edge
+        # of a water/lava region, for example). Without scoping, whichever
+        # type happened to be checked first in this function would "win"
+        # the hit test and get silently deleted even though the designer
+        # was working with the other tool — e.g. right-clicking to delete
+        # a terrain patch could instead delete a collision wall sitting on
+        # top of it, or vice versa. When the Collision or Terrain tool is
+        # the one currently selected in the palette, restrict hit-testing
+        # to that same type only, so the other type is untouchable until
+        # its own tool is selected. No tool selected (or any other tool)
+        # keeps the old behavior of checking every object type.
+        restrict_to = None
+        if isinstance(self.selected_object, dict):
+            if self.selected_object.get('is_collision'):
+                restrict_to = 'collision'
+            elif self.selected_object.get('is_animated_region'):
+                restrict_to = 'animated_region'
+
         # Check spawn point
-        spawn = self.spawn_manager.get_spawn_point(self.current_room_name)
-        if spawn:
-            distance = ((spawn.x - world_x) ** 2 + (spawn.y - world_y) ** 2) ** 0.5
-            if distance < max(spawn.width, spawn.height) / 2:
-                return spawn, 'spawn'
+        if restrict_to is None:
+            spawn = self.spawn_manager.get_spawn_point(self.current_room_name)
+            if spawn:
+                distance = ((spawn.x - world_x) ** 2 + (spawn.y - world_y) ** 2) ** 0.5
+                if distance < max(spawn.width, spawn.height) / 2:
+                    return spawn, 'spawn'
 
         # Check collision walls. Iterate back-to-front (most recently placed
         # first) since draw_collision_objects draws the list front-to-back —
@@ -1083,87 +1103,99 @@ class ObjectEditor:
         # actually clicked stayed put — indistinguishable since both render
         # as the same red overlay — requiring a second click to finish the
         # job.
-        collision_objs = self.collision_manager.get_collision_objects(self.current_room_name)
-        for collision_obj in reversed(collision_objs):
-            if (collision_obj.x <= world_x <= collision_obj.x + collision_obj.width and
-                    collision_obj.y <= world_y <= collision_obj.y + collision_obj.height):
-                return collision_obj, 'collision'
+        if restrict_to != 'animated_region':
+            collision_objs = self.collision_manager.get_collision_objects(self.current_room_name)
+            for collision_obj in reversed(collision_objs):
+                if (collision_obj.x <= world_x <= collision_obj.x + collision_obj.width and
+                        collision_obj.y <= world_y <= collision_obj.y + collision_obj.height):
+                    return collision_obj, 'collision'
 
-        # Check room transitions
-        transitions = self.transition_manager.get_transitions(self.current_room_name)
-        for transition in transitions:
-            if transition.check_collision_with_point(int(world_x), int(world_y)):
-                return transition, 'transition'
+        # The Collision tool is scoped to collision walls only — nothing
+        # else (terrain included) should be reachable for delete/hover
+        # while it's the active tool, even if this click missed every wall.
+        if restrict_to == 'collision':
+            return None, None
 
-        # Check destructible stones
-        if self.room_manager:
-            room = self.room_manager.get_room_by_name(self.current_room_name)
-            if room and hasattr(room, 'destructible_stones'):
-                for stone in room.destructible_stones:
-                    distance = ((stone.x - world_x) ** 2 + (stone.y - world_y) ** 2) ** 0.5
-                    if distance < max(stone.width, stone.height) / 2:
-                        return stone, 'stone'
+        # Everything below is off-limits while the Terrain tool is active —
+        # only the region check further down should run in that case, so a
+        # right-click can't reach through to a collision wall, door, chest,
+        # etc. sitting on top of/near the terrain patch being worked on.
+        if restrict_to is None:
+            # Check room transitions
+            transitions = self.transition_manager.get_transitions(self.current_room_name)
+            for transition in transitions:
+                if transition.check_collision_with_point(int(world_x), int(world_y)):
+                    return transition, 'transition'
 
-        # Check decorations (trees, etc.)
-        if self.room_manager:
-            room = self.room_manager.get_room_by_name(self.current_room_name)
-            if room and hasattr(room, 'decorations'):
-                for decoration in room.decorations:
-                    distance = ((decoration.x - world_x) ** 2 + (decoration.y - world_y) ** 2) ** 0.5
-                    if distance < max(decoration.width, decoration.height) / 2:
-                        return decoration, 'decoration'
+            # Check destructible stones
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(self.current_room_name)
+                if room and hasattr(room, 'destructible_stones'):
+                    for stone in room.destructible_stones:
+                        distance = ((stone.x - world_x) ** 2 + (stone.y - world_y) ** 2) ** 0.5
+                        if distance < max(stone.width, stone.height) / 2:
+                            return stone, 'stone'
 
-        # Check flying pads
-        pads = self.flying_pad_manager.get_pads(self.current_room_name)
-        for pad in pads:
-            distance = ((pad.x - world_x) ** 2 + (pad.y - world_y) ** 2) ** 0.5
-            if distance < max(pad.width, pad.height) / 2:
-                return pad, 'flying_pad'
+            # Check decorations (trees, etc.)
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(self.current_room_name)
+                if room and hasattr(room, 'decorations'):
+                    for decoration in room.decorations:
+                        distance = ((decoration.x - world_x) ** 2 + (decoration.y - world_y) ** 2) ** 0.5
+                        if distance < max(decoration.width, decoration.height) / 2:
+                            return decoration, 'decoration'
 
-        # Check nimbus clouds
-        clouds = self.nimbus_cloud_manager.get_clouds(self.current_room_name)
-        for cloud in clouds:
-            distance = ((cloud.x - world_x) ** 2 + (cloud.y - world_y) ** 2) ** 0.5
-            if distance < max(cloud.width, cloud.height) / 2:
-                return cloud, 'nimbus_cloud'
+            # Check flying pads
+            pads = self.flying_pad_manager.get_pads(self.current_room_name)
+            for pad in pads:
+                distance = ((pad.x - world_x) ** 2 + (pad.y - world_y) ** 2) ** 0.5
+                if distance < max(pad.width, pad.height) / 2:
+                    return pad, 'flying_pad'
 
-        # Check doors
-        for door in self.door_manager.get_doors(self.current_room_name):
-            distance = ((door.x - world_x) ** 2 + (door.y - world_y) ** 2) ** 0.5
-            if distance < max(door.width, door.height) / 2:
-                return door, 'door'
+            # Check nimbus clouds
+            clouds = self.nimbus_cloud_manager.get_clouds(self.current_room_name)
+            for cloud in clouds:
+                distance = ((cloud.x - world_x) ** 2 + (cloud.y - world_y) ** 2) ** 0.5
+                if distance < max(cloud.width, cloud.height) / 2:
+                    return cloud, 'nimbus_cloud'
 
-        # Check chests
-        for chest in self.chest_manager.get_chests(self.current_room_name):
-            distance = ((chest.x - world_x) ** 2 + (chest.y - world_y) ** 2) ** 0.5
-            if distance < max(chest.width, chest.height) / 2:
-                return chest, 'chest'
+            # Check doors
+            for door in self.door_manager.get_doors(self.current_room_name):
+                distance = ((door.x - world_x) ** 2 + (door.y - world_y) ** 2) ** 0.5
+                if distance < max(door.width, door.height) / 2:
+                    return door, 'door'
 
-        # Check level gates
-        gates = self.gate_manager.get_gates(self.current_room_name)
-        for gate in gates:
-            distance = ((gate.x - world_x) ** 2 + (gate.y - world_y) ** 2) ** 0.5
-            if distance < max(gate.width, gate.height) / 2:
-                return gate, 'gate'
+            # Check chests
+            for chest in self.chest_manager.get_chests(self.current_room_name):
+                distance = ((chest.x - world_x) ** 2 + (chest.y - world_y) ** 2) ** 0.5
+                if distance < max(chest.width, chest.height) / 2:
+                    return chest, 'chest'
 
-        # Check save points
-        save_points = self.save_point_manager.get_save_points(self.current_room_name)
-        for save_point in save_points:
-            distance = ((save_point.x - world_x) ** 2 + (save_point.y - world_y) ** 2) ** 0.5
-            if distance < max(save_point.width, save_point.height) / 2:
-                return save_point, 'save_point'
+            # Check level gates
+            gates = self.gate_manager.get_gates(self.current_room_name)
+            for gate in gates:
+                distance = ((gate.x - world_x) ** 2 + (gate.y - world_y) ** 2) ** 0.5
+                if distance < max(gate.width, gate.height) / 2:
+                    return gate, 'gate'
 
-        # Check world map objects
-        for obj in self.world_map_manager.get_objects(self.current_room_name):
-            distance = ((obj.x - world_x) ** 2 + (obj.y - world_y) ** 2) ** 0.5
-            if distance < max(obj.width, obj.height) / 2:
-                return obj, 'world_map_object'
+            # Check save points
+            save_points = self.save_point_manager.get_save_points(self.current_room_name)
+            for save_point in save_points:
+                distance = ((save_point.x - world_x) ** 2 + (save_point.y - world_y) ** 2) ** 0.5
+                if distance < max(save_point.width, save_point.height) / 2:
+                    return save_point, 'save_point'
 
-        # Check trigger boxes
-        for box in self.trigger_box_manager.get_boxes(self.current_room_name):
-            if (box.x <= world_x <= box.x + box.width and
-                    box.y <= world_y <= box.y + box.height):
-                return box, 'trigger_box'
+            # Check world map objects
+            for obj in self.world_map_manager.get_objects(self.current_room_name):
+                distance = ((obj.x - world_x) ** 2 + (obj.y - world_y) ** 2) ** 0.5
+                if distance < max(obj.width, obj.height) / 2:
+                    return obj, 'world_map_object'
+
+            # Check trigger boxes
+            for box in self.trigger_box_manager.get_boxes(self.current_room_name):
+                if (box.x <= world_x <= box.x + box.width and
+                        box.y <= world_y <= box.y + box.height):
+                    return box, 'trigger_box'
 
         # Check water/grass/etc regions LAST — regions tend to be large,
         # ground-level fills that other system boxes (trigger boxes,
@@ -2284,6 +2316,8 @@ class ObjectEditor:
         if self.on_trigger_box_placed:
             self.on_trigger_box_placed(box, room_name)
 
+        self._open_event_editor_for_box(box, room_name)
+
     def _place_always_run_trigger_box(self, room_name):
         """Fast-path placement for Always Run boxes. Since position/size are
         irrelevant to firing, skip the drag-a-rectangle gesture entirely and
@@ -2308,24 +2342,25 @@ class ObjectEditor:
         if self.on_trigger_box_placed:
             self.on_trigger_box_placed(box, room_name)
 
-    def _open_trigger_box_conditions_popup(self):
-        """Open the generalized Event Editor for the trigger box about to be
-        placed, pre-loaded with whatever conditions/actions are currently
-        sticky (self.trigger_box_conditions/self.trigger_box_actions)."""
+        self._open_event_editor_for_box(box, room_name)
+
+    def _open_event_editor_for_box(self, box, room_name):
+        """Immediately pop the Event Editor open for a trigger box that was
+        just placed, pre-filled with whatever conditions/actions it was
+        created with (self.trigger_box_conditions/self.trigger_box_actions —
+        set by whatever wired up placement — usually empty for a brand new
+        box). No-op if no FlagManager/event editor is wired up, matching the
+        same "disabled until connected" behavior the old palette Event
+        button had.
+
+        Saving from here writes straight back onto the box itself via
+        TriggerBox.open_event_editor()/_on_event_editor_save(), same as
+        editing an already-placed box by clicking on it."""
         if self.event_editor is None:
-            return  # no flag_manager wired — button should be disabled anyway
+            return
+        self.event_editor.set_current_room(room_name)
+        box.open_event_editor(self.event_editor)
 
-        def _on_save(conditions, actions):
-            self.trigger_box_conditions = conditions
-            self.trigger_box_actions = actions
-
-        self.event_editor.set_current_room(self.current_room_name)
-        self.event_editor.open(
-            title="Trigger Box Event",
-            existing_conditions=self.trigger_box_conditions,
-            existing_actions=self.trigger_box_actions,
-            on_save=_on_save,
-        )
 
     def _get_world_map_names(self):
         """Return a sorted list of world map stems from assets/world_maps/*.json."""
@@ -2615,10 +2650,8 @@ class ObjectEditor:
             # Left-click: place an object or interact with palette/UI
             if event.button == 1:
                 # Edit an EXISTING trigger box's own conditions/actions in
-                # place. Without this there was no way to configure a box
-                # after it's been placed — the palette panel's Event button
-                # (below) only bakes the sticky conditions/actions into a
-                # brand new box at creation time via _finalize_trigger_box_placement.
+                # place — same event editor a newly placed box now opens
+                # automatically (see _open_event_editor_for_box).
                 if (not self.placing_trigger_box
                         and not self._is_in_palette(mouse_pos[0], mouse_pos[1])
                         and self.hovered_object_type == 'trigger_box'
@@ -2682,13 +2715,6 @@ class ObjectEditor:
                     always_run_rect = self.ui_rects.get('trigger_box_always_run_rect')
                     if always_run_rect and always_run_rect.collidepoint(mouse_pos):
                         self.trigger_box_always_run = not self.trigger_box_always_run
-                        return
-
-                    # Event button — opens the picker (needs a FlagManager
-                    # wired via set_flag_manager; disabled otherwise)
-                    event_rect = self.ui_rects.get('trigger_box_event_btn')
-                    if event_rect and event_rect.collidepoint(mouse_pos) and self.flag_manager is not None:
-                        self._open_trigger_box_conditions_popup()
                         return
 
                     self.trigger_box_id_input_active = False
@@ -3414,6 +3440,15 @@ class ObjectEditor:
         if self._is_in_palette(mouse_pos[0], mouse_pos[1]):
             return
 
+        # Decoration ghosts are drawn by the caller (room_editor) instead,
+        # interleaved with already-placed decorations by Y position — see
+        # draw_decoration_preview(). That way a tree being placed behind
+        # another tree previews as behind it, rather than always drawing
+        # on top of every decoration in the room like a flat, unsorted
+        # overlay would.
+        if self.selected_object.get('object_type') == 'decoration':
+            return
+
         screen_x = (self.preview_x * RENDER_SCALE) - camera_x
         screen_y = (self.preview_y * RENDER_SCALE) - camera_y
 
@@ -3473,6 +3508,108 @@ class ObjectEditor:
 
             pygame.draw.circle(screen, self.colors['accent'], (int(screen_x), int(screen_y)), 3)
             pygame.draw.circle(screen, self.colors['text'], (int(screen_x), int(screen_y)), 1)
+
+    def _decoration_preview_eligible(self):
+        """Whether a decoration ghost should currently be previewed for
+        placement. Mirrors the guard order at the top of draw_preview()
+        (exclusive placement modes, disabled objects, palette hover, an
+        armed item) but only for the decoration case, since that's the
+        one room_editor draws separately for Y-sorting — see
+        draw_decoration_preview().
+        """
+        if not self.active or not self.selected_object or not isinstance(self.selected_object, dict):
+            return False
+        if self.selected_object.get('object_type') != 'decoration':
+            return False
+        if (self.flying_pad_path_editor.active
+                or self.nimbus_cloud_path_editor.active
+                or self.placing_transition_spawn):
+            return False
+        if self._is_object_disabled(self.selected_object):
+            return False
+        if self._item_armed():
+            return False
+        mouse_pos = pygame.mouse.get_pos()
+        if self._is_in_palette(mouse_pos[0], mouse_pos[1]):
+            return False
+        return True
+
+    def get_pending_decoration_preview_y(self):
+        """World-space Y of the decoration about to be placed (the same
+        bottom/trunk anchor used by placed Decoration objects), or None if
+        nothing is currently being previewed for placement. Lets the
+        caller (room_editor) work out where in its Y-sorted decoration
+        pass the ghost belongs, before actually drawing it — see
+        draw_decoration_preview().
+        """
+        if not self._decoration_preview_eligible():
+            return None
+        return self.preview_y
+
+    def draw_decoration_preview(self, screen, camera_x, camera_y):
+        """Draw the ghost preview for a decoration about to be placed.
+
+        Split out from draw_preview() so room_editor can draw this at the
+        correct point in its Y-sorted decoration pass — a tree about to be
+        placed behind another tree should preview as behind it, instead of
+        always rendering on top of every decoration in the room. Callers
+        should check get_pending_decoration_preview_y() first to decide
+        where this belongs in that sort.
+        """
+        if not self._decoration_preview_eligible():
+            return
+
+        screen_x = (self.preview_x * RENDER_SCALE) - camera_x
+        screen_y = (self.preview_y * RENDER_SCALE) - camera_y
+
+        if self.grid_snap:
+            snap = self.grid_snap_size
+            grid_screen_x = int(self.mouse_world_x / snap) * snap * RENDER_SCALE - camera_x
+            grid_screen_y = int(self.mouse_world_y / snap) * snap * RENDER_SCALE - camera_y
+
+            guide_surf = pygame.Surface((snap * RENDER_SCALE, snap * RENDER_SCALE), pygame.SRCALPHA)
+            pygame.draw.rect(guide_surf, self.colors['snap_guide'],
+                             (0, 0, snap * RENDER_SCALE, snap * RENDER_SCALE), 2)
+
+            center_x = snap * RENDER_SCALE // 2
+            center_y = snap * RENDER_SCALE // 2
+            pygame.draw.line(guide_surf, self.colors['snap_guide'],
+                             (center_x - 5, center_y), (center_x + 5, center_y), 2)
+            pygame.draw.line(guide_surf, self.colors['snap_guide'],
+                             (center_x, center_y - 5), (center_x, center_y + 5), 2)
+            screen.blit(guide_surf, (int(grid_screen_x), int(grid_screen_y)))
+
+        if self.selected_object.get('has_variants', False):
+            variant = self.selected_variant or self._get_current_variant(self.selected_object)
+            if variant:
+                obj_sprite = variant.get('sprite')
+                scaled_width = int(variant.get('width', 32) * RENDER_SCALE)
+                scaled_height = int(variant.get('height', 32) * RENDER_SCALE)
+            else:
+                obj_sprite = self.selected_object.get('sprite')
+                scaled_width = int(self.selected_object.get('width', 32) * RENDER_SCALE)
+                scaled_height = int(self.selected_object.get('height', 32) * RENDER_SCALE)
+        else:
+            obj_sprite = self.selected_object.get('sprite')
+            scaled_width = int(self.selected_object.get('width', 32) * RENDER_SCALE)
+            scaled_height = int(self.selected_object.get('height', 32) * RENDER_SCALE)
+
+        if not obj_sprite:
+            return
+
+        scaled_sprite = pygame.transform.scale(obj_sprite, (scaled_width, scaled_height))
+        preview_surf = scaled_sprite.copy()
+        preview_surf.set_alpha(100)
+
+        # Bottom-anchored, same convention as Decoration.get_render_info()
+        # and the placed decoration's (x, y) trunk/base point.
+        preview_x = int(screen_x - scaled_width // 2)
+        preview_y = int(screen_y - scaled_height)
+
+        screen.blit(preview_surf, (preview_x, preview_y))
+
+        pygame.draw.circle(screen, self.colors['accent'], (int(screen_x), int(screen_y)), 3)
+        pygame.draw.circle(screen, self.colors['text'], (int(screen_x), int(screen_y)), 1)
 
     def draw_collision_objects(self, screen, camera_x, camera_y):
         """Draw all collision walls in the current room"""
@@ -4255,34 +4392,6 @@ class ObjectEditor:
                     True, self.colors['text_dark'])
                 screen.blit(hint_surf, (self.palette_x + self.palette_padding, y_pos + 24))
                 y_pos += 18
-
-            y_pos += 30
-
-            # Event button — grey/disabled until a FlagManager is wired
-            event_label = self.font_medium.render("Event:", True, self.colors['text'])
-            screen.blit(event_label, (self.palette_x + self.palette_padding, y_pos))
-
-            event_btn_rect = pygame.Rect(btn_x, y_pos - 3, 160, 25)
-            event_cond_count = len(self.trigger_box_conditions)
-            event_action_count = len(self.trigger_box_actions)
-
-            if self.flag_manager is None:
-                pygame.draw.rect(screen, self.colors['panel'], event_btn_rect)
-                pygame.draw.rect(screen, self.colors['grid'], event_btn_rect, 2)
-                event_text = "(flags not connected)"
-                event_color = self.colors['text_dark']
-            else:
-                pygame.draw.rect(screen, self.colors['input_bg'], event_btn_rect)
-                pygame.draw.rect(screen, self.colors['accent'], event_btn_rect, 2)
-                if event_cond_count or event_action_count:
-                    event_text = f"Edit ({event_cond_count} cond, {event_action_count} act)"
-                else:
-                    event_text = "None — click to add"
-                event_color = self.colors['text']
-
-            event_label_surf = self.font_small.render(event_text, True, event_color)
-            screen.blit(event_label_surf, event_label_surf.get_rect(center=event_btn_rect.center))
-            self.ui_rects['trigger_box_event_btn'] = event_btn_rect
 
             y_pos += 30
 
