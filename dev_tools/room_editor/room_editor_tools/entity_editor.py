@@ -259,7 +259,9 @@ class EntityEditor:
         self.palette_height = 940
         self.palette_padding = 10
         self.item_size = 80
-        self.items_per_row = 3
+        self.item_gap = 10
+        available_w = self.palette_width - self.palette_padding * 2
+        self.items_per_row = max(1, (available_w + self.item_gap) // (self.item_size + self.item_gap))
         self.scroll_offset = 0
 
         # Tab order also controls top-to-bottom render order
@@ -1358,8 +1360,8 @@ class EntityEditor:
             row = i // self.items_per_row
             col = i % self.items_per_row
 
-            item_x = self.palette_x + self.palette_padding + col * (self.item_size + 10)
-            item_y = current_y + row * (self.item_size + 10)
+            item_x = self.palette_x + self.palette_padding + col * (self.item_size + self.item_gap)
+            item_y = current_y + row * (self.item_size + self.item_gap)
 
             # compute the actual tile height for this entity (same logic as _draw_entity_item)
             ew = entity.get('width', 1)

@@ -495,6 +495,13 @@ class CutsceneEditor:
         # game._room_tile_surfaces.  Built once per room/layer, then it's a
         # single camera-offset blit per frame instead of N per-tile blits.
         self._vp_tile_surfaces: dict = {}
+        # Animated tiles (water, flags, etc.) can't live in the surface above —
+        # it's baked once and never touched again, so a cycling tile would
+        # freeze on whatever frame it happened to be baked with. Mirrors
+        # game._animated_tile_lists: tiles whose anchor coord has a
+        # tile_animations entry are pulled out during baking and redrawn
+        # fresh every frame instead. Keyed the same as _vp_tile_surfaces.
+        self._vp_animated_tiles: dict = {}
 
     # ══════════════════════════════════════════════════════════════════════════
     # Public API
@@ -2632,10 +2639,21 @@ class CutsceneEditor:
         te = self.room_editor.tileset_editor
 
         # -- Seed te.room_tiles from the room object --------------------------
-        # room.tiles is the canonical list of Tile objects - the same source
-        # the room editor copies at _enter_view_room.
+        # room.tiles is the on-disk source - the same one _enter_view_room()
+        # reads - but it holds raw dicts (Tile.to_dict() shape) until an
+        # editor session converts them. Without converting here too, every
+        # tile downstream (_build_tile_surface) would try tile.layer /
+        # tile.tileset_name / etc. on a plain dict and blow up - or, since
+        # room.tiles is truthy, silently shadow whatever real Tile data
+        # already sits in te.room_tiles. Mirrors _enter_view_room()'s own
+        # dict-guard so both code paths agree on what a "tile" is.
         if not te.room_tiles.get(room.name):
-            te.room_tiles[room.name] = list(getattr(room, 'tiles', []))
+            from dev_tools.room_editor.room_editor_tools.tileset_editor import Tile
+            raw = getattr(room, 'tiles', None) or []
+            te.room_tiles[room.name] = [
+                Tile.from_dict(t) if isinstance(t, dict) else t
+                for t in raw
+            ]
 
     def _get_or_create_actor_entity(self, actor_def):
         """Return a cached entity for the actor def, creating one if needed."""
@@ -3249,7 +3267,7 @@ class CutsceneEditor:
         cam_y = int(self.camera.y)
 
         if room:
-            inter.blit(self._get_baked_tile_surface(room, False), (-cam_x, -cam_y))
+            self._blit_room_layer(inter, room, cam_x, cam_y, foreground=False)
 
         if room and self._vp_zoom >= 0.4 and self._show_grid:
             self._draw_viewport_grid(inter, room)
@@ -3268,6 +3286,26 @@ class CutsceneEditor:
             snap_size = self._actor_snap_sizes[self._actor_snap_idx]
             self._draw_viewport_grid(inter, room, cell_size=snap_size,
                                      grid_col=(90, 150, 230))
+
+        # ── Decorations (trees, etc.) — own Y-sorted pass, drawn before actors.
+        # Decorations are a separate object system from tiles (see
+        # objects/decoration_objects.py / room.decorations), so the tile-baking
+        # fix alone never surfaces them — nothing here ever asked room.decorations
+        # for anything. game.py's own cutscene-draw path (the branch this
+        # viewport is meant to mirror) draws these the same way: their own
+        # y-sorted pass via layer_manager, before draw_actors(), before fg
+        # tiles. The editor has no LayerManager instance, so this reimplements
+        # just the sort + blit using Decoration.get_render_info(), the same
+        # helper _draw_player_silhouette_if_occluded() uses in game.py — it
+        # already returns a pre-scaled surface and screen-space (x, y) for a
+        # given camera, so no extra scale/offset math is needed here.
+        if room and getattr(room, 'decorations', None):
+            for decoration in sorted(room.decorations, key=lambda d: d.get_sort_key()):
+                if not getattr(decoration, 'active', True):
+                    continue
+                scaled, dx, dy = decoration.get_render_info(self.camera, RENDER_SCALE)
+                if scaled:
+                    inter.blit(scaled, (dx, dy))
 
         # ── Actors + foreground tiles — draw in the correct order so fg tiles
         # (trees, buildings, anything with tile.layer >= 0) occlude actors that
@@ -3299,7 +3337,7 @@ class CutsceneEditor:
 
         # Foreground tile layer — drawn after actors so it occludes them correctly.
         if room:
-            inter.blit(self._get_baked_tile_surface(room, True), (-cam_x, -cam_y))
+            self._blit_room_layer(inter, room, cam_x, cam_y, foreground=True)
 
         if self._runtime:
             # Weather before the overlay — same layering as game.py's own
@@ -3330,9 +3368,40 @@ class CutsceneEditor:
         """
         if room_name is None:
             self._vp_tile_surfaces.clear()
+            self._vp_animated_tiles.clear()
         else:
             self._vp_tile_surfaces.pop((room_name, True),  None)
             self._vp_tile_surfaces.pop((room_name, False), None)
+            self._vp_animated_tiles.pop((room_name, True),  None)
+            self._vp_animated_tiles.pop((room_name, False), None)
+
+    def _blit_room_layer(self, inter, room, cam_x, cam_y, foreground):
+        """Draw one tile layer for *room* onto *inter*, animated content included.
+
+        Prefers self.room_editor.blit_tiles_callback - game.py wires this to
+        Game.blit_room_tiles, the exact same call the Room Editor's own
+        viewport uses (see room_editor.py's _enter_view_room draw path). That
+        one function is the actual single source of truth for a room's full
+        visual layer: the baked static tile surface, the per-tile animated-
+        tile overlay (water/flags/etc.), AND algorithmic AnimatedRegions
+        (grass/water/lava - objects/animated_region.py, drawn underneath the
+        bg bake). This editor has no way to reproduce AnimatedRegions itself
+        - that's ~150 lines of patch-cropping/frame-sheet/scroll logic that
+        only exists on Game - so placed grass etc. would stay invisible here
+        forever without going through the callback.
+
+        Falls back to the local bake-and-cache path below (tiles + per-tile
+        animation only, no AnimatedRegions) if the callback was never wired
+        up - e.g. this editor being exercised outside a full Game instance.
+        """
+        cb = getattr(self.room_editor, 'blit_tiles_callback', None)
+        if cb:
+            # blit_tiles_callback's own 'bg' flag is background=True, the
+            # opposite sense of this method's 'foreground' flag.
+            cb(inter, room.name, cam_x, cam_y, not foreground)
+        else:
+            inter.blit(self._get_baked_tile_surface(room, foreground), (-cam_x, -cam_y))
+            self._draw_viewport_animated_tiles(inter, room, cam_x, cam_y, foreground)
 
     def _get_baked_tile_surface(self, room, foreground):
         """Return the baked tile surface for *room*/*foreground*, building it if needed."""
@@ -3354,15 +3423,27 @@ class CutsceneEditor:
             (int(room.width * RENDER_SCALE), int(room.height * RENDER_SCALE)),
             pygame.SRCALPHA,
         )
-        tiles = list(getattr(room, 'tiles', None) or [])
-        if not tiles:
-            tiles = te.room_tiles.get(room.name, [])
+        # Prefer the editor's live cache (real Tile objects, kept up to date
+        # by every paint/erase this session) and only fall back to the raw
+        # on-disk room.tiles - converting dicts to Tile the same way
+        # _enter_view_room()/_render_room_tile_preview() do - when that cache
+        # hasn't been populated for this room yet. Checking room.tiles first
+        # (as this used to) meant a non-empty raw-dict list would win over a
+        # perfectly good live cache, and either shadow real edits or crash on
+        # tile.layer since dicts don't have attributes.
+        if te.room_tiles.get(room.name):
+            tiles = te.room_tiles[room.name]
+        else:
+            from dev_tools.room_editor.room_editor_tools.tileset_editor import Tile
+            raw = getattr(room, 'tiles', None) or []
+            tiles = [Tile.from_dict(t) if isinstance(t, dict) else t for t in raw]
         # Sort by layer so multiple stacked layers on the same side (bg or fg)
         # bake bottom-to-top in the correct order — mirrors
         # game._build_room_tile_surface. Without this, tiles blit in
         # whatever order they sit in the list (paint order), so a higher
         # layer can end up hidden underneath a lower one that happened to
         # be blitted after it.
+        animated_tiles = []
         for tile in sorted(tiles, key=lambda t: t.layer):
             is_fg = tile.layer >= 0
             if foreground != is_fg:
@@ -3370,14 +3451,55 @@ class CutsceneEditor:
             tileset = te.tileset_manager.get_tileset(tile.tileset_name)
             if not tileset:
                 continue
+            # Animated tiles (water, flags, rotors, etc.) are excluded from
+            # the static bake — this surface is built once and cached, so a
+            # cycling tile would freeze on its anchor frame forever. Mirrors
+            # game._build_room_tile_surface: pull them out here and redraw
+            # them fresh every frame via _draw_viewport_animated_tiles instead.
+            if tileset.is_tile_animated(tile.tile_x, tile.tile_y):
+                animated_tiles.append(tile)
+                continue
             scaled = tileset.get_scaled_tile_surface(tile.tile_x, tile.tile_y, RENDER_SCALE)
             if scaled:
                 surf.blit(scaled, (int(tile.x * RENDER_SCALE), int(tile.y * RENDER_SCALE)))
+        self._vp_animated_tiles[(room.name, foreground)] = animated_tiles
         # Convert to display format so every subsequent blit (camera pan,
         # tiled scroll) is hardware-accelerated rather than per-pixel software.
         # Background layer: no transparency needed → convert() (faster, no alpha).
         # Foreground layer: has transparent gaps → convert_alpha().
         return surf.convert() if not foreground else surf.convert_alpha()
+
+    def _draw_viewport_animated_tiles(self, inter, room, cam_x, cam_y, foreground: bool):
+        """Blit this room/layer's animated tiles on top of the baked static
+        surface, picking each one's current frame from the shared clock.
+
+        Mirrors game._draw_animated_tile_overlay — kept separate from the
+        static bake for the same reason: these tiles cycle frames every
+        tick and can't be pre-rendered once.
+        """
+        animated_tiles = self._vp_animated_tiles.get((room.name, foreground))
+        if not animated_tiles:
+            return
+        te = getattr(self.room_editor, 'tileset_editor', None)
+        if not te:
+            return
+        tick_ms = pygame.time.get_ticks()
+        tileset_mgr = te.tileset_manager
+        iw, ih = inter.get_size()
+        for tile in animated_tiles:
+            tileset = tileset_mgr.get_tileset(tile.tileset_name)
+            if not tileset or not tileset.image:
+                continue
+            screen_x = (tile.x * RENDER_SCALE) - cam_x
+            screen_y = (tile.y * RENDER_SCALE) - cam_y
+            scaled_w = tileset.tile_width * RENDER_SCALE
+            scaled_h = tileset.tile_height * RENDER_SCALE
+            if not (-scaled_w <= screen_x <= iw and -scaled_h <= screen_y <= ih):
+                continue
+            disp_x, disp_y = tileset.get_animated_coords(tile.tile_x, tile.tile_y, tick_ms)
+            scaled = tileset.get_scaled_tile_surface(disp_x, disp_y, RENDER_SCALE)
+            if scaled:
+                inter.blit(scaled, (int(screen_x), int(screen_y)))
 
     def _draw_viewport_grid(self, surf, room, cell_size=None, grid_col=(40, 140, 40)):
         """Draw a world-unit grid onto the intermediate surface using
@@ -3568,9 +3690,26 @@ class CutsceneEditor:
 
     def _draw_left_panel(self, screen, lp):
         x  = lp.x + 8
-        y  = lp.y + 8
+        y0 = lp.y + 8
         W  = lp.width - 16
-        scroll = getattr(self, '_left_scroll', 0)
+
+        # _left_scroll is updated on the mouse wheel (see _on_scroll), but it
+        # used to never be applied here — so with enough actors, the
+        # +ACTOR/-DEL buttons, snap controls, and the add-actor form just
+        # kept getting pushed further down, past lp.bottom, into the
+        # timeline panel's screen region. Clipping hid them visually, but
+        # their hit-rects stayed registered in self._btns at those
+        # off-panel coordinates, so clicks meant for the timeline below
+        # would land on these hidden buttons instead ("pushed behind other
+        # menu stuff"). Clamp against last frame's measured content height
+        # (one-frame lag, imperceptible) and actually offset the layout by
+        # it, the same way the timeline handles _tl_scroll_y.
+        visible_h  = lp.bottom - y0
+        content_h  = getattr(self, '_left_panel_content_h', 0)
+        max_scroll = max(0, content_h - visible_h)
+        self._left_scroll = _clamp(getattr(self, '_left_scroll', 0), 0, max_scroll)
+        scroll = self._left_scroll
+        y = y0 - scroll
 
         # Clip everything drawn in this panel to its own bounds. Without
         # this, a long LAYERS list (many actor tracks) followed by the
@@ -3580,6 +3719,13 @@ class CutsceneEditor:
         # those low fields is drawn on top of everything, visibly covering
         # the timeline).
         screen.set_clip(lp)
+
+        # Buttons this call registers at a y outside the visible panel
+        # (i.e. scrolled out of view) must not remain clickable, or they'd
+        # keep intercepting clicks meant for whatever panel sits below/
+        # behind them. Track keys added during this call and prune any
+        # that end up outside lp once we're done laying things out.
+        _btn_keys_before = set(self._btns.keys())
 
         # ── Section: Room ──────────────────────────────────────────────────────
         self._draw_section_header(screen, x, y, W, 'ROOM')
@@ -3662,6 +3808,28 @@ class CutsceneEditor:
         if self._actor_form:
             self._draw_divider(screen, x, y, W); y += 8
             y = self._draw_actor_form(screen, x, y, W)
+
+        # Remember this frame's laid-out content height (undoing the scroll
+        # offset baked into `y`) so next frame's clamp above knows how far
+        # there is to scroll.
+        self._left_panel_content_h = (y + scroll) - y0
+
+        # Drop any button registered above/below the visible panel — see the
+        # comment at the top of this function for why this matters.
+        for k in (self._btns.keys() - _btn_keys_before):
+            if not lp.colliderect(self._btns[k]):
+                del self._btns[k]
+
+        # Scroll indicator arrows in the left panel margin, mirroring the
+        # timeline's, so it's discoverable that there's more below/above.
+        if max_scroll > 0:
+            ax = lp.right - 12
+            if scroll > 0:
+                pygame.draw.polygon(screen, _C['text_dim'], [
+                    (ax - 6, y0 + 10), (ax, y0 + 2), (ax + 6, y0 + 10)])
+            if scroll < max_scroll:
+                pygame.draw.polygon(screen, _C['text_dim'], [
+                    (ax - 6, lp.bottom - 10), (ax, lp.bottom - 2), (ax + 6, lp.bottom - 10)])
 
         screen.set_clip(None)
 

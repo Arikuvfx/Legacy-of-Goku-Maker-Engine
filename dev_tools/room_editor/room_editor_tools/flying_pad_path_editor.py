@@ -64,6 +64,9 @@ class FlyingPadPathEditor:
         self.dropdown_open = False
         self.dropdown_rect = None
         self.room_item_rects = []
+        self.dropdown_menu_rect = None   # screen rect of the open room list (for scroll hit-testing)
+        self.dropdown_scroll_offset = 0  # index of first visible room in the list
+        self.dropdown_visible_rows = 6   # how many rows are shown at once
 
         # Return pad checkbox
         self.create_return_pad = False
@@ -84,6 +87,7 @@ class FlyingPadPathEditor:
         self.editing_mode = 'placing'
         self.selected_boundary_room = ""
         self.dropdown_open = False
+        self.dropdown_scroll_offset = 0
 
         # Reset room segment tracking
         self.current_room_segment_start = 0
@@ -178,14 +182,20 @@ class FlyingPadPathEditor:
                 # Check room dropdown
                 if self.dropdown_rect and self.dropdown_rect.collidepoint(mouse_pos):
                     self.dropdown_open = not self.dropdown_open
+                    if self.dropdown_open:
+                        self.dropdown_scroll_offset = 0
                     return None
 
-                # Check dropdown items
+                # Check dropdown items (room_item_rects holds only the
+                # currently-visible rows, so map back to the real index
+                # using the scroll offset)
                 if self.dropdown_open:
-                    for i, rect in enumerate(self.room_item_rects):
+                    for row, rect in enumerate(self.room_item_rects):
                         if rect.collidepoint(mouse_pos):
-                            self.selected_boundary_room = self.available_rooms[i]
-                            self.dropdown_open = False
+                            i = self.dropdown_scroll_offset + row
+                            if 0 <= i < len(self.available_rooms):
+                                self.selected_boundary_room = self.available_rooms[i]
+                                self.dropdown_open = False
                             return None
 
                 # Check confirm button
@@ -205,6 +215,15 @@ class FlyingPadPathEditor:
 
                     # Return transition command to switch rooms
                     return f'transition:{target_room}'
+
+            elif event.type == pygame.MOUSEWHEEL:
+                if self.dropdown_open and self.dropdown_menu_rect and \
+                        self.dropdown_menu_rect.collidepoint(mouse_pos):
+                    max_offset = max(0, len(self.available_rooms) - self.dropdown_visible_rows)
+                    # event.y > 0 is scroll up, < 0 is scroll down
+                    self.dropdown_scroll_offset -= event.y
+                    self.dropdown_scroll_offset = max(0, min(self.dropdown_scroll_offset, max_offset))
+                    return None
 
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
@@ -698,16 +717,27 @@ class FlyingPadPathEditor:
 
         # Draw dropdown menu if open
         self.room_item_rects = []
+        self.dropdown_menu_rect = None
         if self.dropdown_open:
-            menu_height = min(len(self.available_rooms) * 35, 200)
+            row_height = 35
+            total_rooms = len(self.available_rooms)
+            visible_rows = min(self.dropdown_visible_rows, total_rooms) if total_rooms else 0
+            menu_height = max(visible_rows * row_height, 1)
+
+            # Clamp scroll offset in case the room list shrank since we last scrolled
+            max_offset = max(0, total_rooms - self.dropdown_visible_rows)
+            self.dropdown_scroll_offset = max(0, min(self.dropdown_scroll_offset, max_offset))
+
             menu_surface = pygame.Surface((dialog_width - 40, menu_height), pygame.SRCALPHA)
             menu_surface.fill((30, 30, 40))
-            pygame.draw.rect(menu_surface, self.colors['accent'],
-                             (0, 0, dialog_width - 40, menu_height), 2)
 
             mouse_pos = pygame.mouse.get_pos()
+            first_index = self.dropdown_scroll_offset
+            last_index = min(first_index + self.dropdown_visible_rows, total_rooms)
+
             item_y = 0
-            for i, room in enumerate(self.available_rooms):
+            for i in range(first_index, last_index):
+                room = self.available_rooms[i]
                 item_rect = pygame.Rect(
                     dialog_x + 20,
                     dialog_y + dropdown_y + dropdown_height + 5 + item_y,
@@ -725,9 +755,28 @@ class FlyingPadPathEditor:
                 room_text = self.font_small.render(room, True, self.colors['text'])
                 menu_surface.blit(room_text, (10, item_y + 7))
 
-                item_y += 35
+                item_y += row_height
 
+            pygame.draw.rect(menu_surface, self.colors['accent'],
+                             (0, 0, dialog_width - 40, menu_height), 2)
+
+            # Scrollbar, drawn only when there are more rooms than fit
+            if total_rooms > self.dropdown_visible_rows:
+                track_x = dialog_width - 40 - 6
+                track_rect = pygame.Rect(track_x, 2, 4, menu_height - 4)
+                pygame.draw.rect(menu_surface, (60, 60, 80), track_rect)
+
+                thumb_h = max(20, int(menu_height * (self.dropdown_visible_rows / total_rooms)))
+                thumb_travel = menu_height - thumb_h
+                thumb_y = int(thumb_travel * (self.dropdown_scroll_offset / max_offset)) if max_offset else 0
+                thumb_rect = pygame.Rect(track_x, thumb_y, 4, thumb_h)
+                pygame.draw.rect(menu_surface, self.colors['accent'], thumb_rect)
+
+            menu_screen_pos = (dialog_x + 20, dialog_y + dropdown_y + dropdown_height + 5)
             dialog_surface.blit(menu_surface, (20, dropdown_y + dropdown_height + 5))
+            self.dropdown_menu_rect = pygame.Rect(
+                menu_screen_pos[0], menu_screen_pos[1], dialog_width - 40, menu_height
+            )
 
         # Confirm button (only if room selected)
         self.confirm_button_rect = None

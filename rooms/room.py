@@ -54,6 +54,16 @@ class Room:
         # Empty dict = no background image set for this room.
         self.scrolling_bg = {}
 
+        # Ambient weather effect for this room, set via the room editor's
+        # Weather field ('none', 'rain', 'snow', 'fog', 'storm').
+        self.ambient_weather = 'none'
+
+        # Whether the player is allowed to fight (melee/charged melee/super
+        # attacks) while in this room, set via the room editor's
+        # 'Can attack?' checkbox. Defaults to True so existing rooms behave
+        # exactly as before.
+        self.can_attack = True
+
         # Transient rooms are never saved to disk and hidden from the editor.
         # Used for the startup fallback room created by Game._create_default_room.
         self.is_transient = False

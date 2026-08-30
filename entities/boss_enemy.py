@@ -126,7 +126,11 @@ class BossEnemy(Enemy):
         )
         for obstacle in self.obstacles:
             if hasattr(obstacle, 'get_collision_rect'):
-                if temp_rect.colliderect(obstacle.get_collision_rect()):
+                obs_rect = obstacle.get_collision_rect()
+                # get_collision_rect() can return None (e.g. a destroyed or
+                # unlocked LevelGate) to signal "no collision this frame" --
+                # skip those rather than passing None to colliderect().
+                if obs_rect is not None and temp_rect.colliderect(obs_rect):
                     return True
             elif hasattr(obstacle, 'x') and hasattr(obstacle, 'width'):
                 obs_rect = pygame.Rect(

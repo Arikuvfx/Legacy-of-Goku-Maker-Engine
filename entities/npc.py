@@ -64,6 +64,13 @@ class NPC:
         self.draw_layer = DrawLayer.NPCS
         self.y_sort = True
         self.shadow_size = 'small'
+        # Ground shadow px width — same field/units as Player.shadow_width and
+        # BossEnemy.shadow_width (character_creator.py's Shadow Size slider,
+        # 8-96 step 4). Defaults to this NPC's own width until overridden by
+        # its entity_creator config (see game._spawn_room_entities), matching
+        # LayerManager._draw_shadow()'s getattr(obj, 'shadow_width', obj.width)
+        # fallback for entities that never get configured.
+        self.shadow_width = self.width
         self.sprite     = None   # set by game._spawn_room_entities if asset found
         self.has_sprite = False
         self.variant    = 'default'

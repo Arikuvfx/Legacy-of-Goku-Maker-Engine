@@ -30,8 +30,16 @@ the player has dropped from the pause menu's Equip tab. Kept in this file
 rather than a separate module because it needs item_icon_path()/get_item()
 right next to the ITEMS table it reads from, the same way zeni_system.py
 keeps its pickup class next to its own denomination tables.
+
+New/edited items don't have to be added here by hand — dev_tools/
+item_creator.py writes them to assets/items/{item_id}.json instead, and
+those are merged into ITEMS at import time (see the "JSON overlay" block
+below get_items_by_category()). This file's hardcoded table remains the
+base game's built-in item set; the overlay just layers on top of it.
 """
 
+import copy
+import json
 import math
 import os
 import random
@@ -1500,6 +1508,90 @@ def get_item(item_id):
 
 def get_items_by_category(category):
     return {iid: data for iid, data in ITEMS.items() if data.get('category') == category}
+
+
+# ---------------------------------------------------------------------------
+# JSON overlay — lets dev_tools/item_creator.py add brand-new items or edit
+# existing ones (name/description/effect_text/category/slot/effect) WITHOUT
+# touching this file's hardcoded ITEMS table, the same "JSON on top of a
+# base schema" approach character_creator.py / entity_creator.py use for
+# their own data. Every consumer that already does `from core.items import
+# get_item` (or ITEMS directly) picks up overlaid/added items for free,
+# since this runs once at import time and mutates ITEMS in place before
+# anything else has a chance to read it.
+#
+# Each override lives at assets/items/{item_id}.json and holds a full item
+# dict in the exact shape used above (name/description/effect_text/
+# category/effect, plus 'slot' for equip items) — item_creator.py writes
+# these out directly via save_item_override().
+# ---------------------------------------------------------------------------
+
+ITEMS_DIR = os.path.join('assets', 'items')
+
+# Snapshot of the hardcoded table above, taken before any JSON overlay is
+# applied. Lets item_creator.py offer "revert to built-in" for an item that
+# started life in this file, vs. simply deleting one that only ever existed
+# as a JSON override — see revert_item_override() below.
+_BUILTIN_ITEMS = copy.deepcopy(ITEMS)
+
+
+def _load_item_overrides():
+    """Merge assets/items/*.json into ITEMS. A file whose name matches a
+    built-in item id overrides that entry entirely; any other id adds a
+    brand-new item. Missing/unreadable directory is fine — the game just
+    runs on the hardcoded table above, same as before this existed."""
+    if not os.path.isdir(ITEMS_DIR):
+        return
+    for fname in sorted(os.listdir(ITEMS_DIR)):
+        if not fname.endswith('.json'):
+            continue
+        item_id = fname[:-5]
+        path = os.path.join(ITEMS_DIR, fname)
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            print(f"Error loading item override {path}: {e}")
+            continue
+        ITEMS[item_id] = data
+
+
+_load_item_overrides()
+
+
+def save_item_override(item_id, data):
+    """Write assets/items/{item_id}.json and apply it to the live ITEMS
+    dict immediately, so the change takes effect in the running game
+    without a restart. Used by dev_tools/item_creator.py's Save."""
+    os.makedirs(ITEMS_DIR, exist_ok=True)
+    path = os.path.join(ITEMS_DIR, f'{item_id}.json')
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+    ITEMS[item_id] = data
+
+
+def revert_item_override(item_id):
+    """Delete {item_id}.json if present. If item_id started out hardcoded
+    in the ITEMS table above, this restores that original definition in
+    the live dict; if it only ever existed as a JSON override (a fully
+    custom item), it's removed from ITEMS entirely. Used by
+    dev_tools/item_creator.py's Delete."""
+    path = os.path.join(ITEMS_DIR, f'{item_id}.json')
+    if os.path.exists(path):
+        os.remove(path)
+    if item_id in _BUILTIN_ITEMS:
+        ITEMS[item_id] = copy.deepcopy(_BUILTIN_ITEMS[item_id])
+    else:
+        ITEMS.pop(item_id, None)
+
+
+def discover_custom_item_ids():
+    """item_ids that currently have a JSON override file, regardless of
+    whether they also exist in the hardcoded table above (edited-in-place
+    vs. brand-new). Used by item_creator.py to badge list entries."""
+    if not os.path.isdir(ITEMS_DIR):
+        return set()
+    return {fname[:-5] for fname in os.listdir(ITEMS_DIR) if fname.endswith('.json')}
 
 
 # ---------------------------------------------------------------------------

@@ -60,7 +60,9 @@ class DevMenu:
             {'id': 'sprite_editor',     'label': 'SPRITE EDITOR',     'icon': 'sprite'},
             {'id': 'cutscene_editor', 'label': 'CUTSCENE EDITOR', 'icon': 'cutscene'},
             {'id': 'character_creator', 'label': 'CHARACTER CREATOR', 'icon': 'character'},
+            {'id': 'attack_creator',  'label': 'ATTACK CREATOR',  'icon': 'attack'},
             {'id': 'entity_creator',  'label': 'ENTITY CREATOR',  'icon': 'character'},
+            {'id': 'item_creator',    'label': 'ITEM CREATOR',    'icon': 'item'},
             {'id': 'config',          'label': 'CONFIGURATION',   'icon': 'config'},
             {'id': 'close',           'label': 'CLOSE MENU',      'icon': 'close'},
         ]
@@ -184,7 +186,7 @@ class DevMenu:
         """
         self.icons = {}
 
-        icon_types = ['room', 'map', 'sprite', 'cutscene', 'character', 'config', 'close', 'xp', 'transform', 'back']
+        icon_types = ['room', 'map', 'sprite', 'cutscene', 'character', 'attack', 'item', 'config', 'close', 'xp', 'transform', 'back']
 
         # Fallback colors keyed by icon type — used when no PNG is present
         icon_colors = {
@@ -193,6 +195,8 @@ class DevMenu:
             'sprite':    (100, 200, 255),
             'cutscene':  (255, 160,  80),
             'character': (255, 120, 220),
+            'attack':    (255,  90,  90),
+            'item':      ( 80, 220, 180),
             'config':    (100, 100, 255),
             'close':     (255,  50,  50),
             'xp':        (255, 215,   0),
@@ -601,8 +605,12 @@ class DevMenu:
                 return 'open_cutscene_editor'
             elif option_id == 'character_creator':
                 return 'open_character_creator'
+            elif option_id == 'attack_creator':
+                return 'open_attack_creator'
             elif option_id == 'entity_creator':
                 return 'open_entity_creator'
+            elif option_id == 'item_creator':
+                return 'open_item_creator'
             elif option_id == 'config':
                 self._enter_menu('config')
             elif option_id == 'close':
@@ -638,5 +646,7 @@ class DevMenu:
             'room_editor':       'ROOM EDITOR',
             'world_map_editor':  'WORLD MAP EDITOR',
             'character_creator': 'CHARACTER CREATOR',
+            'attack_creator':    'ATTACK CREATOR',
             'entity_creator':    'ENTITY CREATOR',
+            'item_creator':      'ITEM CREATOR',
         }.get(self.current_menu, 'DEV MENU')

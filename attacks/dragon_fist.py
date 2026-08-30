@@ -58,9 +58,21 @@ class DragonFistAttack:
                  head_size=(64, 64), body_size=(29, 32),
                  retract_speed=0, anchor_offset=20,
                  head_end_frame_count=2, head_end_frame_duration=0.06,
-                 destruction_frame_count=4, destruction_frame_duration=0.06):
+                 destruction_frame_count=4, destruction_frame_duration=0.06,
+                 attack_name='dragon_fist', destruction_asset='brown_destruction',
+                 push_force=0.4, chain_update_fps=24,
+                 chain_head_smooth_time=0.05, chain_tail_smooth_time=0.22,
+                 chain_gap_safety_margin=2.0):
         self.direction = direction
         self.scale = scale
+
+        # assets/sprites/attacks/{attack_name}/dragon_fist_head.png etc. —
+        # destruction_asset is separate since brown_destruction.png lives
+        # under assets/objects/, not under this attack's own sprite folder
+        # (it's a shared "puff of destruction" effect, not attack-specific
+        # art) — see _load_sprites().
+        self.attack_name = attack_name
+        self.destruction_asset = destruction_asset
 
         # All of the following are tunable placeholders — nothing in the
         # spec pinned down exact reach/speed numbers, so these are picked
@@ -104,7 +116,7 @@ class DragonFistAttack:
         # of flame_kamehameha's slow grind. Cutting the per-frame amount
         # keeps the two feeling the same despite the longer contact
         # window. Tune this directly if it still feels off either way.
-        self.push_force = 0.4
+        self.push_force = push_force
 
         # In the original game the head moves at full framerate but the
         # body segments visibly slide/ease toward their spot in the chain
@@ -116,7 +128,7 @@ class DragonFistAttack:
         # chain_update_fps, same chunky-update feel as the reference
         # footage), but body_positions eases toward those waypoints every
         # real frame instead of being set to them directly.
-        self.chain_update_fps = 24
+        self.chain_update_fps = chain_update_fps
         self.chain_update_interval = 1.0 / self.chain_update_fps
         self.chain_update_timer = 0.0
         # How quickly each segment closes the gap to its target — smaller
@@ -137,8 +149,8 @@ class DragonFistAttack:
         # similar catch-up rates by construction, so their relative gap
         # stays small on its own; _clamp_chain_gaps() is only a rare
         # safety net on top of that, not the thing doing the work.
-        self.chain_head_smooth_time = 0.05
-        self.chain_tail_smooth_time = 0.22
+        self.chain_head_smooth_time = chain_head_smooth_time
+        self.chain_tail_smooth_time = chain_tail_smooth_time
         num_free = num_segments - 1
         if num_free > 1:
             step = (self.chain_tail_smooth_time - self.chain_head_smooth_time) / (num_free - 1)
@@ -159,7 +171,7 @@ class DragonFistAttack:
         # frame hitch), not as routine per-frame enforcement, which would
         # override the throttled/sliding look entirely (see
         # _clamp_chain_gaps' docstring).
-        self.chain_gap_safety_margin = 2.0
+        self.chain_gap_safety_margin = chain_gap_safety_margin
 
         # Closing-sequence timing — also placeholders (frame count/pace
         # picked to look reasonable sight-unseen; retune once the real
@@ -263,28 +275,28 @@ class DragonFistAttack:
         destruction_sheet = None
         try:
             head_sheet = pygame.image.load(
-                'assets/sprites/attacks/dragon_fist/dragon_fist_head.png'
+                f'assets/sprites/attacks/{self.attack_name}/dragon_fist_head.png'
             ).convert_alpha()
         except Exception as e:
-            print(f"No dragon_fist head sprite loaded, using fallback: {e}")
+            print(f"No {self.attack_name} head sprite loaded, using fallback: {e}")
         try:
             body_sheet = pygame.image.load(
-                'assets/sprites/attacks/dragon_fist/dragon_fist_body.png'
+                f'assets/sprites/attacks/{self.attack_name}/dragon_fist_body.png'
             ).convert_alpha()
         except Exception as e:
-            print(f"No dragon_fist body sprite loaded, using fallback: {e}")
+            print(f"No {self.attack_name} body sprite loaded, using fallback: {e}")
         try:
             head_end_sheet = pygame.image.load(
-                'assets/sprites/attacks/dragon_fist/dragon_fist_head_end.png'
+                f'assets/sprites/attacks/{self.attack_name}/dragon_fist_head_end.png'
             ).convert_alpha()
         except Exception as e:
-            print(f"No dragon_fist_head_end sprite loaded, using fallback: {e}")
+            print(f"No {self.attack_name}_head_end sprite loaded, using fallback: {e}")
         try:
             destruction_sheet = pygame.image.load(
-                'assets/objects/brown_destruction.png'
+                f'assets/objects/{self.destruction_asset}.png'
             ).convert_alpha()
         except Exception as e:
-            print(f"No brown_destruction sprite loaded, using fallback: {e}")
+            print(f"No {self.destruction_asset} sprite loaded, using fallback: {e}")
 
         head = self._pick_head_frame(head_sheet) if head_sheet else None
         body = self._pick_body_frame(body_sheet) if body_sheet else None

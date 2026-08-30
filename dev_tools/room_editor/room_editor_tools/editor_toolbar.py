@@ -15,20 +15,11 @@ class EditorToolbar:
     and quick-action buttons (zoom, test, save) on the right side.
     The toolbar can be hidden/shown via the toggle tab at its bottom edge.
 
-    Background panel
-    ----------------
-    Clicking the 'Background' tool button opens a floating panel that lets
-    the designer pick an image from assets/bg and set scroll speed + parallax.
-    The panel communicates back via handle_click() returning 'bg_apply',
-    after which the caller should read toolbar.get_bg_settings() and apply
-    the result to room.scrolling_bg.
-
-    Callers must also:
-      • call toolbar.handle_mousedown(pos) on MOUSEBUTTONDOWN
-      • call toolbar.handle_mouseup()      on MOUSEBUTTONUP
-      • call toolbar.handle_mousemotion(pos) on MOUSEMOTION
-      • call toolbar.handle_scroll(direction) on scroll-wheel events
-      • call toolbar.sync_from_room(room.scrolling_bg) when the active room changes
+    Weather and Background used to live here as toolbar tools/panels; both
+    moved into the Room edit view's Settings section (see room_editor.py's
+    RoomEditor._draw_edit_view / background sub-panel) so they're set
+    per-room alongside Room Music and Can Attack rather than as a global
+    toolbar mode.
 
     Item panel
     ----------
@@ -54,16 +45,6 @@ class EditorToolbar:
     both a ITEM_CATEGORY_LABELS entry and, if its sprites live in a
     subfolder, an ITEM_CATEGORY_SUBDIRS entry.
     """
-
-    # ── Background panel constants ────────────────────────────────────────────
-    BG_DIR       = os.path.join('assets', 'bg')
-    THUMB_SIZE   = 96
-    THUMB_PAD    = 10
-    THUMB_COLS   = 4
-    PANEL_W      = THUMB_COLS * (THUMB_SIZE + THUMB_PAD) + THUMB_PAD + 16
-    SLIDER_H     = 14
-    SLIDER_TRACK = 6
-    SCROLL_MAX   = 400.0   # ±px/s range for scroll_x and scroll_y
 
     # ── Item panel constants ────────────────────────────────────────────────
     ITEM_SPRITE_DIR = os.path.join('assets', 'sprites', 'items')
@@ -130,8 +111,6 @@ class EditorToolbar:
             {'id': 'entities',   'label': 'Entities',   'icon': self._create_entity_icon,     'tooltip': 'Add NPCs and enemies'},
             {'id': 'items',      'label': 'Items',      'icon': self._create_item_icon,       'tooltip': 'Place collectible items'},
             {'id': 'settings',   'label': 'Room',       'icon': self._create_settings_icon,   'tooltip': 'Room properties'},
-            {'id': 'weather',    'label': 'Weather',    'icon': self._create_weather_icon,    'tooltip': 'Add weather effects'},
-            {'id': 'background', 'label': 'Background', 'icon': self._create_background_icon, 'tooltip': 'Set scrolling background (assets/bg)'},
             {'id': 'map_paint',  'label': 'Map',         'icon': self._create_map_paint_icon,  'tooltip': 'Paint the Scouter minimap shape (F6)'},
         ]
 
@@ -171,24 +150,6 @@ class EditorToolbar:
         self._sprites: dict = {}
         self._load_sprites()
 
-        # ── Background panel state ────────────────────────────────────────────
-        self.bg_panel_open    = False
-        self._bg_files:  list = []
-        self._bg_thumbs: dict = {}          # fname → Surface | None
-        self._bg_scroll       = 0           # vertical scroll offset in the grid
-        self._bg_selected     = ''          # chosen filename ('' = none)
-        self._bg_hover        = ''
-        self._bg_scroll_x     = 0.0
-        self._bg_scroll_y     = 0.0
-        self._bg_parallax     = 0.5
-        self._bg_drag_slider  = None        # 'scroll_x' | 'scroll_y' | 'parallax' | None
-        self._bg_panel_rect   = pygame.Rect(0, 0, 0, 0)
-        self._bg_grid_rect    = pygame.Rect(0, 0, 0, 0)
-        self._bg_thumb_rects: dict  = {}
-        self._bg_slider_rects: dict = {}
-        self._bg_clear_rect   = pygame.Rect(0, 0, 0, 0)
-        self._bg_scan_done    = False
-
         # ── Item panel state ───────────────────────────────────────────────────
         self.item_panel_open  = False
         self._item_sections:  list = []   # [(label, [item_id, ...]), ...]
@@ -204,24 +165,6 @@ class EditorToolbar:
     # =========================================================================
     # Public API
     # =========================================================================
-
-    def sync_from_room(self, scrolling_bg: dict):
-        """Call whenever the active room changes to mirror its bg settings."""
-        bg = scrolling_bg or {}
-        self._bg_selected = bg.get('image', '')
-        self._bg_scroll_x = float(bg.get('scroll_x', 0.0))
-        self._bg_scroll_y = float(bg.get('scroll_y', 0.0))
-        self._bg_parallax = float(bg.get('parallax', 0.5))
-
-    def get_bg_settings(self) -> dict:
-        """Return current bg settings ready to assign to room.scrolling_bg."""
-        result: dict = {}
-        if self._bg_selected:
-            result['image'] = self._bg_selected
-        result['scroll_x'] = self._bg_scroll_x
-        result['scroll_y'] = self._bg_scroll_y
-        result['parallax'] = self._bg_parallax
-        return result
 
     def get_selected_item_id(self) -> str:
         """The item id currently armed via the Items panel, or '' if none.
@@ -298,14 +241,6 @@ class EditorToolbar:
             else:
                 self.tool_hover_anim[ai] = max(0.0, self.tool_hover_anim[ai] - dt * 8)
 
-        # Hover detection inside bg panel
-        if self.bg_panel_open:
-            self._bg_hover = ''
-            for fname, rect in self._bg_thumb_rects.items():
-                if rect.collidepoint(mouse_pos):
-                    self._bg_hover = fname
-                    break
-
         # Hover detection inside item panel
         if self.item_panel_open:
             self._item_hover = ''
@@ -315,24 +250,12 @@ class EditorToolbar:
                     break
 
     def handle_click(self, mouse_pos) -> "str | None":
-        """
-        Returns a token string or None.
-        'bg_apply' means get_bg_settings() has new data ready to write to the room.
-        """
+        """Returns a token string or None."""
         if self._toggle_rect().collidepoint(mouse_pos):
             self.visible = not self.visible
             return 'toolbar_toggle'
 
         if not self.visible:
-            return None
-
-        # Background panel intercepts all clicks when open
-        if self.bg_panel_open:
-            result = self._handle_bg_panel_click(mouse_pos)
-            if result is not None:
-                return result
-            if not self._bg_panel_rect.collidepoint(mouse_pos):
-                self.bg_panel_open = False
             return None
 
         # Item panel intercepts all clicks when open. Clicking a thumbnail
@@ -363,14 +286,7 @@ class EditorToolbar:
             r = pygame.Rect(tool_start_x + i * (self.tool_size + self.tool_spacing),
                             self.padding, self.tool_size, self.tool_size)
             if r.collidepoint(mouse_pos):
-                if tool['id'] == 'background':
-                    self.item_panel_open = False
-                    self.bg_panel_open = not self.bg_panel_open
-                    if self.bg_panel_open:
-                        self._ensure_bg_scanned()
-                    return 'background_toggle'
                 if tool['id'] == 'items':
-                    self.bg_panel_open = False
                     self.item_panel_open = not self.item_panel_open
                     if self.item_panel_open:
                         self._ensure_items_scanned()
@@ -394,45 +310,8 @@ class EditorToolbar:
 
         return None
 
-    def handle_mousedown(self, mouse_pos) -> "str | None":
-        """Call on MOUSEBUTTONDOWN — starts slider drags.
-
-        Returns 'bg_apply' when a slider drag begins, mirroring handle_click()'s
-        protocol, so the caller knows to copy get_bg_settings() onto the room
-        right away rather than waiting for a thumbnail/clear click that may
-        never come.
-        """
-        if not self.bg_panel_open:
-            return None
-        for key, track in self._bg_slider_rects.items():
-            if track.collidepoint(mouse_pos):
-                self._bg_drag_slider = key
-                self._apply_slider_drag(key, mouse_pos[0], track)
-                return 'bg_apply'
-        return None
-
-    def handle_mouseup(self):
-        """Call on MOUSEBUTTONUP — ends slider drags."""
-        self._bg_drag_slider = None
-
-    def handle_mousemotion(self, mouse_pos) -> "str | None":
-        """Call on MOUSEMOTION — updates slider values while dragging.
-
-        Returns 'bg_apply' while a slider is actively being dragged so the
-        caller can keep the room's scrolling_bg in sync live, not just at
-        drag-start.
-        """
-        if self._bg_drag_slider and self._bg_drag_slider in self._bg_slider_rects:
-            self._apply_slider_drag(self._bg_drag_slider, mouse_pos[0],
-                                    self._bg_slider_rects[self._bg_drag_slider])
-            return 'bg_apply'
-        return None
-
     def handle_scroll(self, direction):
         """Call on scroll-wheel events (direction +1 = up, -1 = down)."""
-        if (self.bg_panel_open
-                and self._bg_grid_rect.collidepoint(pygame.mouse.get_pos())):
-            self._bg_scroll = max(0, self._bg_scroll - direction * 80)
         if (self.item_panel_open
                 and self._item_grid_rect.collidepoint(pygame.mouse.get_pos())):
             self._item_scroll = max(0, self._item_scroll - direction * 80)
@@ -473,249 +352,9 @@ class EditorToolbar:
                    else action['tooltip']) if action['id'] == 'zoom' else action['tooltip']
             self._draw_tooltip(screen, tip)
 
-        # Background panel (always on top)
-        if self.bg_panel_open:
-            self._draw_bg_panel(screen)
-
         # Item panel (always on top)
         if self.item_panel_open:
             self._draw_item_panel(screen)
-
-    # =========================================================================
-    # Background panel — internal
-    # =========================================================================
-
-    def _ensure_bg_scanned(self):
-        if self._bg_scan_done:
-            return
-        self._bg_scan_done = True
-        try:
-            self._bg_files = sorted(
-                f for f in os.listdir(self.BG_DIR)
-                if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))
-            )
-        except OSError:
-            self._bg_files = []
-
-    def _load_thumb(self, fname):
-        if fname in self._bg_thumbs:
-            return self._bg_thumbs[fname]
-        try:
-            img = pygame.image.load(os.path.join(self.BG_DIR, fname)).convert()
-            iw, ih = img.get_size()
-            scale = min(self.THUMB_SIZE / iw, self.THUMB_SIZE / ih)
-            self._bg_thumbs[fname] = pygame.transform.scale(
-                img, (max(1, int(iw * scale)), max(1, int(ih * scale))))
-        except Exception:
-            self._bg_thumbs[fname] = None
-        return self._bg_thumbs[fname]
-
-    def _apply_slider_drag(self, key, mouse_x, track):
-        t = max(0.0, min(1.0, (mouse_x - track.x) / max(1, track.width)))
-        if key == 'scroll_x':
-            self._bg_scroll_x = round((t * 2 - 1) * self.SCROLL_MAX, 1)
-        elif key == 'scroll_y':
-            self._bg_scroll_y = round((t * 2 - 1) * self.SCROLL_MAX, 1)
-        elif key == 'parallax':
-            self._bg_parallax = round(t, 2)
-
-    def _handle_bg_panel_click(self, mouse_pos) -> "str | None":
-        # Thumbnail picks
-        for fname, rect in self._bg_thumb_rects.items():
-            if rect.collidepoint(mouse_pos):
-                # Toggle: clicking the already-selected image deselects it
-                self._bg_selected = '' if self._bg_selected == fname else fname
-                return 'bg_apply'
-        # Clear button
-        if self._bg_clear_rect.collidepoint(mouse_pos):
-            self._bg_selected = ''
-            self._bg_scroll_x = 0.0
-            self._bg_scroll_y = 0.0
-            self._bg_parallax = 0.5
-            return 'bg_apply'
-        return None
-
-    def _draw_bg_panel(self, screen):
-        SW, SH   = screen.get_size()
-        PANEL_H  = SH - self.height - 20
-        PX = (SW - self.PANEL_W) // 2
-        PY = self.height + 10
-
-        self._bg_panel_rect = pygame.Rect(PX, PY, self.PANEL_W, PANEL_H)
-
-        # Drop shadow
-        shadow = pygame.Surface((self.PANEL_W + 8, PANEL_H + 8), pygame.SRCALPHA)
-        shadow.fill((0, 0, 0, 90))
-        screen.blit(shadow, (PX - 4, PY - 4))
-
-        # Panel body
-        pygame.draw.rect(screen, self.colors['panel'],
-                         self._bg_panel_rect, border_radius=8)
-        pygame.draw.rect(screen, self.colors['accent'],
-                         self._bg_panel_rect, 2, border_radius=8)
-
-        # Title + current selection
-        title_s = self.font_large.render('Scrolling Background', True, self.colors['accent'])
-        screen.blit(title_s, (PX + 12, PY + 10))
-
-        sel_name = os.path.splitext(self._bg_selected)[0] if self._bg_selected else 'None'
-        sel_col  = self.colors['text'] if self._bg_selected else self.colors['text_dim']
-        sel_s    = self.font_medium.render(f'Selected: {sel_name}', True, sel_col)
-        screen.blit(sel_s, (PX + 12, PY + 36))
-
-        # ── Sliders ───────────────────────────────────────────────────────────
-        inner_w = self.PANEL_W - 24
-        sy = PY + 62
-        self._bg_slider_rects = {}
-
-        sx_t = (self._bg_scroll_x / self.SCROLL_MAX + 1) / 2
-        self._draw_slider(screen, PX + 12, sy, inner_w,
-                          'scroll_x', 'Scroll X', sx_t,
-                          f'{self._bg_scroll_x:+.0f} px/s')
-        sy += self.SLIDER_H + 24
-
-        sy_t = (self._bg_scroll_y / self.SCROLL_MAX + 1) / 2
-        self._draw_slider(screen, PX + 12, sy, inner_w,
-                          'scroll_y', 'Scroll Y', sy_t,
-                          f'{self._bg_scroll_y:+.0f} px/s')
-        sy += self.SLIDER_H + 24
-
-        self._draw_slider(screen, PX + 12, sy, inner_w,
-                          'parallax', 'Parallax', self._bg_parallax,
-                          f'{self._bg_parallax:.2f}')
-        sy += self.SLIDER_H + 20
-
-        hint = self.font_small.render(
-            '0 = fixed on screen  ·  0.5 = half camera  ·  1 = moves with camera',
-            True, self.colors['text_dim'])
-        screen.blit(hint, (PX + 12, sy))
-        sy += 20
-
-        # ── Clear button ──────────────────────────────────────────────────────
-        sy += 4
-        clr_rect = pygame.Rect(PX + 12, sy, inner_w, 26)
-        mx, my   = pygame.mouse.get_pos()
-        clr_hov  = clr_rect.collidepoint(mx, my)
-        pygame.draw.rect(screen, (130, 40, 40) if clr_hov else (70, 25, 25),
-                         clr_rect, border_radius=4)
-        pygame.draw.rect(screen, self.colors['danger'], clr_rect, 1, border_radius=4)
-        clr_s = self.font_medium.render('Clear Background', True, self.colors['danger'])
-        screen.blit(clr_s, clr_s.get_rect(center=clr_rect.center))
-        self._bg_clear_rect = clr_rect
-        sy += 34
-
-        # ── Divider ───────────────────────────────────────────────────────────
-        pygame.draw.line(screen, self.colors['panel_border'],
-                         (PX + 8, sy), (PX + self.PANEL_W - 8, sy))
-        sy += 8
-
-        # ── Thumbnail grid ────────────────────────────────────────────────────
-        grid_rect = pygame.Rect(PX, sy, self.PANEL_W, PY + PANEL_H - sy - 8)
-        self._bg_grid_rect = grid_rect
-        old_clip = screen.get_clip()
-        screen.set_clip(grid_rect)
-
-        self._bg_thumb_rects = {}
-        col = row = 0
-        total_rows = max(1, (len(self._bg_files) + self.THUMB_COLS - 1) // self.THUMB_COLS)
-        row_h      = self.THUMB_SIZE + self.THUMB_PAD
-        max_scroll = max(0, total_rows * row_h - grid_rect.height)
-        self._bg_scroll = min(self._bg_scroll, max_scroll)
-
-        if not self._bg_files:
-            no_s = self.font_medium.render('No images found in assets/bg',
-                                           True, self.colors['text_dim'])
-            screen.blit(no_s, (PX + 12, sy + 12))
-        else:
-            for fname in self._bg_files:
-                cx = PX + self.THUMB_PAD + col * row_h
-                cy = sy + self.THUMB_PAD + row * row_h - self._bg_scroll
-                cell = pygame.Rect(cx, cy, self.THUMB_SIZE, self.THUMB_SIZE)
-                self._bg_thumb_rects[fname] = cell
-
-                is_sel = fname == self._bg_selected
-                is_hov = fname == self._bg_hover
-                border = (self.colors['accent'] if is_sel else
-                          self.colors['text']   if is_hov else
-                          self.colors['panel_border'])
-                bw = 2 if (is_sel or is_hov) else 1
-
-                pygame.draw.rect(screen, (18, 18, 32), cell, border_radius=4)
-                pygame.draw.rect(screen, border, cell, bw, border_radius=4)
-
-                thumb = self._load_thumb(fname)
-                if thumb:
-                    screen.blit(thumb, thumb.get_rect(center=cell.center))
-                else:
-                    q = self.font_medium.render('?', True, self.colors['text_dim'])
-                    screen.blit(q, q.get_rect(center=cell.center))
-
-                # Filename strip
-                lbl = self.font_small.render(
-                    os.path.splitext(fname)[0], True,
-                    self.colors['accent'] if is_sel else self.colors['text_dim'])
-                screen.blit(lbl, (cell.x + 2, cell.bottom - 14))
-
-                if is_sel:
-                    chk = self.font_medium.render('✓', True, self.colors['accent'])
-                    screen.blit(chk, (cell.right - 18, cell.top + 2))
-
-                col += 1
-                if col >= self.THUMB_COLS:
-                    col = 0
-                    row += 1
-
-        screen.set_clip(old_clip)
-
-        # Scroll indicator dots on right edge
-        if max_scroll > 0:
-            n   = min(8, total_rows)
-            dot_x = PX + self.PANEL_W - 6
-            for d in range(n):
-                dot_y  = grid_rect.top + int(grid_rect.height * d / max(1, n - 1))
-                ratio  = self._bg_scroll / max(1, max_scroll)
-                active = abs(d / max(1, n - 1) - ratio) < 0.15
-                pygame.gfxdraw.filled_circle(
-                    screen, dot_x, dot_y, 3,
-                    self.colors['accent'] if active else self.colors['panel_border'])
-
-    def _draw_slider(self, screen, x, y, width, key, label, value, display):
-        """Horizontal slider with label, value readout, and thumb."""
-        lbl_s = self.font_small.render(label, True, self.colors['text_dim'])
-        screen.blit(lbl_s, (x, y))
-
-        val_s = self.font_small.render(display, True, self.colors['text'])
-        screen.blit(val_s, (x + width - val_s.get_width(), y))
-
-        track_y = y + self.SLIDER_H + 2
-        track   = pygame.Rect(x, track_y, width, self.SLIDER_TRACK)
-        pygame.draw.rect(screen, self.colors['slider_track'], track, border_radius=3)
-
-        fill_w = max(0, int(value * width))
-        if fill_w:
-            pygame.draw.rect(screen, self.colors['slider_fill'],
-                             pygame.Rect(x, track_y, fill_w, self.SLIDER_TRACK),
-                             border_radius=3)
-
-        thumb_x = x + int(value * width)
-        thumb_cy = track_y + self.SLIDER_TRACK // 2
-        THUMB_R  = 7
-        mx, my   = pygame.mouse.get_pos()
-        dragging = self._bg_drag_slider == key
-        hovered  = (abs(mx - thumb_x) <= THUMB_R + 3
-                    and abs(my - thumb_cy) <= THUMB_R + 3)
-        tcol = self.colors['accent'] if (dragging or hovered) else self.colors['text']
-        pygame.gfxdraw.filled_circle(screen, thumb_x, thumb_cy, THUMB_R, tcol)
-        pygame.gfxdraw.aacircle(screen, thumb_x, thumb_cy, THUMB_R,
-                                 self.colors['panel_border'])
-
-        # Centre tick mark for scroll sliders (zero point)
-        if key in ('scroll_x', 'scroll_y'):
-            mid_x = x + width // 2
-            pygame.draw.line(screen, self.colors['panel_border'],
-                             (mid_x, track_y - 3), (mid_x, track_y + self.SLIDER_TRACK + 3), 1)
-
-        self._bg_slider_rects[key] = track
 
     # =========================================================================
     # Item panel — internal
@@ -912,14 +551,9 @@ class EditorToolbar:
         else:
             bg_col, bdr_col, bdr_w = self.colors['tool_bg'], self.colors['tool_border'], 1
 
-        # Background-tool button glows when a background is active
-        if tool['id'] == 'background' and self._bg_selected:
-            bdr_col = self.colors['accent']
-            bdr_w   = max(bdr_w, 2)
-
-        # Items-tool button glows when an item is armed for placement, same
-        # convention as the background button above — visible even with the
-        # panel closed, since the selection persists after it auto-closes.
+        # Items-tool button glows when an item is armed for placement —
+        # visible even with the panel closed, since the selection persists
+        # after it auto-closes.
         if tool['id'] == 'items' and self.selected_item_id:
             bdr_col = self.colors['accent']
             bdr_w   = max(bdr_w, 2)
@@ -1064,35 +698,6 @@ class EditorToolbar:
             pygame.draw.line(surf, (180, 180, 200), (x1, y1), (x2, y2), 3)
         pygame.gfxdraw.filled_circle(surf, center, center, inner_r, (100, 100, 120))
         pygame.gfxdraw.aacircle(surf, center, center, inner_r, (150, 150, 170))
-        return surf
-
-    def _create_weather_icon(self):
-        surf = pygame.Surface((32, 32), pygame.SRCALPHA)
-        pygame.gfxdraw.filled_circle(surf, 12, 10, 6, (200, 200, 220))
-        pygame.gfxdraw.filled_circle(surf, 18, 10, 6, (200, 200, 220))
-        pygame.gfxdraw.filled_circle(surf, 15,  8, 5, (200, 200, 220))
-        for rx in [10, 16, 22]:
-            pygame.draw.line(surf, (100, 150, 255), (rx, 18), (rx, 26), 2)
-        return surf
-
-    def _create_background_icon(self):
-        """Layered landscape silhouette suggesting a scrolling sky/ground BG."""
-        surf = pygame.Surface((32, 32), pygame.SRCALPHA)
-        # Sky gradient — three bands
-        pygame.draw.rect(surf, (40,  80, 160), (0, 0, 32, 10))
-        pygame.draw.rect(surf, (70, 120, 200), (0, 10, 32, 8))
-        # Ground band
-        pygame.draw.rect(surf, (40, 100,  40), (0, 18, 32, 14))
-        # Hills as circles
-        pygame.gfxdraw.filled_circle(surf,  8, 20, 9, (30, 80, 30))
-        pygame.gfxdraw.filled_circle(surf, 22, 22, 7, (30, 80, 30))
-        # Two scroll arrows to hint motion
-        pygame.draw.line(surf, (255, 255, 255), (2, 6), (8,  6), 2)
-        pygame.draw.line(surf, (255, 255, 255), (2, 6), (4,  4), 2)
-        pygame.draw.line(surf, (255, 255, 255), (2, 6), (4,  8), 2)
-        pygame.draw.line(surf, (255, 255, 255), (24, 6), (30, 6), 2)
-        pygame.draw.line(surf, (255, 255, 255), (30, 6), (28, 4), 2)
-        pygame.draw.line(surf, (255, 255, 255), (30, 6), (28, 8), 2)
         return surf
 
     def _create_map_paint_icon(self):

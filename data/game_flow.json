@@ -1,0 +1,14 @@
+{
+  "title_text": "",
+  "intro_cutscene": "1",
+  "main_menu": {
+    "background": "assets/ui/title/main_bg.png",
+    "music": "Opening (Yannis Brown)",
+    "intro_images": [
+      "assets/ui/title/boot_1.png",
+      "assets/ui/title/boot_2.png",
+      "assets/ui/title/boot_3.png",
+      "assets/ui/title/boot_4.png"
+    ]
+  }
+}

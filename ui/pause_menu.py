@@ -276,6 +276,12 @@ class PauseMenu:
         # you're actually playing as.
         self._viewed_char_id    = None
         self.char_name_sprites  = {}
+        # Status page name-tag row: which index into the roster list the
+        # row is scrolled to, plus press-feedback timers for the left/
+        # right scroll arrows — mirrors scroll_up_timer/scroll_down_timer.
+        self._status_char_scroll       = 0
+        self.status_scroll_left_timer  = 0.0
+        self.status_scroll_right_timer = 0.0
 
         self._load_ui_sprites()
 
@@ -385,6 +391,14 @@ class PauseMenu:
         self.arrow_down         = _img('assets/ui/buttons/arrow_down.png')
         self.arrow_down_pressed = _img('assets/ui/buttons/arrow_down_pressed.png')
         self.arrow_down_grey    = _img('assets/ui/buttons/arrow_down_greyed.png')
+
+        # Left/right scroll arrows for the Status page's name-tag row.
+        self.status_arrow_right        = _img('assets/ui/buttons/arrow_right.png')
+        self.status_arrow_right_pressed = _img('assets/ui/buttons/arrow_right_pressed.png')
+        self.status_arrow_right_grey    = _img('assets/ui/buttons/arrow_right_greyed.png')
+        self.status_arrow_left          = _img('assets/ui/buttons/arrow_left.png')
+        self.status_arrow_left_pressed  = _img('assets/ui/buttons/arrow_left_pressed.png')
+        self.status_arrow_left_grey     = _img('assets/ui/buttons/arrow_left_greyed.png')
 
         self.inv_scroll_offset    = 0
         self.inv_scroll_max       = 0
@@ -517,6 +531,9 @@ class PauseMenu:
         self._item_feedback_timer = 0.0
         self.scroll_up_timer     = 0.0
         self.scroll_down_timer   = 0.0
+        self._status_char_scroll       = 0
+        self.status_scroll_left_timer  = 0.0
+        self.status_scroll_right_timer = 0.0
         self.allocating_stats    = False
         self.stat_alloc_index    = 0
         self._session_stat_alloc = {lbl: 0 for lbl in STAT_ALLOC_LABELS}
@@ -910,6 +927,8 @@ class PauseMenu:
                     self.popup_button_states[btn] = False
         self.scroll_up_timer   = max(0.0, self.scroll_up_timer   - dt)
         self.scroll_down_timer = max(0.0, self.scroll_down_timer - dt)
+        self.status_scroll_left_timer  = max(0.0, self.status_scroll_left_timer  - dt)
+        self.status_scroll_right_timer = max(0.0, self.status_scroll_right_timer - dt)
 
     # ── Input ─────────────────────────────────────────────────────────────────
 
@@ -1278,6 +1297,18 @@ class PauseMenu:
                     self._viewed_char_id = cid
                     self._play_switch_sfx()
                     return None
+
+            roster_count = len(self._name_sprites)
+            if _hit('status_scroll_left'):
+                if self._status_char_scroll > 0:
+                    self._status_char_scroll -= 1
+                    self.status_scroll_left_timer = self.scroll_press_duration
+                return None
+            if _hit('status_scroll_right'):
+                if self._status_char_scroll < roster_count - 1:
+                    self._status_char_scroll += 1
+                    self.status_scroll_right_timer = self.scroll_press_duration
+                return None
 
         if self.tab_index == 2:
             if self.equip_browsing_items:
@@ -2143,15 +2174,94 @@ class PauseMenu:
         num_surf  = _tint(self.bold_numbers_font.render(str(level)), (255,0,0))
 
         if self._name_sprites:
-            tag_h=max(16,int(h*0.08)); gap=max(2,int(self.screen_width*0.003)); tx,ty=x-6,y-3
-            for cid,surfs in self._name_sprites.items():
-                surf=surfs['selected'] if cid==char_id else surfs['unselected']
-                if surf:
-                    s=max(1,round(tag_h/surf.get_height()))
-                    scaled=pygame.transform.scale(surf,(surf.get_width()*s,surf.get_height()*s))
-                    screen.blit(scaled,(tx,ty))
-                    self._click_zones[f'name_tag_{cid}'] = pygame.Rect(tx,ty,scaled.get_width(),scaled.get_height())
-                    tx+=scaled.get_width()+gap
+            tag_h=max(16,int(h*0.08)); gap=max(2,int(self.screen_width*0.01)); ty=y-3
+            row_left  = x + 2
+            row_right = x+w-13
+
+            roster    = list(self._name_sprites.keys())
+            max_scroll = max(0, len(roster)-1)
+            self._status_char_scroll = max(0, min(self._status_char_scroll, max_scroll))
+
+            # Left/right scroll arrows only appear once there's more than
+            # one character to show — a single character never needs them.
+            show_arrows = len(roster) > 1 and self.status_arrow_left and self.status_arrow_right
+
+            # Now using the dedicated arrow_left/arrow_right sprites (correctly
+            # oriented, not rotated), so scale to a target height like the
+            # other menus' scroll arrows.
+            # arrow_h controls just the arrows' size — bump the multiplier
+            # (currently 1.3x tag_h) to make them bigger/smaller without
+            # affecting the name-tag sprites, which stay sized to tag_h.
+            arrow_h = int(tag_h * 1.2)
+            def _scale_to_h(img, target_h):
+                sf = target_h / img.get_height()
+                return pygame.transform.scale(img,(max(1,int(img.get_width()*sf)),target_h))
+
+            tags_left  = row_left
+            tags_right = row_right
+
+            left_scaled = None
+            if show_arrows:
+                left_img = (self.status_arrow_left_pressed if self.status_scroll_left_timer > 0
+                            else (self.status_arrow_left if self._status_char_scroll > 0 else self.status_arrow_left_grey))
+                left_scaled = _scale_to_h(left_img, arrow_h)
+                tags_left = row_left + left_scaled.get_width() + gap
+
+            right_ref_w = 0
+            if show_arrows:
+                right_ref_w = _scale_to_h(self.status_arrow_right, arrow_h).get_width()
+                tags_right = row_right - right_ref_w - gap
+
+            # Build the run of name tags that fit between the arrows without
+            # overlapping them, starting from the current scroll index —
+            # this is what decides how many names are shown at once. The
+            # available span is tags_left→tags_right (bounded by the arrows,
+            # or the full row if there aren't any); a name that would run
+            # past that span isn't drawn at all — it stays hidden until the
+            # user scrolls to it, rather than spilling over or getting
+            # clipped. The lone exception is a single name wider than the
+            # whole span: it's kept so something is never left blank.
+            avail_w = max(0, tags_right - tags_left)
+            visible = []
+            total_w = 0
+            for cid in roster[self._status_char_scroll:]:
+                surfs = self._name_sprites[cid]
+                surf  = surfs['selected'] if cid==char_id else surfs['unselected']
+                if not surf:
+                    continue
+                s  = max(1,round(tag_h/surf.get_height()))
+                tw = surf.get_width()*s
+                added_w = tw if not visible else total_w+gap+tw
+                if visible and added_w > avail_w:
+                    break
+                visible.append((cid,surf,s,tw))
+                total_w = added_w
+
+            # Center the visible run of names within the available span
+            # (between the arrows, if shown) rather than hugging the left.
+            start_x = tags_left + max(0, (avail_w - total_w)//2)
+
+            if show_arrows:
+                left_y = ty + (tag_h - left_scaled.get_height()) // 2
+                screen.blit(left_scaled,(row_left,left_y))
+                self._click_zones['status_scroll_left'] = pygame.Rect(row_left-4,left_y-4,left_scaled.get_width()+8,left_scaled.get_height()+8)
+
+            tx = start_x
+            for cid,surf,s,tw in visible:
+                scaled=pygame.transform.scale(surf,(surf.get_width()*s,surf.get_height()*s))
+                screen.blit(scaled,(tx,ty))
+                self._click_zones[f'name_tag_{cid}'] = pygame.Rect(tx,ty,scaled.get_width(),scaled.get_height())
+                tx+=tw+gap
+
+            if show_arrows:
+                can_scroll_right = (self._status_char_scroll+len(visible)) < len(roster)
+                right_img = (self.status_arrow_right_pressed if self.status_scroll_right_timer > 0
+                             else (self.status_arrow_right if can_scroll_right else self.status_arrow_right_grey))
+                right_scaled = _scale_to_h(right_img, arrow_h)
+                right_x = row_right - right_scaled.get_width()
+                right_y = ty + (tag_h - right_scaled.get_height()) // 2
+                screen.blit(right_scaled,(right_x,right_y))
+                self._click_zones['status_scroll_right'] = pygame.Rect(right_x-4,right_y-4,right_scaled.get_width()+8,right_scaled.get_height()+8)
 
         name_y=y+49; gap_px=max(5,int(self.screen_width*0.005)); cx=x-6
         for surf in (name_surf,lvl_surf,num_surf):

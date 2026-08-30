@@ -27,7 +27,7 @@ import pygame
 from core.flag_manager import (
     flag_is, flag_is_not, variable_is,
     check_item, check_stat, check_character, check_zeni, check_resource, check_skill,
-    check_timer, check_boss_hp, check_bar,
+    check_timer, check_boss_hp, check_bar, check_room_kills,
 )
 from core.event_actions import ACTION_TYPES
 
@@ -542,6 +542,13 @@ def _unbuild_live(lookup_name, arg_index=None):
     return _unbuild
 
 
+def _unbuild_room_kills(cond):
+    if cond.get('type') == 'variable' and cond.get('name') == 'room_kill_count':
+        return {'cmp': cond.get('cmp', '=='),
+                'value': '' if cond.get('value') is None else str(cond.get('value'))}
+    return None
+
+
 def _unbuild_boss_hp(cond):
     """boss_hp is built from one of two live lookups (percent vs. raw
     value — see check_boss_hp's `mode` param), so it needs its own
@@ -626,6 +633,12 @@ CONDITION_KINDS = {
         'build': lambda p: check_bar(p.get('arg0', ''), p.get('cmp', '=='), _coerce(p.get('value'))),
         'unbuild': _unbuild_live('player_bar_percent', 0),
     },
+    'room_kills': {
+        'label': 'Enemies Killed (this room)',
+        'fields': [('cmp', 'cmp', None), ('value', 'text', None)],
+        'build': lambda p: check_room_kills(p.get('cmp', '>='), _coerce(p.get('value'))),
+        'unbuild': _unbuild_room_kills,
+    },
     'boss_hp': {
         'label': 'Boss HP',
         'fields': [('arg0', 'boss_picker', None), ('mode', 'choice', ['percent', 'value']),
@@ -636,7 +649,7 @@ CONDITION_KINDS = {
     },
 }
 
-_KIND_ORDER = ['flag', 'flag_not', 'variable', 'item', 'stat', 'character', 'zeni', 'resource', 'skill', 'timer', 'bar', 'boss_hp']
+_KIND_ORDER = ['flag', 'flag_not', 'variable', 'item', 'stat', 'character', 'zeni', 'resource', 'skill', 'timer', 'bar', 'room_kills', 'boss_hp']
 
 
 class ConditionBuilder:
@@ -1330,6 +1343,12 @@ ACTION_SCHEMA = {
                              ('value', 'text', None)],
     'world_map_location': [('mode', 'choice', ['add', 'remove']), ('map_name', 'world_map_picker', None),
                             ('name', 'wm_location_picker', None)],
+    # pad_id is the label shown on the pad itself in the dev-mode path
+    # preview overlay (objects/flying_pad.py auto-assigns one, like
+    # 'room_1_pad_1', when the pad is placed) — plain text field, same
+    # pattern as timer_id above, since pads aren't tied to a fixed catalogue
+    # the way skills/npcs/enemies are.
+    'toggle_flying_pad': [('pad_id', 'text', None), ('mode', 'choice', ['enable', 'disable'])],
 }
 
 # For action types whose schema pairs a 'set'/'stop' mode choice with a

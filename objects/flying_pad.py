@@ -39,7 +39,7 @@ class FlyingPadWaypoint:
 class FlyingPad(LayeredDrawMixin):
     """Flying pad object that transports player along a predefined path"""
 
-    def __init__(self, x: int, y: int, pad_type: str = 'stone'):
+    def __init__(self, x: int, y: int, pad_type: str = 'stone', pad_id: Optional[str] = None):
         LayeredDrawMixin.__init__(self, layer=DrawLayer.PLAYER, y_sort=False)
         self.x = x
         self.y = y
@@ -47,6 +47,13 @@ class FlyingPad(LayeredDrawMixin):
         self.height = 32
         self.pad_type = pad_type
         self.active = True
+
+        # Stable identifier so a trigger box action (e.g. 'toggle_flying_pad')
+        # can target this specific pad. Auto-assigned per-room by
+        # FlyingPadManager.add_pad() when left None, the same way trigger
+        # boxes get a box_id — see toggle_flying_pad in event_actions.py and
+        # Game._handle_toggle_flying_pad_action in game.py.
+        self.pad_id = pad_id
 
         # Path configuration
         self.waypoints: List[FlyingPadWaypoint] = []
@@ -253,6 +260,11 @@ class FlyingPad(LayeredDrawMixin):
     def draw_path_preview(self, screen: pygame.Surface, camera, render_scale: int = 2):
         """Draw the flight path in editor mode"""
         if len(self.waypoints) < 2:
+            # Still worth showing the pad_id even with no path yet, since
+            # that id is what you'd type into a trigger box's
+            # 'toggle_flying_pad' action to enable/disable this pad.
+            if self.pad_id:
+                self._draw_id_label(screen, camera, render_scale)
             return
 
         # If this is a return pad, show the reversed path
@@ -349,6 +361,9 @@ class FlyingPad(LayeredDrawMixin):
         else:
             pad_type_text = "FLYING PAD"
 
+        if self.pad_id:
+            pad_type_text += f"  [id: {self.pad_id}]"
+
         text_color = (255, 100, 255) if self.is_return_pad else (100, 200, 255)
         type_label = font.render(pad_type_text, True, text_color)
 
@@ -361,6 +376,20 @@ class FlyingPad(LayeredDrawMixin):
         bg_surf.fill((0, 0, 0, 200))
         screen.blit(bg_surf, bg_rect.topleft)
         screen.blit(type_label, type_rect)
+
+    def _draw_id_label(self, screen: pygame.Surface, camera, render_scale: int = 2):
+        """Small standalone pad_id tag, used when there's no path yet to
+        piggyback the label onto (see draw_path_preview)."""
+        font = pygame.font.Font(None, 18)
+        text = font.render(f"[id: {self.pad_id}]", True, (100, 200, 255))
+        x = (self.x * render_scale) - camera.x
+        y = (self.y * render_scale) - camera.y - 30
+        rect = text.get_rect(center=(x, y))
+        bg_rect = rect.inflate(8, 4)
+        bg_surf = pygame.Surface((bg_rect.width, bg_rect.height), pygame.SRCALPHA)
+        bg_surf.fill((0, 0, 0, 200))
+        screen.blit(bg_surf, bg_rect.topleft)
+        screen.blit(text, rect)
 
     def to_dict(self) -> dict:
         """Serialize for saving"""
@@ -375,7 +404,8 @@ class FlyingPad(LayeredDrawMixin):
             'is_return_pad': self.is_return_pad,
             'linked_pad_id': self.linked_pad_id,
             'source_room': self.source_room,
-            'current_room': self.current_room
+            'current_room': self.current_room,
+            'pad_id': self.pad_id
         }
 
     @staticmethod
@@ -393,6 +423,7 @@ class FlyingPad(LayeredDrawMixin):
         pad.linked_pad_id = data.get('linked_pad_id')
         pad.source_room = data.get('source_room', '')
         pad.current_room = data.get('current_room', '')
+        pad.pad_id = data.get('pad_id')
         return pad
 
 
@@ -412,6 +443,22 @@ class FlyingPadManager:
             self.flying_pads[room_name] = []
         # Set the current_room field when adding
         pad.current_room = room_name
+
+        # Auto-assign a stable, room-scoped pad_id if the pad doesn't
+        # already have one (e.g. hand-set via from_dict/save data). This is
+        # what a trigger box's 'toggle_flying_pad' action targets — see
+        # event_actions.py / Game._handle_toggle_flying_pad_action. Numbered
+        # rather than random so ids stay short and readable in the dev-mode
+        # path preview label.
+        if not pad.pad_id:
+            existing_ids = {p.pad_id for p in self.flying_pads[room_name] if p.pad_id}
+            n = 1
+            candidate = f"{room_name}_pad_{n}"
+            while candidate in existing_ids:
+                n += 1
+                candidate = f"{room_name}_pad_{n}"
+            pad.pad_id = candidate
+
         self.flying_pads[room_name].append(pad)
 
     def remove_pad(self, room_name: str, pad: FlyingPad):

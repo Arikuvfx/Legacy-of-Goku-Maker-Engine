@@ -77,11 +77,24 @@ class GenkidamaChargeEffect:
     ORB_SPAWN_RADIUS = 70       # world units — orbs start this far out
     ORB_SPEED = 90              # world units / second, inward drift speed
 
-    def __init__(self, player, scale=_RENDER_SCALE):
+    def __init__(self, player, scale=_RENDER_SCALE, attack_name='genkidama',
+                 direction_offsets=None, state_advance_times=None,
+                 pulse_duration=None, orb_spawn_interval=None,
+                 orb_spawn_radius=None, orb_speed=None):
         self.player = player
         self.scale = scale
         self.active = True
         self.y_sort = False
+
+        # NOTE ON PARAMETERIZATION: attack_name and the five *_None kwargs
+        # below are new, optional overrides added so this whole attack can
+        # be driven from data (see attacks/attack_config.py's "genkidama"
+        # archetype and dev_tools/attack_creator.py). Every one of them
+        # defaults to exactly the value that used to be hardcoded, so an
+        # existing call site (`GenkidamaChargeEffect(player)`) behaves
+        # identically to before — same additive convention
+        # burning_attack.py already uses on top of Projectile.
+        self.attack_name = attack_name
 
         self.state = 1
         self.hold_time = 0.0
@@ -92,10 +105,22 @@ class GenkidamaChargeEffect:
         self.orbs = []
         self.orb_spawn_timer = 0.0
 
+        # Instance copies of what used to be pure class attributes, so a
+        # caller can override any of them per-instance without touching
+        # the class defaults every other GenkidamaChargeEffect still uses.
+        self.STATE_ADVANCE_TIMES = (
+            list(state_advance_times) if state_advance_times is not None
+            else list(self.STATE_ADVANCE_TIMES)
+        )
+        self.PULSE_DURATION = pulse_duration if pulse_duration is not None else self.PULSE_DURATION
+        self.ORB_SPAWN_INTERVAL = orb_spawn_interval if orb_spawn_interval is not None else self.ORB_SPAWN_INTERVAL
+        self.ORB_SPAWN_RADIUS = orb_spawn_radius if orb_spawn_radius is not None else self.ORB_SPAWN_RADIUS
+        self.ORB_SPEED = orb_speed if orb_speed is not None else self.ORB_SPEED
+
         # Per-direction fine-tuning, in world units, same convention as
         # KamehamehaChargeEffect.direction_offsets — nudge the ball so it
         # sits in front of the player regardless of which way they're facing.
-        self.direction_offsets = {
+        self.direction_offsets = dict(direction_offsets) if direction_offsets is not None else {
             'down':  (0, -14),
             'left':  (0, -12),
             'right': (0, -12),
@@ -119,29 +144,45 @@ class GenkidamaChargeEffect:
         for i in range(1, self.NUM_STATES + 1):
             try:
                 sheet = pygame.image.load(
-                    f'assets/sprites/attacks/genkidama/state{i}.png'
+                    f'assets/sprites/attacks/{self.attack_name}/state{i}.png'
                 ).convert_alpha()
                 w = int(sheet.get_width() * self.scale)
                 h = int(sheet.get_height() * self.scale)
                 self.state_sprites_scaled.append(pygame.transform.scale(sheet, (w, h)))
             except Exception as e:
-                print(f"Error loading genkidama state{i} sprite: {e}")
+                print(f"Error loading {self.attack_name} state{i} sprite: {e}")
                 self.state_sprites_scaled.append(None)
 
         for name in ('charge1', 'charge2'):
             try:
                 sheet = pygame.image.load(
-                    f'assets/sprites/attacks/genkidama/{name}.png'
+                    f'assets/sprites/attacks/{self.attack_name}/{name}.png'
                 ).convert_alpha()
                 w = int(sheet.get_width() * self.scale)
                 h = int(sheet.get_height() * self.scale)
                 self.charge_sprites_scaled[name] = pygame.transform.scale(sheet, (w, h))
             except Exception as e:
-                print(f"Error loading genkidama {name} sprite: {e}")
+                print(f"Error loading {self.attack_name} {name} sprite: {e}")
                 self.charge_sprites_scaled[name] = None
 
     def get_sort_key(self):
         return (self.draw_layer, 0)
+
+    def get_total_duration(self):
+        """Interface parity with KamehamehaChargeEffect/BurningChargeEffect's
+        get_total_duration() (see their own docstrings) — generic charge-loop
+        drivers like dev_tools/attack_creator.py compare elapsed wall-clock
+        time against this to know when to auto-fire a fully-charged attack.
+
+        Genkidama has no such moment: per the class docstring, releasing the
+        charge key fires whatever state is CURRENT, at any point from state 1
+        onward — there's no "finished charging" to auto-fire into, you just
+        keep charging (capped at state 5) until you let go. Returning
+        infinity means that comparison never trips, so a generic driver
+        never auto-fires this attack out from under a held button — see
+        attacks/attack_config.py's GenkidamaAttackConfig.fires_on_release
+        for how release itself is wired to fire instead."""
+        return float('inf')
 
     def get_state_sprite(self, state):
         """Return the scaled Surface for the given 1-5 state, or None if it
@@ -247,16 +288,29 @@ class GenkidamaBlast:
 
     BASE_SPEED = 1  # matches Projectile.speed
 
-    def __init__(self, x, y, direction, state, sprite=None):
+    def __init__(self, x, y, direction, state, sprite=None, attack_name='genkidama',
+                 base_speed=None, state_stats=None):
         self.x = x
         self.y = y
         self.direction = direction
         self.state = max(1, min(state, 5))
         self.active = True
 
-        radius, speed_mult = self._STATE_STATS[self.state]
+        # NOTE ON PARAMETERIZATION: attack_name/base_speed/state_stats are
+        # new, optional kwargs (see attacks/attack_config.py's "genkidama"
+        # archetype) — each defaults to exactly what used to be hardcoded,
+        # so `GenkidamaBlast(x, y, direction, state, sprite=...)` behaves
+        # identically to before. attack_name is stored for identity/
+        # consistency with every other attack class's convention even
+        # though this class doesn't load its own art (see below); it isn't
+        # read anywhere internally.
+        self.attack_name = attack_name
+
+        stats = state_stats if state_stats is not None else self._STATE_STATS
+        radius, speed_mult = stats[self.state]
         self.radius = radius
-        self.speed = self.BASE_SPEED * speed_mult
+        speed_base = base_speed if base_speed is not None else self.BASE_SPEED
+        self.speed = speed_base * speed_mult
 
         # The already-scaled state sprite Surface, handed over from the
         # GenkidamaChargeEffect at the moment of release, so this class
@@ -319,13 +373,19 @@ class GenkidamaHitEffect:
     PLAY_COUNT = 2        # how many full passes through the strip before vanishing
     FRAME_DURATION = 0.06  # seconds per frame — tune for a snappier/slower flash
 
-    def __init__(self, x, y, scale=_RENDER_SCALE):
+    def __init__(self, x, y, scale=_RENDER_SCALE, attack_name='genkidama',
+                 play_count=None, frame_duration=None):
         self.x = x
         self.y = y
         self.scale = scale
         self.active = True
         self.y_sort = False
         self.draw_layer = DrawLayer.EFFECTS_FRONT
+
+        # Same additive-override convention as GenkidamaChargeEffect above.
+        self.attack_name = attack_name
+        self.PLAY_COUNT = play_count if play_count is not None else self.PLAY_COUNT
+        self.FRAME_DURATION = frame_duration if frame_duration is not None else self.FRAME_DURATION
 
         self.current_frame = 0
         self.frame_timer = 0.0
@@ -340,7 +400,7 @@ class GenkidamaHitEffect:
 
     def _load_sprite(self):
         try:
-            sheet = pygame.image.load('assets/sprites/attacks/genkidama/hit.png').convert_alpha()
+            sheet = pygame.image.load(f'assets/sprites/attacks/{self.attack_name}/hit.png').convert_alpha()
             # Frames assumed square, laid out left-to-right in a single row —
             # frame size is taken directly from the sheet's own height.
             frame_size = sheet.get_height()
@@ -353,7 +413,7 @@ class GenkidamaHitEffect:
             h = int(frame_size * self.scale)
             self.frames_scaled = [pygame.transform.scale(f, (w, h)) for f in raw_frames]
         except Exception as e:
-            print(f"Error loading genkidama hit sprite: {e}")
+            print(f"Error loading {self.attack_name} hit sprite: {e}")
             self.frames_scaled = []
 
     def get_sort_key(self):

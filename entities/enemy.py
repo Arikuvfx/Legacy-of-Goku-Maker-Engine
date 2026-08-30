@@ -199,6 +199,12 @@ class Enemy:
         self.width = 32
         self.height = 32
         self.shadow_size = 'small'  # 'small' or 'big' — override per enemy subclass if needed
+        # Ground shadow px width — character_creator.py's Shadow Size slider
+        # (8-96 step 4), same field BossEnemy already reads from its own cfg.
+        # Regular (non-boss) Enemy doesn't load its config itself, so this is
+        # just the fallback; game._spawn_room_entities overwrites it with the
+        # entity_creator-configured value right after construction.
+        self.shadow_width = self.width
         self.speed = 1
         self.hp = 1
         self.max_hp = 150
@@ -738,7 +744,8 @@ class Enemy:
 
             # Generic fallback for anything with a get_collision_rect() method
             elif hasattr(obstacle, 'get_collision_rect'):
-                if temp_rect.colliderect(obstacle.get_collision_rect()):
+                obstacle_rect = obstacle.get_collision_rect()
+                if obstacle_rect is not None and temp_rect.colliderect(obstacle_rect):
                     return True
 
         return False

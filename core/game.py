@@ -10,6 +10,64 @@ Main loop:      handle_events → update → draw → clock.tick(FPS)
 """
 
 import sys
+import os
+
+# ── Single-instance guard ────────────────────────────────────────────────────
+# Prevents the game (or the exported .exe) from being launched a second time
+# while one copy is already running. This matters because cleanup() on exit
+# flushes room/editor data to disk — with two copies open, whichever one
+# closes *last* silently overwrites whatever the other one had already saved,
+# which is exactly the "accidentally opened it twice and lost stuff" scenario.
+#
+# We claim a named OS-level lock as the very first thing the process does —
+# before pygame, before any subsystem — and bail out immediately if another
+# copy already holds it. This is a plain OS primitive (a named mutex on
+# Windows), not a Python-only trick, so it works identically whether this is
+# run as `python game.py` or as the PyInstaller-built .exe; packaging can't
+# strip it out.
+_SINGLE_INSTANCE_NAME = "Global\\DBZGame_SingleInstance_8f3a1c2d"
+
+def _enforce_single_instance():
+    if sys.platform == 'win32':
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        ERROR_ALREADY_EXISTS = 183
+        mutex = kernel32.CreateMutexW(None, False, _SINGLE_INSTANCE_NAME)
+        if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                "The game is already running.\n\nClose the other window "
+                "before opening a new one — running two copies at once can "
+                "overwrite your saved room/editor data.",
+                "Already Running",
+                0x30,  # MB_ICONWARNING | MB_OK
+            )
+            sys.exit(0)
+        # Stash the handle at module scope so it lives for the whole process
+        # (and isn't released early by garbage collection).
+        global _single_instance_mutex_handle
+        _single_instance_mutex_handle = mutex
+    else:
+        # Cross-platform fallback for dev runs on macOS/Linux: an exclusive
+        # advisory lock on a file in the OS temp dir. Held for the life of
+        # the process; the OS releases it automatically if the process dies
+        # or crashes, so it can never get "stuck" locked.
+        import tempfile
+        import atexit
+        lock_path = os.path.join(tempfile.gettempdir(), "dbz_game.instance.lock")
+        try:
+            import fcntl
+            lock_file = open(lock_path, 'w')
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            global _single_instance_lock_file
+            _single_instance_lock_file = lock_file
+            atexit.register(lock_file.close)
+        except (ImportError, OSError):
+            print("The game is already running. Close the other window first.")
+            sys.exit(0)
+
+_enforce_single_instance()
+
 import math
 import time
 import random
@@ -68,7 +126,9 @@ from dev_tools.room_editor.room_editor_tools.mission_manager import MissionManag
 from dev_tools.cutscene_editor import CutsceneEditor
 from dev_tools.world_map_editor import WorldMapEditor
 from dev_tools import character_creator
+from dev_tools import attack_creator
 from dev_tools import entity_creator
+from dev_tools import item_creator
 from ui.title_screen import TitleScreen
 
 # Flip to False when building an exported/player-facing release — gates the
@@ -296,7 +356,9 @@ class Game:
         self.world_map_editor.room_manager = self.room_manager
         self.world_map_editor.on_save = self._on_world_map_saved
         self.character_creator = character_creator.CharacterCreator(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.attack_creator = attack_creator.AttackCreator(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.entity_creator = entity_creator.EntityCreator(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.item_creator = item_creator.ItemCreator(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.cutscene_editor = CutsceneEditor(
             self.room_manager,
             self.room_editor,
@@ -435,6 +497,11 @@ class Game:
         self.trigger_boxes        = []   # room's placed trigger box zones (see core/event system)
         self.zeni_pickups         = []   # dropped-zeni world pickups; see _update_zeni_pickups
         self.item_pickups         = []   # dropped-item world pickups; see _update_item_pickups
+        # Zeni drops rolled this frame but not yet turned into world pickups —
+        # held here while a level-up sequence is starting/active so they only
+        # pop out once the last level-up popup closes (see _update_enemies'
+        # zeni-drop block and _flush_pending_zeni_drops).
+        self._pending_zeni_drops = []
         # item_ids removed from the inventory via 'drop_item:' while the pause
         # menu is open, not yet turned into world pickups — see the
         # pause_menu.active handling below. Flushed (and the actual
@@ -445,13 +512,12 @@ class Game:
         self.active_item_buffs    = []   # timed stat buffs from consumables (e.g. Holy Water); see systems/item_effects.py
 
         # ── Performance caches ────────────────────────────────────────────────
-        # key: (room_name, is_background) → pre-baked tile Surface
+        # key: (room_name, is_background) → ordered list of render segments,
+        # each either ('static', pre-baked Surface) or ('anim', [Tile, ...]).
+        # Tiles are baked in layer order, and an animated tile splits the run
+        # into a fresh segment right where it occurs instead of always
+        # landing on top of the whole bucket — see _build_room_tile_surface().
         self._room_tile_surfaces: dict = {}
-        # (room_name, bg) -> list of Tile instances that are animated and were
-        # therefore excluded from the baked surface above; drawn dynamically
-        # every frame instead. Populated as a side effect of
-        # _build_room_tile_surface() and evicted alongside it.
-        self._animated_tile_lists: dict = {}
         self._dirty_tile_rooms:   set  = set()   # rooms pending a full surface rebuild
         # room_name -> set of (grid_x, grid_y) world-space cells pending an
         # in-place patch (single tile placed/erased). Cheaper than a full
@@ -740,10 +806,13 @@ class Game:
         self.event_runner.register_handler('change_map', self._handle_change_map_action, blocking=True)
         self.event_runner.register_handler('set_player_location', self._handle_set_player_location_action)
         self.event_runner.register_handler('play_cutscene', self._handle_play_cutscene_action, blocking=True)
+        self.event_runner.register_handler('spawn_enemies', self._handle_spawn_enemies_action)
+        self.event_runner.register_handler('spawn_npc', self._handle_spawn_npc_action)
         self.event_runner.register_handler('item', self._handle_item_action)
         self.event_runner.register_handler('quest', self._handle_quest_action)
         self.event_runner.register_handler('modify_quest_variable', self._handle_modify_quest_variable_action)
         self.event_runner.register_handler('mission', self._handle_mission_action)
+        self.event_runner.register_handler('toggle_flying_pad', self._handle_toggle_flying_pad_action)
 
         # Create the default starting room (a fresh transient "green dev" room).
         self._create_default_room()
@@ -894,7 +963,7 @@ class Game:
         ts = self.player.transformation
         current_costume = (ts.current_transform_costume
                             if (ts and ts.is_transformed and ts.current_transform_costume)
-                            else 'base')
+                            else getattr(self.player, 'costume', None) or 'base')
         # 'current_costume' above is for display only (see
         # _get_save_slot_summary → TitleScreen's slot preview). The
         # actual restorable transformation state lives in
@@ -1190,6 +1259,23 @@ class Game:
                 ts.is_shining               = transform_data.get('is_shining', False)
                 ts.shine_timer              = transform_data.get('shine_timer', 0.0)
                 ts.ready_notification_shown = transform_data.get('ready_notification_shown', False)
+
+        # Restore the actual costume/skin this save was played with — the
+        # character switch above (_switch_character, or the "no switch
+        # needed" branch) only knows the character's *configured default*
+        # costume (assets/characters/{id}.json), not whatever skin was
+        # actually equipped when this save was written (see
+        # _write_save_slot's 'current_costume'). Skipped when the player
+        # loads in already transformed — the transformation block just
+        # above already set self.player.costume/sprite to the transform
+        # costume, and that should win over the pre-transform base skin.
+        saved_costume = data.get('current_costume')
+        already_transformed = bool(transform_data and transform_data.get('is_transformed') and ts is not None and ts.is_transformed)
+        if saved_costume and not already_transformed and saved_costume != getattr(self.player, 'costume', None):
+            from core.sprite_system import create_character_sprite
+            self.player.sprite = create_character_sprite(
+                getattr(self.player, 'character', None), saved_costume, 32, 32)
+            self.player.costume = saved_costume
 
         # NOTE: level/XP/HP/KI/stats are now restored above as part of
         # per-character progress (character_progress / restore_progress),
@@ -1532,8 +1618,16 @@ class Game:
                         self.player.exp_to_next_level = self.game_config.get_xp_for_level(self.player.level)
                 continue
 
+            if self.attack_creator.active:
+                self.attack_creator.handle_input(event)
+                continue
+
             if self.entity_creator.active:
                 self.entity_creator.handle_input(event)
+                continue
+
+            if self.item_creator.active:
+                self.item_creator.handle_input(event)
                 continue
 
             if self.room_editor.active:
@@ -1572,9 +1666,15 @@ class Game:
                 elif result == 'open_character_creator':
                     self.dev_menu.active = False
                     self.character_creator.toggle()
+                elif result == 'open_attack_creator':
+                    self.dev_menu.active = False
+                    self.attack_creator.toggle()
                 elif result == 'open_entity_creator':
                     self.dev_menu.active = False
                     self.entity_creator.toggle()
+                elif result == 'open_item_creator':
+                    self.dev_menu.active = False
+                    self.item_creator.toggle()
 
             # ── Normal gameplay input ─────────────────────────────────────────
             # Only reached when no overlay is active.
@@ -1756,6 +1856,13 @@ class Game:
 
         elif event.key == pygame.K_q:
             # Q fires a ki blast or begins charging a beam, depending on the current mode.
+            # Rooms with can_attack disabled (room editor's 'Can attack?'
+            # checkbox) block every super attack below — instant ones
+            # (blast, ultra volleyball, energy punch, dragon fist, ghost
+            # kamikaze) and every hold-to-charge one alike — but not
+            # transform, which isn't itself an attack.
+            if not self.player.ki_attack_mode.startswith('transform') and not self._room_allows_attack():
+                return
             self.player.is_q_pressed = True
             if self.player.ki_attack_mode == 'blast':
                 self.player.shoot_blast()
@@ -1827,20 +1934,33 @@ class Game:
                 # Game._update_ghost_kamikaze). Nothing needed in the
                 # KEYUP handler.
                 self.player.start_ghost_kamikaze()
-            elif self.player.ki_attack_mode == 'transform':
-                # Q triggers a transformation when charged and ready, and
-                # reverses an active transformation back to base form when
-                # already transformed — same trigger key as every other
-                # super attack above. Ignored mid-transition
-                # (is_transforming / is_untransforming) so a repeat press
-                # can't restart the animation partway through.
+            elif self.player.ki_attack_mode == 'transform' or self.player.ki_attack_mode.startswith('transform:'):
+                # Q triggers a transformation when the selected slot's
+                # requirement is met (and, for a base-level slot, once the
+                # charge meter is ready), and reverses an active
+                # transformation back to base form when the player is
+                # already sitting in exactly the form this slot targets —
+                # same trigger key as every other super attack above.
+                # Ignored mid-transition (is_transforming /
+                # is_untransforming) so a repeat press can't restart the
+                # animation partway through.
+                #
+                # A "tier 2" slot (e.g. SSJ3, which requires SSJ) pressed
+                # while NOT currently in its required form is simply a
+                # no-op here — TransformationSystem.start_transform()
+                # itself refuses in that case, there's nothing else to do
+                # about it from this end (the slot only becomes usable once
+                # the player has transformed into the prerequisite tier via
+                # ITS OWN slot first).
                 ts = self.player.transformation
                 if (getattr(self.player, 'has_transformation', False)
                         and ts and not ts.is_transforming and not ts.is_untransforming):
-                    if ts.is_transformed:
-                        ts.start_untransform()
-                    elif ts.is_ready:
-                        ts.start_transform()
+                    target_form = self._transform_form_for_mode(self.player.ki_attack_mode)
+                    if target_form:
+                        if ts.is_transformed and ts.active_form_name == target_form:
+                            ts.start_untransform()
+                        else:
+                            ts.start_transform(target_form)
 
         elif event.key == pygame.K_e:
             # Tracked so Player.update() can tell, once the normal melee
@@ -1862,6 +1982,17 @@ class Game:
             # Double-tapping a direction key starts a run.
             if self.player.check_double_tap(event.key):
                 self.player.is_running = True
+
+    def _room_allows_attack(self):
+        """Whether the player is allowed to fight in the current room —
+        driven by the room editor's 'Can attack?' checkbox
+        (room.can_attack, defaults to True for rooms that predate the
+        field). Covers default melee, charged melee (which only rolls in
+        after a default melee swing completes — see the E-key KEYUP
+        handler above), and every Q-key super attack, since both of those
+        are gated at their single call sites below.
+        """
+        return getattr(self.current_room, 'can_attack', True)
 
     def _handle_interact(self):
         """
@@ -2002,6 +2133,12 @@ class Game:
             # Default: throw a melee punch. A random melee1/melee2 swing
             # sound plays either way (hit or miss) — resolved once the
             # swing ends, see the melee-attack cleanup loop in update().
+            # Rooms with can_attack disabled (see the room editor's 'Can
+            # attack?' checkbox) skip this entirely — nothing else here
+            # counts as combat, so save points/NPCs/chests/items/flying
+            # pads all still work normally in a no-attack room.
+            if not self._room_allows_attack():
+                return
             melee = self.player.melee_attack()
             if melee:
                 melee.hit_something = False
@@ -2040,7 +2177,7 @@ class Game:
         ts = self.player.transformation
         current_costume = (ts.current_transform_costume
                             if (ts and ts.is_transformed and ts.current_transform_costume)
-                            else 'base')
+                            else getattr(self.player, 'costume', None) or 'base')
 
         # Room + play time shown on the Room/Time lines that now sit
         # where "New Game" used to (see TitleScreen._draw_save_overlay_info).
@@ -2331,10 +2468,11 @@ class Game:
         # Hide the NPC's own indicator the moment dialogue starts.
         npc.is_talking = True
 
-        # Immediately snap the player to idle so walking-into-E never leaves
-        # the walk/run animation frozen on screen during the conversation.
-        if self.player.current_animation_state in ('walk', 'run'):
-            self.player.enter_idle()
+        # Note: the player is NOT snapped to idle here — enter_idle() also
+        # resets facing direction, which made the player visibly flip to
+        # face down the instant a conversation started. Player movement
+        # input is suppressed elsewhere while the dialogue box is up, so
+        # the walk/run animation just holds its last frame instead.
         self.player.is_running = False
 
         iid = getattr(npc, 'instance_id', '')
@@ -2537,6 +2675,11 @@ class Game:
     def _end_levelup_sequence(self):
         """Second dialogue box closed — unfreeze the world."""
         self._levelup_active = False
+        # Release any zeni (see _flush_pending_zeni_drops) that dropped
+        # while this sequence was starting/active — held back so pickups
+        # didn't pop out and start hopping while the popups were still
+        # covering the screen.
+        self._flush_pending_zeni_drops()
         # Safety net: player.update() is frozen for the entire sequence, so
         # if is_attacking somehow got set mid-freeze (e.g. a future change
         # reintroduces a path that starts an attack while _levelup_active is
@@ -2559,15 +2702,21 @@ class Game:
         if not frames:
             return
         idx = min(self._levelup_anim_idx, len(frames) - 1)
-        sw  = self.player.width  * RENDER_SCALE
-        sh  = self.player.height * RENDER_SCALE
+        # Tied to the Sprite HUD's own scale (not RENDER_SCALE) since this
+        # animation is considered part of the Sprite HUD — bump
+        # self.sprite_hud.scale to resize this along with the rest of the HUD.
+        _hud_scale = self.sprite_hud.scale
+        sw  = int(self.player.width  * _hud_scale)
+        sh  = int(self.player.height * _hud_scale)
 
-        # Pre-scaled-frame cache — same source frame always scales to the
-        # same size, so scale once per frame index instead of every draw().
-        scaled = self._levelup_anim_scaled_cache.get(idx)
+        # Pre-scaled-frame cache — same source frame + same HUD scale always
+        # produces the same size, so scale once per (frame, scale) pair
+        # instead of every draw().
+        cache_key = (idx, _hud_scale)
+        scaled = self._levelup_anim_scaled_cache.get(cache_key)
         if scaled is None:
             scaled = pygame.transform.scale(frames[idx], (sw, sh))
-            self._levelup_anim_scaled_cache[idx] = scaled
+            self._levelup_anim_scaled_cache[cache_key] = scaled
 
         cx = int(self.player.x * RENDER_SCALE - camera.x)
         cy = int(self.player.y * RENDER_SCALE - camera.y)
@@ -2643,6 +2792,13 @@ class Game:
 
         self.room_manager.current_room = room
         self.current_room              = room
+
+        # Reset this room's autonomous scroll-background phase so each test
+        # run starts fresh. Without this, _bg_scroll_accum (keyed by room
+        # name, see __init__) keeps accumulating across test sessions —
+        # leaving/re-entering test on the same room resumes the background
+        # mid-motion instead of at its configured starting position.
+        self._bg_scroll_accum.pop(room_name, None)
 
         # Sync tiles from the editor into the room object before testing starts.
         if self.room_editor.tileset_editor and room_name in self.room_editor.tileset_editor.room_tiles:
@@ -2747,6 +2903,7 @@ class Game:
                         'y':              gate.y,
                         'gate_type':      gate.gate_type,
                         'required_level': gate.required_level,
+                        'required_character': gate.required_character,
                         'max_health':     gate.max_health,
                         'health':         gate.health,
                         'width':          gate.width,
@@ -2854,7 +3011,8 @@ class Game:
         if hasattr(room, 'level_gates') and room.level_gates:
             from objects.level_gate import LevelGate
             for gate in room.level_gates:
-                copy_gate            = LevelGate(gate.x, gate.y, gate.gate_type, gate.required_level)
+                copy_gate            = LevelGate(gate.x, gate.y, gate.gate_type, gate.required_level,
+                                                  gate.required_character)
                 copy_gate.max_health = gate.max_health
                 copy_gate.health     = gate.health
                 copy_gate.width      = gate.width
@@ -2899,6 +3057,7 @@ class Game:
         # mode from mutating the editor original.
         self.music_track = getattr(room, 'music_track', '')
         self._apply_room_music(room)
+        self._apply_room_weather(room)
 
         # Trigger boxes — copy so test mode doesn't latch (once=True) the
         # editor originals' `triggered` flag.
@@ -3025,7 +3184,8 @@ class Game:
             from objects.level_gate import LevelGate
             room.level_gates = []
             for d in backup['level_gates']:
-                gate            = LevelGate(d['x'], d['y'], d['gate_type'], d['required_level'])
+                gate            = LevelGate(d['x'], d['y'], d['gate_type'], d['required_level'],
+                                             d.get('required_character'))
                 gate.max_health = d['max_health']
                 gate.health     = d['health']
                 gate.width      = d['width']
@@ -3126,6 +3286,7 @@ class Game:
         # opened, so there's no "close on room exit" step needed here).
         self.chests                = room.chests[:]             if hasattr(room, 'chests')              and room.chests              else []
         self._apply_room_music(room)
+        self._apply_room_weather(room)
 
 
         # Spawn entities.
@@ -3274,6 +3435,11 @@ class Game:
                 npc.display_name  = _npc_cfg.get('display_name') or npc.npc_id
                 npc.description   = _npc_cfg.get('description', '')
 
+                # Ground shadow width — same entity_creator "Shadow Size"
+                # slider BossEnemy already reads for itself; NPC doesn't load
+                # its own config, so it's applied here instead.
+                npc.shadow_width  = _npc_cfg.get('shadow_width', npc.width)
+
                 # Register the mission if this NPC has one defined inline.
                 # Stamp giver_instance_id/id from the live NPC instance
                 # (matches scan_rooms_for_missions' behavior) rather than
@@ -3380,8 +3546,143 @@ class Game:
                     enemy.attack_damage = (enemy.strength if enemy_category == 'melee'
                                             else enemy.power)
 
+                # Ground shadow width — same entity_creator "Shadow Size"
+                # slider BossEnemy.__init__ already reads for itself; regular
+                # Enemy doesn't load its own config, so it's applied here.
+                enemy.shadow_width = _enemy_cfg.get('shadow_width', enemy.width)
+
                 self._push_out_of_obstacles(enemy, spawn_obstacles)
                 self.enemies.append(enemy)
+
+    def _handle_spawn_enemies_action(self, enemy_id, x, y):
+        """EventRunner handler for the trigger-box 'spawn_enemies' action
+        (core.event_editor.ACTION_SCHEMA['spawn_enemies']: enemy_id/x/y).
+
+        Was previously unregistered, so trigger boxes authored with a
+        "spawn enemy" action silently did nothing — EventRunner had no
+        handler to call. Mirrors the 'enemy' branch of
+        _spawn_room_entities() (used for room-load-time spawns) so a
+        trigger-fired enemy ends up configured identically: same stats,
+        display_name/description, shadow_width, and obstacle push-out.
+
+        The action only carries enemy_id/x/y (variant isn't authorable on
+        a trigger box), but ai_type/enemy_category/shooter_style/zeni_pool
+        are all real per-enemy fields set in the entity editor
+        (entity_creator.DEFAULT_ENEMY_CONFIG) — load the config *first* and
+        read them from there, same as _spawn_room_entities does, rather
+        than hardcoding 'easy'/'melee'/'bomb'/'tier1' defaults that would
+        silently ignore however this enemy was actually configured.
+        """
+        variant_type = 'default'
+        _enemy_cfg   = entity_creator.load_config(entity_creator.KIND_ENEMY, enemy_id)
+
+        # entity_type == 'boss' configs use BossEnemy at room-load; a
+        # trigger-authored spawn_enemies row can still point at a boss id
+        # via enemy_picker, so route it the same way rather than building
+        # a plain Enemy with boss stats.
+        if _enemy_cfg.get('entity_type') == 'boss':
+            from entities.boss_enemy import BossEnemy
+            boss        = BossEnemy(x, y, boss_id=enemy_id, variant=variant_type)
+            boss.active = True
+            spawn_obstacles = (
+                self.collision_objects
+                + self.destructible_stones
+                + self.level_gates
+                + self.room_transitions
+            )
+            self._push_out_of_obstacles(boss, spawn_obstacles)
+            self.enemies.append(boss)
+            return
+
+        # Regular (non-boss) enemy: read ai_type/enemy_category/
+        # shooter_style/zeni_pool straight off the config, same fields
+        # BossEnemy.__init__ already reads for bosses. Unlike
+        # _spawn_room_entities' 'enemy' branch — which maps a placed
+        # variant_type ('gunner'/'rocketlauncher') to a shooter_style —
+        # spawn_enemies has no variant field at all, so shooter_style has
+        # to come from the config directly rather than a variant guess.
+        ai_type        = _enemy_cfg.get('ai_type', 'easy')
+        enemy_category = _enemy_cfg.get('enemy_category', 'melee')
+        shooter_style  = _enemy_cfg.get('shooter_style', 'bomb')
+        zeni_pool      = _enemy_cfg.get('zeni_pool', 'tier1')
+
+        enemy        = Enemy(x, y, enemy_type=enemy_id, variant=variant_type,
+                             ai_type=ai_type, enemy_category=enemy_category,
+                             shooter_style=shooter_style, zeni_pool=zeni_pool)
+        enemy.active = True
+
+        enemy.display_name = _enemy_cfg.get('display_name') or enemy_id
+        enemy.description  = _enemy_cfg.get('description', '')
+
+        _stats = _enemy_cfg.get('stats', {})
+        if _stats:
+            enemy.max_hp   = _stats.get('max_hp', enemy.max_hp)
+            enemy.hp       = enemy.max_hp
+            enemy.defense  = _stats.get('defense', enemy.defense)
+            enemy.speed    = _stats.get('speed', enemy.speed)
+            enemy.strength = _stats.get('strength', enemy.strength)
+            enemy.power    = _stats.get('power', enemy.power)
+            enemy.attack_damage = (enemy.strength if enemy_category == 'melee'
+                                    else enemy.power)
+
+        enemy.shadow_width = _enemy_cfg.get('shadow_width', enemy.width)
+
+        spawn_obstacles = (
+            self.collision_objects
+            + self.destructible_stones
+            + self.level_gates
+            + self.room_transitions
+        )
+        self._push_out_of_obstacles(enemy, spawn_obstacles)
+        self.enemies.append(enemy)
+
+    def _handle_spawn_npc_action(self, npc_id, x, y, animation):
+        """EventRunner handler for the trigger-box 'spawn_npc' action
+        (core.event_editor.ACTION_SCHEMA['spawn_npc']: npc_id/x/y/animation).
+
+        Was previously unregistered — same silent no-op bug as
+        spawn_enemies above. Mirrors the 'npc' branch of
+        _spawn_room_entities() for consistent config, and if `animation`
+        names a valid animation on the loaded sprite, plays it once on
+        spawn (e.g. an NPC that "pops in").
+
+        The action only carries npc_id/x/y/animation — there's no
+        dialogue_config field a designer can author per-trigger-spawn (that
+        only exists on placed room entities). So, like ai_type/
+        enemy_category above for enemies, load the config *first* and use
+        its own 'dialogue'/'npc_type'/'speed' fields (entity_creator.
+        DEFAULT_NPC_CONFIG) as this NPC's defaults, instead of hardcoding
+        npc_type='static' and dialogue_config=None regardless of how the
+        NPC was actually configured in the entity editor.
+        """
+        _npc_cfg = entity_creator.load_config(entity_creator.KIND_NPC, npc_id)
+
+        npc                  = NPC(x, y, _npc_cfg.get('dialogue'))
+        npc.active           = True
+        npc.npc_type         = _npc_cfg.get('npc_type', 'static')
+        npc.facing_direction = 'down'
+        npc.variant          = 'default'
+        npc.npc_id           = npc_id
+        npc.instance_id      = ''
+
+        if hasattr(npc, 'speed'):
+            npc.speed = _npc_cfg.get('speed', npc.speed)
+
+        npc.display_name  = _npc_cfg.get('display_name') or npc_id
+        npc.description   = _npc_cfg.get('description', '')
+        npc.shadow_width  = _npc_cfg.get('shadow_width', npc.width)
+
+        try:
+            from core.sprite_system import create_npc_sprite
+            npc.sprite     = create_npc_sprite(npc_id, 'default', npc.width, npc.height)
+            npc.has_sprite = npc.sprite is not None
+        except Exception:
+            npc.has_sprite = False
+
+        if animation and npc.has_sprite and hasattr(npc.sprite, 'set_animation'):
+            npc.sprite.set_animation(animation, npc.facing_direction)
+
+        self.npcs.append(npc)
 
     def _assign_obstacles(self):
         """Build a shared obstacle list and hand it to the player and every enemy.
@@ -3432,6 +3733,7 @@ class Game:
         self.big_bang_destruction_effects = []
         self.zeni_pickups   = []
         self.item_pickups   = []   # dropped-item pickups despawn on room leave — see core.items.ItemPickup
+        self._pending_zeni_drops = []   # don't carry queued drops across a room change
         self._white_flash_timer = 0.0
         self.it_selector = None
         self.dmg_numbers.clear()  # Wipe leftover popups on room transition
@@ -3795,11 +4097,8 @@ class Game:
     def _handle_dialogue_box_action(self, on_complete, speaker_type, text, speaker_name=None, portrait=None):
         """EventRunner handler for the 'dialogue_box' action. Single line,
         closed on player input — see _advance_npc_dialogue()'s event branch."""
-        # Snap the player to idle so walking into the trigger box doesn't
-        # leave the walk/run animation frozen on screen during the dialogue
-        # — same fix _start_npc_dialogue() applies for NPC conversations.
-        if self.player.current_animation_state in ('walk', 'run'):
-            self.player.enter_idle()
+        # Player is NOT snapped to idle here — see the note in
+        # _start_npc_dialogue(); enter_idle() resets facing direction too.
         self.player.is_running = False
 
         name = speaker_name or ('Narrator' if speaker_type == 'narrator' else '')
@@ -3818,8 +4117,8 @@ class Game:
         the runner itself splices the picked option's actions back into the
         sequence, so all we do here is show the menu and forward whichever
         index the player picked."""
-        if self.player.current_animation_state in ('walk', 'run'):
-            self.player.enter_idle()
+        # Player is NOT snapped to idle here — see the note in
+        # _start_npc_dialogue(); enter_idle() resets facing direction too.
         self.player.is_running = False
 
         labels = [opt.get('text', '') for opt in (options or [])]
@@ -4120,6 +4419,24 @@ class Game:
             self._event_spam_qte_on_complete = None
             if on_complete:
                 on_complete()
+
+    def _handle_toggle_flying_pad_action(self, pad_id, mode='enable'):
+        """EventRunner handler for the 'toggle_flying_pad' action — mode:
+        'enable' | 'disable'. Flips FlyingPad.active on the matching pad,
+        which already gates both interaction (check_collision_with_player
+        is only consulted for active pads — see the flying-pad checks in
+        _update_interactions/draw) and visibility (FlyingPad.draw() itself
+        early-returns while inactive), so a single flag covers what a
+        trigger box needs to enable/disable a pad.
+
+        Searches self.flying_pads (the current room's pads) by pad_id
+        rather than object identity, since that's the only thing an event
+        action dict can serialize — see objects/flying_pad.py's
+        FlyingPadManager.add_pad() for where pad_id gets auto-assigned."""
+        for pad in self.flying_pads:
+            if pad.pad_id == pad_id:
+                pad.active = (mode == 'enable')
+                break
 
     def _handle_weather_action(self, mode, weather_type=None):
         """EventRunner handler for the 'weather' action — mode: 'set' | 'stop'.
@@ -4427,6 +4744,13 @@ class Game:
 
             self.room_manager.save_room(room)
 
+    # Extensions the room editor's music scan (and AudioAssetLoader) know
+    # about. Used defensively below in case a room's music_track was ever
+    # saved with an extension still attached — see the room editor's
+    # handle_music_dropdown_event for why that used to happen and broke
+    # playback (sound_engine.music_tracks is keyed by stem only).
+    _MUSIC_EXTENSIONS = ('.ogg', '.mp3', '.wav', '.it', '.xm', '.s3m', '.mod')
+
     def _apply_room_music(self, room):
         """Apply the given room's persisted music track, if any, to the
         currently playing track.
@@ -4441,11 +4765,39 @@ class Game:
         if not track:
             return  # No track set for this room — leave music as-is
 
+        # Defensive: strip a known extension if one is still attached.
+        # sound_engine.music_tracks is keyed by filename stem (no
+        # extension), so an extension here would never match and playback
+        # would silently no-op.
+        if track.lower().endswith(self._MUSIC_EXTENSIONS):
+            track = os.path.splitext(track)[0]
+
         if track == self.sound_engine.current_music:
             return  # Already playing this track — avoid restarting it on every room entry
 
         print(f"[room_music] switching to '{track}' for room '{getattr(room, 'name', '?')}'")
         self.sound_manager.play_music(track)
+
+    def _apply_room_weather(self, room):
+        """Apply the given room's persisted ambient weather (set via the
+        room editor's Weather field) on room entry, routed through the same
+        _handle_weather_action handler the 'weather' event action uses so
+        the fade timings and art match.
+
+        Design rule mirrors _apply_room_music: a room with no weather set
+        ('none' / missing) stops whatever ambient weather may still be
+        active from a previous room, rather than leaving it running.
+        """
+        if not room:
+            return
+
+        weather_type = getattr(room, 'ambient_weather', 'none')
+        if weather_type and weather_type != 'none':
+            if self.room_weather is None or self.room_weather.weather_type != weather_type:
+                self._handle_weather_action('set', weather_type)
+        else:
+            if self.room_weather is not None:
+                self._handle_weather_action('stop')
 
     def _apply_world_map_music(self, map_name):
         """Apply the given world map's music track, if any, to the currently
@@ -5522,14 +5874,15 @@ class Game:
                 _sh        = SCREEN_HEIGHT
                 _sky_h     = int(_sh * 0.35)                          # fixed sky height
                 _base_f    = getattr(self, '_MJF_FOCAL', SCREEN_WIDTH // 8)
-                _FOCAL     = int(_base_f * (0.3 + 1.9 * _alt))        # matches draw method
+                _zoom_alt  = _alt ** 1.6                                # eased altitude for zoom curve
+                _FOCAL     = int(_base_f * (0.3 + 1.9 * _zoom_alt))    # matches draw method
                 _PROJ_HOR  = int(_sh * 0.20)                           # PROJECTION_HORIZON
                 _vground_h = _sh - _PROJ_HOR
                 _HOR_OFF   = 2                                          # HORIZON_OFFSET
-                _hor_y     = int(_sh * (0.30 - 0.20 * _alt))           # horizon_y from draw
+                _hor_y     = int(_sh * (0.30 - 0.20 * _zoom_alt))      # horizon_y from draw
 
                 # Pivot = shadow screen position — must match shadow_ground_y in draw code
-                _pivot_screen_y = int(_sky_h + (_sh - _sky_h) * 0.32)
+                _pivot_screen_y = int(_sky_h + (_sh - _sky_h) * self._mjf_shadow_gy_frac(_alt))
 
                 # Curvature-corrected depth: the ground pixel visible at
                 # shadow_ground_y comes from a deeper render row because the
@@ -5563,7 +5916,7 @@ class Game:
             # E = rise, Q = descend.
             rise    = keys[pygame.K_e]
             descend = keys[pygame.K_q]
-            ALT_SPD = 0.8 * dt
+            ALT_SPD = 0.6 * dt
             if rise or descend:
                 _old_alt = self._mjf_altitude
                 _new_alt = (min(1.0, _old_alt + ALT_SPD) if rise
@@ -5580,13 +5933,23 @@ class Game:
                     _vground_h = _sh - _PROJ_HOR
                     _HOR_OFF   = 2                  # HORIZON_OFFSET constant
                     _sky_h     = int(_sh * 0.35)    # fixed sky height
-                    # Shadow is always drawn at the same row — must match shadow_ground_y in draw code.
-                    _shad_gy   = int(_sky_h + (_sh - _sky_h) * 0.32)
+                    # Shadow's row now bumps closer then eases back out with
+                    # altitude (see _mjf_shadow_gy_frac) — so old/new rows can
+                    # differ even without any other altitude-driven change.
+                    # Kept as floats (no int() truncation) — these only feed
+                    # the float cam_x/cam_y anchor math below, never a pixel
+                    # index. Near the bottom of the climb the true per-frame
+                    # change is tiny, so rounding to int here made several
+                    # frames land on the same pixel and then snap by 1,
+                    # producing visible jitter close to the lowest altitude.
+                    _shad_gy_old = _sky_h + (_sh - _sky_h) * self._mjf_shadow_gy_frac(_old_alt)
+                    _shad_gy_new = _sky_h + (_sh - _sky_h) * self._mjf_shadow_gy_frac(_new_alt)
 
                     # --- old projection: world point under the shadow ---
-                    _old_FOCAL = int(_base_f * (0.3 + 1.9 * _old_alt))
-                    _old_hor_y = int(_sh * (0.30 - 0.20 * _old_alt))
-                    _old_row   = max(_shad_gy - _old_hor_y, 1)
+                    _old_zoom_alt = _old_alt ** 1.6                     # eased altitude for zoom curve
+                    _old_FOCAL = _base_f * (0.3 + 1.9 * _old_zoom_alt)
+                    _old_hor_y = _sh * (0.30 - 0.20 * _old_zoom_alt)
+                    _old_row   = max(_shad_gy_old - _old_hor_y, 1)
                     _old_depth = _old_FOCAL * _vground_h / (_old_row + _HOR_OFF)
 
                     _angle  = self._mjf_cam_angle
@@ -5598,9 +5961,10 @@ class Game:
                     self._mjf_altitude = _new_alt
 
                     # --- new projection: re-derive cam so same world point stays ---
-                    _new_FOCAL = int(_base_f * (0.3 + 1.9 * _new_alt))
-                    _new_hor_y = int(_sh * (0.30 - 0.20 * _new_alt))
-                    _new_row   = max(_shad_gy - _new_hor_y, 1)
+                    _new_zoom_alt = _new_alt ** 1.6                     # eased altitude for zoom curve
+                    _new_FOCAL = _base_f * (0.3 + 1.9 * _new_zoom_alt)
+                    _new_hor_y = _sh * (0.30 - 0.20 * _new_zoom_alt)
+                    _new_row   = max(_shad_gy_new - _new_hor_y, 1)
                     _new_depth = _new_FOCAL * _vground_h / (_new_row + _HOR_OFF)
 
                     _tex = getattr(self, '_world_map_texture', None)
@@ -5664,14 +6028,15 @@ class Game:
                 _tw  = _tex.get_width()  if _tex else 1
                 _th  = _tex.get_height() if _tex else 1
                 _alt    = self._mjf_altitude
+                _zoom_alt = _alt ** 1.6                                # eased altitude for zoom curve
                 _base_f = getattr(self, '_MJF_FOCAL', SCREEN_WIDTH // 8)
-                _focal  = int(_base_f * (0.3 + 1.9 * _alt))
+                _focal  = int(_base_f * (0.3 + 1.9 * _zoom_alt))
                 _vgh    = SCREEN_HEIGHT - int(SCREEN_HEIGHT * 0.20)
-                _hor_y  = int(SCREEN_HEIGHT * (0.30 - 0.20 * _alt))
+                _hor_y  = int(SCREEN_HEIGHT * (0.30 - 0.20 * _zoom_alt))
                 _sky_h2 = int(SCREEN_HEIGHT * 0.35)
-                # Must match shadow_ground_y formula in draw: sky_h + (sh-sky_h)*0.32
+                # Must match shadow_ground_y formula in draw (see _mjf_shadow_gy_frac)
                 _sky_h2_draw = int(SCREEN_HEIGHT * 0.35)
-                _shad_y = int(_sky_h2_draw + (SCREEN_HEIGHT - _sky_h2_draw) * 0.32)
+                _shad_y = int(_sky_h2_draw + (SCREEN_HEIGHT - _sky_h2_draw) * self._mjf_shadow_gy_frac(_alt))
                 _row    = max(_shad_y - _hor_y, 1)
                 _pdepth = _focal * _vgh / (_row + 2)
                 _angle  = self._mjf_cam_angle
@@ -6112,6 +6477,43 @@ class Game:
         self._wm_scouter_cache[map_name] = result
         return result
 
+    def _mjf_shadow_gy_frac(self, alt):
+        """Fraction of (screen_h - sky_h) below the sky where the shadow's
+        ground row sits, as a function of altitude.
+
+        The shadow's WORLD position never moves on its own (only up/down
+        flight and the zoom-anchor logic move it) — but its apparent screen
+        depth bumps closer then eases back out as altitude climbs, matching
+        the reference Mode7 flying scene. Tune these two numbers:
+          _BASE = row fraction at min/max altitude (0.0 and 1.0)
+          _AMP  = how much closer (larger fraction) it swings at the peak
+        Peak currently lands at alt ≈ 0.5; shift the sin() argument below
+        if you want the closest point earlier/later in the climb.
+        """
+        _BASE = 0.32
+        _AMP  = 0.38
+        _alt  = max(0.0, min(1.0, alt))
+
+        # The rising half (0.0 -> 0.5) shares screen space with the FOCAL /
+        # horizon_y zoom curve (alt ** 1.6), which starts perfectly flat at
+        # alt = 0. A plain sin(pi * alt) here instead has its steepest slope
+        # right at alt = 0, so for the first few frames of ascent this curve
+        # races ahead of the zoom curve and the computed depth briefly moves
+        # the wrong way (zooms out, then back in) before the two curves fall
+        # back into step — that's the "sudden zoom out" glitch on lift-off.
+        # Re-parameterise the rising half with the same zero-slope-at-zero
+        # easing so both curves start in lockstep. The peak still lands
+        # exactly at alt = 0.5 (t=1 -> eased=1 -> x=0.5).
+        if _alt <= 0.5:
+            _t = _alt / 0.5
+            _x = (_t ** 1.6) * 0.5
+        else:
+            # Falling half (0.5 -> 1.0) is unchanged — this is what drives
+            # the intended zoom-out at the top of the climb.
+            _x = _alt
+
+        return _BASE + _AMP * math.sin(math.pi * _x)
+
     def _draw_world_map_flying_scene(self):
         """Draw the world-map flying view.
 
@@ -6130,12 +6532,13 @@ class Game:
         """
         sw, sh = SCREEN_WIDTH, SCREEN_HEIGHT
         altitude = getattr(self, '_mjf_altitude', 0.5)
+        zoom_alt = altitude ** 1.6   # eased altitude for FOCAL/horizon zoom curve — do NOT use for sprite scale/position
 
         # Fixed sky size (never changes)
         sky_h = int(sh * 0.35)
 
         # Draw the ground starting exactly below the sky
-        horizon_y = int(sh * (0.30 - 0.20 * altitude))
+        horizon_y = int(sh * (0.30 - 0.20 * zoom_alt))
         ground_h = sh - horizon_y
 
         # Hidden projection horizon:
@@ -6248,13 +6651,14 @@ class Game:
 
             # Compute depth/angle constants used for the spawn-margin offset
             _alt     = getattr(self, '_mjf_altitude', 0.5)
+            _zoom_alt_p = _alt ** 1.6                                  # eased altitude for zoom curve
             _base_f  = getattr(self, '_MJF_FOCAL', sw // 8)
-            _FOCAL_p = int(_base_f * (0.3 + 1.9 * _alt))
+            _FOCAL_p = int(_base_f * (0.3 + 1.9 * _zoom_alt_p))
             _PROJ_p  = int(sh * 0.20)
             _vgh_p   = sh - _PROJ_p
             _sky_hp  = int(sh * 0.35)
-            _hor_yp  = int(sh * (0.30 - 0.20 * _alt))
-            _shad_yp = int(_sky_hp + (sh - _sky_hp) * 0.32)
+            _hor_yp  = int(sh * (0.30 - 0.20 * _zoom_alt_p))
+            _shad_yp = int(_sky_hp + (sh - _sky_hp) * self._mjf_shadow_gy_frac(_alt))
             _row_p   = max(_shad_yp - _hor_yp + 2, 1)
             _dep_p   = _FOCAL_p * _vgh_p / _row_p
             _ang     = self._mjf_cam_angle
@@ -6296,7 +6700,7 @@ class Game:
         # Therefore:
         #   altitude = 0.0 (low / descended)  -> small FOCAL  -> close
         #   altitude = 1.0 (high / ascended)  -> large FOCAL  -> far
-        FOCAL = int(base_focal * (0.3 + 1.9 * altitude))
+        FOCAL = int(base_focal * (0.3 + 1.9 * zoom_alt))
         RENDER_DIV = 2
 
         HORIZON_OFFSET = 2
@@ -6459,7 +6863,13 @@ class Game:
         if self._mjf_flying_frames:
             frame = self._mjf_flying_frames[self._mjf_flying_frame_idx]
 
-            sprite_scale = RENDER_SCALE * (3.0 - 2.3 * altitude)
+            # Eased with the same alt ** 1.6 curve used for FOCAL / horizon_y
+            # (see _draw_world_map_flying_scene's zoom_alt), so the sprite
+            # shrinks in sync with the camera zoom instead of linearly:
+            # barely shrinks near the ground, then shrinks faster as altitude
+            # climbs toward the top.
+            _sprite_zoom_alt = altitude ** 0.6
+            sprite_scale = RENDER_SCALE * (3.0 - 2.3 * _sprite_zoom_alt)
             w = int(frame.get_width() * sprite_scale)
             h = int(frame.get_height() * sprite_scale)
 
@@ -6472,15 +6882,14 @@ class Game:
             # sprite_cy = sky_h * (0.30 at max alt  ->  0.93 at ground level)
             # Lowered the base from 0.48 -> 0.30 so the icon rises higher
             # on-screen as altitude increases (was capped near the midpoint).
-            sprite_y = sky_h * (0.30 + 0.63 * (1.0 - altitude))
+            sprite_y = sky_h * (0.5 + 0.63 * (1.0 - altitude))
 
             # Shadow — now after sprite_y is known
             shadow_x = int(self._mjf_fly_x)
-            # Shadow Y: placed lower on screen (0.65 factor vs old 0.35) and shifts
-            # slightly toward the horizon at higher altitude, matching Buu's Fury reference.
-            # Pixel-measured from GBA footage: shadow sits at ~77% of screen height at
-            # low alt, drifting up to ~75% at high alt.
-            shadow_ground_y = int(sky_h + (sh - sky_h) * 0.32)
+            # Shadow Y: bumps closer (larger fraction, lower on screen) around
+            # mid-altitude, then eases back out toward the base row at the
+            # extremes. See _mjf_shadow_gy_frac for the tunable curve.
+            shadow_ground_y = int(sky_h + (sh - sky_h) * self._mjf_shadow_gy_frac(altitude))
 
             # ── GBA-style shadow – pixel-exact 11-step lookup ────────────────
             # Each entry: (total_w, total_h, [(left_inset, right_inset), ...])
@@ -6592,7 +7001,7 @@ class Game:
                                       special_flags=pygame.BLEND_ADD)
 
             if texture:
-                _shad_screen_y  = int(sky_h + (sh - sky_h) * 0.32)
+                _shad_screen_y  = int(sky_h + (sh - sky_h) * self._mjf_shadow_gy_frac(altitude))
                 _shad_row       = max(_shad_screen_y - horizon_y + HORIZON_OFFSET, 1)
                 _shad_depth     = FOCAL * (sh - PROJECTION_HORIZON) / _shad_row
                 _angle          = self._mjf_cam_angle
@@ -7146,16 +7555,19 @@ class Game:
           - 'dragon_fist' in equipped → dragon_fist mode available
           - 'ghost_kamikaze' in equipped → ghost_kamikaze mode available
           - 'instant_transmission' in equipped → instant_transmission mode available
-          - transform is appended last, but only if this character actually
-            has at least one transformation configured in the character
-            creator (player.has_transformation — set in _reload_attack_config
-            from cfg["transformations"])
+          - one or more 'transform' slots are appended last — one per
+            unlocked transformation configured for the currently-equipped
+            costume, in authoring order. The first is always named
+            'transform' (backward-compatible); any additional tier (e.g. a
+            "tier 2" form like SSJ3 that requires an earlier one) gets its
+            own slot named 'transform:<form_name>' so it can be cycled to
+            and triggered independently. See _transform_mode_slots().
 
         Falls back to blast-only (plus transform, if the character has one)
         when no config has been loaded yet.
         """
         equipped = getattr(self.player, 'equipped_attacks', [])
-        has_transform = getattr(self.player, 'has_transformation', False)
+        transform_slots = self._transform_mode_slots()
 
         modes: list[str] = []
         if 'ki_blast' in equipped:
@@ -7193,15 +7605,14 @@ class Game:
         if 'instant_transmission' in equipped:
             modes.append('instant_transmission')
 
-        if has_transform:
-            modes.append('transform')
+        modes.extend(mode for mode, _ in transform_slots)
 
         if modes:
             return tuple(modes)
 
         # If nothing was equipped at all, keep blast as the default so the
         # game is still playable before any config file has been saved.
-        return ('blast', 'transform') if has_transform else ('blast',)
+        return ('blast', 'transform') if transform_slots else ('blast',)
 
     def _sync_event_editor_character(self):
         """Tell the Room Editor's object editor (if it exists yet) which
@@ -7318,6 +7729,54 @@ class Game:
         if marker not in (costume_path or ''):
             return ''
         return costume_path.split(marker, 1)[1]
+
+    def _transform_mode_slots(self, cfg=None) -> list:
+        """Ordered list of (ki_attack_mode_name, form_name) for every
+        transformation registered on the costume the player currently has
+        equipped AND unlocked (in player.unlocked_transformations).
+
+        Historically there was only ever one transform slot ('transform'),
+        always resolved to the costume's FIRST registered form. That's
+        preserved here for backward compatibility: the first entry found
+        keeps the literal name 'transform', and every OTHER entry (e.g. a
+        "tier 2" form like SSJ3 that "requires" the first) gets its own
+        distinct slot named 'transform:<form_name>' — so TAB can cycle to
+        it independently, and pressing the transform key while it's
+        selected targets that specific tier (see
+        TransformationSystem.start_transform()'s form_name/requires
+        handling) instead of always landing on whichever form is index 0.
+
+        A tier-2+ form still only actually works once its "requires" tier
+        has been reached in-game — this list is just which slots exist to
+        cycle to, not whether using them will currently succeed.
+        """
+        if cfg is None:
+            cfg = character_creator.load_config(self.player.character)
+
+        current_costume = getattr(self.player, 'costume', None) or cfg.get('costume', '')
+        prefix = f"{current_costume}/transformations/"
+        unlocked = getattr(self.player, 'unlocked_transformations', None) or []
+
+        slots = []
+        for t in cfg.get('transformations', []):
+            costume = t.get('costume', '')
+            if not costume.startswith(prefix):
+                continue
+            form_name = self._transformation_form_id(costume)
+            if not form_name or form_name not in unlocked:
+                continue
+            mode_name = 'transform' if not slots else f'transform:{form_name}'
+            slots.append((mode_name, form_name))
+        return slots
+
+    def _transform_form_for_mode(self, mode_name, cfg=None):
+        """Reverse of _transform_mode_slots(): the form_name a given
+        'transform' / 'transform:<form_name>' ki_attack_mode slot targets,
+        or None if mode_name isn't a currently-available transform slot."""
+        for mode, form_name in self._transform_mode_slots(cfg=cfg):
+            if mode == mode_name:
+                return form_name
+        return None
 
     def _refresh_transformation_gate(self, cfg=None):
         """Recompute player.has_transformation for whichever costume the
@@ -7559,6 +8018,19 @@ class Game:
         self.player.character = character_id
         self.player.costume   = costume
         self.player.sprite    = create_character_sprite(character_id, costume, 32, 32)
+
+        # Transformation state (is_transformed/progress/transformed_ki/etc.)
+        # lives on TransformationSystem, which is created once in __init__
+        # and attached to self.player — it's never recreated per character,
+        # so without an explicit reset here it just kept whatever state the
+        # OUTGOING character left it in. E.g. transform as Goku, switch to
+        # Trunks, and Trunks would show the transformation bar as "ready"/
+        # "transformed" even though he never transformed himself. Each
+        # character's transformation now starts fresh on switch —
+        # TransformationSystem.reset() already existed for exactly this
+        # but was never actually called anywhere.
+        if self.player.transformation:
+            self.player.transformation.reset()
 
         # Restore shared state so the swap is completely seamless to the player.
         for key, value in state.items():
@@ -7880,6 +8352,23 @@ class Game:
             self.title_screen.update(dt)
             self._update_save_flow(dt)
 
+        # Pause menu, character switch menu, and the save-pad flow (the
+        # confirm prompt and the "Saving..." popup) each freeze gameplay
+        # simulation entirely while open — same full freeze the scouter
+        # menu already gets above. Enemies stop moving and attacking,
+        # projectiles/beams/melee attacks stop traveling, NPCs/critters
+        # hold still, gates/doors stop ticking — the whole world holds
+        # perfectly still. Only the active menu's own animation (ticked
+        # just above) keeps advancing. This sits here, before world
+        # simulation begins, rather than threading a check through every
+        # individual update call below — the previous per-call gating
+        # only covered a handful of systems (player movement, XP/timers)
+        # and silently missed enemies, projectiles, beams, and melee
+        # attacks, which kept running while these menus were open.
+        if self.pause_menu.active or self.character_switch_menu.active \
+                or self.save_point_menu.active or self.save_flow_active:
+            return
+
         if self.ui.current_screen == 'game':
             # ── World-map flying sequence ──────────────────────────────────────
             # Once the map-jump fade-out has fired (or is completing), hand off
@@ -7887,6 +8376,44 @@ class Game:
             if self._mjf_state in ('pending_fade_in', 'fade_in', 'flying',
                                    'landing_fade_out', 'landing_fade_in'):
                 self._update_map_flying(dt)
+                return
+
+            # Dev-tool overlays pause simulation when active — bail out early,
+            # before any player-movement/gameplay update runs. This has to sit
+            # here (not further down, after _update_player_movement) — it used
+            # to run after player movement/transformation/gate/door updates,
+            # so e.g. holding Shift+WASD to fast-pan the cutscene editor's
+            # camera was also being read as real player input: Shift set
+            # is_running, WASD moved the (invisible, off-screen) player, and
+            # the run footstep sfx played even though only the dev tool's
+            # camera was meant to move.
+            if self.cutscene_editor.active:
+                self.cutscene_editor.update(dt)
+                return
+            if self.dev_menu.active:
+                self.dev_menu.update(dt)
+                return
+            if self.world_map_editor.active:
+                self.world_map_editor.update(dt)
+                return
+            if self.sprite_editor.active:
+                self.sprite_editor.update(dt)
+                return
+            if self.character_creator.active:
+                self.character_creator.update(dt)
+                return
+            if self.attack_creator.active:
+                self.attack_creator.update(dt)
+                return
+            if self.entity_creator.active:
+                self.entity_creator.update(dt)
+                return
+            if self.item_creator.active:
+                self.item_creator.update(dt)
+                return
+            if self.room_editor.active:
+                self._sync_event_editor_rooms()
+                self.room_editor.update(dt, self._get_logical_mouse_pos())
                 return
 
             # Accumulate play time only while unpaused and no overlay is blocking.
@@ -8175,12 +8702,17 @@ class Game:
             # _update_death_sequence) — the player is already fully locked
             # out via is_dead, but the rest of the world (and whatever
             # killed them) should keep moving right through it.
+            #
+            # Note: enemies are NOT snapped to idle here (see the matching
+            # NPC note above) — enter_idle() also resets facing direction,
+            # so an enemy would visibly flip to face down for the whole
+            # dialogue instead of staying turned toward the player. Since
+            # _update_enemies() is already skipped whenever this branch
+            # runs, the enemy just holds whatever animation/facing it had
+            # the instant the dialogue box opened.
             if (not self.dialogue_box.active or self._death_state == 'box') \
                     and not self.dialogue_choice_menu.active and not self._levelup_active:
                 enemies_defeated_this_frame = self._update_enemies(dt)
-            else:
-                for enemy in self.enemies:
-                    self._freeze_actor_to_idle(enemy)
 
             # Grow/decay the beam now that enemies have moved (and reported
             # any beam-blocking contact) this frame — see _grow_beam()
@@ -8244,15 +8776,20 @@ class Game:
                     self.big_bang_destruction_effects.remove(burst)
 
             # NPC interaction detection — frozen while any dialogue box is
-            # up, same as enemy AI above, so an NPC doesn't wander off or
-            # change facing mid-conversation. Same death-notice exception as
-            # enemy AI above — NPCs keep going while it's up.
+            # up, same as enemy AI above, so an NPC doesn't wander off
+            # mid-conversation. Same death-notice exception as enemy AI
+            # above — NPCs keep going while it's up.
+            #
+            # Note: NPCs are NOT snapped to idle here (unlike enemies below)
+            # — forcing enter_idle() during dialogue also reset the NPC's
+            # facing direction, so the NPC would visibly flip to face down
+            # for the whole conversation instead of staying turned toward
+            # the player. Since npc.update() is already skipped whenever
+            # this branch runs, the NPC just holds whatever animation/
+            # facing it had the instant the dialogue box opened.
             if (not self.dialogue_box.active or self._death_state == 'box') \
                     and not self.dialogue_choice_menu.active and not self._levelup_active:
                 self._update_npcs(dt)
-            else:
-                for npc in self.npcs:
-                    self._freeze_actor_to_idle(npc)
 
             # Ambient wildlife — no interaction detection needed, just tick them.
             # Frozen during the level-up sequence too, so it reads as "everything
@@ -8315,30 +8852,6 @@ class Game:
 
             # Adaptive music — switch between exploration and battle tracks.
             self.sound_manager.update_battle_state(dt, len(self.enemies) > 0)
-
-            # Dev-tool overlays pause simulation when active — bail out early.
-            if self.cutscene_editor.active:
-                self.cutscene_editor.update(dt)
-                return
-            if self.dev_menu.active:
-                self.dev_menu.update(dt)
-                return
-            if self.world_map_editor.active:
-                self.world_map_editor.update(dt)
-                return
-            if self.sprite_editor.active:
-                self.sprite_editor.update(dt)
-                return
-            if self.character_creator.active:
-                self.character_creator.update(dt)
-                return
-            if self.entity_creator.active:
-                self.entity_creator.update(dt)
-                return
-            if self.room_editor.active:
-                self._sync_event_editor_rooms()
-                self.room_editor.update(dt, self._get_logical_mouse_pos())
-                return
 
         if self.cutscene_editor.active:
             self.cutscene_editor.update(dt)
@@ -8481,6 +8994,19 @@ class Game:
                             self._load_room_objects(target_room)
                         self.player.is_transitioning = False
                         self.flag_manager.mark_room_visited(target_room_name)
+
+                        # The player was just teleported straight to the spawn
+                        # point above. Without this, the camera's smooth-follow
+                        # ease (see Camera.update()) would keep chasing from
+                        # wherever it was sitting in the OLD room toward the
+                        # new spawn position over the next several frames —
+                        # visible as the camera visibly sliding/drifting in
+                        # from off-target while the screen fades in, instead
+                        # of already being centered on the player the instant
+                        # the destination room becomes visible. snap() forces
+                        # the very next camera.update() call to position
+                        # instantly instead of easing.
+                        self.camera.snap()
 
                 self.player.is_transitioning = True
                 self.transition_controller.start_transition(
@@ -8892,24 +9418,36 @@ class Game:
                         enemy.last_damage_dealt, variant='enemy',
                     )
 
-            # Zeni drop — enemy.zeni_drop is rolled once in Enemy.take_damage()
-            # at the moment the killing blow lands (see its init comment in
-            # enemy.py), so pickups pop out immediately rather than waiting
-            # for the death animation to finish. Consumed and cleared here
-            # the same frame it's set; spawns world pickups (see ZeniPickup)
-            # that hop away from the player, instead of crediting the player
-            # straight away — collection happens in _update_zeni_pickups.
-            if enemy.zeni_drop:
-                from core.zeni_system import spawn_zeni_pickups
-                _dx = enemy.x - self.player.x
-                _dy = enemy.y - self.player.y
-                _dist = math.hypot(_dx, _dy)
-                _direction = (_dx / _dist, _dy / _dist) if _dist > 0 else (1.0, 0.0)
-                self.zeni_pickups.extend(
-                    spawn_zeni_pickups(enemy.zeni_drop, enemy.x, enemy.y, _direction))
-                enemy.zeni_drop = None
-
             if not enemy.active:
+                # Zeni drop — enemy.zeni_drop is rolled once in
+                # Enemy.take_damage() at the moment the killing blow lands
+                # (see its init comment in enemy.py), but take_damage() only
+                # sets is_dying=True at that point — enemy.active doesn't go
+                # False until the death animation finishes playing, several
+                # frames later. THIS is that frame, and it's also the frame
+                # XP gets granted and any level-up gets triggered below — so
+                # the drop must be queued here, not the instant zeni_drop is
+                # rolled. Queuing it back on the killing-blow frame meant
+                # _levelup_active was still False (no XP granted yet) at
+                # that frame's flush check, so the pickups got released
+                # immediately regardless of an incoming level-up.
+                #
+                # Rather than spawning the world pickups immediately, queue
+                # them in self._pending_zeni_drops: if this kill also
+                # triggers a level-up, the pickups shouldn't pop out and
+                # start hopping/settling while the level-up popup is
+                # covering the screen. They're released together in
+                # _flush_pending_zeni_drops, called just below when no
+                # level-up kicks off, and again from _end_levelup_sequence()
+                # once the last popup closes.
+                if enemy.zeni_drop:
+                    _dx = enemy.x - self.player.x
+                    _dy = enemy.y - self.player.y
+                    _dist = math.hypot(_dx, _dy)
+                    _direction = (_dx / _dist, _dy / _dist) if _dist > 0 else (1.0, 0.0)
+                    self._pending_zeni_drops.append((enemy.zeni_drop, enemy.x, enemy.y, _direction))
+                    enemy.zeni_drop = None
+
                 defeated   += 1
                 xp_reward   = enemy.get_xp_reward(self.game_config)
                 self.player.gain_exp(xp_reward, self.game_config)
@@ -8928,10 +9466,38 @@ class Game:
                 self.flag_manager.mark_enemy_defeated(enemy_id)
                 self.flag_manager.add_variable(f'kill_count:{enemy_id}', 1)
                 self.flag_manager.add_variable(f'kill_count:{enemy_id}:{room_name}', 1)
+                # Flat "kills since entering this room" tally, any enemy
+                # type — reset to 0 by mark_room_visited() on room entry.
+                # Backs the 'room_kills' event-editor condition / the
+                # check_room_kills() helper, for "kill N enemies in this
+                # room" trigger boxes.
+                self.flag_manager.add_variable('room_kill_count', 1)
 
                 self.enemies.remove(enemy)
 
+        # No level-up kicked off from any kill this frame (or the kill
+        # didn't trigger one at all) — release any queued zeni drops right
+        # away instead of holding them for a popup that isn't coming.
+        # _update_enemies() itself is skipped entirely while
+        # _levelup_active is True (see update()'s gating above it), so
+        # there's no risk of a second kill queuing more drops mid-sequence
+        # — the pending list is always flushed here or in
+        # _end_levelup_sequence(), never left to grow unbounded.
+        if not self._levelup_active:
+            self._flush_pending_zeni_drops()
+
         return defeated
+
+    def _flush_pending_zeni_drops(self):
+        if not self._pending_zeni_drops:
+            return
+        import traceback
+        print(f"[zeni] flushing {len(self._pending_zeni_drops)} drop(s), levelup_active={self._levelup_active}")
+        traceback.print_stack(limit=4)
+        from core.zeni_system import spawn_zeni_pickups
+        for zeni_amount, x, y, direction in self._pending_zeni_drops:
+            self.zeni_pickups.extend(spawn_zeni_pickups(zeni_amount, x, y, direction))
+        self._pending_zeni_drops = []
 
     def _update_bombs(self, dt):
         """Poll shooter enemies for new projectile spawns, tick all in-flight bombs,
@@ -9912,6 +10478,30 @@ class Game:
                 'WHITE': (255, 255, 255), 'RED': (220, 60, 60),
                 'CYAN': (80, 220, 220), 'YELLOW': (255, 220, 80),
             }
+
+            # Static room objects (decorations, chests, doors, save points,
+            # etc.) — the normal layer_manager pass above is skipped
+            # entirely while a cutscene is running, which meant these all
+            # silently vanished for the duration of every cutscene instead
+            # of just being occluded/reordered like actors are. Only the
+            # objects that are never actor-driven go here — enemies/npcs/
+            # the player are excluded because a cutscene actor already
+            # takes over (and separately draws) whichever entity it wraps.
+            #
+            # NOTE: this is its own y-sorted pass, drawn before actors —
+            # it is NOT merged into draw_actors()'s own y-sort, so an actor
+            # standing behind a decoration won't occlude quite as precisely
+            # as normal gameplay's single combined sort does. Good enough
+            # to stop the room going bare during a cutscene; a full merge
+            # would mean teaching CutsceneRuntime.draw_actors about
+            # non-actor objects too.
+            self.layer_manager.clear()
+            for obj in (self.destructible_stones + self.decorations + self.level_gates
+                        + self.doors + self.chests + self.flying_pads + self.nimbus_clouds
+                        + self.save_points + self.world_map_objects):
+                self.layer_manager.add_object(obj)
+            self.layer_manager.draw_all(self.logical_surface, self.camera, self.colors, RENDER_SCALE)
+
             self.active_cutscene_runtime.draw_actors(self.logical_surface, self.camera, _cs_colors)
 
             # Scripted attacks spawned via _cutscene_spawn_attack (kiblast/
@@ -9927,6 +10517,97 @@ class Game:
                 melee.draw(self.logical_surface, self.camera, self.colors)
             for beam in self.cutscene_beams:
                 beam.draw(self.logical_surface, self.camera, self.colors)
+
+        # Fog weather is drawn here — after the y-sorted layer (player, decorations,
+        # npcs, etc.) has already been fully drawn — instead of down with the rest
+        # of the weather layer below. Drawing fog now means it paints over the
+        # player (fog reads as ABOVE the player), and we immediately redraw tree
+        # decorations on top of the fog so their canopy still reads as being IN
+        # FRONT of the haze (fog reads as BELOW trees). This does not touch the
+        # actual y-sort between the player and decorations at all — that was
+        # already computed once, above, exactly as before; we're just punting
+        # trees back on top afterward the same way _draw_player_silhouette_if_
+        # occluded() re-derives occlusion from already-sorted state rather than
+        # re-sorting anything. Only 'tree'-type decorations are punched back
+        # through for now — other decoration types (once added) still get
+        # washed out by fog like the player does. Every other weather type
+        # (rain, snow, storm, dust…) still draws later, above everything, since
+        # precipitation falling in front of objects reads correctly there. See
+        # the matching skip_types={'fog'} / weather_type != 'fog' call further
+        # down.
+        _fog_drawn = False
+        if self.active_cutscene_runtime and not self.pause_menu.active:
+            _fog_w, _fog_h = self.logical_surface.get_size()
+            self.active_cutscene_runtime.draw_weather(self.logical_surface, _fog_w, _fog_h, only_types={'fog'})
+            _fog_drawn = True
+        elif (self.room_weather is not None and not self.pause_menu.active
+              and self.room_weather.weather_type == 'fog'):
+            _fog_w, _fog_h = self.logical_surface.get_size()
+            self.room_weather.draw(self.logical_surface, _fog_w, _fog_h)
+            _fog_drawn = True
+
+        if _fog_drawn:
+            def _rect_subtract(base, cut):
+                """base minus its overlap with cut, as a list of 0-4 rects."""
+                if not base.colliderect(cut):
+                    return [base]
+                inter = base.clip(cut)
+                pieces = []
+                if inter.top > base.top:
+                    pieces.append(pygame.Rect(base.left, base.top, base.width, inter.top - base.top))
+                if inter.bottom < base.bottom:
+                    pieces.append(pygame.Rect(base.left, inter.bottom, base.width, base.bottom - inter.bottom))
+                if inter.left > base.left:
+                    pieces.append(pygame.Rect(base.left, inter.top, inter.left - base.left, inter.height))
+                if inter.right < base.right:
+                    pieces.append(pygame.Rect(inter.right, inter.top, base.right - inter.right, inter.height))
+                return pieces
+
+            _player_key = self.player.get_sort_key()
+            _pw = int(self.player.width  * RENDER_SCALE)
+            _ph = int(self.player.height * RENDER_SCALE)
+            _px = int(self.player.x * RENDER_SCALE - self.camera.x)
+            _py = int(self.player.y * RENDER_SCALE - self.camera.y)
+            _player_rect = pygame.Rect(_px - _pw // 2, _py - _ph // 2, _pw, _ph)
+
+            _trees = sorted(
+                (d for d in self.decorations
+                 if d.active and d.frames and d.decoration_type == 'tree'),
+                key=lambda d: d.get_sort_key(),
+            )
+
+            # Behind-tree overlaps are overspill our punch-through caused and need
+            # fixing up. In-front-tree overlaps are legitimate occlusion — the
+            # ghost-silhouette pass further down handles those on its own, so we
+            # must never redraw the player there too.
+            _behind_overlaps = []
+            _infront_overlaps = []
+            for decoration in _trees:
+                scaled, dx, dy = decoration.get_render_info(self.camera, RENDER_SCALE)
+                self.logical_surface.blit(scaled, (dx, dy))
+                tree_rect = pygame.Rect(dx, dy, scaled.get_width(), scaled.get_height())
+                if not tree_rect.colliderect(_player_rect):
+                    continue
+                overlap = tree_rect.clip(_player_rect)
+                if decoration.get_sort_key() < _player_key:
+                    _behind_overlaps.append(overlap)
+                else:
+                    _infront_overlaps.append(overlap)
+
+            if _behind_overlaps:
+                _restore_pieces = _behind_overlaps
+                for _cut in _infront_overlaps:
+                    _next_pieces = []
+                    for _piece in _restore_pieces:
+                        _next_pieces.extend(_rect_subtract(_piece, _cut))
+                    _restore_pieces = _next_pieces
+
+                for _piece in _restore_pieces:
+                    if _piece.width <= 0 or _piece.height <= 0:
+                        continue
+                    self.logical_surface.set_clip(_piece)
+                    self.player.draw(self.logical_surface, self.camera, self.colors)
+                self.logical_surface.set_clip(None)
 
         # Flying pad path previews — editor-only overlay drawn after the layer pass.
         if self.dev_menu.active or self.room_editor.active:
@@ -9957,10 +10638,14 @@ class Game:
         # HUD, menus, and dev overlays.
         # Weather is drawn first (below the dialogue box), then the UI layer which
         # includes the dialogue box, then the colour/invert overlay on top of everything.
+        # Fog is excluded here — it was already drawn earlier, right after the
+        # y-sorted layer (see the only_types={'fog'} call above, just before the
+        # flying-pad path previews).
         if self.active_cutscene_runtime and not self.pause_menu.active:
             w, h = self.logical_surface.get_size()
-            self.active_cutscene_runtime.draw_weather(self.logical_surface, w, h)
-        elif self.room_weather is not None and not self.pause_menu.active:
+            self.active_cutscene_runtime.draw_weather(self.logical_surface, w, h, skip_types={'fog'})
+        elif (self.room_weather is not None and not self.pause_menu.active
+              and self.room_weather.weather_type != 'fog'):
             w, h = self.logical_surface.get_size()
             self.room_weather.draw(self.logical_surface, w, h)
 
@@ -9981,7 +10666,9 @@ class Game:
         # Dev tools — always drawn last so they sit on top of everything.
         self.sprite_editor.draw(self.logical_surface)
         self.character_creator.draw(self.logical_surface, self.dt)
+        self.attack_creator.draw(self.logical_surface, self.dt)
         self.entity_creator.draw(self.logical_surface, self.dt)
+        self.item_creator.draw(self.logical_surface, self.dt)
         self.room_editor.draw(self.logical_surface)
         self.dev_menu.draw(self.logical_surface)
         self.cutscene_editor.draw(self.logical_surface)
@@ -10138,14 +10825,11 @@ class Game:
         if self._dirty_tile_rooms:
             if None in self._dirty_tile_rooms:
                 self._room_tile_surfaces.clear()
-                self._animated_tile_lists.clear()
                 self._dirty_tile_cells.clear()
             else:
                 for room in self._dirty_tile_rooms:
                     self._room_tile_surfaces.pop((room, True),  None)
                     self._room_tile_surfaces.pop((room, False), None)
-                    self._animated_tile_lists.pop((room, True),  None)
-                    self._animated_tile_lists.pop((room, False), None)
                     self._dirty_tile_cells.pop(room, None)
             self._dirty_tile_rooms.clear()
 
@@ -10215,9 +10899,35 @@ class Game:
 
         for bg in (True, False):
             key = (room_name, bg)
-            surf = self._room_tile_surfaces.get(key)
-            if surf is None:
+            plan = self._room_tile_surfaces.get(key)
+            if plan is None:
                 continue  # nothing baked yet for this room/layer — skip
+
+            bg_cell_tiles = [t for t in cell_tiles if (t.layer < 0) == bg]
+
+            def _is_animated(t):
+                t_tileset = tileset_mgr.get_tileset(t.tileset_name)
+                return bool(t_tileset) and t_tileset.is_tile_animated(t.tile_x, t.tile_y)
+
+            # If this edit touches an animated tile, or the room already has
+            # one interleaved into its layer stack, the segment boundaries
+            # from _build_room_tile_surface() may need to move (a tile could
+            # start/stop splitting a static run). Patching a single cached
+            # Surface in place can't express that, so just drop the cached
+            # plan and let it rebuild fresh — same as a full invalidation,
+            # and correctness matters far more than the rebuild cost here
+            # since animated tiles are a small minority of any room.
+            has_anim_segment = any(kind == 'anim' for kind, _ in plan)
+            if has_anim_segment or any(_is_animated(t) for t in bg_cell_tiles):
+                self._room_tile_surfaces.pop(key, None)
+                continue
+
+            # Fast path: no animated tiles involved at all for this layer
+            # group, so the plan is just a single static Surface — patch it
+            # in place exactly as before.
+            surf = plan[0][1] if plan else None
+            if surf is None:
+                continue
 
             # Clear just this cell's real footprint back to transparent.
             rect = pygame.Rect(
@@ -10226,46 +10936,29 @@ class Game:
             )
             surf.fill((0, 0, 0, 0), rect)
 
-            # Drop any stale animated-tile entries touching this region for
-            # this layer group; they'll be re-added below if still present.
-            # Same overlap reasoning as cell_tiles above, rather than an
-            # exact corner match.
-            anim_list = self._animated_tile_lists.get(key)
-            if anim_list:
-                kept_anim = []
-                for t in anim_list:
-                    t_tileset = tileset_mgr.get_tileset(t.tileset_name)
-                    t_w, t_h = (t_tileset.tile_width, t_tileset.tile_height) if t_tileset else (cell_w, cell_h)
-                    overlaps = (
-                        t.x < region_x1 and t.x + t_w > region_x0 and
-                        t.y < region_y1 and t.y + t_h > region_y0
-                    )
-                    if not overlaps:
-                        kept_anim.append(t)
-                self._animated_tile_lists[key] = kept_anim
-
-            for tile in cell_tiles:
-                is_bg_tile = tile.layer < 0
-                if bg != is_bg_tile:
-                    continue
+            for tile in bg_cell_tiles:
                 tileset = tileset_mgr.get_tileset(tile.tileset_name)
                 if not tileset or not tileset.image:
-                    continue
-                if tileset.is_tile_animated(tile.tile_x, tile.tile_y):
-                    self._animated_tile_lists.setdefault(key, []).append(tile)
                     continue
                 scaled = tileset.get_scaled_tile_surface(tile.tile_x, tile.tile_y, RENDER_SCALE)
                 if scaled:
                     surf.blit(scaled, (int(tile.x * RENDER_SCALE), int(tile.y * RENDER_SCALE)))
 
-    def _build_room_tile_surface(self, room_name: str, bg: bool) -> pygame.Surface:
-        """Pre-render all tiles for one layer into a single static Surface.
+    def _build_room_tile_surface(self, room_name: str, bg: bool) -> list:
+        """Pre-render one layer group ('background' bg=True / 'foreground'
+        bg=False) into an ordered list of render segments.
 
-        bg=True  → background layer (tile.layer < 0)
-        bg=False → foreground layer (tile.layer >= 0)
+        Each segment is either:
+          ('static', Surface)   — a run of non-animated tiles baked together
+          ('anim',   [Tile...]) — animated tiles that fall at this point in
+                                   the layer order, drawn fresh every frame
 
-        The resulting surface is in scaled-world-space (world_units × RENDER_SCALE),
-        so each frame only needs a single camera-offset blit — no per-tile work.
+        Static tiles are still merged into as few Surfaces as possible (one
+        camera-offset blit each), but an animated tile splits the run right
+        where it occurs instead of always being pulled out to draw on top of
+        the whole bucket — that's what used to make animated tiles ignore
+        layer order entirely. Drawing the returned segments back in order
+        (see _draw_room_tile_plan) reproduces the tiles' real depth order.
 
         Tile source priority
         ────────────────────
@@ -10277,10 +10970,10 @@ class Game:
         """
         room = self.room_manager.get_room_by_name(room_name)
         if not room:
-            return pygame.Surface((1, 1), pygame.SRCALPHA)
+            return []
 
         if not self.room_editor.tileset_editor:
-            return pygame.Surface((1, 1), pygame.SRCALPHA)
+            return []
 
         # Prefer the editor's live tile list so painted tiles appear immediately.
         te = self.room_editor.tileset_editor
@@ -10290,16 +10983,15 @@ class Game:
             tiles = getattr(room, 'tiles', None) or []
 
         if not tiles:
-            return pygame.Surface((1, 1), pygame.SRCALPHA)
+            return []
 
-        # Allocate a surface the size of the whole room in render-scale space.
-        surf = pygame.Surface(
-            (int(room.width * RENDER_SCALE), int(room.height * RENDER_SCALE)),
-            pygame.SRCALPHA,
-        )
-
+        room_px_w = int(room.width * RENDER_SCALE)
+        room_px_h = int(room.height * RENDER_SCALE)
         tileset_mgr = te.tileset_manager
-        animated_tiles = []
+
+        segments = []
+        current_surf = None
+
         for tile in sorted(tiles, key=lambda t: t.layer):
             is_bg_tile = tile.layer < 0
             if bg != is_bg_tile:
@@ -10308,42 +11000,50 @@ class Game:
             if not tileset or not tileset.image:
                 continue
 
-            # Animated tiles are excluded from the static bake — they're drawn
-            # fresh every frame by _draw_animated_tile_overlay() instead, since
-            # a static surface can't show a cycling frame.
             if tileset.is_tile_animated(tile.tile_x, tile.tile_y):
-                animated_tiles.append(tile)
+                # Close out whatever static run was in progress so it stays
+                # below this animated tile, then either start a new 'anim'
+                # segment or extend the current one if it's already on top
+                # (no static tile has been baked since it started).
+                if current_surf is not None:
+                    segments.append(('static', current_surf))
+                    current_surf = None
+                if segments and segments[-1][0] == 'anim':
+                    segments[-1][1].append(tile)
+                else:
+                    segments.append(('anim', [tile]))
                 continue
 
+            if current_surf is None:
+                current_surf = pygame.Surface((room_px_w, room_px_h), pygame.SRCALPHA)
             scaled = tileset.get_scaled_tile_surface(tile.tile_x, tile.tile_y, RENDER_SCALE)
             if scaled:
-                surf.blit(scaled, (int(tile.x * RENDER_SCALE), int(tile.y * RENDER_SCALE)))
+                current_surf.blit(scaled, (int(tile.x * RENDER_SCALE), int(tile.y * RENDER_SCALE)))
 
-        self._animated_tile_lists[(room_name, bg)] = animated_tiles
-        return surf
+        if current_surf is not None:
+            segments.append(('static', current_surf))
 
-    def _draw_animated_tile_overlay(self, target_surface: 'pygame.Surface', room_name: str,
-                                     bg: bool, camera_x: int, camera_y: int):
-        """Blit the small set of animated tiles (water, flags, rotors, etc.) on top
-        of the baked static surface for this room/layer.
+        return segments
 
-        Kept separate from the baked surface because those tiles cycle frames
-        every tick and can't be pre-rendered once. Cost stays O(animated tiles)
-        regardless of total room tile count, since everything static is still
-        a single cached blit.
+    def _draw_animated_tile_segment(self, target_surface: 'pygame.Surface', tiles: list,
+                                     camera_x: int, camera_y: int):
+        """Blit one interleaved run of animated tiles (see
+        _build_room_tile_surface) at its correct point in the layer stack.
+
+        Kept separate from the baked static surfaces because these tiles
+        cycle frames every tick and can't be pre-rendered once. Cost stays
+        O(animated tiles) regardless of total room tile count, since
+        everything static is still a single cached blit per segment.
         """
-        animated_tiles = self._animated_tile_lists.get((room_name, bg))
-        if not animated_tiles:
-            return
-
         te = getattr(self.room_editor, 'tileset_editor', None)
         if not te:
             return
 
         tick_ms = pygame.time.get_ticks()
         tileset_mgr = te.tileset_manager
+        sw, sh = target_surface.get_size()
 
-        for tile in animated_tiles:
+        for tile in tiles:
             tileset = tileset_mgr.get_tileset(tile.tileset_name)
             if not tileset or not tileset.image:
                 continue
@@ -10353,7 +11053,6 @@ class Game:
 
             scaled_width = tileset.tile_width * RENDER_SCALE
             scaled_height = tileset.tile_height * RENDER_SCALE
-            sw, sh = target_surface.get_size()
             if not (-scaled_width <= screen_x <= sw and -scaled_height <= screen_y <= sh):
                 continue
 
@@ -10361,6 +11060,24 @@ class Game:
             scaled = tileset.get_scaled_tile_surface(disp_x, disp_y, RENDER_SCALE)
             if scaled:
                 target_surface.blit(scaled, (int(screen_x), int(screen_y)))
+
+    def _draw_room_tile_plan(self, target_surface: 'pygame.Surface', room_name: str,
+                              bg: bool, camera_x: int, camera_y: int):
+        """Draw every render segment for a room/layer group back in order.
+
+        This is what actually restores correct depth ordering: each static
+        segment is blitted, then each animated segment right after it, in
+        the same sequence they were baked in — instead of drawing every
+        animated tile in one pass after all of the static content.
+        """
+        plan = self._room_tile_surfaces.get((room_name, bg))
+        if not plan:
+            return
+        for kind, payload in plan:
+            if kind == 'static':
+                target_surface.blit(payload, (-camera_x, -camera_y))
+            else:
+                self._draw_animated_tile_segment(target_surface, payload, camera_x, camera_y)
 
     def _load_region_sheet(self, sprite_name: str, frame_size: int, grid_rows: int = 1, frame_h: int = None):
         """Load (and cache) the frame strip/grid a water/grass/dirt region
@@ -11080,22 +11797,16 @@ class Game:
         key = (room_name, bg)
         if key not in self._room_tile_surfaces:
             self._room_tile_surfaces[key] = self._build_room_tile_surface(room_name, bg)
-        surf = self._room_tile_surfaces[key]
 
         # Animated regions (layer -100) are meant to be the floor everything
-        # else sits on. The baked "bg" surface bundles EVERY negative tile
-        # layer (-100 through -1) into a single blit — there's no per-layer
-        # separation inside it — so the region has to be drawn BEFORE that
-        # surface. Drawing it after (the old order) put it on top of the
-        # whole bg bucket regardless of a tile's individual layer value,
-        # which is why -100/-99 tiles were still ending up underneath it.
+        # else sits on, so they still need to go in before the rest of the
+        # bg group regardless of the (now layer-respecting) segment plan.
         if bg:
             self._draw_animated_regions_overlay(
                 self.logical_surface, room_name, int(self.camera.x), int(self.camera.y)
             )
 
-        self.logical_surface.blit(surf, (-int(self.camera.x), -int(self.camera.y)))
-        self._draw_animated_tile_overlay(
+        self._draw_room_tile_plan(
             self.logical_surface, room_name, bg, int(self.camera.x), int(self.camera.y)
         )
 
@@ -11115,15 +11826,12 @@ class Game:
         key = (room_name, bg)
         if key not in self._room_tile_surfaces:
             self._room_tile_surfaces[key] = self._build_room_tile_surface(room_name, bg)
-        surf = self._room_tile_surfaces.get(key)
-        if surf:
-            # See _draw_room_tiles for why this has to go before the bg blit:
-            # the baked surface bundles every negative tile layer together,
-            # so the region overlay must sit underneath it, not on top.
-            if bg:
-                self._draw_animated_regions_overlay(screen, room_name, camera_x, camera_y)
-            screen.blit(surf, (-camera_x, -camera_y))
-            self._draw_animated_tile_overlay(screen, room_name, bg, camera_x, camera_y)
+
+        # See _draw_room_tiles for why this has to go before the rest of the
+        # bg group: animated regions are the floor everything else sits on.
+        if bg:
+            self._draw_animated_regions_overlay(screen, room_name, camera_x, camera_y)
+        self._draw_room_tile_plan(screen, room_name, bg, camera_x, camera_y)
 
     def _draw_tile(self, tile):
         """Blit a single tile at its world position. Mostly used for one-off debug draws."""

@@ -59,11 +59,13 @@ DECORATION_STYLES = {
         'label': 'Tree',
         'sheet_path': 'assets/objects/decorations/tree/tree.png',
         'frame_w': 80, 'frame_h': 92,
-        'grid_rows': 1, 'frame_count': 3,
+        'grid_rows': 2, 'frame_count': 3,
         'sequence': [1, 2, 1, 2, 1, 2, 3, 2, 3, 2, 3, 2, 1, 1, 2, 3, 2, 1],
         'fps': 3,
         'collision_size': (32, 25),
-        'variants': ['Tree'],
+        # NOTE: label for row 1 is a placeholder — rename once it's clear
+        # what the second row actually depicts.
+        'variants': ['Tree', 'Tree (Variant 2)'],
     },
 }
 

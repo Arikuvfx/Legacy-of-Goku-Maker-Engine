@@ -143,6 +143,24 @@ def check_bar(bar_id, cmp, value):
     return live_check('player_bar_percent', cmp, value, args=[bar_id])
 
 
+def check_room_kills(cmp, value):
+    """Leaf condition comparing how many enemies have been killed since
+    the player last entered the CURRENT room against `value` — backed by
+    the plain 'room_kill_count' variable, which Game bumps on every enemy
+    kill (any type) and mark_room_visited() resets to 0 on room entry
+    (see there). This is what powers a "kill N enemies in this room"
+    trigger box: e.g. check_room_kills('>=', 3).
+
+    Deliberately a flat count across ALL enemy types in the room, unlike
+    the per-enemy-id kill_count:{enemy_id}:{room_name} variables Game
+    also bumps (those back MissionManager's 'kill this specific enemy'
+    objectives) — use variable_is('kill_count:{enemy_id}:{room_name}',
+    cmp, value) directly instead if you need to count just one enemy
+    type.
+    """
+    return variable_is('room_kill_count', cmp, value)
+
+
 def check_boss_hp(boss_id, cmp, value, mode='percent'):
     """Leaf condition comparing a specific boss's HP against `value`.
 
@@ -251,6 +269,16 @@ class FlagManager:
     # Room Transition
     def mark_room_visited(self, room_name):
         self.trigger(f'room_entered:{room_name}')
+        # Reset the "kills since entering this room" counter (see
+        # check_room_kills()/the 'room_kills' event-editor condition
+        # below, and Game's kill bookkeeping which bumps it). Every
+        # room-transition code path already funnels through
+        # mark_room_visited() (normal door, world map, flying pad,
+        # cutscene change_room, ...), so resetting it here — rather than
+        # at each of those call sites — guarantees a fresh count no
+        # matter how the player got into the room, including re-entering
+        # the same room after leaving it.
+        self.variables['room_kill_count'] = 0
 
     def mark_room_exited(self, room_name):
         self.trigger(f'room_exited:{room_name}')

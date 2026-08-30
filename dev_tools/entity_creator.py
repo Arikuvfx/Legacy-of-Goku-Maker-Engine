@@ -139,6 +139,12 @@ DEFAULT_NPC_CONFIG: dict = {
     "npc_type":          "static",   # "static" | "moving"
     "speed":             1.5,
     "interaction_range": 50,
+    # Ground shadow width in px — same slider/units as character_creator.py's
+    # cfg["shadow_size"] (8-96, step 4), just named shadow_width here to match
+    # the enemy config's existing field of the same purpose (see
+    # DEFAULT_ENEMY_CONFIG above). NPC.shadow_size stays the separate legacy
+    # 'small'/'big' sprite-asset toggle and isn't touched by this.
+    "shadow_width":      32,
     "dialogue": {
         "dialogues":        ["Hello, traveler!"],
         "trigger_limit":    -1,      # -1 = unlimited
@@ -385,7 +391,19 @@ def _load_preview_sprite(kind: str, entity_id: str, variant_type: str, entity_ty
         frame_w = min(frame_w, sheet_w)
         frame_h = min(frame_h, sheet_h // 4 if sheet_h >= 4 else sheet_h)
         frame = sheet.subsurface(pygame.Rect(0, 0, frame_w, frame_h))
-        return pygame.transform.scale(frame, (size, size))
+
+        # Scale to fit the (size, size) box while preserving the sprite's
+        # actual aspect ratio, then pad with transparency and centre it —
+        # a straight scale to (size, size) stretched/squashed anything that
+        # wasn't already square (most enemy/npc/boss sheets aren't).
+        scale = min(size / frame_w, size / frame_h)
+        scaled_w = max(1, round(frame_w * scale))
+        scaled_h = max(1, round(frame_h * scale))
+        scaled = pygame.transform.smoothscale(frame, (scaled_w, scaled_h))
+
+        canvas = pygame.Surface((size, size), pygame.SRCALPHA)
+        canvas.blit(scaled, ((size - scaled_w) // 2, (size - scaled_h) // 2))
+        return canvas
     except Exception as e:
         print(f"Error loading preview sprite ({path}): {e}")
         return None
@@ -600,6 +618,12 @@ class EntityEditorPanel:
             w["level"]     = Slider(pygame.Rect(lx, y, 220, Slider.H), 1, 99, self.cfg["level"], step=1); y += ROW_H
             w["xp_reward"] = Slider(pygame.Rect(lx, y, 220, Slider.H), 0, 2000, self.cfg["xp_reward"], step=5); y += ROW_H
 
+            # Ground shadow width — same 8-96/step-4 slider as
+            # character_creator.py's Shadow Size control on the Identity tab.
+            y += 10
+            w["shadow_width"] = Slider(pygame.Rect(lx, y, 220, Slider.H), 8, 96,
+                                        self.cfg.get("shadow_width", 32), step=4); y += ROW_H
+
             # Description sits below the entity_type/category/ai/zeni cycle
             # buttons — _draw_enemy() repositions this rect each frame once
             # it knows exactly how many cycle-button rows are showing
@@ -609,6 +633,12 @@ class EntityEditorPanel:
             y = y0 + 44
             w["speed"] = Slider(pygame.Rect(lx, y, 220, Slider.H), 0.2, 5, self.cfg["speed"], step=0.1, fmt="{:.1f}"); y += ROW_H
             w["interaction_range"] = Slider(pygame.Rect(lx, y, 220, Slider.H), 20, 150, self.cfg["interaction_range"], step=5); y += ROW_H
+
+            # Ground shadow width — same 8-96/step-4 slider as
+            # character_creator.py's Shadow Size control on the Identity tab.
+            y += 10
+            w["shadow_width"] = Slider(pygame.Rect(lx, y, 220, Slider.H), 8, 96,
+                                        self.cfg.get("shadow_width", 32), step=4); y += ROW_H
 
             y += 10
             dlg = self.cfg["dialogue"]
@@ -655,6 +685,8 @@ class EntityEditorPanel:
             self.cfg["speed"] = round(wgt.value, 2)
         elif key == "interaction_range":
             self.cfg["interaction_range"] = int(wgt.value)
+        elif key == "shadow_width":
+            self.cfg["shadow_width"] = int(wgt.value)
         elif key == "dialogue_0":
             dlg = self.cfg["dialogue"]
             if dlg["dialogues"]:
@@ -686,7 +718,9 @@ class EntityEditorPanel:
     #    shooter_style / zeni_pool for enemies; npc_type for NPCs) -----
     def _cycle_rects_enemy(self):
         lx = self.rect.x + 160
-        y = self.rect.y + 16 + 44 + ROW_H * 4 + 10 + ROW_H * 2 + 20
+        # +10 + ROW_H accounts for the Shadow Size slider row inserted
+        # between XP Reward and these cycle buttons (see _build_widgets).
+        y = self.rect.y + 16 + 44 + ROW_H * 4 + 10 + ROW_H * 2 + 10 + ROW_H + 20
         out = []
         rows = [
             ("entity_type",    ["enemy", "boss"]),
@@ -709,7 +743,9 @@ class EntityEditorPanel:
 
     def _cycle_rects_npc(self):
         lx = self.rect.x + 160
-        y = self.rect.y + 16 + 44 + ROW_H * 2 + 10 + (ROW_H + 10) + ROW_H + 20
+        # +ROW_H + 10 accounts for the Shadow Size slider row inserted
+        # between Interact Range and these cycle buttons (see _build_widgets).
+        y = self.rect.y + 16 + 44 + ROW_H * 2 + 10 + ROW_H + 10 + (ROW_H + 10) + ROW_H + 20
         out = []
         for opt in ("static", "moving"):
             r = pygame.Rect(lx, y, 80, 26)
@@ -799,6 +835,10 @@ class EntityEditorPanel:
         draw_label(surf, font_sm, "XP Reward", lx, y + 2)
         self.widgets["xp_reward"].draw(surf, font_sm); y += ROW_H
 
+        y += 10
+        draw_label(surf, font_sm, "Shadow Size", lx, y + 2)
+        self.widgets["shadow_width"].draw(surf, font_sm); y += ROW_H
+
         y += 20
         for rect, val, field in self._cycle_rects_enemy():
             hovered = rect.collidepoint(pygame.mouse.get_pos())
@@ -834,6 +874,10 @@ class EntityEditorPanel:
         self.widgets["speed"].draw(surf, font_sm); y += ROW_H
         draw_label(surf, font_sm, "Interact Range", lx, y + 2)
         self.widgets["interaction_range"].draw(surf, font_sm); y += ROW_H
+
+        y += 10
+        draw_label(surf, font_sm, "Shadow Size", lx, y + 2)
+        self.widgets["shadow_width"].draw(surf, font_sm); y += ROW_H
 
         y += 10
         for rect, val, field in self._cycle_rects_npc():

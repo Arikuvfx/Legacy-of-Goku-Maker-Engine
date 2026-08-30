@@ -35,6 +35,8 @@ class RoomPersistence:
                 'save_points':          self._serialize_save_points(room),
                 'world_map_objects':     self._serialize_world_map_objects(room),
                 'music_track':           getattr(room, 'music_track', ''),
+                'ambient_weather':       getattr(room, 'ambient_weather', 'none'),
+                'can_attack':            getattr(room, 'can_attack', True),
                 'animated_regions':      self._serialize_animated_regions(room),
                 'doors':                 self._serialize_doors(room),
                 'trigger_boxes':         self._serialize_trigger_boxes(room),
@@ -514,6 +516,8 @@ class RoomManagerWithPersistence:
         room.save_points         = self.persistence.deserialize_save_points(data['save_points'])      if data.get('save_points')         else []
         room.world_map_objects   = self.persistence.deserialize_world_map_objects(data['world_map_objects']) if data.get('world_map_objects') else []
         room.music_track         = data.get('music_track', '')
+        room.ambient_weather     = data.get('ambient_weather', 'none')
+        room.can_attack          = data.get('can_attack', True)
         room.animated_regions    = self.persistence.deserialize_animated_regions(data['animated_regions'], room_name) if data.get('animated_regions') else []
         room.doors               = self.persistence.deserialize_doors(data['doors'])              if data.get('doors')               else []
         room.trigger_boxes       = self.persistence.deserialize_trigger_boxes(data['trigger_boxes']) if data.get('trigger_boxes') else []

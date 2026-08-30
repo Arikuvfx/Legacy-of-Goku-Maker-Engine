@@ -14,14 +14,23 @@ class EnergySwordChargeEffect:
     whole build-up-then-pulse sequence always takes the same amount of
     time no matter how many frames the sheet has.
 
-    charging_energy_sword.png is assumed to be a single row of
+    charging_{attack_name}.png is assumed to be a single row of
     frame_width x frame_height frames — there's no per-direction art for
     the charge-up itself (only the spin, afterwards, needs that).
+
+    attack_name/frame_width/frame_height/target_charge_duration/
+    pulse_steps/direction_offsets are all new, optional kwargs added so
+    this can be driven from data (see attacks/attack_config.py's "sword"
+    archetype and dev_tools/attack_creator.py) — same additive convention
+    burning_attack.py's BurningChargeEffect already uses. Every one
+    defaults to exactly the value that used to be hardcoded, so an
+    existing `EnergySwordChargeEffect(player)` call site behaves
+    identically to before.
     """
 
-    SPRITE_PATH = 'assets/sprites/attacks/energy_sword/charging_energy_sword.png'
-
-    def __init__(self, player, scale=RENDER_SCALE, facing=None):
+    def __init__(self, player, scale=RENDER_SCALE, facing=None, attack_name='energy_sword',
+                 frame_width=24, frame_height=27, target_charge_duration=3.0,
+                 pulse_steps=2, direction_offsets=None):
         self.player = player
         # true_direction drives layering (still tucked behind the player
         # when they're actually facing up); direction drives which offset
@@ -33,22 +42,26 @@ class EnergySwordChargeEffect:
         self.active = True
         self.y_sort = False
 
-        self.frame_width = 24
-        self.frame_height = 27
+        self.attack_name = attack_name
+        self.sprite_path = f'assets/sprites/attacks/{self.attack_name}/charging_{self.attack_name}.png'
+
+        self.frame_width = frame_width
+        self.frame_height = frame_height
 
         # Charging the sword should feel deliberate — a few seconds of
         # building energy before the spin kicks off.
-        self.target_charge_duration = 3.0
+        self.target_charge_duration = target_charge_duration
         # Extra time (in frame_duration units) held on the final frame once
         # the run-up finishes, rather than advancing to a new frame — pads
         # out the charge duration without needing more source art.
-        self.pulse_steps = 2
+        self.pulse_steps = pulse_steps
 
         self.frame_duration = 0.1  # placeholder; recalculated in _load_sprite()
 
         # Per-direction fine-tuning, in world units (pre-scale). Tweak
         # these once real art is in so the glow lines up with the hand.
-        self.direction_offsets = {
+        # None (the default) keeps the original hardcoded tuning.
+        self.direction_offsets = direction_offsets if direction_offsets is not None else {
             'down':  (-20, 5),
             'left':  (-20, 5),
             'right': (20, 5),
@@ -68,7 +81,7 @@ class EnergySwordChargeEffect:
 
     def _load_sprite(self):
         try:
-            sheet = pygame.image.load(self.SPRITE_PATH).convert_alpha()
+            sheet = pygame.image.load(self.sprite_path).convert_alpha()
             frames_per_row = sheet.get_width() // self.frame_width
 
             raw_frames = [
@@ -185,29 +198,64 @@ class EnergySwordSpinEffect:
     call enemy.check_collision_with_attack() when can_hit(enemy) is True,
     then call register_hit(enemy) immediately after a successful hit.
 
-    sword_cardinal.png / sword_diagonal.png are each assumed to be a single
-    row of frame_width x frame_height frames, drawn facing 'up' and
-    'up_right' respectively — see the rotation tables above.
+    assets/sprites/attacks/{attack_name}/sword_cardinal.png / sword_diagonal.png
+    are each assumed to be a single row of frame_width x frame_height frames,
+    drawn facing 'up' and 'up_right' respectively — see the rotation
+    tables above.
+
+    attack_name/frame_width/frame_height/hit_radius/octant_offsets/
+    duration/direction_offsets are all new, optional kwargs (same
+    additive convention as EnergySwordChargeEffect above) so this is
+    drivable from attacks/attack_config.py's "sword" archetype.
+    duration=None (the default) keeps the original behavior — player.py
+    owns the timer and is responsible for ending the spin itself. Pass a
+    number of seconds to have this object end itself instead (used by the
+    attack creator's preview, which has no player.py driving it) — see
+    update(). direction_offsets=None (the default) keeps the original
+    behavior — the spin centers exactly on the player with no nudge; pass
+    a {direction: (x, y)} dict (keyed by the player's facing when the
+    spin started, which doesn't change mid-spin) to offset it, same
+    convention EnergySwordChargeEffect's own direction_offsets uses.
+
+    no_release_cancel is read by dev_tools/attack_creator.py's generic
+    fire-release handler: unlike a beam's decay sweep or a chain's
+    stop(), letting go of the button mid-spin should NOT cut it short —
+    the spin is a fixed, free, autoplay beat once it starts (see the
+    class docstring above) — so the creator skips its usual
+    start_decay()/stop() fallback whenever this is True.
     """
 
-    CARDINAL_SPRITE_PATH = 'assets/sprites/attacks/energy_sword/sword_cardinal.png'
-    DIAGONAL_SPRITE_PATH = 'assets/sprites/attacks/energy_sword/sword_diagonal.png'
-
     HIT_RADIUS = 34
+    no_release_cancel = True
 
     def __init__(self, player, scale=RENDER_SCALE, damage=15,
-                 rotations_per_second=2.0, hit_interval=0.2, clockwise=True):
+                 rotations_per_second=2.0, hit_interval=0.2, clockwise=True,
+                 attack_name='energy_sword', frame_width=24, frame_height=32,
+                 hit_radius=None, octant_offsets=None, duration=None,
+                 direction_offsets=None):
         self.player = player
         self.scale = scale
         self.active = True
         self.y_sort = False
 
-        self.frame_width = 24
-        self.frame_height = 32
+        self.attack_name = attack_name
+        self.CARDINAL_SPRITE_PATH = f'assets/sprites/attacks/{self.attack_name}/sword_cardinal.png'
+        self.DIAGONAL_SPRITE_PATH = f'assets/sprites/attacks/{self.attack_name}/sword_diagonal.png'
+
+        self.frame_width = frame_width
+        self.frame_height = frame_height
+        # None keeps the class-level HIT_RADIUS default (34).
+        self.hit_radius = hit_radius if hit_radius is not None else self.HIT_RADIUS
 
         self.damage = damage
         self.hit_interval = hit_interval
         self._enemy_cooldowns = {}  # id(enemy) -> seconds remaining before it can be hit again
+
+        # None (the default) = no self-timeout, matching the original
+        # behavior where player.py's own timer ends the spin. A number
+        # counts down in update() and sets active=False on expiry.
+        self.duration = duration
+        self._elapsed = 0.0
 
         # Which way the spin travels through the 8 octants — set once at
         # construction from the direction the player was facing when they
@@ -229,9 +277,13 @@ class EnergySwordSpinEffect:
         self.local_frame_index = 0
 
         # World position — refreshed every update() so the hitbox and
-        # draw position always track the (possibly moving) player.
-        self.x = player.x
-        self.y = player.y
+        # draw position always track the (possibly moving) player, offset
+        # by direction_offsets below (keyed by the player's facing at
+        # spin time, which doesn't change mid-spin).
+        self.direction_offsets = direction_offsets if direction_offsets is not None else {}
+        ox, oy = self.direction_offsets.get(player.direction, (0, 0))
+        self.x = player.x + ox
+        self.y = player.y + oy
 
         # Per-octant (offset_x, offset_y) in world units, pre-scale, from
         # the player's true position — NOT a shared radius. A single
@@ -242,7 +294,8 @@ class EnergySwordSpinEffect:
         # distances from the player's actual feet/anchor). Tune each
         # octant independently instead so up/down/diagonals can all be
         # made to actually look equidistant against the real art.
-        self.octant_offsets = {
+        # None (the default) keeps the original hardcoded tuning.
+        self.octant_offsets = octant_offsets if octant_offsets is not None else {
             'up':         (0, -25),
             'up_right':   (18, -18),
             'right':      (25, 0),
@@ -313,8 +366,15 @@ class EnergySwordSpinEffect:
         if not self.active:
             return
 
-        self.x = self.player.x
-        self.y = self.player.y
+        if self.duration is not None:
+            self._elapsed += dt
+            if self._elapsed >= self.duration:
+                self.active = False
+                return
+
+        ox, oy = self.direction_offsets.get(self.player.direction, (0, 0))
+        self.x = self.player.x + ox
+        self.y = self.player.y + oy
 
         self.step_timer += dt
         while self.step_timer >= self.step_duration and self.step_duration > 0:
@@ -382,7 +442,7 @@ class EnergySwordSpinEffect:
             # Fallback while art is missing — draw a bright line pointing
             # in the current octant so the spin is still visible/testable.
             vx, vy = _OCTANT_VECTORS.get(octant, (0, -1))
-            length = self.HIT_RADIUS * RENDER_SCALE
+            length = self.hit_radius * RENDER_SCALE
             end = (int(center_x + vx * length), int(center_y + vy * length))
             pygame.draw.line(screen, (140, 220, 255), (int(center_x), int(center_y)), end, 3)
             pygame.draw.circle(screen, (200, 240, 255), (int(center_x), int(center_y)), 4)

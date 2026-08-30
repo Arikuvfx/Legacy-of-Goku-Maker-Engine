@@ -266,6 +266,16 @@ def play_sound(sound_id):
     return {'type': 'play_sound', 'sound_id': sound_id}
 
 
+def toggle_flying_pad(pad_id, mode='enable'):
+    """mode: 'enable' | 'disable'. Flips a FlyingPad's `.active` flag, which
+    already gates both interaction (the player can't stand on an inactive
+    pad to fly) and visibility (FlyingPad.draw() early-returns while
+    inactive) — so this one action covers both. `pad_id` is the label shown
+    on the pad in the dev-mode path-preview overlay (auto-assigned per-room
+    when the pad is placed, e.g. 'room_1_pad_1')."""
+    return {'type': 'toggle_flying_pad', 'pad_id': pad_id, 'mode': mode}
+
+
 def play_character_animation(character_id, animation_id, wait=False):
     """wait=True marks this call blocking — sequence pauses until the
     animation finishes."""
@@ -353,5 +363,5 @@ ACTION_TYPES = [
     'play_character_animation', 'save_game', 'change_map',
     'set_player_location', 'spawn_enemies', 'spawn_npc', 'play_cutscene',
     'quest', 'modify_quest_variable', 'set_custom_variable', 'world_map_location',
-    'mission',
+    'mission', 'toggle_flying_pad',
 ]

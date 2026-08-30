@@ -399,8 +399,8 @@ class TilesetEditor:
             'text_dim': (180, 180, 200),
             'success': (100, 255, 100),
             'danger': (255, 100, 100),
-            'grid': (255, 255, 255, 80),
-            'grid_dim': (255, 255, 255, 30),
+            'grid': (44, 149, 44, 80),
+            'grid_dim': (44, 149, 44, 30),
             'button': (60, 60, 80),
             'button_hover': (80, 80, 100),
             'checkbox': (100, 100, 120)

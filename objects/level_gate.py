@@ -8,13 +8,26 @@ class LevelGate:
     """
     Destructible gate that only breaks if the player meets the level requirement.
     Metal gates are a special case — they unlock on melee instead of shattering.
+
+    Optionally locked to one specific character via `required_character`
+    (a char_id from assets/characters/{id}.json). When set, every other
+    character is blocked exactly like being under-levelled — level alone
+    is no longer enough. The gate's number is drawn in that character's
+    assigned "color" (set in the character creator's Identity tab) so
+    players can tell at a glance who it belongs to; unassigned gates keep
+    the classic gold.
     """
 
-    def __init__(self, x, y, gate_type='stone', required_level=1):
+    def __init__(self, x, y, gate_type='stone', required_level=1, required_character=None):
         self.x = x
         self.y = y
         self.gate_type = gate_type
         self.required_level = required_level
+        # Optional char_id (e.g. "goku") this gate is locked to. When set,
+        # only that specific character can open the gate — everyone else
+        # is blocked regardless of level, same as being under-levelled.
+        # None/'' means "any character", the old behaviour.
+        self.required_character = required_character or None
         self.active = True
 
         gate_configs = {
@@ -59,6 +72,27 @@ class LevelGate:
         # Sorting support
         self.draw_layer = 0
         self.y_sort = True
+
+        # Number color — matches the assigned character's color from the
+        # character creator, so the player can tell at a glance who this
+        # gate belongs to. Falls back to the classic gold when the gate
+        # isn't locked to anyone or the character has no config on disk.
+        self.gate_color = (255, 215, 0)
+        self._load_gate_color()
+
+    def _load_gate_color(self):
+        if not self.required_character:
+            return
+        try:
+            from dev_tools import character_creator
+            cfg = character_creator.load_config(self.required_character)
+            self.gate_color = character_creator.hex_to_rgb(
+                cfg.get('color', '#FFD700'), fallback=(255, 215, 0)
+            )
+        except Exception:
+            # Character config missing/unreadable — keep the gold default
+            # rather than let a bad asset crash gate creation.
+            pass
 
     # ── Sprite loading ────────────────────────────────────────────────────────
 
@@ -149,6 +183,8 @@ class LevelGate:
     # ── Collision / damage ────────────────────────────────────────────────────
 
     def can_be_destroyed_by(self, player) -> bool:
+        if self.required_character and getattr(player, 'character', None) != self.required_character:
+            return False
         return player.level >= self.required_level
 
     def get_collision_rect(self):
@@ -318,7 +354,7 @@ class LevelGate:
         outline = pygame.transform.scale(outline, (int(outline.get_width() * scale), int(outline.get_height() * scale)))
         screen.blit(outline, outline.get_rect(center=(int(sx + 2), int(fy + 2))))
 
-        label = font.render(text, True, (255, 215, 0))
+        label = font.render(text, True, self.gate_color)
         label = pygame.transform.scale(label, (int(label.get_width() * scale), int(label.get_height() * scale)))
         screen.blit(label, label.get_rect(center=(int(sx), int(fy))))
 

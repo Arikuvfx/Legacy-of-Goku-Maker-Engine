@@ -35,9 +35,11 @@ import os
 import sys
 import copy
 import math
+import colorsys
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pygame
 
 # ──────────────────────────────────────────────────────────────────────
@@ -142,6 +144,12 @@ DEFAULT_CONFIG: dict = {
     "description":  "",
     "costume":      "default",
     "shadow_size":  32,
+    # This character's assigned color — used to color-code anything tied
+    # to a specific character in-game (e.g. a level gate's number, so the
+    # player can tell at a glance which character it's locked to). Stored
+    # as a "#RRGGBB" hex string, picked freely via a color wheel in the
+    # Identity tab (see CharacterEditor's hue-strip/SV-square widget).
+    "color":        "#FFD700",
     "stats": {
         "max_hp":   100,
         "max_ki":   100,
@@ -183,6 +191,25 @@ DEFAULT_CONFIG: dict = {
     # folder still exists on disk.
     "removed_transformations": [],
 }
+
+
+def hex_to_rgb(hex_str: str, fallback: tuple = (255, 215, 0)) -> tuple:
+    """'#RRGGBB' -> (r, g, b). Falls back to gold on anything malformed."""
+    try:
+        h = (hex_str or "").lstrip("#")
+        if len(h) != 6:
+            return fallback
+        return tuple(int(h[i:i + 2], 16) for i in (0, 2, 4))
+    except (ValueError, TypeError):
+        return fallback
+
+
+def rgb_to_hex(rgb: tuple) -> str:
+    """(r, g, b) -> '#RRGGBB', used to persist the color wheel's picked
+    color back into cfg['color']."""
+    r, g, b = rgb
+    return "#{:02X}{:02X}{:02X}".format(int(r), int(g), int(b))
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  Helper: filesystem scanning
@@ -383,18 +410,27 @@ def load_attack_icon(attack_id: str, size: int = ATTACK_ICON_SIZE) -> pygame.Sur
     picker.
 
     Priority:
-      1. assets/sprites/attacks/{attack_id}/icon.png — per-attack icon at
-         native pixel size; takes precedence over everything else.
-      2. assets/ui/hud/{attack_id}.png  — dedicated HUD icon, loaded at its
-         *native* pixel size (no scaling).
+      1. assets/sprites/attacks/{attack_id}/icon.png — per-attack icon,
+         enlarged up to `size` if the source art is smaller (see below).
+      2. assets/ui/hud/{attack_id}.png  — dedicated HUD icon, same
+         enlarge-if-small treatment.
       3. assets/sprites/attacks/{attack_id}/ — sprite-sheet fallback: grab the
          top-left frame and scale it to `size` (same as before).
       4. Placeholder tile when nothing is found.
+
+    Icons from #1/#2 are loaded at native resolution first, then — if
+    smaller than `size` in both dimensions — scaled UP (never down) to fit
+    within a `size` x `size` box, aspect ratio preserved. Existing attack
+    art (ki_blast.png, begin_kamehameha.png, ...) is 16x16, so without this
+    the picker showed icons that were basically invisible. Scaling uses
+    pygame.transform.scale (nearest-neighbor), not smoothscale, so the
+    pixel art stays crisp instead of going blurry.
     """
     if attack_id in _ATTACK_ICON_CACHE:
         return _ATTACK_ICON_CACHE[attack_id]
 
     icon: Optional[pygame.Surface] = None
+    native = False  # True if icon came from #1/#2 (needs the enlarge step below)
 
     # ── 1. Per-attack icon.png (native resolution) ─────────────────────
     # assets/sprites/attacks/{attack_id}/icon.png takes top priority so
@@ -403,6 +439,7 @@ def load_attack_icon(attack_id: str, size: int = ATTACK_ICON_SIZE) -> pygame.Sur
     if sprite_icon_path.exists():
         try:
             icon = pygame.image.load(str(sprite_icon_path)).convert_alpha()
+            native = True
         except Exception:
             icon = None
 
@@ -412,6 +449,7 @@ def load_attack_icon(attack_id: str, size: int = ATTACK_ICON_SIZE) -> pygame.Sur
         if hud_path.exists():
             try:
                 icon = pygame.image.load(str(hud_path)).convert_alpha()
+                native = True
             except Exception:
                 icon = None
 
@@ -450,6 +488,20 @@ def load_attack_icon(attack_id: str, size: int = ATTACK_ICON_SIZE) -> pygame.Sur
         label = (attack_id[:1] or "?").upper()
         txt = ph_font.render(label, True, C_TEXT_DIM)
         icon.blit(txt, txt.get_rect(center=icon.get_rect().center))
+
+    # ── Enlarge small native icons ──────────────────────────────────────
+    # #1/#2 above load at whatever resolution the source PNG happens to be.
+    # If that's smaller than `size` in both dimensions (e.g. the game's
+    # 16x16 attack frames reused as an icon), bump it up so it isn't shown
+    # at a barely-visible size in the picker. Only ever scales UP — HUD art
+    # already at or above `size` is left exactly as-is.
+    if icon is not None and native:
+        w, h = icon.get_width(), icon.get_height()
+        if 0 < w < size and 0 < h < size:
+            factor = size / max(w, h)
+            icon = pygame.transform.scale(
+                icon, (max(1, round(w * factor)), max(1, round(h * factor)))
+            )
 
     _ATTACK_ICON_CACHE[attack_id] = icon
     return icon
@@ -538,6 +590,23 @@ def load_config(char_id: str) -> dict:
     cfg = copy.deepcopy(DEFAULT_CONFIG)
     cfg["id"] = char_id
     cfg["display_name"] = char_id.replace("_", " ").title()
+    # DEFAULT_CONFIG["costume"] is just the literal placeholder string
+    # "default" — it doesn't correspond to any real costume folder on disk.
+    # The character-creator UI itself never leaks this (CharacterEditor
+    # falls back to costumes[0] whenever cfg["costume"] isn't an actual
+    # discovered costume), but callers that use load_config() directly at
+    # runtime — Game._switch_character(), TransformationSystem.
+    # _resolve_transform_costume(), _refresh_transformation_gate() — take
+    # cfg["costume"] at face value. For a character that's never been
+    # opened/saved in the character creator (e.g. just dropped in as a new
+    # sprite folder), that left self.player.costume set to "default",
+    # which doesn't exist as a folder — so any transformation registered
+    # under the real costume (e.g. "base/transformations/ssj") could never
+    # be found, and pressing the transform key silently did nothing.
+    # Seed it with the character's actual first discovered costume instead,
+    # so a never-saved character behaves the same as a saved one.
+    real_costumes = discover_costumes(char_id)
+    cfg["costume"] = real_costumes[0] if real_costumes else "base"
     return cfg
 
 
@@ -753,6 +822,29 @@ def sync_transformations(cfg: dict, costumes: list[str],
             "defense_mult":  1.0,
             "speed_mult":    1.0,
             "ki_drain":      0.0,
+            # Custom ki-bar color override (see CharacterEditor's Ki Bar
+            # Color picker on the Transformations tab). None = use the
+            # sprite's baked-in transformed_ki_bar.png colors as before.
+            "ki_color":      None,
+            # Whether the transformed-ki charge bar shows/fills while the
+            # transform animation plays (see CharacterEditor's "Show Charge
+            # Bar" checkbox). True = historical behavior. False = the
+            # animation plays straight through at its own pace with no bar.
+            "ki_bar_enabled":  True,
+            # Seconds the charge bar takes to fill before the transform
+            # completes (see CharacterEditor's "Charge Duration" slider).
+            # None = use TransformationSystem's built-in default (~3.75s,
+            # matched to the stock 'transform' sprite sheet's own length).
+            # Ignored entirely when ki_bar_enabled is False.
+            "charge_duration": None,
+            # Prerequisite tier — the form-name (e.g. "ssj") of another
+            # transformation on this SAME costume that the player must
+            # already be transformed into before this one becomes
+            # reachable (see CharacterEditor's "Requires" picker on the
+            # Transformations tab). None = a base-level form, reachable
+            # directly from the untransformed state like every
+            # transformation before this feature existed.
+            "requires": None,
         })
         used.add(costume_path)
         added = True
@@ -1501,6 +1593,20 @@ class CharacterEditor:
         y += row_h
         self.costume_idx   = costumes.index(cfg["costume"]) if cfg["costume"] in costumes else 0
 
+        # Gate/identity color — picked via a hue-strip + saturation/value
+        # square (see _draw_identity), same widget style as the animated
+        # region color picker in dev_tools/object_editor.py. Rects are
+        # recomputed each draw (position depends on layout) and hit-tested
+        # in handle_event; the hue-strip surface is cached since it never
+        # changes, the SV-square surface is cached per-hue.
+        self.selected_color   = cfg.get("color", "#FFD700")
+        self._color_hue_rect: pygame.Rect | None = None
+        self._color_sv_rect:  pygame.Rect | None = None
+        self._color_hue_dragging = False
+        self._color_sv_dragging  = False
+        self._hue_strip_cache = None   # (w, h) -> surface
+        self._sv_square_cache = None   # (hue, w, h) -> surface
+
         # Description box — rect is a placeholder here; _draw_identity()
         # repositions it every frame based on where the portrait preview
         # ends up, same pattern as name_input/shadow_slider above.
@@ -1586,6 +1692,37 @@ class CharacterEditor:
         self.transform_costume_idx  = 0
         self.transform_name_input: Optional[TextInput] = None
         self.transform_sliders: dict[str, Slider] = {}
+
+        # Per-form ki-bar color override (hue-strip + SV-square picker,
+        # same widget as the Identity tab's Gate Color). "enabled" tracks
+        # whether this form uses a custom color at all — unchecked means
+        # ki_color stays None in cfg and the original transformed_ki_bar.png
+        # art is used untouched, so existing/unconfigured forms don't
+        # silently get recolored the moment the file is saved.
+        self.transform_ki_color_enabled = False
+        self.transform_ki_color         = "#FFD700"
+        self._tf_ki_color_checkbox_rect: Optional[pygame.Rect] = None
+        self._tf_color_hue_rect: Optional[pygame.Rect] = None
+        self._tf_color_sv_rect:  Optional[pygame.Rect] = None
+        self._tf_color_hue_dragging = False
+        self._tf_color_sv_dragging  = False
+
+        # Whether this form shows/fills the transformed-ki charge bar while
+        # its transform animation plays. Checked (True) by default so
+        # existing/unconfigured forms keep the historical behavior.
+        # Unchecking it lets the transform animation just play straight
+        # through at its own natural pace, with no bar and no fixed
+        # duration — the player lands in the transformed state the instant
+        # the animation finishes.
+        self.transform_ki_bar_enabled = True
+        self._tf_ki_bar_enabled_checkbox_rect: Optional[pygame.Rect] = None
+
+        # Prerequisite tier for the selected transformation — a form-name
+        # (e.g. "ssj") from this same costume's OTHER transformations, or
+        # None for a base-level form reachable directly from untransformed.
+        # See the "Requires" stepper on the Transformations tab.
+        self.transform_requires: Optional[str] = None
+
         self._load_transform_widgets()
 
         # ── Identity tab: portrait cycle ─────────────────────────────
@@ -1595,10 +1732,164 @@ class CharacterEditor:
         self.portrait_cache: dict[tuple[str, str], Optional[pygame.Surface]] = {}
         self.portrait_cycle_timer = 0.0
 
+    # ── Assigned color (hue-strip + SV-square picker) ────────────────
+    # Same widget style as the animated-region color picker in
+    # dev_tools/object_editor.py — a vertical rainbow hue strip plus a
+    # saturation/value square for the chosen hue, so the player can pick
+    # any RGB color instead of a fixed swatch set.
+    def _selected_color_hsv(self) -> tuple:
+        """Current self.selected_color (a '#RRGGBB' string) as (h, s, v),
+        each in 0-1."""
+        r, g, b = hex_to_rgb(self.selected_color)
+        return colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+
+    def _set_color_hue_from_mouse_y(self, mouse_y: int, hue_rect: pygame.Rect) -> None:
+        """Vertical hue strip: y position maps to hue 0-1. Keeps the
+        current saturation/value, only the hue changes."""
+        _, s, v = self._selected_color_hsv()
+        frac = (mouse_y - hue_rect.top) / hue_rect.height
+        hue = max(0.0, min(1.0, frac))
+        r, g, b = colorsys.hsv_to_rgb(hue, s, v)
+        self.selected_color = rgb_to_hex((round(r * 255), round(g * 255), round(b * 255)))
+
+    def _set_color_sv_from_mouse(self, mouse_pos: tuple, sv_rect: pygame.Rect) -> None:
+        """Saturation/value square: x -> saturation 0-1, y -> value 1-0
+        (top of the square is brightest). Keeps the current hue."""
+        h, _, _ = self._selected_color_hsv()
+        s = max(0.0, min(1.0, (mouse_pos[0] - sv_rect.left) / sv_rect.width))
+        v = max(0.0, min(1.0, 1 - (mouse_pos[1] - sv_rect.top) / sv_rect.height))
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+        self.selected_color = rgb_to_hex((round(r * 255), round(g * 255), round(b * 255)))
+
+    @staticmethod
+    def _hsv_to_rgb_grid(hue, s_grid, v_grid):
+        """Vectorized HSV->RGB for arrays of s/v sharing one fixed hue.
+        Returns an (..., 3) float array in 0-1."""
+        h6 = hue * 6.0
+        sector = int(h6) % 6
+        factor = 1 - abs(h6 % 2 - 1)
+
+        c_grid = v_grid * s_grid
+        x_grid = c_grid * factor
+        m_grid = v_grid - c_grid
+        zero = np.zeros_like(c_grid)
+
+        order = {
+            0: (c_grid, x_grid, zero),
+            1: (x_grid, c_grid, zero),
+            2: (zero, c_grid, x_grid),
+            3: (zero, x_grid, c_grid),
+            4: (x_grid, zero, c_grid),
+            5: (c_grid, zero, x_grid),
+        }[sector]
+        return np.stack([order[0] + m_grid, order[1] + m_grid, order[2] + m_grid], axis=-1)
+
+    def _get_hue_strip_surface(self, w: int, h: int) -> pygame.Surface:
+        """Vertical rainbow gradient (full saturation/value, hue 0-1 top to
+        bottom). Doesn't depend on the current color, so it's computed once
+        and reused for the lifetime of this editor."""
+        cache = self._hue_strip_cache
+        if cache and cache[0] == (w, h):
+            return cache[1]
+
+        hues = np.linspace(0.0, 1.0, h, dtype=np.float32)
+        column = np.zeros((h, 3), dtype=np.float32)
+        for i, hue in enumerate(hues):
+            column[i] = self._hsv_to_rgb_grid(float(hue), np.float32(1.0), np.float32(1.0))
+        column = np.clip(column * 255, 0, 255).astype(np.uint8)
+
+        arr = np.tile(column[np.newaxis, :, :], (w, 1, 1))  # (w, h, 3) for surfarray
+        surf = pygame.surfarray.make_surface(arr)
+        self._hue_strip_cache = ((w, h), surf)
+        return surf
+
+    def _get_sv_square_surface(self, hue: float, w: int, h: int) -> pygame.Surface:
+        """Saturation (x, 0-1) / value (y, 1-0 top-to-bottom) gradient for a
+        fixed hue. Recomputed only when the hue actually changes."""
+        cache = self._sv_square_cache
+        if cache and abs(cache[0][0] - hue) < 1e-6 and cache[0][1] == w and cache[0][2] == h:
+            return cache[1]
+
+        s = np.linspace(0.0, 1.0, w, dtype=np.float32)
+        v = np.linspace(1.0, 0.0, h, dtype=np.float32)
+        s_grid, v_grid = np.meshgrid(s, v, indexing='xy')  # shape (h, w)
+
+        rgb = self._hsv_to_rgb_grid(hue, s_grid, v_grid)
+        rgb = np.clip(rgb * 255, 0, 255).astype(np.uint8)
+        rgb = np.transpose(rgb, (1, 0, 2))  # (w, h, 3) for surfarray
+
+        surf = pygame.surfarray.make_surface(rgb)
+        self._sv_square_cache = ((hue, w, h), surf)
+        return surf
+
+    # ── Transformation ki-bar color (hue-strip + SV-square picker) ───
+    # Same widget/math as the Identity tab's Gate Color picker above, but
+    # operating on self.transform_ki_color (per-form, reloaded by
+    # _load_transform_widgets whenever the selected transformation changes)
+    # instead of the single per-character self.selected_color.
+    def _ki_color_hsv(self) -> tuple:
+        r, g, b = hex_to_rgb(self.transform_ki_color)
+        return colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+
+    def _set_ki_color_hue_from_mouse_y(self, mouse_y: int, hue_rect: pygame.Rect) -> None:
+        _, s, v = self._ki_color_hsv()
+        frac = (mouse_y - hue_rect.top) / hue_rect.height
+        hue = max(0.0, min(1.0, frac))
+        r, g, b = colorsys.hsv_to_rgb(hue, s, v)
+        self.transform_ki_color = rgb_to_hex((round(r * 255), round(g * 255), round(b * 255)))
+
+    def _set_ki_color_sv_from_mouse(self, mouse_pos: tuple, sv_rect: pygame.Rect) -> None:
+        h, _, _ = self._ki_color_hsv()
+        s = max(0.0, min(1.0, (mouse_pos[0] - sv_rect.left) / sv_rect.width))
+        v = max(0.0, min(1.0, 1 - (mouse_pos[1] - sv_rect.top) / sv_rect.height))
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+        self.transform_ki_color = rgb_to_hex((round(r * 255), round(g * 255), round(b * 255)))
+
     # ── Transformation scoping ───────────────────────────────────────
     def _current_costume(self) -> str:
         """The base costume currently selected on the Identity tab."""
         return self.costumes[self.costume_idx] if self.costumes else "base"
+
+    def _form_name_of(self, tf: dict) -> str:
+        """Folder form-name for a transformation entry, parsed from its
+        'costume' field (e.g. 'base/transformations/ssj' -> 'ssj'). This is
+        the same identifier game.py's unlocked_transformations / ki-mode
+        slots / TransformationSystem's "requires" gating all use — keep in
+        sync with Game._transformation_form_id()."""
+        costume = tf.get("costume", "")
+        if "/transformations/" in costume:
+            return costume.split("/transformations/")[-1]
+        return tf.get("id", "")
+
+    def _requires_candidates(self) -> list[str]:
+        """Form-names eligible to be picked as the currently-selected
+        transformation's prerequisite via the "Requires" stepper: every
+        OTHER transformation on this costume, except ones that already
+        (directly or transitively) require the current one — picking one
+        of those would create a dependency cycle (A requires B requires A),
+        which TransformationSystem has no way to ever satisfy."""
+        visible = self.visible_transformations()
+        if not (0 <= self.transform_idx < len(visible)):
+            return []
+        current_form = self._form_name_of(visible[self.transform_idx])
+        by_form = {self._form_name_of(t): t for t in visible}
+
+        def depends_on_current(form_name: str, seen: set) -> bool:
+            if form_name in seen:
+                return False  # already-cyclic elsewhere; don't loop forever
+            seen.add(form_name)
+            tf = by_form.get(form_name)
+            req = tf.get("requires") if tf else None
+            if not req:
+                return False
+            if req == current_form:
+                return True
+            return depends_on_current(req, seen)
+
+        return [
+            form for form in by_form
+            if form != current_form and not depends_on_current(form, set())
+        ]
 
     def _transforms_for_costume(self, costume: str) -> list[dict]:
         """Transformations that belong to `costume` — i.e. entries stored as
@@ -1624,9 +1915,29 @@ class CharacterEditor:
         if not (0 <= self.transform_idx < len(visible)):
             self.transform_name_input = None
             self.transform_sliders    = {}
+            self.transform_ki_color_enabled = False
+            self.transform_ki_color         = "#FFD700"
+            self.transform_ki_bar_enabled   = True
+            self.transform_requires         = None
             return
 
         tf = visible[self.transform_idx]
+
+        # Prerequisite tier — None means base-level (reachable from
+        # untransformed, same as every form before this feature existed).
+        self.transform_requires = tf.get("requires")
+
+        # Ki bar color override — None means "not customized", keep the
+        # checkbox unchecked but still seed the picker with a sensible
+        # starting color in case the user turns it on.
+        saved_ki_color = tf.get("ki_color")
+        self.transform_ki_color_enabled = saved_ki_color is not None
+        self.transform_ki_color         = saved_ki_color or "#FFD700"
+
+        # Whether the charge bar is shown/filled for this form. Missing
+        # entries (old configs saved before this feature existed) default
+        # to True, same as TransformationSystem._resolve_transform_ki_bar_enabled.
+        self.transform_ki_bar_enabled = tf.get("ki_bar_enabled", True)
         self.transform_name_input = TextInput(
             pygame.Rect(fx, 0, fw, 28), tf.get("display_name", "")
         )
@@ -1651,6 +1962,14 @@ class CharacterEditor:
                                     0.5, 5.0, tf.get("speed_mult", 1.0), 0.05, "{:.2f}x"),
             "ki_drain":     Slider(pygame.Rect(fx, 0, fw - 50, 20),
                                     0.0, 50.0, tf.get("ki_drain", 0.0), 0.5, "{:.1f}/s"),
+            # How long the charge bar takes to fill before the transform
+            # completes. Only meaningful (and only drawn) while "Show
+            # Charge Bar" is checked — see draw()/handle_event() below.
+            # Seeded from the saved value, or the built-in ~3.75s default
+            # (matching TransformationSystem.DEFAULT_TRANSFORM_ANIMATION_DURATION)
+            # if this form hasn't customized it yet.
+            "charge_duration": Slider(pygame.Rect(fx, 0, fw - 50, 20),
+                                    0.5, 10.0, tf.get("charge_duration") or 3.75, 0.05, "{:.2f}s"),
         }
 
     # ── Animation grid reload ──────────────────────────────────────
@@ -1702,6 +2021,7 @@ class CharacterEditor:
         self.cfg["description"]  = self.desc_input.value.strip()
         self.cfg["costume"]      = self.costumes[self.costume_idx]
         self.cfg["shadow_size"]  = int(self.shadow_slider.value)
+        self.cfg["color"]       = self.selected_color
 
         for key, sl in self.stat_sliders.items():
             self.cfg["stats"][key] = int(sl.value)
@@ -1728,14 +2048,42 @@ class CharacterEditor:
                 tf.setdefault("costume", f"{base_costume}/transformations/{tf.get('id', '')}")
             for key, sl in self.transform_sliders.items():
                 tf[key] = round(sl.value, 2) if key != "ki_drain" else round(sl.value, 1)
+            tf["ki_color"] = self.transform_ki_color if self.transform_ki_color_enabled else None
+            tf["ki_bar_enabled"] = self.transform_ki_bar_enabled
+            tf["requires"] = self.transform_requires
 
     # ── Event routing ──────────────────────────────────────────────
     def handle_event(self, event: pygame.event.Event, active_tab: int) -> None:
         changed = False
+        # Unconditional so a drag can't get stuck 'active' if the user
+        # switches tabs mid-drag (mirrors object_editor.py's region color
+        # picker, which resets its drag flags the same way).
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self._color_sv_dragging = False
+            self._color_hue_dragging = False
+            self._tf_color_sv_dragging = False
+            self._tf_color_hue_dragging = False
         if active_tab == TAB_IDENTITY:
             changed |= self.name_input.handle_event(event)
             changed |= self.desc_input.handle_event(event)
             changed |= self.shadow_slider.handle_event(event)
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if self._color_sv_rect and self._color_sv_rect.collidepoint(event.pos):
+                    self._color_sv_dragging = True
+                    self._set_color_sv_from_mouse(event.pos, self._color_sv_rect)
+                    changed = True
+                elif self._color_hue_rect and self._color_hue_rect.collidepoint(event.pos):
+                    self._color_hue_dragging = True
+                    self._set_color_hue_from_mouse_y(event.pos[1], self._color_hue_rect)
+                    changed = True
+            elif event.type == pygame.MOUSEMOTION and self._color_sv_dragging:
+                if self._color_sv_rect:
+                    self._set_color_sv_from_mouse(event.pos, self._color_sv_rect)
+                    changed = True
+            elif event.type == pygame.MOUSEMOTION and self._color_hue_dragging:
+                if self._color_hue_rect:
+                    self._set_color_hue_from_mouse_y(event.pos[1], self._color_hue_rect)
+                    changed = True
         elif active_tab == TAB_STATS:
             for sl in self.stat_sliders.values():
                 changed |= sl.handle_event(event)
@@ -1745,8 +2093,39 @@ class CharacterEditor:
         elif active_tab == TAB_TRANSFORM:
             if self.transform_name_input:
                 changed |= self.transform_name_input.handle_event(event)
-            for sl in self.transform_sliders.values():
+            for key, sl in self.transform_sliders.items():
+                # The charge-duration slider is only drawn (and hit-testable)
+                # while "Show Charge Bar" is checked — see draw(). Skip it
+                # here too so a hidden slider can't swallow clicks meant for
+                # whatever's drawn in its place.
+                if key == "charge_duration" and not self.transform_ki_bar_enabled:
+                    continue
                 changed |= sl.handle_event(event)
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if self._tf_ki_bar_enabled_checkbox_rect and self._tf_ki_bar_enabled_checkbox_rect.collidepoint(event.pos):
+                    self.transform_ki_bar_enabled = not self.transform_ki_bar_enabled
+                    changed = True
+                elif self._tf_ki_color_checkbox_rect and self._tf_ki_color_checkbox_rect.collidepoint(event.pos):
+                    self.transform_ki_color_enabled = not self.transform_ki_color_enabled
+                    changed = True
+                elif (self.transform_ki_color_enabled and self._tf_color_sv_rect
+                      and self._tf_color_sv_rect.collidepoint(event.pos)):
+                    self._tf_color_sv_dragging = True
+                    self._set_ki_color_sv_from_mouse(event.pos, self._tf_color_sv_rect)
+                    changed = True
+                elif (self.transform_ki_color_enabled and self._tf_color_hue_rect
+                      and self._tf_color_hue_rect.collidepoint(event.pos)):
+                    self._tf_color_hue_dragging = True
+                    self._set_ki_color_hue_from_mouse_y(event.pos[1], self._tf_color_hue_rect)
+                    changed = True
+            elif event.type == pygame.MOUSEMOTION and self._tf_color_sv_dragging:
+                if self._tf_color_sv_rect:
+                    self._set_ki_color_sv_from_mouse(event.pos, self._tf_color_sv_rect)
+                    changed = True
+            elif event.type == pygame.MOUSEMOTION and self._tf_color_hue_dragging:
+                if self._tf_color_hue_rect:
+                    self._set_ki_color_hue_from_mouse_y(event.pos[1], self._tf_color_hue_rect)
+                    changed = True
         elif active_tab == TAB_PREVIEW:
             self.anim_grid.handle_event(event)
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
@@ -2025,6 +2404,51 @@ class CharacterEditor:
         self.shadow_slider.draw(surf, font_sm)
         y += row_h
 
+        # ── Assigned color — hue-strip + saturation/value picker. Used to
+        # color-code anything tied to this specific character in-game, e.g.
+        # a level gate locked to them shows its number in this color.
+        # Same widget style as the animated-region color picker in
+        # dev_tools/object_editor.py: SV square for the current hue, plus a
+        # vertical hue strip. Rects are recomputed each draw (position
+        # depends on layout) and stored for handle_event's hit-testing.
+        draw_label(surf, font_sm, "Gate Color", lx, y + 6)
+
+        preview_rect = pygame.Rect(fx, y + 2, 30, 22)
+        pygame.draw.rect(surf, hex_to_rgb(self.selected_color), preview_rect, border_radius=4)
+        pygame.draw.rect(surf, C_BORDER, preview_rect, 1, border_radius=4)
+        hex_lbl = render_text_cached(font_sm, self.selected_color.upper(), C_TEXT_DIM)
+        surf.blit(hex_lbl, (preview_rect.right + 10, y + 7))
+        y += 32
+
+        hue, sat, val = self._selected_color_hsv()
+        sv_w, sv_h, hue_w, gap = 130, 90, 18, 10
+
+        sv_rect = pygame.Rect(fx, y, sv_w, sv_h)
+        sv_surf = self._get_sv_square_surface(hue, sv_w, sv_h)
+        surf.blit(sv_surf, sv_rect.topleft)
+        pygame.draw.rect(surf, C_BORDER, sv_rect, 1)
+
+        # Cursor ring — white on dark colors, black on light ones so it's
+        # always visible against whatever's under it.
+        sv_cursor_x = sv_rect.left + int(sat * sv_rect.width)
+        sv_cursor_y = sv_rect.top + int((1 - val) * sv_rect.height)
+        ring_color = (255, 255, 255) if val < 0.6 else (0, 0, 0)
+        pygame.draw.circle(surf, ring_color, (sv_cursor_x, sv_cursor_y), 6, 2)
+
+        hue_rect = pygame.Rect(sv_rect.right + gap, y, hue_w, sv_h)
+        hue_surf = self._get_hue_strip_surface(hue_w, sv_h)
+        surf.blit(hue_surf, hue_rect.topleft)
+        pygame.draw.rect(surf, C_BORDER, hue_rect, 1)
+
+        hue_marker_y = hue_rect.top + int(hue * hue_rect.height)
+        marker_rect = pygame.Rect(hue_rect.left - 2, hue_marker_y - 2, hue_rect.width + 4, 4)
+        pygame.draw.rect(surf, (255, 255, 255), marker_rect, 1)
+
+        self._color_sv_rect  = sv_rect
+        self._color_hue_rect = hue_rect
+
+        y += sv_h + 14
+
         # ── Description — freeform prose shown in the Scouter Data panel
         # (see ui/scouter_menu.py's _get_entity_description). Lives on the
         # Identity tab, next to the other "who is this character" fields,
@@ -2079,8 +2503,10 @@ class CharacterEditor:
         when nothing has actually moved.
 
         Icon size is derived from the actual pixel dimensions of the first
-        available icon (HUD PNGs are already sized for display and must not
-        be scaled), falling back to ATTACK_ICON_SIZE if nothing is loaded yet.
+        available icon — load_attack_icon() already enlarges small native
+        icons up to a sane display size, so what we get back here is
+        picker-ready — falling back to ATTACK_ICON_SIZE if nothing is
+        loaded yet.
         """
         cache_key = (tuple(self.available_attacks), self.panel.w, self._attack_grid_y0)
         if getattr(self, "_attack_grid_cache_key", None) == cache_key:
@@ -2170,7 +2596,8 @@ class CharacterEditor:
             selected = aid in self.equipped_attacks
             hovered  = icon_rect.collidepoint(mx, my)
 
-            # Load at native size — HUD icons are already display-ready.
+            # load_attack_icon() already enlarges small native icons, so
+            # this is display-ready regardless of the source art's size.
             icon = load_attack_icon(aid)
             # Re-use the icon's actual dimensions for the drawn rect in case
             # icons have varying sizes (future-proofing).
@@ -2260,6 +2687,31 @@ class CharacterEditor:
         surf.blit(costume_lbl, (fx + 34, y + 5))
         y += row_h
 
+        # ── Requires — the prerequisite tier this form needs before it can
+        # be transformed into (e.g. SSJ3 requiring SSJ). None (default)
+        # means it's reachable directly from the untransformed state, same
+        # as every transformation before this feature existed. Once set,
+        # this form gets its own slot in the TAB ki-mode cycle instead of
+        # sharing the costume's main transform slot — see game.py's
+        # _transform_mode_slots() — and pressing the transform key on that
+        # slot only works while the player is currently in the required
+        # form.
+        draw_label(surf, font_sm, "Requires", lx, y + 6)
+        req_arr_l = pygame.Rect(fx,       y + 2, 26, 26)
+        req_arr_r = pygame.Rect(fx + 160, y + 2, 26, 26)
+        req_candidates = self._requires_candidates()
+        draw_button(surf, font_sm, req_arr_l, "◄",
+                    hover=bool(req_candidates) and req_arr_l.collidepoint(mx, my))
+        draw_button(surf, font_sm, req_arr_r, "►",
+                    hover=bool(req_candidates) and req_arr_r.collidepoint(mx, my))
+        if self.transform_requires:
+            req_tf = next((t for t in visible if self._form_name_of(t) == self.transform_requires), None)
+            req_label = (req_tf.get("display_name") if req_tf else None) or self.transform_requires
+        else:
+            req_label = "None (base form)"
+        surf.blit(render_text_cached(font, req_label, C_TEXT), (fx + 34, y + 5))
+        y += row_h
+
         LABELS = {
             "power_mult":   "Power x",
             "defense_mult": "Defense x",
@@ -2274,6 +2726,92 @@ class CharacterEditor:
             sl.rect.y = y + 6
             sl.draw(surf, font_sm)
             y += row_h
+
+        # ── Show Charge Bar — checked (default) plays the usual charge-up:
+        # the transformed-ki bar fills over "Charge Duration" seconds and
+        # the transform sprite holds on frames 2<->3 until it does.
+        # Unchecked skips the hold entirely — the transform animation just
+        # plays straight through at its own natural pace, with no bar, and
+        # the player lands in the transformed state the moment it finishes.
+        draw_label(surf, font_sm, "Show Charge Bar", lx, y + 6)
+        bar_cb_rect = pygame.Rect(fx, y + 4, 20, 20)
+        pygame.draw.rect(surf, C_PANEL_DARK, bar_cb_rect, border_radius=3)
+        pygame.draw.rect(surf, C_BORDER, bar_cb_rect, 1, border_radius=3)
+        if self.transform_ki_bar_enabled:
+            pygame.draw.line(surf, C_ACCENT, bar_cb_rect.topleft, bar_cb_rect.bottomright, 2)
+            pygame.draw.line(surf, C_ACCENT, bar_cb_rect.topright, bar_cb_rect.bottomleft, 2)
+        self._tf_ki_bar_enabled_checkbox_rect = bar_cb_rect
+        y += row_h
+
+        if self.transform_ki_bar_enabled:
+            dur_sl = self.transform_sliders.get("charge_duration")
+            if dur_sl:
+                draw_label(surf, font_sm, "Charge Duration", lx, y + 6)
+                dur_sl.rect.y = y + 6
+                dur_sl.draw(surf, font_sm)
+                y += row_h
+        else:
+            hint = render_text_cached(
+                font_sm,
+                "Bar disabled — the transform animation plays through at its own pace.",
+                C_TEXT_DIM,
+            )
+            surf.blit(hint, (lx, y + 6))
+            y += row_h
+
+        # ── Ki Bar Color override — hue-strip + SV-square picker, same
+        # widget style as the Identity tab's Gate Color. Unchecked =
+        # keep using transformed_ki_bar.png's baked-in colors as before;
+        # checked = recolor that bar art to this hue at the player's
+        # current lightness pattern (see SpriteHUD._get_recolored_bar_surface).
+        draw_label(surf, font_sm, "Ki Bar Color", lx, y + 6)
+        cb_rect = pygame.Rect(fx, y + 4, 20, 20)
+        pygame.draw.rect(surf, C_PANEL_DARK, cb_rect, border_radius=3)
+        pygame.draw.rect(surf, C_BORDER, cb_rect, 1, border_radius=3)
+        if self.transform_ki_color_enabled:
+            pygame.draw.line(surf, C_ACCENT, cb_rect.topleft, cb_rect.bottomright, 2)
+            pygame.draw.line(surf, C_ACCENT, cb_rect.topright, cb_rect.bottomleft, 2)
+        self._tf_ki_color_checkbox_rect = cb_rect
+        cb_lbl = render_text_cached(font_sm, "Custom", C_TEXT_DIM)
+        surf.blit(cb_lbl, (cb_rect.right + 8, y + 7))
+        y += row_h
+
+        if self.transform_ki_color_enabled:
+            preview_rect = pygame.Rect(fx, y + 2, 30, 22)
+            pygame.draw.rect(surf, hex_to_rgb(self.transform_ki_color), preview_rect, border_radius=4)
+            pygame.draw.rect(surf, C_BORDER, preview_rect, 1, border_radius=4)
+            hex_lbl = render_text_cached(font_sm, self.transform_ki_color.upper(), C_TEXT_DIM)
+            surf.blit(hex_lbl, (preview_rect.right + 10, y + 7))
+            y += 32
+
+            hue, sat, val = self._ki_color_hsv()
+            sv_w, sv_h, hue_w, gap = 130, 90, 18, 10
+
+            sv_rect = pygame.Rect(fx, y, sv_w, sv_h)
+            sv_surf = self._get_sv_square_surface(hue, sv_w, sv_h)
+            surf.blit(sv_surf, sv_rect.topleft)
+            pygame.draw.rect(surf, C_BORDER, sv_rect, 1)
+
+            sv_cursor_x = sv_rect.left + int(sat * sv_rect.width)
+            sv_cursor_y = sv_rect.top + int((1 - val) * sv_rect.height)
+            ring_color = (255, 255, 255) if val < 0.6 else (0, 0, 0)
+            pygame.draw.circle(surf, ring_color, (sv_cursor_x, sv_cursor_y), 6, 2)
+
+            hue_rect = pygame.Rect(sv_rect.right + gap, y, hue_w, sv_h)
+            hue_surf = self._get_hue_strip_surface(hue_w, sv_h)
+            surf.blit(hue_surf, hue_rect.topleft)
+            pygame.draw.rect(surf, C_BORDER, hue_rect, 1)
+
+            hue_marker_y = hue_rect.top + int(hue * hue_rect.height)
+            marker_rect = pygame.Rect(hue_rect.left - 2, hue_marker_y - 2, hue_rect.width + 4, 4)
+            pygame.draw.rect(surf, (255, 255, 255), marker_rect, 1)
+
+            self._tf_color_sv_rect  = sv_rect
+            self._tf_color_hue_rect = hue_rect
+            y += sv_h + 14
+        else:
+            self._tf_color_sv_rect  = None
+            self._tf_color_hue_rect = None
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2665,6 +3203,10 @@ class CharacterCreator:
             "defense_mult":  1.0,
             "speed_mult":    1.0,
             "ki_drain":      0.0,
+            "ki_color":      None,
+            "ki_bar_enabled":   True,
+            "charge_duration":  None,
+            "requires":         None,
         })
         ed.transform_idx = len(ed.visible_transformations()) - 1
         ed._load_transform_widgets()
@@ -2931,8 +3473,8 @@ class CharacterCreator:
                     self._open_confirm(f"Remove transformation '{label}'?", self._do_remove_transformation)
 
                 picker_list = self.editor.transform_forms
+                y_costume = y0 + 3 * row_h_ + 30   # matches _draw_transformations's "Form" row
                 if n and picker_list:
-                    y_costume = y0 + 3 * row_h_ + 30
                     c_arr_l = pygame.Rect(fx_t,       y_costume + 2, 26, 26)
                     c_arr_r = pygame.Rect(fx_t + 160, y_costume + 2, 26, 26)
                     if c_arr_l.collidepoint(mx, my):
@@ -2947,6 +3489,26 @@ class CharacterCreator:
                         ed.dirty = True
                         form = picker_list[ed.transform_costume_idx]
                         self._set_transform_preview(f"{ed._current_costume()}/transformations/{form}")
+
+                # "Requires" stepper — one row below Form (drawn
+                # unconditionally by _draw_transformations regardless of
+                # picker_list, so its click handling lives outside that
+                # gate too). Steps through [None] + every other
+                # transformation on this costume that wouldn't create a
+                # dependency cycle (see CharacterEditor._requires_candidates()).
+                if n:
+                    y_requires = y_costume + row_h_
+                    req_arr_l = pygame.Rect(fx_t,       y_requires + 2, 26, 26)
+                    req_arr_r = pygame.Rect(fx_t + 160, y_requires + 2, 26, 26)
+                    req_options = [None] + ed._requires_candidates()
+                    if len(req_options) > 1 and (req_arr_l.collidepoint(mx, my)
+                                                  or req_arr_r.collidepoint(mx, my)):
+                        ed.flush()
+                        cur_idx = (req_options.index(ed.transform_requires)
+                                   if ed.transform_requires in req_options else 0)
+                        step = -1 if req_arr_l.collidepoint(mx, my) else 1
+                        ed.transform_requires = req_options[(cur_idx + step) % len(req_options)]
+                        ed.dirty = True
 
         if self.active_tab == TAB_SETTINGS:
             if self.max_level_slider.handle_event(event):

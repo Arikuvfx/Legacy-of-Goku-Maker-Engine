@@ -745,6 +745,19 @@ class Player:
         """True if the TransformationSystem reports we are in a transformed state."""
         return self.transformation and self.transformation.is_transformed
 
+    def has_free_ki(self):
+        """True while transformed AND that transformation's charge bar is
+        enabled — the signal every attack cost-check/drain below uses to
+        skip spending normal ki. A transformation with its charge bar
+        disabled (see character_creator.py's "Show Charge Bar" checkbox)
+        deliberately does NOT get this perk: the player is meant to read as
+        just using their normal ki bar the whole time for that form, so
+        attacks cost ki exactly as if untransformed.
+        """
+        if not self.is_transformed():
+            return False
+        return getattr(self.transformation, 'current_transform_ki_bar_enabled', True)
+
     def can_act(self):
         """False while locked in an animation, transitioning, or knocked back."""
         if self.is_dead:
@@ -825,7 +838,7 @@ class Player:
 
     def get_current_ki_cost(self):
         """Ki cost for the current attack (0 while transformed — free attacks)."""
-        return 0 if self.is_transformed() else self.blast_ki_cost
+        return 0 if self.has_free_ki() else self.blast_ki_cost
 
     def enter_idle(self):
         """Return to standing idle and (re)start the stand-still timer.
@@ -1423,7 +1436,7 @@ class Player:
         if not self.can_act():
             return False
 
-        if self.ki > 0 or self.is_transformed():
+        if self.ki > 0 or self.has_free_ki():
             self.is_charging_beam = True
             self.beam_charge_time = 0
             self.is_q_pressed = True
@@ -1502,7 +1515,7 @@ class Player:
         if not self.can_act():
             return False
 
-        if self.ki > 0 or self.is_transformed():
+        if self.ki > 0 or self.has_free_ki():
             self.is_charging_kamekameha = True
             self.kamekameha_charge_time = 0
             self.is_q_pressed = True
@@ -1588,7 +1601,7 @@ class Player:
         if not self.can_act():
             return False
 
-        if self.ki > 0 or self.is_transformed():
+        if self.ki > 0 or self.has_free_ki():
             self.is_charging_banshee_blast = True
             self.banshee_blast_charge_time = 0
             self.is_q_pressed = True
@@ -1693,7 +1706,7 @@ class Player:
         if not self.can_act():
             return False
 
-        if self.ki > 0 or self.is_transformed():
+        if self.ki > 0 or self.has_free_ki():
             self.is_charging_final_flash = True
             self.final_flash_charge_time = 0
             self.is_q_pressed = True
@@ -1770,7 +1783,7 @@ class Player:
         if not self.can_act():
             return False
 
-        if self.ki > 0 or self.is_transformed():
+        if self.ki > 0 or self.has_free_ki():
             self.is_charging_big_bang_kamehameha = True
             self.big_bang_kamehameha_charge_time = 0
             self.is_q_pressed = True
@@ -1843,7 +1856,7 @@ class Player:
         if not self.can_act():
             return False
 
-        if self.ki > 0 or self.is_transformed():
+        if self.ki > 0 or self.has_free_ki():
             self.is_charging_flame_kamehameha = True
             self.flame_kamehameha_charge_time = 0
             self.is_q_pressed = True
@@ -1934,7 +1947,7 @@ class Player:
         if not self.can_act():
             return False
 
-        if self.ki < self.genkidama_ki_cost[1] and not self.is_transformed():
+        if self.ki < self.genkidama_ki_cost[1] and not self.has_free_ki():
             return False
 
         self.is_charging_genkidama = True
@@ -1960,13 +1973,13 @@ class Player:
         state = self.genkidama_charge_effect.state
         cost = self.genkidama_ki_cost.get(state, self.genkidama_ki_cost[1])
 
-        if self.ki < cost and not self.is_transformed():
+        if self.ki < cost and not self.has_free_ki():
             # Not enough ki to actually let it off — cancel silently rather
             # than firing for free.
             self.stop_genkidama()
             return None
 
-        if not self.is_transformed():
+        if not self.has_free_ki():
             self.ki -= cost
 
         sprite = self.genkidama_charge_effect.get_state_sprite(state)
@@ -2010,7 +2023,7 @@ class Player:
         if not self.can_act():
             return False
 
-        if self.ki < self.big_bang_attack_ki_cost and not self.is_transformed():
+        if self.ki < self.big_bang_attack_ki_cost and not self.has_free_ki():
             return False
 
         self.is_charging_big_bang_attack = True
@@ -2036,13 +2049,13 @@ class Player:
         if not self.is_charging_big_bang_attack or not self.current_big_bang_charge:
             return None
 
-        if self.ki < self.big_bang_attack_ki_cost and not self.is_transformed():
+        if self.ki < self.big_bang_attack_ki_cost and not self.has_free_ki():
             # Not enough ki to actually let it off — cancel silently
             # rather than firing for free.
             self.stop_big_bang_attack()
             return None
 
-        if not self.is_transformed():
+        if not self.has_free_ki():
             self.ki -= self.big_bang_attack_ki_cost
 
         sprite = self.current_big_bang_charge.get_fire_sprite()
@@ -2166,7 +2179,7 @@ class Player:
         if not self.can_act():
             return False
 
-        if self.ki < self.it_ki_cost and not self.is_transformed():
+        if self.ki < self.it_ki_cost and not self.has_free_ki():
             return False
 
         self.is_targeting_it = True
@@ -2198,7 +2211,7 @@ class Player:
             self.enter_idle()
             return False
 
-        if not self.is_transformed():
+        if not self.has_free_ki():
             self.ki -= self.it_ki_cost
 
         # Only now — actually starting the teleport hops, not just aiming —
@@ -2379,7 +2392,7 @@ class Player:
         if not self.can_act():
             return False
 
-        if self.ki <= 0 and not self.is_transformed():
+        if self.ki <= 0 and not self.has_free_ki():
             return False
 
         self.is_charging_masenko = True
@@ -2406,13 +2419,13 @@ class Player:
         if not self.is_charging_masenko or not self.masenko_indicator:
             return None
 
-        if self.ki < self.masenko_ki_cost and not self.is_transformed():
+        if self.ki < self.masenko_ki_cost and not self.has_free_ki():
             # Not enough ki to actually let it off — cancel silently rather
             # than throwing for free.
             self.stop_masenko()
             return None
 
-        if not self.is_transformed():
+        if not self.has_free_ki():
             self.ki -= self.masenko_ki_cost
 
         target_x, target_y = self.masenko_indicator.get_target_position()
@@ -2460,7 +2473,7 @@ class Player:
         if not self.can_act():
             return False
 
-        if self.ki <= 0 and not self.is_transformed():
+        if self.ki <= 0 and not self.has_free_ki():
             return False
 
         self.is_charging_sword = True
@@ -2495,7 +2508,7 @@ class Player:
 
         Transformed state skips the Ki drain but still checks for Q release.
         Called every tick from update_sword_charge()."""
-        if not self.is_transformed():
+        if not self.has_free_ki():
             self.ki = max(0.0, self.ki - self.energy_sword_ki_drain * dt)
             if self.ki <= 0 or not self.is_q_pressed:
                 self.stop_charging_sword()
@@ -2627,7 +2640,7 @@ class Player:
         """
         if not self.can_act():
             return False
-        if self.ki <= 0 and not self.is_transformed():
+        if self.ki <= 0 and not self.has_free_ki():
             return False
 
         self.is_using_dragon_fist = True
@@ -2691,9 +2704,9 @@ class Player:
             # frame threshold is crossed" shape as pending_blast /
             # pending_ultra_volleyball, just resolved entirely here rather
             # than handed off to game.py's update loop.
-            if not self.is_transformed():
+            if not self.has_free_ki():
                 self.ki = max(0.0, self.ki - self.dragon_fist_ki_drain * dt)
-            if (not self.is_transformed() and self.ki <= 0) or not self.is_q_pressed:
+            if (not self.has_free_ki() and self.ki <= 0) or not self.is_q_pressed:
                 # Ran out of Ki or Q was released before the wind-up
                 # finished — nothing's spawned yet, so cancel outright
                 # (see the pending_dragon_fist branch in stop_dragon_fist).
@@ -2716,7 +2729,7 @@ class Player:
         if self.current_dragon_fist:
             self.current_dragon_fist.update(dt, self.x, self.y)
 
-        if not self.is_transformed():
+        if not self.has_free_ki():
             self.ki = max(0.0, self.ki - self.dragon_fist_ki_drain * dt)
             if self.ki <= 0 or not self.is_q_pressed:
                 self.stop_dragon_fist()
@@ -2808,7 +2821,7 @@ class Player:
         """
         if not self.can_act():
             return None
-        if self.ki < self.ghost_kamikaze_ki_cost and not self.is_transformed():
+        if self.ki < self.ghost_kamikaze_ki_cost and not self.has_free_ki():
             return None
 
         self.is_casting_ghost_kamikaze = True
@@ -2878,7 +2891,7 @@ class Player:
             # gating the ki deduction on that return value is what
             # charges ghost_kamikaze_ki_cost_per_ghost exactly once per
             # ghost rather than once per frame this branch runs.
-            if self.current_ghost_kamikaze.spawn_next_ghost() and not self.is_transformed():
+            if self.current_ghost_kamikaze.spawn_next_ghost() and not self.has_free_ki():
                 self.ki -= self.ghost_kamikaze_ki_cost_per_ghost
 
         all_ghosts_spawned = (
@@ -3457,7 +3470,7 @@ class Player:
         Called from update() in both the 'firebeam' animation branch and the
         safety fallback below it.
         """
-        if not self.is_transformed():
+        if not self.has_free_ki():
             self.ki = max(0.0, self.ki - self.beam_ki_drain * dt)
             if self.ki <= 0 or not self.is_q_pressed:
                 self.stop_beam()
@@ -3467,7 +3480,7 @@ class Player:
     def _tick_kamekameha_ki_drain(self, dt):
         """Drain Ki while the Kamekameha is firing, and stop it when Ki runs
         out or Q is released. Mirrors _tick_beam_ki_drain exactly."""
-        if not self.is_transformed():
+        if not self.has_free_ki():
             self.ki = max(0.0, self.ki - self.kamekameha_ki_drain * dt)
             if self.ki <= 0 or not self.is_q_pressed:
                 self.stop_kamekameha()
@@ -3477,7 +3490,7 @@ class Player:
     def _tick_banshee_blast_ki_drain(self, dt):
         """Drain Ki while the Banshee Blast is firing, and stop it when Ki
         runs out or Q is released. Mirrors _tick_kamekameha_ki_drain exactly."""
-        if not self.is_transformed():
+        if not self.has_free_ki():
             self.ki = max(0.0, self.ki - self.banshee_blast_ki_drain * dt)
             if self.ki <= 0 or not self.is_q_pressed:
                 self.stop_banshee_blast()
@@ -3488,7 +3501,7 @@ class Player:
         """Drain Ki while Final Flash is firing, and stop it when Ki runs out
         or Q is released. Mirrors _tick_beam_ki_drain exactly — see that
         method for the transformed-state reasoning."""
-        if not self.is_transformed():
+        if not self.has_free_ki():
             self.ki = max(0.0, self.ki - self.final_flash_ki_drain * dt)
             if self.ki <= 0 or not self.is_q_pressed:
                 self.stop_final_flash()
@@ -3499,7 +3512,7 @@ class Player:
         """Drain Ki while Big Bang Kamehameha is firing, and stop it when Ki
         runs out or Q is released. Mirrors _tick_final_flash_ki_drain
         exactly — see that method for the transformed-state reasoning."""
-        if not self.is_transformed():
+        if not self.has_free_ki():
             self.ki = max(0.0, self.ki - self.big_bang_kamehameha_ki_drain * dt)
             if self.ki <= 0 or not self.is_q_pressed:
                 self.stop_big_bang_kamehameha()
@@ -3510,7 +3523,7 @@ class Player:
         """Drain Ki while Flame Kamehameha is firing, and stop it when Ki
         runs out or Q is released. Mirrors _tick_beam_ki_drain exactly —
         see that method for the transformed-state reasoning."""
-        if not self.is_transformed():
+        if not self.has_free_ki():
             self.ki = max(0.0, self.ki - self.flame_kamehameha_ki_drain * dt)
             if self.ki <= 0 or not self.is_q_pressed:
                 self.stop_flame_kamehameha()

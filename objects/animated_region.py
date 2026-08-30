@@ -257,6 +257,16 @@ def draw_animated_region(screen, region: AnimatedRegion, camera_x: int, camera_y
     style = REGION_STYLES.get(region.region_type, {'color': (200, 200, 200)})
     base_color = style['color']
 
+    # The region's own color/opacity settings (from the editor's settings
+    # panel) drive this overlay too, so dragging the opacity slider or
+    # picking a tint refreshes what's shown immediately instead of the box
+    # always looking like the region_type's fixed default.
+    region_color = tuple(getattr(region, 'color', (255, 255, 255)))
+    if region_color != (255, 255, 255):
+        base_color = region_color
+
+    region_opacity = max(0, min(100, getattr(region, 'opacity', 100)))
+
     sx = (region.x * render_scale) - camera_x
     sy = (region.y * render_scale) - camera_y
     sw = region.width  * render_scale
@@ -264,7 +274,8 @@ def draw_animated_region(screen, region: AnimatedRegion, camera_x: int, camera_y
 
     rect = pygame.Rect(int(sx), int(sy), int(sw), int(sh))
 
-    alpha = 150 if selected else 100
+    base_alpha = 150 if selected else 100
+    alpha = round(base_alpha * (region_opacity / 100))
     fill_color = tuple(min(255, c + 60) for c in base_color) + (alpha,) if selected else base_color + (alpha,)
 
     # The region box can be dragged far larger than the viewport, but only the

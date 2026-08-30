@@ -102,6 +102,36 @@ class _WeatherEffect:
         'dust': 255,
     }
 
+    # Number of precomputed dimmed variants used while opacity is mid-fade.
+    # Draw-time fading then becomes a table lookup instead of a per-frame
+    # surface copy + blend — see _make_dimmed / _load / draw.
+    _FADE_STEPS = 20
+
+    def _make_dimmed(self, base_img, factor):
+        """A dimmed copy of base_img at the given 0-1 factor.
+
+        Additive types (fog, dust) scale RGB brightness (BLEND_ADD ignores
+        alpha). Standard types (rain, snow) scale the per-pixel alpha
+        channel. Mirrors _bake_alpha's own additive/standard split, just
+        parameterized by an arbitrary factor instead of self.alpha so it can
+        be called once per fade step at load time.
+        """
+        factor = max(0.0, min(1.0, factor))
+        dim = base_img.copy()
+        if self.weather_type in self._ADDITIVE_TYPES:
+            scale = int(255 * factor)
+            if scale < 255:
+                dim.fill((scale, scale, scale), special_flags=pygame.BLEND_RGB_MULT)
+        else:
+            try:
+                import numpy as np
+                arr = pygame.surfarray.pixels_alpha(dim)
+                arr[:] = (arr.astype('float32') * factor).astype('uint8')
+                del arr
+            except Exception:
+                dim.set_alpha(int(255 * factor))
+        return dim
+
     def __init__(self, weather_type: str, speed: float = 120.0, alpha: int = -1):
         self.weather_type = weather_type
         self.speed        = float(speed)
@@ -190,8 +220,16 @@ class _WeatherEffect:
                 self._frames.append(frame_surf)
             self._frame_idx = 0.0
             self._surf = self._frames[0] if self._frames else None
+            # One dimmed-variant table per frame — see _FADE_STEPS/_make_dimmed.
+            self._fade_tables = [
+                [self._make_dimmed(frame, i / self._FADE_STEPS)
+                 for i in range(self._FADE_STEPS + 1)]
+                for frame in self._frames
+            ]
         else:
             self._surf = self._bake_alpha(self._scale(sheet))
+            self._fade_table = [self._make_dimmed(self._surf, i / self._FADE_STEPS)
+                                 for i in range(self._FADE_STEPS + 1)]
 
     # ── Update ────────────────────────────────────────────────────────────────
 
@@ -231,66 +269,31 @@ class _WeatherEffect:
         start_y     = int(self.scroll_y) - img_h
         start_x     = int(self.scroll_x) - img_w
         is_additive = self.weather_type in self._ADDITIVE_TYPES
+        blit_flags  = pygame.BLEND_ADD if is_additive else 0
 
         if self.opacity >= 0.999:
-            # Fast path — no intermediate surface needed.
-            blit_flags = pygame.BLEND_ADD if is_additive else 0
-            y = start_y
-            while y < screen_h:
-                x = start_x
-                while x < screen_w:
-                    screen.blit(self._surf, (x, y), special_flags=blit_flags)
-                    x += img_w
-                y += img_h
-            return
-
-        # Fading path — tile into an intermediate surface, apply opacity, then blit.
-        #
-        # Additive (fog, dust): tile with BLEND_ADD into a plain RGB surface,
-        # then scale brightness by opacity using BLEND_RGB_MULT, then blit with
-        # BLEND_ADD. This correctly dims the additive light contribution.
-        #
-        # Standard (rain, snow): tile into an SRCALPHA surface normally, then
-        # scale the alpha channel by opacity.
-        if is_additive:
-            need_new = (not hasattr(self, '_fade_surf')
-                        or self._fade_surf.get_size() != (screen_w, screen_h)
-                        or (self._fade_surf.get_flags() & pygame.SRCALPHA))
-            if need_new:
-                self._fade_surf = pygame.Surface((screen_w, screen_h))
-            self._fade_surf.fill((0, 0, 0))
-            y = start_y
-            while y < screen_h:
-                x = start_x
-                while x < screen_w:
-                    self._fade_surf.blit(self._surf, (x, y), special_flags=pygame.BLEND_ADD)
-                    x += img_w
-                y += img_h
-            scale = int(255 * max(0.0, min(1.0, self.opacity)))
-            self._fade_surf.fill((scale, scale, scale), special_flags=pygame.BLEND_RGB_MULT)
-            screen.blit(self._fade_surf, (0, 0), special_flags=pygame.BLEND_ADD)
+            tile = self._surf
         else:
-            need_new = (not hasattr(self, '_fade_surf')
-                        or self._fade_surf.get_size() != (screen_w, screen_h)
-                        or not (self._fade_surf.get_flags() & pygame.SRCALPHA))
-            if need_new:
-                self._fade_surf = pygame.Surface((screen_w, screen_h), pygame.SRCALPHA)
-            self._fade_surf.fill((0, 0, 0, 0))
-            y = start_y
-            while y < screen_h:
-                x = start_x
-                while x < screen_w:
-                    self._fade_surf.blit(self._surf, (x, y))
-                    x += img_w
-                y += img_h
-            try:
-                import numpy as np
-                arr = pygame.surfarray.pixels_alpha(self._fade_surf)
-                arr[:] = (arr.astype('float32') * self.opacity).astype('uint8')
-                del arr
-            except Exception:
-                pass  # numpy unavailable — tile drawn at full opacity
-            screen.blit(self._fade_surf, (0, 0))
+            # Pick the nearest precomputed dimmed variant (see _FADE_STEPS /
+            # _make_dimmed / _load) instead of building one on the fly — this
+            # is what makes fading no more expensive per frame than the fast
+            # path above: no surface copy, no fill, no numpy call here at all.
+            step = int(round(max(0.0, min(1.0, self.opacity)) * self._FADE_STEPS))
+            step = max(0, min(self._FADE_STEPS, step))
+            if self._frames:
+                frame_idx = int(self._frame_idx)
+                frame_idx = max(0, min(len(self._fade_tables) - 1, frame_idx))
+                tile = self._fade_tables[frame_idx][step]
+            else:
+                tile = self._fade_table[step]
+
+        y = start_y
+        while y < screen_h:
+            x = start_x
+            while x < screen_w:
+                screen.blit(tile, (x, y), special_flags=blit_flags)
+                x += img_w
+            y += img_h
 
 
 class CutsceneRuntime:
@@ -594,14 +597,28 @@ class CutsceneRuntime:
         for effect in self._attack_effects:
             effect.draw(screen, camera, colors)
 
-    def draw_weather(self, screen, screen_width, screen_height):
+    def draw_weather(self, screen, screen_width, screen_height, only_types=None, skip_types=None):
         """Draw the weather layer.
 
         Call before the dialogue box so weather scrolls behind it, and before
         draw_overlay() so fades and invert sit on top of everything.
+
+        only_types / skip_types: optional iterables of weather_type strings
+        used to split a single active weather effect across two draw calls —
+        e.g. fog is drawn once, earlier, behind decorations/actors (via
+        only_types={'fog'}), while every other type (rain, snow, storm,
+        dust…) is drawn later, above everything, via skip_types={'fog'}.
+        Only one of the two is normally passed at a time; only_types wins if
+        both are given.
         """
-        if self._weather is not None:
-            self._weather.draw(screen, screen_width, screen_height)
+        if self._weather is None:
+            return
+        wt = self._weather.weather_type
+        if only_types is not None and wt not in only_types:
+            return
+        if only_types is None and skip_types is not None and wt in skip_types:
+            return
+        self._weather.draw(screen, screen_width, screen_height)
 
     def draw_overlay(self, screen, screen_width, screen_height):
         """Draw the invert effect and colour-fade overlay above the scene.

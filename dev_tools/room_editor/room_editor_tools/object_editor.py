@@ -1,5 +1,4 @@
 import os
-import colorsys
 
 import numpy as np
 import pygame
@@ -112,11 +111,15 @@ class ObjectEditor:
         self.region_seed_text = "0"
         self.region_seed_input_active = False
         self.region_color = (255, 255, 255)  # RGB tint; (255,255,255) = original art colors
-        self._region_hue_dragging = False  # dragging the hue strip
-        self._region_sv_dragging = False  # dragging the saturation/value square
+        self._region_r_dragging = False  # dragging the R gradient bar
+        self._region_g_dragging = False  # dragging the G gradient bar
+        self._region_b_dragging = False  # dragging the B gradient bar
+        self.region_channel_input_active = None  # 'r' / 'g' / 'b' / None — which spin box is being typed into
+        self.region_channel_text = ""
+        self.region_hex_text = "FFFFFF"
+        self.region_hex_input_active = False
         self.region_variant = 0  # 0-based index into the current tile-mode region's static variants
-        self._hue_strip_cache = None  # (size, surface) — hue gradient never changes, computed once
-        self._sv_square_cache = None  # (hue, size, surface) — recomputed only when hue changes
+        self._channel_gradient_cache = {}  # channel idx -> ((w, h), surface) — black->full-channel gradient, doesn't depend on the current value
         self._region_variant_sprites_cache = {}  # region_type -> list of cropped variant frames, lazy-loaded once each
 
         self.on_animated_region_placed = None
@@ -252,6 +255,20 @@ class ObjectEditor:
         self.gate_level_input_active = False
         self.gate_level_text = "1"
 
+        # ── Gate character lock ─────────────────────────────────────────────
+        # None = "Any" — the old behaviour, no character requirement. When set
+        # to a char_id, the placed gate is locked to that character and its
+        # number is drawn in that character's assigned color (see
+        # objects/level_gate.py's LevelGate._load_gate_color). Sticky like
+        # gate_required_level above: it carries over to the next gate placed
+        # until changed. Cache is built lazily from
+        # dev_tools/character_creator.py's discover_characters() the first
+        # time it's needed, and can be refreshed with
+        # _refresh_gate_character_choices() if a character is added/removed
+        # while this editor is open.
+        self.gate_required_character = None
+        self._gate_character_choices_cache = None
+
         # ── Variant selection ─────────────────────────────────────────────────
         self.selected_variant = None
         self.hover_variant_index = -1
@@ -290,12 +307,15 @@ class ObjectEditor:
         # instead of going through the variant system.
         self.nimbus_cloud_sprite = NimbusCloud(0, 0).sprite
 
-        # Tree decoration's palette icon is its first animation frame. Like
-        # nimbus_cloud above, it has no per-type variants to pick between
-        # (yet — see DECORATION_STYLES['variants']), so it's loaded directly
-        # here instead of going through the has_variants/variant-picker
-        # system that gates/doors/chests use.
-        self._tree_icon_sprite = Decoration(0, 0, 'tree').frames[0]
+        # Tree decoration variants come straight off DECORATION_STYLES'
+        # grid_rows — one entry per sheet row (see decoration_objects.py's
+        # module docstring). 'type' holds the row/variant index itself
+        # (an int), which is exactly what Decoration(..., variant) expects,
+        # rather than a string key like doors/chests use.
+        self.tree_variants = [
+            {'type': i, 'name': name, 'sprite': None}
+            for i, name in enumerate(DECORATION_STYLES['tree']['variants'])
+        ]
 
         # Door variants are discovered from assets/sprites/structures/door/ at
         # startup (one sheet per type — see Door.list_door_types()) rather
@@ -423,17 +443,14 @@ class ObjectEditor:
                 {
                     'id': 'tree',
                     'name': 'Tree',
-                    'sprite': self._tree_icon_sprite,
+                    'sprite': None,
                     'width': DECORATION_STYLES['tree']['frame_w'],
                     'height': DECORATION_STYLES['tree']['frame_h'],
                     'object_type': 'decoration',
                     'decoration_type': 'tree',
-                    # No has_variants here — 'tree' has exactly one variant
-                    # today (DECORATION_STYLES['tree']['variants']), so there's
-                    # nothing to pick between yet. If a second row is ever
-                    # added to tree.png, this can switch to the same
-                    # has_variants/variants/default_variant scheme doors and
-                    # chests use.
+                    'has_variants': True,
+                    'variants': self.tree_variants,
+                    'default_variant': 0,
                 },
             ],
         }
@@ -887,6 +904,18 @@ class ObjectEditor:
                             pygame.draw.polygon(sprite, (255, 255, 255), points)
                             variant['sprite'] = sprite
 
+                    elif obj['object_type'] == 'decoration':
+                        # variant['type'] is the row index itself (see
+                        # tree_variants above) — Decoration._load_frames
+                        # slices row `variant * frame_h` out of the sheet,
+                        # so this just asks for that row's first frame.
+                        decoration_type = obj.get('decoration_type', 'tree')
+                        variant_index = variant['type']
+                        deco = Decoration(0, 0, decoration_type, variant_index)
+                        variant['width'] = deco.width
+                        variant['height'] = deco.height
+                        variant['sprite'] = deco.frames[0].copy()
+
                     elif obj['object_type'] == 'save_point':
                         # Try to load custom sprite first
                         variant_type = variant['type']
@@ -951,7 +980,7 @@ class ObjectEditor:
 
                 # Set the main object sprite to the default variant
                 default_variant_type = obj.get('default_variant')
-                if default_variant_type:
+                if default_variant_type is not None:
                     for variant in variants:
                         if variant['type'] == default_variant_type:
                             obj['sprite'] = variant['sprite'].copy()
@@ -1063,6 +1092,57 @@ class ObjectEditor:
                 return variant
 
         return variants[0] if variants else None
+
+    def _all_objects(self, room_name):
+        """Yield (obj, obj_type) for every placed object in the room, across
+        every manager. Used by the room editor's area-select rubber-band to
+        collect everything inside a drag rectangle — unlike
+        _check_object_at_position this doesn't hit-test or apply the
+        collision/terrain tool scoping, since a rect select isn't tied to
+        whichever palette tool happens to be active."""
+        spawn = self.spawn_manager.get_spawn_point(room_name)
+        if spawn:
+            yield spawn, 'spawn'
+
+        for obj in self.collision_manager.get_collision_objects(room_name):
+            yield obj, 'collision'
+
+        room = self.room_manager.get_room_by_name(room_name) if self.room_manager else None
+        if room:
+            for stone in getattr(room, 'destructible_stones', []):
+                yield stone, 'stone'
+            for decoration in getattr(room, 'decorations', []):
+                yield decoration, 'decoration'
+
+        for pad in self.flying_pad_manager.get_pads(room_name):
+            yield pad, 'flying_pad'
+
+        for cloud in self.nimbus_cloud_manager.get_clouds(room_name):
+            yield cloud, 'nimbus_cloud'
+
+        for door in self.door_manager.get_doors(room_name):
+            yield door, 'door'
+
+        for chest in self.chest_manager.get_chests(room_name):
+            yield chest, 'chest'
+
+        for gate in self.gate_manager.get_gates(room_name):
+            yield gate, 'gate'
+
+        for save_point in self.save_point_manager.get_save_points(room_name):
+            yield save_point, 'save_point'
+
+        for obj in self.world_map_manager.get_objects(room_name):
+            yield obj, 'world_map_object'
+
+        for box in self.trigger_box_manager.get_boxes(room_name):
+            yield box, 'trigger_box'
+
+        for transition in self.transition_manager.get_transitions(room_name):
+            yield transition, 'transition'
+
+        for region in self.animated_region_manager.get_regions(room_name):
+            yield region, 'animated_region'
 
     def _check_object_at_position(self, world_x, world_y):
         """See if there's an object at this position (for deletion)"""
@@ -1498,6 +1578,60 @@ class ObjectEditor:
         input_rect = pygame.Rect(input_x, input_y, input_width, input_height)
         return input_rect.collidepoint(mouse_pos)
 
+    # ── Gate character lock helpers ─────────────────────────────────────────
+
+    def _gate_character_choices(self):
+        """[None, *char_ids] for the Gate Character cycle control — None is
+        always first ('Any character'). Built lazily and cached since
+        discover_characters() touches disk on every call."""
+        if self._gate_character_choices_cache is None:
+            self._refresh_gate_character_choices()
+        return self._gate_character_choices_cache
+
+    def _refresh_gate_character_choices(self):
+        """Rebuild the cached character list. Call this if the roster could
+        have changed since the editor opened (e.g. a character was just
+        created or deleted in Character Creator)."""
+        try:
+            from dev_tools import character_creator
+            self._gate_character_choices_cache = [None] + character_creator.discover_characters()
+        except Exception:
+            self._gate_character_choices_cache = [None]
+
+    def _gate_character_display_name(self, char_id):
+        """Label shown in the palette for char_id ('Any' for None)."""
+        if not char_id:
+            return "Any"
+        try:
+            from dev_tools import character_creator
+            cfg = character_creator.load_config(char_id)
+            return cfg.get('display_name') or char_id.replace('_', ' ').title()
+        except Exception:
+            return char_id.replace('_', ' ').title()
+
+    def _gate_character_color(self, char_id):
+        """RGB the gate's number will actually render in for char_id — mirrors
+        LevelGate._load_gate_color exactly, so the palette swatch preview
+        never drifts from what gets placed."""
+        if not char_id:
+            return (255, 215, 0)
+        try:
+            from dev_tools import character_creator
+            cfg = character_creator.load_config(char_id)
+            return character_creator.hex_to_rgb(cfg.get('color', '#FFD700'), fallback=(255, 215, 0))
+        except Exception:
+            return (255, 215, 0)
+
+    def _cycle_gate_character(self, direction):
+        """Step gate_required_character forward/backward (direction = +1/-1)
+        through [None, *discover_characters()], wrapping around."""
+        choices = self._gate_character_choices()
+        if not choices:
+            return
+        current = self.gate_required_character if self.gate_required_character in choices else None
+        idx = (choices.index(current) + direction) % len(choices)
+        self.gate_required_character = choices[idx]
+
     def _is_variant_selector_clicked(self, mouse_pos):
         """Check if clicking on variant selector and handle selection"""
         if not self.selected_object or not isinstance(self.selected_object, dict):
@@ -1656,6 +1790,10 @@ class ObjectEditor:
 
             decoration_type = self.selected_object.get('decoration_type', 'tree')
 
+            # Get selected variant (row index) or default
+            variant = self.selected_variant or self._get_current_variant(self.selected_object)
+            variant_index = variant['type'] if variant else 0
+
             if self.room_manager:
                 room = self.room_manager.get_room_by_name(room_name)
                 if room and self._too_close_to_existing(
@@ -1666,7 +1804,8 @@ class ObjectEditor:
             decoration = Decoration(
                 int(self.preview_x),
                 int(self.preview_y),
-                decoration_type
+                decoration_type,
+                variant_index
             )
 
             if self.room_manager:
@@ -1943,7 +2082,8 @@ class ObjectEditor:
                 int(self.preview_x),
                 int(self.preview_y),
                 gate_type,
-                self.gate_required_level
+                self.gate_required_level,
+                self.gate_required_character
             )
 
             self.gate_manager.add_gate(room_name, gate)
@@ -2099,88 +2239,56 @@ class ObjectEditor:
         frac = (mouse_x - slider_rect.left) / slider_rect.width
         self.region_wave_amount = max(0, min(100, round(frac * 100)))
 
-    def _region_color_hsv(self):
-        """Current self.region_color as (h, s, v), each in 0-1."""
-        r, g, b = self.region_color
-        return colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
-
-    def _set_region_hue_from_mouse_y(self, mouse_y, hue_rect):
-        """Vertical hue strip: y position maps to hue 0-1. Keeps the
-        current saturation/value, only the hue changes."""
-        _, s, v = self._region_color_hsv()
-        frac = (mouse_y - hue_rect.top) / hue_rect.height
-        hue = max(0.0, min(1.0, frac))
-        r, g, b = colorsys.hsv_to_rgb(hue, s, v)
-        self.region_color = (round(r * 255), round(g * 255), round(b * 255))
-
-    def _set_region_sv_from_mouse(self, mouse_pos, sv_rect):
-        """Saturation/value square: x -> saturation 0-1, y -> value 1-0
-        (top of the square is brightest). Keeps the current hue."""
-        h, _, _ = self._region_color_hsv()
-        s = max(0.0, min(1.0, (mouse_pos[0] - sv_rect.left) / sv_rect.width))
-        v = max(0.0, min(1.0, 1 - (mouse_pos[1] - sv_rect.top) / sv_rect.height))
-        r, g, b = colorsys.hsv_to_rgb(h, s, v)
-        self.region_color = (round(r * 255), round(g * 255), round(b * 255))
-
     @staticmethod
-    def _hsv_to_rgb_grid(hue, s_grid, v_grid):
-        """Vectorized HSV->RGB for arrays of s/v sharing one fixed hue.
-        Returns an (..., 3) float array in 0-1."""
-        h6 = hue * 6.0
-        sector = int(h6) % 6
-        factor = 1 - abs(h6 % 2 - 1)
+    def _clamp_channel(value):
+        return max(0, min(255, int(value)))
 
-        c_grid = v_grid * s_grid
-        x_grid = c_grid * factor
-        m_grid = v_grid - c_grid
-        zero = np.zeros_like(c_grid)
+    def _sync_hex_text(self):
+        """Refresh the hex field's text from the current self.region_color.
+        Call this any time region_color changes from something other than
+        the hex field itself (slider drag, spin arrows, typed channel,
+        reset)."""
+        r, g, b = self.region_color
+        self.region_hex_text = f"{r:02X}{g:02X}{b:02X}"
 
-        order = {
-            0: (c_grid, x_grid, zero),
-            1: (x_grid, c_grid, zero),
-            2: (zero, c_grid, x_grid),
-            3: (zero, x_grid, c_grid),
-            4: (x_grid, zero, c_grid),
-            5: (c_grid, zero, x_grid),
-        }[sector]
-        return np.stack([order[0] + m_grid, order[1] + m_grid, order[2] + m_grid], axis=-1)
+    def _commit_hex_text(self):
+        """Parse self.region_hex_text (typed by the user) into region_color.
+        Invalid/partial input is simply discarded and the field snaps back
+        to match the current color."""
+        text = self.region_hex_text.strip()
+        if len(text) == 6:
+            try:
+                r = int(text[0:2], 16)
+                g = int(text[2:4], 16)
+                b = int(text[4:6], 16)
+                self.region_color = (r, g, b)
+            except ValueError:
+                pass
+        self._sync_hex_text()
 
-    def _get_hue_strip_surface(self, w, h):
-        """Vertical rainbow gradient (full saturation/value, hue 0-1 top to
-        bottom). Doesn't depend on the current color, so it's computed once
-        and reused for the lifetime of the editor."""
-        cache = self._hue_strip_cache
+    def _set_region_channel_from_mouse_x(self, channel_idx, mouse_x, bar_rect):
+        """Horizontal R/G/B gradient bar: x position maps that one channel
+        to 0-255, the other two channels are untouched."""
+        frac = (mouse_x - bar_rect.left) / bar_rect.width
+        value = self._clamp_channel(round(frac * 255))
+        channel = list(self.region_color)
+        channel[channel_idx] = value
+        self.region_color = tuple(channel)
+        self._sync_hex_text()
+
+    def _get_channel_gradient_surface(self, channel_idx, w, h):
+        """Horizontal black -> full-channel-color gradient (e.g. black to
+        pure red for channel 0). Doesn't depend on the current color, so
+        it's cached once per channel/size and reused."""
+        cache = self._channel_gradient_cache.get(channel_idx)
         if cache and cache[0] == (w, h):
             return cache[1]
 
-        hues = np.linspace(0.0, 1.0, h, dtype=np.float32)
-        column = np.zeros((h, 3), dtype=np.float32)
-        for i, hue in enumerate(hues):
-            column[i] = self._hsv_to_rgb_grid(float(hue), np.float32(1.0), np.float32(1.0))
-        column = np.clip(column * 255, 0, 255).astype(np.uint8)
-
-        arr = np.tile(column[np.newaxis, :, :], (w, 1, 1))  # (w, h, 3) for surfarray
+        ramp = np.linspace(0, 255, w, dtype=np.uint8)
+        arr = np.zeros((w, h, 3), dtype=np.uint8)
+        arr[:, :, channel_idx] = ramp[:, np.newaxis]
         surf = pygame.surfarray.make_surface(arr)
-        self._hue_strip_cache = ((w, h), surf)
-        return surf
-
-    def _get_sv_square_surface(self, hue, w, h):
-        """Saturation (x, 0-1) / value (y, 1-0 top-to-bottom) gradient for a
-        fixed hue. Recomputed only when the hue actually changes."""
-        cache = self._sv_square_cache
-        if cache and abs(cache[0][0] - hue) < 1e-6 and cache[0][1] == w and cache[0][2] == h:
-            return cache[1]
-
-        s = np.linspace(0.0, 1.0, w, dtype=np.float32)
-        v = np.linspace(1.0, 0.0, h, dtype=np.float32)
-        s_grid, v_grid = np.meshgrid(s, v, indexing='xy')  # shape (h, w)
-
-        rgb = self._hsv_to_rgb_grid(hue, s_grid, v_grid)
-        rgb = np.clip(rgb * 255, 0, 255).astype(np.uint8)
-        rgb = np.transpose(rgb, (1, 0, 2))  # (w, h, 3) for surfarray
-
-        surf = pygame.surfarray.make_surface(rgb)
-        self._sv_square_cache = ((hue, w, h), surf)
+        self._channel_gradient_cache[channel_idx] = ((w, h), surf)
         return surf
 
     def _finalize_animated_region_placement(self, room_name):
@@ -2666,150 +2774,195 @@ class ObjectEditor:
                     self._finalize_transition_spawn_placement()
                     return
 
-                # Check if clicking on level input box
-                if self._is_level_input_clicked(mouse_pos):
-                    self.gate_level_input_active = True
-                    return
-
-                # Check if clicking on the door "Permanent" checkbox
-                if self._is_door_permanent_checkbox_clicked(mouse_pos):
-                    return
-
-                # Check if clicking on the door sound picker or its Preview button
-                if self._is_door_sound_ui_clicked(mouse_pos):
-                    return
-
-                # Assigning loot to an existing chest via the toolbar's
-                # Items panel selection takes priority over normal
-                # placement/selection — a click in the world while an item
-                # is armed always means "drop this item in that chest".
-                # If the click misses every chest, still consume the world
-                # click: falling through to normal placement would stamp a
-                # brand-new empty object (e.g. another chest) because
-                # selected_object stays set from the Objects palette.
-                # Palette / settings-panel clicks must still pass through
-                # so the designer can switch tools or clear selection.
-                if self._item_armed() and not self._is_in_palette(mouse_pos[0], mouse_pos[1]):
-                    self._try_assign_chest_loot(mouse_pos)
-                    return
-
-                # Handle trigger box property clicks
-                if (self.selected_object and isinstance(self.selected_object, dict)
-                        and self.selected_object.get('is_trigger_box', False)):
-
-                    id_rect = self.ui_rects.get('trigger_box_id_rect')
-                    if id_rect and id_rect.collidepoint(mouse_pos):
-                        self.trigger_box_id_input_active = True
+                # All the panel-control checks below (settings panel inputs,
+                # opacity/color sliders, dropdowns, checkboxes) only apply while
+                # the panel is visible — skip them when hidden so a click doesn't
+                # land on stale rects left over from before the panel was closed.
+                if self.palette_visible:
+                    # Check if clicking on level input box
+                    if self._is_level_input_clicked(mouse_pos):
+                        self.gate_level_input_active = True
                         return
 
-                    once_rect = self.ui_rects.get('trigger_box_once_rect')
-                    if once_rect and once_rect.collidepoint(mouse_pos):
-                        self.trigger_box_once = not self.trigger_box_once
-                        return
-
-                    key_rect = self.ui_rects.get('trigger_box_requires_key_rect')
-                    if key_rect and key_rect.collidepoint(mouse_pos):
-                        self.trigger_box_requires_key = not self.trigger_box_requires_key
-                        return
-
-                    always_run_rect = self.ui_rects.get('trigger_box_always_run_rect')
-                    if always_run_rect and always_run_rect.collidepoint(mouse_pos):
-                        self.trigger_box_always_run = not self.trigger_box_always_run
-                        return
-
-                    self.trigger_box_id_input_active = False
-
-                # Handle world map dropdown clicks
-                if (self.selected_object and isinstance(self.selected_object, dict)
-                        and self.selected_object.get('object_type') == 'world_map_object'):
-                    current_variant = self._get_current_variant(self.selected_object)
-                    if current_variant and current_variant.get('type') in ('world_map', 'world_map_sign'):
-                        # Dropdown button — toggle open/closed
-                        wm_btn = self.ui_rects.get('world_map_dropdown_btn')
-                        if wm_btn and wm_btn.collidepoint(mouse_pos):
-                            self.world_map_dropdown_open = not self.world_map_dropdown_open
-                            if self.world_map_dropdown_open:
-                                self.world_map_dropdown_names = self._get_world_map_names()
+                    # Check if clicking the Gate Character cycle arrows
+                    if (self.selected_object and isinstance(self.selected_object, dict)
+                            and self.selected_object.get('object_type') == 'level_gate'):
+                        left_arrow = self.ui_rects.get('gate_char_arrow_left')
+                        if left_arrow and left_arrow.collidepoint(mouse_pos):
+                            self._cycle_gate_character(-1)
+                            return
+                        right_arrow = self.ui_rects.get('gate_char_arrow_right')
+                        if right_arrow and right_arrow.collidepoint(mouse_pos):
+                            self._cycle_gate_character(1)
                             return
 
-                        # Item inside open dropdown list
-                        if self.world_map_dropdown_open:
-                            for item_rect, name in self.ui_rects.get('world_map_dropdown_items', []):
-                                if item_rect.collidepoint(mouse_pos):
-                                    self.world_map_name_text = name
-                                    self.world_map_dropdown_open = False
-                                    return
-                            # Click outside list — close without selecting
-                            self.world_map_dropdown_open = False
-                            return
-
-                # Handle water/grass opacity slider
-                if (self.selected_object and isinstance(self.selected_object, dict)
-                        and self.selected_object.get('is_animated_region', False)):
-                    slider_rect = self.ui_rects.get('region_opacity_slider')
-                    if slider_rect and slider_rect.collidepoint(mouse_pos):
-                        self._region_opacity_dragging = True
-                        self._set_region_opacity_from_mouse_x(mouse_pos[0], slider_rect)
+                    # Check if clicking on the door "Permanent" checkbox
+                    if self._is_door_permanent_checkbox_clicked(mouse_pos):
                         return
 
-                    if REGION_STYLES.get(self.selected_object.get('region_type'), {}).get('mode', 'patch') == 'tile':
-                        for i, variant_rect in enumerate(self.ui_rects.get('region_variant_rects', [])):
-                            if variant_rect.collidepoint(mouse_pos):
-                                self.region_variant = i
+                    # Check if clicking on the door sound picker or its Preview button
+                    if self._is_door_sound_ui_clicked(mouse_pos):
+                        return
+
+                    # Assigning loot to an existing chest via the toolbar's
+                    # Items panel selection takes priority over normal
+                    # placement/selection — a click in the world while an item
+                    # is armed always means "drop this item in that chest".
+                    # If the click misses every chest, still consume the world
+                    # click: falling through to normal placement would stamp a
+                    # brand-new empty object (e.g. another chest) because
+                    # selected_object stays set from the Objects palette.
+                    # Palette / settings-panel clicks must still pass through
+                    # so the designer can switch tools or clear selection.
+                    if self._item_armed() and not self._is_in_palette(mouse_pos[0], mouse_pos[1]):
+                        self._try_assign_chest_loot(mouse_pos)
+                        return
+
+                    # Handle trigger box property clicks
+                    if (self.selected_object and isinstance(self.selected_object, dict)
+                            and self.selected_object.get('is_trigger_box', False)):
+
+                        id_rect = self.ui_rects.get('trigger_box_id_rect')
+                        if id_rect and id_rect.collidepoint(mouse_pos):
+                            self.trigger_box_id_input_active = True
+                            return
+
+                        once_rect = self.ui_rects.get('trigger_box_once_rect')
+                        if once_rect and once_rect.collidepoint(mouse_pos):
+                            self.trigger_box_once = not self.trigger_box_once
+                            return
+
+                        key_rect = self.ui_rects.get('trigger_box_requires_key_rect')
+                        if key_rect and key_rect.collidepoint(mouse_pos):
+                            self.trigger_box_requires_key = not self.trigger_box_requires_key
+                            return
+
+                        always_run_rect = self.ui_rects.get('trigger_box_always_run_rect')
+                        if always_run_rect and always_run_rect.collidepoint(mouse_pos):
+                            self.trigger_box_always_run = not self.trigger_box_always_run
+                            return
+
+                        self.trigger_box_id_input_active = False
+
+                    # Handle world map dropdown clicks
+                    if (self.selected_object and isinstance(self.selected_object, dict)
+                            and self.selected_object.get('object_type') == 'world_map_object'):
+                        current_variant = self._get_current_variant(self.selected_object)
+                        if current_variant and current_variant.get('type') in ('world_map', 'world_map_sign'):
+                            # Dropdown button — toggle open/closed
+                            wm_btn = self.ui_rects.get('world_map_dropdown_btn')
+                            if wm_btn and wm_btn.collidepoint(mouse_pos):
+                                self.world_map_dropdown_open = not self.world_map_dropdown_open
+                                if self.world_map_dropdown_open:
+                                    self.world_map_dropdown_names = self._get_world_map_names()
                                 return
 
-                    if self.selected_object.get('region_type') in ('water',):
-                        wave_rect = self.ui_rects.get('region_wave_slider')
-                        if wave_rect and wave_rect.collidepoint(mouse_pos):
-                            self._region_wave_dragging = True
-                            self._set_region_wave_amount_from_mouse_x(mouse_pos[0], wave_rect)
+                            # Item inside open dropdown list
+                            if self.world_map_dropdown_open:
+                                for item_rect, name in self.ui_rects.get('world_map_dropdown_items', []):
+                                    if item_rect.collidepoint(mouse_pos):
+                                        self.world_map_name_text = name
+                                        self.world_map_dropdown_open = False
+                                        return
+                                # Click outside list — close without selecting
+                                self.world_map_dropdown_open = False
+                                return
+
+                    # Handle water/grass opacity slider
+                    if (self.selected_object and isinstance(self.selected_object, dict)
+                            and self.selected_object.get('is_animated_region', False)):
+                        slider_rect = self.ui_rects.get('region_opacity_slider')
+                        if slider_rect and slider_rect.collidepoint(mouse_pos):
+                            self._region_opacity_dragging = True
+                            self._set_region_opacity_from_mouse_x(mouse_pos[0], slider_rect)
                             return
 
-                        seed_rect = self.ui_rects.get('region_seed_input')
-                        if seed_rect and seed_rect.collidepoint(mouse_pos):
-                            self.region_seed_input_active = True
-                            self.region_seed_text = str(self.region_seed)
-                            return
+                        if REGION_STYLES.get(self.selected_object.get('region_type'), {}).get('mode', 'patch') == 'tile':
+                            for i, variant_rect in enumerate(self.ui_rects.get('region_variant_rects', [])):
+                                if variant_rect.collidepoint(mouse_pos):
+                                    self.region_variant = i
+                                    return
 
-                        reroll_rect = self.ui_rects.get('region_seed_reroll')
-                        if reroll_rect and reroll_rect.collidepoint(mouse_pos):
-                            import random
-                            self.region_seed = random.randint(0, 999999)
-                            self.region_seed_text = str(self.region_seed)
-                            return
+                        if self.selected_object.get('region_type') in ('water',):
+                            wave_rect = self.ui_rects.get('region_wave_slider')
+                            if wave_rect and wave_rect.collidepoint(mouse_pos):
+                                self._region_wave_dragging = True
+                                self._set_region_wave_amount_from_mouse_x(mouse_pos[0], wave_rect)
+                                return
 
-                    region_style = REGION_STYLES.get(self.selected_object.get('region_type'), {})
-                    if region_style.get('mode', 'patch') == 'patch':
-                        reset_rect = self.ui_rects.get('region_color_reset')
-                        if reset_rect and reset_rect.collidepoint(mouse_pos):
-                            self.region_color = (255, 255, 255)
-                            return
+                            seed_rect = self.ui_rects.get('region_seed_input')
+                            if seed_rect and seed_rect.collidepoint(mouse_pos):
+                                self.region_seed_input_active = True
+                                self.region_seed_text = str(self.region_seed)
+                                return
 
-                        sv_rect = self.ui_rects.get('region_sv_square')
-                        if sv_rect and sv_rect.collidepoint(mouse_pos):
-                            self._region_sv_dragging = True
-                            self._set_region_sv_from_mouse(mouse_pos, sv_rect)
-                            return
+                            reroll_rect = self.ui_rects.get('region_seed_reroll')
+                            if reroll_rect and reroll_rect.collidepoint(mouse_pos):
+                                import random
+                                self.region_seed = random.randint(0, 999999)
+                                self.region_seed_text = str(self.region_seed)
+                                return
 
-                        hue_rect = self.ui_rects.get('region_hue_strip')
-                        if hue_rect and hue_rect.collidepoint(mouse_pos):
-                            self._region_hue_dragging = True
-                            self._set_region_hue_from_mouse_y(mouse_pos[1], hue_rect)
-                            return
+                        region_style = REGION_STYLES.get(self.selected_object.get('region_type'), {})
+                        if region_style.get('mode', 'patch') == 'patch':
+                            reset_rect = self.ui_rects.get('region_color_reset')
+                            if reset_rect and reset_rect.collidepoint(mouse_pos):
+                                self.region_color = (255, 255, 255)
+                                self._sync_hex_text()
+                                return
 
-                # Variant scroll-arrow clicks (only present when the row overflows)
-                left_arrow = self.ui_rects.get('variant_scroll_left')
-                if left_arrow and left_arrow.collidepoint(mouse_pos):
-                    self.variant_scroll -= 1
-                    return
-                right_arrow = self.ui_rects.get('variant_scroll_right')
-                if right_arrow and right_arrow.collidepoint(mouse_pos):
-                    self.variant_scroll += 1
-                    return
+                            for key, idx in (('r', 0), ('g', 1), ('b', 2)):
+                                bar_rect = self.ui_rects.get(f'region_{key}_bar')
+                                if bar_rect and bar_rect.collidepoint(mouse_pos):
+                                    if key == 'r':
+                                        self._region_r_dragging = True
+                                    elif key == 'g':
+                                        self._region_g_dragging = True
+                                    else:
+                                        self._region_b_dragging = True
+                                    self._set_region_channel_from_mouse_x(idx, mouse_pos[0], bar_rect)
+                                    return
 
-                # Check if clicking on variant selector
-                if self._is_variant_selector_clicked(mouse_pos):
-                    return
+                                spin_text_rect = self.ui_rects.get(f'region_{key}_spin_text')
+                                if spin_text_rect and spin_text_rect.collidepoint(mouse_pos):
+                                    self.region_channel_input_active = key
+                                    self.region_channel_text = str(self.region_color[idx])
+                                    return
+
+                                spin_up_rect = self.ui_rects.get(f'region_{key}_spin_up')
+                                if spin_up_rect and spin_up_rect.collidepoint(mouse_pos):
+                                    channel = list(self.region_color)
+                                    channel[idx] = self._clamp_channel(channel[idx] + 1)
+                                    self.region_color = tuple(channel)
+                                    self._sync_hex_text()
+                                    return
+
+                                spin_down_rect = self.ui_rects.get(f'region_{key}_spin_down')
+                                if spin_down_rect and spin_down_rect.collidepoint(mouse_pos):
+                                    channel = list(self.region_color)
+                                    channel[idx] = self._clamp_channel(channel[idx] - 1)
+                                    self.region_color = tuple(channel)
+                                    self._sync_hex_text()
+                                    return
+
+                            hex_rect = self.ui_rects.get('region_hex_input')
+                            if hex_rect and hex_rect.collidepoint(mouse_pos):
+                                self.region_hex_input_active = True
+                                return
+
+                    # Variant scroll-arrow clicks (only present when the row overflows)
+                    left_arrow = self.ui_rects.get('variant_scroll_left')
+                    if left_arrow and left_arrow.collidepoint(mouse_pos):
+                        self.variant_scroll -= 1
+                        return
+                    right_arrow = self.ui_rects.get('variant_scroll_right')
+                    if right_arrow and right_arrow.collidepoint(mouse_pos):
+                        self.variant_scroll += 1
+                        return
+
+                    # Check if clicking on variant selector
+                    if self._is_variant_selector_clicked(mouse_pos):
+                        return
 
                 # Deactivate input if clicking elsewhere
                 if self.gate_level_input_active:
@@ -2820,6 +2973,21 @@ class ObjectEditor:
                         self.region_seed = int(self.region_seed_text)
                     except ValueError:
                         self.region_seed_text = str(self.region_seed)
+                if self.region_channel_input_active:
+                    key = self.region_channel_input_active
+                    idx = {'r': 0, 'g': 1, 'b': 2}[key]
+                    self.region_channel_input_active = None
+                    try:
+                        value = self._clamp_channel(int(self.region_channel_text or 0))
+                    except ValueError:
+                        value = self.region_color[idx]
+                    channel = list(self.region_color)
+                    channel[idx] = value
+                    self.region_color = tuple(channel)
+                    self._sync_hex_text()
+                if self.region_hex_input_active:
+                    self.region_hex_input_active = False
+                    self._commit_hex_text()
 
                 # Finish placing collision wall if we're in the middle of it
                 if self.placing_collision:
@@ -2894,25 +3062,33 @@ class ObjectEditor:
                 self._set_region_wave_amount_from_mouse_x(mouse_pos[0], wave_rect)
             return
 
-        # Dragging the water color saturation/value square
-        if event.type == pygame.MOUSEMOTION and self._region_sv_dragging:
-            sv_rect = self.ui_rects.get('region_sv_square')
-            if sv_rect:
-                self._set_region_sv_from_mouse(mouse_pos, sv_rect)
+        # Dragging the water color R gradient bar
+        if event.type == pygame.MOUSEMOTION and self._region_r_dragging:
+            bar_rect = self.ui_rects.get('region_r_bar')
+            if bar_rect:
+                self._set_region_channel_from_mouse_x(0, mouse_pos[0], bar_rect)
             return
 
-        # Dragging the water color hue strip
-        if event.type == pygame.MOUSEMOTION and self._region_hue_dragging:
-            hue_rect = self.ui_rects.get('region_hue_strip')
-            if hue_rect:
-                self._set_region_hue_from_mouse_y(mouse_pos[1], hue_rect)
+        # Dragging the water color G gradient bar
+        if event.type == pygame.MOUSEMOTION and self._region_g_dragging:
+            bar_rect = self.ui_rects.get('region_g_bar')
+            if bar_rect:
+                self._set_region_channel_from_mouse_x(1, mouse_pos[0], bar_rect)
+            return
+
+        # Dragging the water color B gradient bar
+        if event.type == pygame.MOUSEMOTION and self._region_b_dragging:
+            bar_rect = self.ui_rects.get('region_b_bar')
+            if bar_rect:
+                self._set_region_channel_from_mouse_x(2, mouse_pos[0], bar_rect)
             return
 
         if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
             self._region_opacity_dragging = False
             self._region_wave_dragging = False
-            self._region_sv_dragging = False
-            self._region_hue_dragging = False
+            self._region_r_dragging = False
+            self._region_g_dragging = False
+            self._region_b_dragging = False
 
         # Keyboard shortcuts
         if event.type == pygame.KEYDOWN:
@@ -2965,6 +3141,37 @@ class ObjectEditor:
                         self.region_seed_text = event.unicode
                     elif len(self.region_seed_text) < 6:
                         self.region_seed_text += event.unicode
+                return
+
+            if self.region_channel_input_active:
+                key = self.region_channel_input_active
+                idx = {'r': 0, 'g': 1, 'b': 2}[key]
+                if event.key == pygame.K_BACKSPACE:
+                    self.region_channel_text = self.region_channel_text[:-1]
+                elif event.key == pygame.K_RETURN or event.key == pygame.K_ESCAPE:
+                    self.region_channel_input_active = None
+                    try:
+                        value = self._clamp_channel(int(self.region_channel_text or 0))
+                    except ValueError:
+                        value = self.region_color[idx]
+                    channel = list(self.region_color)
+                    channel[idx] = value
+                    self.region_color = tuple(channel)
+                    self._sync_hex_text()
+                elif event.unicode.isdigit():
+                    if len(self.region_channel_text) < 3:
+                        self.region_channel_text += event.unicode
+                return
+
+            if self.region_hex_input_active:
+                if event.key == pygame.K_BACKSPACE:
+                    self.region_hex_text = self.region_hex_text[:-1]
+                elif event.key == pygame.K_RETURN or event.key == pygame.K_ESCAPE:
+                    self.region_hex_input_active = False
+                    self._commit_hex_text()
+                elif event.unicode and event.unicode.upper() in "0123456789ABCDEF":
+                    if len(self.region_hex_text) < 6:
+                        self.region_hex_text += event.unicode.upper()
                 return
 
             if event.key == pygame.K_g:
@@ -4008,11 +4215,19 @@ class ObjectEditor:
             border_width = 2 if is_selected else 1
             pygame.draw.rect(screen, border_color, variant_rect, border_width, border_radius=3)
 
-            # Sprite
+            # Sprite — scaled to fit the slot (mirrors _draw_object_item's
+            # scale-to-fit, needed now that variant sprites aren't all
+            # small icons — a tree frame is 80x92, well past variant_size).
             if variant.get('sprite'):
-                sprite = variant['sprite'].copy()
-                sprite_rect = sprite.get_rect(center=variant_rect.center)
-                screen.blit(sprite, sprite_rect)
+                sprite = variant['sprite']
+                sw, sh = sprite.get_size()
+                max_dim = variant_size - 6  # small padding on each axis
+                scale = min(max_dim / sw, max_dim / sh, 1.0)
+                scaled_w = max(1, int(sw * scale))
+                scaled_h = max(1, int(sh * scale))
+                scaled_sprite = pygame.transform.scale(sprite, (scaled_w, scaled_h))
+                sprite_rect = scaled_sprite.get_rect(center=variant_rect.center)
+                screen.blit(scaled_sprite, sprite_rect)
 
             # Label
             label_text = self.font_small.render(variant['name'], True, self.colors['text_dim'])
@@ -4139,7 +4354,8 @@ class ObjectEditor:
         obj = self.selected_object
         if obj and isinstance(obj, dict):
             if obj.get('object_type') == 'level_gate':
-                height += 30
+                height += 30  # Gate Level Req row
+                height += 30  # Gate Character row
 
             if obj.get('object_type') == 'door':
                 height += 30
@@ -4243,6 +4459,53 @@ class ObjectEditor:
                     pygame.draw.line(screen, self.colors['text'],
                                      (cursor_x, cursor_y - 10),
                                      (cursor_x, cursor_y + 10), 2)
+
+            y_pos += 30
+
+            # ── Gate Character lock ─────────────────────────────────────
+            # Cycle arrows through [Any, *characters]; the swatch previews
+            # exactly the color the placed gate's number will use (see
+            # _gate_character_color / LevelGate._load_gate_color).
+            char_label = self.font_medium.render("Gate Character:", True, self.colors['text'])
+            screen.blit(char_label, (self.palette_x + self.palette_padding, y_pos))
+
+            arrow_size = 22
+            name_x = self.palette_x + self.palette_padding + 135
+            left_rect = pygame.Rect(name_x, y_pos - 3, arrow_size, arrow_size)
+            right_rect = pygame.Rect(
+                self.palette_x + self.palette_width - self.palette_padding - arrow_size,
+                y_pos - 3, arrow_size, arrow_size,
+            )
+
+            ay = left_rect.centery
+            pygame.draw.polygon(screen, self.colors['text'], [
+                (left_rect.right - 6, ay - 7),
+                (left_rect.left + 5, ay),
+                (left_rect.right - 6, ay + 7),
+            ])
+            pygame.draw.polygon(screen, self.colors['text'], [
+                (right_rect.left + 6, ay - 7),
+                (right_rect.right - 5, ay),
+                (right_rect.left + 6, ay + 7),
+            ])
+            pygame.draw.rect(screen, self.colors['grid'], left_rect, 1, border_radius=4)
+            pygame.draw.rect(screen, self.colors['grid'], right_rect, 1, border_radius=4)
+
+            self.ui_rects['gate_char_arrow_left'] = left_rect
+            self.ui_rects['gate_char_arrow_right'] = right_rect
+
+            name_txt = self._gate_character_display_name(self.gate_required_character)
+            name_surf = self.font_medium.render(name_txt, True, self.colors['text'])
+            name_area = pygame.Rect(left_rect.right + 6, y_pos - 3,
+                                     right_rect.left - left_rect.right - 12 - 20, arrow_size)
+            name_clip = name_surf.get_rect()
+            name_clip.width = min(name_clip.width, name_area.width)
+            screen.blit(name_surf, name_area.topleft, name_clip)
+
+            swatch_rect = pygame.Rect(right_rect.left - 18, y_pos, 14, 14)
+            pygame.draw.rect(screen, self._gate_character_color(self.gate_required_character),
+                             swatch_rect, border_radius=3)
+            pygame.draw.rect(screen, self.colors['grid'], swatch_rect, 1, border_radius=3)
 
             y_pos += 30
 
@@ -4640,41 +4903,83 @@ class ObjectEditor:
 
                 y_pos += 26
 
-                hue, sat, val = self._region_color_hsv()
+                # RGB sliders + spin boxes + a hex field — one gradient bar
+                # per channel (black -> full channel color) with a draggable
+                # marker, a numeric read-out with tiny +/- spin arrows next
+                # to it, and a hex box that free-types a color directly.
+                row_h = 18
+                row_gap = 6
+                label_w = 16
+                spin_text_w = 32
+                spin_arrow_w = 12
+                spin_w = spin_text_w + spin_arrow_w
+                bar_gap = 6
+                bar_x = self.palette_x + self.palette_padding + label_w
+                bar_w = self.palette_width - self.palette_padding * 2 - label_w - bar_gap - spin_w
 
-                hue_w = 18
-                gap = 10
-                sv_h = 90
-                sv_x = self.palette_x + self.palette_padding
-                sv_y = y_pos
-                sv_w = self.palette_width - self.palette_padding * 2 - hue_w - gap
-                sv_rect = pygame.Rect(sv_x, sv_y, sv_w, sv_h)
+                for key, idx, label_text in (('r', 0, 'R'), ('g', 1, 'G'), ('b', 2, 'B')):
+                    bar_rect = pygame.Rect(bar_x, y_pos, bar_w, row_h)
+                    grad_surf = self._get_channel_gradient_surface(idx, bar_w, row_h)
+                    screen.blit(grad_surf, bar_rect.topleft)
+                    pygame.draw.rect(screen, self.colors['grid'], bar_rect, 1)
 
-                sv_surf = self._get_sv_square_surface(hue, sv_w, sv_h)
-                screen.blit(sv_surf, sv_rect.topleft)
-                pygame.draw.rect(screen, self.colors['grid'], sv_rect, 2)
+                    label_surf = self.font_small.render(label_text + ":", True, self.colors['text'])
+                    screen.blit(label_surf, (bar_rect.left - label_w,
+                                              bar_rect.centery - label_surf.get_height() // 2))
 
-                # Cursor ring — white on dark colors, black on light ones so
-                # it's always visible against whatever's under it.
-                sv_cursor_x = sv_rect.left + int(sat * sv_rect.width)
-                sv_cursor_y = sv_rect.top + int((1 - val) * sv_rect.height)
-                ring_color = (255, 255, 255) if val < 0.6 else (0, 0, 0)
-                pygame.draw.circle(screen, ring_color, (sv_cursor_x, sv_cursor_y), 6, 2)
+                    val = self.region_color[idx]
+                    marker_x = bar_rect.left + int((val / 255) * bar_rect.width)
+                    marker_rect = pygame.Rect(marker_x - 2, bar_rect.top - 2, 4, bar_rect.height + 4)
+                    pygame.draw.rect(screen, (255, 255, 255), marker_rect, 1)
+                    pygame.draw.rect(screen, (0, 0, 0), marker_rect, 1)
+                    self.ui_rects[f'region_{key}_bar'] = bar_rect
 
-                self.ui_rects['region_sv_square'] = sv_rect
+                    spin_rect = pygame.Rect(bar_rect.right + bar_gap, y_pos, spin_text_w, row_h)
+                    pygame.draw.rect(screen, self.colors['panel_light'], spin_rect)
+                    border_col = self.colors['accent'] if self.region_channel_input_active == key else self.colors['grid']
+                    pygame.draw.rect(screen, border_col, spin_rect, 1)
+                    val_text = self.region_channel_text if self.region_channel_input_active == key else str(val)
+                    val_surf = self.font_small.render(val_text, True, self.colors['text'])
+                    screen.blit(val_surf, val_surf.get_rect(center=spin_rect.center))
+                    self.ui_rects[f'region_{key}_spin_text'] = spin_rect
 
-                hue_rect = pygame.Rect(sv_rect.right + gap, sv_y, hue_w, sv_h)
-                hue_surf = self._get_hue_strip_surface(hue_w, sv_h)
-                screen.blit(hue_surf, hue_rect.topleft)
-                pygame.draw.rect(screen, self.colors['grid'], hue_rect, 2)
+                    arrow_up_rect = pygame.Rect(spin_rect.right, y_pos, spin_arrow_w, row_h // 2)
+                    arrow_down_rect = pygame.Rect(spin_rect.right, y_pos + row_h // 2,
+                                                   spin_arrow_w, row_h - row_h // 2)
+                    pygame.draw.rect(screen, self.colors['panel_light'], arrow_up_rect)
+                    pygame.draw.rect(screen, self.colors['panel_light'], arrow_down_rect)
+                    pygame.draw.rect(screen, self.colors['grid'], arrow_up_rect, 1)
+                    pygame.draw.rect(screen, self.colors['grid'], arrow_down_rect, 1)
+                    up_pts = [(arrow_up_rect.centerx, arrow_up_rect.top + 3),
+                              (arrow_up_rect.left + 3, arrow_up_rect.bottom - 2),
+                              (arrow_up_rect.right - 3, arrow_up_rect.bottom - 2)]
+                    down_pts = [(arrow_down_rect.centerx, arrow_down_rect.bottom - 3),
+                                (arrow_down_rect.left + 3, arrow_down_rect.top + 2),
+                                (arrow_down_rect.right - 3, arrow_down_rect.top + 2)]
+                    pygame.draw.polygon(screen, self.colors['text'], up_pts)
+                    pygame.draw.polygon(screen, self.colors['text'], down_pts)
+                    self.ui_rects[f'region_{key}_spin_up'] = arrow_up_rect
+                    self.ui_rects[f'region_{key}_spin_down'] = arrow_down_rect
 
-                hue_marker_y = hue_rect.top + int(hue * hue_rect.height)
-                marker_rect = pygame.Rect(hue_rect.left - 2, hue_marker_y - 2, hue_rect.width + 4, 4)
-                pygame.draw.rect(screen, (255, 255, 255), marker_rect, 1)
+                    y_pos += row_h + row_gap
 
-                self.ui_rects['region_hue_strip'] = hue_rect
+                hex_label_text = "Hex:"
+                hex_label_surf = self.font_small.render(hex_label_text, True, self.colors['text'])
+                hex_label_x = self.palette_x + self.palette_padding
+                screen.blit(hex_label_surf, (hex_label_x, y_pos + row_h // 2 - hex_label_surf.get_height() // 2))
 
-                y_pos += sv_h + 10
+                hex_field_x = hex_label_x + label_w + 24
+                hex_rect = pygame.Rect(hex_field_x, y_pos,
+                                        self.palette_x + self.palette_width - self.palette_padding - hex_field_x,
+                                        row_h)
+                pygame.draw.rect(screen, self.colors['panel_light'], hex_rect)
+                hex_border_col = self.colors['accent'] if self.region_hex_input_active else self.colors['grid']
+                pygame.draw.rect(screen, hex_border_col, hex_rect, 2 if self.region_hex_input_active else 1)
+                hex_surf = self.font_small.render("#" + self.region_hex_text, True, self.colors['text'])
+                screen.blit(hex_surf, (hex_rect.left + 6, hex_rect.centery - hex_surf.get_height() // 2))
+                self.ui_rects['region_hex_input'] = hex_rect
+
+                y_pos += row_h + 10
 
         instructions = [
             "Click: Select Object",

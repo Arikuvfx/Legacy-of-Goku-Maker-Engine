@@ -2,7 +2,19 @@ import pygame
 import os
 import sys
 import time
+import colorsys
 from config.settings import RENDER_SCALE
+
+
+class _TintedBarSprite:
+    """Thin HUDSprite-alike wrapper around an already-recolored pygame
+    Surface, so draw_bar_simple() (which reads bar_sprite.sprite) can treat
+    a tinted ki bar exactly like a normal HUDSprite without caring where
+    the surface came from."""
+    __slots__ = ('sprite',)
+
+    def __init__(self, surface):
+        self.sprite = surface
 
 
 class HUDSprite:
@@ -51,7 +63,7 @@ class SpriteHUD:
         self._hud_slide_in  = False
 
         # Change this one value to resize everything
-        self.scale = 0.7 * 2
+        self.scale = 6
 
         if getattr(sys, 'frozen', False):
             app_path = os.path.dirname(sys.executable)
@@ -59,6 +71,7 @@ class SpriteHUD:
             app_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         self.base_path = os.path.join(app_path, "assets", "ui", "hud")
         self.attacks_path = os.path.join(app_path, "assets", "sprites", "attacks")
+        self.player_sprites_path = os.path.join(app_path, "assets", "sprites", "player")
 
         # Attack-icon HUD keys map to the actual attack folder ids (the same
         # ids used in equipped_attacks / _get_allowed_ki_modes), since the
@@ -95,7 +108,9 @@ class SpriteHUD:
             'transformed_ki_bar':  HUDSprite(os.path.join(self.base_path, "transformed_ki_bar.png")),
             'exp_bar':             HUDSprite(os.path.join(self.base_path, "exp_bar.png")),
             'transform_bar':       HUDSprite(os.path.join(self.base_path, "transform_bar.png")),
-            # Transformation icon is NOT affected by the attacks-folder switch.
+            # Fallback transformation icon, used when the active transformation
+            # doesn't have its own icon.png in its sprite folder (see
+            # _get_transformation_icon / self._transform_icon_cache below).
             'transformation_icon': HUDSprite(os.path.join(self.base_path, "transformation_icon.png")),
             # Default/fallback attack icon also stays in the HUD folder.
             'attack_icon':         HUDSprite(os.path.join(self.base_path, "attack_icon.png")),
@@ -116,16 +131,16 @@ class SpriteHUD:
 
         # Base dimensions of each element at scale 1.0 (pixels)
         self.config = {
-            'frame':              {'x': 0, 'y': 0, 'w': 338, 'h': 100},
+            'frame':              {'x': 0, 'y': 0, 'w': 80, 'h': 16},
             'attack_icon':        {'x': 0, 'y': 0, 'w': 338, 'h': 100},
             # Real per-attack icons are 64×28 native — draw at native size
             # (scaled by sc()) instead of stretching them to fill the frame.
-            'attack_mode_icon':   {'x': 43, 'y': 26, 'w': 64, 'h': 28},
-            'hp_bar':             {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 139, 'bar_end': 311},
-            'ki_bar':             {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 123, 'bar_end': 295},
-            'transformed_ki_bar': {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start': 123, 'bar_end': 295},
-            'exp_bar':            {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start':  19, 'bar_end': 311},
-            'transform_bar':      {'x': 0, 'y': 0, 'w': 338, 'h': 100, 'bar_start':  13, 'bar_end':  40},
+            'attack_mode_icon':   {'x': 3, 'y': 3, 'w': 16, 'h': 7},
+            'hp_bar':             {'x': 33, 'y': 3, 'w': 43, 'h': 3, 'bar_start': 0, 'bar_end': 43},
+            'ki_bar':             {'x': 29, 'y': 7, 'w': 43, 'h': 3, 'bar_start': 0, 'bar_end': 43},
+            'transformed_ki_bar': {'x': 29, 'y': 7, 'w': 43, 'h': 3, 'bar_start': 0, 'bar_end': 43},
+            'exp_bar':            {'x': 3, 'y': 12, 'w': 73, 'h': 2, 'bar_start':  0, 'bar_end': 73},
+            'transform_bar':      {'x': 22, 'y': 3, 'w': 7, 'h': 7, 'bar_start':  0, 'bar_end':  7},
             # Boss bar — sprites are 64×8 px native, scaled to match the player
             # HUD width (338 config units → same sc() factor as everything else).
             # Height is proportional: 338 * 8/64 = 42.
@@ -160,6 +175,18 @@ class SpriteHUD:
             'transform_ready':  (255, 255, 255),
             'transform_fill':   (255, 215, 0),
         }
+
+        # Recolored transformed-ki-bar surfaces, keyed by (id(base_surface),
+        # hex_color). Built lazily the first time a given custom ki color is
+        # actually drawn, then reused every frame after that — recoloring is
+        # a per-pixel loop so we don't want to redo it every draw() call.
+        self._ki_color_cache = {}
+
+        # Per-transformation icon sprites, keyed by (char_id, transform_costume).
+        # Loaded lazily the first time a given transformation is drawn — see
+        # _get_transformation_icon() — since the icon now lives alongside that
+        # transformation's own sprites instead of a single flat HUD file.
+        self._transform_icon_cache = {}
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -200,9 +227,59 @@ class SpriteHUD:
         region_w  = bar_end_x - bar_start_x
         fill_w    = int(region_w * (current / maximum))
         scaled    = pygame.transform.scale(bar_sprite.sprite, (width, height))
-        if fill_w > 0:
-            screen.blit(scaled.subsurface((bar_start_x, 0, fill_w, height)),
-                        (x + bar_start_x, y))
+        if fill_w <= 0:
+            return
+
+        # Step once per REAL source pixel row (e.g. 3), not per scaled screen
+        # row — otherwise a 3px bar scaled up to 18px tall draws 18 tiny
+        # 1px steps, which just looks like a smooth "/" slope. Each source
+        # row should be a full blocky step:
+        #   ---
+        #    --
+        #     -
+        src_rows = max(1, bar_sprite.sprite.get_height())
+        row_h    = max(1, height // src_rows)
+        for row in range(src_rows):
+            row_y    = row * row_h
+            # last row absorbs any leftover height from integer division
+            this_h   = height - row_y if row == src_rows - 1 else row_h
+            row_fill = max(0, fill_w - row * row_h)
+            if row_fill <= 0:
+                continue
+            screen.blit(scaled.subsurface((bar_start_x, row_y, row_fill, this_h)),
+                        (x + bar_start_x, y + row_y))
+
+    def _get_recolored_bar_surface(self, base_surface, hex_color):
+        """Recolor transformed_ki_bar.png to a custom hue, preserving each
+        pixel's own lightness — replicating how the original game's ki bar
+        palettes work (normal/SSJ/SSJ3 each step through the same five
+        lightness steps, only the hue changes; see the ki-color hex lists
+        in the transformation design notes). Result is cached per
+        (source surface, color) pair since this loops pixel-by-pixel.
+        """
+        key = (id(base_surface), hex_color)
+        cached = self._ki_color_cache.get(key)
+        if cached is not None:
+            return cached
+
+        target_r = int(hex_color[1:3], 16) / 255.0
+        target_g = int(hex_color[3:5], 16) / 255.0
+        target_b = int(hex_color[5:7], 16) / 255.0
+        target_hue, _, target_sat = colorsys.rgb_to_hls(target_r, target_g, target_b)
+
+        w, h = base_surface.get_size()
+        out = base_surface.copy()
+        for py in range(h):
+            for px in range(w):
+                r, g, b, a = base_surface.get_at((px, py))
+                if a == 0:
+                    continue
+                _, lightness, _ = colorsys.rgb_to_hls(r / 255.0, g / 255.0, b / 255.0)
+                nr, ng, nb = colorsys.hls_to_rgb(target_hue, lightness, target_sat)
+                out.set_at((px, py), (round(nr * 255), round(ng * 255), round(nb * 255), a))
+
+        self._ki_color_cache[key] = out
+        return out
 
     def draw_transform_bar_with_shine(self, screen, x, y, width, height,
                                        progress, is_ready, shine_alpha, bar_sprite):
@@ -217,6 +294,45 @@ class SpriteHUD:
         if hasattr(player, 'transformation') and player.transformation:
             return player.transformation.transform_animation_progress
         return 0.0
+
+    def _get_transformation_icon(self, player, form_name=None):
+        """Return the HUDSprite to use for a transform ki-mode icon.
+
+        form_name: which specific tier's icon to load (e.g. "ssj3") — pass
+          this for a 'transform:<form_name>' slot so each tier shows its
+          own icon.png instead of always the first-registered form's. None
+          means the base 'transform' slot (historical behavior).
+
+        Mirrors load_attack_icon()'s per-item lookup in character_creator.py:
+        each transformation's icon.png now lives in that transformation's own
+        sprite folder —
+            assets/sprites/player/{char_id}/{active_costume}/transformations/{form}/icon.png
+        — instead of the flat assets/ui/hud/transformation_icon.png. Falls
+        back to the old HUD icon if the active transformation doesn't have
+        its own icon.png (e.g. an older project that hasn't added one yet).
+        """
+        char_id = getattr(player, 'character', None)
+        transformation = getattr(player, 'transformation', None)
+        transform_costume = transformation.get_display_transform_costume(form_name) if transformation else None
+
+        if not char_id or not transform_costume:
+            return self.sprites['transformation_icon']
+
+        cache_key = (char_id, transform_costume)
+        cached = self._transform_icon_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        icon_path = os.path.join(self.player_sprites_path, char_id, transform_costume, "icon.png")
+        icon_sprite = HUDSprite(icon_path)
+        if not icon_sprite.sprite:
+            # No dedicated icon.png for this transformation — fall back to
+            # the shared HUD icon. Cached under this key too, since icon
+            # files aren't expected to appear mid-session.
+            icon_sprite = self.sprites['transformation_icon']
+
+        self._transform_icon_cache[cache_key] = icon_sprite
+        return icon_sprite
 
     # ── Boss bar ──────────────────────────────────────────────────────────────
 
@@ -330,10 +446,34 @@ class SpriteHUD:
 
         mode  = getattr(player, 'ki_attack_mode', 'blast')
 
+        # Which specific transformation tier the current mode targets, if
+        # any — 'transform' (the base slot) resolves to None (meaning
+        # "whichever form is registered first"), 'transform:<form_name>'
+        # resolves to that form_name, and every other mode is untouched.
+        transform_form = None
+        is_transform_mode = mode == 'transform' or mode.startswith('transform:')
+        if mode.startswith('transform:'):
+            transform_form = mode.split(':', 1)[1]
+
         xform_opacity = 255
-        if hasattr(player, 'transformation') and player.transformation:
-            if not player.transformation.is_ready:
-                xform_opacity = 128  # dim the icon when transform isn't charged
+        if is_transform_mode and hasattr(player, 'transformation') and player.transformation:
+            # Dim the icon when selecting this slot right now wouldn't
+            # actually do anything — either the base charge meter isn't
+            # ready yet, or (for a tier-2+ slot) its prerequisite tier
+            # hasn't been reached. Full opacity also while the player is
+            # currently standing in the exact form this slot targets, so
+            # an active tier doesn't read as "unavailable".
+            ts = player.transformation
+            # Resolve which actual form_name the base 'transform' slot
+            # (transform_form None) points at, so "currently active" can
+            # be compared by real form_name rather than against the literal
+            # None sentinel — otherwise standing in SSJ while its own slot
+            # is selected would incorrectly read as "not active".
+            resolved_costume = ts.get_display_transform_costume(transform_form)
+            resolved_form = ts._form_name_from_costume(resolved_costume) if resolved_costume else transform_form
+            if not (ts.is_transformed and ts.active_form_name == resolved_form):
+                if not ts.can_start_transform(transform_form):
+                    xform_opacity = 128
 
         if mode == 'beam' and self.sprites['attack_icon_beam'].sprite:
             self.sprites['attack_icon_beam'].draw(screen, ax, ay, aw, ah)
@@ -367,8 +507,8 @@ class SpriteHUD:
             self.sprites['attack_icon_instant_transmission'].draw(screen, ax, ay, aw, ah)
         elif mode == 'ghost_kamikaze_attack' and self.sprites['attack_icon_ghost_kamikaze'].sprite:
             self.sprites['attack_icon_ghost_kamikaze'].draw(screen, ax, ay, aw, ah)
-        elif mode == 'transform' and self.sprites['transformation_icon'].sprite:
-            self.sprites['transformation_icon'].draw(screen, ix, iy, iw, ih, opacity=xform_opacity)
+        elif is_transform_mode and self._get_transformation_icon(player, transform_form).sprite:
+            self._get_transformation_icon(player, transform_form).draw(screen, ax, ay, aw, ah, opacity=xform_opacity)
         elif mode == 'blast' and self.sprites['attack_icon_blast'].sprite:
             self.sprites['attack_icon_blast'].draw(screen, ax, ay, aw, ah)
         else:
@@ -396,20 +536,68 @@ class SpriteHUD:
         tkx, tky = bx + sc(tki_cfg['x']), by + sc(tki_cfg['y'])
         tkw, tkh = sc(tki_cfg['w']),       sc(tki_cfg['h'])
 
-        if is_transforming:
-            # Show the bar filling up during the animation
-            anim = self.get_transform_animation_progress(player)
-            self.draw_bar_simple(screen, tkx, tky, tkw, tkh,
-                                 anim, 1.0, self.sprites['transformed_ki_bar'],
-                                 bar_start_x=sc(tki_cfg.get('bar_start', 0)),
-                                 bar_end_x=sc(tki_cfg.get('bar_end', tki_cfg['w'])))
-        elif is_transformed:
+        def _tier_bar_sprite(ki_color):
+            """Only the transformed bar is customizable — the normal (non-
+            transformed) ki bar above always stays the original green
+            sprite. A form with no ki_color configured falls back to
+            transformed_ki_bar.png's own baked-in colors, unchanged."""
+            sprite = self.sprites['transformed_ki_bar']
+            if ki_color and sprite.sprite:
+                recolored = self._get_recolored_bar_surface(sprite.sprite, ki_color)
+                return _TintedBarSprite(recolored)
+            return sprite
+
+        # A transformation can have its charge bar disabled entirely (see
+        # character_creator.py's "Show Charge Bar" checkbox). In that case
+        # the transform animation just plays straight through on its own
+        # with no fill progress to represent, and — since the player is
+        # meant to read as just using their normal ki bar for this form —
+        # the transformed-ki bar also stays hidden once transformed, not
+        # just during the animation.
+        transform_bar_enabled = getattr(player.transformation, 'current_transform_ki_bar_enabled', True)
+        if (is_transforming or is_transformed) and transform_bar_enabled:
             t = player.transformation
-            self.draw_bar_simple(screen, tkx, tky, tkw, tkh,
-                                 t.transformed_ki, t.max_transformed_ki,
-                                 self.sprites['transformed_ki_bar'],
-                                 bar_start_x=sc(tki_cfg.get('bar_start', 0)),
-                                 bar_end_x=sc(tki_cfg.get('bar_end', tki_cfg['w'])))
+            tier_depth = getattr(t, 'tier_depth', 0)
+            frozen_colors = getattr(t, 'frozen_tier_colors', [])
+            frozen_fills = getattr(t, 'frozen_tier_fills', [])
+
+            bar_start = sc(tki_cfg.get('bar_start', 0))
+            bar_end   = sc(tki_cfg.get('bar_end', tki_cfg['w']))
+
+            # The most-recently-completed tier gets drawn first, as a
+            # frozen backdrop across the WHOLE row — frozen at the exact
+            # ki fraction it actually had the instant the player advanced
+            # past it (see frozen_tier_fills), so it stays completely
+            # static while the current tier charges, instead of snapping
+            # to "full" if it wasn't. Any earlier frozen tiers are fully
+            # covered underneath it either way and don't need drawing.
+            if tier_depth > 0:
+                prev_color = frozen_colors[-1] if frozen_colors else None
+                prev_fill  = frozen_fills[-1] if frozen_fills else 1.0
+                backdrop_sprite = _tier_bar_sprite(prev_color)
+                self.draw_bar_simple(screen, tkx, tky, tkw, tkh,
+                                     prev_fill, 1.0, backdrop_sprite,
+                                     bar_start_x=bar_start, bar_end_x=bar_end)
+
+            # Current tier's own bar grows from the SAME starting point
+            # every tier uses (the left edge of the row), layered on top of
+            # the previous tier's backdrop as it fills — so SSJ's bar stays
+            # visible underneath until SSJ3's own bar grows enough to cover
+            # it, instead of picking up from wherever SSJ's fill happened
+            # to stop.
+            active_sprite = _tier_bar_sprite(getattr(t, 'current_transform_ki_color', None))
+            if is_transforming:
+                # Show the bar filling up during the animation
+                anim = self.get_transform_animation_progress(player)
+                self.draw_bar_simple(screen, tkx, tky, tkw, tkh,
+                                     anim, 1.0, active_sprite,
+                                     bar_start_x=bar_start, bar_end_x=bar_end)
+            else:
+                self.draw_bar_simple(screen, tkx, tky, tkw, tkh,
+                                     t.transformed_ki, t.max_transformed_ki,
+                                     active_sprite,
+                                     bar_start_x=bar_start, bar_end_x=bar_end)
+
 
         # 5. EXP bar
         exp = self.config['exp_bar']
