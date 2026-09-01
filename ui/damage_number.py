@@ -50,7 +50,7 @@ FONT_DIR = os.path.join("assets", "ui", "fonts", "dmg_font")
 # Integer scale applied to every digit sprite at load time.
 # pygame.transform.scale uses nearest-neighbor — pixel art stays sharp.
 # Never use smoothscale here or the crisp edges will blur.
-DIGIT_SCALE = 4
+DIGIT_SCALE = 6
 
 
 def _load_digits(variant: str) -> list:

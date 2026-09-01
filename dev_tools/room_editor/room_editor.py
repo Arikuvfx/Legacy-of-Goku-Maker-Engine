@@ -218,6 +218,16 @@ class RoomEditor:
         self._zoom_scale  = 1.0      # fit scale factor used for coord conversion
         self._zoom_dirty  = True     # when True the cache must be rebuilt
 
+        # ── Continuous editor zoom (Ctrl+scroll) ────────────────────────────
+        # Separate from zoom_active above: this stays live/editable, scaling
+        # the whole live-edit viewport out so more of a room is visible at
+        # once now that RENDER_SCALE is bigger, rather than snapping to a
+        # static, non-editable full-room overview. 1.0 = unchanged/native.
+        self.editor_zoom = 1.0
+        self._editor_zoom_min = 0.35
+        self._editor_zoom_max = 1.0
+        self._editor_zoom_step = 0.1
+
         self.anim_timer = 0
         self.hover_anim = [0.0] * 20
 
@@ -256,6 +266,14 @@ class RoomEditor:
         # painted tiles are evicted from the baked-surface cache before the
         # very next draw call — even while the room editor owns the draw loop.
         self.flush_tile_cache_callback = None
+        # Wired by game.py to game._draw_animated_regions_overlay — the real,
+        # animated water/lava/grass texture used in actual gameplay, as
+        # opposed to object_editor.draw_animated_regions()'s flat colored
+        # placeholder box. Used while the tile editor is active so regions
+        # still read as their real texture instead of a blank-looking box,
+        # since blit_tiles_callback (which normally draws this overlay) is
+        # skipped in favor of tileset_editor.draw_tiles() during tile editing.
+        self.draw_animated_overlay_callback = None
 
     @staticmethod
     def _load_icon(path, w, h):
@@ -649,6 +667,7 @@ class RoomEditor:
                     Tile.from_dict(t) if isinstance(t, dict) else t
                     for t in raw
                 ]
+                self.tileset_editor._invalidate_sorted_tiles_cache(room_name)
 
         if self.object_editor and hasattr(self.object_editor, 'collision_manager'):
             self.object_editor.collision_manager.collision_objects[room_name] = []
@@ -919,7 +938,7 @@ class RoomEditor:
 
             if self.object_editor:
                 self.object_editor.handle_input(
-                    event,
+                    self._zoom_adjust_event(event, self.object_editor._is_in_palette),
                     int(self.camera.x),
                     int(self.camera.y),
                     self.viewing_room.name if self.viewing_room else ""
@@ -1042,7 +1061,38 @@ class RoomEditor:
                 return None
 
         if event.type == pygame.MOUSEWHEEL:
+            if (pygame.key.get_mods() & pygame.KMOD_CTRL) and not self.zoom_active:
+                zoom_old = self._effective_editor_zoom()
+                mouse_x, mouse_y = pygame.mouse.get_pos()
+
+                self.editor_zoom = max(
+                    self._editor_zoom_min,
+                    min(self._editor_zoom_max,
+                        self.editor_zoom + event.y * self._editor_zoom_step)
+                )
+
+                # Re-anchor the camera so the world point under the mouse
+                # stays under the mouse after the zoom changes, instead of
+                # the view always zooming from the virtual viewport's
+                # top-left corner. mouse/zoom converts real screen pixels
+                # to virtual-viewport pixels (see _effective_editor_zoom /
+                # the "screen = Surface((vw, vh))" viewport used in
+                # _draw_view_room), and camera.x/y live in that same space,
+                # so camera.x + mouse/zoom is the world point under the
+                # cursor both before and after the change.
+                zoom_new = self._effective_editor_zoom()
+                if zoom_new != zoom_old:
+                    self.camera.x += mouse_x / zoom_old - mouse_x / zoom_new
+                    self.camera.y += mouse_y / zoom_old - mouse_y / zoom_new
+
+                return None
             self.toolbar.handle_scroll(event.y)
+
+        # Ctrl+0 resets the live-edit zoom back to native scale.
+        if (event.type == pygame.KEYDOWN and event.key == pygame.K_0
+                and (pygame.key.get_mods() & pygame.KMOD_CTRL)):
+            self.editor_zoom = 1.0
+            return None
 
         # F2/F3/F4 are keyboard shortcuts for the same toolbar buttons above.
         # Same mutual-exclusion logic applies — toggling one closes the others.
@@ -1118,7 +1168,7 @@ class RoomEditor:
                 ]
 
             self.tileset_editor.handle_input(
-                event,
+                self._zoom_adjust_event(event, self.tileset_editor._is_in_palette),
                 int(self.camera.x),
                 int(self.camera.y),
                 room_name
@@ -1236,7 +1286,9 @@ class RoomEditor:
                     self.object_editor.current_room_name = (
                         self.viewing_room.name if self.viewing_room else ""
                     )
-                    self.object_editor._try_assign_chest_loot(event.pos)
+                    _zoom = self._effective_editor_zoom()
+                    _adj_pos = (event.pos[0] / _zoom, event.pos[1] / _zoom) if _zoom != 1.0 else event.pos
+                    self.object_editor._try_assign_chest_loot(_adj_pos)
                     return None  # never fall through to placement
 
             # ── Cutscene-trigger drag intercept ───────────────────────────────
@@ -1302,7 +1354,7 @@ class RoomEditor:
             # ── end cutscene-trigger drag intercept ───────────────────────────
 
             result = self.object_editor.handle_input(
-                event,
+                self._zoom_adjust_event(event, self.object_editor._is_in_palette),
                 int(self.camera.x),
                 int(self.camera.y),
                 self.viewing_room.name if self.viewing_room else ""
@@ -1353,7 +1405,7 @@ class RoomEditor:
 
             # Delegate scroll / click / hotkeys to entity editor
             consumed = self.entity_editor.handle_event(
-                event,
+                self._zoom_adjust_event(event, self.entity_editor._mouse_in_palette),
                 int(self.camera.x),
                 int(self.camera.y)
             )
@@ -1788,6 +1840,7 @@ class RoomEditor:
                     Tile.from_dict(t) if isinstance(t, dict) else t
                     for t in room.tiles
                 ]
+                self.tileset_editor._invalidate_sorted_tiles_cache(room_name)
 
         # Sync collision objects
         if self.object_editor and hasattr(self.object_editor, 'collision_manager'):
@@ -2160,6 +2213,7 @@ class RoomEditor:
             from dev_tools.room_editor.room_editor_tools.tileset_editor import Tile
             tile_list = data['after'] if forward else data['before']
             self.tileset_editor.room_tiles[room] = [Tile.from_dict(t) for t in tile_list]
+            self.tileset_editor._invalidate_sorted_tiles_cache(room)
 
             # Invalidate the baked tile surface so the change is visible immediately
             # without needing to place another tile to trigger a cache rebuild.
@@ -2377,6 +2431,60 @@ class RoomEditor:
         # Record in undo history (deep-copy so later edits don't mutate the snapshot)
         self._push_undo(_HistoryEntry('entity_add', copy.deepcopy(entity_data)))
 
+    def _effective_editor_zoom(self):
+        """The zoom factor actually in effect right now. Falls back to 1.0
+        (native scale) whenever the fit-to-room overview is showing or a
+        modal/path-editor holds the camera — those overlays are authored
+        against a locked, real-scale frame, so continuous zoom is suspended
+        rather than fighting them."""
+        if self.editor_zoom == 1.0 or self.zoom_active or self._zoom_locked():
+            return 1.0
+        return self.editor_zoom
+
+    def _zoom_locked(self):
+        """True while some modal or path-editor should keep editor_zoom
+        suspended — same set of states that already pin WASD camera panning
+        in update()."""
+        event_editor = getattr(self.object_editor, 'event_editor', None)
+        if event_editor is not None and event_editor.active:
+            return True
+        if (self.entity_editor and self.entity_editor.active and
+                self.entity_editor._dialogue_popup is not None):
+            return True
+        if self.editing_field is not None:
+            return True
+        if (self.object_editor is not None and
+                hasattr(self.object_editor, 'nimbus_cloud_path_editor') and
+                self.object_editor.nimbus_cloud_path_editor.active):
+            return True
+        if (self.object_editor is not None and
+                hasattr(self.object_editor, 'flying_pad_path_editor') and
+                self.object_editor.flying_pad_path_editor.active):
+            return True
+        if self.map_paint_editor and self.map_paint_editor.active:
+            return True
+        return False
+
+    def _zoom_adjust_event(self, event, is_in_palette_fn=None):
+        """Return a copy of `event` with .pos (and .rel, if present) converted
+        from real screen pixels into the render-scale space the sub-editors
+        expect, so world clicks land correctly while zoomed. Left unchanged
+        when zoom is inactive, the event carries no position, or the raw
+        position is over that editor's own fixed-scale palette/panel (UI
+        chrome is never zoomed, so it must keep receiving real coordinates).
+        """
+        zoom = self._effective_editor_zoom()
+        if zoom == 1.0 or not hasattr(event, 'pos'):
+            return event
+        if is_in_palette_fn is not None and is_in_palette_fn(*event.pos):
+            return event
+        new_dict = dict(event.dict)
+        new_dict['pos'] = (event.pos[0] / zoom, event.pos[1] / zoom)
+        if 'rel' in new_dict:
+            rx, ry = new_dict['rel']
+            new_dict['rel'] = (rx / zoom, ry / zoom)
+        return pygame.event.Event(event.type, new_dict)
+
     def _delete_entity_at(self, screen_x, screen_y):
         """Remove the entity closest to a right-click position.
         Works in world coordinates; threshold is 40 units so it feels
@@ -2384,8 +2492,7 @@ class RoomEditor:
         if not self.viewing_room or not hasattr(self.viewing_room, 'entities'):
             return
 
-        world_x = (screen_x + self.camera.x) / RENDER_SCALE
-        world_y = (screen_y + self.camera.y) / RENDER_SCALE
+        world_x, world_y = self._screen_to_world(screen_x, screen_y)
 
         best_idx = -1
         best_dist = 40  # world-unit click radius
@@ -2458,6 +2565,10 @@ class RoomEditor:
         return None
 
     def _screen_to_world(self, sx, sy):
+        zoom = self._effective_editor_zoom()
+        if zoom != 1.0:
+            sx = sx / zoom
+            sy = sy / zoom
         return (sx + self.camera.x) / RENDER_SCALE, (sy + self.camera.y) / RENDER_SCALE
 
     # =========================================================================
@@ -2533,11 +2644,22 @@ class RoomEditor:
         return None
 
     def _delete_selection(self):
-        """Remove every item currently box-selected, as one undo step."""
+        """Remove every non-object item currently box-selected, as one undo step.
+
+        Placed game-objects are deliberately excluded here: this path (and
+        _handle_select_drag_event's right-click delete) only runs in
+        no-editor-panel mode, i.e. never while the object editor is open.
+        Objects can only be deleted from within the object editor itself
+        (its own handle_input, gated on self.active) — that keeps a stray
+        box-select + Delete, or a right-click, in the tileset editor or
+        plain room view from wiping out placed objects by accident.
+        """
         if not self.selection or not self.viewing_room:
             return
         room_name = self.viewing_room.name
-        removed = list(self.selection)
+        removed = [item for item in self.selection if item[0] != 'object']
+        if not removed:
+            return
         for kind, item, obj_type in removed:
             if kind == 'entity':
                 if item in self.viewing_room.entities:
@@ -2546,12 +2668,10 @@ class RoomEditor:
                 room_tiles = self.tileset_editor.room_tiles.get(room_name, [])
                 if item in room_tiles:
                     room_tiles.remove(item)
-            else:
-                if self.object_editor:
-                    self.object_editor.current_room_name = room_name
-                    self.object_editor._delete_object(item, obj_type)
         self._push_undo(_HistoryEntry('area_remove', {'room': room_name, 'items': removed}))
-        self.selection = []
+        # Objects stay selected (they weren't touched); only the deleted
+        # kinds drop out of the selection.
+        self.selection = [item for item in self.selection if item[0] == 'object']
         if callable(getattr(self.tileset_editor, 'on_tile_changed', None)) and any(k == 'tile' for k, _, _ in removed):
             self.tileset_editor.on_tile_changed(room_name)
 
@@ -2613,16 +2733,12 @@ class RoomEditor:
                     self.drag_target_type = None
                     self.is_dragging = False
                 return True
-            # Try object
-            obj, obj_type = self._find_object_at(world_x, world_y)
-            if obj and obj_type:
-                # callback in object_editor will push the undo entry
-                self.object_editor._delete_object(obj, obj_type)
-                if self.drag_target is obj:
-                    self.drag_target = None
-                    self.drag_target_type = None
-                    self.is_dragging = False
-                return True
+            # Objects are NOT right-click-deletable here on purpose — this
+            # branch only runs when no editor panel is open, so deleting an
+            # object from it would let a stray right-click in the tileset
+            # editor or plain room view wipe out placed objects. Object
+            # deletion is only available from inside the object editor
+            # itself.
             return False
 
         # ── left mouse down: begin select/drag ────────────────────────────
@@ -3131,7 +3247,8 @@ class RoomEditor:
                     dt,
                     mouse_pos,
                     int(self.camera.x),
-                    int(self.camera.y)
+                    int(self.camera.y),
+                    self._effective_editor_zoom()
                 )
 
             if self.entity_editor and self.entity_editor.active:
@@ -3216,20 +3333,29 @@ class RoomEditor:
             # room bounds, and re-clamping/re-centering here could nudge it
             # off what was drawn during path placement.
             if not nimbus_editor_active:
-                if self.viewing_room.width * RENDER_SCALE <= self.screen_width:
-                    # Room is smaller than screen width - keep centered
-                    self.camera.x = (self.viewing_room.width * RENDER_SCALE - self.screen_width) // 2
-                else:
-                    # Room is larger than screen - clamp to room bounds
-                    self.camera.x = max(0, min(self.camera.x, (self.viewing_room.width * RENDER_SCALE) - self.screen_width))
+                # When zoomed out, the live-edit viewport shows more world
+                # than a physical screen's worth of pixels — clamp against
+                # that larger virtual viewport instead of the real screen
+                # size, or panning would stop short of the room's actual edges.
+                zoom = self._effective_editor_zoom()
+                viewport_w = self.screen_width / zoom
+                viewport_h = self.screen_height / zoom
 
-                if self.viewing_room.height * RENDER_SCALE <= self.screen_height:
-                    # Room is smaller than screen height - keep centered
-                    self.camera.y = (self.viewing_room.height * RENDER_SCALE - self.screen_height) // 2
+                if self.viewing_room.width * RENDER_SCALE <= viewport_w:
+                    # Room is smaller than the viewport - keep centered
+                    self.camera.x = (self.viewing_room.width * RENDER_SCALE - viewport_w) // 2
                 else:
-                    # Room is larger than screen - clamp to room bounds
+                    # Room is larger than the viewport - clamp to room bounds
+                    self.camera.x = max(0, min(self.camera.x, (self.viewing_room.width * RENDER_SCALE) - viewport_w))
+
+                if self.viewing_room.height * RENDER_SCALE <= viewport_h:
+                    # Room is smaller than the viewport - keep centered
+                    self.camera.y = (self.viewing_room.height * RENDER_SCALE - viewport_h) // 2
+                else:
+                    # Room is larger than the viewport - clamp to room bounds
                     self.camera.y = max(0,
-                                        min(self.camera.y, (self.viewing_room.height * RENDER_SCALE) - self.screen_height))
+                                        min(self.camera.y, (self.viewing_room.height * RENDER_SCALE) - viewport_h))
+
 
     def draw(self, screen):
         """Draw the current view"""
@@ -3295,6 +3421,45 @@ class RoomEditor:
             screen.blit(coord_surf, (margin + 8, self.screen_height - coord_bg_h - margin + 5))
             return
 
+        # ── Continuous editor zoom (Ctrl+scroll) ────────────────────────────
+        # Renders the "world" portion of the view (background, tiles,
+        # objects, entities, previews, drag/select overlays) into a larger
+        # offscreen surface sized to show more of the room, then scales that
+        # single composited image down onto the real screen. Toolbar and
+        # palettes are drawn afterwards, straight onto the real screen at
+        # real size, so UI chrome stays crisp and fixed-size regardless of
+        # zoom — see the "screen = real_screen" restore further down, right
+        # before that UI is drawn.
+        zoom = self._effective_editor_zoom()
+        real_screen = screen
+        orig_sw, orig_sh = self.screen_width, self.screen_height
+        _zoom_sub_editors = []
+        _zoom_orig_dims = {}
+        if zoom != 1.0:
+            vw = max(1, int(orig_sw / zoom))
+            vh = max(1, int(orig_sh / zoom))
+            # Reuse the same offscreen surface across frames instead of
+            # allocating a fresh one every call. At low zoom this surface
+            # can be 8x+ the pixel area of the real screen (area scales
+            # with 1/zoom^2), so re-allocating it 60x/sec was a big chunk
+            # of the zoomed-out slowdown. It's also .convert()ed to match
+            # the display's pixel format — without that, every one of the
+            # many blits below onto a plain (mismatched-format) Surface
+            # has to convert pixels on the fly, which is far slower than a
+            # same-format blit. Only rebuilt when the target size actually
+            # changes (zoom level or window resize).
+            cached = getattr(self, '_editor_zoom_surface', None)
+            if cached is None or cached.get_size() != (vw, vh):
+                cached = pygame.Surface((vw, vh)).convert()
+                self._editor_zoom_surface = cached
+            screen = cached
+            self.screen_width, self.screen_height = vw, vh
+            _zoom_sub_editors = [e for e in (self.tileset_editor, self.object_editor, self.entity_editor) if e]
+            for ed in _zoom_sub_editors:
+                _zoom_orig_dims[id(ed)] = (getattr(ed, 'screen_width', None), getattr(ed, 'screen_height', None))
+                if hasattr(ed, 'screen_width'):  ed.screen_width  = vw
+                if hasattr(ed, 'screen_height'): ed.screen_height = vh
+
         screen.fill((34, 139, 34))
 
         # ── Scrolling background preview ──────────────────────────────────────
@@ -3305,17 +3470,35 @@ class RoomEditor:
                 room_name = self.viewing_room.name
                 if not hasattr(self, '_bg_image_cache'):
                     self._bg_image_cache = {}
-                if img_path not in self._bg_image_cache:
+                if not hasattr(self, '_bg_image_raw_cache'):
+                    self._bg_image_raw_cache = {}
+                # Cache key includes the current viewport height: this tile is
+                # rescaled to match screen height, and that height is the real
+                # (possibly much larger) virtual viewport while Ctrl+scroll
+                # zoom is active — not the physical window. Keying on
+                # img_path alone meant a tile cached once at normal zoom kept
+                # getting reused, unscaled, once zoomed out; the tiling loop
+                # below then had to blit far more copies of that now-tiny
+                # tile to cover the bigger viewport (blit count grows as
+                # ~1/zoom^2), which is what was tanking FPS when zoomed out.
+                # The raw (unscaled) load is cached separately so a zoom
+                # change only costs one rescale, not a re-decode from disk.
+                _, cache_sh = screen.get_size()
+                cache_key = (img_path, cache_sh)
+                if cache_key not in self._bg_image_cache:
                     try:
                         import os
-                        raw = pygame.image.load(os.path.join('assets', 'bg', os.path.basename(img_path))).convert()
-                        sw, sh = screen.get_size()
-                        ratio = sh / raw.get_height()
+                        if img_path not in self._bg_image_raw_cache:
+                            self._bg_image_raw_cache[img_path] = pygame.image.load(
+                                os.path.join('assets', 'bg', os.path.basename(img_path))
+                            ).convert()
+                        raw = self._bg_image_raw_cache[img_path]
+                        ratio = cache_sh / raw.get_height()
                         nw    = max(1, int(raw.get_width() * ratio))
-                        self._bg_image_cache[img_path] = pygame.transform.scale(raw, (nw, sh))
+                        self._bg_image_cache[cache_key] = pygame.transform.scale(raw, (nw, cache_sh))
                     except Exception:
-                        self._bg_image_cache[img_path] = None
-                surf = self._bg_image_cache.get(img_path)
+                        self._bg_image_cache[cache_key] = None
+                surf = self._bg_image_cache.get(cache_key)
                 if surf:
                     parallax = bg.get('parallax', 0.5)
                     sw, sh   = screen.get_size()
@@ -3335,18 +3518,33 @@ class RoomEditor:
             self.flush_tile_cache_callback()
 
         # Animated regions (water/grass/floor/etc.) are drawn BEFORE any
-        # tile layer so their editor-overlay tint sits underneath painted
-        # tiles rather than staining them. Any tile placed on top of a
-        # region fully covers its fill color, matching how the region
-        # actually renders at runtime (tiles/entities draw over the fill).
+        # tile layer so they sit underneath painted tiles rather than being
+        # staining them — matching how the region actually renders at
+        # runtime (tiles/entities draw over it). While tile editing is
+        # active, this draws the real animated texture (via
+        # draw_animated_overlay_callback) instead of the flat editor-overlay
+        # box, since the box alone (even without its drag handles) just
+        # reads as a blank color square.
+        _isolating_layer = bool(self.tileset_editor and self.tileset_editor.active)
+
         if self.object_editor:
             self.object_editor.current_room_name = self.viewing_room.name
-            self.object_editor.draw_animated_regions(
-                screen,
-                int(self.camera.x),
-                int(self.camera.y)
-            )
-
+            if _isolating_layer and callable(self.draw_animated_overlay_callback):
+                # Tile editing: show the same animated texture gameplay uses
+                # (water waves, lava, etc.) instead of the flat editor box —
+                # the box has no handles to hide behind and just reads as a
+                # blank color square without it.
+                self.draw_animated_overlay_callback(
+                    screen, self.viewing_room.name,
+                    int(self.camera.x), int(self.camera.y)
+                )
+            else:
+                self.object_editor.draw_animated_regions(
+                    screen,
+                    int(self.camera.x),
+                    int(self.camera.y),
+                    show_handles=not _isolating_layer
+                )
         # Background tiles — use baked surface if available (O(1) blit),
         # fall back to per-tile loop when the callback isn't wired OR when
         # the tile editor is the active tool. The baked surface is the same
@@ -3354,7 +3552,6 @@ class RoomEditor:
         # per-tile layers, so it can't dim inactive ones individually. Only
         # tileset_editor.draw_tiles() dims non-active layers (always on, by
         # current_layer), so that path is required whenever tiles are being edited.
-        _isolating_layer = bool(self.tileset_editor and self.tileset_editor.active)
         if self.blit_tiles_callback and not _isolating_layer:
             self.blit_tiles_callback(
                 screen, self.viewing_room.name,
@@ -3403,9 +3600,22 @@ class RoomEditor:
 
         # Draw destructible stones
         if hasattr(self.viewing_room, 'destructible_stones'):
+            _margin = 160
             for stone in self.viewing_room.destructible_stones:
-                if stone.active:
-                    stone.draw(screen, self.camera, self.colors)
+                if not stone.active:
+                    continue
+                # Defensive getattr: if a stone doesn't expose plain x/y for
+                # any reason, fall back to always drawing it rather than
+                # risk silently hiding it.
+                _sx_world = getattr(stone, 'x', None)
+                _sy_world = getattr(stone, 'y', None)
+                if _sx_world is not None and _sy_world is not None:
+                    _sx = (_sx_world * RENDER_SCALE) - self.camera.x
+                    _sy = (_sy_world * RENDER_SCALE) - self.camera.y
+                    if not (-_margin <= _sx <= self.screen_width + _margin and
+                            -_margin <= _sy <= self.screen_height + _margin):
+                        continue
+                stone.draw(screen, self.camera, self.colors)
 
         # Draw decorations (trees, etc.) — Y-sorted by trunk/base position
         # (same convention gameplay uses, see game.py's decoration.get_sort_key()
@@ -3426,9 +3636,22 @@ class RoomEditor:
             if self.object_editor and self.object_editor.active:
                 preview_y = self.object_editor.get_pending_decoration_preview_y()
 
+            # The Y-sort order (and where the placement preview interleaves
+            # into it) still has to be computed over every decoration, so
+            # the loop and its ordering logic are unchanged — only the
+            # actual decoration.draw() call is skipped for ones nowhere
+            # near the camera.
+            _dec_margin = 160
+            def _decoration_in_view(d):
+                _dx = (d.x * RENDER_SCALE) - self.camera.x
+                _dy = (d.y * RENDER_SCALE) - self.camera.y
+                return (-_dec_margin <= _dx <= self.screen_width + _dec_margin and
+                        -_dec_margin <= _dy <= self.screen_height + _dec_margin)
+
             if preview_y is None:
                 for decoration in sorted_decorations:
-                    decoration.draw(screen, self.camera, self.colors)
+                    if _decoration_in_view(decoration):
+                        decoration.draw(screen, self.camera, self.colors)
             else:
                 preview_drawn = False
                 for decoration in sorted_decorations:
@@ -3437,7 +3660,8 @@ class RoomEditor:
                             screen, int(self.camera.x), int(self.camera.y)
                         )
                         preview_drawn = True
-                    decoration.draw(screen, self.camera, self.colors)
+                    if _decoration_in_view(decoration):
+                        decoration.draw(screen, self.camera, self.colors)
                 if not preview_drawn:
                     self.object_editor.draw_decoration_preview(
                         screen, int(self.camera.x), int(self.camera.y)
@@ -3594,6 +3818,22 @@ class RoomEditor:
                 int(self.camera.y)
             )
 
+        # ── Restore real screen / dims before UI chrome ─────────────────────
+        # Everything above this point may have drawn onto the oversized
+        # virtual surface set up at the top of this method; scale that whole
+        # composited picture down onto the real screen now, then switch back
+        # to drawing directly on it (at real size) for the toolbar/palettes
+        # below, so UI chrome never gets visually scaled by editor_zoom.
+        if zoom != 1.0:
+            scaled = pygame.transform.scale(screen, (orig_sw, orig_sh))
+            real_screen.blit(scaled, (0, 0))
+            for ed in _zoom_sub_editors:
+                sw, sh = _zoom_orig_dims[id(ed)]
+                if sw is not None and hasattr(ed, 'screen_width'):  ed.screen_width  = sw
+                if sh is not None and hasattr(ed, 'screen_height'): ed.screen_height = sh
+            self.screen_width, self.screen_height = orig_sw, orig_sh
+            screen = real_screen
+
         # Check if we're in transition spawn placement mode
         is_placing_spawn = (self.object_editor and
                             hasattr(self.object_editor, 'placing_transition_spawn') and
@@ -3625,8 +3865,8 @@ class RoomEditor:
 
         # ── Mouse coordinates overlay (bottom-left) ───────────────────────────
         mouse_sx, mouse_sy = pygame.mouse.get_pos()
-        world_x = int((mouse_sx + self.camera.x) / RENDER_SCALE)
-        world_y = int((mouse_sy + self.camera.y) / RENDER_SCALE)
+        world_x, world_y = self._screen_to_world(mouse_sx, mouse_sy)
+        world_x, world_y = int(world_x), int(world_y)
         coord_text = f"X: {world_x}  Y: {world_y}"
         coord_surf = self.font_medium.render(coord_text, True, self.colors['text'])
         coord_bg_w = coord_surf.get_width() + 16

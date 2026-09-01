@@ -457,8 +457,14 @@ class Enemy:
         self.draw_layer = DrawLayer.ENEMIES
         self.y_sort = True              # Participates in depth-sorted rendering
 
-        # Injected by the room/game system after construction
-        self.obstacles = []      # For collision checking during movement and knockback
+        # Injected by the room/game system after construction. Backed by a
+        # property (see obstacles.setter below) so the expensive per-obstacle
+        # classification/broad-phase-extent work happens once, when game.py
+        # hands over the shared list (room load), instead of redoing it on
+        # every single collision check.
+        self._obstacles = []
+        self._prepared_obstacles = []
+        self._obstacle_grid = {}
         self.other_enemies = []  # For separation force and path-blocking checks
 
         # Stuck detection — if we haven't moved enough, increment stuck_timer
@@ -711,42 +717,188 @@ class Enemy:
     # Collision detection
     # =========================================================================
 
-    def check_collision_with_obstacles(self, new_x, new_y):
-        """Return True if the given position overlaps any active obstacle."""
-        temp_rect = pygame.Rect(
-            new_x - self.width // 2,
-            new_y - self.height // 2,
-            self.width,
-            self.height,
-        )
+    @property
+    def obstacles(self):
+        return self._obstacles
 
-        for obstacle in self.obstacles:
-            # Collision wall (e.g. invisible wall object with an 'id' attribute)
-            if hasattr(obstacle, 'id') and obstacle.id == 'collision_wall':
-                if hasattr(obstacle, 'active') and not obstacle.active:
+    # World-space size of one obstacle-grid cell (see obstacles.setter). Chosen
+    # to be a few tiles wide — big enough that a typical entity's query only
+    # touches 1-4 cells, small enough that a heavy room's obstacles spread
+    # out across many cells instead of all piling into one.
+    _OBSTACLE_GRID_CELL = 128
+
+    @obstacles.setter
+    def obstacles(self, value):
+        """game.py hands every enemy the same shared obstacle list once per
+        room load (see Game._assign_obstacles) — not per frame. So the
+        classification work check_collision_with_obstacles used to redo on
+        every single call (hasattr() branching to figure out what KIND of
+        obstacle each one is) happens exactly once here instead, and is
+        cached in self._prepared_obstacles alongside a rough broad-phase
+        center/radius per obstacle so the hot path can reject far-away
+        obstacles with a cheap squared-distance check before touching
+        hasattr, Rect construction, or colliderect at all.
+
+        On top of that, obstacles are bucketed into a uniform spatial grid
+        (self._obstacle_grid) keyed by cell coordinate. A heavy room can have
+        several hundred shared obstacles, and check_collision_with_obstacles
+        used to scan every single one of them per call regardless — with
+        dozens of enemies each calling it several times a frame (more once
+        stuck and probing 8 directions), that per-call cost scales with the
+        *whole room's* obstacle count, which is what made unusually large
+        rooms specifically tank the framerate. The grid means a call only
+        has to look at obstacles actually near the query position — a
+        handful of cells' worth — rather than the entire room, so cost
+        scales with local obstacle density instead of room size. Each
+        obstacle is inserted into every cell its (center, radius) bounding
+        box touches, so a query that gathers every obstacle whose bounding
+        box could reach the query position is guaranteed not to miss one
+        (see check_collision_with_obstacles).
+        """
+        self._obstacles = value
+        self._prepared_obstacles = [self._classify_obstacle(o) for o in value]
+
+        cell = self._OBSTACLE_GRID_CELL
+        grid = {}
+        for entry in self._prepared_obstacles:
+            _, kind, approx_x, approx_y, reject_radius = entry
+            if kind == 'skip':
+                continue
+            min_cx = int((approx_x - reject_radius) // cell)
+            max_cx = int((approx_x + reject_radius) // cell)
+            min_cy = int((approx_y - reject_radius) // cell)
+            max_cy = int((approx_y + reject_radius) // cell)
+            for gx in range(min_cx, max_cx + 1):
+                for gy in range(min_cy, max_cy + 1):
+                    grid.setdefault((gx, gy), []).append(entry)
+        self._obstacle_grid = grid
+
+    @staticmethod
+    def _classify_obstacle(obstacle):
+        """One-time per-obstacle setup: figure out which of the three
+        collision "kinds" it is (same precedence the old inline hasattr
+        chain used), plus an approximate (center_x, center_y, radius) for
+        the broad-phase distance check. Positions are assumed static for
+        the lifetime of a room's obstacle list — true for walls, stones,
+        gates, chests, and decorations alike."""
+        if hasattr(obstacle, 'id') and obstacle.id == 'collision_wall':
+            cx = obstacle.x + obstacle.width / 2
+            cy = obstacle.y + obstacle.height / 2
+            radius = math.hypot(obstacle.width / 2, obstacle.height / 2)
+            return (obstacle, 'wall', cx, cy, radius)
+
+        if hasattr(obstacle, 'solid') and hasattr(obstacle, 'active'):
+            radius = math.hypot(obstacle.width / 2, obstacle.height / 2)
+            return (obstacle, 'stone', obstacle.x, obstacle.y, radius)
+
+        if hasattr(obstacle, 'get_collision_rect'):
+            rect = obstacle.get_collision_rect()
+            if rect is not None:
+                cx, cy = rect.centerx, rect.centery
+                radius = math.hypot(rect.width / 2, rect.height / 2)
+            else:
+                # Not currently solid (e.g. inactive) — fall back to the
+                # object's own position with a generous placeholder radius
+                # so a future non-None rect still gets caught by the
+                # broad-phase check rather than silently ignored.
+                cx = getattr(obstacle, 'x', 0)
+                cy = getattr(obstacle, 'y', 0)
+                radius = 64
+            return (obstacle, 'generic', cx, cy, radius)
+
+        return (obstacle, 'skip', 0, 0, 0)
+
+    def _nearby_prepared_obstacles(self, cx, cy, radius):
+        """Return the prepared-obstacle entries whose bounding box could
+        possibly reach a query centered at (cx, cy) with the given radius,
+        by only visiting the grid cells that box overlaps — see
+        obstacles.setter for how the grid is built and why this can't miss
+        an obstacle that's actually in range.
+        """
+        grid = getattr(self, '_obstacle_grid', None)
+        if not grid:
+            return self._prepared_obstacles
+
+        cell = self._OBSTACLE_GRID_CELL
+        min_cx = int((cx - radius) // cell)
+        max_cx = int((cx + radius) // cell)
+        min_cy = int((cy - radius) // cell)
+        max_cy = int((cy + radius) // cell)
+
+        # Fast path: query touches a single cell (the overwhelmingly common
+        # case — entities are small relative to the grid cell size).
+        if min_cx == max_cx and min_cy == max_cy:
+            return grid.get((min_cx, min_cy), ())
+
+        seen_ids = set()
+        result = []
+        for gx in range(min_cx, max_cx + 1):
+            for gy in range(min_cy, max_cy + 1):
+                for entry in grid.get((gx, gy), ()):
+                    obstacle_id = id(entry[0])
+                    if obstacle_id not in seen_ids:
+                        seen_ids.add(obstacle_id)
+                        result.append(entry)
+        return result
+
+    def check_collision_with_obstacles(self, new_x, new_y):
+        """Return True if the given position overlaps any active obstacle.
+
+        Broad-phase first: each obstacle was pre-classified and given an
+        approximate center/radius once, in the obstacles setter above, so
+        here we can reject anything clearly too far away with a single
+        squared-distance compare — no hasattr(), no Rect, no colliderect —
+        before paying for the precise check. On top of that, candidates now
+        come from the spatial grid (_nearby_prepared_obstacles) instead of
+        the room's full obstacle list, so a heavy room's several hundred
+        shared obstacles no longer have to be scanned on every single call —
+        this is called several times per enemy per frame (plus 8x more
+        inside find_clear_path_around_obstacle whenever an enemy is stuck),
+        so keeping the per-call cost proportional to nearby obstacles rather
+        than total room obstacles is what keeps a heavy room affordable.
+        """
+        self_half_w = self.width // 2
+        self_half_h = self.height // 2
+        self_reject_radius = math.hypot(self_half_w, self_half_h)
+
+        temp_rect = None  # built lazily, only once we have a real candidate
+
+        candidates = self._nearby_prepared_obstacles(new_x, new_y, self_reject_radius)
+        for obstacle, kind, approx_x, approx_y, reject_radius in candidates:
+            dx = approx_x - new_x
+            dy = approx_y - new_y
+            max_dist = self_reject_radius + reject_radius
+            if dx * dx + dy * dy > max_dist * max_dist:
+                continue
+
+            if kind == 'wall':
+                if not getattr(obstacle, 'active', True):
                     continue
                 obstacle_rect = pygame.Rect(obstacle.x, obstacle.y, obstacle.width, obstacle.height)
-                if temp_rect.colliderect(obstacle_rect):
-                    return True
 
-            # DestructibleStone or similar — must be both active and solid
-            elif hasattr(obstacle, 'solid') and hasattr(obstacle, 'active'):
+            elif kind == 'stone':
                 if not obstacle.active or not obstacle.solid:
                     continue
-                stone_rect = pygame.Rect(
+                obstacle_rect = pygame.Rect(
                     obstacle.x - obstacle.width // 2,
                     obstacle.y - obstacle.height // 2,
                     obstacle.width,
                     obstacle.height,
                 )
-                if temp_rect.colliderect(stone_rect):
-                    return True
 
-            # Generic fallback for anything with a get_collision_rect() method
-            elif hasattr(obstacle, 'get_collision_rect'):
+            elif kind == 'generic':
                 obstacle_rect = obstacle.get_collision_rect()
-                if obstacle_rect is not None and temp_rect.colliderect(obstacle_rect):
-                    return True
+                if obstacle_rect is None:
+                    continue
+
+            else:
+                continue
+
+            if temp_rect is None:
+                temp_rect = pygame.Rect(new_x - self_half_w, new_y - self_half_h, self.width, self.height)
+
+            if temp_rect.colliderect(obstacle_rect):
+                return True
 
         return False
 

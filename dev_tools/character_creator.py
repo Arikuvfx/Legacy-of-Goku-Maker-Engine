@@ -2518,10 +2518,18 @@ class CharacterEditor:
             return
 
         # Determine cell size from the real icon surface dimensions so that
-        # high-res HUD PNGs are shown at their native resolution.
-        first_icon = load_attack_icon(self.available_attacks[0])
-        icon_w     = first_icon.get_width()
-        icon_h     = first_icon.get_height()
+        # high-res HUD PNGs are shown at their native resolution. Icons are
+        # NOT guaranteed to be uniform in size — each attack's icon.png loads
+        # at its own native resolution and the "enlarge small icons" step
+        # preserves aspect ratio rather than forcing a square — so sizing the
+        # grid off a single (e.g. the first) attack's icon lets a wider icon
+        # from a later attack spill into the next cell and overlap it. Use
+        # the max across every discovered attack instead.
+        icon_w = icon_h = 0
+        for aid in self.available_attacks:
+            icon = load_attack_icon(aid)
+            icon_w = max(icon_w, icon.get_width())
+            icon_h = max(icon_h, icon.get_height())
 
         lx      = self.panel.x + 20
         avail_w = max(icon_w, self.panel.w - 40)

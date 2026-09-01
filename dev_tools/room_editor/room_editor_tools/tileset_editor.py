@@ -82,6 +82,12 @@ class Tileset:
         self.cols = 0
         self.rows = 0
         self._tile_transparency_cache = {}
+        # key: (tile_x, tile_y) → True if every pixel is fully opaque (alpha == 255).
+        # Lets get_scaled_tile_surface() hand out a non-alpha Surface for these tiles,
+        # which pygame blits with its fast opaque path instead of per-pixel alpha
+        # blending — a big win for animated tiles (water/lava/etc.) that get blitted
+        # individually every frame instead of once into a baked static surface.
+        self._tile_opaque_cache = {}
         self._scaled_cache = {}  # key: (tile_x, tile_y, scale) → pre-scaled Surface
         self._dimmed_cache = {}  # key: (tile_x, tile_y, scale, alpha) → pre-scaled, alpha-reduced Surface
 
@@ -191,7 +197,11 @@ class Tileset:
             print(f"Error saving tile animations for {self.name}: {e}")
 
     def _build_transparency_cache(self):
-        """Pre-scan every tile and note which ones are fully transparent — skips empty blits at draw time."""
+        """Pre-scan every tile once and record both whether it's fully transparent
+        (skips empty blits at draw time) and fully opaque (lets animated-tile
+        rendering use a faster non-alpha blit — see _tile_opaque_cache above).
+        One pixel pass per tile does both checks instead of two separate scans.
+        """
         if not self.image:
             return
 
@@ -199,21 +209,39 @@ class Tileset:
             for tx in range(self.cols):
                 tile_surface = self.get_tile_surface(tx, ty)
                 if tile_surface:
-                    self._tile_transparency_cache[(tx, ty)] = self._is_tile_transparent(tile_surface)
+                    transparent, opaque = self._scan_tile_alpha(tile_surface)
+                    self._tile_transparency_cache[(tx, ty)] = transparent
+                    self._tile_opaque_cache[(tx, ty)] = opaque
 
-    def _is_tile_transparent(self, surface: pygame.Surface) -> bool:
-        """Returns True if every pixel has alpha == 0."""
+    def _scan_tile_alpha(self, surface: pygame.Surface) -> Tuple[bool, bool]:
+        """Single pixel pass returning (is fully transparent, is fully opaque).
+
+        A tile with no alpha channel at all can't be transparent and is
+        always opaque. Otherwise scans pixels, bailing out early the moment
+        neither result could still hold (most tiles resolve this almost
+        immediately since mixed-alpha edge pixels tend to show up early).
+        """
         if not (surface.get_flags() & pygame.SRCALPHA):
-            return False
+            return False, True
 
+        all_transparent = True
+        all_opaque = True
         width, height = surface.get_size()
         for y in range(height):
             for x in range(width):
-                r, g, b, a = surface.get_at((x, y))
-                if a > 0:
-                    return False
+                a = surface.get_at((x, y))[3]
+                if a != 0:
+                    all_transparent = False
+                if a != 255:
+                    all_opaque = False
+                if not all_transparent and not all_opaque:
+                    return False, False
+        return all_transparent, all_opaque
 
-        return True
+    def _is_tile_transparent(self, surface: pygame.Surface) -> bool:
+        """Returns True if every pixel has alpha == 0."""
+        transparent, _ = self._scan_tile_alpha(surface)
+        return transparent
 
     def is_tile_empty(self, tile_x: int, tile_y: int) -> bool:
         """Returns True if the tile at (tile_x, tile_y) was fully transparent when the cache was built."""
@@ -237,6 +265,14 @@ class Tileset:
 
         This avoids calling pygame.transform.scale() and subsurface().copy() on
         every tile every frame — the heavy work happens once and is reused.
+
+        Tiles that are fully opaque (see _tile_opaque_cache) are converted with
+        convert() instead of kept as convert_alpha(). Every placed tile still
+        looks identical since there's no transparency to lose, but blitting a
+        non-alpha Surface skips pygame's per-pixel alpha-blend path in favour of
+        a straight copy — which matters most here for animated tiles, which are
+        blitted individually every frame rather than baked once into a static
+        surface like everything else.
         """
         key = (tile_x, tile_y, scale)
         if key not in self._scaled_cache:
@@ -244,9 +280,15 @@ class Tileset:
             if raw is None:
                 self._scaled_cache[key] = None
             else:
-                self._scaled_cache[key] = pygame.transform.scale(
+                scaled = pygame.transform.scale(
                     raw, (self.tile_width * scale, self.tile_height * scale)
                 )
+                if self._tile_opaque_cache.get((tile_x, tile_y)):
+                    try:
+                        scaled = scaled.convert()
+                    except pygame.error:
+                        pass  # no display surface yet (e.g. headless tooling) — keep the alpha version
+                self._scaled_cache[key] = scaled
         return self._scaled_cache[key]
 
     def invalidate_scaled_cache(self):
@@ -418,6 +460,16 @@ class TilesetEditor:
         # correct for 8px, 16px, 32px, etc. tilesets automatically.)
         self.snap_size = self.grid_size
         self.room_tiles: dict[str, List[Tile]] = {}
+
+        # Cache of room_tiles sorted by layer, keyed by room name. draw_tiles()
+        # is called twice per frame (background + foreground passes) and used
+        # to re-sort the *entire* tile list both times, every frame, even
+        # though tile layers only change on edits. That's a full O(n log n)
+        # sort paid twice per frame for nothing — this cache is rebuilt only
+        # when the room's tiles are actually mutated (see
+        # _invalidate_sorted_tiles_cache, called from every place that adds,
+        # removes, or reloads room_tiles).
+        self._sorted_tiles_cache: dict[str, List[Tile]] = {}
 
         self.is_dragging = False
         self.is_erasing = False
@@ -886,6 +938,8 @@ class TilesetEditor:
         if room_name not in self.room_tiles:
             self.room_tiles[room_name] = []
 
+        self._invalidate_sorted_tiles_cache(room_name)
+
         min_x, max_x, min_y, max_y = self._get_selection_bounds()
 
         touched_cells = []
@@ -1018,6 +1072,7 @@ class TilesetEditor:
             tile for tile in self.room_tiles[room_name]
             if id(tile) not in removed_ids
         ]
+        self._invalidate_sorted_tiles_cache(room_name)
 
         # Footprint of what was actually removed (not a fixed grid constant)
         # — same reasoning as _place_tiles: the renderer's incremental patch
@@ -1092,6 +1147,23 @@ class TilesetEditor:
                 pygame.draw.rect(screen, self.colors['accent'],
                                  (screen_x, screen_y, scaled_width, scaled_height), 2)
 
+    def _invalidate_sorted_tiles_cache(self, room_name: str):
+        """Drop the cached layer-sorted tile order for a room. Call this
+        anywhere room_tiles[room_name] is reassigned or appended to."""
+        self._sorted_tiles_cache.pop(room_name, None)
+
+    def _get_sorted_tiles(self, room_name: str) -> List[Tile]:
+        """Layer-sorted view of room_tiles[room_name], cached across frames.
+
+        Rebuilt only when _invalidate_sorted_tiles_cache() has been called
+        for this room (i.e. on an actual edit), not on every draw call.
+        """
+        cached = self._sorted_tiles_cache.get(room_name)
+        if cached is None:
+            cached = sorted(self.room_tiles[room_name], key=lambda t: t.layer)
+            self._sorted_tiles_cache[room_name] = cached
+        return cached
+
     def draw_tiles(self, screen: pygame.Surface, camera_x: int, camera_y: int,
                    room_name: str, layer: str = 'background'):
         """Draw all tiles for a room at the specified rendering pass ('background' or 'foreground').
@@ -1113,7 +1185,7 @@ class TilesetEditor:
         # because the reference layer happens to be invisible.
         active_layer_is_visible = self.current_layer not in self.hidden_layers
 
-        for tile in sorted(self.room_tiles[room_name], key=lambda t: t.layer):
+        for tile in self._get_sorted_tiles(room_name):
             # Layers hidden via the per-layer checkbox are skipped entirely —
             # unlike dimming, this is a full hide, and only ever affects the
             # specific layer(s) the checkbox was toggled on.
@@ -1478,3 +1550,4 @@ class TilesetEditor:
         except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
             print(f"Error loading room tiles: {e}")
             self.room_tiles[room_name] = []
+        self._invalidate_sorted_tiles_cache(room_name)

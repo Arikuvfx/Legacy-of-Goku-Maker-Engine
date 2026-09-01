@@ -486,6 +486,9 @@ class ScouterMenu:
     # _capture_data_viewer_frame(). Must comfortably exceed any single
     # character frame's on-screen footprint (32px sprite * RENDER_SCALE),
     # same margin-of-safety reasoning as _SPRITE_CAPTURE_PAD above.
+    # Calibrated for RENDER_SCALE == _CAPTURE_REFERENCE_RENDER_SCALE and
+    # scaled proportionally at capture time so it doesn't clip the sprite
+    # when the real RENDER_SCALE is higher than that.
     _DATA_VIEWER_SCRATCH_SIZE = 160
 
     # Straight scale multiplier for the rotating character, on top of
@@ -499,6 +502,17 @@ class ScouterMenu:
     # of the separate static-portrait sizing (_DATA_PORTRAIT_* /
     # _get_data_portrait_box()).
     _DATA_VIEWER_SCALE = 1.5
+
+    # The Data section's viewer character is meant to always look like it
+    # was rendered at RENDER_SCALE == 4, no matter what config.settings.
+    # RENDER_SCALE actually is right now — see _draw_data_viewer(), which
+    # multiplies _DATA_VIEWER_SCALE by (this / real RENDER_SCALE) to cancel
+    # out AnimatedSprite.draw()'s real-RENDER_SCALE sizing before reapplying
+    # this fixed one. (_capture_data_viewer_frame()'s centering math still
+    # has to divide by the REAL RENDER_SCALE, since that's inverting the
+    # actual multiply AnimatedSprite.draw() performs — only the apparent
+    # on-screen SIZE is pinned here, not that centering step.)
+    _DATA_VIEWER_FIXED_RENDER_SCALE = 4
 
     # Simple procedural shadow ellipse drawn under the viewer sprite's
     # feet — see _draw_data_viewer_shadow() for why this can't just
@@ -1078,7 +1092,12 @@ class ScouterMenu:
     # Generous box (px, pre-render_scale) around an entity's screen position
     # that _capture_entity_sprite renders into before cropping — comfortably
     # bigger than any single character frame so nothing gets clipped.
+    # Calibrated for RENDER_SCALE == _CAPTURE_REFERENCE_RENDER_SCALE — scaled
+    # proportionally at capture time (see _capture_entity_sprite) so it stays
+    # generous instead of clipping the sprite when the real RENDER_SCALE is
+    # higher than that.
     _SPRITE_CAPTURE_PAD = 64
+    _CAPTURE_REFERENCE_RENDER_SCALE = 4
 
     def _capture_entity_sprite(self, obj, camera, colors, layer_manager, sx, sy):
         """Get the entity's *real* current frame, split into its shadow and
@@ -1126,7 +1145,7 @@ class ScouterMenu:
             print(f'[scouter_menu] could not snapshot sprite for {type(obj).__name__}: {e}')
             return None
 
-        pad = self._SPRITE_CAPTURE_PAD
+        pad = int(self._SPRITE_CAPTURE_PAD * max(1, RENDER_SCALE) / self._CAPTURE_REFERENCE_RENDER_SCALE)
         box = pygame.Rect(sx - pad, sy - pad, pad * 2, pad * 2).clip(
             pygame.Rect(0, 0, self.screen_width, self.screen_height))
         if box.width <= 0 or box.height <= 0:
@@ -1456,7 +1475,7 @@ class ScouterMenu:
         if sprite is None:
             return None
 
-        size = self._DATA_VIEWER_SCRATCH_SIZE
+        size = int(self._DATA_VIEWER_SCRATCH_SIZE * max(1, RENDER_SCALE) / self._CAPTURE_REFERENCE_RENDER_SCALE)
         scratch = pygame.Surface((size, size), pygame.SRCALPHA)
         # camera=None -> AnimatedSprite.draw() centers the frame on
         # (x * RENDER_SCALE, y * RENDER_SCALE). Picking x=y=half the
@@ -3061,7 +3080,12 @@ class ScouterMenu:
         fw, fh = frame.get_width(), frame.get_height()
         if fw <= 0 or fh <= 0:
             return
-        scale = max(0.01, self._DATA_VIEWER_SCALE)
+        # Cancel out AnimatedSprite.draw()'s real-RENDER_SCALE sizing (baked
+        # into `frame`'s pixel dimensions) and reapply a fixed RENDER_SCALE
+        # of 4 instead, so the viewer's apparent size never changes even if
+        # config.settings.RENDER_SCALE does — see _DATA_VIEWER_FIXED_RENDER_SCALE.
+        render_scale_compensation = self._DATA_VIEWER_FIXED_RENDER_SCALE / max(1, RENDER_SCALE)
+        scale = max(0.01, self._DATA_VIEWER_SCALE * render_scale_compensation)
         scaled_w = max(1, round(fw * scale))
         scaled_h = max(1, round(fh * scale))
         # Place the tight body crop relative to the entity centre

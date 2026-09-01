@@ -75,7 +75,11 @@ import json
 import os
 import pygame
 
-from config.settings import RENDER_SCALE
+# Fixed in place of config.settings.RENDER_SCALE — this screen's own sizing
+# is cosmetic UI scale, not a world/camera transform, so it's pinned here at
+# the engine's current default (4) instead of tracking that setting.
+# Changing RENDER_SCALE elsewhere no longer resizes anything in this file.
+RENDER_SCALE = 4
 from ui.pause_menu import FlatBitmapFont
 
 DEFAULT_PATH = os.path.join('data', 'game_flow.json')

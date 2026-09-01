@@ -10,7 +10,11 @@ class LevelUpNotification:
     FRAME_W = 16
     FRAME_H = 16
     FRAME_DURATION = 0.2   # seconds per animation frame, loops while active
-    ICON_NATIVE_SIZE = 64  # target size at sprite_hud.scale == 1.0
+    # Drawn at the source frame's own native size (like every other HUD
+    # icon, e.g. attack_mode_icon) and then scaled by sprite_hud.scale only —
+    # do NOT pre-stretch this above FRAME_W/H, or it ends up several times
+    # bigger than the HUD frame it sits next to.
+    ICON_NATIVE_SIZE = FRAME_W
     ICON_GAP = 8           # native-space gap between the HUD frame and the icon
 
     def __init__(self, screen_width, screen_height):

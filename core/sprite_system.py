@@ -25,13 +25,41 @@ def _directions(use_8_directions):
 
 
 class SpriteSheet:
-    """Wraps a sprite sheet PNG and gives back individual frames."""
+    """Wraps a sprite sheet PNG and gives back individual frames.
+
+    Instances are cached by filepath (see __new__) and cut frame-rows are
+    cached per-instance (see get_sprite_row) — a room that places many
+    entities of the same (type, variant) — e.g. 31 'shooter' enemies —
+    used to re-run pygame.image.load()+convert_alpha() on the same PNG,
+    and re-cut+convert_alpha() every frame, once per entity. That's disk
+    I/O and surface conversion multiplied by however many duplicates are
+    placed, all up front when the room loads. Caching means the file is
+    read and every frame is cut exactly once no matter how many entities
+    share that sprite; each entity still gets its own Animation object
+    wrapping the shared (read-only) frame Surfaces, so playback state
+    (current frame, timers) stays independent per instance.
+    """
+
+    _sheet_cache: dict = {}
+
+    def __new__(cls, filepath):
+        cached = cls._sheet_cache.get(filepath)
+        if cached is not None:
+            return cached
+        instance = super().__new__(cls)
+        instance.sheet = None
+        instance._row_cache = {}
+        if os.path.exists(filepath):
+            instance.sheet = pygame.image.load(filepath).convert_alpha()
+        cls._sheet_cache[filepath] = instance
+        return instance
 
     def __init__(self, filepath):
-        """Load from filepath; sheet stays None if the file doesn't exist."""
-        self.sheet = None
-        if os.path.exists(filepath):
-            self.sheet = pygame.image.load(filepath).convert_alpha()
+        # __new__ does all the real work so a repeat SpriteSheet(filepath)
+        # for an already-loaded file is a cache hit; Python still calls
+        # __init__ on the cached instance every time, so keep it a no-op
+        # rather than re-running setup (or clobbering _row_cache) here.
+        pass
 
     def get_sprite(self, x, y, width, height):
         """Cut a single frame out of the sheet. Returns magenta placeholder if sheet is missing."""
@@ -49,12 +77,25 @@ class SpriteSheet:
         return sprite.convert_alpha()
 
     def get_sprite_row(self, row, num_frames, width, height, start_x=0):
-        """Pull every frame from a single row — handy for grabbing a full animation."""
+        """Pull every frame from a single row — handy for grabbing a full animation.
+
+        Cached per (row, num_frames, width, height, start_x): once one
+        'shooter' has had its idle/down row cut and convert_alpha()'d, the
+        next 30 shooters loading the same row get the same Surface list
+        back instead of re-cutting identical pixels.
+        """
+        key = (row, num_frames, width, height, start_x)
+        cached = self._row_cache.get(key)
+        if cached is not None:
+            return cached
+
         y = row * height
-        return [
+        frames = [
             self.get_sprite(start_x + (i * width), y, width, height)
             for i in range(num_frames)
         ]
+        self._row_cache[key] = frames
+        return frames
 
     def get_all_frames(self, width, height, direction_row=0):
         """Return all frames from one row, auto-detecting the frame count from sheet width."""

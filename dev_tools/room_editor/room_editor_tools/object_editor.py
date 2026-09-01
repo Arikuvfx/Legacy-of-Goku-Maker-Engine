@@ -28,6 +28,27 @@ from core.event_editor import EventEditorWindow
 class ObjectEditor:
     """Editor for placing game objects like spawn points, collision walls, and decorations"""
 
+    # Maps every obj_type string returned by _check_object_at_position /
+    # _all_objects to the palette category (self.categories key / tab)
+    # it's placed from. Used to scope right-click deletion (and hover) to
+    # whichever category tab is currently open — see _check_object_at_position.
+    OBJ_TYPE_CATEGORY = {
+        'spawn': 'System',
+        'collision': 'System',
+        'transition': 'System',
+        'trigger_box': 'System',
+        'animated_region': 'Terrain',
+        'stone': 'Interactive',
+        'gate': 'Interactive',
+        'flying_pad': 'Interactive',
+        'nimbus_cloud': 'Interactive',
+        'save_point': 'Interactive',
+        'world_map_object': 'Interactive',
+        'chest': 'Interactive',
+        'door': 'Interactive',
+        'decoration': 'Decorations',
+    }
+
     def __init__(self, screen_width, screen_height, room_manager=None):
         self.screen_width = screen_width
         self.screen_height = screen_height
@@ -119,6 +140,13 @@ class ObjectEditor:
         self.region_hex_text = "FFFFFF"
         self.region_hex_input_active = False
         self.region_variant = 0  # 0-based index into the current tile-mode region's static variants
+        # region_type -> last-used {opacity, wave_amount, seed, color, variant}.
+        # region_color/opacity/etc above are a single shared "current settings"
+        # scratch space edited by the sliders; without this cache, switching
+        # which region type is selected in the palette left that scratch space
+        # untouched, so e.g. tinting a water region red would leak that same
+        # red into the next lava/grass/dirt region placed afterward.
+        self.region_settings_by_type = {}
         self._channel_gradient_cache = {}  # channel idx -> ((w, h), surface) — black->full-channel gradient, doesn't depend on the current value
         self._region_variant_sprites_cache = {}  # region_type -> list of cropped variant frames, lazy-loaded once each
 
@@ -1098,8 +1126,8 @@ class ObjectEditor:
         every manager. Used by the room editor's area-select rubber-band to
         collect everything inside a drag rectangle — unlike
         _check_object_at_position this doesn't hit-test or apply the
-        collision/terrain tool scoping, since a rect select isn't tied to
-        whichever palette tool happens to be active."""
+        current-category-tab scoping, since a rect select isn't tied to
+        whichever palette tab happens to be open."""
         spawn = self.spawn_manager.get_spawn_point(room_name)
         if spawn:
             yield spawn, 'spawn'
@@ -1145,28 +1173,26 @@ class ObjectEditor:
             yield region, 'animated_region'
 
     def _check_object_at_position(self, world_x, world_y):
-        """See if there's an object at this position (for deletion)"""
-        # Collision walls and terrain regions are frequently placed
-        # overlapping one another (a collision wall running along the edge
-        # of a water/lava region, for example). Without scoping, whichever
-        # type happened to be checked first in this function would "win"
-        # the hit test and get silently deleted even though the designer
-        # was working with the other tool — e.g. right-clicking to delete
-        # a terrain patch could instead delete a collision wall sitting on
-        # top of it, or vice versa. When the Collision or Terrain tool is
-        # the one currently selected in the palette, restrict hit-testing
-        # to that same type only, so the other type is untouchable until
-        # its own tool is selected. No tool selected (or any other tool)
-        # keeps the old behavior of checking every object type.
-        restrict_to = None
-        if isinstance(self.selected_object, dict):
-            if self.selected_object.get('is_collision'):
-                restrict_to = 'collision'
-            elif self.selected_object.get('is_animated_region'):
-                restrict_to = 'animated_region'
+        """See if there's an object at this position (for deletion).
+
+        Category-tab locked: only object types belonging to whichever
+        category is currently open (self.current_category — System,
+        Terrain, Interactive, Decorations, Structures) are hit-tested at
+        all. An object from a different category is completely invisible
+        here, so a right-click while the Decorations tab is open can never
+        reach through and delete a System collision wall, an Interactive
+        door, etc. sitting on/near the spot clicked — you have to switch
+        to that object's own tab first. This also naturally keeps
+        collision walls and terrain regions (System vs Terrain) from
+        stealing each other's clicks, since they're different tabs.
+        """
+        category = self.current_category
+
+        def wants(obj_type):
+            return self.OBJ_TYPE_CATEGORY.get(obj_type) == category
 
         # Check spawn point
-        if restrict_to is None:
+        if wants('spawn'):
             spawn = self.spawn_manager.get_spawn_point(self.current_room_name)
             if spawn:
                 distance = ((spawn.x - world_x) ** 2 + (spawn.y - world_y) ** 2) ** 0.5
@@ -1183,30 +1209,28 @@ class ObjectEditor:
         # actually clicked stayed put — indistinguishable since both render
         # as the same red overlay — requiring a second click to finish the
         # job.
-        if restrict_to != 'animated_region':
+        if wants('collision'):
             collision_objs = self.collision_manager.get_collision_objects(self.current_room_name)
             for collision_obj in reversed(collision_objs):
                 if (collision_obj.x <= world_x <= collision_obj.x + collision_obj.width and
                         collision_obj.y <= world_y <= collision_obj.y + collision_obj.height):
                     return collision_obj, 'collision'
 
-        # The Collision tool is scoped to collision walls only — nothing
-        # else (terrain included) should be reachable for delete/hover
-        # while it's the active tool, even if this click missed every wall.
-        if restrict_to == 'collision':
-            return None, None
-
-        # Everything below is off-limits while the Terrain tool is active —
-        # only the region check further down should run in that case, so a
-        # right-click can't reach through to a collision wall, door, chest,
-        # etc. sitting on top of/near the terrain patch being worked on.
-        if restrict_to is None:
+        if wants('transition'):
             # Check room transitions
             transitions = self.transition_manager.get_transitions(self.current_room_name)
             for transition in transitions:
                 if transition.check_collision_with_point(int(world_x), int(world_y)):
                     return transition, 'transition'
 
+        if wants('trigger_box'):
+            # Check trigger boxes
+            for box in self.trigger_box_manager.get_boxes(self.current_room_name):
+                if (box.x <= world_x <= box.x + box.width and
+                        box.y <= world_y <= box.y + box.height):
+                    return box, 'trigger_box'
+
+        if wants('stone'):
             # Check destructible stones
             if self.room_manager:
                 room = self.room_manager.get_room_by_name(self.current_room_name)
@@ -1216,6 +1240,7 @@ class ObjectEditor:
                         if distance < max(stone.width, stone.height) / 2:
                             return stone, 'stone'
 
+        if wants('decoration'):
             # Check decorations (trees, etc.)
             if self.room_manager:
                 room = self.room_manager.get_room_by_name(self.current_room_name)
@@ -1225,6 +1250,7 @@ class ObjectEditor:
                         if distance < max(decoration.width, decoration.height) / 2:
                             return decoration, 'decoration'
 
+        if wants('flying_pad'):
             # Check flying pads
             pads = self.flying_pad_manager.get_pads(self.current_room_name)
             for pad in pads:
@@ -1232,6 +1258,7 @@ class ObjectEditor:
                 if distance < max(pad.width, pad.height) / 2:
                     return pad, 'flying_pad'
 
+        if wants('nimbus_cloud'):
             # Check nimbus clouds
             clouds = self.nimbus_cloud_manager.get_clouds(self.current_room_name)
             for cloud in clouds:
@@ -1239,18 +1266,21 @@ class ObjectEditor:
                 if distance < max(cloud.width, cloud.height) / 2:
                     return cloud, 'nimbus_cloud'
 
+        if wants('door'):
             # Check doors
             for door in self.door_manager.get_doors(self.current_room_name):
                 distance = ((door.x - world_x) ** 2 + (door.y - world_y) ** 2) ** 0.5
                 if distance < max(door.width, door.height) / 2:
                     return door, 'door'
 
+        if wants('chest'):
             # Check chests
             for chest in self.chest_manager.get_chests(self.current_room_name):
                 distance = ((chest.x - world_x) ** 2 + (chest.y - world_y) ** 2) ** 0.5
                 if distance < max(chest.width, chest.height) / 2:
                     return chest, 'chest'
 
+        if wants('gate'):
             # Check level gates
             gates = self.gate_manager.get_gates(self.current_room_name)
             for gate in gates:
@@ -1258,6 +1288,7 @@ class ObjectEditor:
                 if distance < max(gate.width, gate.height) / 2:
                     return gate, 'gate'
 
+        if wants('save_point'):
             # Check save points
             save_points = self.save_point_manager.get_save_points(self.current_room_name)
             for save_point in save_points:
@@ -1265,17 +1296,12 @@ class ObjectEditor:
                 if distance < max(save_point.width, save_point.height) / 2:
                     return save_point, 'save_point'
 
+        if wants('world_map_object'):
             # Check world map objects
             for obj in self.world_map_manager.get_objects(self.current_room_name):
                 distance = ((obj.x - world_x) ** 2 + (obj.y - world_y) ** 2) ** 0.5
                 if distance < max(obj.width, obj.height) / 2:
                     return obj, 'world_map_object'
-
-            # Check trigger boxes
-            for box in self.trigger_box_manager.get_boxes(self.current_room_name):
-                if (box.x <= world_x <= box.x + box.width and
-                        box.y <= world_y <= box.y + box.height):
-                    return box, 'trigger_box'
 
         # Check water/grass/etc regions LAST — regions tend to be large,
         # ground-level fills that other system boxes (trigger boxes,
@@ -1285,12 +1311,14 @@ class ObjectEditor:
         # be deleted/moved before the box underneath could be selected or
         # edited. Checking regions last means any other box "wins" the
         # click when they overlap, and a region is only picked when
-        # nothing else is there.
-        regions = self.animated_region_manager.get_regions(self.current_room_name)
-        for region in regions:
-            if (region.x <= world_x <= region.x + region.width and
-                    region.y <= world_y <= region.y + region.height):
-                return region, 'animated_region'
+        # nothing else is there. (Moot when they're on different tabs, but
+        # still matters for two regions/objects sharing the same tab.)
+        if wants('animated_region'):
+            regions = self.animated_region_manager.get_regions(self.current_room_name)
+            for region in regions:
+                if (region.x <= world_x <= region.x + region.width and
+                        region.y <= world_y <= region.y + region.height):
+                    return region, 'animated_region'
 
         return None, None
 
@@ -1689,6 +1717,13 @@ class ObjectEditor:
                     self.selected_variant = None  # clear old variant before switching object
                     self.selected_object = obj
                     self.variant_scroll = 0
+                    # Animated regions keep per-type color/opacity/wave/seed/
+                    # variant settings — load this type's own last-used
+                    # values instead of leaving whatever a different region
+                    # type's sliders left behind (see region_settings_by_type).
+                    if obj.get('is_animated_region', False):
+                        self.current_region_type = obj.get('region_type', 'water')
+                        self._load_region_settings_for_type(self.current_region_type)
                     # Reset variant selection when selecting new object
                     if obj.get('has_variants', False):
                         self.showing_variants_for = obj
@@ -2290,6 +2325,40 @@ class ObjectEditor:
         surf = pygame.surfarray.make_surface(arr)
         self._channel_gradient_cache[channel_idx] = ((w, h), surf)
         return surf
+
+    def _save_region_settings_for_type(self, region_type):
+        """Snapshot the current opacity/wave/seed/color/variant scratch
+        fields into the per-type cache, so they aren't lost/overwritten
+        when the palette selection switches to a different region type."""
+        self.region_settings_by_type[region_type] = {
+            'opacity': self.region_opacity,
+            'wave_amount': self.region_wave_amount,
+            'seed': self.region_seed,
+            'color': self.region_color,
+            'variant': self.region_variant,
+        }
+
+    def _load_region_settings_for_type(self, region_type):
+        """Restore the scratch fields for region_type from the per-type
+        cache (or sensible defaults if it's never been configured), so
+        selecting e.g. Lava after tinting Water doesn't carry Water's
+        tint over."""
+        settings = self.region_settings_by_type.get(region_type)
+        if settings is None:
+            settings = {
+                'opacity': 100,
+                'wave_amount': 100,
+                'seed': 0,
+                'color': (255, 255, 255),
+                'variant': 0,
+            }
+        self.region_opacity = settings['opacity']
+        self.region_wave_amount = settings['wave_amount']
+        self.region_seed = settings['seed']
+        self.region_seed_text = str(settings['seed'])
+        self.region_color = settings['color']
+        self.region_variant = settings['variant']
+        self._sync_hex_text()
 
     def _finalize_animated_region_placement(self, room_name):
         """Finish placing a water/grass region after dragging"""
@@ -3206,9 +3275,23 @@ class ObjectEditor:
                 else:
                     self.active = False
 
-    def update(self, dt, mouse_pos, camera_x, camera_y):
+    def update(self, dt, mouse_pos, camera_x, camera_y, editor_zoom=1.0):
         """Tick editor state: animate category tabs, update world-mouse coords,
-        rebuild drag-resize previews, and compute palette scroll limits."""
+        rebuild drag-resize previews, and compute palette scroll limits.
+
+        editor_zoom is the room editor's Ctrl+scroll continuous zoom factor
+        (RoomEditor._effective_editor_zoom()). mouse_pos is always the real
+        screen position, but while zoomed the world is rendered into a
+        larger virtual viewport before being scaled down onto the real
+        screen — so a real screen pixel corresponds to mouse_pos / editor_zoom
+        virtual pixels, not mouse_pos directly. Click *events* already get
+        this correction via RoomEditor._zoom_adjust_event() before reaching
+        the tileset editor, which is why tile placement tracks the cursor
+        correctly at any zoom; object placement instead derives its position
+        from mouse_world_x/y computed here every frame, so the same
+        correction has to be applied on this path too, matching
+        RoomEditor._screen_to_world().
+        """
         if not self.active:
             return
 
@@ -3218,8 +3301,12 @@ class ObjectEditor:
             target = 1.0 if category == self.current_category else 0.0
             self.category_hover[category] += (target - self.category_hover[category]) * dt * 10
 
-        self.mouse_world_x = (mouse_pos[0] + camera_x) / RENDER_SCALE
-        self.mouse_world_y = (mouse_pos[1] + camera_y) / RENDER_SCALE
+        mouse_x, mouse_y = mouse_pos
+        if editor_zoom != 1.0:
+            mouse_x = mouse_x / editor_zoom
+            mouse_y = mouse_y / editor_zoom
+        self.mouse_world_x = (mouse_x + camera_x) / RENDER_SCALE
+        self.mouse_world_y = (mouse_y + camera_y) / RENDER_SCALE
 
         if self.placing_transition_spawn:
             if self.grid_snap and self.pending_transition_for_spawn:
@@ -3246,6 +3333,13 @@ class ObjectEditor:
         # Guard: selected_object is set to a raw dict — ensure it hasn't been
         # replaced with a live game object before reading dict keys.
         if self.selected_object and isinstance(self.selected_object, dict):
+            # Keep the per-type settings cache in sync with whatever the
+            # sliders currently hold, so this region type's tint/opacity/etc.
+            # survive switching to a different region type and back.
+            if self.selected_object.get('is_animated_region', False):
+                self._save_region_settings_for_type(
+                    self.selected_object.get('region_type', 'water')
+                )
             if self.grid_snap:
                 snap = self.grid_snap_size
                 grid_x = int(self.mouse_world_x / snap) * snap + snap // 2
@@ -3818,6 +3912,41 @@ class ObjectEditor:
         pygame.draw.circle(screen, self.colors['accent'], (int(screen_x), int(screen_y)), 3)
         pygame.draw.circle(screen, self.colors['text'], (int(screen_x), int(screen_y)), 1)
 
+    def _in_view(self, world_x, world_y, camera_x, camera_y, margin=160,
+                 world_w=0, world_h=0):
+        """Cheap screen-space visibility check used to skip drawing objects
+        that can't possibly be on screen. `margin` is generous slack (in
+        screen pixels) to cover sprite size/anchoring we don't know exactly
+        here, so nothing pops in/out at the edge. Pass `world_w`/`world_h`
+        for objects with a real footprint (e.g. collision boxes) so a large
+        object isn't culled just because its (x, y) origin corner happens
+        to be off-screen while the rest of it is still visible. Only ever
+        used to *skip* draw calls, never to change what's drawn, so it
+        can't hide anything that would actually be visible; worst case a
+        few extra objects just outside the edge still get drawn.
+
+        These per-object draw loops previously drew every object in the
+        room every frame, whether or not it was anywhere near the camera —
+        harmless for a small room, but with a large room and everything on
+        screen at once (which is exactly what happens while zoomed out),
+        that was a lot of unnecessary draw() calls piling up.
+        """
+        left = (world_x * RENDER_SCALE) - camera_x
+        top = (world_y * RENDER_SCALE) - camera_y
+        right = left + world_w * RENDER_SCALE
+        bottom = top + world_h * RENDER_SCALE
+        return (right >= -margin and left <= self.screen_width + margin and
+                bottom >= -margin and top <= self.screen_height + margin)
+
+    def _center_obj_in_view(self, obj, camera_x, camera_y, margin=160):
+        """Same as _in_view, but for the many room objects here (pads,
+        clouds, doors, chests, gates, save points, world map objects,
+        regions) whose .x/.y is their center, not a top-left corner."""
+        w = getattr(obj, 'width', 0) or 0
+        h = getattr(obj, 'height', 0) or 0
+        return self._in_view(obj.x - w / 2, obj.y - h / 2, camera_x, camera_y,
+                              margin=margin, world_w=w, world_h=h)
+
     def draw_collision_objects(self, screen, camera_x, camera_y):
         """Draw all collision walls in the current room"""
         if not self.current_room_name:
@@ -3826,19 +3955,34 @@ class ObjectEditor:
         collision_objs = self.collision_manager.get_collision_objects(self.current_room_name)
 
         for collision_obj in collision_objs:
+            if not self._in_view(collision_obj.x, collision_obj.y, camera_x, camera_y,
+                                  world_w=collision_obj.width, world_h=collision_obj.height):
+                continue
             draw_collision_object(screen, collision_obj, camera_x, camera_y,
                                   RENDER_SCALE, dev_mode=True, selected=False)
 
-    def draw_animated_regions(self, screen, camera_x, camera_y):
-        """Draw all water/grass regions in the current room (editor overlay only)"""
+    def draw_animated_regions(self, screen, camera_x, camera_y, show_handles=True):
+        """Draw all water/grass regions in the current room (editor overlay only).
+
+        show_handles=False keeps the region fill/border visible but hides the
+        yellow corner drag handles — used while the tile editor is active,
+        since those handles belong to region editing, not tile painting.
+        """
         if not self.current_room_name:
             return
 
         regions = self.animated_region_manager.get_regions(self.current_room_name)
 
         for region in regions:
+            # Regions are stored top-left + width/height (see the hit-test
+            # at region.x <= world_x <= region.x + region.width above),
+            # unlike the center-anchored objects below.
+            if not self._in_view(region.x, region.y, camera_x, camera_y,
+                                  world_w=region.width, world_h=region.height):
+                continue
             draw_animated_region(screen, region, camera_x, camera_y,
-                                 RENDER_SCALE, dev_mode=True, selected=False)
+                                 RENDER_SCALE, dev_mode=True, selected=False,
+                                 show_handles=show_handles)
 
     def _make_camera(self, camera_x, camera_y):
         """Lightweight camera-like object used by draw methods that expect a .x/.y camera."""
@@ -3860,8 +4004,12 @@ class ObjectEditor:
         temp_camera = self._make_camera(camera_x, camera_y)
 
         for transition in transitions:
-            if transition.active:
-                transition.draw(screen, temp_camera, RENDER_SCALE, dev_mode=True, selected=False)
+            if not transition.active:
+                continue
+            if not self._in_view(transition.x, transition.y, camera_x, camera_y,
+                                  world_w=transition.width, world_h=transition.height):
+                continue
+            transition.draw(screen, temp_camera, RENDER_SCALE, dev_mode=True, selected=False)
 
     def draw_level_gates(self, screen, camera_x, camera_y, colors):
         """Draw level gates in the current room"""
@@ -3873,8 +4021,11 @@ class ObjectEditor:
         temp_camera = self._make_camera(camera_x, camera_y)
 
         for gate in gates:
-            if gate.active:
-                gate.draw(screen, temp_camera, colors)
+            if not gate.active:
+                continue
+            if not self._center_obj_in_view(gate, camera_x, camera_y):
+                continue
+            gate.draw(screen, temp_camera, colors)
 
     def draw_doors(self, screen, camera_x, camera_y, colors=None):
         """Draw doors in the current room (editor preview — always shows the
@@ -3886,6 +4037,8 @@ class ObjectEditor:
         temp_camera = self._make_camera(camera_x, camera_y)
 
         for door in self.door_manager.get_doors(self.current_room_name):
+            if not self._center_obj_in_view(door, camera_x, camera_y):
+                continue
             door.draw(screen, temp_camera, colors)
 
     def _get_chest_loot_icon(self, item_id):
@@ -3917,6 +4070,8 @@ class ObjectEditor:
         temp_camera = self._make_camera(camera_x, camera_y)
 
         for chest in self.chest_manager.get_chests(self.current_room_name):
+            if not self._center_obj_in_view(chest, camera_x, camera_y):
+                continue
             chest.draw(screen, temp_camera, colors)
             if chest.item_id:
                 self._draw_chest_loot_badge(screen, chest, camera_x, camera_y)
@@ -4290,10 +4445,14 @@ class ObjectEditor:
         temp_camera = self._make_camera(camera_x, camera_y)
 
         for pad in pads:
-            if pad.active:
+            if not pad.active:
+                continue
+            # Only cull the pad sprite itself, not its path preview — a
+            # pad's path can span far beyond the pad, so a segment of it
+            # may still be on screen even when the pad marker isn't.
+            if self._center_obj_in_view(pad, camera_x, camera_y):
                 pad.draw(screen, temp_camera, colors, RENDER_SCALE)
-                # Draw path preview in editor
-                pad.draw_path_preview(screen, temp_camera, RENDER_SCALE)
+            pad.draw_path_preview(screen, temp_camera, RENDER_SCALE)
 
     def draw_nimbus_clouds(self, screen, camera_x, camera_y, colors):
         """Draw nimbus clouds in the current room"""
@@ -4305,10 +4464,13 @@ class ObjectEditor:
         temp_camera = self._make_camera(camera_x, camera_y)
 
         for cloud in clouds:
-            if cloud.active:
+            if not cloud.active:
+                continue
+            # Same reasoning as flying pads: only cull the cloud sprite,
+            # never its path preview.
+            if self._center_obj_in_view(cloud, camera_x, camera_y):
                 cloud.draw(screen, temp_camera, colors, RENDER_SCALE)
-                # Draw path preview in editor
-                cloud.draw_path_preview(screen, temp_camera, RENDER_SCALE)
+            cloud.draw_path_preview(screen, temp_camera, RENDER_SCALE)
 
     def draw_save_points(self, screen, camera_x, camera_y, colors):
         """Draw save points in the current room"""
@@ -4320,8 +4482,11 @@ class ObjectEditor:
         temp_camera = self._make_camera(camera_x, camera_y)
 
         for save_point in save_points:
-            if save_point.active:
-                save_point.draw(screen, temp_camera, colors)
+            if not save_point.active:
+                continue
+            if not self._center_obj_in_view(save_point, camera_x, camera_y):
+                continue
+            save_point.draw(screen, temp_camera, colors)
 
     def draw_world_map_objects(self, screen, camera_x, camera_y, colors):
         """Draw world map objects in the current room."""
@@ -4329,8 +4494,11 @@ class ObjectEditor:
             return
         temp_camera = self._make_camera(camera_x, camera_y)
         for obj in self.world_map_manager.get_objects(self.current_room_name):
-            if obj.active:
-                obj.draw(screen, temp_camera, colors)
+            if not obj.active:
+                continue
+            if not self._center_obj_in_view(obj, camera_x, camera_y):
+                continue
+            obj.draw(screen, temp_camera, colors)
 
     def draw_trigger_boxes(self, screen, camera_x, camera_y):
         """Draw all trigger box zones in the current room (dev mode only)."""
@@ -4338,6 +4506,9 @@ class ObjectEditor:
             return
 
         for box in self.trigger_box_manager.get_boxes(self.current_room_name):
+            if not self._in_view(box.x, box.y, camera_x, camera_y,
+                                  world_w=box.width, world_h=box.height):
+                continue
             draw_trigger_box(
                 screen, box, camera_x, camera_y, RENDER_SCALE,
                 dev_mode=True, selected=False

@@ -14,7 +14,7 @@ WORLD_WIDTH  = 1808
 WORLD_HEIGHT = 1792
 
 # Tiles are drawn at TILE_SIZE * RENDER_SCALE pixels on screen (48x48 at 3x).
-RENDER_SCALE = 4
+RENDER_SCALE = 6
 
 # ── Palette ───────────────────────────────────────────────────────────────────
 WHITE      = (255, 255, 255)

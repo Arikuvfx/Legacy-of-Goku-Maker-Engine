@@ -3,7 +3,7 @@ import os
 import sys
 import time
 import colorsys
-from config.settings import RENDER_SCALE
+# (RENDER_SCALE import removed — this file never used it.)
 
 
 class _TintedBarSprite:
@@ -144,7 +144,7 @@ class SpriteHUD:
             # Boss bar — sprites are 64×8 px native, scaled to match the player
             # HUD width (338 config units → same sc() factor as everything else).
             # Height is proportional: 338 * 8/64 = 42.
-            'boss_bar':           {'w': 338, 'h': 42, 'bar_start': 0, 'bar_end': 338},
+            'boss_bar':           {'w': 64, 'h': 8, 'bar_start': 0, 'bar_end': 64},
         }
 
         # Scan the frame sprite to find the actual lowest non-transparent pixel

@@ -17,7 +17,6 @@ Pressing S or Down on the Status tab signals 'open_skills' back to game.py.
 
 import pygame
 import os
-from config.settings import RENDER_SCALE
 from core.bitmap_font import BitmapFont
 from dev_tools.character_creator import discover_characters, load_config, resolve_portrait_path
 from core.items import (
@@ -25,6 +24,11 @@ from core.items import (
     CATEGORY_EQUIP_BODY, CATEGORY_EQUIP_HANDS, CATEGORY_EQUIP_FEET, CATEGORY_EQUIP_ACCESSORY,
 )
 
+# Fixed in place of config.settings.RENDER_SCALE — this menu's own sizing is
+# cosmetic UI scale, not a world/camera transform, so it's pinned here at the
+# engine's current default (4) instead of tracking that setting. Changing
+# RENDER_SCALE elsewhere no longer resizes anything in this file.
+RENDER_SCALE = 4
 _S = max(1, RENDER_SCALE)
 
 TABS = ['STATUS', 'INVENTORY', 'EQUIP', 'OPTIONS', 'JOURNAL']

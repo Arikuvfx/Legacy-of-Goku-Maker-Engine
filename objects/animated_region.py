@@ -248,7 +248,8 @@ _label_font = None
 
 
 def draw_animated_region(screen, region: AnimatedRegion, camera_x: int, camera_y: int,
-                          render_scale: int, dev_mode: bool = True, selected: bool = False):
+                          render_scale: int, dev_mode: bool = True, selected: bool = False,
+                          show_handles: bool = True):
     """Editor-only overlay — colored by region_type, with corner handles like
     the collision box overlay, so it's visually distinct at a glance."""
     if not dev_mode:
@@ -293,20 +294,23 @@ def draw_animated_region(screen, region: AnimatedRegion, camera_x: int, camera_y
     border_width = 3 if selected else 2
     pygame.draw.rect(screen, border_color, rect, border_width)
 
-    # Corner drag handles
-    handle = 6 * render_scale
-    handle_color = (255, 255, 0) if selected else (255, 200, 0)
-    corners = [
-        (sx,      sy),
-        (sx + sw, sy),
-        (sx,      sy + sh),
-        (sx + sw, sy + sh),
-    ]
-    for cx, cy in corners:
-        hx = int(cx - handle // 2)
-        hy = int(cy - handle // 2)
-        pygame.draw.rect(screen, handle_color, (hx, hy, int(handle), int(handle)))
-        pygame.draw.rect(screen, (0, 0, 0),    (hx, hy, int(handle), int(handle)), 1)
+    # Corner drag handles — only relevant while actually dragging/resizing
+    # the region itself, so they're skipped while the tile editor is active
+    # (the region fill/border still draws above, just without the handles).
+    if show_handles:
+        handle = 6 * render_scale
+        handle_color = (255, 255, 0) if selected else (255, 200, 0)
+        corners = [
+            (sx,      sy),
+            (sx + sw, sy),
+            (sx,      sy + sh),
+            (sx + sw, sy + sh),
+        ]
+        for cx, cy in corners:
+            hx = int(cx - handle // 2)
+            hy = int(cy - handle // 2)
+            pygame.draw.rect(screen, handle_color, (hx, hy, int(handle), int(handle)))
+            pygame.draw.rect(screen, (0, 0, 0),    (hx, hy, int(handle), int(handle)), 1)
 
     # Dimension + type label — skip if the box is too small to fit text
     if sw > 50 and sh > 30:

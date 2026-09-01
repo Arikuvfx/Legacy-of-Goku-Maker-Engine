@@ -50,6 +50,13 @@ _BOTTOM_MARGIN = 40  # px (pre-render_scale) from the bottom of the screen
 # stops lining up with the bg frame). 1.0 = native image size.
 _BAR_SCALE = 1.5
 
+# Fixed stand-in for the render_scale the caller passes into draw() (see
+# Game.draw's `bar.draw(screen, render_scale=RENDER_SCALE)`). This bar's
+# scale is purely cosmetic UI sizing, so draw() ignores whatever value it's
+# handed and uses this pinned constant instead — the bar's on-screen size no
+# longer changes if config.settings.RENDER_SCALE changes.
+_FIXED_RENDER_SCALE = 4
+
 # Fill-bar-only offset, added on top of the bg bar's (x, y) — positive X
 # moves it right, positive Y moves it down. Tune these two to line
 # spam_bar.png up with wherever it should sit inside spam_bar_bg.png's frame.
@@ -147,10 +154,13 @@ class SpamQTEBar:
         self._pending_presses = 0
 
     def draw(self, screen, render_scale=1.0):
+        # render_scale is accepted for call-site compatibility (game.py
+        # still passes RENDER_SCALE in) but intentionally ignored — see
+        # _FIXED_RENDER_SCALE above.
         if not self.active or self._bg_image is None:
             return
 
-        total_scale = render_scale * _BAR_SCALE
+        total_scale = _FIXED_RENDER_SCALE * _BAR_SCALE
 
         bg_w, bg_h = self._bg_image.get_size()
         scaled_w   = max(1, int(bg_w * total_scale))
@@ -158,7 +168,7 @@ class SpamQTEBar:
 
         screen_w, screen_h = screen.get_size()
         x = (screen_w - scaled_w) // 2
-        y = screen_h - scaled_h - int(_BOTTOM_MARGIN * render_scale) + 100
+        y = screen_h - scaled_h - int(_BOTTOM_MARGIN * _FIXED_RENDER_SCALE) + 100
 
         bg_scaled = pygame.transform.scale(self._bg_image, (scaled_w, scaled_h))
         screen.blit(bg_scaled, (x, y))

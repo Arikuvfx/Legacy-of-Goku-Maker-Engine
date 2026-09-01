@@ -71,6 +71,9 @@ _enforce_single_instance()
 import math
 import time
 import random
+import itertools
+import csv
+import gc
 
 # ── Game subsystems — import order follows dependency depth ────────────────────
 from attacks import Projectile
@@ -219,6 +222,91 @@ class _LevelUpPlayerSpriteDrawable:
 
 
 
+# ── Frame-time profiler ──────────────────────────────────────────────────────
+# Diagnostic tool for chasing the drops Ariku's been seeing — NOT meant to
+# ship. Toggle with the PROFILE_FRAMES env var (defaults on); turn off with
+# PROFILE_FRAMES=0 once done, or just flip _PROFILE_FRAMES_ENABLED below.
+#
+# Splits each frame into handle_events / update / draw and logs the three
+# to frame_log.csv, along with a GC-collections-per-generation count for
+# that frame. A stutter should show up as exactly one of those columns
+# spiking rather than a vague "frame took too long" — a spike in 'draw_ms'
+# points at rendering, 'update_ms' at game logic, and a nonzero 'gc2'
+# (a full garbage-collection pass, the expensive kind) explains a hitch
+# that isn't tied to anything you're doing on screen at all.
+#
+# Any frame at/above SLOW_FRAME_MS (default 33ms, i.e. below ~30fps) also
+# prints straight to the console, so a drop is visible immediately without
+# opening the CSV.
+_PROFILE_FRAMES_ENABLED = os.environ.get('PROFILE_FRAMES', '1') != '0'
+_SLOW_FRAME_MS = float(os.environ.get('SLOW_FRAME_MS', '33'))
+
+
+class FrameProfiler:
+    """Times handle_events/update/draw per frame and writes frame_log.csv."""
+
+    def __init__(self, path='frame_log.csv', enabled=True, slow_ms=33.0, flush_every=120):
+        self.enabled = enabled
+        self.slow_ms = slow_ms
+        self._flush_every = flush_every
+        self._frame_index = 0
+        self._file = None
+        self._writer = None
+        self._gc_counts_prev = self._gc_collection_counts()
+        if self.enabled:
+            try:
+                self._file = open(path, 'w', newline='')
+                self._writer = csv.writer(self._file)
+                self._writer.writerow([
+                    'frame', 'time', 'room',
+                    'events_ms', 'update_ms', 'draw_ms', 'total_ms',
+                    'gc0', 'gc1', 'gc2',
+                ])
+            except OSError:
+                # Diagnostic tool — if the log file can't be opened for some
+                # reason, fail quiet rather than taking the game down with it.
+                self.enabled = False
+
+    @staticmethod
+    def _gc_collection_counts():
+        """(gen0, gen1, gen2) cumulative collection counts since interpreter
+        start. gen2 is the expensive one — a full collection pass over
+        every tracked object — so a nonzero gen2 delta on a slow frame is
+        usually the smoking gun."""
+        stats = gc.get_stats()
+        return tuple(g['collections'] for g in stats)
+
+    def record(self, room_name, events_ms, update_ms, draw_ms):
+        counts_now = self._gc_collection_counts()
+        gc0, gc1, gc2 = (now - prev for now, prev in zip(counts_now, self._gc_counts_prev))
+        self._gc_counts_prev = counts_now
+
+        if not self.enabled:
+            return
+
+        self._frame_index += 1
+        total_ms = events_ms + update_ms + draw_ms
+
+        self._writer.writerow([
+            self._frame_index, f'{time.time():.3f}', room_name,
+            f'{events_ms:.2f}', f'{update_ms:.2f}', f'{draw_ms:.2f}', f'{total_ms:.2f}',
+            gc0, gc1, gc2,
+        ])
+        if self._frame_index % self._flush_every == 0:
+            self._file.flush()
+
+        if total_ms >= self.slow_ms:
+            gc_note = f'  gc(0/1/2)={gc0}/{gc1}/{gc2}' if (gc0 or gc1 or gc2) else ''
+            print(f'[frame {self._frame_index}] SLOW {total_ms:.1f}ms  '
+                  f'(events {events_ms:.1f} / update {update_ms:.1f} / draw {draw_ms:.1f})  '
+                  f'room={room_name}{gc_note}')
+
+    def close(self):
+        if self._file:
+            self._file.flush()
+            self._file.close()
+
+
 class Game:
     """
     Top-level controller. Owns every subsystem (rendering, audio, rooms, input),
@@ -234,6 +322,9 @@ class Game:
         comments below for where each subsystem is set up.
         """
         pygame.init()
+
+        # See FrameProfiler above — diagnostic only, PROFILE_FRAMES=0 to disable.
+        self.frame_profiler = FrameProfiler(enabled=_PROFILE_FRAMES_ENABLED, slow_ms=_SLOW_FRAME_MS)
 
         # Whitelist only the events we actually handle.
         # All other event types are blocked so pygame's queue never fills up
@@ -346,6 +437,11 @@ class Game:
         # Let the editor flush the baked-surface cache before each draw so
         # deleted/painted tiles are visible immediately without leaving the editor.
         self.room_editor.flush_tile_cache_callback = self._flush_dirty_tile_rooms
+        # Let the editor draw the real animated water/lava/grass texture
+        # (instead of its own flat placeholder box) while the tile editor is
+        # active, since blit_tiles_callback — which normally draws this — is
+        # bypassed in favor of tileset_editor.draw_tiles() during tile editing.
+        self.room_editor.draw_animated_overlay_callback = self._draw_animated_regions_overlay
 
         # ── Dev tools ─────────────────────────────────────────────────────────
         self.dev_menu             = DevMenu(self.game_config, SCREEN_WIDTH, SCREEN_HEIGHT, self.sound_manager)
@@ -485,6 +581,17 @@ class Game:
         self.critters = []  # ambient wildlife: squirrels, birds, butterflies
         self.destructible_stones  = []
         self.decorations          = []  # trees, etc. — see objects/decoration_object.py
+        # Rebuilt every frame by _update_critters/_update_decorations: the subset
+        # of self.critters/self.decorations currently within the camera viewport
+        # (see _zeni_cull_rect). A room can have hundreds of trees or critters
+        # that are almost entirely off-screen at any given moment, so update()
+        # only ticks these on-screen ones' animation/movement, and draw() (plus
+        # the player-silhouette occlusion check right after it) only sorts and
+        # blits these instead of re-scanning the full room every time. Purely a
+        # perf cache — both are purely ambient (no hitbox/AI state that would be
+        # lost by pausing off-screen), so this never changes what's on screen.
+        self._visible_critters    = []
+        self._visible_decorations = []
         self.collision_objects    = []
         self.room_transitions     = []
         self.level_gates          = []
@@ -519,6 +626,15 @@ class Game:
         # landing on top of the whole bucket — see _build_room_tile_surface().
         self._room_tile_surfaces: dict = {}
         self._dirty_tile_rooms:   set  = set()   # rooms pending a full surface rebuild
+        # Memoizes the current-frame (disp_x, disp_y) lookup for animated tiles,
+        # keyed by (id(tileset), tile_x, tile_y). Cleared whenever the game tick
+        # advances (see _draw_animated_tile_segment), so within a single frame
+        # every instance of the same animated tile — and there can be hundreds,
+        # e.g. a whole lake of the same water tile — reuses one lookup instead
+        # of recomputing it per instance. Also shared across the bg/fg draw
+        # calls that both happen within that same frame.
+        self._anim_coords_cache:      dict = {}
+        self._anim_coords_cache_tick = None
         # room_name -> set of (grid_x, grid_y) world-space cells pending an
         # in-place patch (single tile placed/erased). Cheaper than a full
         # rebuild since it never reallocates the room-sized surface or
@@ -2702,17 +2818,17 @@ class Game:
         if not frames:
             return
         idx = min(self._levelup_anim_idx, len(frames) - 1)
-        # Tied to the Sprite HUD's own scale (not RENDER_SCALE) since this
-        # animation is considered part of the Sprite HUD — bump
-        # self.sprite_hud.scale to resize this along with the rest of the HUD.
-        _hud_scale = self.sprite_hud.scale
-        sw  = int(self.player.width  * _hud_scale)
-        sh  = int(self.player.height * _hud_scale)
+        # Scaled by RENDER_SCALE to match the player's normal in-world sprite
+        # (and every other sprite in the game world, e.g. _draw_landing_sprite) —
+        # NOT sprite_hud.scale, which is for blowing up tiny HUD icons and made
+        # the player sprite huge here.
+        sw  = int(self.player.width  * RENDER_SCALE)
+        sh  = int(self.player.height * RENDER_SCALE)
 
-        # Pre-scaled-frame cache — same source frame + same HUD scale always
+        # Pre-scaled-frame cache — same source frame + same scale always
         # produces the same size, so scale once per (frame, scale) pair
         # instead of every draw().
-        cache_key = (idx, _hud_scale)
+        cache_key = (idx, RENDER_SCALE)
         scaled = self._levelup_anim_scaled_cache.get(cache_key)
         if scaled is None:
             scaled = pygame.transform.scale(frames[idx], (sw, sh))
@@ -3332,6 +3448,13 @@ class Game:
 
         20 iterations handles any realistic tight 3-wall corner;
         fewer leaves enemies visibly clipping through walls after hard knockback.
+
+        Obstacle Rects are resolved once per call (obstacles don't move while
+        an entity is being pushed clear of them). Re-deriving each obstacle's
+        Rect on every iteration — via a chain of hasattr() checks + Rect()
+        construction — for every obstacle × every entity × up to 20 passes
+        was the main cause of multi-second hitches and gen0 GC storms when
+        spawning into rooms with hundreds of collision objects.
         """
         import pygame
 
@@ -3357,12 +3480,20 @@ class Game:
                 )
             return None
 
+        # Resolve once — obstacles are static for the duration of this call.
+        obs_rects = []
+        for obs in obstacles:
+            r = get_obstacle_rect(obs)
+            if r is not None:
+                obs_rects.append(r)
+        if not obs_rects:
+            return
+
         for _ in range(max_iterations):
             ent_rect = get_entity_rect(entity)
             pushed   = False
-            for obs in obstacles:
-                obs_rect = get_obstacle_rect(obs)
-                if obs_rect is None or not ent_rect.colliderect(obs_rect):
+            for obs_rect in obs_rects:
+                if not ent_rect.colliderect(obs_rect):
                     continue
 
                 # Push along the axis with the smallest overlap.
@@ -3497,8 +3628,6 @@ class Game:
                 ai_type        = data.get('ai_type', 'easy')
                 enemy_category = data.get('enemy_category', 'melee')
                 zeni_pool      = data.get('zeni_pool', 'tier1')
-                print(f"DEBUG spawning enemy id={enemy_id} zeni_pool={zeni_pool!r} raw_data_keys={list(data.keys())}")
-
                 # Map variant to the correct projectile type for shooter enemies.
                 if variant_type == 'gunner':
                     shooter_style = 'bullet'
@@ -9492,8 +9621,6 @@ class Game:
         if not self._pending_zeni_drops:
             return
         import traceback
-        print(f"[zeni] flushing {len(self._pending_zeni_drops)} drop(s), levelup_active={self._levelup_active}")
-        traceback.print_stack(limit=4)
         from core.zeni_system import spawn_zeni_pickups
         for zeni_amount, x, y, direction in self._pending_zeni_drops:
             self.zeni_pickups.extend(spawn_zeni_pickups(zeni_amount, x, y, direction))
@@ -9855,11 +9982,26 @@ class Game:
         No player argument, no nearby-interaction bookkeeping — critters
         never react to the player, so there's nothing to track here beyond
         advancing each one's own wander/animation state.
+
+        Only critters within the camera viewport (+margin) actually get
+        ticked. A room can have a couple hundred ambient critters and, at
+        any moment, most of them are off-screen — skipping their update is
+        free since they're purely ambient (no hitbox, no AI reacting to
+        anything), so an off-screen critter just holds its position/frame
+        until the camera comes back around, which nobody can see happen.
+        Also builds self._visible_critters so draw() doesn't have to
+        re-scan the full list a second time to figure out what's on screen.
         """
+        cam_left, cam_top, cam_right, cam_bottom = self._zeni_cull_rect()
+        visible = []
         for critter in self.critters:
             if not critter.active:
                 continue
-            critter.update(dt, self.current_room.width, self.current_room.height)
+            onscreen = cam_left <= critter.x <= cam_right and cam_top <= critter.y <= cam_bottom
+            if onscreen:
+                critter.update(dt, self.current_room.width, self.current_room.height)
+                visible.append(critter)
+        self._visible_critters = visible
 
     def _update_save_points(self, dt):
         """Tick save points and record whichever one the player is standing near."""
@@ -10038,9 +10180,27 @@ class Game:
     def _update_decorations(self, dt):
         """Advance each placed decoration's (tree, etc.) frame animation.
         No attack/collision checks here — unlike destructible stones,
-        decorations are purely ambient and never destroyed."""
+        decorations are purely ambient and never destroyed.
+
+        Only decorations within the camera viewport (+margin) actually tick
+        their animation timer — a forest room is almost entirely off-screen
+        trees at any given moment, and skipping their update is free (an
+        off-screen tree just holds its current frame; nobody can see it not
+        sway until the camera comes back to it). Also builds
+        self._visible_decorations so draw() and the player-silhouette
+        occlusion check right after it can reuse this same on-screen set
+        instead of each re-scanning every decoration in the room again.
+        """
+        cam_left, cam_top, cam_right, cam_bottom = self._zeni_cull_rect()
+        visible = []
         for decoration in self.decorations:
-            decoration.update(dt)
+            if not decoration.active:
+                continue
+            onscreen = cam_left <= decoration.x <= cam_right and cam_top <= decoration.y <= cam_bottom
+            if onscreen:
+                decoration.update(dt)
+                visible.append(decoration)
+        self._visible_decorations = visible
 
     def _trigger_genkidama_hit(self, x, y):
         """Spawn the hit-flash effect and kick off the screen white-flash
@@ -10387,8 +10547,8 @@ class Game:
             ]
 
             for obj in (self.projectiles + self.ultra_volleyballs + _player_objs + self.enemies + self.npcs
-                        + self.critters
-                        + self.destructible_stones + self.decorations + self.level_gates + self.doors
+                        + self._visible_critters
+                        + self.destructible_stones + self._visible_decorations + self.level_gates + self.doors
                         + self.chests
                         + self.bombs + self.explosions + self.genkidama_hit_effects
                         + self.burning_hit_effects + self.flying_pads + self.nimbus_clouds
@@ -10571,8 +10731,8 @@ class Game:
             _player_rect = pygame.Rect(_px - _pw // 2, _py - _ph // 2, _pw, _ph)
 
             _trees = sorted(
-                (d for d in self.decorations
-                 if d.active and d.frames and d.decoration_type == 'tree'),
+                (d for d in self._visible_decorations
+                 if d.frames and d.decoration_type == 'tree'),
                 key=lambda d: d.get_sort_key(),
             )
 
@@ -10949,16 +11109,44 @@ class Game:
         bg=False) into an ordered list of render segments.
 
         Each segment is either:
-          ('static', Surface)   — a run of non-animated tiles baked together
-          ('anim',   [Tile...]) — animated tiles that fall at this point in
-                                   the layer order, drawn fresh every frame
+          ('static', Surface)   — a run of consecutive (in layer order)
+                                   non-animated tiles, baked into ONE Surface
+          ('anim',   [Tile...]) — a run of consecutive (in layer order)
+                                   animated tiles, drawn fresh every frame
 
-        Static tiles are still merged into as few Surfaces as possible (one
-        camera-offset blit each), but an animated tile splits the run right
-        where it occurs instead of always being pulled out to draw on top of
-        the whole bucket — that's what used to make animated tiles ignore
-        layer order entirely. Drawing the returned segments back in order
-        (see _draw_room_tile_plan) reproduces the tiles' real depth order.
+        Segments are emitted in layer order and a new one only starts when
+        the run switches between animated and static, so draw order stays
+        correct: an animated tile at a lower layer than a static tile still
+        draws underneath it, and vice versa (see _draw_room_tile_plan, which
+        blits these segments back in this same order).
+
+        PERFORMANCE NOTE (see profiling from Aug 2026): each segment — no
+        matter how few tiles it holds — costs a full alpha-blended
+        Surface.blit() sized to the screen every frame (blit cost is bounded
+        by the destination viewport, not by how much of the source surface
+        has content). A room with animated tiles scattered through the layer
+        order instead of clustered together can rack up dozens of these
+        full-screen blits per frame — profiling showed this function's
+        blit() calls alone eating ~20% of total frame time in one such room.
+        Consecutive same-kind tiles still collapse into a single segment (so
+        the common case of a few clustered animated tiles stays cheap). A
+        prior version of this function always collapsed to exactly one
+        static segment and one animated segment regardless of layer order to
+        avoid that cost entirely, but that meant every animated tile always
+        drew on top of every static tile no matter its layer value.
+
+        Tiles are first grouped by their exact layer value. Tiles that share
+        the same layer value have no ordering requirement relative to each
+        other (they're at the same depth), so within one layer group all
+        static tiles are batched into a single blit and all animated tiles
+        into a single run, regardless of how they were interleaved when
+        painted. Only a change in layer VALUE can force a new segment.
+        Without this, a single layer that freely interleaves animated and
+        static tiles (e.g. a pond of water tiles dotted with static rocks,
+        all on the Shadows layer) fragments into one segment per tile —
+        which is what caused the severe frame-rate regression after the
+        z-order fix above, since alternation like that costs nothing
+        visually but was being charged a full segment each time.
 
         Tile source priority
         ────────────────────
@@ -10991,37 +11179,63 @@ class Game:
 
         segments = []
         current_surf = None
+        current_anim = None
 
-        for tile in sorted(tiles, key=lambda t: t.layer):
-            is_bg_tile = tile.layer < 0
+        for layer_value, layer_group in itertools.groupby(
+                sorted(tiles, key=lambda t: t.layer), key=lambda t: t.layer):
+            is_bg_tile = layer_value < 0
             if bg != is_bg_tile:
                 continue
-            tileset = tileset_mgr.get_tileset(tile.tileset_name)
-            if not tileset or not tileset.image:
-                continue
 
-            if tileset.is_tile_animated(tile.tile_x, tile.tile_y):
-                # Close out whatever static run was in progress so it stays
-                # below this animated tile, then either start a new 'anim'
-                # segment or extend the current one if it's already on top
-                # (no static tile has been baked since it started).
-                if current_surf is not None:
-                    segments.append(('static', current_surf))
-                    current_surf = None
-                if segments and segments[-1][0] == 'anim':
-                    segments[-1][1].append(tile)
+            # Split this single layer's tiles into statics and animateds.
+            # Their relative order within the layer doesn't matter (same
+            # depth), so we can always emit statics-then-animated for this
+            # layer regardless of how they were originally interleaved.
+            layer_statics = []
+            layer_animateds = []
+            for tile in layer_group:
+                tileset = tileset_mgr.get_tileset(tile.tileset_name)
+                if not tileset or not tileset.image:
+                    continue
+                if tileset.is_tile_animated(tile.tile_x, tile.tile_y):
+                    layer_animateds.append(tile)
                 else:
-                    segments.append(('anim', [tile]))
-                continue
+                    layer_statics.append((tile, tileset))
 
-            if current_surf is None:
-                current_surf = pygame.Surface((room_px_w, room_px_h), pygame.SRCALPHA)
-            scaled = tileset.get_scaled_tile_surface(tile.tile_x, tile.tile_y, RENDER_SCALE)
-            if scaled:
-                current_surf.blit(scaled, (int(tile.x * RENDER_SCALE), int(tile.y * RENDER_SCALE)))
+            if layer_statics:
+                # Extend the in-progress static surface, or start a new one
+                # if the previous layer (in layer order) ended on an
+                # animated run — this is what keeps a static tile at the
+                # correct depth relative to animated tiles instead of always
+                # drawing underneath all of them. Only an actual switch
+                # between layer values pays for an extra segment; every tile
+                # sharing this layer value collapses into the same blit no
+                # matter how it was interleaved with animated tiles when
+                # painted.
+                if current_surf is None:
+                    current_surf = pygame.Surface((room_px_w, room_px_h), pygame.SRCALPHA)
+                    segments.append(('static', current_surf))
+                for tile, tileset in layer_statics:
+                    scaled = tileset.get_scaled_tile_surface(tile.tile_x, tile.tile_y, RENDER_SCALE)
+                    if scaled:
+                        current_surf.blit(scaled, (int(tile.x * RENDER_SCALE), int(tile.y * RENDER_SCALE)))
+                # A later layer's animated tiles must start a fresh run
+                # rather than silently extending an animated run that sits
+                # BEFORE this layer's statics in the segment list — that
+                # would draw them underneath these statics regardless of
+                # their actual layer value.
+                current_anim = None
 
-        if current_surf is not None:
-            segments.append(('static', current_surf))
+            if layer_animateds:
+                if current_anim is None:
+                    current_anim = []
+                    segments.append(('anim', current_anim))
+                current_anim.extend(layer_animateds)
+                # Symmetric reset: a later layer's static tiles must start a
+                # brand-new Surface/segment rather than being blitted into
+                # whatever static surface preceded this animated run (see
+                # the z-order bug this whole function exists to avoid).
+                current_surf = None
 
         return segments
 
@@ -11034,14 +11248,35 @@ class Game:
         cycle frames every tick and can't be pre-rendered once. Cost stays
         O(animated tiles) regardless of total room tile count, since
         everything static is still a single cached blit per segment.
+
+        Two things keep this cheap even when a room is covered in hundreds
+        of copies of the same animated tile (a whole lake of water, say):
+          - the (tileset, tile_x, tile_y) -> current-frame lookup is
+            memoized per game tick in self._anim_coords_cache, so repeated
+            instances of the same animated tile — and the bg/fg call that
+            follows this one in the same frame — reuse one lookup instead
+            of recomputing get_animated_coords() per instance.
+          - every on-screen tile's blit is queued and issued with a single
+            Surface.blits() call instead of one Surface.blit() per tile,
+            which cuts per-call overhead substantially once there are many
+            animated tiles on screen at once. (Fully opaque animated tiles
+            also get a non-alpha Surface from get_scaled_tile_surface(),
+            which blits() itself blits faster than an alpha-blended one.)
         """
         te = getattr(self.room_editor, 'tileset_editor', None)
         if not te:
             return
 
         tick_ms = pygame.time.get_ticks()
+        if tick_ms != self._anim_coords_cache_tick:
+            self._anim_coords_cache.clear()
+            self._anim_coords_cache_tick = tick_ms
+        coords_cache = self._anim_coords_cache
+
         tileset_mgr = te.tileset_manager
         sw, sh = target_surface.get_size()
+
+        blit_sequence = []
 
         for tile in tiles:
             tileset = tileset_mgr.get_tileset(tile.tileset_name)
@@ -11056,10 +11291,19 @@ class Game:
             if not (-scaled_width <= screen_x <= sw and -scaled_height <= screen_y <= sh):
                 continue
 
-            disp_x, disp_y = tileset.get_animated_coords(tile.tile_x, tile.tile_y, tick_ms)
+            cache_key = (id(tileset), tile.tile_x, tile.tile_y)
+            disp_coords = coords_cache.get(cache_key)
+            if disp_coords is None:
+                disp_coords = tileset.get_animated_coords(tile.tile_x, tile.tile_y, tick_ms)
+                coords_cache[cache_key] = disp_coords
+            disp_x, disp_y = disp_coords
+
             scaled = tileset.get_scaled_tile_surface(disp_x, disp_y, RENDER_SCALE)
             if scaled:
-                target_surface.blit(scaled, (int(screen_x), int(screen_y)))
+                blit_sequence.append((scaled, (int(screen_x), int(screen_y))))
+
+        if blit_sequence:
+            target_surface.blits(blit_sequence, doreturn=False)
 
     def _draw_room_tile_plan(self, target_surface: 'pygame.Surface', room_name: str,
                               bg: bool, camera_x: int, camera_y: int):
@@ -11459,6 +11703,11 @@ class Game:
         Only chunks/tiles intersecting the camera view (plus padding, so
         nothing pops in at the screen border) are drawn either way, so cost
         is proportional to what's on screen, not to how large the region is.
+        Every patch/tile across every region is queued into one list and
+        issued with a single Surface.blits() call at the end of this method
+        instead of one Surface.blit() per patch — a room can easily have a
+        few hundred small regions, and at 8-16px per patch that's thousands
+        of individual blits a frame otherwise.
         """
         room = self.room_manager.get_room_by_name(room_name)
         if not room:
@@ -11475,6 +11724,16 @@ class Game:
         tick_ms = pygame.time.get_ticks()
         sw, sh = target_surface.get_size()
 
+        # Every patch/tile blit across every region this call is queued here
+        # and issued as one Surface.blits() call at the very end instead of
+        # one Surface.blit() per patch. A single grass/water region can be
+        # made up of hundreds of tiny 8-16px patches, and a room can have a
+        # hundred-plus regions — that's easily thousands of individual
+        # blit() calls a frame otherwise, which is real Python/pygame
+        # per-call overhead piling up on top of everything else the frame
+        # has to draw. blits() batches all of that into one C-side pass.
+        blit_batch = []
+
         # Visible bounds (+ padding) in the same unscaled world/tile-unit
         # space region.x/.y live in.
         view_left   = (camera_x / RENDER_SCALE) - PAD
@@ -11484,6 +11743,23 @@ class Game:
 
         for region in regions:
             if not getattr(region, 'active', True):
+                continue
+
+            # Cull off-screen regions FIRST, using only region.x/y/width/
+            # height (already available with no lookups) — before touching
+            # REGION_STYLES, loading/tinting the sprite sheet, or mutating
+            # frame alpha below. This room's 140 regions spread across a
+            # 2400x1800 space rarely have more than a handful on screen at
+            # once, so doing that per-region setup work for the ~100+
+            # off-screen ones every single frame was pure waste. The
+            # style/frame lookup right after this still needs `style` for
+            # mode/chunk_size, so region_type-only info is checked again
+            # once we know a region is actually visible.
+            rx0 = max(region.x, view_left)
+            ry0 = max(region.y, view_top)
+            rx1 = min(region.x + region.width,  view_right)
+            ry1 = min(region.y + region.height, view_bottom)
+            if rx0 >= rx1 or ry0 >= ry1:
                 continue
 
             style = REGION_STYLES.get(region.region_type, {})
@@ -11533,23 +11809,30 @@ class Game:
                         sprite_name, frame_size_key, color, [plain_frame], key_suffix='_plain'
                     )[0]
 
-            # 0-100 editor slider -> 0-255 surface alpha. Set on every frame
-            # this region might use (cheap — at most a handful), since the
-            # same cached frame objects are shared across regions/instances
-            # and each region can have its own opacity.
+            # 0-100 editor slider -> 0-255 surface alpha. Only touched when
+            # it actually differs from the last value applied to this exact
+            # cached (sprite, frame_size, color) frame set — these Surface
+            # objects are shared across every region using the same sprite/
+            # tint, so if the last region we drew with them already left
+            # them at this alpha there's nothing to do. Before this check,
+            # a full-opacity region still paid a set_alpha() call per frame
+            # per visible region every single frame for no visible effect.
             alpha_value = max(0, min(255, round(getattr(region, 'opacity', 100) / 100 * 255)))
-            for f in frames:
-                f.set_alpha(alpha_value)
-            if plain_frame is not None:
+            if not hasattr(self, '_region_frame_alpha_cache'):
+                self._region_frame_alpha_cache = {}
+            alpha_cache = self._region_frame_alpha_cache
+            alpha_cache_key = (sprite_name, frame_size_key, color)
+            if alpha_cache.get(alpha_cache_key) != alpha_value:
+                for f in frames:
+                    f.set_alpha(alpha_value)
+                if plain_frame is not None:
+                    plain_frame.set_alpha(alpha_value)
+                alpha_cache[alpha_cache_key] = alpha_value
+            elif plain_frame is not None:
+                # plain_frame isn't covered by the cached key above (it's a
+                # different Surface than `frames`), so make sure it still
+                # matches even when `frames` didn't need re-touching.
                 plain_frame.set_alpha(alpha_value)
-
-            # Clip the region to the camera view before chunking it.
-            rx0 = max(region.x, view_left)
-            ry0 = max(region.y, view_top)
-            rx1 = min(region.x + region.width,  view_right)
-            ry1 = min(region.y + region.height, view_bottom)
-            if rx0 >= rx1 or ry0 >= ry1:
-                continue
 
             if mode == 'patch':
                 # Snap the starting corner down to the nearest chunk boundary.
@@ -11615,10 +11898,10 @@ class Game:
                         src_x = int(((cx % frame_size) + offset_x) * RENDER_SCALE)
                         screen_x = (cx * RENDER_SCALE) - camera_x
                         screen_y = (cy * RENDER_SCALE) - camera_y
-                        target_surface.blit(
+                        blit_batch.append((
                             source, (int(screen_x), int(screen_y)),
                             (src_x, int(src_y), scaled_chunk, scaled_chunk)
-                        )
+                        ))
                         cx += chunk_size
                     cy += chunk_size
 
@@ -11659,10 +11942,10 @@ class Game:
                                 src_x = int((tile_left - cx) * RENDER_SCALE)
                                 src_w = int((tile_right - tile_left) * RENDER_SCALE)
                                 screen_x = (tile_left * RENDER_SCALE) - camera_x
-                                target_surface.blit(
+                                blit_batch.append((
                                     frame, (int(screen_x), int(screen_y)),
                                     (src_x, src_y, src_w, src_h)
-                                )
+                                ))
                             cx += frame_w
                     cy += frame_h
 
@@ -11710,6 +11993,9 @@ class Game:
             #
             #             cx += chunk_size
             #         cy += chunk_size
+
+        if blit_batch:
+            target_surface.blits(blit_batch, doreturn=False)
 
     def _draw_scrolling_background(self, dt):
         """Draw the current room's scrolling background image, if it has one.
@@ -11879,6 +12165,84 @@ class Game:
         self._fg_tiles_cache = (cache_key, result)
         return result
 
+    # World-space size of one foreground-tile grid cell — see
+    # _get_foreground_tile_grid. Kept generous relative to typical tile
+    # sizes so a tile only ever needs inserting into a small handful of
+    # cells even if a tileset uses larger-than-default tiles.
+    _FG_TILE_GRID_CELL = 128
+
+    def _get_foreground_tile_grid(self):
+        """Spatial index of foreground tiles, bucketed by world position.
+
+        _draw_player_silhouette_if_occluded used to scan every single
+        foreground tile in the room every frame just to find the handful
+        (usually zero) actually overlapping the player — a heavy room's
+        foreground layer can run into the hundreds of tiles, all scanned
+        every frame regardless of where the player actually is. This index
+        is built once per (room, tile-list) — same invalidation key as
+        _get_foreground_tiles — and lets that check instead only look at
+        tiles in the few cells near the player.
+
+        Each tile is inserted into every cell its real (tileset-supplied)
+        width/height bounding box touches, so a query gathering all tiles
+        whose bounding box could reach a point is guaranteed not to miss
+        one — same approach as Enemy/Player's obstacle grid.
+        """
+        fg_tiles = self._get_foreground_tiles()
+        room_name = self.current_room.name if self.current_room else None
+        cache_key = (room_name, id(fg_tiles))
+        cached = getattr(self, '_fg_tile_grid_cache', None)
+        if cached is not None and cached[0] == cache_key:
+            return cached[1]
+
+        te = getattr(self.room_editor, 'tileset_editor', None)
+        cell = self._FG_TILE_GRID_CELL
+        grid = {}
+        for tile in fg_tiles:
+            tw = th = TILE_SIZE
+            if te:
+                tileset = te.tileset_manager.get_tileset(tile.tileset_name)
+                if tileset:
+                    tw = tileset.tile_width
+                    th = tileset.tile_height
+            min_cx = int(tile.x // cell)
+            max_cx = int((tile.x + tw) // cell)
+            min_cy = int(tile.y // cell)
+            max_cy = int((tile.y + th) // cell)
+            for gx in range(min_cx, max_cx + 1):
+                for gy in range(min_cy, max_cy + 1):
+                    grid.setdefault((gx, gy), []).append(tile)
+
+        self._fg_tile_grid_cache = (cache_key, grid)
+        return grid
+
+    def _nearby_foreground_tiles(self, world_x, world_y, half_w, half_h):
+        """Return the foreground tiles whose bounding box could reach the
+        (world_x, world_y) ± (half_w, half_h) box, via the grid above,
+        deduplicated (a large tile can span multiple cells)."""
+        grid = self._get_foreground_tile_grid()
+        if not grid:
+            return []
+        cell = self._FG_TILE_GRID_CELL
+        min_cx = int((world_x - half_w) // cell)
+        max_cx = int((world_x + half_w) // cell)
+        min_cy = int((world_y - half_h) // cell)
+        max_cy = int((world_y + half_h) // cell)
+
+        if min_cx == max_cx and min_cy == max_cy:
+            return grid.get((min_cx, min_cy), [])
+
+        seen_ids = set()
+        result = []
+        for gx in range(min_cx, max_cx + 1):
+            for gy in range(min_cy, max_cy + 1):
+                for tile in grid.get((gx, gy), ()):
+                    tid = id(tile)
+                    if tid not in seen_ids:
+                        seen_ids.add(tid)
+                        result.append(tile)
+        return result
+
     def _draw_player_silhouette_if_occluded(self):
         """After the foreground tile layer is drawn, check whether any opaque
         foreground tile pixel — or any decoration (tree, etc.) currently
@@ -11895,7 +12259,15 @@ class Game:
         if self.active_cutscene_runtime:
             return
 
-        fg_tiles = self._get_foreground_tiles()
+        # Query the spatial grid instead of scanning every foreground tile
+        # in the room — see _get_foreground_tile_grid's docstring. Padded by
+        # one TILE_SIZE beyond the player's own half-extents so tiles whose
+        # top-left cell falls just outside the player's box, but whose full
+        # extent still reaches it, aren't missed.
+        fg_tiles = self._nearby_foreground_tiles(
+            self.player.x, self.player.y,
+            self.player.width / 2 + TILE_SIZE, self.player.height / 2 + TILE_SIZE,
+        )
 
         # Build the player's screen-space bounding rect.
         pw = int(self.player.width  * RENDER_SCALE)
@@ -11945,9 +12317,13 @@ class Game:
         # matching LayerManager's own (layer, y) compare — otherwise a tree
         # the player is standing in front of (visually correct, no occlusion
         # needed) would incorrectly ghost the player out.
-        for decoration in self.decorations:
-            if not decoration.active:
-                continue
+        #
+        # Scoped to self._visible_decorations (already active + on-screen,
+        # built once this frame by _update_decorations) instead of
+        # self.decorations — a room full of trees would otherwise mean this
+        # runs the same off-screen-heavy full-room scan a second time every
+        # single frame, right after the main draw pass already did it once.
+        for decoration in self._visible_decorations:
             if decoration.get_sort_key() < self.player.get_sort_key():
                 continue  # drawn behind the player this frame — nothing to occlude
 
@@ -12274,15 +12650,28 @@ class Game:
         self.last_time = time.time()
         try:
             while self.running:
+                _t0 = time.perf_counter()
                 self.handle_events()
+                _t1 = time.perf_counter()
                 self.update()
+                _t2 = time.perf_counter()
                 self.draw()
+                _t3 = time.perf_counter()
+
                 self.clock.tick(FPS)
+
+                self.frame_profiler.record(
+                    self.current_room.name if self.current_room else '',
+                    (_t1 - _t0) * 1000.0,
+                    (_t2 - _t1) * 1000.0,
+                    (_t3 - _t2) * 1000.0,
+                )
         except Exception:
             import traceback
             traceback.print_exc()   # print the real crash reason before exiting
             raise                   # re-raise so the OS exit code becomes 1
         finally:
+            self.frame_profiler.close()
             self.cleanup()
             pygame.quit()
             sys.exit()
