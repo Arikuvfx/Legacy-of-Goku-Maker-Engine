@@ -3167,10 +3167,8 @@ class Player:
         self._map_jump_frames      = []
         self._map_jump_frame_idx   = 0
         self._map_jump_frame_timer = 0.0
-        # Pre-scaled-frame cache for draw() — reset here since a fresh load
-        # means new source Surface objects (stale entries would point at
-        # frames that no longer match this direction/sheet).
-        self._map_jump_scaled_cache = {}
+        # (Pre-scaled-frame cache removed here — draw() no longer pre-scales,
+        # see GPU MIGRATION note at the end of this file.)
 
         try:
             sheet      = pygame.image.load(path).convert_alpha()
@@ -4278,7 +4276,12 @@ class Player:
     # =========================================================================
 
     def draw(self, screen, camera, colors):
-        """Draw the player sprite with the current hurt tint applied."""
+        """Draw the player sprite with the current hurt tint applied.
+
+        NOTE (GPU render pass): self.sprite.draw(...) at the bottom
+        delegates to core/sprite_system.py (shared by player/enemy/NPC),
+        not yet converted -- see MIGRATION note at the end of this file.
+        """
         if self.is_map_jumping and self._map_jump_frames:
             idx    = self._map_jump_frame_idx
             sx     = int(self.x * RENDER_SCALE - camera.x)
@@ -4286,22 +4289,35 @@ class Player:
             w      = int(self.width * RENDER_SCALE)
             h      = int(self._map_jump_frames[idx].get_height() * RENDER_SCALE)
 
-            # Scaling is deterministic per frame index (same source frame,
-            # same target size every time), so cache it instead of re-scaling
-            # on every single frame of the ascent. Cache is reset in
-            # start_map_jump() whenever a new jump sequence starts.
-            cache = getattr(self, '_map_jump_scaled_cache', None)
-            if cache is None:
-                cache = self._map_jump_scaled_cache = {}
-            scaled = cache.get(idx)
-            if scaled is None:
-                scaled = pygame.transform.scale(self._map_jump_frames[idx], (w, h))
-                cache[idx] = scaled
-
-            screen.blit(scaled, scaled.get_rect(center=(sx, sy)))
+            # The scaled-frame cache this used to need (_map_jump_scaled_cache)
+            # is gone: that cache existed purely to avoid re-running
+            # pygame.transform.scale -- a CPU pixel resample -- on every frame
+            # of the ascent. blit_scaled() draws the ORIGINAL, unscaled frame
+            # and lets the GPU stretch it to the dest rect as part of the
+            # copy, so there's nothing left to cache; recomputing `dest_rect`
+            # every call is just arithmetic, not a resample.
+            frame = self._map_jump_frames[idx]
+            dest_rect = frame.get_rect(center=(sx, sy))
+            dest_rect.width, dest_rect.height = w, h
+            screen.blit_scaled(frame, dest_rect)
             return
 
         tint = getattr(self, 'hurt_tint', 0.0)
         flash_white = getattr(self, 'charged_melee_flash_amount', 0.0)
         self.sprite.draw(screen, self.x, self.y, camera, scale=RENDER_SCALE,
                          hurt_tint=tint, flash_white=flash_white)
+
+
+# ── GPU MIGRATION STATUS (this file) ────────────────────────────────────────
+# Done: the map-jump ascent draw (the only place this file itself scaled and
+# blitted a frame). Deleted _map_jump_scaled_cache and its reset-on-
+# start_map_jump() wiring -- if start_map_jump() explicitly cleared that
+# cache anywhere else in this file, that clear call is now dead code and
+# can be deleted too (I don't have that method in view to confirm/remove it
+# myself -- grep this file for `_map_jump_scaled_cache` to check).
+# Not this file's problem: self.sprite.draw(...) -- core/sprite_system.py,
+# not uploaded yet. That module is the highest-value remaining target: it's
+# the shared code path for every character's on-screen body (player, every
+# enemy, every NPC), so converting it once fixes rendering cost for all of
+# them at once, unlike this file/enemy.py/npc.py which each only had one or
+# two isolated call sites.

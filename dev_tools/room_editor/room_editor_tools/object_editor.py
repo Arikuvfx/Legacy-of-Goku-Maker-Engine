@@ -720,8 +720,8 @@ class ObjectEditor:
         rect = self._panel_toggle_rect()
         bg = self.colors['panel_light'] if self._hover_panel_toggle else self.colors['panel']
         border = self.colors['accent'] if self._hover_panel_toggle else self.colors['grid']
-        pygame.draw.rect(screen, bg, rect, border_radius=6)
-        pygame.draw.rect(screen, border, rect, 1, border_radius=6)
+        screen.draw_rect( bg, rect, border_radius=6)
+        screen.draw_rect( border, rect, 1, border_radius=6)
         arrow = '◀' if self.palette_visible else '▶'
         font = self.font_small
         label = font.render(
@@ -2146,7 +2146,7 @@ class ObjectEditor:
         scaled_width = int(chest.width * RENDER_SCALE)
 
         pulse = int(20 + 10 * abs(pygame.time.get_ticks() % 1000 - 500) / 500)
-        pygame.draw.circle(screen, self.colors['success'],
+        screen.draw_circle( self.colors['success'],
                            (int(screen_x), int(screen_y)),
                            scaled_width // 2 + pulse, 3)
 
@@ -2161,7 +2161,7 @@ class ObjectEditor:
             scaled_width = int(obj.width * RENDER_SCALE)
 
             pulse = int(20 + 10 * abs(pygame.time.get_ticks() % 1000 - 500) / 500)
-            pygame.draw.circle(screen, self.colors['delete'],
+            screen.draw_circle( self.colors['delete'],
                                (int(screen_x), int(screen_y)),
                                scaled_width // 2 + pulse, 3)
 
@@ -2172,7 +2172,7 @@ class ObjectEditor:
             scaled_height = int(obj.height * RENDER_SCALE)
 
             pulse = int(3 + 2 * abs(pygame.time.get_ticks() % 1000 - 500) / 500)
-            pygame.draw.rect(screen, self.colors['delete'],
+            screen.draw_rect( self.colors['delete'],
                              (int(screen_x), int(screen_y), int(scaled_width), int(scaled_height)),
                              pulse)
 
@@ -2182,7 +2182,7 @@ class ObjectEditor:
             scaled_width = int(obj.width * RENDER_SCALE)
 
             pulse = int(20 + 10 * abs(pygame.time.get_ticks() % 1000 - 500) / 500)
-            pygame.draw.circle(screen, self.colors['delete'],
+            screen.draw_circle( self.colors['delete'],
                                (int(screen_x), int(screen_y)),
                                scaled_width // 2 + pulse, 3)
 
@@ -2196,15 +2196,15 @@ class ObjectEditor:
             scaled_width = int(obj.width * RENDER_SCALE)
 
             pulse = int(20 + 10 * abs(pygame.time.get_ticks() % 1000 - 500) / 500)
-            pygame.draw.circle(screen, self.colors['delete'],
+            screen.draw_circle( self.colors['delete'],
                                (int(screen_x), int(screen_y)),
                                scaled_width // 2 + pulse, 3)
 
         mouse_pos = pygame.mouse.get_pos()
-        pygame.draw.line(screen, self.colors['delete'],
+        screen.draw_line( self.colors['delete'],
                          (mouse_pos[0] - 10, mouse_pos[1] - 10),
                          (mouse_pos[0] + 10, mouse_pos[1] + 10), 3)
-        pygame.draw.line(screen, self.colors['delete'],
+        screen.draw_line( self.colors['delete'],
                          (mouse_pos[0] + 10, mouse_pos[1] - 10),
                          (mouse_pos[0] - 10, mouse_pos[1] + 10), 3)
 
@@ -3623,7 +3623,7 @@ class ObjectEditor:
             screen.blit(fill_surface, (int(screen_x), int(screen_y)))
 
             # Border
-            pygame.draw.rect(screen, (0, 150, 255), rect, 3)
+            screen.draw_rect( (0, 150, 255), rect, 3)
 
             # Diagonal lines pattern (like the transition object)
             line_surface = pygame.Surface((int(screen_width), int(screen_height)), pygame.SRCALPHA)
@@ -3641,10 +3641,10 @@ class ObjectEditor:
             center_x = screen_x + screen_width // 2
             center_y = screen_y + screen_height // 2
 
-            pygame.draw.line(screen, (255, 255, 0),
+            screen.draw_line( (255, 255, 0),
                              (center_x - 15, center_y),
                              (center_x + 15, center_y), 2)
-            pygame.draw.line(screen, (255, 255, 0),
+            screen.draw_line( (255, 255, 0),
                              (center_x, center_y - 15),
                              (center_x, center_y + 15), 2)
 
@@ -3807,8 +3807,8 @@ class ObjectEditor:
 
             screen.blit(preview_surf, (preview_x, preview_y))
 
-            pygame.draw.circle(screen, self.colors['accent'], (int(screen_x), int(screen_y)), 3)
-            pygame.draw.circle(screen, self.colors['text'], (int(screen_x), int(screen_y)), 1)
+            screen.draw_circle( self.colors['accent'], (int(screen_x), int(screen_y)), 3)
+            screen.draw_circle( self.colors['text'], (int(screen_x), int(screen_y)), 1)
 
     def _decoration_preview_eligible(self):
         """Whether a decoration ghost should currently be previewed for
@@ -3909,8 +3909,8 @@ class ObjectEditor:
 
         screen.blit(preview_surf, (preview_x, preview_y))
 
-        pygame.draw.circle(screen, self.colors['accent'], (int(screen_x), int(screen_y)), 3)
-        pygame.draw.circle(screen, self.colors['text'], (int(screen_x), int(screen_y)), 1)
+        screen.draw_circle( self.colors['accent'], (int(screen_x), int(screen_y)), 3)
+        screen.draw_circle( self.colors['text'], (int(screen_x), int(screen_y)), 1)
 
     def _in_view(self, world_x, world_y, camera_x, camera_y, margin=160,
                  world_w=0, world_h=0):
@@ -3961,12 +3961,18 @@ class ObjectEditor:
             draw_collision_object(screen, collision_obj, camera_x, camera_y,
                                   RENDER_SCALE, dev_mode=True, selected=False)
 
-    def draw_animated_regions(self, screen, camera_x, camera_y, show_handles=True):
+    def draw_animated_regions(self, screen, camera_x, camera_y, show_handles=True,
+                               show_fill=True):
         """Draw all water/grass regions in the current room (editor overlay only).
 
         show_handles=False keeps the region fill/border visible but hides the
         yellow corner drag handles — used while the tile editor is active,
         since those handles belong to region editing, not tile painting.
+
+        show_fill=False skips the translucent fill (border/handles still
+        draw) — pass this only when the caller guarantees an opaque draw
+        covers this same area immediately afterward (see
+        draw_animated_region's docstring for why).
         """
         if not self.current_room_name:
             return
@@ -3982,7 +3988,7 @@ class ObjectEditor:
                 continue
             draw_animated_region(screen, region, camera_x, camera_y,
                                  RENDER_SCALE, dev_mode=True, selected=False,
-                                 show_handles=show_handles)
+                                 show_handles=show_handles, show_fill=show_fill)
 
     def _make_camera(self, camera_x, camera_y):
         """Lightweight camera-like object used by draw methods that expect a .x/.y camera."""
@@ -4082,25 +4088,38 @@ class ObjectEditor:
         chest's own sprite."""
         screen_x = int(chest.x * RENDER_SCALE - camera_x)
         top_y = int((chest.y - chest.height / 2) * RENDER_SCALE - camera_y)
-        badge_size = 20
+        badge_size = 96
         badge_rect = pygame.Rect(0, 0, badge_size, badge_size)
-        badge_rect.midbottom = (screen_x, top_y - 4)
+        badge_rect.midbottom = (screen_x, top_y + 60)
 
-        pygame.draw.rect(screen, (25, 25, 40), badge_rect, border_radius=4)
-        pygame.draw.rect(screen, self.colors['accent'], badge_rect, 1, border_radius=4)
+        screen.draw_rect( (25, 25, 40), badge_rect, border_radius=4)
+        screen.draw_rect( self.colors['accent'], badge_rect, 2, border_radius=4)
 
         icon = self._get_chest_loot_icon(chest.item_id)
         if icon:
-            scale = min((badge_size - 4) / icon.get_width(), (badge_size - 4) / icon.get_height())
-            icon = pygame.transform.scale(
-                icon, (max(1, int(icon.get_width() * scale)), max(1, int(icon.get_height() * scale)))
-            )
-            screen.blit(icon, icon.get_rect(center=badge_rect.center))
+            # Cache the badge-sized icon per item_id — was being rescaled
+            # from the full-size source icon every frame for every chest
+            # with assigned loot.
+            if not hasattr(self, '_chest_badge_icon_cache'):
+                self._chest_badge_icon_cache = {}
+            badge_icon = self._chest_badge_icon_cache.get(chest.item_id)
+            if badge_icon is None:
+                scale = min((badge_size - 4) / icon.get_width(), (badge_size - 4) / icon.get_height())
+                badge_icon = pygame.transform.scale(
+                    icon, (max(1, int(icon.get_width() * scale)), max(1, int(icon.get_height() * scale)))
+                )
+                self._chest_badge_icon_cache[chest.item_id] = badge_icon
+            screen.blit(badge_icon, badge_icon.get_rect(center=badge_rect.center))
 
         if chest.item_qty > 1:
-            qty_surf = self.font_small.render(f'x{chest.item_qty}', True, self.colors['accent'])
+            if not hasattr(self, '_chest_qty_label_cache'):
+                self._chest_qty_label_cache = {}
+            qty_surf = self._chest_qty_label_cache.get(chest.item_qty)
+            if qty_surf is None:
+                qty_surf = self.font_small.render(f'x{chest.item_qty}', True, self.colors['accent'])
+                self._chest_qty_label_cache[chest.item_qty] = qty_surf
             qty_rect = qty_surf.get_rect(midtop=(badge_rect.centerx, badge_rect.bottom + 1))
-            pygame.draw.rect(screen, (25, 25, 40), qty_rect.inflate(4, 2))
+            screen.draw_rect( (25, 25, 40), qty_rect.inflate(4, 2))
             screen.blit(qty_surf, qty_rect)
 
     def draw_spawn_points(self, screen, camera_x, camera_y):
@@ -4153,7 +4172,7 @@ class ObjectEditor:
         palette_bg = pygame.Surface((self.palette_width, self.palette_height), pygame.SRCALPHA)
         palette_bg.fill(self.colors['bg_transparent'])
         screen.blit(palette_bg, (self.palette_x, self.palette_y))
-        pygame.draw.rect(screen, self.colors['accent'], palette_rect, 2)
+        screen.draw_rect( self.colors['accent'], palette_rect, 2)
 
         y_pos = self.palette_y + 10
 
@@ -4180,9 +4199,9 @@ class ObjectEditor:
                                  (0, 0, category_rect.width + 4, category_rect.height + 4), border_radius=5)
                 screen.blit(glow_surf, (category_rect.x - 2, category_rect.y - 2))
 
-            pygame.draw.rect(screen, bg_color, category_rect, border_radius=5)
+            screen.draw_rect( bg_color, category_rect, border_radius=5)
             border_color = self.colors['accent'] if is_selected else self.colors['grid']
-            pygame.draw.rect(screen, border_color, category_rect, 2, border_radius=5)
+            screen.draw_rect( border_color, category_rect, 2, border_radius=5)
 
             text_color = self.colors['text'] if is_selected else self.colors['text_dim']
             cat_text = self.font_medium.render(category, True, text_color)
@@ -4191,7 +4210,7 @@ class ObjectEditor:
 
             y_pos += 40
 
-        pygame.draw.line(screen, self.colors['accent'],
+        screen.draw_line( self.colors['accent'],
                          (self.palette_x + self.palette_padding, y_pos),
                          (self.palette_x + self.palette_width - self.palette_padding, y_pos), 1)
         y_pos += 10
@@ -4244,24 +4263,46 @@ class ObjectEditor:
                 screen.blit(glow_surf, (x - 2, y - 2))
 
         bg_color = self.colors['panel_light'] if (is_selected and not is_disabled) else self.colors['panel']
-        pygame.draw.rect(screen, bg_color, item_rect, border_radius=5)
+        screen.draw_rect( bg_color, item_rect, border_radius=5)
 
         border_color = self.colors['accent'] if (is_selected and not is_disabled) else self.colors['grid']
         border_width = 2 if is_selected else 1
-        pygame.draw.rect(screen, border_color, item_rect, border_width, border_radius=5)
+        screen.draw_rect( border_color, item_rect, border_width, border_radius=5)
 
         if obj['sprite']:
             src = obj['sprite']
-            sw, sh = src.get_size()
-            max_dim = self.item_size - 8  # 8px padding on each axis
-            scale = min(max_dim / sw, max_dim / sh)
-            scaled = pygame.transform.scale(src, (max(1, int(sw * scale)), max(1, int(sh * scale))))
-            if is_disabled:
-                scaled.fill((100, 100, 100, 150), special_flags=pygame.BLEND_RGBA_MULT)
+            # This loop runs every frame the palette is visible, over every
+            # on-screen tile — re-scaling the thumbnail and re-tinting it
+            # for disabled state here used to cost a fresh
+            # pygame.transform.scale() (and a fill() for disabled items)
+            # per item per frame regardless of whether anything changed.
+            # Cache both the plain and disabled-tinted thumbnail keyed by
+            # (sprite identity, item_size), same idea as the tile/sprite
+            # caches used elsewhere in the editor.
+            if not hasattr(self, '_palette_thumb_cache'):
+                self._palette_thumb_cache = {}
+            thumb_key = (id(src), self.item_size, is_disabled)
+            scaled = self._palette_thumb_cache.get(thumb_key)
+            if scaled is None:
+                sw, sh = src.get_size()
+                max_dim = self.item_size - 8  # 8px padding on each axis
+                scale = min(max_dim / sw, max_dim / sh)
+                scaled = pygame.transform.scale(src, (max(1, int(sw * scale)), max(1, int(sh * scale))))
+                if is_disabled:
+                    scaled.fill((100, 100, 100, 150), special_flags=pygame.BLEND_RGBA_MULT)
+                self._palette_thumb_cache[thumb_key] = scaled
             screen.blit(scaled, scaled.get_rect(center=item_rect.center))
 
+        # Name label — same reasoning: cached per (text, color) instead of
+        # re-rasterized every frame for every visible palette item.
+        if not hasattr(self, '_palette_label_cache'):
+            self._palette_label_cache = {}
         name_color = self.colors['disabled'] if is_disabled else self.colors['text_dim']
-        name_text = self.font_small.render(obj['name'], True, name_color)
+        label_key = (obj['name'], name_color)
+        name_text = self._palette_label_cache.get(label_key)
+        if name_text is None:
+            name_text = self.font_small.render(obj['name'], True, name_color)
+            self._palette_label_cache[label_key] = name_text
         name_rect = name_text.get_rect(centerx=item_rect.centerx, top=item_rect.bottom + 2)
         screen.blit(name_text, name_rect)
 
@@ -4308,8 +4349,8 @@ class ObjectEditor:
 
         # Background
         selector_rect = pygame.Rect(selector_x, selector_y, self.palette_width, selector_height)
-        pygame.draw.rect(screen, self.colors['variant_bg'], selector_rect)
-        pygame.draw.line(screen, self.colors['accent'],
+        screen.draw_rect( self.colors['variant_bg'], selector_rect)
+        screen.draw_line( self.colors['accent'],
                          (selector_x, selector_y),
                          (selector_x + self.palette_width, selector_y), 2)
         self.ui_rects['variant_selector_rect'] = selector_rect
@@ -4363,12 +4404,12 @@ class ObjectEditor:
             else:
                 bg_color = self.colors['panel']
 
-            pygame.draw.rect(screen, bg_color, variant_rect, border_radius=3)
+            screen.draw_rect( bg_color, variant_rect, border_radius=3)
 
             # Border
             border_color = self.colors['accent'] if is_selected else self.colors['grid']
             border_width = 2 if is_selected else 1
-            pygame.draw.rect(screen, border_color, variant_rect, border_width, border_radius=3)
+            screen.draw_rect( border_color, variant_rect, border_width, border_radius=3)
 
             # Sprite — scaled to fit the slot (mirrors _draw_object_item's
             # scale-to-fit, needed now that variant sprites aren't all
@@ -4408,12 +4449,12 @@ class ObjectEditor:
             left_color = self.colors['text'] if left_active else self.colors['text_dim']
             right_color = self.colors['text'] if right_active else self.colors['text_dim']
 
-            pygame.draw.polygon(screen, left_color, [
+            screen.draw_polygon( left_color, [
                 (left_rect.right - 4, arrow_y - 8),
                 (left_rect.left + 4, arrow_y),
                 (left_rect.right - 4, arrow_y + 8),
             ])
-            pygame.draw.polygon(screen, right_color, [
+            screen.draw_polygon( right_color, [
                 (right_rect.left + 4, arrow_y - 8),
                 (right_rect.right - 4, arrow_y),
                 (right_rect.left + 4, arrow_y + 8),
@@ -4577,8 +4618,8 @@ class ObjectEditor:
         panel_y = self.palette_y + self.palette_height - panel_height
 
         panel_rect = pygame.Rect(self.palette_x, panel_y, self.palette_width, panel_height)
-        pygame.draw.rect(screen, self.colors['bg'], panel_rect)
-        pygame.draw.line(screen, self.colors['accent'],
+        screen.draw_rect( self.colors['bg'], panel_rect)
+        screen.draw_line( self.colors['accent'],
                          (self.palette_x, panel_y),
                          (self.palette_x + self.palette_width, panel_y), 2)
 
@@ -4614,8 +4655,8 @@ class ObjectEditor:
 
             input_rect = pygame.Rect(input_x, input_y, input_width, input_height)
             input_bg_color = self.colors['input_active'] if self.gate_level_input_active else self.colors['input_bg']
-            pygame.draw.rect(screen, input_bg_color, input_rect)
-            pygame.draw.rect(screen, self.colors['accent'] if self.gate_level_input_active else self.colors['grid'],
+            screen.draw_rect( input_bg_color, input_rect)
+            screen.draw_rect( self.colors['accent'] if self.gate_level_input_active else self.colors['grid'],
                              input_rect, 2)
 
             display_text = self.gate_level_text if self.gate_level_input_active else str(self.gate_required_level)
@@ -4627,7 +4668,7 @@ class ObjectEditor:
                 if int(pygame.time.get_ticks() / 500) % 2 == 0:
                     cursor_x = text_rect.right + 3
                     cursor_y = input_rect.centery
-                    pygame.draw.line(screen, self.colors['text'],
+                    screen.draw_line( self.colors['text'],
                                      (cursor_x, cursor_y - 10),
                                      (cursor_x, cursor_y + 10), 2)
 
@@ -4649,18 +4690,18 @@ class ObjectEditor:
             )
 
             ay = left_rect.centery
-            pygame.draw.polygon(screen, self.colors['text'], [
+            screen.draw_polygon( self.colors['text'], [
                 (left_rect.right - 6, ay - 7),
                 (left_rect.left + 5, ay),
                 (left_rect.right - 6, ay + 7),
             ])
-            pygame.draw.polygon(screen, self.colors['text'], [
+            screen.draw_polygon( self.colors['text'], [
                 (right_rect.left + 6, ay - 7),
                 (right_rect.right - 5, ay),
                 (right_rect.left + 6, ay + 7),
             ])
-            pygame.draw.rect(screen, self.colors['grid'], left_rect, 1, border_radius=4)
-            pygame.draw.rect(screen, self.colors['grid'], right_rect, 1, border_radius=4)
+            screen.draw_rect( self.colors['grid'], left_rect, 1, border_radius=4)
+            screen.draw_rect( self.colors['grid'], right_rect, 1, border_radius=4)
 
             self.ui_rects['gate_char_arrow_left'] = left_rect
             self.ui_rects['gate_char_arrow_right'] = right_rect
@@ -4674,9 +4715,9 @@ class ObjectEditor:
             screen.blit(name_surf, name_area.topleft, name_clip)
 
             swatch_rect = pygame.Rect(right_rect.left - 18, y_pos, 14, 14)
-            pygame.draw.rect(screen, self._gate_character_color(self.gate_required_character),
+            screen.draw_rect( self._gate_character_color(self.gate_required_character),
                              swatch_rect, border_radius=3)
-            pygame.draw.rect(screen, self.colors['grid'], swatch_rect, 1, border_radius=3)
+            screen.draw_rect( self.colors['grid'], swatch_rect, 1, border_radius=3)
 
             y_pos += 30
 
@@ -4692,14 +4733,14 @@ class ObjectEditor:
             self.ui_rects['door_permanent_checkbox'] = box_rect
 
             box_bg = self.colors['success'] if self.door_permanent else self.colors['input_bg']
-            pygame.draw.rect(screen, box_bg, box_rect)
-            pygame.draw.rect(screen, self.colors['accent'] if self.door_permanent else self.colors['grid'],
+            screen.draw_rect( box_bg, box_rect)
+            screen.draw_rect( self.colors['accent'] if self.door_permanent else self.colors['grid'],
                              box_rect, 2)
 
             if self.door_permanent:
-                pygame.draw.line(screen, (255, 255, 255),
+                screen.draw_line( (255, 255, 255),
                                  (box_x + 4, box_y + 10), (box_x + 8, box_y + 15), 2)
-                pygame.draw.line(screen, (255, 255, 255),
+                screen.draw_line( (255, 255, 255),
                                  (box_x + 8, box_y + 15), (box_x + 16, box_y + 5), 2)
 
             hint = self.font_small.render("(stays open once opened)", True, self.colors['text_dim'])
@@ -4727,8 +4768,8 @@ class ObjectEditor:
 
                 is_selected = (name == self.door_sound_text)
                 bg = self.colors['variant_selected'] if is_selected else self.colors['input_bg']
-                pygame.draw.rect(screen, bg, btn_rect)
-                pygame.draw.rect(screen, self.colors['accent'] if is_selected else self.colors['grid'],
+                screen.draw_rect( bg, btn_rect)
+                screen.draw_rect( self.colors['accent'] if is_selected else self.colors['grid'],
                                  btn_rect, 2)
                 screen.blit(label_surf, label_surf.get_rect(center=btn_rect.center))
 
@@ -4743,12 +4784,12 @@ class ObjectEditor:
             preview_rect = pygame.Rect(btn_x + 6, btn_y, 78, btn_h)
             preview_hover = preview_rect.collidepoint(pygame.mouse.get_pos())
             preview_bg = self.colors['input_active'] if preview_hover else self.colors['input_bg']
-            pygame.draw.rect(screen, preview_bg, preview_rect)
-            pygame.draw.rect(screen, self.colors['accent'], preview_rect, 2)
+            screen.draw_rect( preview_bg, preview_rect)
+            screen.draw_rect( self.colors['accent'], preview_rect, 2)
 
             tri_x = preview_rect.x + 8
             tri_y = preview_rect.centery
-            pygame.draw.polygon(screen, self.colors['accent'], [
+            screen.draw_polygon( self.colors['accent'], [
                 (tri_x, tri_y - 5), (tri_x, tri_y + 5), (tri_x + 8, tri_y)
             ])
             preview_label = self.font_small.render("Preview", True, self.colors['text'])
@@ -4765,8 +4806,8 @@ class ObjectEditor:
             btn_x = self.palette_x + self.palette_padding + 120
             id_rect = pygame.Rect(btn_x, y_pos - 3, 200, 25)
             id_bg = self.colors['input_active'] if self.trigger_box_id_input_active else self.colors['input_bg']
-            pygame.draw.rect(screen, id_bg, id_rect)
-            pygame.draw.rect(screen,
+            screen.draw_rect( id_bg, id_rect)
+            screen.draw_rect(
                              self.colors['accent'] if self.trigger_box_id_input_active else self.colors['grid'],
                              id_rect, 2)
 
@@ -4786,8 +4827,8 @@ class ObjectEditor:
 
             once_rect = pygame.Rect(btn_x, y_pos - 3, 60, 22)
             once_color = self.colors['success'] if self.trigger_box_once else self.colors['panel']
-            pygame.draw.rect(screen, once_color, once_rect, border_radius=4)
-            pygame.draw.rect(screen, self.colors['accent'], once_rect, 2, border_radius=4)
+            screen.draw_rect( once_color, once_rect, border_radius=4)
+            screen.draw_rect( self.colors['accent'], once_rect, 2, border_radius=4)
             once_text = self.font_small.render('ON' if self.trigger_box_once else 'OFF', True, self.colors['text'])
             screen.blit(once_text, once_text.get_rect(center=once_rect.center))
             self.ui_rects['trigger_box_once_rect'] = once_rect
@@ -4799,8 +4840,8 @@ class ObjectEditor:
 
             key_rect = pygame.Rect(btn_x, y_pos - 3, 60, 22)
             key_color = self.colors['success'] if self.trigger_box_requires_key else self.colors['panel']
-            pygame.draw.rect(screen, key_color, key_rect, border_radius=4)
-            pygame.draw.rect(screen, self.colors['accent'], key_rect, 2, border_radius=4)
+            screen.draw_rect( key_color, key_rect, border_radius=4)
+            screen.draw_rect( self.colors['accent'], key_rect, 2, border_radius=4)
             key_text = self.font_small.render('ON' if self.trigger_box_requires_key else 'OFF', True,
                                               self.colors['text'])
             screen.blit(key_text, key_text.get_rect(center=key_rect.center))
@@ -4813,8 +4854,8 @@ class ObjectEditor:
 
             always_run_rect = pygame.Rect(btn_x, y_pos - 3, 60, 22)
             always_run_color = self.colors['success'] if self.trigger_box_always_run else self.colors['panel']
-            pygame.draw.rect(screen, always_run_color, always_run_rect, border_radius=4)
-            pygame.draw.rect(screen, self.colors['accent'], always_run_rect, 2, border_radius=4)
+            screen.draw_rect( always_run_color, always_run_rect, border_radius=4)
+            screen.draw_rect( self.colors['accent'], always_run_rect, 2, border_radius=4)
             always_run_text = self.font_small.render('ON' if self.trigger_box_always_run else 'OFF', True,
                                                       self.colors['text'])
             screen.blit(always_run_text, always_run_text.get_rect(center=always_run_rect.center))
@@ -4840,8 +4881,8 @@ class ObjectEditor:
                 btn_x = self.palette_x + self.palette_padding + 120
                 btn_rect = pygame.Rect(btn_x, y_pos - 3, 200, 25)
                 btn_bg = self.colors['input_active'] if self.world_map_dropdown_open else self.colors['input_bg']
-                pygame.draw.rect(screen, btn_bg, btn_rect)
-                pygame.draw.rect(screen,
+                screen.draw_rect( btn_bg, btn_rect)
+                screen.draw_rect(
                                  self.colors['accent'] if self.world_map_dropdown_open else self.colors['grid'],
                                  btn_rect, 2)
 
@@ -4855,7 +4896,7 @@ class ObjectEditor:
                 arrow_x = btn_rect.right - 14
                 arrow_y = btn_rect.centery
                 arrow_pts = [(arrow_x, arrow_y - 4), (arrow_x + 8, arrow_y - 4), (arrow_x + 4, arrow_y + 4)]
-                pygame.draw.polygon(screen, self.colors['text_dim'], arrow_pts)
+                screen.draw_polygon( self.colors['text_dim'], arrow_pts)
 
                 self.ui_rects['world_map_dropdown_btn'] = btn_rect
 
@@ -4869,7 +4910,7 @@ class ObjectEditor:
                     list_bg = pygame.Surface((list_rect.w, list_rect.h), pygame.SRCALPHA)
                     list_bg.fill((30, 30, 45, 240))
                     screen.blit(list_bg, list_rect.topleft)
-                    pygame.draw.rect(screen, self.colors['accent'], list_rect, 1)
+                    screen.draw_rect( self.colors['accent'], list_rect, 1)
 
                     self.ui_rects['world_map_dropdown_items'] = []
                     if not names:
@@ -4880,7 +4921,7 @@ class ObjectEditor:
                             item_rect = pygame.Rect(list_rect.x, list_rect.y + i * item_h, list_rect.w, item_h)
                             is_sel = name == self.world_map_name_text
                             if is_sel:
-                                pygame.draw.rect(screen, self.colors['variant_selected'], item_rect)
+                                screen.draw_rect( self.colors['variant_selected'], item_rect)
                             item_surf = self.font_small.render(name, True,
                                                                self.colors['text'] if is_sel else self.colors[
                                                                    'text_dim'])
@@ -4901,19 +4942,19 @@ class ObjectEditor:
             track_h = 14
             track_rect = pygame.Rect(track_x, track_y, track_w, track_h)
 
-            pygame.draw.rect(screen, self.colors['input_bg'], track_rect, border_radius=4)
+            screen.draw_rect( self.colors['input_bg'], track_rect, border_radius=4)
 
             fill_w = int(track_w * (self.region_opacity / 100))
             if fill_w > 0:
                 fill_rect = pygame.Rect(track_x, track_y, fill_w, track_h)
-                pygame.draw.rect(screen, self.colors['accent'], fill_rect, border_radius=4)
+                screen.draw_rect( self.colors['accent'], fill_rect, border_radius=4)
 
-            pygame.draw.rect(screen, self.colors['grid'], track_rect, 2, border_radius=4)
+            screen.draw_rect( self.colors['grid'], track_rect, 2, border_radius=4)
 
             handle_x = track_x + fill_w
             handle_rect = pygame.Rect(0, 0, 10, track_h + 8)
             handle_rect.center = (handle_x, track_y + track_h // 2)
-            pygame.draw.rect(screen, self.colors['text'], handle_rect, border_radius=3)
+            screen.draw_rect( self.colors['text'], handle_rect, border_radius=3)
 
             self.ui_rects['region_opacity_slider'] = track_rect
 
@@ -4935,19 +4976,19 @@ class ObjectEditor:
                 wtrack_h = 14
                 wtrack_rect = pygame.Rect(wtrack_x, wtrack_y, wtrack_w, wtrack_h)
 
-                pygame.draw.rect(screen, self.colors['input_bg'], wtrack_rect, border_radius=4)
+                screen.draw_rect( self.colors['input_bg'], wtrack_rect, border_radius=4)
 
                 wfill_w = int(wtrack_w * (self.region_wave_amount / 100))
                 if wfill_w > 0:
                     wfill_rect = pygame.Rect(wtrack_x, wtrack_y, wfill_w, wtrack_h)
-                    pygame.draw.rect(screen, self.colors['accent'], wfill_rect, border_radius=4)
+                    screen.draw_rect( self.colors['accent'], wfill_rect, border_radius=4)
 
-                pygame.draw.rect(screen, self.colors['grid'], wtrack_rect, 2, border_radius=4)
+                screen.draw_rect( self.colors['grid'], wtrack_rect, 2, border_radius=4)
 
                 whandle_x = wtrack_x + wfill_w
                 whandle_rect = pygame.Rect(0, 0, 10, wtrack_h + 8)
                 whandle_rect.center = (whandle_x, wtrack_y + wtrack_h // 2)
-                pygame.draw.rect(screen, self.colors['text'], whandle_rect, border_radius=3)
+                screen.draw_rect( self.colors['text'], whandle_rect, border_radius=3)
 
                 self.ui_rects['region_wave_slider'] = wtrack_rect
 
@@ -4963,8 +5004,8 @@ class ObjectEditor:
                 seed_input_rect = pygame.Rect(seed_input_x, seed_input_y, 80, 25)
                 seed_bg_color = self.colors['input_active'] if self.region_seed_input_active else self.colors[
                     'input_bg']
-                pygame.draw.rect(screen, seed_bg_color, seed_input_rect)
-                pygame.draw.rect(screen,
+                screen.draw_rect( seed_bg_color, seed_input_rect)
+                screen.draw_rect(
                                  self.colors['accent'] if self.region_seed_input_active else self.colors['grid'],
                                  seed_input_rect, 2)
 
@@ -4976,8 +5017,8 @@ class ObjectEditor:
                 self.ui_rects['region_seed_input'] = seed_input_rect
 
                 reroll_rect = pygame.Rect(seed_input_rect.right + 8, seed_input_y, 60, 25)
-                pygame.draw.rect(screen, self.colors['panel_light'], reroll_rect, border_radius=4)
-                pygame.draw.rect(screen, self.colors['accent'], reroll_rect, 2, border_radius=4)
+                screen.draw_rect( self.colors['panel_light'], reroll_rect, border_radius=4)
+                screen.draw_rect( self.colors['accent'], reroll_rect, 2, border_radius=4)
                 reroll_text = self.font_small.render("Reroll", True, self.colors['text'])
                 screen.blit(reroll_text, reroll_text.get_rect(center=reroll_rect.center))
                 self.ui_rects['region_seed_reroll'] = reroll_rect
@@ -5018,8 +5059,8 @@ class ObjectEditor:
                     btn_rect = pygame.Rect(btn_x, y_pos, btn_w, btn_h)
                     selected = (self.region_variant == i)
                     bg_color = self.colors['variant_selected'] if selected else self.colors['panel_light']
-                    pygame.draw.rect(screen, bg_color, btn_rect, border_radius=4)
-                    pygame.draw.rect(screen, self.colors['accent'], btn_rect,
+                    screen.draw_rect( bg_color, btn_rect, border_radius=4)
+                    screen.draw_rect( self.colors['accent'], btn_rect,
                                      3 if selected else 2, border_radius=4)
 
                     sprite = variant_sprites[i] if i < len(variant_sprites) else None
@@ -5062,12 +5103,12 @@ class ObjectEditor:
                 screen.blit(color_label, (self.palette_x + self.palette_padding, y_pos))
 
                 swatch_rect = pygame.Rect(self.palette_x + self.palette_padding + 120, y_pos - 2, 30, 18)
-                pygame.draw.rect(screen, self.region_color, swatch_rect)
-                pygame.draw.rect(screen, self.colors['grid'], swatch_rect, 2)
+                screen.draw_rect( self.region_color, swatch_rect)
+                screen.draw_rect( self.colors['grid'], swatch_rect, 2)
 
                 reset_rect = pygame.Rect(swatch_rect.right + 8, y_pos - 2, 60, 18)
-                pygame.draw.rect(screen, self.colors['panel_light'], reset_rect, border_radius=4)
-                pygame.draw.rect(screen, self.colors['accent'], reset_rect, 2, border_radius=4)
+                screen.draw_rect( self.colors['panel_light'], reset_rect, border_radius=4)
+                screen.draw_rect( self.colors['accent'], reset_rect, 2, border_radius=4)
                 reset_text = self.font_small.render("Reset", True, self.colors['text'])
                 screen.blit(reset_text, reset_text.get_rect(center=reset_rect.center))
                 self.ui_rects['region_color_reset'] = reset_rect
@@ -5092,7 +5133,7 @@ class ObjectEditor:
                     bar_rect = pygame.Rect(bar_x, y_pos, bar_w, row_h)
                     grad_surf = self._get_channel_gradient_surface(idx, bar_w, row_h)
                     screen.blit(grad_surf, bar_rect.topleft)
-                    pygame.draw.rect(screen, self.colors['grid'], bar_rect, 1)
+                    screen.draw_rect( self.colors['grid'], bar_rect, 1)
 
                     label_surf = self.font_small.render(label_text + ":", True, self.colors['text'])
                     screen.blit(label_surf, (bar_rect.left - label_w,
@@ -5101,14 +5142,14 @@ class ObjectEditor:
                     val = self.region_color[idx]
                     marker_x = bar_rect.left + int((val / 255) * bar_rect.width)
                     marker_rect = pygame.Rect(marker_x - 2, bar_rect.top - 2, 4, bar_rect.height + 4)
-                    pygame.draw.rect(screen, (255, 255, 255), marker_rect, 1)
-                    pygame.draw.rect(screen, (0, 0, 0), marker_rect, 1)
+                    screen.draw_rect( (255, 255, 255), marker_rect, 1)
+                    screen.draw_rect( (0, 0, 0), marker_rect, 1)
                     self.ui_rects[f'region_{key}_bar'] = bar_rect
 
                     spin_rect = pygame.Rect(bar_rect.right + bar_gap, y_pos, spin_text_w, row_h)
-                    pygame.draw.rect(screen, self.colors['panel_light'], spin_rect)
+                    screen.draw_rect( self.colors['panel_light'], spin_rect)
                     border_col = self.colors['accent'] if self.region_channel_input_active == key else self.colors['grid']
-                    pygame.draw.rect(screen, border_col, spin_rect, 1)
+                    screen.draw_rect( border_col, spin_rect, 1)
                     val_text = self.region_channel_text if self.region_channel_input_active == key else str(val)
                     val_surf = self.font_small.render(val_text, True, self.colors['text'])
                     screen.blit(val_surf, val_surf.get_rect(center=spin_rect.center))
@@ -5117,18 +5158,18 @@ class ObjectEditor:
                     arrow_up_rect = pygame.Rect(spin_rect.right, y_pos, spin_arrow_w, row_h // 2)
                     arrow_down_rect = pygame.Rect(spin_rect.right, y_pos + row_h // 2,
                                                    spin_arrow_w, row_h - row_h // 2)
-                    pygame.draw.rect(screen, self.colors['panel_light'], arrow_up_rect)
-                    pygame.draw.rect(screen, self.colors['panel_light'], arrow_down_rect)
-                    pygame.draw.rect(screen, self.colors['grid'], arrow_up_rect, 1)
-                    pygame.draw.rect(screen, self.colors['grid'], arrow_down_rect, 1)
+                    screen.draw_rect( self.colors['panel_light'], arrow_up_rect)
+                    screen.draw_rect( self.colors['panel_light'], arrow_down_rect)
+                    screen.draw_rect( self.colors['grid'], arrow_up_rect, 1)
+                    screen.draw_rect( self.colors['grid'], arrow_down_rect, 1)
                     up_pts = [(arrow_up_rect.centerx, arrow_up_rect.top + 3),
                               (arrow_up_rect.left + 3, arrow_up_rect.bottom - 2),
                               (arrow_up_rect.right - 3, arrow_up_rect.bottom - 2)]
                     down_pts = [(arrow_down_rect.centerx, arrow_down_rect.bottom - 3),
                                 (arrow_down_rect.left + 3, arrow_down_rect.top + 2),
                                 (arrow_down_rect.right - 3, arrow_down_rect.top + 2)]
-                    pygame.draw.polygon(screen, self.colors['text'], up_pts)
-                    pygame.draw.polygon(screen, self.colors['text'], down_pts)
+                    screen.draw_polygon( self.colors['text'], up_pts)
+                    screen.draw_polygon( self.colors['text'], down_pts)
                     self.ui_rects[f'region_{key}_spin_up'] = arrow_up_rect
                     self.ui_rects[f'region_{key}_spin_down'] = arrow_down_rect
 
@@ -5143,9 +5184,9 @@ class ObjectEditor:
                 hex_rect = pygame.Rect(hex_field_x, y_pos,
                                         self.palette_x + self.palette_width - self.palette_padding - hex_field_x,
                                         row_h)
-                pygame.draw.rect(screen, self.colors['panel_light'], hex_rect)
+                screen.draw_rect( self.colors['panel_light'], hex_rect)
                 hex_border_col = self.colors['accent'] if self.region_hex_input_active else self.colors['grid']
-                pygame.draw.rect(screen, hex_border_col, hex_rect, 2 if self.region_hex_input_active else 1)
+                screen.draw_rect( hex_border_col, hex_rect, 2 if self.region_hex_input_active else 1)
                 hex_surf = self.font_small.render("#" + self.region_hex_text, True, self.colors['text'])
                 screen.blit(hex_surf, (hex_rect.left + 6, hex_rect.centery - hex_surf.get_height() // 2))
                 self.ui_rects['region_hex_input'] = hex_rect

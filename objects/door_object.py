@@ -82,6 +82,14 @@ class Door:
         if self.open_sprite.get_size() != (self.width, self.height):
             self.open_sprite = pygame.transform.scale(self.open_sprite, (self.width, self.height))
 
+        # RENDER_SCALE-scaled copies of closed_sprite/open_sprite, built
+        # lazily on first draw and cached from then on — draw() used to
+        # rescale the world-unit sprite up to screen size fresh every
+        # frame, on top of the one-time world-unit scaling done above.
+        self._render_scaled_closed = None
+        self._render_scaled_open = None
+        self._render_scaled_at = None
+
     def _load_sprites(self, width=None, height=None):
         """Load this door's sheet and split it into closed/open frames.
         Layout is fixed: one image, two frames side by side — left half
@@ -207,7 +215,13 @@ class Door:
         screen_y = (rect.y * RENDER_SCALE) - camera.y
         scaled_w = int(self.width * RENDER_SCALE)
         scaled_h = int(self.height * RENDER_SCALE)
-        scaled = pygame.transform.scale(sprite, (scaled_w, scaled_h))
+
+        if self._render_scaled_at != RENDER_SCALE:
+            self._render_scaled_closed = pygame.transform.scale(self.closed_sprite, (scaled_w, scaled_h))
+            self._render_scaled_open = pygame.transform.scale(self.open_sprite, (scaled_w, scaled_h))
+            self._render_scaled_at = RENDER_SCALE
+
+        scaled = self._render_scaled_open if self.is_open else self._render_scaled_closed
         screen.blit(scaled, (int(screen_x), int(screen_y)))
 
     def to_dict(self):

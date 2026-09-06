@@ -288,13 +288,6 @@ class AnimatedSprite:
         self.offset_x = sprite_width // 2
         self.offset_y = sprite_height // 2
 
-        # Draw-time render cache — see _ensure_render_cache(). Built lazily so
-        # that sprites created via AnimatedSprite.__new__() (the enemy/NPC/boss
-        # loaders below) don't need to remember to set this up too.
-        self._scaled_frame_cache = {}
-        self._scaled_width = int(sprite_width * RENDER_SCALE)
-        self._scaled_height = int(sprite_height * RENDER_SCALE)
-
     @classmethod
     def _create_bare(cls, character_name, costume_name, sprite_width, sprite_height, base_path):
         """Build an AnimatedSprite that points at a custom base_path, without going
@@ -320,9 +313,6 @@ class AnimatedSprite:
         sprite.current_variant_index = 0
         sprite.offset_x = sprite_width // 2
         sprite.offset_y = sprite_height // 2
-        sprite._scaled_frame_cache = {}
-        sprite._scaled_width = int(sprite_width * RENDER_SCALE)
-        sprite._scaled_height = int(sprite_height * RENDER_SCALE)
         return sprite
 
     def load_animation(self, animation_name, direction, frame_duration=0.1, loop=True, num_variants=1,
@@ -598,25 +588,30 @@ class AnimatedSprite:
         else:
             anim.update(dt)
 
-    def _get_scaled_frame(self, frame):
-        """Return `frame` scaled to on-screen size, reusing a cached copy when possible.
+    def _dst_rect(self, x, y, camera):
+        """World position -> the on-screen pygame.Rect for this sprite's
+        native (sprite_width, sprite_height) footprint, centered on
+        (x, y) the same way this sprite has always centered its draw.
 
-        This is the main perf fix in this file: draw() used to call
-        pygame.transform.scale() on every single call, for every sprite, every
-        frame — but an animation frame is a fixed Surface that only actually
-        changes when the animation advances to its next frame (a handful of
-        times a second, not 60 times a second). Scaling is one of the more
-        expensive things pygame does per-sprite, so caching the scaled result
-        keyed by the frame it came from turns "rescale N sprites every tick"
-        into "rescale a frame only the first time it's shown."
+        offset_x/offset_y (sprite_width//2, sprite_height//2, in *world*
+        units, unscaled) get subtracted from x/y before handing off to
+        camera.apply_rect(), so the rect that comes back is already the
+        top-left corner of a *centered* sprite -- apply_rect() itself
+        just maps whatever world position it's given straight to the
+        dst_rect's top-left corner, with no centering of its own.
+
+        Falls back to plain RENDER_SCALE (no zoom, no camera-relative
+        offset) when no camera is given, matching draw()'s old no-camera
+        behavior.
         """
-        cached = self._scaled_frame_cache.get(id(frame))
-        if cached is not None:
-            return cached
-
-        scaled = pygame.transform.scale(frame, (self._scaled_width, self._scaled_height))
-        self._scaled_frame_cache[id(frame)] = scaled
-        return scaled
+        if camera:
+            return camera.apply_rect(x - self.offset_x, y - self.offset_y,
+                                     self.sprite_width, self.sprite_height)
+        scaled_w = self.sprite_width * RENDER_SCALE
+        scaled_h = self.sprite_height * RENDER_SCALE
+        screen_x = x * RENDER_SCALE - scaled_w / 2
+        screen_y = y * RENDER_SCALE - scaled_h / 2
+        return pygame.Rect(round(screen_x), round(screen_y), round(scaled_w), round(scaled_h))
 
     def draw(self, screen, x, y, camera=None, scale=1.0, hurt_tint=0.0, flash_white=0.0):
         """Draw the current frame at world position (x, y).
@@ -632,31 +627,29 @@ class AnimatedSprite:
         excludes the other).
 
         Note: `scale` is accepted for backwards compatibility but isn't used —
-        on-screen size is driven entirely by RENDER_SCALE plus this sprite's
-        own sprite_width/sprite_height.
+        on-screen size is driven entirely by RENDER_SCALE (and, via
+        camera.apply_rect(), camera.zoom) plus this sprite's own
+        sprite_width/sprite_height.
+
+        GPU RENDERING: this used to pre-scale each frame once with
+        pygame.transform.scale() and cache the result (see git history --
+        _get_scaled_frame/_scaled_frame_cache, now removed), which was fast
+        but baked in a fixed RENDER_SCALE with no zoom -- this sprite never
+        actually responded to camera.zoom before. Now the RAW, native-size
+        frame is blitted straight through screen.blit_scaled(), which hands
+        the frame + a dst_rect to SDL and lets the GPU do the resize as part
+        of the draw. That's strictly less work than the old cache on the
+        common path (no transform.scale() call ever, not even once per
+        frame) and it's zoom-aware for free, since camera.apply_rect() folds
+        camera.zoom into the dst_rect it computes.
         """
-        # Sprites created before this cache existed (or via a stale pickle/save)
-        # won't have these attributes; build them on first use rather than
-        # requiring every construction path to remember to do it.
-        if not hasattr(self, '_scaled_frame_cache'):
-            self._scaled_frame_cache = {}
-            self._scaled_width = int(self.sprite_width * RENDER_SCALE)
-            self._scaled_height = int(self.sprite_height * RENDER_SCALE)
-
         if not self.current_animation or self.current_animation not in self.animations:
-            # Draw placeholder if no animation
-            if camera:
-                screen_x = (x * RENDER_SCALE) - camera.x
-                screen_y = (y * RENDER_SCALE) - camera.y
-            else:
-                screen_x = x * RENDER_SCALE
-                screen_y = y * RENDER_SCALE
-
-            pygame.draw.rect(screen, (255, 0, 255),
-                             (screen_x - self.offset_x * RENDER_SCALE,
-                              screen_y - self.offset_y * RENDER_SCALE,
-                              self.sprite_width * RENDER_SCALE,
-                              self.sprite_height * RENDER_SCALE))
+            # Draw placeholder if no animation. Same apply_rect()-or-fallback
+            # split as the real-frame path below, just producing a filled
+            # rect instead of a textured blit -- see screen.draw_rect() in
+            # gpu_renderer.GPUScreen.
+            dst_rect = self._dst_rect(x, y, camera)
+            screen.draw_rect((255, 0, 255), dst_rect)
             return
 
         anim = self.animations[self.current_animation]
@@ -672,23 +665,17 @@ class AnimatedSprite:
             frame = anim.get_current_frame()
 
         if frame:
-            # Convert WORLD coordinates to SCREEN coordinates
-            # Formula: (world_pos * scale) - camera_screen_pos
-            # This matches how spawn objects are drawn in game.py
-            if camera:
-                screen_x = (x * RENDER_SCALE) - camera.x
-                screen_y = (y * RENDER_SCALE) - camera.y
-            else:
-                screen_x = x * RENDER_SCALE
-                screen_y = y * RENDER_SCALE
-
-            frame = self._get_scaled_frame(frame)
+            dst_rect = self._dst_rect(x, y, camera)
 
             # Hurt tint / charged-melee glow: add colour to each pixel's RGB,
             # alpha untouched → no square artifact. Only copy when actually
-            # active, so the common case (neither active) just blits the
-            # cached scaled surface directly with no copy at all.
-            if hurt_tint > 0 or flash_white > 0:
+            # active, so the common case (neither active) blits the shared,
+            # cached-by-GPUScreen frame texture directly -- no per-call
+            # Surface copy, no per-call transform.scale (that's gone now,
+            # see draw()'s docstring), nothing but a texture lookup + one
+            # GPU-scaled draw.
+            tinted = hurt_tint > 0 or flash_white > 0
+            if tinted:
                 frame = frame.copy()
                 if hurt_tint > 0:
                     red_amount = int(hurt_tint * 180)
@@ -704,11 +691,17 @@ class AnimatedSprite:
                     white_amount = int(min(1.0, flash_white) * 0.65 * 255)
                     frame.fill((white_amount, white_amount, white_amount), special_flags=pygame.BLEND_RGB_ADD)
 
-            offset_x = self._scaled_width // 2
-            offset_y = self._scaled_height // 2
-
-            # Draw sprite centered on position
-            screen.blit(frame, (screen_x - offset_x, screen_y - offset_y))
+            if tinted:
+                # This copy is genuinely new pixels every call it's active --
+                # caching it by id() the way blit()/blit_scaled() do would
+                # mean a fresh, never-reused cache entry piling up forever
+                # (the exact leak blit_transient's docstring warns about).
+                # blit_transient still needs the zoomed dst_rect, not native
+                # size, so a tinted sprite doesn't snap to unscaled res the
+                # instant it's hurt-flashing.
+                screen.blit_transient(frame, dst_rect)
+            else:
+                screen.blit_scaled(frame, dst_rect)
 
     def release_hold(self, animation_name, direction):
         """Let a held animation (see Animation.hold_frames) continue past its

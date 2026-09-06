@@ -5,6 +5,84 @@ from typing import List
 _DIM_FONT = None  # lazily created on first draw; avoids re-loading a font every wall/frame
 
 
+def beam_block_distance_for_rect(blocking_rect: pygame.Rect, attack):
+    """Return the distance (SCREEN-space pixels — see below — measured
+    from the beam's origin at (attack.x, attack.y) along its own
+    direction) at which `attack` (a BeamAttack) should stop growing
+    because `blocking_rect` (WORLD-space, same convention as the player
+    and enemies) is in its path — or None if it isn't in the beam's way
+    at all this frame. Mirrors the beam-rect construction used for
+    beam-vs-enemy hit-testing in Enemy.check_collision_with_attack, so a
+    beam stops at whichever of a wall/decoration/enemy it reaches first.
+
+    Shared by CollisionObject.get_beam_block_distance and any other
+    object type (e.g. Decoration) that wants to block beams using its own
+    rect — the geometry below doesn't care what kind of object owns the
+    rect, only where the rect is.
+    """
+    # attack.width is screen-space, so it needs converting down to world
+    # space to compare against blocking_rect.
+    world_width = attack.width / attack.scale
+
+    # This rect exists only to answer "is blocking_rect somewhere along
+    # the beam's travel line at all" (right axis, right side, laterally
+    # overlapping the corridor) — NOT "has the beam already visually
+    # grown as far as blocking_rect". It used to be sized off
+    # attack.length/attack.scale, i.e. the beam's CURRENT reach, but
+    # attack.length isn't actually how far the beam's tip is drawn on
+    # screen: the real tip sits at attack.get_tip_world_length(), which
+    # adds BeamAttack._min_reach() on top of attack.length (begin-sprite
+    # footprint, tip-sprite footprint, and — for beams like
+    # BigBangKamehamehaAttack that set ball_gap/circle_gap/beam_gap —
+    # a further fixed offset that can be quite large). Sizing this rect
+    # off attack.length alone meant the obstruction only started
+    # registering as "in reach" once attack.length itself had grown that
+    # far, while the beam's actual rendered tip — already ahead of
+    # attack.length by the full _min_reach() amount — had by then already
+    # visually grown through the near edge and, for beams with a large
+    # _min_reach() like Big Bang Kamehameha, sometimes all the way to
+    # (or past) the far edge before any obstruction was ever reported and
+    # growth got capped. An obstruction's position along the beam's path
+    # doesn't depend on how far the beam has grown so far, so this uses
+    # a generously large fixed reach instead, to always catch it.
+    reach = 100000
+
+    if attack.direction == 'up':
+        beam_rect = pygame.Rect(attack.x - world_width // 2, attack.y - reach,
+                                 world_width, reach)
+    elif attack.direction == 'down':
+        beam_rect = pygame.Rect(attack.x - world_width // 2, attack.y,
+                                 world_width, reach)
+    elif attack.direction == 'left':
+        beam_rect = pygame.Rect(attack.x - reach, attack.y - world_width // 2,
+                                 reach, world_width)
+    elif attack.direction == 'right':
+        beam_rect = pygame.Rect(attack.x, attack.y - world_width // 2,
+                                 reach, world_width)
+    else:
+        return None
+
+    if not beam_rect.colliderect(blocking_rect):
+        return None
+
+    if attack.direction == 'up':
+        world_distance = attack.y - blocking_rect.bottom
+    elif attack.direction == 'down':
+        world_distance = blocking_rect.top - attack.y
+    elif attack.direction == 'left':
+        world_distance = attack.x - blocking_rect.right
+    elif attack.direction == 'right':
+        world_distance = blocking_rect.left - attack.x
+    else:
+        return None
+
+    # report_obstruction (and attack.length/max_length) live in
+    # screen-space, so scale this world-space distance back up before
+    # handing it back — otherwise the beam freezes attack.scale times
+    # short of where blocking_rect actually is.
+    return max(0, world_distance) * attack.scale
+
+
 class CollisionObject:
     """Invisible wall placed in the editor to block player movement."""
 
@@ -30,81 +108,15 @@ class CollisionObject:
         return self.get_rect()
 
     def get_beam_block_distance(self, attack):
-        """Return the distance (SCREEN-space pixels — see below — measured
-        from the beam's origin at (attack.x, attack.y) along its own
-        direction) at which `attack` (a BeamAttack) should stop growing
-        because this wall is in its path — or None if this wall isn't in
-        the beam's way at all this frame. Mirrors the beam-rect
-        construction used for beam-vs-enemy hit-testing in
-        Enemy.check_collision_with_attack, so a beam stops at whichever of
-        a wall or an enemy it reaches first.
+        """Return the distance (SCREEN-space pixels — see
+        beam_block_distance_for_rect's docstring below) at which `attack`
+        (a BeamAttack) should stop growing because this wall is in its
+        path — or None if this wall isn't in the beam's way at all this
+        frame.
         """
         if not self.active:
             return None
-
-        # self.x/y/width/height here (and this beam rect) are WORLD-space,
-        # same convention as the player and enemies, so attack.width needs
-        # converting down from screen-space to match.
-        world_width = attack.width / attack.scale
-
-        # This rect exists only to answer "is this wall somewhere along the
-        # beam's travel line at all" (right axis, right side, laterally
-        # overlapping the corridor) — NOT "has the beam already visually
-        # grown as far as this wall". It used to be sized off
-        # attack.length/attack.scale, i.e. the beam's CURRENT reach, but
-        # attack.length isn't actually how far the beam's tip is drawn on
-        # screen: the real tip sits at attack.get_tip_world_length(), which
-        # adds BeamAttack._min_reach() on top of attack.length (begin-sprite
-        # footprint, tip-sprite footprint, and — for beams like
-        # BigBangKamehamehaAttack that set ball_gap/circle_gap/beam_gap —
-        # a further fixed offset that can be quite large). Sizing this rect
-        # off attack.length alone meant the wall only started registering
-        # as "in reach" once attack.length itself had grown that far, while
-        # the beam's actual rendered tip — already ahead of attack.length by
-        # the full _min_reach() amount — had by then already visually grown
-        # through the wall's near edge and, for beams with a large
-        # _min_reach() like Big Bang Kamehameha, sometimes all the way to
-        # (or past) its far edge before any obstruction was ever reported
-        # and growth got capped. A wall's position along the beam's path
-        # doesn't depend on how far the beam has grown so far, so this uses
-        # a generously large fixed reach instead, to always catch it.
-        reach = 100000
-
-        if attack.direction == 'up':
-            beam_rect = pygame.Rect(attack.x - world_width // 2, attack.y - reach,
-                                     world_width, reach)
-        elif attack.direction == 'down':
-            beam_rect = pygame.Rect(attack.x - world_width // 2, attack.y,
-                                     world_width, reach)
-        elif attack.direction == 'left':
-            beam_rect = pygame.Rect(attack.x - reach, attack.y - world_width // 2,
-                                     reach, world_width)
-        elif attack.direction == 'right':
-            beam_rect = pygame.Rect(attack.x, attack.y - world_width // 2,
-                                     reach, world_width)
-        else:
-            return None
-
-        wall_rect = self.get_rect()
-        if not beam_rect.colliderect(wall_rect):
-            return None
-
-        if attack.direction == 'up':
-            world_distance = attack.y - wall_rect.bottom
-        elif attack.direction == 'down':
-            world_distance = wall_rect.top - attack.y
-        elif attack.direction == 'left':
-            world_distance = attack.x - wall_rect.right
-        elif attack.direction == 'right':
-            world_distance = wall_rect.left - attack.x
-        else:
-            return None
-
-        # report_obstruction (and attack.length/max_length) live in
-        # screen-space, so scale this world-space distance back up before
-        # handing it back — otherwise the beam freezes attack.scale times
-        # short of where the wall actually is.
-        return max(0, world_distance) * attack.scale
+        return beam_block_distance_for_rect(self.get_rect(), attack)
 
     def to_dict(self):
         return {
@@ -216,7 +228,7 @@ def draw_collision_object(screen, collision_obj: CollisionObject, camera_x: int,
 
     border_color = (255, 165, 0) if selected else (255, 0, 0)
     border_width = 3 if selected else 2
-    pygame.draw.rect(screen, border_color, rect, border_width)
+    screen.draw_rect(border_color, rect, border_width)
 
     screen.blit(line_surf, (int(sx), int(sy)))
 
@@ -232,8 +244,8 @@ def draw_collision_object(screen, collision_obj: CollisionObject, camera_x: int,
     for cx, cy in corners:
         hx = int(cx - handle // 2)
         hy = int(cy - handle // 2)
-        pygame.draw.rect(screen, handle_color, (hx, hy, int(handle), int(handle)))
-        pygame.draw.rect(screen, (0, 0, 0),    (hx, hy, int(handle), int(handle)), 1)
+        screen.draw_rect(handle_color, (hx, hy, int(handle), int(handle)))
+        screen.draw_rect((0, 0, 0),    (hx, hy, int(handle), int(handle)), 1)
 
     # Dimension label — skip if the box is too small to fit text
     if sw > 50 and sh > 30 and label_bundle is not None:

@@ -1,6 +1,19 @@
 import pygame
 from typing import Optional, Tuple, List
 
+# Dev-mode overlay fonts for RoomTransition.draw() — cached by size so a
+# room full of transitions doesn't re-parse the font file every frame for
+# every transition (same fix as flying_pad.py/nimbus_cloud.py).
+_FONT_CACHE = {}
+
+
+def _get_font(size):
+    font = _FONT_CACHE.get(size)
+    if font is None:
+        font = pygame.font.Font(None, size)
+        _FONT_CACHE[size] = font
+    return font
+
 
 class RoomTransition:
     """Portal object that triggers transitions between rooms"""
@@ -102,7 +115,7 @@ class RoomTransition:
         # Draw border
         border_color = (0, 150, 255) if not selected else (100, 200, 255)
         border_width = 2 if not selected else 3
-        pygame.draw.rect(screen, border_color, rect, border_width)
+        screen.draw_rect(border_color, rect, border_width)
 
         # Draw diagonal lines pattern
         line_color = (0, 120, 200, 100) if not selected else (80, 180, 255, 150)
@@ -131,11 +144,11 @@ class RoomTransition:
         ]
 
         for corner_x, corner_y in corners:
-            pygame.draw.rect(screen, handle_color,
+            screen.draw_rect(handle_color,
                              (int(corner_x - handle_size // 2),
                               int(corner_y - handle_size // 2),
                               int(handle_size), int(handle_size)))
-            pygame.draw.rect(screen, (0, 0, 0),
+            screen.draw_rect((0, 0, 0),
                              (int(corner_x - handle_size // 2),
                               int(corner_y - handle_size // 2),
                               int(handle_size), int(handle_size)), 1)
@@ -152,49 +165,49 @@ class RoomTransition:
                 if radius > 0:
                     alpha = 40 - i * 5
                     color = (100, 200, 255, alpha)
-                    pygame.draw.circle(screen, color, (int(center_x), int(center_y)), radius)
+                    screen.draw_circle(color, (int(center_x), int(center_y)), radius)
 
             # Inner portal
             inner_radius = min(int(screen_width // 6), int(screen_height // 6))
             if inner_radius > 0:
-                pygame.draw.circle(screen, (150, 220, 255, 180), (int(center_x), int(center_y)), inner_radius)
+                screen.draw_circle((150, 220, 255, 180), (int(center_x), int(center_y)), inner_radius)
 
         # Draw direction arrow
         arrow_length = 15 * render_scale
         arrow_color = (255, 255, 0)
 
         if self.exit_direction == 'up':
-            pygame.draw.line(screen, arrow_color,
+            screen.draw_line(arrow_color,
                              (center_x, center_y),
                              (center_x, center_y - arrow_length), 3)
-            pygame.draw.polygon(screen, arrow_color, [
+            screen.draw_polygon(arrow_color, [
                 (center_x, center_y - arrow_length),
                 (center_x - 5 * render_scale, center_y - arrow_length + 10 * render_scale),
                 (center_x + 5 * render_scale, center_y - arrow_length + 10 * render_scale)
             ])
         elif self.exit_direction == 'down':
-            pygame.draw.line(screen, arrow_color,
+            screen.draw_line(arrow_color,
                              (center_x, center_y),
                              (center_x, center_y + arrow_length), 3)
-            pygame.draw.polygon(screen, arrow_color, [
+            screen.draw_polygon(arrow_color, [
                 (center_x, center_y + arrow_length),
                 (center_x - 5 * render_scale, center_y + arrow_length - 10 * render_scale),
                 (center_x + 5 * render_scale, center_y + arrow_length - 10 * render_scale)
             ])
         elif self.exit_direction == 'left':
-            pygame.draw.line(screen, arrow_color,
+            screen.draw_line(arrow_color,
                              (center_x, center_y),
                              (center_x - arrow_length, center_y), 3)
-            pygame.draw.polygon(screen, arrow_color, [
+            screen.draw_polygon(arrow_color, [
                 (center_x - arrow_length, center_y),
                 (center_x - arrow_length + 10 * render_scale, center_y - 5 * render_scale),
                 (center_x - arrow_length + 10 * render_scale, center_y + 5 * render_scale)
             ])
         elif self.exit_direction == 'right':
-            pygame.draw.line(screen, arrow_color,
+            screen.draw_line(arrow_color,
                              (center_x, center_y),
                              (center_x + arrow_length, center_y), 3)
-            pygame.draw.polygon(screen, arrow_color, [
+            screen.draw_polygon(arrow_color, [
                 (center_x + arrow_length, center_y),
                 (center_x + arrow_length - 10 * render_scale, center_y - 5 * render_scale),
                 (center_x + arrow_length - 10 * render_scale, center_y + 5 * render_scale)
@@ -202,7 +215,7 @@ class RoomTransition:
 
         # Draw dimensions text if object is large enough
         if screen_width > 50 and screen_height > 30:
-            font = pygame.font.Font(None, 18)
+            font = _get_font(18)
             dims_text = f"{self.width} x {self.height}"
             text_surface = font.render(dims_text, True, (255, 255, 255))
             text_rect = text_surface.get_rect(center=(center_x, center_y + 20))
@@ -217,7 +230,7 @@ class RoomTransition:
 
         # Draw target room name if set
         if self.target_room and screen_width > 60:
-            font = pygame.font.Font(None, int(16 * render_scale))
+            font = _get_font(int(16 * render_scale))
             text = font.render(f"→ {self.target_room}", True, (255, 255, 255))
             text_rect = text.get_rect(
                 centerx=center_x,
@@ -685,17 +698,3 @@ class TransitionConfigDialog:
 
         # Cancel button
         cancel_x = dialog_width - button_width - 50
-        cancel_rect = pygame.Rect(cancel_x, button_y, button_width, 50)
-        cancel_is_hover = cancel_rect.collidepoint(adjusted_mouse)
-        cancel_color = (255, 120, 120) if cancel_is_hover else (255, 100, 100)
-
-        pygame.draw.rect(dialog_surface, cancel_color, cancel_rect, border_radius=5)
-        pygame.draw.rect(dialog_surface, self.colors['accent'], cancel_rect, 2, border_radius=5)
-
-        cancel_text = self.font_large.render("Cancel", True, (0, 0, 0) if cancel_is_hover else (255, 255, 255))
-        cancel_text_rect = cancel_text.get_rect(center=cancel_rect.center)
-        dialog_surface.blit(cancel_text, cancel_text_rect)
-
-        self.ui_rects['cancel_button'] = cancel_rect.move(dialog_x, dialog_y)
-
-        screen.blit(dialog_surface, (dialog_x, dialog_y))

@@ -34,6 +34,271 @@ _MAX_UNDO = 50
 _RUBBER_BAND_CLICK_THRESHOLD = 4
 
 
+class _SurfaceDrawCompat:
+    """
+    Thin wrapper that gives a plain pygame.Surface the GPUScreen-style
+    draw_* / filled_circle / aacircle methods the rest of the engine was
+    migrated to.
+
+    Continuous editor zoom normally uses _ZoomedScreen to project directly
+    onto GPUScreen. This wrapper remains for non-GPU fallback/debug paths.
+    """
+
+    __slots__ = ('_s',)
+
+    def __init__(self, surface: pygame.Surface):
+        self._s = surface
+
+    # -- Surface-shaped API the rest of the draw path already uses ----------
+    def blit(self, source, dest, area=None, special_flags=0):
+        return self._s.blit(source, dest, area, special_flags)
+
+    def blits(self, blit_sequence, doreturn=True):
+        return self._s.blits(blit_sequence, doreturn)
+
+    def fill(self, color, rect=None, special_flags=0):
+        return self._s.fill(color, rect, special_flags)
+
+    def get_size(self):
+        return self._s.get_size()
+
+    def get_width(self):
+        return self._s.get_width()
+
+    def get_height(self):
+        return self._s.get_height()
+
+    def get_rect(self, **kwargs):
+        return self._s.get_rect(**kwargs)
+
+    def set_clip(self, rect):
+        return self._s.set_clip(rect)
+
+    def get_clip(self):
+        return self._s.get_clip()
+
+    def copy(self):
+        return self._s.copy()
+
+    # -- GPUScreen-shaped draw_* API ----------------------------------------
+    def draw_rect(self, color, rect, width=0, border_radius=0,
+                  border_top_left_radius=-1, border_top_right_radius=-1,
+                  border_bottom_left_radius=-1, border_bottom_right_radius=-1):
+        # pygame.draw.rect() ignores the alpha channel entirely when the
+        # target Surface isn't SRCALPHA (self._s here is `screen`, the
+        # plain non-GPU display Surface used by this fallback/debug path,
+        # which isn't SRCALPHA) -- a translucent color would silently
+        # render fully opaque, e.g. animated_region.py's region-overlay
+        # fill, which relies on real alpha blending to show through
+        # underlying tiles. Route those through a small SRCALPHA scratch
+        # surface + blit instead, which does per-pixel alpha correctly.
+        # This path is debug/fallback only (see class docstring), so the
+        # extra Surface here isn't the hot-path concern GPUScreen's
+        # draw_rect is.
+        if len(color) > 3 and color[3] < 255:
+            r = pygame.Rect(rect)
+            scratch = pygame.Surface((max(1, r.w), max(1, r.h)), pygame.SRCALPHA)
+            pygame.draw.rect(
+                scratch, color, scratch.get_rect(), width,
+                border_radius=border_radius,
+                border_top_left_radius=border_top_left_radius,
+                border_top_right_radius=border_top_right_radius,
+                border_bottom_left_radius=border_bottom_left_radius,
+                border_bottom_right_radius=border_bottom_right_radius,
+            )
+            self._s.blit(scratch, r.topleft)
+            return
+        pygame.draw.rect(
+            self._s, color, rect, width,
+            border_radius=border_radius,
+            border_top_left_radius=border_top_left_radius,
+            border_top_right_radius=border_top_right_radius,
+            border_bottom_left_radius=border_bottom_left_radius,
+            border_bottom_right_radius=border_bottom_right_radius,
+        )
+
+    def draw_line(self, color, start_pos, end_pos, width=1):
+        # Same alpha gap as draw_rect above: pygame.draw.line() also
+        # ignores alpha on a non-SRCALPHA surface (confirmed: a
+        # (60,60,80,90) line came back fully opaque). map_paint_editor.py's
+        # grid lines rely on real translucency here, so route alpha'd
+        # colors through a small SRCALPHA scratch + blit, same pattern as
+        # draw_rect.
+        if len(color) > 3 and color[3] < 255:
+            x0, y0 = start_pos
+            x1, y1 = end_pos
+            pad = max(1, width)
+            min_x, min_y = min(x0, x1) - pad, min(y0, y1) - pad
+            max_x, max_y = max(x0, x1) + pad, max(y0, y1) + pad
+            w, h = max(1, int(max_x - min_x)), max(1, int(max_y - min_y))
+            scratch = pygame.Surface((w, h), pygame.SRCALPHA)
+            local_start = (x0 - min_x, y0 - min_y)
+            local_end = (x1 - min_x, y1 - min_y)
+            pygame.draw.line(scratch, color, local_start, local_end, width)
+            self._s.blit(scratch, (min_x, min_y))
+            return
+        pygame.draw.line(self._s, color, start_pos, end_pos, width)
+
+    def draw_circle(self, color, center, radius, width=0):
+        pygame.draw.circle(self._s, color, center, radius, width)
+
+    def draw_polygon(self, color, points, width=0):
+        pygame.draw.polygon(self._s, color, points, width)
+
+    def filled_circle(self, x, y, radius, color):
+        pygame.gfxdraw.filled_circle(self._s, int(x), int(y), int(radius), color)
+
+    def aacircle(self, x, y, radius, color):
+        pygame.gfxdraw.aacircle(self._s, int(x), int(y), int(radius), color)
+
+
+class _ZoomedScreen:
+    """Virtual zoom canvas projected directly onto the real GPUScreen."""
+
+    __slots__ = ("_screen", "_zoom", "_w", "_h")
+
+    def __init__(self, screen, zoom, real_width, real_height):
+        self._screen = screen
+        self._zoom = float(zoom)
+        self._w = max(1, int(real_width / self._zoom))
+        self._h = max(1, int(real_height / self._zoom))
+
+    def _rect(self, rect):
+        r = pygame.Rect(rect)
+        return pygame.Rect(
+            round(r.x * self._zoom), round(r.y * self._zoom),
+            max(1, round(r.w * self._zoom)),
+            max(1, round(r.h * self._zoom)),
+        )
+
+    def _point(self, point):
+        return (round(point[0] * self._zoom), round(point[1] * self._zoom))
+
+    def _width(self, width):
+        return 0 if width <= 0 else max(1, round(width * self._zoom))
+
+    def blit(self, surface, dest, area=None, special_flags=0):
+        if isinstance(dest, pygame.Rect):
+            dst = self._rect(dest)
+        else:
+            x, y = dest
+            a = area if isinstance(area, pygame.Rect) else (pygame.Rect(area) if area is not None else None)
+            w, h = a.size if a else surface.get_size()
+            dst = pygame.Rect(
+                round(x * self._zoom), round(y * self._zoom),
+                max(1, round(w * self._zoom)),
+                max(1, round(h * self._zoom)),
+            )
+        return self._screen.blit(surface, dst, area=area, special_flags=special_flags)
+
+    def blit_scaled(self, surface, dst_rect, area=None):
+        return self.blit(surface, dst_rect, area=area)
+
+    def blits(self, seq, doreturn=True):
+        rects = [] if doreturn else None
+        for item in seq:
+            if len(item) == 2:
+                surface, dest = item
+                area = None
+            else:
+                surface, dest, area = item
+            self.blit(surface, dest, area=area)
+            if doreturn:
+                if isinstance(dest, pygame.Rect):
+                    rects.append(self._rect(dest))
+                else:
+                    x, y = dest
+                    a = area if isinstance(area, pygame.Rect) else (pygame.Rect(area) if area is not None else None)
+                    w, h = a.size if a else surface.get_size()
+                    rects.append(pygame.Rect(
+                        round(x * self._zoom), round(y * self._zoom),
+                        max(1, round(w * self._zoom)),
+                        max(1, round(h * self._zoom)),
+                    ))
+        return rects
+
+    def blit_transient(self, surface, dest, area=None):
+        if isinstance(dest, pygame.Rect):
+            dst = self._rect(dest)
+        else:
+            x, y = dest
+            a = area if isinstance(area, pygame.Rect) else (pygame.Rect(area) if area is not None else None)
+            w, h = a.size if a else surface.get_size()
+            dst = pygame.Rect(
+                round(x * self._zoom), round(y * self._zoom),
+                max(1, round(w * self._zoom)),
+                max(1, round(h * self._zoom)),
+            )
+        return self._screen.blit_transient(surface, dst, area=area)
+
+    def fill(self, color, rect=None, special_flags=0):
+        if rect is None:
+            return self._screen.fill(color)
+        return self._screen.fill(color, self._rect(rect), special_flags)
+
+    def get_size(self):
+        return self._w, self._h
+
+    def get_width(self):
+        return self._w
+
+    def get_height(self):
+        return self._h
+
+    def get_rect(self, **kwargs):
+        rect = pygame.Rect(0, 0, self._w, self._h)
+        for attr, value in kwargs.items():
+            setattr(rect, attr, value)
+        return rect
+
+    def set_clip(self, rect):
+        return self._screen.set_clip(None if rect is None else self._rect(rect))
+
+    def get_clip(self):
+        return self._screen.get_clip()
+
+    def draw_rect(self, color, rect, width=0, border_radius=0,
+                  border_top_left_radius=-1, border_top_right_radius=-1,
+                  border_bottom_left_radius=-1, border_bottom_right_radius=-1):
+        scale_radius = lambda r: -1 if r < 0 else self._width(r)
+        return self._screen.draw_rect(
+            color, self._rect(rect), self._width(width),
+            border_radius=scale_radius(border_radius),
+            border_top_left_radius=scale_radius(border_top_left_radius),
+            border_top_right_radius=scale_radius(border_top_right_radius),
+            border_bottom_left_radius=scale_radius(border_bottom_left_radius),
+            border_bottom_right_radius=scale_radius(border_bottom_right_radius),
+        )
+
+    def draw_line(self, color, start_pos, end_pos, width=1):
+        return self._screen.draw_line(
+            color, self._point(start_pos), self._point(end_pos), self._width(width)
+        )
+
+    def draw_circle(self, color, center, radius, width=0):
+        return self._screen.draw_circle(
+            color, self._point(center), max(1, round(radius * self._zoom)),
+            self._width(width)
+        )
+
+    def draw_polygon(self, color, points, width=0):
+        return self._screen.draw_polygon(
+            color, [self._point(p) for p in points], self._width(width)
+        )
+
+    def filled_circle(self, x, y, radius, color):
+        return self._screen.filled_circle(
+            round(x * self._zoom), round(y * self._zoom),
+            max(1, round(radius * self._zoom)), color
+        )
+
+    def aacircle(self, x, y, radius, color):
+        return self._screen.aacircle(
+            round(x * self._zoom), round(y * self._zoom),
+            max(1, round(radius * self._zoom)), color
+        )
+
+
 class _HistoryEntry:
     """
     A single undoable action recorded in the room editor.
@@ -224,7 +489,19 @@ class RoomEditor:
         # once now that RENDER_SCALE is bigger, rather than snapping to a
         # static, non-editable full-room overview. 1.0 = unchanged/native.
         self.editor_zoom = 1.0
-        self._editor_zoom_min = 0.35
+        # The zoomed-out view is rendered onto an offscreen canvas sized
+        # screen/zoom, then scaled back down — so canvas *area* (and with
+        # it, the cost of every blit onto it) grows as 1/zoom^2, not
+        # linearly. 0.35 let that canvas balloon to ~8.2x screen area,
+        # which is what was tanking FPS at max zoom-out (SLOW-frame draw
+        # times of 100-190ms in practice). 0.55 caps it at ~3.3x — still a
+        # meaningful zoom-out range, without the worst-case blowup.
+        # Eliminating the blowup entirely means rendering at final scale
+        # directly instead of shrinking afterwards, which requires touching
+        # every object's own draw() code (collision boxes, decorations,
+        # doors, chests, gates, etc. — a dozen-plus files outside this
+        # one), not just this editor.
+        self._editor_zoom_min = 0.55
         self._editor_zoom_max = 1.0
         self._editor_zoom_step = 0.1
 
@@ -939,8 +1216,8 @@ class RoomEditor:
             if self.object_editor:
                 self.object_editor.handle_input(
                     self._zoom_adjust_event(event, self.object_editor._is_in_palette),
-                    int(self.camera.x),
-                    int(self.camera.y),
+                    0 if self.zoom_active else int(self.camera.x),
+                    0 if self.zoom_active else int(self.camera.y),
                     self.viewing_room.name if self.viewing_room else ""
                 )
             return None
@@ -1167,10 +1444,11 @@ class RoomEditor:
                     for t in self.tileset_editor.room_tiles.get(room_name, [])
                 ]
 
+            self.tileset_editor.editor_zoom = self._effective_editor_zoom()
             self.tileset_editor.handle_input(
                 self._zoom_adjust_event(event, self.tileset_editor._is_in_palette),
-                int(self.camera.x),
-                int(self.camera.y),
+                0 if self.zoom_active else int(self.camera.x),
+                0 if self.zoom_active else int(self.camera.y),
                 room_name
             )
 
@@ -1210,7 +1488,7 @@ class RoomEditor:
                 )
 
             self.map_paint_editor.handle_input(
-                event,
+                self._zoom_adjust_event(event),
                 int(self.camera.x),
                 int(self.camera.y),
                 room_name
@@ -1286,8 +1564,13 @@ class RoomEditor:
                     self.object_editor.current_room_name = (
                         self.viewing_room.name if self.viewing_room else ""
                     )
-                    _zoom = self._effective_editor_zoom()
-                    _adj_pos = (event.pos[0] / _zoom, event.pos[1] / _zoom) if _zoom != 1.0 else event.pos
+                    if self.zoom_active:
+                        scale = self._zoom_scale or 1.0
+                        ox, oy = self._zoom_offset
+                        _adj_pos = ((event.pos[0] - ox) / scale, (event.pos[1] - oy) / scale)
+                    else:
+                        _zoom = self._effective_editor_zoom()
+                        _adj_pos = (event.pos[0] / _zoom, event.pos[1] / _zoom) if _zoom != 1.0 else event.pos
                     self.object_editor._try_assign_chest_loot(_adj_pos)
                     return None  # never fall through to placement
 
@@ -1355,8 +1638,8 @@ class RoomEditor:
 
             result = self.object_editor.handle_input(
                 self._zoom_adjust_event(event, self.object_editor._is_in_palette),
-                int(self.camera.x),
-                int(self.camera.y),
+                0 if self.zoom_active else int(self.camera.x),
+                0 if self.zoom_active else int(self.camera.y),
                 self.viewing_room.name if self.viewing_room else ""
             )
 
@@ -1404,10 +1687,11 @@ class RoomEditor:
                 # popup is open → let handle_event below consume the ESC
 
             # Delegate scroll / click / hotkeys to entity editor
+            self.entity_editor.editor_zoom = self._effective_editor_zoom()
             consumed = self.entity_editor.handle_event(
                 self._zoom_adjust_event(event, self.entity_editor._mouse_in_palette),
-                int(self.camera.x),
-                int(self.camera.y)
+                0 if self.zoom_active else int(self.camera.x),
+                0 if self.zoom_active else int(self.camera.y)
             )
             if consumed:
                 return None
@@ -2444,7 +2728,19 @@ class RoomEditor:
     def _zoom_locked(self):
         """True while some modal or path-editor should keep editor_zoom
         suspended — same set of states that already pin WASD camera panning
-        in update()."""
+        in update().
+
+        Map Paint used to be in this list too: its draw_dim_overlay()/
+        draw() rasterized onto pygame.Surfaces sized to the real window and
+        blit them at a literal (0, 0), which only looked right at zoom ==
+        1.0 -- so continuous zoom was suspended here as a workaround. Now
+        that map_paint_editor.py draws through screen.draw_line()/
+        draw_rect()/fill() in the same zoom-aware space every other editor
+        overlay uses, it scales correctly like everything else and no
+        longer needs zoom suspended -- leaving it here just pinned the
+        view to base zoom and swallowed the scroll-wheel zoom control the
+        whole time Map Paint was open.
+        """
         event_editor = getattr(self.object_editor, 'event_editor', None)
         if event_editor is not None and event_editor.active:
             return True
@@ -2461,8 +2757,6 @@ class RoomEditor:
                 hasattr(self.object_editor, 'flying_pad_path_editor') and
                 self.object_editor.flying_pad_path_editor.active):
             return True
-        if self.map_paint_editor and self.map_paint_editor.active:
-            return True
         return False
 
     def _zoom_adjust_event(self, event, is_in_palette_fn=None):
@@ -2473,6 +2767,27 @@ class RoomEditor:
         position is over that editor's own fixed-scale palette/panel (UI
         chrome is never zoomed, so it must keep receiving real coordinates).
         """
+        if self.zoom_active:
+            # Fit-to-screen overview: sub-editors were rendered with camera
+            # (0, 0) into a surface scaled by _zoom_scale and blitted at
+            # _zoom_offset (see _render_zoom_overview), so their events need
+            # that same scale/offset undone here rather than the continuous
+            # editor_zoom math below (which assumes zoom == 1.0 whenever the
+            # overview is active and would otherwise pass raw screen pixels
+            # straight through, landing placements near the top-left).
+            if not hasattr(event, 'pos'):
+                return event
+            if is_in_palette_fn is not None and is_in_palette_fn(*event.pos):
+                return event
+            scale = self._zoom_scale or 1.0
+            ox, oy = self._zoom_offset
+            new_dict = dict(event.dict)
+            new_dict['pos'] = ((event.pos[0] - ox) / scale, (event.pos[1] - oy) / scale)
+            if 'rel' in new_dict:
+                rx, ry = new_dict['rel']
+                new_dict['rel'] = (rx / scale, ry / scale)
+            return pygame.event.Event(event.type, new_dict)
+
         zoom = self._effective_editor_zoom()
         if zoom == 1.0 or not hasattr(event, 'pos'):
             return event
@@ -2565,6 +2880,17 @@ class RoomEditor:
         return None
 
     def _screen_to_world(self, sx, sy):
+        if self.zoom_active:
+            # Fit-to-screen overview: the room is rendered at cam (0, 0) into
+            # an offscreen surface, then scaled by _zoom_scale and blitted at
+            # _zoom_offset (see _render_zoom_overview). Screen -> world has
+            # to invert that scale/offset directly instead of going through
+            # camera + _effective_editor_zoom, which both assume the normal
+            # (non-overview) view and would otherwise leave clicks landing
+            # near the top-left of the room instead of under the cursor.
+            scale = self._zoom_scale or 1.0
+            ox, oy = self._zoom_offset
+            return (sx - ox) / (RENDER_SCALE * scale), (sy - oy) / (RENDER_SCALE * scale)
         zoom = self._effective_editor_zoom()
         if zoom != 1.0:
             sx = sx / zoom
@@ -2692,7 +3018,7 @@ class RoomEditor:
             box = pygame.Surface((max(rw, 1), max(rh, 1)), pygame.SRCALPHA)
             box.fill((80, 170, 255, 60))
             screen.blit(box, (rx, ry))
-            pygame.draw.rect(screen, (80, 170, 255), (rx, ry, rw, rh), 1)
+            screen.draw_rect((80, 170, 255), (rx, ry, rw, rh), 1)
 
         for kind, item, obj_type in self.selection:
             r = self._item_rect(kind, item, obj_type)
@@ -2701,7 +3027,7 @@ class RoomEditor:
             sw = int(r.width * RENDER_SCALE)
             sh = int(r.height * RENDER_SCALE)
             color = (255, 255, 0) if self._group_drag_origin else (80, 170, 255)
-            pygame.draw.rect(screen, color, (sx - 2, sy - 2, sw + 4, sh + 4), 2)
+            screen.draw_rect(color, (sx - 2, sy - 2, sw + 4, sh + 4), 2)
 
     def _handle_select_drag_event(self, event):
         """Handle click-select, drag, and right-click-delete when no editor panel is open."""
@@ -3003,7 +3329,7 @@ class RoomEditor:
             sx = int(ent['x'] * RENDER_SCALE - camera_x) - sw // 2
             sy = int(ent['y'] * RENDER_SCALE - camera_y) - sh // 2
             color = (255, 255, 0) if self.is_dragging else (255, 200, 0)
-            pygame.draw.rect(screen, color, (sx - 2, sy - 2, sw + 4, sh + 4), 2)
+            screen.draw_rect(color, (sx - 2, sy - 2, sw + 4, sh + 4), 2)
         else:
             obj = self.drag_target
             if hasattr(obj, 'x') and hasattr(obj, 'width'):
@@ -3012,7 +3338,7 @@ class RoomEditor:
                 sw = int(getattr(obj, 'width', 32) * RENDER_SCALE)
                 sh = int(getattr(obj, 'height', 32) * RENDER_SCALE)
                 # Some objects are centred, others are top-left — use a generous outline
-                pygame.draw.rect(screen, (255, 200, 0),
+                screen.draw_rect((255, 200, 0),
                                  (sx - sw // 2 - 2, sy - sh // 2 - 2, sw + 4, sh + 4), 2)
 
     # =========================================================================
@@ -3022,6 +3348,7 @@ class RoomEditor:
     _placed_sprite_cache = {}
     _shadow_surf_cache = {}
     _shadow_source = None  # loaded once on first use
+    _entity_label_cache = {}  # (label_text, color) -> rendered Surface
 
     @staticmethod
     def _get_editor_shadow(width_world):
@@ -3106,10 +3433,17 @@ class RoomEditor:
             sy = int(ent['y'] * RENDER_SCALE - camera_y)
             w = ent['width']
             h = ent['height']
+            sw = w * RENDER_SCALE
+            sh = h * RENDER_SCALE
 
-            # cull anything fully off-screen
-            if sx + w < 0 or sx - w > self.screen_width or \
-                    sy + h < 0 or sy - h > self.screen_height:
+            # Cull anything fully off-screen. Margin has to be the actual
+            # on-screen half-extent (sw/2, sh/2) — the sprite is drawn
+            # centered on (sx, sy) at RENDER_SCALE size, not at raw world
+            # size w/h. Culling on w/h directly (their pre-scale values)
+            # made entities disappear while still partly visible, worse
+            # the further RENDER_SCALE exceeds 1.
+            if sx + sw // 2 < 0 or sx - sw // 2 > self.screen_width or \
+                    sy + sh // 2 < 0 or sy - sh // 2 > self.screen_height:
                 continue
 
             # ── try real sprite first ────────────────────────────────────
@@ -3144,34 +3478,34 @@ class RoomEditor:
                 dark = tuple(max(0, c - 60) for c in color)
                 light = tuple(min(255, c + 50) for c in color)
                 if entity_type == 'npc':
-                    pygame.draw.rect(screen, color, rect, border_radius=6)
-                    pygame.draw.rect(screen, dark, rect, 2, border_radius=6)
-                    pygame.draw.circle(screen, light, rect.center, min(sw, sh) // 5)
+                    screen.draw_rect(color, rect, border_radius=6)
+                    screen.draw_rect(dark, rect, 2, border_radius=6)
+                    screen.draw_circle(light, rect.center, min(sw, sh) // 5)
                 elif entity_type == 'enemy':
-                    pygame.draw.rect(screen, color, rect)
-                    pygame.draw.rect(screen, dark, rect, 2)
+                    screen.draw_rect(color, rect)
+                    screen.draw_rect(dark, rect, 2)
                     pad = 6
-                    pygame.draw.line(screen, dark,
+                    screen.draw_line(dark,
                                      (rect.x + pad, rect.y + pad),
                                      (rect.right - pad, rect.bottom - pad), 3)
-                    pygame.draw.line(screen, dark,
+                    screen.draw_line(dark,
                                      (rect.right - pad, rect.y + pad),
                                      (rect.x + pad, rect.bottom - pad), 3)
                 elif entity_type == 'boss':
-                    pygame.draw.rect(screen, color, rect)
-                    pygame.draw.rect(screen, dark, rect, 3)
+                    screen.draw_rect(color, rect)
+                    screen.draw_rect(dark, rect, 3)
                     cx, cy = rect.center
                     r = min(sw, sh) // 4
                     pts = [(cx, cy - r), (cx + r, cy), (cx, cy + r), (cx - r, cy)]
-                    pygame.draw.polygon(screen, light, pts)
-                    pygame.draw.polygon(screen, dark, pts, 2)
+                    screen.draw_polygon(light, pts)
+                    screen.draw_polygon(dark, pts, 2)
                 elif entity_type == 'critter':
                     # Small, soft, no outline — matches the placeholder
                     # entity_editor's palette uses for the same category.
                     cx, cy = rect.center
                     r = max(2, min(sw, sh) // 3)
-                    pygame.draw.circle(screen, color, (cx, cy), r)
-                    pygame.draw.circle(screen, light, (cx, cy), max(1, r // 2))
+                    screen.draw_circle(color, (cx, cy), r)
+                    screen.draw_circle(light, (cx, cy), max(1, r // 2))
 
             # ── name + variant label above the sprite ───────────────────
             variant_name = ent.get('variant_name', '')
@@ -3185,7 +3519,22 @@ class RoomEditor:
                 if ai_type != 'easy':  # Only show if not default
                     label_text += f" (AI:{ai_type.capitalize()})"
 
-            label_surf = self.font_small.render(label_text, True, self.colors['text'])
+            # Cache rendered label surfaces keyed by (text, color) — this
+            # loop runs for every on-screen entity every single frame, and
+            # font.render() allocates + rasterizes a brand-new Surface each
+            # call. That's cheap for a handful of entities but at low
+            # editor zoom the visible viewport (and therefore the number of
+            # entities passing the cull check above) can be several times
+            # larger, so this was quietly becoming dozens-to-hundreds of
+            # font renders per frame — the main cost behind the zoomed-out
+            # slowdown, and the source of the extra gen-0 GC pressure (all
+            # those short-lived label Surfaces) seen in the frame log.
+            label_color = self.colors['text']
+            label_key = (label_text, label_color)
+            label_surf = RoomEditor._entity_label_cache.get(label_key)
+            if label_surf is None:
+                label_surf = self.font_small.render(label_text, True, label_color)
+                RoomEditor._entity_label_cache[label_key] = label_surf
             screen.blit(label_surf,
                         label_surf.get_rect(centerx=rect.centerx, bottom=rect.top - 2))
 
@@ -3422,45 +3771,60 @@ class RoomEditor:
             return
 
         # ── Continuous editor zoom (Ctrl+scroll) ────────────────────────────
-        # Renders the "world" portion of the view (background, tiles,
-        # objects, entities, previews, drag/select overlays) into a larger
-        # offscreen surface sized to show more of the room, then scales that
-        # single composited image down onto the real screen. Toolbar and
-        # palettes are drawn afterwards, straight onto the real screen at
-        # real size, so UI chrome stays crisp and fixed-size regardless of
-        # zoom — see the "screen = real_screen" restore further down, right
-        # before that UI is drawn.
+        # Keep the old virtual coordinate/culling space, but project it directly
+        # onto the real GPU target. This removes the oversized software canvas
+        # and the CPU transform.scale() at the end of the frame.
         zoom = self._effective_editor_zoom()
+        if self.tileset_editor:
+            self.tileset_editor.editor_zoom = zoom
+        if self.entity_editor:
+            self.entity_editor.editor_zoom = zoom
+
         real_screen = screen
         orig_sw, orig_sh = self.screen_width, self.screen_height
         _zoom_sub_editors = []
         _zoom_orig_dims = {}
+
         if zoom != 1.0:
             vw = max(1, int(orig_sw / zoom))
             vh = max(1, int(orig_sh / zoom))
-            # Reuse the same offscreen surface across frames instead of
-            # allocating a fresh one every call. At low zoom this surface
-            # can be 8x+ the pixel area of the real screen (area scales
-            # with 1/zoom^2), so re-allocating it 60x/sec was a big chunk
-            # of the zoomed-out slowdown. It's also .convert()ed to match
-            # the display's pixel format — without that, every one of the
-            # many blits below onto a plain (mismatched-format) Surface
-            # has to convert pixels on the fly, which is far slower than a
-            # same-format blit. Only rebuilt when the target size actually
-            # changes (zoom level or window resize).
-            cached = getattr(self, '_editor_zoom_surface', None)
-            if cached is None or cached.get_size() != (vw, vh):
-                cached = pygame.Surface((vw, vh)).convert()
-                self._editor_zoom_surface = cached
-            screen = cached
+
+            if hasattr(real_screen, "blit_scaled"):
+                screen = _ZoomedScreen(real_screen, zoom, orig_sw, orig_sh)
+            else:
+                # Keep a software fallback for old/debug render paths.
+                cached = getattr(self, '_editor_zoom_surface', None)
+                if cached is None or cached.get_size() != (vw, vh):
+                    cached = pygame.Surface((vw, vh)).convert()
+                    self._editor_zoom_surface = cached
+                screen = _SurfaceDrawCompat(cached)
+
+            # Existing renderers use these dimensions for culling/tile coverage.
             self.screen_width, self.screen_height = vw, vh
-            _zoom_sub_editors = [e for e in (self.tileset_editor, self.object_editor, self.entity_editor) if e]
+            _zoom_sub_editors = [
+                e for e in (self.tileset_editor, self.object_editor, self.entity_editor) if e
+            ]
             for ed in _zoom_sub_editors:
-                _zoom_orig_dims[id(ed)] = (getattr(ed, 'screen_width', None), getattr(ed, 'screen_height', None))
-                if hasattr(ed, 'screen_width'):  ed.screen_width  = vw
-                if hasattr(ed, 'screen_height'): ed.screen_height = vh
+                _zoom_orig_dims[id(ed)] = (
+                    getattr(ed, 'screen_width', None),
+                    getattr(ed, 'screen_height', None),
+                )
+                if hasattr(ed, 'screen_width'):
+                    ed.screen_width = vw
+                if hasattr(ed, 'screen_height'):
+                    ed.screen_height = vh
 
         screen.fill((34, 139, 34))
+
+        # ── DIAGNOSTIC: per-section draw timer (temporary, remove once the
+        # zoomed-out slowdown is tracked down) ──────────────────────────────
+        _prof = []
+        _pt = time.perf_counter()
+        def _mark(label):
+            nonlocal _pt
+            now = time.perf_counter()
+            _prof.append((label, (now - _pt) * 1000))
+            _pt = now
 
         # ── Scrolling background preview ──────────────────────────────────────
         if self.viewing_room:
@@ -3511,6 +3875,7 @@ class RoomEditor:
                             screen.blit(surf, (x, y))
                             x += iw
                         y += surf.get_height()
+        _mark("bg_preview")
 
         # Flush any tiles invalidated by paint/erase this frame before reading
         # the baked surface cache — ensures deletions are visible immediately.
@@ -3562,6 +3927,7 @@ class RoomEditor:
                 screen, int(self.camera.x), int(self.camera.y),
                 self.viewing_room.name, layer='background'
             )
+        _mark("bg_tile_blit")
 
         # Draw the grid
         if self.tileset_editor and self.tileset_editor.active:
@@ -3581,14 +3947,16 @@ class RoomEditor:
                 self._draw_default_grid(screen)
         else:
             self._draw_default_grid(screen)
+        _mark("grid")
 
         # Room boundary outline
         room_rect_x = (0 * RENDER_SCALE) - self.camera.x
         room_rect_y = (0 * RENDER_SCALE) - self.camera.y
         room_width = self.viewing_room.width * RENDER_SCALE
         room_height = self.viewing_room.height * RENDER_SCALE
-        pygame.draw.rect(screen, self.colors['accent'],
+        screen.draw_rect(self.colors['accent'],
                          (int(room_rect_x), int(room_rect_y), int(room_width), int(room_height)), 3)
+        _mark("room_boundary")
 
         # Draw spawn points
         if self.object_editor:
@@ -3597,6 +3965,7 @@ class RoomEditor:
                 int(self.camera.x),
                 int(self.camera.y)
             )
+        _mark("spawn_points")
 
         # Draw destructible stones
         if hasattr(self.viewing_room, 'destructible_stones'):
@@ -3616,6 +3985,7 @@ class RoomEditor:
                             -_margin <= _sy <= self.screen_height + _margin):
                         continue
                 stone.draw(screen, self.camera, self.colors)
+        _mark("stones")
 
         # Draw decorations (trees, etc.) — Y-sorted by trunk/base position
         # (same convention gameplay uses, see game.py's decoration.get_sort_key()
@@ -3641,12 +4011,27 @@ class RoomEditor:
             # the loop and its ordering logic are unchanged — only the
             # actual decoration.draw() call is skipped for ones nowhere
             # near the camera.
-            _dec_margin = 160
+            #
+            # This has to test the decoration's actual sprite footprint,
+            # not just a flat margin around its (x, y) anchor point — a
+            # fixed margin around the anchor is what used to make trees
+            # visibly pop out of existence while still partly on screen,
+            # since a tree's canopy reaches well above/beside its trunk
+            # anchor (see Decoration's bottom-center anchor convention in
+            # objects/decoration_object.py) and a tall/wide enough sprite
+            # blew right past the old constant. Using the same width/height
+            # the sprite is actually drawn at keeps the cull exact while
+            # staying just as cheap (still plain arithmetic — no scaling or
+            # blitting for anything ruled out here).
             def _decoration_in_view(d):
                 _dx = (d.x * RENDER_SCALE) - self.camera.x
                 _dy = (d.y * RENDER_SCALE) - self.camera.y
-                return (-_dec_margin <= _dx <= self.screen_width + _dec_margin and
-                        -_dec_margin <= _dy <= self.screen_height + _dec_margin)
+                _half_w = (d.width * RENDER_SCALE) / 2
+                _top = d.height * RENDER_SCALE
+                _left, _right = _dx - _half_w, _dx + _half_w
+                _sprite_top, _bottom = _dy - _top, _dy  # bottom-center anchored
+                return (_right >= 0 and _left <= self.screen_width and
+                        _bottom >= 0 and _sprite_top <= self.screen_height)
 
             if preview_y is None:
                 for decoration in sorted_decorations:
@@ -3666,9 +4051,11 @@ class RoomEditor:
                     self.object_editor.draw_decoration_preview(
                         screen, int(self.camera.x), int(self.camera.y)
                     )
+        _mark("decorations")
 
         # Draw placed entities (NPCs / enemies / bosses)
         self._draw_placed_entities(screen, int(self.camera.x), int(self.camera.y))
+        _mark("entities")
 
         # Foreground tiles — same baked path as background, same
         # active-tile-editor override (see the background block above).
@@ -3682,6 +4069,7 @@ class RoomEditor:
                 screen, int(self.camera.x), int(self.camera.y),
                 self.viewing_room.name, layer='foreground'
             )
+        _mark("fg_tiles")
 
         # --- Editor overlays always drawn above ALL tile layers ---
         # (animated regions are the exception — drawn earlier, beneath the
@@ -3779,6 +4167,7 @@ class RoomEditor:
                 int(self.camera.x),
                 int(self.camera.y)
             )
+        _mark("object_overlays")
 
         # Map Paint tool — dims EVERYTHING drawn above (tiles, entities,
         # AND every editor overlay: collision boxes, spawn points, gates,
@@ -3817,6 +4206,7 @@ class RoomEditor:
                 int(self.camera.x),
                 int(self.camera.y)
             )
+        _mark("previews")
 
         # ── Restore real screen / dims before UI chrome ─────────────────────
         # Everything above this point may have drawn onto the oversized
@@ -3825,14 +4215,17 @@ class RoomEditor:
         # to drawing directly on it (at real size) for the toolbar/palettes
         # below, so UI chrome never gets visually scaled by editor_zoom.
         if zoom != 1.0:
-            scaled = pygame.transform.scale(screen, (orig_sw, orig_sh))
-            real_screen.blit(scaled, (0, 0))
+            # GPU zoom already rendered directly onto real_screen. Only restore
+            # the temporary virtual dimensions before drawing fixed-size UI.
             for ed in _zoom_sub_editors:
                 sw, sh = _zoom_orig_dims[id(ed)]
-                if sw is not None and hasattr(ed, 'screen_width'):  ed.screen_width  = sw
-                if sh is not None and hasattr(ed, 'screen_height'): ed.screen_height = sh
+                if sw is not None and hasattr(ed, 'screen_width'):
+                    ed.screen_width = sw
+                if sh is not None and hasattr(ed, 'screen_height'):
+                    ed.screen_height = sh
             self.screen_width, self.screen_height = orig_sw, orig_sh
             screen = real_screen
+        _mark("final_scale_blit")
 
         # Check if we're in transition spawn placement mode
         is_placing_spawn = (self.object_editor and
@@ -3877,6 +4270,10 @@ class RoomEditor:
         screen.blit(coord_bg, (margin, self.screen_height - coord_bg_h - margin))
         screen.blit(coord_surf, (margin + 8, self.screen_height - coord_bg_h - margin + 5))
 
+        # ── DIAGNOSTIC: print section breakdown on slow frames (temporary) ──
+        if sum(t for _, t in _prof) >= 30:
+            print("  ".join(f"{label}={t:.1f}ms" for label, t in _prof))
+
     def _render_zoom_overview(self, screen):
         """Render the entire room scaled to fit the screen for the zoom-out view.
         The scaled surface is cached and only rebuilt when _zoom_dirty is True."""
@@ -3895,6 +4292,10 @@ class RoomEditor:
         # Offscreen surface covering the full room in pixels
         zoom_surf = pygame.Surface((room_pw, room_ph))
         zoom_surf.fill((34, 139, 34))
+        # The sub-editor draw_* functions below are shared with the normal
+        # (GPU-backed) view and call screen.draw_rect()/draw_circle()/etc,
+        # which a plain pygame.Surface doesn't have. Wrap it so it does.
+        zoom_screen = _SurfaceDrawCompat(zoom_surf)
 
         # Temporarily widen the viewport on sub-editors so their tile-culling
         # covers the whole room rather than just screen_width × screen_height.
@@ -3927,48 +4328,48 @@ class RoomEditor:
         # path above for the full explanation).
         if self.object_editor:
             self.object_editor.current_room_name = room_name
-            self.object_editor.draw_animated_regions(zoom_surf, cam_x, cam_y)
+            self.object_editor.draw_animated_regions(zoom_screen, cam_x, cam_y)
 
         if self.blit_tiles_callback:
-            self.blit_tiles_callback(zoom_surf, room_name, cam_x, cam_y, True)
+            self.blit_tiles_callback(zoom_screen, room_name, cam_x, cam_y, True)
         elif self.tileset_editor:
-            self.tileset_editor.draw_tiles(zoom_surf, cam_x, cam_y, room_name, layer='background')
+            self.tileset_editor.draw_tiles(zoom_screen, cam_x, cam_y, room_name, layer='background')
 
         pygame.draw.rect(zoom_surf, self.colors['accent'], (0, 0, room_pw, room_ph), 3)
 
         if self.object_editor:
-            self.object_editor.draw_spawn_points(zoom_surf, cam_x, cam_y)
+            self.object_editor.draw_spawn_points(zoom_screen, cam_x, cam_y)
 
         if hasattr(room, 'destructible_stones'):
             for stone in room.destructible_stones:
                 if stone.active:
-                    stone.draw(zoom_surf, type('_Cam', (), {'x': 0, 'y': 0})(), self.colors)
+                    stone.draw(zoom_screen, type('_Cam', (), {'x': 0, 'y': 0})(), self.colors)
 
         if hasattr(room, 'decorations'):
             # Same Y-sort as the normal view (no placement preview here —
             # the zoom overview has no live editing — so just the sort).
             for decoration in sorted(
                     (d for d in room.decorations if d.active), key=lambda d: d.y):
-                decoration.draw(zoom_surf, type('_Cam', (), {'x': 0, 'y': 0})(), self.colors)
+                decoration.draw(zoom_screen, type('_Cam', (), {'x': 0, 'y': 0})(), self.colors)
 
-        self._draw_placed_entities(zoom_surf, cam_x, cam_y)
+        self._draw_placed_entities(zoom_screen, cam_x, cam_y)
 
         if self.blit_tiles_callback:
-            self.blit_tiles_callback(zoom_surf, room_name, cam_x, cam_y, False)
+            self.blit_tiles_callback(zoom_screen, room_name, cam_x, cam_y, False)
         elif self.tileset_editor:
-            self.tileset_editor.draw_tiles(zoom_surf, cam_x, cam_y, room_name, layer='foreground')
+            self.tileset_editor.draw_tiles(zoom_screen, cam_x, cam_y, room_name, layer='foreground')
 
         if self.object_editor:
             self.object_editor.current_room_name = room_name
-            self.object_editor.draw_collision_objects(zoom_surf, cam_x, cam_y)
-            self.object_editor.draw_flying_pads(zoom_surf, cam_x, cam_y, self.colors)
-            self.object_editor.draw_nimbus_clouds(zoom_surf, cam_x, cam_y, self.colors)
-            self.object_editor.draw_save_points(zoom_surf, cam_x, cam_y, self.colors)
-            self.object_editor.draw_world_map_objects(zoom_surf, cam_x, cam_y, self.colors)
-            self.object_editor.draw_level_gates(zoom_surf, cam_x, cam_y, self.colors)
-            self.object_editor.draw_doors(zoom_surf, cam_x, cam_y, self.colors)
-            self.object_editor.draw_chests(zoom_surf, cam_x, cam_y, self.colors)
-            self.object_editor.draw_room_transitions(zoom_surf, cam_x, cam_y)
+            self.object_editor.draw_collision_objects(zoom_screen, cam_x, cam_y)
+            self.object_editor.draw_flying_pads(zoom_screen, cam_x, cam_y, self.colors)
+            self.object_editor.draw_nimbus_clouds(zoom_screen, cam_x, cam_y, self.colors)
+            self.object_editor.draw_save_points(zoom_screen, cam_x, cam_y, self.colors)
+            self.object_editor.draw_world_map_objects(zoom_screen, cam_x, cam_y, self.colors)
+            self.object_editor.draw_level_gates(zoom_screen, cam_x, cam_y, self.colors)
+            self.object_editor.draw_doors(zoom_screen, cam_x, cam_y, self.colors)
+            self.object_editor.draw_chests(zoom_screen, cam_x, cam_y, self.colors)
+            self.object_editor.draw_room_transitions(zoom_screen, cam_x, cam_y)
 
         # Restore sub-editor and self dimensions
         for ed in sub_editors:
@@ -4006,7 +4407,7 @@ class RoomEditor:
         for x in range(start_x, end_x, TILE_SIZE):
             screen_x = (x * RENDER_SCALE) - self.camera.x
             if -TILE_SIZE * RENDER_SCALE <= screen_x <= self.screen_width:
-                pygame.draw.line(screen, (44, 149, 44),
+                screen.draw_line((44, 149, 44),
                                  (int(screen_x), 0),
                                  (int(screen_x), self.screen_height), 1)
 
@@ -4016,7 +4417,7 @@ class RoomEditor:
         for y in range(start_y, end_y, TILE_SIZE):
             screen_y = (y * RENDER_SCALE) - self.camera.y
             if -TILE_SIZE * RENDER_SCALE <= screen_y <= self.screen_height:
-                pygame.draw.line(screen, (44, 149, 44),
+                screen.draw_line((44, 149, 44),
                                  (0, int(screen_y)),
                                  (self.screen_width, int(screen_y)), 1)
 
@@ -4032,19 +4433,19 @@ class RoomEditor:
             r = int(self.colors['bg'][0] + (self.colors['panel'][0] - self.colors['bg'][0]) * progress)
             g = int(self.colors['bg'][1] + (self.colors['panel'][1] - self.colors['bg'][1]) * progress)
             b = int(self.colors['bg'][2] + (self.colors['panel'][2] - self.colors['bg'][2]) * progress)
-            pygame.draw.line(screen, (r, g, b), (0, y), (self.screen_width, y))
+            screen.draw_line((r, g, b), (0, y), (self.screen_width, y))
 
         # Animated grid pattern
         offset = int(self.anim_timer * 20) % (TILE_SIZE * 2)
         for x in range(-offset, self.screen_width, TILE_SIZE * 2):
-            pygame.draw.line(screen, self.colors['grid'], (x, 0), (x, self.screen_height), 1)
+            screen.draw_line(self.colors['grid'], (x, 0), (x, self.screen_height), 1)
         for y in range(-offset, self.screen_height, TILE_SIZE * 2):
-            pygame.draw.line(screen, self.colors['grid'], (0, y), (self.screen_width, y), 1)
+            screen.draw_line(self.colors['grid'], (0, y), (self.screen_width, y), 1)
 
     def _draw_sidebar(self, screen):
         """Draw the info sidebar"""
         sidebar_rect = pygame.Rect(0, 0, self.sidebar_width, self.screen_height)
-        pygame.draw.rect(screen, self.colors['panel'], sidebar_rect)
+        screen.draw_rect(self.colors['panel'], sidebar_rect)
 
         # Nice glow on the right edge
         for i in range(5):
@@ -4061,7 +4462,7 @@ class RoomEditor:
         screen.blit(title, (self.padding, y_pos))
         y_pos += 50
 
-        pygame.draw.line(screen, self.colors['accent'],
+        screen.draw_line(self.colors['accent'],
                          (self.padding, y_pos),
                          (self.sidebar_width - self.padding, y_pos), 2)
         y_pos += 30
@@ -4084,7 +4485,7 @@ class RoomEditor:
 
         # What view are we in?
         y_pos = self.screen_height - 100
-        pygame.draw.line(screen, self.colors['accent'],
+        screen.draw_line(self.colors['accent'],
                          (self.padding, y_pos),
                          (self.sidebar_width - self.padding, y_pos), 2)
         y_pos += 20
@@ -4197,8 +4598,8 @@ class RoomEditor:
             screen.blit(glow_surf, (x - 5, y - 5))
 
         color = self.colors['panel_light'] if selected else self.colors['panel']
-        pygame.draw.rect(screen, color, panel_rect, border_radius=8)
-        pygame.draw.rect(screen, self.colors['accent'] if selected else self.colors['grid'],
+        screen.draw_rect(color, panel_rect, border_radius=8)
+        screen.draw_rect(self.colors['accent'] if selected else self.colors['grid'],
                          panel_rect, 2, border_radius=8)
 
         # Group colour circle
@@ -4207,8 +4608,8 @@ class RoomEditor:
         icon_radius = 12
         group_hash = hash(room.group) % 360
         icon_color = self._hue_to_rgb(group_hash)
-        pygame.gfxdraw.filled_circle(screen, icon_x, icon_y, icon_radius, icon_color)
-        pygame.gfxdraw.aacircle(screen, icon_x, icon_y, icon_radius, self.colors['text'])
+        screen.filled_circle(icon_x, icon_y, icon_radius, icon_color)
+        screen.aacircle(icon_x, icon_y, icon_radius, self.colors['text'])
 
         # Room name and dimensions
         name_surf = self.font_large.render(room.name, True, self.colors['text'])
@@ -4235,8 +4636,8 @@ class RoomEditor:
 
         # View button
         view_bg = (60, 120, 200) if view_hovered else (40, 80, 140)
-        pygame.draw.rect(screen, view_bg, view_btn_rect, border_radius=6)
-        pygame.draw.rect(screen, (100, 160, 255) if view_hovered else (70, 120, 200),
+        screen.draw_rect(view_bg, view_btn_rect, border_radius=6)
+        screen.draw_rect((100, 160, 255) if view_hovered else (70, 120, 200),
                          view_btn_rect, 2, border_radius=6)
         if self._view_icon:
             screen.blit(self._view_icon, self._view_icon.get_rect(center=view_btn_rect.center))
@@ -4246,8 +4647,8 @@ class RoomEditor:
 
         # Settings button
         settings_bg = (80, 60, 160) if settings_hovered else (50, 40, 110)
-        pygame.draw.rect(screen, settings_bg, settings_btn_rect, border_radius=6)
-        pygame.draw.rect(screen, (140, 100, 255) if settings_hovered else (100, 70, 200),
+        screen.draw_rect(settings_bg, settings_btn_rect, border_radius=6)
+        screen.draw_rect((140, 100, 255) if settings_hovered else (100, 70, 200),
                          settings_btn_rect, 2, border_radius=6)
         gear_surf = self.font_large.render("S", True, self.colors['text'])
         screen.blit(gear_surf, gear_surf.get_rect(center=settings_btn_rect.center))
@@ -4285,8 +4686,8 @@ class RoomEditor:
             bg_color = self.colors['panel_light'] if (is_selected or is_hovered) else self.colors['panel']
             border_color = self.colors['accent'] if (is_selected or is_hovered) else self.colors['grid']
 
-            pygame.draw.rect(screen, bg_color, field_rect, border_radius=5)
-            pygame.draw.rect(screen, border_color, field_rect, 2, border_radius=5)
+            screen.draw_rect(bg_color, field_rect, border_radius=5)
+            screen.draw_rect(border_color, field_rect, 2, border_radius=5)
 
             self.clickable_rects.append({'rect': field_rect, 'index': i, 'type': 'item'})
 
@@ -4323,8 +4724,8 @@ class RoomEditor:
                 pygame.draw.rect(glow_surf, (*btn_color, glow_alpha), (0, 0, 260, 60), border_radius=8)
                 screen.blit(glow_surf, (content_x + j * 260 - 5, y_pos - 5))
 
-            pygame.draw.rect(screen, bg_color, btn_rect, border_radius=8)
-            pygame.draw.rect(screen, btn_color, btn_rect, 2, border_radius=8)
+            screen.draw_rect(bg_color, btn_rect, border_radius=8)
+            screen.draw_rect(btn_color, btn_rect, 2, border_radius=8)
 
             self.clickable_rects.append({'rect': btn_rect, 'index': btn_index, 'type': 'item'})
 
@@ -4478,8 +4879,8 @@ class RoomEditor:
         shadow.fill((0, 0, 0, 90))
         screen.blit(shadow, (list_rect.x - 3, list_rect.y - 3))
 
-        pygame.draw.rect(screen, self.colors['panel'], list_rect, border_radius=5)
-        pygame.draw.rect(screen, self.colors['accent'], list_rect, 2, border_radius=5)
+        screen.draw_rect(self.colors['panel'], list_rect, border_radius=5)
+        screen.draw_rect(self.colors['accent'], list_rect, 2, border_radius=5)
 
         current = getattr(self.editing_room, 'ambient_weather', 'none')
         mouse_pos = pygame.mouse.get_pos()
@@ -4490,7 +4891,7 @@ class RoomEditor:
 
             is_current = (weather_type == current)
             if item_rect.collidepoint(mouse_pos):
-                pygame.draw.rect(screen, self.colors['panel_light'], item_rect)
+                screen.draw_rect(self.colors['panel_light'], item_rect)
 
             text_color = self.colors['accent'] if is_current else self.colors['text']
             label = weather_type.capitalize() + ('  \u2713' if is_current else '')
@@ -4557,8 +4958,8 @@ class RoomEditor:
         shadow.fill((0, 0, 0, 90))
         screen.blit(shadow, (list_rect.x - 3, list_rect.y - 3))
 
-        pygame.draw.rect(screen, self.colors['panel'], list_rect, border_radius=5)
-        pygame.draw.rect(screen, self.colors['accent'], list_rect, 2, border_radius=5)
+        screen.draw_rect(self.colors['panel'], list_rect, border_radius=5)
+        screen.draw_rect(self.colors['accent'], list_rect, 2, border_radius=5)
 
         current = getattr(self.editing_room, 'music_track', '')
         mouse_pos = pygame.mouse.get_pos()
@@ -4579,7 +4980,7 @@ class RoomEditor:
             # track_name here is the raw filename, so compare stem-to-stem.
             is_current = (os.path.splitext(track_name)[0] == current) if track_name else (current == '')
             if item_rect.collidepoint(mouse_pos):
-                pygame.draw.rect(screen, self.colors['panel_light'], item_rect)
+                screen.draw_rect(self.colors['panel_light'], item_rect)
 
             text_color = self.colors['accent'] if is_current else self.colors['text']
             display = os.path.splitext(track_name)[0] if track_name else 'None'
@@ -4613,8 +5014,8 @@ class RoomEditor:
         screen.blit(shadow, (PX - 4, PY - 4))
 
         # Panel body
-        pygame.draw.rect(screen, self.colors['panel'], self._bg_panel_rect, border_radius=8)
-        pygame.draw.rect(screen, self.colors['accent'], self._bg_panel_rect, 2, border_radius=8)
+        screen.draw_rect(self.colors['panel'], self._bg_panel_rect, border_radius=8)
+        screen.draw_rect(self.colors['accent'], self._bg_panel_rect, 2, border_radius=8)
 
         bg_selected = self._room_bg_get('image', '')
         bg_scroll_x = float(self._room_bg_get('scroll_x', 0.0))
@@ -4660,16 +5061,16 @@ class RoomEditor:
         clr_rect = pygame.Rect(PX + 12, sy, inner_w, 26)
         mx, my   = pygame.mouse.get_pos()
         clr_hov  = clr_rect.collidepoint(mx, my)
-        pygame.draw.rect(screen, (130, 40, 40) if clr_hov else (70, 25, 25),
+        screen.draw_rect((130, 40, 40) if clr_hov else (70, 25, 25),
                          clr_rect, border_radius=4)
-        pygame.draw.rect(screen, self.colors['danger'], clr_rect, 1, border_radius=4)
+        screen.draw_rect(self.colors['danger'], clr_rect, 1, border_radius=4)
         clr_s = self.font_medium.render('Clear Background', True, self.colors['danger'])
         screen.blit(clr_s, clr_s.get_rect(center=clr_rect.center))
         self._bg_clear_rect = clr_rect
         sy += 34
 
         # ── Divider ──────────────────────────────────────────────────────
-        pygame.draw.line(screen, self.colors['panel_border'],
+        screen.draw_line(self.colors['panel_border'],
                          (PX + 8, sy), (PX + self.PANEL_W - 8, sy))
         sy += 8
 
@@ -4703,8 +5104,8 @@ class RoomEditor:
                           self.colors['panel_border'])
                 bw = 2 if (is_sel or is_hov) else 1
 
-                pygame.draw.rect(screen, (18, 18, 32), cell, border_radius=4)
-                pygame.draw.rect(screen, border, cell, bw, border_radius=4)
+                screen.draw_rect((18, 18, 32), cell, border_radius=4)
+                screen.draw_rect(border, cell, bw, border_radius=4)
 
                 thumb = self._load_bg_thumb(fname)
                 if thumb:
@@ -4736,8 +5137,7 @@ class RoomEditor:
                 dot_y  = grid_rect.top + int(grid_rect.height * d / max(1, n - 1))
                 ratio  = self._bg_scroll / max(1, max_scroll)
                 active = abs(d / max(1, n - 1) - ratio) < 0.15
-                pygame.gfxdraw.filled_circle(
-                    screen, dot_x, dot_y, 3,
+                screen.filled_circle(dot_x, dot_y, 3,
                     self.colors['accent'] if active else self.colors['panel_border'])
 
     def _draw_bg_slider(self, screen, x, y, width, key, label, value, display):
@@ -4750,11 +5150,11 @@ class RoomEditor:
 
         track_y = y + self.SLIDER_H + 2
         track   = pygame.Rect(x, track_y, width, self.SLIDER_TRACK)
-        pygame.draw.rect(screen, self.colors['slider_track'], track, border_radius=3)
+        screen.draw_rect(self.colors['slider_track'], track, border_radius=3)
 
         fill_w = max(0, int(value * width))
         if fill_w:
-            pygame.draw.rect(screen, self.colors['slider_fill'],
+            screen.draw_rect(self.colors['slider_fill'],
                              pygame.Rect(x, track_y, fill_w, self.SLIDER_TRACK),
                              border_radius=3)
 
@@ -4766,12 +5166,12 @@ class RoomEditor:
         hovered  = (abs(mx - thumb_x) <= THUMB_R + 3
                     and abs(my - thumb_cy) <= THUMB_R + 3)
         tcol = self.colors['accent'] if (dragging or hovered) else self.colors['text']
-        pygame.gfxdraw.filled_circle(screen, thumb_x, thumb_cy, THUMB_R, tcol)
-        pygame.gfxdraw.aacircle(screen, thumb_x, thumb_cy, THUMB_R, self.colors['panel_border'])
+        screen.filled_circle(thumb_x, thumb_cy, THUMB_R, tcol)
+        screen.aacircle(thumb_x, thumb_cy, THUMB_R, self.colors['panel_border'])
 
         if key in ('scroll_x', 'scroll_y'):
             mid_x = x + width // 2
-            pygame.draw.line(screen, self.colors['panel_border'],
+            screen.draw_line(self.colors['panel_border'],
                              (mid_x, track_y - 3), (mid_x, track_y + self.SLIDER_TRACK + 3), 1)
 
         self._bg_slider_rects[key] = track
@@ -4834,8 +5234,8 @@ class RoomEditor:
             bg_color = self.colors['panel_light'] if (is_selected or is_hovered) else self.colors['panel']
             border_color = self.colors['accent'] if (is_selected or is_hovered) else self.colors['grid']
 
-            pygame.draw.rect(screen, bg_color, field_rect, border_radius=5)
-            pygame.draw.rect(screen, border_color, field_rect, 2, border_radius=5)
+            screen.draw_rect(bg_color, field_rect, border_radius=5)
+            screen.draw_rect(border_color, field_rect, 2, border_radius=5)
 
             self.clickable_rects.append({'rect': field_rect, 'index': i, 'type': 'item'})
 
@@ -4876,8 +5276,8 @@ class RoomEditor:
             row_rect = pygame.Rect(content_x + j * (row_w + 12), y_pos + 22, row_w, 34)
             bg_color = self.colors['panel_light'] if (is_selected or is_hovered) else self.colors['panel']
             border_color = self.colors['accent'] if (is_selected or is_hovered) else self.colors['grid']
-            pygame.draw.rect(screen, bg_color, row_rect, border_radius=5)
-            pygame.draw.rect(screen, border_color, row_rect, 2, border_radius=5)
+            screen.draw_rect(bg_color, row_rect, border_radius=5)
+            screen.draw_rect(border_color, row_rect, 2, border_radius=5)
             self.clickable_rects.append({'rect': row_rect, 'index': idx, 'type': 'item'})
 
             if field_id == 'weather':
@@ -4901,8 +5301,8 @@ class RoomEditor:
         box_x = content_x + 130
         box_rect = pygame.Rect(box_x, y_pos, box_size, box_size)
         border_color = self.colors['accent'] if (is_selected or is_hovered) else self.colors['grid']
-        pygame.draw.rect(screen, self.colors['panel'], box_rect, border_radius=4)
-        pygame.draw.rect(screen, border_color, box_rect, 2, border_radius=4)
+        screen.draw_rect(self.colors['panel'], box_rect, border_radius=4)
+        screen.draw_rect(border_color, box_rect, 2, border_radius=4)
         if can_attack_val:
             check_surf = self.font_medium.render('X', True, self.colors['success'])
             screen.blit(check_surf, check_surf.get_rect(center=box_rect.center))
@@ -4920,8 +5320,8 @@ class RoomEditor:
         bg_row_rect = pygame.Rect(content_x, y_pos, field_width, 34)
         bg_bg_color = self.colors['panel_light'] if (is_selected or is_hovered) else self.colors['panel']
         bg_border_color = self.colors['accent'] if (is_selected or is_hovered) else self.colors['grid']
-        pygame.draw.rect(screen, bg_bg_color, bg_row_rect, border_radius=5)
-        pygame.draw.rect(screen, bg_border_color, bg_row_rect, 2, border_radius=5)
+        screen.draw_rect(bg_bg_color, bg_row_rect, border_radius=5)
+        screen.draw_rect(bg_border_color, bg_row_rect, 2, border_radius=5)
         self.clickable_rects.append({'rect': bg_row_rect, 'index': 7, 'type': 'item'})
 
         bg_hint = ' (CLICK to configure)' if (is_selected or is_hovered) else ''
@@ -4950,8 +5350,8 @@ class RoomEditor:
                 pygame.draw.rect(glow_surf, (*btn_color, glow_alpha), (0, 0, 180, 60), border_radius=8)
                 screen.blit(glow_surf, (content_x + j * 180 - 5, y_pos - 5))
 
-            pygame.draw.rect(screen, bg_color, btn_rect, border_radius=8)
-            pygame.draw.rect(screen, btn_color, btn_rect, 2, border_radius=8)
+            screen.draw_rect(bg_color, btn_rect, border_radius=8)
+            screen.draw_rect(btn_color, btn_rect, 2, border_radius=8)
 
             self.clickable_rects.append({'rect': btn_rect, 'index': btn_index, 'type': 'item'})
 
@@ -4980,8 +5380,8 @@ class RoomEditor:
         box_x = (self.screen_width - box_width) // 2
         box_y = (self.screen_height - box_height) // 2
 
-        pygame.draw.rect(screen, self.colors['panel'], (box_x, box_y, box_width, box_height), border_radius=10)
-        pygame.draw.rect(screen, self.colors['accent'], (box_x, box_y, box_width, box_height), 3, border_radius=10)
+        screen.draw_rect(self.colors['panel'], (box_x, box_y, box_width, box_height), border_radius=10)
+        screen.draw_rect(self.colors['accent'], (box_x, box_y, box_width, box_height), 3, border_radius=10)
 
         prompt_text = "Enter group name:" if self.editing_field == 'new_group' else "Enter value:"
 
@@ -4991,8 +5391,8 @@ class RoomEditor:
         screen.blit(prompt, (prompt_x, box_y + 20))
 
         input_rect = pygame.Rect(box_x + 20, box_y + 50, box_width - 40, 40)
-        pygame.draw.rect(screen, self.colors['panel_light'], input_rect, border_radius=5)
-        pygame.draw.rect(screen, self.colors['accent'], input_rect, 2, border_radius=5)
+        screen.draw_rect(self.colors['panel_light'], input_rect, border_radius=5)
+        screen.draw_rect(self.colors['accent'], input_rect, 2, border_radius=5)
 
         cursor = "_" if int(self.cursor_blink * 2) % 2 == 0 else ""
         input_text = self.font_medium.render(self.text_input + cursor, True, self.colors['text'])
@@ -5045,8 +5445,8 @@ class RoomEditor:
             screen.blit(glow_surf, (x - 5, y - 5))
 
         bg_color = self.colors['panel_light'] if selected else self.colors['panel']
-        pygame.draw.rect(screen, bg_color, panel_rect, border_radius=8)
-        pygame.draw.rect(screen, color, panel_rect, 2, border_radius=8)
+        screen.draw_rect(bg_color, panel_rect, border_radius=8)
+        screen.draw_rect(color, panel_rect, 2, border_radius=8)
 
         text_color = color if selected else self.colors['text_dim']
         label_surf = self.font_large.render(label, True, text_color)
@@ -5067,8 +5467,8 @@ class RoomEditor:
             screen.blit(glow_surf, (x - 5, y - 5))
 
         color = self.colors['panel_light'] if selected else self.colors['panel']
-        pygame.draw.rect(screen, color, panel_rect, border_radius=8)
-        pygame.draw.rect(screen, self.colors['accent'] if selected else self.colors['grid'],
+        screen.draw_rect(color, panel_rect, border_radius=8)
+        screen.draw_rect(self.colors['accent'] if selected else self.colors['grid'],
                          panel_rect, 2, border_radius=8)
 
         # Colored icon
@@ -5079,8 +5479,8 @@ class RoomEditor:
         group_hash = hash(group_name) % 360
         icon_color = self._hue_to_rgb(group_hash)
 
-        pygame.gfxdraw.filled_circle(screen, icon_x, icon_y, icon_radius, icon_color)
-        pygame.gfxdraw.aacircle(screen, icon_x, icon_y, icon_radius, self.colors['text'])
+        screen.filled_circle(icon_x, icon_y, icon_radius, icon_color)
+        screen.aacircle(icon_x, icon_y, icon_radius, self.colors['text'])
 
         # Group name
         name_surf = self.font_large.render(group_name, True, self.colors['text'])

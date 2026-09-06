@@ -269,6 +269,176 @@ def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
 
 
+class _ZoomedViewport:
+    """Virtual zoom canvas projected directly onto a sub-rect of the real
+    GPUScreen.
+
+    Self-contained copy of the same fix room_editor.py uses for its own
+    continuous zoom (its ``_ZoomedScreen``) -- kept private to this module
+    rather than imported, since room_editor.py's own canvas always covers
+    the whole screen and has no notion of a screen-space (ox, oy) origin.
+    Adding that origin here is what lets the same trick work for a viewport
+    that's only a sub-panel of the edit-view layout (surrounded by the top
+    bar / side panels / timeline), rather than the full window.
+
+    draw_* / blit calls made against an instance of this class are in
+    "virtual" (unscaled, base-scale) coordinates -- exactly the same
+    coordinate space the old CPU intermediate Surface used -- and are
+    projected onto the real GPUScreen as (coord * zoom) + origin, so SDL's
+    GPU-side stretched blit does the scaling per call instead of a
+    CPU-bound pygame.transform.scale() over the whole canvas once a frame.
+    """
+
+    __slots__ = ("_screen", "_zoom", "_w", "_h", "_ox", "_oy")
+
+    def __init__(self, screen, zoom, real_width, real_height, origin=(0, 0)):
+        self._screen = screen
+        self._zoom = float(zoom)
+        self._w = max(1, int(real_width / self._zoom))
+        self._h = max(1, int(real_height / self._zoom))
+        self._ox, self._oy = origin
+
+    def _rect(self, rect):
+        r = pygame.Rect(rect)
+        return pygame.Rect(
+            round(r.x * self._zoom) + self._ox, round(r.y * self._zoom) + self._oy,
+            max(1, round(r.w * self._zoom)),
+            max(1, round(r.h * self._zoom)),
+        )
+
+    def _point(self, point):
+        return (round(point[0] * self._zoom) + self._ox, round(point[1] * self._zoom) + self._oy)
+
+    def _width(self, width):
+        return 0 if width <= 0 else max(1, round(width * self._zoom))
+
+    def blit(self, surface, dest, area=None, special_flags=0):
+        if isinstance(dest, pygame.Rect):
+            dst = self._rect(dest)
+        else:
+            x, y = dest
+            a = area if isinstance(area, pygame.Rect) else (pygame.Rect(area) if area is not None else None)
+            w, h = a.size if a else surface.get_size()
+            dst = pygame.Rect(
+                round(x * self._zoom) + self._ox, round(y * self._zoom) + self._oy,
+                max(1, round(w * self._zoom)),
+                max(1, round(h * self._zoom)),
+            )
+        return self._screen.blit(surface, dst, area=area, special_flags=special_flags)
+
+    def blit_scaled(self, surface, dst_rect, area=None):
+        return self.blit(surface, dst_rect, area=area)
+
+    def blits(self, seq, doreturn=True):
+        rects = [] if doreturn else None
+        for item in seq:
+            if len(item) == 2:
+                surface, dest = item
+                area = None
+            else:
+                surface, dest, area = item
+            self.blit(surface, dest, area=area)
+            if doreturn:
+                if isinstance(dest, pygame.Rect):
+                    rects.append(self._rect(dest))
+                else:
+                    x, y = dest
+                    a = area if isinstance(area, pygame.Rect) else (pygame.Rect(area) if area is not None else None)
+                    w, h = a.size if a else surface.get_size()
+                    rects.append(pygame.Rect(
+                        round(x * self._zoom) + self._ox, round(y * self._zoom) + self._oy,
+                        max(1, round(w * self._zoom)),
+                        max(1, round(h * self._zoom)),
+                    ))
+        return rects
+
+    def blit_transient(self, surface, dest, area=None):
+        if isinstance(dest, pygame.Rect):
+            dst = self._rect(dest)
+        else:
+            x, y = dest
+            a = area if isinstance(area, pygame.Rect) else (pygame.Rect(area) if area is not None else None)
+            w, h = a.size if a else surface.get_size()
+            dst = pygame.Rect(
+                round(x * self._zoom) + self._ox, round(y * self._zoom) + self._oy,
+                max(1, round(w * self._zoom)),
+                max(1, round(h * self._zoom)),
+            )
+        return self._screen.blit_transient(surface, dst, area=area)
+
+    def fill(self, color, rect=None, special_flags=0):
+        # GPUScreen.fill() (unlike a real Surface.fill()) takes no
+        # special_flags -- it's flat-color fill/rect only, no blend-mode
+        # variants -- so it isn't forwarded here. Kept as an accepted
+        # parameter for interface compatibility with any caller that
+        # passes it positionally/by keyword the way Surface.fill() allows.
+        if rect is None:
+            rect = pygame.Rect(0, 0, self._w, self._h)
+        return self._screen.fill(color, self._rect(rect))
+
+    def get_size(self):
+        return self._w, self._h
+
+    def get_width(self):
+        return self._w
+
+    def get_height(self):
+        return self._h
+
+    def get_rect(self, **kwargs):
+        rect = pygame.Rect(0, 0, self._w, self._h)
+        for attr, value in kwargs.items():
+            setattr(rect, attr, value)
+        return rect
+
+    def set_clip(self, rect):
+        return self._screen.set_clip(None if rect is None else self._rect(rect))
+
+    def get_clip(self):
+        return self._screen.get_clip()
+
+    def draw_rect(self, color, rect, width=0, border_radius=0,
+                  border_top_left_radius=-1, border_top_right_radius=-1,
+                  border_bottom_left_radius=-1, border_bottom_right_radius=-1):
+        scale_radius = lambda r: -1 if r < 0 else self._width(r)
+        return self._screen.draw_rect(
+            color, self._rect(rect), self._width(width),
+            border_radius=scale_radius(border_radius),
+            border_top_left_radius=scale_radius(border_top_left_radius),
+            border_top_right_radius=scale_radius(border_top_right_radius),
+            border_bottom_left_radius=scale_radius(border_bottom_left_radius),
+            border_bottom_right_radius=scale_radius(border_bottom_right_radius),
+        )
+
+    def draw_line(self, color, start_pos, end_pos, width=1):
+        return self._screen.draw_line(
+            color, self._point(start_pos), self._point(end_pos), self._width(width)
+        )
+
+    def draw_circle(self, color, center, radius, width=0):
+        return self._screen.draw_circle(
+            color, self._point(center), max(1, round(radius * self._zoom)),
+            self._width(width)
+        )
+
+    def draw_polygon(self, color, points, width=0):
+        return self._screen.draw_polygon(
+            color, [self._point(p) for p in points], self._width(width)
+        )
+
+    def filled_circle(self, x, y, radius, color):
+        return self._screen.filled_circle(
+            round(x * self._zoom) + self._ox, round(y * self._zoom) + self._oy,
+            max(1, round(radius * self._zoom)), color
+        )
+
+    def aacircle(self, x, y, radius, color):
+        return self._screen.aacircle(
+            round(x * self._zoom) + self._ox, round(y * self._zoom) + self._oy,
+            max(1, round(radius * self._zoom)), color
+        )
+
+
 class CutsceneEditor:
     """Full cutscene editor.  Mirrors SpriteEditor / RoomEditor API:
     toggle() / handle_input(event) / update(dt) / draw(screen).
@@ -2522,8 +2692,14 @@ class CutsceneEditor:
                               costume=actor_def.get('costume', 'base'))
             elif atype == 'boss':
                 from entities.boss_enemy import BossEnemy
-                return BossEnemy(x, y, boss_id=actor_def.get('enemy_type', 'pui_pui'),
+                boss = BossEnemy(x, y, boss_id=actor_def.get('enemy_type', 'pui_pui'),
                                  variant=actor_def.get('variant', 'default'))
+                # Every real spawn site sets this right after construction
+                # (see game.py's _spawn_room_entities) — BossEnemy defaults
+                # to inactive otherwise, which made cutscene bosses build
+                # fine but draw as nothing.
+                boss.active = True
+                return boss
             elif atype == 'npc':
                 from entities.npc import NPC
                 npc_id  = actor_def.get('enemy_type', 'generic')
@@ -2531,6 +2707,9 @@ class CutsceneEditor:
                 npc = NPC(x, y, None)
                 npc.npc_id  = npc_id
                 npc.variant = variant
+                # See the boss branch above — NPC also defaults to inactive
+                # until a spawn site flips this on.
+                npc.active  = True
                 try:
                     from core.sprite_system import create_npc_sprite
                     npc.sprite     = create_npc_sprite(npc_id, variant, npc.width, npc.height)
@@ -2540,8 +2719,12 @@ class CutsceneEditor:
                 return npc
             else:
                 from entities.enemy import Enemy
-                return Enemy(x, y, enemy_type=actor_def.get('enemy_type', 'tiger_bandit'),
+                enemy = Enemy(x, y, enemy_type=actor_def.get('enemy_type', 'tiger_bandit'),
                              variant=actor_def.get('variant', 'default'))
+                # See the boss branch above — Enemy also defaults to
+                # inactive until a spawn site flips this on.
+                enemy.active = True
+                return enemy
         except Exception as ex:
             print(f'[CutsceneEditor] entity_factory error: {ex}')
             return None
@@ -2776,14 +2959,14 @@ class CutsceneEditor:
             screen, W - 104, 18, 84, _BTN_H, 'CLOSE', _C['danger'])
 
         # New cutscene box
-        pygame.draw.rect(screen, _C['panel'], (60, 88, W - 120, 76), border_radius=6)
-        pygame.draw.rect(screen, _C['border'], (60, 88, W - 120, 76), 1, border_radius=6)
+        screen.draw_rect(_C['panel'], (60, 88, W - 120, 76), border_radius=6)
+        screen.draw_rect(_C['border'], (60, 88, W - 120, 76), 1, border_radius=6)
         lbl = self.font_medium.render('New cutscene name:', True, _C['text_dim'])
         screen.blit(lbl, (78, 102))
         tf = pygame.Rect(78, 122, W - 286, 30)
         col = _C['accent'] if self._new_name_focus else _C['border']
-        pygame.draw.rect(screen, _C['highlight'], tf, border_radius=4)
-        pygame.draw.rect(screen, col, tf, 1, border_radius=4)
+        screen.draw_rect(_C['highlight'], tf, border_radius=4)
+        screen.draw_rect(col, tf, 1, border_radius=4)
         txt = self.font_medium.render(
             self._new_name_buf + ('|' if self._new_name_focus else ''), True, _C['white'])
         screen.blit(txt, (tf.x + 6, tf.y + 6))
@@ -2805,10 +2988,10 @@ class CutsceneEditor:
                 ry  = items_top + i * row_h - self._list_scroll
                 col = _C['sel'] if i == self._list_sel else _C['panel']
                 r   = pygame.Rect(60, ry, W - 120, row_h - 4)
-                pygame.draw.rect(screen, col, r, border_radius=5)
-                pygame.draw.rect(screen, _C['border'], r, 1, border_radius=5)
+                screen.draw_rect(col, r, border_radius=5)
+                screen.draw_rect(_C['border'], r, 1, border_radius=5)
                 # colour bar
-                pygame.draw.rect(screen, _ACTOR_COLORS[i % len(_ACTOR_COLORS)],
+                screen.draw_rect(_ACTOR_COLORS[i % len(_ACTOR_COLORS)],
                                  (r.x, r.y, 4, r.height), border_radius=2)
                 nt = self.font_large.render(name, True, _C['text'])
                 screen.blit(nt, (r.x + 14, r.y + (row_h - 4 - nt.get_height()) // 2))
@@ -2839,12 +3022,16 @@ class CutsceneEditor:
         screen.fill(_C['bg'])
 
         # ── 1. Viewport (draw first so panels overlay borders) ─────────────────
+        # Was: render into a CPU pygame.Surface sized to vp, then blit it in
+        # whole. _draw_viewport now draws straight onto the real GPUScreen
+        # through a _ZoomedViewport (see its docstring) -- clip to vp so the
+        # zoomed content can't paint over the surrounding panels, same as
+        # the old vp_surf's bounds did automatically.
         vp = self._vp_rect
-        vp_surf = pygame.Surface((vp.width, vp.height))
-        vp_surf.fill((30, 120, 30))
-        self._draw_viewport(vp_surf)
-        screen.blit(vp_surf, (vp.x, vp.y))
-        pygame.draw.rect(screen, _C['border'], vp, 1)
+        screen.set_clip(vp)
+        self._draw_viewport(screen, vp)
+        screen.set_clip(None)
+        screen.draw_rect(_C['border'], vp, 1)
 
         # Pick-mode banner
         if self._pick_mode:
@@ -2898,8 +3085,8 @@ class CutsceneEditor:
                     scr_x = int(vp.x + (ax * RENDER_SCALE - self.camera.x) * self._vp_zoom)
                     scr_y = int(vp.y + (ay * RENDER_SCALE - self.camera.y) * self._vp_zoom)
                     ring_r = int(16 * self._vp_zoom)
-                    pygame.draw.circle(screen, col,   (scr_x, scr_y), ring_r, 2)
-                    pygame.draw.circle(screen, _C['white'], (scr_x, scr_y), ring_r, 1)
+                    screen.draw_circle(col,   (scr_x, scr_y), ring_r, 2)
+                    screen.draw_circle(_C['white'], (scr_x, scr_y), ring_r, 1)
                     hint = self.font_small.render('drag to move', True, col)
                     screen.blit(hint, (scr_x + ring_r + 4,
                                        scr_y - hint.get_height() // 2))
@@ -2928,10 +3115,10 @@ class CutsceneEditor:
                 # Ghost actor circle + crosshair at cursor
                 num_actors = len(self.cutscene_data.get('actors', [])) if self.cutscene_data else 0
                 ghost_col = _ACTOR_COLORS[num_actors % len(_ACTOR_COLORS)]
-                pygame.draw.circle(screen, ghost_col, (mx, my), 13, 2)
-                pygame.draw.circle(screen, _C['white'], (mx, my), 13, 1)
-                pygame.draw.line(screen, ghost_col, (mx - 18, my), (mx + 18, my), 1)
-                pygame.draw.line(screen, ghost_col, (mx, my - 18), (mx, my + 18), 1)
+                screen.draw_circle(ghost_col, (mx, my), 13, 2)
+                screen.draw_circle(_C['white'], (mx, my), 13, 1)
+                screen.draw_line(ghost_col, (mx - 18, my), (mx + 18, my), 1)
+                screen.draw_line(ghost_col, (mx, my - 18), (mx, my + 18), 1)
                 actor_id = self._place_actor_def.get('id', 'actor')
                 lbl = self.font_small.render(actor_id, True, ghost_col)
                 screen.blit(lbl, (mx + 16, my - lbl.get_height() // 2))
@@ -2942,9 +3129,9 @@ class CutsceneEditor:
                                      'pick_fly_to', 'pick_teleport'):
                 # Crosshair + world-coord label for camera / move targets
                 arm = 22
-                pygame.draw.line(screen, _C['accent'], (mx - arm, my), (mx + arm, my), 1)
-                pygame.draw.line(screen, _C['accent'], (mx, my - arm), (mx, my + arm), 1)
-                pygame.draw.circle(screen, _C['accent'], (mx, my), 5, 1)
+                screen.draw_line(_C['accent'], (mx - arm, my), (mx + arm, my), 1)
+                screen.draw_line(_C['accent'], (mx, my - arm), (mx, my + arm), 1)
+                screen.draw_circle(_C['accent'], (mx, my), 5, 1)
                 coord_lbl = self.font_mono.render(f'({wx:.1f}, {wy:.1f})', True, _C['accent'])
                 screen.blit(coord_lbl, (mx + arm + 4, my - coord_lbl.get_height() // 2))
 
@@ -2969,15 +3156,15 @@ class CutsceneEditor:
                 if direction in ('up', 'down'):
                     # Only Y matters: vertical guide from the actor down to
                     # the cursor's height; the stop marker sits on that line.
-                    pygame.draw.line(screen, _C['accent2'], (a_scr_x, a_scr_y), (a_scr_x, my), 2)
-                    pygame.draw.circle(screen, _C['accent2'], (a_scr_x, my), 5, 1)
+                    screen.draw_line(_C['accent2'], (a_scr_x, a_scr_y), (a_scr_x, my), 2)
+                    screen.draw_circle(_C['accent2'], (a_scr_x, my), 5, 1)
                     coord_lbl = self.font_mono.render(f'stop Y = {wy:.1f}', True, _C['accent2'])
                     screen.blit(coord_lbl, (a_scr_x + 10, my - coord_lbl.get_height() // 2))
                 else:
                     # Only X matters: horizontal guide from the actor across
                     # to the cursor's position.
-                    pygame.draw.line(screen, _C['accent2'], (a_scr_x, a_scr_y), (mx, a_scr_y), 2)
-                    pygame.draw.circle(screen, _C['accent2'], (mx, a_scr_y), 5, 1)
+                    screen.draw_line(_C['accent2'], (a_scr_x, a_scr_y), (mx, a_scr_y), 2)
+                    screen.draw_circle(_C['accent2'], (mx, a_scr_y), 5, 1)
                     coord_lbl = self.font_mono.render(f'stop X = {wx:.1f}', True, _C['accent2'])
                     screen.blit(coord_lbl, (mx + 10, a_scr_y - coord_lbl.get_height() // 2))
 
@@ -2999,20 +3186,20 @@ class CutsceneEditor:
 
         # ── 3. Left panel ──────────────────────────────────────────────────────
         lp = self._left_panel_rect()
-        pygame.draw.rect(screen, _C['panel2'], lp)
-        pygame.draw.line(screen, _C['border'], (lp.right, lp.y), (lp.right, lp.bottom), 1)
+        screen.draw_rect(_C['panel2'], lp)
+        screen.draw_line(_C['border'], (lp.right, lp.y), (lp.right, lp.bottom), 1)
         self._draw_left_panel(screen, lp)
 
         # ── 4. Right panel ─────────────────────────────────────────────────────
         rp = self._right_panel_rect()
-        pygame.draw.rect(screen, _C['panel2'], rp)
-        pygame.draw.line(screen, _C['border'], (rp.x, rp.y), (rp.x, rp.bottom), 1)
+        screen.draw_rect(_C['panel2'], rp)
+        screen.draw_line(_C['border'], (rp.x, rp.y), (rp.x, rp.bottom), 1)
         self._draw_right_panel(screen, rp)
 
         # ── 5. Timeline ────────────────────────────────────────────────────────
         tl = self._tl_panel_rect()
-        pygame.draw.rect(screen, _C['panel'], tl)
-        pygame.draw.line(screen, _C['border'], (tl.x, tl.y), (tl.right, tl.y), 1)
+        screen.draw_rect(_C['panel'], tl)
+        screen.draw_line(_C['border'], (tl.x, tl.y), (tl.right, tl.y), 1)
         self._draw_timeline(screen, tl)
 
         # ── 6. Dialogue box ────────────────────────────────────────────────────
@@ -3053,8 +3240,8 @@ class CutsceneEditor:
             shadow = pygame.Surface((dr.width + 4, dr.height + 4), pygame.SRCALPHA)
             shadow.fill((0, 0, 0, 110))
             screen.blit(shadow, (dr.x + 2, dr.y + 2))
-            pygame.draw.rect(screen, _C['panel2'], dr)
-            pygame.draw.rect(screen, _C['accent'],  dr, 1)
+            screen.draw_rect(_C['panel2'], dr)
+            screen.draw_rect(_C['accent'],  dr, 1)
             scroll = self._portrait_dropdown_scroll
             for i in range(visible):
                 actual = i + scroll
@@ -3066,12 +3253,12 @@ class CutsceneEditor:
                 iy    = dr.y + 4 + i * item_h
                 ir    = pygame.Rect(dr.x + 1, iy, dr.width - 2, item_h)
                 if key == cur_val:
-                    pygame.draw.rect(screen, _C['accent'], ir)
+                    screen.draw_rect(_C['accent'], ir)
                     text_col = _C['bg']
                 else:
                     hmx, hmy = pygame.mouse.get_pos()
                     if ir.collidepoint(hmx, hmy):
-                        pygame.draw.rect(screen, _C['highlight'], ir)
+                        screen.draw_rect(_C['highlight'], ir)
                     text_col = _C['text']
                 lbl = self.font_small.render(label, True, text_col)
                 screen.blit(lbl, (ir.x + 6, iy + (item_h - lbl.get_height()) // 2))
@@ -3090,8 +3277,8 @@ class CutsceneEditor:
             shadow = pygame.Surface((dr.width + 4, dr.height + 4), pygame.SRCALPHA)
             shadow.fill((0, 0, 0, 110))
             screen.blit(shadow, (dr.x + 2, dr.y + 2))
-            pygame.draw.rect(screen, _C['panel2'], dr)
-            pygame.draw.rect(screen, _C['accent'],  dr, 1)
+            screen.draw_rect(_C['panel2'], dr)
+            screen.draw_rect(_C['accent'],  dr, 1)
             scroll = self._character_dropdown_scroll
             for i in range(visible):
                 actual = i + scroll
@@ -3102,12 +3289,12 @@ class CutsceneEditor:
                 iy    = dr.y + 4 + i * item_h
                 ir    = pygame.Rect(dr.x + 1, iy, dr.width - 2, item_h)
                 if key == cur_val:
-                    pygame.draw.rect(screen, _C['accent'], ir)
+                    screen.draw_rect(_C['accent'], ir)
                     text_col = _C['bg']
                 else:
                     hmx, hmy = pygame.mouse.get_pos()
                     if ir.collidepoint(hmx, hmy):
-                        pygame.draw.rect(screen, _C['highlight'], ir)
+                        screen.draw_rect(_C['highlight'], ir)
                     text_col = _C['text']
                 lbl = self.font_small.render(label, True, text_col)
                 screen.blit(lbl, (ir.x + 6, iy + (item_h - lbl.get_height()) // 2))
@@ -3129,8 +3316,8 @@ class CutsceneEditor:
             shadow = pygame.Surface((dr.width + 4, dr.height + 4), pygame.SRCALPHA)
             shadow.fill((0, 0, 0, 110))
             screen.blit(shadow, (dr.x + 2, dr.y + 2))
-            pygame.draw.rect(screen, _C['panel2'], dr)
-            pygame.draw.rect(screen, _C['accent2'], dr, 1)
+            screen.draw_rect(_C['panel2'], dr)
+            screen.draw_rect(_C['accent2'], dr, 1)
             scroll = self._costume_dropdown_scroll
             for i in range(visible):
                 actual = i + scroll
@@ -3141,12 +3328,12 @@ class CutsceneEditor:
                 iy    = dr.y + 4 + i * item_h
                 ir    = pygame.Rect(dr.x + 1, iy, dr.width - 2, item_h)
                 if key == cur_val:
-                    pygame.draw.rect(screen, _C['accent2'], ir)
+                    screen.draw_rect(_C['accent2'], ir)
                     text_col = _C['bg']
                 else:
                     hmx, hmy = pygame.mouse.get_pos()
                     if ir.collidepoint(hmx, hmy):
-                        pygame.draw.rect(screen, _C['highlight'], ir)
+                        screen.draw_rect(_C['highlight'], ir)
                     text_col = _C['text']
                 lbl = self.font_small.render(label, True, text_col)
                 screen.blit(lbl, (ir.x + 6, iy + (item_h - lbl.get_height()) // 2))
@@ -3167,8 +3354,8 @@ class CutsceneEditor:
             shadow = pygame.Surface((dr.width + 4, dr.height + 4), pygame.SRCALPHA)
             shadow.fill((0, 0, 0, 110))
             screen.blit(shadow, (dr.x + 2, dr.y + 2))
-            pygame.draw.rect(screen, _C['panel2'], dr)
-            pygame.draw.rect(screen, _SOUND_COLOR, dr, 1)
+            screen.draw_rect(_C['panel2'], dr)
+            screen.draw_rect(_SOUND_COLOR, dr, 1)
             scroll = self._sound_dropdown_scroll
             for i in range(visible):
                 actual = i + scroll
@@ -3179,12 +3366,12 @@ class CutsceneEditor:
                 iy    = dr.y + 4 + i * item_h
                 ir    = pygame.Rect(dr.x + 1, iy, dr.width - 2, item_h)
                 if key == cur_val:
-                    pygame.draw.rect(screen, _SOUND_COLOR, ir)
+                    screen.draw_rect(_SOUND_COLOR, ir)
                     text_col = _C['bg']
                 else:
                     hmx, hmy = pygame.mouse.get_pos()
                     if ir.collidepoint(hmx, hmy):
-                        pygame.draw.rect(screen, _C['highlight'], ir)
+                        screen.draw_rect(_C['highlight'], ir)
                     text_col = _C['text']
                 lbl = self.font_small.render(label, True, text_col)
                 screen.blit(lbl, (ir.x + 6, iy + (item_h - lbl.get_height()) // 2))
@@ -3206,8 +3393,8 @@ class CutsceneEditor:
             shadow = pygame.Surface((dr.width + 4, dr.height + 4), pygame.SRCALPHA)
             shadow.fill((0, 0, 0, 110))
             screen.blit(shadow, (dr.x + 2, dr.y + 2))
-            pygame.draw.rect(screen, _C['panel2'], dr)
-            pygame.draw.rect(screen, _C['accent2'], dr, 1)
+            screen.draw_rect(_C['panel2'], dr)
+            screen.draw_rect(_C['accent2'], dr, 1)
             scroll = self._etype_dropdown_scroll
             for i in range(visible):
                 actual = i + scroll
@@ -3218,12 +3405,12 @@ class CutsceneEditor:
                 iy    = dr.y + 4 + i * item_h
                 ir    = pygame.Rect(dr.x + 1, iy, dr.width - 2, item_h)
                 if key == cur_val:
-                    pygame.draw.rect(screen, _C['accent2'], ir)
+                    screen.draw_rect(_C['accent2'], ir)
                     text_col = _C['bg']
                 else:
                     hmx, hmy = pygame.mouse.get_pos()
                     if ir.collidepoint(hmx, hmy):
-                        pygame.draw.rect(screen, _C['highlight'], ir)
+                        screen.draw_rect(_C['highlight'], ir)
                     text_col = _C['text']
                 lbl = self.font_small.render(label, True, text_col)
                 screen.blit(lbl, (ir.x + 6, iy + (item_h - lbl.get_height()) // 2))
@@ -3236,24 +3423,40 @@ class CutsceneEditor:
                 screen.blit(hint, (dr.x + dr.width - hint.get_width() - 4,
                                    dr.bottom - hint.get_height() - 2))
 
-    def _draw_viewport(self, surf):
-        """Render the room and actors into *surf* with zoom support.
+    def _draw_viewport(self, screen, vp):
+        """Render the room and actors into viewport rect *vp* on the real
+        GPUScreen, with zoom support.
 
-        Strategy: render at RENDER_SCALE into a smaller intermediate surface
-        (iw × ih = vw/zoom × vh/zoom), then scale that surface back up to fill
-        *surf*.  This means tile drawing code and sprite drawing code are
-        unchanged — they still use RENDER_SCALE — and zoom is purely visual.
+        This used to render at RENDER_SCALE into a smaller CPU-side
+        intermediate Surface (iw x ih = vw/zoom x vh/zoom) cached across
+        frames, then pygame.transform.scale() that up to fill *vp* every
+        frame. That's the same "offscreen canvas area grows as 1/zoom^2,
+        plus a CPU-bound full-frame transform.scale() on top" shape that
+        was tanking room_editor.py's FPS when zoomed out (see
+        room_editor.py's _ZoomedScreen / _draw_view_room) -- zooming out
+        here grows iw/ih the same way, so it was only a matter of time
+        before it hit the same wall.
+
+        Fixed the same way room_editor.py was: draw calls below target a
+        _ZoomedViewport (a private, self-contained copy of the same idea
+        room_editor.py's _ZoomedScreen uses, plus a screen-space origin
+        offset since this viewport is a sub-panel, not the whole window)
+        wrapping the real screen, so each one lands on the real GPUScreen
+        already scaled by SDL's GPU-side stretched blit, instead of
+        accumulating into a big CPU surface that then needs one expensive
+        software scale per frame. Tile/sprite drawing code below is
+        unchanged -- it still works in RENDER_SCALE, unscaled, "world"
+        coordinates; the _ZoomedViewport is what makes zoom purely visual,
+        same contract as before.
         """
         zoom = self._vp_zoom
-        vw, vh = surf.get_size()
+        vscreen = _ZoomedViewport(screen, zoom, vp.width, vp.height, origin=(vp.x, vp.y))
+        vscreen.fill((30, 120, 30))
 
-        # Intermediate surface size: how much world we see at base scale
-        iw = max(1, int(vw / zoom))
-        ih = max(1, int(vh / zoom))
-        if not hasattr(self, '_inter_surf') or self._inter_surf.get_size() != (iw, ih):
-            self._inter_surf = pygame.Surface((iw, ih)).convert()
-        inter = self._inter_surf
-        inter.fill((30, 120, 30))
+        # How much world we see at base scale -- vscreen.get_size() already
+        # does exactly the iw/ih = real_size/zoom division internally.
+        iw, ih = vscreen.get_size()
+        inter = vscreen  # kept as `inter` below to minimize the diff
 
         room = self._get_current_room()
         te   = getattr(self.room_editor, 'tileset_editor', None)
@@ -3274,8 +3477,8 @@ class CutsceneEditor:
             # Room boundary outline
             rx = -cam_x
             ry = -cam_y
-            pygame.draw.rect(inter, _C['accent'],
-                             (rx, ry, room.width * RENDER_SCALE, room.height * RENDER_SCALE), 2)
+            inter.draw_rect(_C['accent'],
+                            (rx, ry, room.width * RENDER_SCALE, room.height * RENDER_SCALE), 2)
 
         # Actor placement snap grid — shown only while it's actually relevant
         # (placing a new actor or dragging an existing one) so it doesn't
@@ -3346,19 +3549,6 @@ class CutsceneEditor:
             # state on self._runtime but nothing ever blitted it here.
             self._runtime.draw_weather(inter, iw, ih)
             self._runtime.draw_overlay(inter, iw, ih)
-
-        # Scale the intermediate surface to fill the viewport.
-        # Cache the output surface — pygame.transform.scale allocates a new
-        # Surface on every call, which means a malloc+free every frame at any
-        # zoom level other than 1.0.  Reuse a persistent surface instead.
-        if zoom == 1.0:
-            surf.blit(inter, (0, 0))
-        else:
-            if (not hasattr(self, '_scaled_surf')
-                    or self._scaled_surf.get_size() != (vw, vh)):
-                self._scaled_surf = pygame.Surface((vw, vh)).convert()
-            pygame.transform.scale(inter, (vw, vh), self._scaled_surf)
-            surf.blit(self._scaled_surf, (0, 0))
 
     def _invalidate_tile_cache(self, room_name=None):
         """Drop baked tile surfaces so they are rebuilt on the next draw.
@@ -3516,7 +3706,7 @@ class CutsceneEditor:
         while x * RENDER_SCALE - cx <= vw:
             sx = x * RENDER_SCALE - cx
             if 0 <= sx <= vw:
-                pygame.draw.line(surf, grid_col, (sx, 0), (sx, vh), 1)
+                surf.draw_line(grid_col, (sx, 0), (sx, vh), 1)
             x += size
 
         ys = (cy // RENDER_SCALE // size) * size
@@ -3524,7 +3714,7 @@ class CutsceneEditor:
         while y * RENDER_SCALE - cy <= vh:
             sy = y * RENDER_SCALE - cy
             if 0 <= sy <= vh:
-                pygame.draw.line(surf, grid_col, (0, sy), (vw, sy), 1)
+                surf.draw_line(grid_col, (0, sy), (vw, sy), 1)
             y += size
 
     def _draw_viewport_tiles(self, inter, room, cam_x, cam_y, foreground: bool):
@@ -3611,16 +3801,16 @@ class CutsceneEditor:
 
             # Selection highlight ring around the sprite centre
             if selected:
-                pygame.draw.circle(inter_surf, col, (sx, sy), 14, 2)
-                pygame.draw.circle(inter_surf, _C['white'], (sx, sy), 14, 1)
+                inter_surf.draw_circle(col, (sx, sy), 14, 2)
+                inter_surf.draw_circle(_C['white'], (sx, sy), 14, 1)
             else:
-                pygame.draw.circle(inter_surf, col, (sx, sy), 10, 1)
+                inter_surf.draw_circle(col, (sx, sy), 10, 1)
         else:
             # Fallback: plain coloured circle
             r = 10 if selected else 7
-            pygame.draw.circle(inter_surf, col, (sx, sy), r)
+            inter_surf.draw_circle(col, (sx, sy), r)
             if selected:
-                pygame.draw.circle(inter_surf, _C['white'], (sx, sy), r, 2)
+                inter_surf.draw_circle(_C['white'], (sx, sy), r, 2)
 
         # Label (always drawn so the actor is identifiable)
         lbl = self.font_small.render(actor.get('id', '?'), True, col)
@@ -3630,8 +3820,8 @@ class CutsceneEditor:
 
     def _draw_top_bar(self, screen):
         bar_w = self.screen_width
-        pygame.draw.rect(screen, _C['panel'], (0, 0, bar_w, _TOP_H))
-        pygame.draw.line(screen, _C['border'], (0, _TOP_H), (bar_w, _TOP_H), 1)
+        screen.draw_rect(_C['panel'], (0, 0, bar_w, _TOP_H))
+        screen.draw_line(_C['border'], (0, _TOP_H), (bar_w, _TOP_H), 1)
 
         # Back
         self._btns['back'] = self._draw_button(
@@ -3652,8 +3842,8 @@ class CutsceneEditor:
         dur_display = (self._duration_buf + '|') if self._duration_focus else f'{dur:.1f} s'
         dur_col     = _C['accent'] if self._duration_focus else _C['border']
         dur_r       = pygame.Rect(dur_x, dur_fy, dur_fw, dur_fh)
-        pygame.draw.rect(screen, _C['highlight'], dur_r, border_radius=3)
-        pygame.draw.rect(screen, dur_col, dur_r, 1, border_radius=3)
+        screen.draw_rect(_C['highlight'], dur_r, border_radius=3)
+        screen.draw_rect(dur_col, dur_r, 1, border_radius=3)
         dur_lbl = self.font_small.render(
             dur_display, True, _C['white'] if self._duration_focus else _C['text_dim'])
         screen.blit(dur_lbl, (dur_r.x + 5, dur_r.y + (dur_fh - dur_lbl.get_height()) // 2))
@@ -3663,7 +3853,7 @@ class CutsceneEditor:
         tc = self.font_mono.render(
             f'{self._tl_playhead_t:05.2f}', True, _C['accent2'])
         cx = bar_w // 2
-        pygame.draw.rect(screen, _C['highlight'],
+        screen.draw_rect(_C['highlight'],
                          (cx - tc.get_width() // 2 - 10, 7,
                           tc.get_width() + 20, _BTN_H), border_radius=4)
         screen.blit(tc, (cx - tc.get_width() // 2, (_TOP_H - tc.get_height()) // 2))
@@ -3758,10 +3948,10 @@ class CutsceneEditor:
 
             row_r = pygame.Rect(x, y, W, 26)
             bg    = _C['sel'] if selected else _C['highlight']
-            pygame.draw.rect(screen, bg, row_r, border_radius=3)
+            screen.draw_rect(bg, row_r, border_radius=3)
 
             # Color strip
-            pygame.draw.rect(screen, color, (x, y, 3, 26), border_radius=2)
+            screen.draw_rect(color, (x, y, 3, 26), border_radius=2)
 
             # Label
             it = self.font_small.render(label, True, _C['text'])
@@ -3825,10 +4015,10 @@ class CutsceneEditor:
         if max_scroll > 0:
             ax = lp.right - 12
             if scroll > 0:
-                pygame.draw.polygon(screen, _C['text_dim'], [
+                screen.draw_polygon(_C['text_dim'], [
                     (ax - 6, y0 + 10), (ax, y0 + 2), (ax + 6, y0 + 10)])
             if scroll < max_scroll:
-                pygame.draw.polygon(screen, _C['text_dim'], [
+                screen.draw_polygon(_C['text_dim'], [
                     (ax - 6, lp.bottom - 10), (ax, lp.bottom - 2), (ax + 6, lp.bottom - 10)])
 
         screen.set_clip(None)
@@ -3987,8 +4177,8 @@ class CutsceneEditor:
                         f'<  {display_buf}  >', _C['highlight'])
                     rgb = _COLOR_PRESETS.get(buf, (0, 0, 0))
                     swatch_r = pygame.Rect(x + W - swatch_w, y, swatch_w, 22)
-                    pygame.draw.rect(screen, rgb, swatch_r, border_radius=3)
-                    pygame.draw.rect(screen, _C['border'], swatch_r, 1, border_radius=3)
+                    screen.draw_rect(rgb, swatch_r, border_radius=3)
+                    screen.draw_rect(_C['border'], swatch_r, 1, border_radius=3)
                 else:
                     self._btns[f'cycle_{key}'] = self._draw_button(
                         screen, x, y, W, 22, f'<  {display_buf}  >', _C['highlight'])
@@ -4081,8 +4271,8 @@ class CutsceneEditor:
         tracks_y     = ruler_y + _TL_RULER_H
 
         # ── Header strip ───────────────────────────────────────────────────────
-        pygame.draw.rect(screen, _C['panel'], (tl.x, hdr_y, tl.width, _TL_HDR_H))
-        pygame.draw.line(screen, _C['border'], (tl.x, hdr_y + _TL_HDR_H),
+        screen.draw_rect(_C['panel'], (tl.x, hdr_y, tl.width, _TL_HDR_H))
+        screen.draw_line(_C['border'], (tl.x, hdr_y + _TL_HDR_H),
                          (tl.right, hdr_y + _TL_HDR_H), 1)
 
         # ADD / DUP / DEL
@@ -4115,9 +4305,9 @@ class CutsceneEditor:
                             hdr_y + (_TL_HDR_H - dur_t.get_height()) // 2))
 
         # ── Ruler ──────────────────────────────────────────────────────────────
-        pygame.draw.rect(screen, _C['ruler_bg'],
+        screen.draw_rect(_C['ruler_bg'],
                          (label_end_x, ruler_y, time_area_w, _TL_RULER_H))
-        pygame.draw.line(screen, _C['border'],
+        screen.draw_line(_C['border'],
                          (label_end_x, ruler_y + _TL_RULER_H),
                          (tl.right, ruler_y + _TL_RULER_H), 1)
 
@@ -4134,7 +4324,7 @@ class CutsceneEditor:
             is_second = (round(t * 2) % 2 == 0)
             tick_h    = 10 if is_second else 5
             col       = _C['text_dim'] if is_second else _C['border']
-            pygame.draw.line(screen, col,
+            screen.draw_line(col,
                              (tx, ruler_y + _TL_RULER_H - tick_h),
                              (tx, ruler_y + _TL_RULER_H), 1)
             if is_second:
@@ -4189,7 +4379,7 @@ class CutsceneEditor:
             # Row background — child (sub-lane) rows get a subtly darker
             # tint so the parent/child grouping reads at a glance.
             row_bg = _C['highlight'] if i % 2 == 0 else _C['panel2']
-            pygame.draw.rect(screen, row_bg,
+            screen.draw_rect(row_bg,
                              (label_end_x, row_y, time_area_w, _TL_ROW_H))
             if row['kind'] == 'child':
                 shade = pygame.Surface((time_area_w, _TL_ROW_H), pygame.SRCALPHA)
@@ -4199,7 +4389,7 @@ class CutsceneEditor:
             # Grid-snap guide lines — drawn under the keyframes so diamonds
             # sitting exactly on a grid line still read clearly.
             for gx in _grid_xs:
-                pygame.draw.line(screen, (55, 62, 90),
+                screen.draw_line((55, 62, 90),
                                  (gx, row_y), (gx, row_y + _TL_ROW_H), 1)
 
             # Draw keyframes for this row — parent rows always show every
@@ -4245,7 +4435,7 @@ class CutsceneEditor:
                 kf_size  = 8 if dragging else 6
                 self._draw_keyframe_diamond(screen, kf_x, kf_cy, kf_size, color, selected)
 
-            pygame.draw.line(screen, _C['border'],
+            screen.draw_line(_C['border'],
                              (label_end_x, row_y + _TL_ROW_H - 1),
                              (tl.right, row_y + _TL_ROW_H - 1), 1)
 
@@ -4256,27 +4446,27 @@ class CutsceneEditor:
         screen.set_clip(pygame.Rect(label_end_x, ruler_y, time_area_w, tl.bottom - ruler_y))
         ph_x = label_end_x + self._tl_playhead_t * time_zoom - scroll_x
         if label_end_x <= ph_x <= tl.right:
-            pygame.draw.line(screen, _C['playhead'],
+            screen.draw_line(_C['playhead'],
                              (ph_x, ruler_y), (ph_x, tl.bottom), 1)
             # Triangle handle at top of ruler
             pts = [(ph_x, ruler_y + _TL_RULER_H),
                    (ph_x - 6, ruler_y + 4),
                    (ph_x + 6, ruler_y + 4)]
-            pygame.draw.polygon(screen, _C['playhead'], pts)
+            screen.draw_polygon(_C['playhead'], pts)
 
         screen.set_clip(None)
 
         # ── Label column ───────────────────────────────────────────────────────
         # Draw over the clip region so labels are always visible
-        pygame.draw.rect(screen, _C['panel'],
+        screen.draw_rect(_C['panel'],
                          (tl.x, content_y, _TL_LABEL_W, tl.height - _TL_HDR_H))
-        pygame.draw.line(screen, _C['border'],
+        screen.draw_line(_C['border'],
                          (label_end_x, content_y), (label_end_x, tl.bottom), 1)
 
         # Ruler label cell
-        pygame.draw.rect(screen, _C['ruler_bg'],
+        screen.draw_rect(_C['ruler_bg'],
                          (tl.x, ruler_y, _TL_LABEL_W, _TL_RULER_H))
-        pygame.draw.line(screen, _C['border'],
+        screen.draw_line(_C['border'],
                          (tl.x, ruler_y + _TL_RULER_H),
                          (label_end_x, ruler_y + _TL_RULER_H), 1)
         ph_lbl = self.font_mono.render(f'{self._tl_playhead_t:.2f}s', True, _C['playhead'])
@@ -4290,7 +4480,7 @@ class CutsceneEditor:
                 continue
             label, color = row['label'], row['color']
             row_bg = _C['highlight'] if i % 2 == 0 else _C['panel2']
-            pygame.draw.rect(screen, row_bg,
+            screen.draw_rect(row_bg,
                              (tl.x, row_y, _TL_LABEL_W, _TL_ROW_H))
             if row['kind'] == 'child':
                 shade = pygame.Surface((_TL_LABEL_W, _TL_ROW_H), pygame.SRCALPHA)
@@ -4298,7 +4488,7 @@ class CutsceneEditor:
                 screen.blit(shade, (tl.x, row_y))
 
             # Color swatch
-            pygame.draw.rect(screen, color,
+            screen.draw_rect(color,
                              (tl.x, row_y + 2, 3, _TL_ROW_H - 4), border_radius=1)
 
             text_x = tl.x + 7
@@ -4315,14 +4505,14 @@ class CutsceneEditor:
                     pts = [(cx - 4, cy - 3), (cx + 4, cy - 3), (cx, cy + 4)]
                 else:
                     pts = [(cx - 3, cy - 4), (cx - 3, cy + 4), (cx + 4, cy)]
-                pygame.draw.polygon(screen, _C['text_dim'], pts)
+                screen.draw_polygon(_C['text_dim'], pts)
                 text_x += 12
 
             text_col = _C['text_dim'] if row['kind'] == 'child' else _C['text']
             lbl_surf = self.font_small.render(label, True, text_col)
             screen.blit(lbl_surf,
                         (text_x, row_y + (_TL_ROW_H - lbl_surf.get_height()) // 2))
-            pygame.draw.line(screen, _C['border'],
+            screen.draw_line(_C['border'],
                              (tl.x, row_y + _TL_ROW_H - 1),
                              (label_end_x, row_y + _TL_ROW_H - 1), 1)
         screen.set_clip(None)
@@ -4341,11 +4531,11 @@ class CutsceneEditor:
         visible_h = tl.bottom - tracks_y
         if content_h > visible_h:
             if self._tl_scroll_y > 0:
-                pygame.draw.polygon(screen, _C['text_dim'], [
+                screen.draw_polygon(_C['text_dim'], [
                     (label_end_x - 14, tracks_y + 10), (label_end_x - 8, tracks_y + 2),
                     (label_end_x - 2, tracks_y + 10)])
             if self._tl_scroll_y < content_h - visible_h:
-                pygame.draw.polygon(screen, _C['text_dim'], [
+                screen.draw_polygon(_C['text_dim'], [
                     (label_end_x - 14, tl.bottom - 10), (label_end_x - 8, tl.bottom - 2),
                     (label_end_x - 2, tl.bottom - 10)])
 
@@ -4361,25 +4551,25 @@ class CutsceneEditor:
         """
         pts = [(cx, cy - size), (cx + size, cy),
                (cx, cy + size), (cx - size, cy)]
-        pygame.draw.polygon(screen, color, pts)
+        screen.draw_polygon(color, pts)
         if selected:
-            pygame.draw.polygon(screen, _C['white'], pts, 2)
+            screen.draw_polygon(_C['white'], pts, 2)
         else:
-            pygame.draw.polygon(screen, (0, 0, 0, 120), pts, 1)
+            screen.draw_polygon((0, 0, 0, 120), pts, 1)
 
     def _draw_section_header(self, screen, x, y, W, text):
         t = self.font_small.render(text, True, _C['text_dim'])
         screen.blit(t, (x, y))
-        pygame.draw.line(screen, _C['border'],
+        screen.draw_line(_C['border'],
                          (x + t.get_width() + 6, y + t.get_height() // 2),
                          (x + W, y + t.get_height() // 2), 1)
 
     def _draw_divider(self, screen, x, y, W):
-        pygame.draw.line(screen, _C['border'], (x, y), (x + W, y), 1)
+        screen.draw_line(_C['border'], (x, y), (x + W, y), 1)
 
     def _draw_button(self, screen, x, y, w, h, label, color):
         r = pygame.Rect(x, y, w, h)
-        pygame.draw.rect(screen, color, r, border_radius=4)
+        screen.draw_rect(color, r, border_radius=4)
         t = self.font_small.render(label, True, _C['white'])
         screen.blit(t, (r.centerx - t.get_width() // 2,
                         r.centery - t.get_height() // 2))
@@ -4403,8 +4593,8 @@ class CutsceneEditor:
         """
         r   = pygame.Rect(x, y, W, 24)
         col = _C['accent'] if focused else _C['border']
-        pygame.draw.rect(screen, _C['highlight'], r, border_radius=3)
-        pygame.draw.rect(screen, col, r, 1, border_radius=3)
+        screen.draw_rect(_C['highlight'], r, border_radius=3)
+        screen.draw_rect(col, r, 1, border_radius=3)
 
         pad = 5
         max_w = max(1, W - pad * 2)
@@ -4511,8 +4701,8 @@ class CutsceneEditor:
 
         r = pygame.Rect(x, y, W, box_h)
         col = _C['accent'] if focused else _C['border']
-        pygame.draw.rect(screen, _C['highlight'], r, border_radius=3)
-        pygame.draw.rect(screen, col, r, 1, border_radius=3)
+        screen.draw_rect(_C['highlight'], r, border_radius=3)
+        screen.draw_rect(col, r, 1, border_radius=3)
 
         prev_clip = screen.get_clip()
         screen.set_clip(pygame.Rect(r.x + pad_x, r.y + pad_y, max_w, n_rows * line_h))

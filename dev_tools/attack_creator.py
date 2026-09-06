@@ -242,8 +242,8 @@ class Button:
             bg = (170, 60, 60) if self.hovered else (120, 45, 45)
         else:
             bg = (54, 54, 68) if self.hovered else C_PANEL
-        pygame.draw.rect(surf, bg, self.rect, border_radius=4)
-        pygame.draw.rect(surf, C_BORDER, self.rect, width=1, border_radius=4)
+        surf.draw_rect(bg, self.rect, border_radius=4)
+        surf.draw_rect(C_BORDER, self.rect, width=1, border_radius=4)
         color = C_TEXT if self.enabled else C_TEXT_DIM
         text = font.render(self.label, True, color)
         surf.blit(text, text.get_rect(center=self.rect.center))
@@ -278,8 +278,8 @@ class HoldButton(Button):
 
     def draw(self, surf, font):
         bg = (200, 90, 60) if self.pressed else (C_ACCENT if self.hovered else C_ACCENT_DIM)
-        pygame.draw.rect(surf, bg, self.rect, border_radius=4)
-        pygame.draw.rect(surf, C_BORDER, self.rect, width=1, border_radius=4)
+        surf.draw_rect(bg, self.rect, border_radius=4)
+        surf.draw_rect(C_BORDER, self.rect, width=1, border_radius=4)
         text = font.render(self.label, True, C_TEXT)
         surf.blit(text, text.get_rect(center=self.rect.center))
 
@@ -392,19 +392,19 @@ class FieldEditor:
 
         if spec.kind == "bool":
             on = bool(self.value())
-            pygame.draw.rect(surf, C_GOOD if on else C_PANEL_DARK, widget_rect, border_radius=4)
-            pygame.draw.rect(surf, C_BORDER, widget_rect, width=1, border_radius=4)
+            surf.draw_rect(C_GOOD if on else C_PANEL_DARK, widget_rect, border_radius=4)
+            surf.draw_rect(C_BORDER, widget_rect, width=1, border_radius=4)
             txt = font_sm.render("ON" if on else "OFF", True, C_TEXT)
             surf.blit(txt, txt.get_rect(center=widget_rect.center))
         elif spec.kind == "choice":
-            pygame.draw.rect(surf, C_PANEL_DARK, widget_rect, border_radius=4)
-            pygame.draw.rect(surf, C_BORDER, widget_rect, width=1, border_radius=4)
+            surf.draw_rect(C_PANEL_DARK, widget_rect, border_radius=4)
+            surf.draw_rect(C_BORDER, widget_rect, width=1, border_radius=4)
             txt = font_sm.render(str(self.value()), True, C_TEXT)
             surf.blit(txt, txt.get_rect(center=widget_rect.center))
         else:
             bg = C_PANEL if self.editing else C_PANEL_DARK
-            pygame.draw.rect(surf, bg, widget_rect, border_radius=4)
-            pygame.draw.rect(surf, C_ACCENT if self.editing else C_BORDER, widget_rect, width=1, border_radius=4)
+            surf.draw_rect(bg, widget_rect, border_radius=4)
+            surf.draw_rect(C_ACCENT if self.editing else C_BORDER, widget_rect, width=1, border_radius=4)
             if self.editing:
                 shown = self.buffer + ("_" if (pygame.time.get_ticks() // 400) % 2 == 0 else "")
             else:
@@ -464,14 +464,14 @@ class ParamPanel:
     def draw(self, surf, font, font_sm):
         prev_clip = surf.get_clip()
         surf.set_clip(self.rect)
-        pygame.draw.rect(surf, C_PANEL_DARK, self.rect)
+        surf.draw_rect(C_PANEL_DARK, self.rect)
 
         y = self.rect.y - self.scroll
         for kind, payload in self.editors:
             if kind == "header":
                 row = pygame.Rect(self.rect.x, y, self.rect.width, 28)
                 if row.bottom > self.rect.y and row.top < self.rect.bottom:
-                    pygame.draw.rect(surf, (34, 34, 46), row)
+                    surf.draw_rect((34, 34, 46), row)
                     txt = font.render(payload, True, C_ACCENT)
                     surf.blit(txt, (row.x + 8, row.y + 5))
                 y += 28
@@ -485,16 +485,16 @@ class ParamPanel:
                 y += FieldEditor.ROW_H
 
         surf.set_clip(prev_clip)
-        pygame.draw.rect(surf, C_BORDER, self.rect, width=1)
+        surf.draw_rect(C_BORDER, self.rect, width=1)
 
         # scrollbar
         total = self.content_height()
         if total > self.rect.height:
             track = pygame.Rect(self.rect.right - 6, self.rect.y, 6, self.rect.height)
-            pygame.draw.rect(surf, C_PANEL, track)
+            surf.draw_rect(C_PANEL, track)
             thumb_h = max(20, int(self.rect.height * self.rect.height / total))
             thumb_y = self.rect.y + int(self.scroll * (self.rect.height - thumb_h) / max(1, total - self.rect.height))
-            pygame.draw.rect(surf, C_ACCENT_DIM, (track.x, thumb_y, 6, thumb_h), border_radius=3)
+            surf.draw_rect(C_ACCENT_DIM, (track.x, thumb_y, 6, thumb_h), border_radius=3)
 
     def field_under_mouse(self, pos):
         for kind, payload in self.editors:
@@ -838,8 +838,8 @@ class PreviewActor:
             w, h = 20 * scale, self.height * scale
             body = pygame.Rect(0, 0, w, h)
             body.midbottom = (int(screen_x), int(screen_y))
-            pygame.draw.ellipse(surf, (90, 130, 170), body)
-            pygame.draw.ellipse(surf, C_BORDER, body, width=2)
+            surf.draw_ellipse((90, 130, 170), body)
+            surf.draw_ellipse(C_BORDER, body, width=2)
             label = pygame.font.Font(None, 16).render(self.char_id, True, C_TEXT_DIM)
             surf.blit(label, label.get_rect(midtop=(body.centerx, body.bottom + 2)))
 
@@ -1617,8 +1617,8 @@ class AttackCreator:
 
     def _draw_sidebar(self, screen):
         r = self.sidebar_rect
-        pygame.draw.rect(screen, C_PANEL, r)
-        pygame.draw.rect(screen, C_BORDER, r, width=1)
+        screen.draw_rect(C_PANEL, r)
+        screen.draw_rect(C_BORDER, r, width=1)
         title = self.font_lg.render("Attacks", True, C_TEXT)
         screen.blit(title, (r.x + 8, r.y + 6))
 
@@ -1637,7 +1637,7 @@ class AttackCreator:
             row = self._sidebar_row_rect(i)
             selected = cid == self.config.id and arch == self.config.archetype
             if selected:
-                pygame.draw.rect(screen, C_ACCENT_DIM, row, border_radius=3)
+                screen.draw_rect(C_ACCENT_DIM, row, border_radius=3)
             arch_label = ARCHETYPES.get(arch, (arch,))[0]
             txt = self.font_sm.render(f"[{arch_label}] {name}", True, C_TEXT if selected else C_TEXT_DIM)
             screen.blit(txt, (row.x + 6, row.y + 4))
@@ -1646,8 +1646,8 @@ class AttackCreator:
         self.btn_delete.draw(screen, self.font_sm)
 
     def _draw_top_bar(self, screen):
-        pygame.draw.rect(screen, C_PANEL, self.top_rect, border_radius=4)
-        pygame.draw.rect(screen, C_BORDER, self.top_rect, width=1, border_radius=4)
+        screen.draw_rect(C_PANEL, self.top_rect, border_radius=4)
+        screen.draw_rect(C_BORDER, self.top_rect, width=1, border_radius=4)
         self.btn_char_prev.draw(screen, self.font)
         self.btn_char_next.draw(screen, self.font)
         char_name = self.characters[self.char_index]
@@ -1664,13 +1664,13 @@ class AttackCreator:
 
     def _draw_stage(self, screen):
         r = self.stage_rect
-        pygame.draw.rect(screen, (10, 10, 15), r)
-        pygame.draw.rect(screen, C_BORDER, r, width=1)
+        screen.draw_rect((10, 10, 15), r)
+        screen.draw_rect(C_BORDER, r, width=1)
         prev_clip = screen.get_clip()
         screen.set_clip(r)
 
         # simple ground line so travel direction reads clearly
-        pygame.draw.line(screen, (30, 30, 40), (r.x, r.bottom - 40), (r.right, r.bottom - 40), 1)
+        screen.draw_line((30, 30, 40), (r.x, r.bottom - 40), (r.right, r.bottom - 40), 1)
 
         from config.settings import RENDER_SCALE
         # Real LayerManager pass — same draw_layer/get_sort_key() sorting
@@ -1720,9 +1720,9 @@ class AttackCreator:
         hx, hy = self._offset_screen_pos(attr_name)
         color = C_ACCENT if self.paused else C_TEXT_DIM
         radius = 8 if is_dragging else 6
-        pygame.draw.circle(screen, color, (hx, hy), radius, width=0 if is_dragging else 2)
-        pygame.draw.line(screen, color, (hx - 10, hy), (hx + 10, hy), 1)
-        pygame.draw.line(screen, color, (hx, hy - 10), (hx, hy + 10), 1)
+        screen.draw_circle(color, (hx, hy), radius, width=0 if is_dragging else 2)
+        screen.draw_line(color, (hx - 10, hy), (hx + 10, hy), 1)
+        screen.draw_line(color, (hx, hy - 10), (hx, hy + 10), 1)
 
         ox, oy = getattr(self.config, attr_name).get(self.actor.direction, (0, 0))
         label = self.active_tab.replace("_", " ").title()
@@ -1738,8 +1738,8 @@ class AttackCreator:
     def _draw_panel(self, screen):
         for tab_name, rect in self.tab_rects.items():
             active = self.active_tab == tab_name
-            pygame.draw.rect(screen, C_ACCENT_DIM if active else C_PANEL, rect)
-            pygame.draw.rect(screen, C_BORDER, rect, width=1)
+            screen.draw_rect(C_ACCENT_DIM if active else C_PANEL, rect)
+            screen.draw_rect(C_BORDER, rect, width=1)
             label = tab_name.replace("_", " ").title()
             txt = self.font.render(label, True, C_TEXT)
             screen.blit(txt, txt.get_rect(center=rect.center))
@@ -1748,8 +1748,8 @@ class AttackCreator:
             cb = self._charge_enabled_rect()
             on = self.config.set_enabled[self.active_tab]
             label = self.active_tab.replace("_", " ").title()
-            pygame.draw.rect(screen, C_GOOD if on else C_PANEL_DARK, cb, border_radius=4)
-            pygame.draw.rect(screen, C_BORDER, cb, width=1, border_radius=4)
+            screen.draw_rect(C_GOOD if on else C_PANEL_DARK, cb, border_radius=4)
+            screen.draw_rect(C_BORDER, cb, width=1, border_radius=4)
             txt = self.font_sm.render(f"{label}: ON" if on else f"{label}: OFF", True, C_TEXT)
             screen.blit(txt, txt.get_rect(center=cb.center))
 

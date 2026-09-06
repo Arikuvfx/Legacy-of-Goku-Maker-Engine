@@ -2444,8 +2444,8 @@ class SpriteEditor:
         slider_height = 20
 
         # Background
-        pygame.draw.rect(screen, (45, 45, 55), (slider_x, slider_y, slider_width, slider_height))
-        pygame.draw.rect(screen, (80, 80, 90), (slider_x, slider_y, slider_width, slider_height), 1)
+        screen.draw_rect((45, 45, 55), (slider_x, slider_y, slider_width, slider_height))
+        screen.draw_rect((80, 80, 90), (slider_x, slider_y, slider_width, slider_height), 1)
 
         # Calculate progress
         progress = self.tool_options['tolerance'] / 100.0
@@ -2453,14 +2453,14 @@ class SpriteEditor:
         # Fill
         fill_width = int(slider_width * progress)
         fill_color = (100, 200, 255)  # Blue color
-        pygame.draw.rect(screen, fill_color, (slider_x, slider_y, fill_width, slider_height))
+        screen.draw_rect(fill_color, (slider_x, slider_y, fill_width, slider_height))
 
         # Indicator
         indicator_x = slider_x + int(slider_width * progress)
-        pygame.draw.line(screen, (255, 255, 255),
+        screen.draw_line((255, 255, 255),
                          (indicator_x, slider_y - 2),
                          (indicator_x, slider_y + slider_height + 2), 3)
-        pygame.draw.line(screen, (0, 0, 0),
+        screen.draw_line((0, 0, 0),
                          (indicator_x, slider_y - 2),
                          (indicator_x, slider_y + slider_height + 2), 1)
 
@@ -2512,13 +2512,19 @@ class SpriteEditor:
                         blended_g = int(color[1] * alpha + bg_color[1] * (1 - alpha))
                         blended_b = int(color[2] * alpha + bg_color[2] * (1 - alpha))
 
-                        pixel_surface = pygame.Surface((self.pixel_size, self.pixel_size), pygame.SRCALPHA)
-                        pixel_surface.fill((blended_r, blended_g, blended_b, 255))
-                        screen.blit(pixel_surface, (px, py))
+                        # Solid fill, no per-pixel Surface: a fresh
+                        # pygame.Surface here (as this used to do) is a
+                        # brand-new Python object every call, so
+                        # GPUScreen's texture cache (keyed by Surface
+                        # identity) can never reuse it — every opaque
+                        # pixel meant a fresh GPU texture upload every
+                        # single frame. draw_rect with width=0 is a
+                        # native SDL fill_rect instead: no texture at all.
+                        screen.draw_rect((blended_r, blended_g, blended_b), (px, py, self.pixel_size, self.pixel_size))
 
                 # Grid
                 if self.show_grid and self.pixel_size >= 8:
-                    pygame.draw.rect(screen, (60, 60, 70), (px, py, self.pixel_size, self.pixel_size), 1)
+                    screen.draw_rect((60, 60, 70), (px, py, self.pixel_size, self.pixel_size), 1)
 
         # Draw selection preview
         if self.current_tool == 'select' and self.selection_start:
@@ -2542,7 +2548,7 @@ class SpriteEditor:
             screen.blit(selection_surface, (rect_x, rect_y))
 
             # Border
-            pygame.draw.rect(screen, (255, 255, 0), (rect_x, rect_y, rect_w, rect_h), 2)
+            screen.draw_rect((255, 255, 0), (rect_x, rect_y, rect_w, rect_h), 2)
 
         # Draw magic wand selection
         if self.current_tool == 'magicwand' and self.magic_wand_selection:
@@ -2626,7 +2632,7 @@ class SpriteEditor:
                     screen_y = rect_center_y + dy_screen
 
                 handle_rect = pygame.Rect(screen_x - hs, screen_y - hs, hs * 2, hs * 2)
-                pygame.draw.rect(screen, handle_color, handle_rect, 1)
+                screen.draw_rect(handle_color, handle_rect, 1)
 
     def _draw_dashed_rect(self, screen, color, rect, width=1, dash_length=4):
         """Draw a dashed rectangle"""
@@ -2635,22 +2641,22 @@ class SpriteEditor:
         # Top
         for i in range(0, w, dash_length * 2):
             start, end = min(i, w), min(i + dash_length, w)
-            pygame.draw.line(screen, color, (x + start, y), (x + end, y), width)
+            screen.draw_line(color, (x + start, y), (x + end, y), width)
 
         # Bottom
         for i in range(0, w, dash_length * 2):
             start, end = min(i, w), min(i + dash_length, w)
-            pygame.draw.line(screen, color, (x + start, y + h), (x + end, y + h), width)
+            screen.draw_line(color, (x + start, y + h), (x + end, y + h), width)
 
         # Left
         for i in range(0, h, dash_length * 2):
             start, end = min(i, h), min(i + dash_length, h)
-            pygame.draw.line(screen, color, (x, y + start), (x, y + end), width)
+            screen.draw_line(color, (x, y + start), (x, y + end), width)
 
         # Right
         for i in range(0, h, dash_length * 2):
             start, end = min(i, h), min(i + dash_length, h)
-            pygame.draw.line(screen, color, (x + w, y + start), (x + w, y + end), width)
+            screen.draw_line(color, (x + w, y + start), (x + w, y + end), width)
 
     def _draw_tools(self, screen):
         """Draw tool button with dropdown"""
@@ -2661,8 +2667,8 @@ class SpriteEditor:
 
         # Draw main button
         color, border_color = (64, 128, 255), (96, 160, 255)
-        pygame.draw.rect(screen, color, (tool_x, tool_y, tool_size, tool_size))
-        pygame.draw.rect(screen, border_color, (tool_x, tool_y, tool_size, tool_size), 1)
+        screen.draw_rect(color, (tool_x, tool_y, tool_size, tool_size))
+        screen.draw_rect(border_color, (tool_x, tool_y, tool_size, tool_size), 1)
 
         # Draw icon
         if current_tool['id'] in self.tool_icons:
@@ -2676,7 +2682,7 @@ class SpriteEditor:
             (tool_x + tool_size - 6, tool_y + tool_size - 4),
             (tool_x + tool_size - 2, tool_y + tool_size - 8)
         ]
-        pygame.draw.polygon(screen, (200, 200, 200), arrow_points)
+        screen.draw_polygon((200, 200, 200), arrow_points)
 
         # Tool name
         name_text = self.fonts['small'].render(current_tool['name'], True, (220, 220, 220))
@@ -2689,8 +2695,8 @@ class SpriteEditor:
             dropdown_x, dropdown_y = tool_x, tool_y + tool_size + 2
 
             # Background
-            pygame.draw.rect(screen, (45, 45, 55), (dropdown_x, dropdown_y, dropdown_width, dropdown_height))
-            pygame.draw.rect(screen, (96, 160, 255), (dropdown_x, dropdown_y, dropdown_width, dropdown_height), 2)
+            screen.draw_rect((45, 45, 55), (dropdown_x, dropdown_y, dropdown_width, dropdown_height))
+            screen.draw_rect((96, 160, 255), (dropdown_x, dropdown_y, dropdown_width, dropdown_height), 2)
 
             # Items
             mouse_x, mouse_y = pygame.mouse.get_pos()
@@ -2701,9 +2707,9 @@ class SpriteEditor:
 
                 # Highlight
                 if item_rect.collidepoint(mouse_x, mouse_y):
-                    pygame.draw.rect(screen, (64, 128, 255), item_rect)
+                    screen.draw_rect((64, 128, 255), item_rect)
                 elif tool['id'] == self.current_tool:
-                    pygame.draw.rect(screen, (55, 55, 65), item_rect)
+                    screen.draw_rect((55, 55, 65), item_rect)
 
                 # Icon
                 if tool['id'] in self.tool_icons:
@@ -2721,7 +2727,7 @@ class SpriteEditor:
 
                 # Separator
                 if i < len(self.tools) - 1:
-                    pygame.draw.line(screen, (60, 60, 70),
+                    screen.draw_line((60, 60, 70),
                                      (dropdown_x + 5, item_y + dropdown_item_height),
                                      (dropdown_x + dropdown_width - 5, item_y + dropdown_item_height))
 
@@ -2739,14 +2745,14 @@ class SpriteEditor:
             cy = palette_y + i * (color_size + color_spacing)
 
             # Color swatch
-            pygame.draw.rect(screen, color, (palette_x, cy, color_size, color_size))
+            screen.draw_rect(color, (palette_x, cy, color_size, color_size))
 
             # Border
             if color == self.current_color:
-                pygame.draw.rect(screen, (255, 255, 255),
+                screen.draw_rect((255, 255, 255),
                                  (palette_x - 2, cy - 2, color_size + 4, color_size + 4), 2)
             else:
-                pygame.draw.rect(screen, (60, 60, 70), (palette_x, cy, color_size, color_size), 1)
+                screen.draw_rect((60, 60, 70), (palette_x, cy, color_size, color_size), 1)
 
         # Color wheel button with icon
         wheel_btn_y = palette_y + len(self.recent_colors) * (color_size + color_spacing) + 10
@@ -2774,16 +2780,16 @@ class SpriteEditor:
         """Draw current color preview"""
         preview_x, preview_y, preview_size = self.screen_width - 120, 20, 30
 
-        pygame.draw.rect(screen, self.current_color, (preview_x, preview_y, preview_size, preview_size))
-        pygame.draw.rect(screen, (255, 255, 255), (preview_x, preview_y, preview_size, preview_size), 2)
+        screen.draw_rect(self.current_color, (preview_x, preview_y, preview_size, preview_size))
+        screen.draw_rect((255, 255, 255), (preview_x, preview_y, preview_size, preview_size), 2)
 
         label = self.fonts['small'].render("Current:", True, (200, 200, 200))
         screen.blit(label, (preview_x - 70, preview_y + 8))
 
     def _draw_menu_bar(self, screen):
         """Draw top menu bar"""
-        pygame.draw.rect(screen, (35, 35, 42), (0, 0, self.screen_width, 50))
-        pygame.draw.line(screen, (60, 60, 70), (0, 49), (self.screen_width, 49), 1)
+        screen.draw_rect((35, 35, 42), (0, 0, self.screen_width, 50))
+        screen.draw_line((60, 60, 70), (0, 49), (self.screen_width, 49), 1)
 
         buttons = [
             {'id': 'new', 'label': 'New', 'x': 20, 'w': 80},
@@ -2793,8 +2799,8 @@ class SpriteEditor:
 
         for btn in buttons:
             btn_color = (74, 148, 255) if self.button_states[btn['id']] else (45, 45, 55)
-            pygame.draw.rect(screen, btn_color, (btn['x'], 10, btn['w'], 30))
-            pygame.draw.rect(screen, (60, 60, 70), (btn['x'], 10, btn['w'], 30), 1)
+            screen.draw_rect(btn_color, (btn['x'], 10, btn['w'], 30))
+            screen.draw_rect((60, 60, 70), (btn['x'], 10, btn['w'], 30), 1)
 
             text = self.fonts['small'].render(btn['label'], True, (220, 220, 220))
             text_rect = text.get_rect(center=(btn['x'] + btn['w'] // 2, 25))
@@ -2813,8 +2819,8 @@ class SpriteEditor:
             else:
                 tab_color, border_color = (45, 45, 55), (60, 60, 70)
 
-            pygame.draw.rect(screen, tab_color, (tab['x'], 10, tab_width, 30))
-            pygame.draw.rect(screen, border_color, (tab['x'], 10, tab_width, 30), 1)
+            screen.draw_rect(tab_color, (tab['x'], 10, tab_width, 30))
+            screen.draw_rect(border_color, (tab['x'], 10, tab_width, 30), 1)
 
             text = self.fonts['small'].render(tab['label'], True, (220, 220, 220))
             text_rect = text.get_rect(center=(tab['x'] + tab_width // 2, 25))
@@ -2829,8 +2835,8 @@ class SpriteEditor:
         tab_spacing, tab_start_x = 5, 0
 
         # Background
-        pygame.draw.rect(screen, (35, 35, 42), (0, tab_bar_y, self.screen_width, tab_bar_height))
-        pygame.draw.line(screen, (60, 60, 70), (0, tab_bar_y + tab_bar_height - 1),
+        screen.draw_rect((35, 35, 42), (0, tab_bar_y, self.screen_width, tab_bar_height))
+        screen.draw_line((60, 60, 70), (0, tab_bar_y + tab_bar_height - 1),
                          (self.screen_width, tab_bar_y + tab_bar_height - 1), 1)
 
         # Tabs
@@ -2846,8 +2852,8 @@ class SpriteEditor:
             else:
                 tab_color, border_color, text_color = (45, 45, 55), (60, 60, 70), (200, 200, 200)
 
-            pygame.draw.rect(screen, tab_color, (tab_x, tab_bar_y + 2, tab_width, tab_bar_height - 4))
-            pygame.draw.rect(screen, border_color, (tab_x, tab_bar_y + 2, tab_width, tab_bar_height - 4), 1)
+            screen.draw_rect(tab_color, (tab_x, tab_bar_y + 2, tab_width, tab_bar_height - 4))
+            screen.draw_rect(border_color, (tab_x, tab_bar_y + 2, tab_width, tab_bar_height - 4), 1)
 
             # Canvas name
             name = canvas['name']
@@ -2867,15 +2873,15 @@ class SpriteEditor:
                 mouse_x, mouse_y = pygame.mouse.get_pos()
                 if close_btn_x <= mouse_x <= close_btn_x + close_btn_size and \
                         close_btn_y <= mouse_y <= close_btn_y + close_btn_size:
-                    pygame.draw.rect(screen, (255, 100, 100),
+                    screen.draw_rect((255, 100, 100),
                                      (close_btn_x, close_btn_y, close_btn_size, close_btn_size),
                                      border_radius=3)
 
                 x_color = (255, 255, 255) if i == self.current_canvas_index else (200, 200, 200)
-                pygame.draw.line(screen, x_color,
+                screen.draw_line(x_color,
                                  (close_btn_x + 4, close_btn_y + 4),
                                  (close_btn_x + close_btn_size - 4, close_btn_y + close_btn_size - 4), 2)
-                pygame.draw.line(screen, x_color,
+                screen.draw_line(x_color,
                                  (close_btn_x + close_btn_size - 4, close_btn_y + 4),
                                  (close_btn_x + 4, close_btn_y + close_btn_size - 4), 2)
 
@@ -2888,8 +2894,8 @@ class SpriteEditor:
             btn_color = (64, 128, 255) if new_btn_x <= mouse_x <= new_btn_x + new_btn_size and \
                                           new_btn_y <= mouse_y <= new_btn_y + new_btn_size else (55, 55, 65)
 
-            pygame.draw.rect(screen, btn_color, (new_btn_x, new_btn_y, new_btn_size, new_btn_size), border_radius=4)
-            pygame.draw.rect(screen, (100, 100, 110), (new_btn_x, new_btn_y, new_btn_size, new_btn_size),
+            screen.draw_rect(btn_color, (new_btn_x, new_btn_y, new_btn_size, new_btn_size), border_radius=4)
+            screen.draw_rect((100, 100, 110), (new_btn_x, new_btn_y, new_btn_size, new_btn_size),
                              1, border_radius=4)
 
             plus_text = self.fonts['large'].render("+", True, (220, 220, 220))
@@ -2899,8 +2905,8 @@ class SpriteEditor:
     def _draw_status_bar(self, screen):
         """Draw bottom status bar"""
         status_y = self.screen_height - 30
-        pygame.draw.rect(screen, (35, 35, 42), (0, status_y, self.screen_width, 30))
-        pygame.draw.line(screen, (60, 60, 70), (0, status_y), (self.screen_width, status_y), 1)
+        screen.draw_rect((35, 35, 42), (0, status_y, self.screen_width, 30))
+        screen.draw_line((60, 60, 70), (0, status_y), (self.screen_width, status_y), 1)
 
         # Info text
         info_parts = [
@@ -2931,8 +2937,8 @@ class SpriteEditor:
         box_x = (self.screen_width - box_width) // 2
         box_y = (self.screen_height - box_height) // 2
 
-        pygame.draw.rect(screen, (45, 45, 55), (box_x, box_y, box_width, box_height))
-        pygame.draw.rect(screen, (64, 128, 255), (box_x, box_y, box_width, box_height), 3)
+        screen.draw_rect((45, 45, 55), (box_x, box_y, box_width, box_height))
+        screen.draw_rect((64, 128, 255), (box_x, box_y, box_width, box_height), 3)
 
         # Title
         field_label = "Width" if self.canvas_size_field == "width" else "Height"
@@ -2941,8 +2947,8 @@ class SpriteEditor:
 
         # Input field
         input_rect = pygame.Rect(box_x + 20, box_y + 60, box_width - 40, 40)
-        pygame.draw.rect(screen, (60, 60, 70), input_rect)
-        pygame.draw.rect(screen, (255, 255, 255), input_rect, 2)
+        screen.draw_rect((60, 60, 70), input_rect)
+        screen.draw_rect((255, 255, 255), input_rect, 2)
 
         input_text = self.fonts['large'].render(self.canvas_size_input, True, (255, 255, 255))
         screen.blit(input_text, (box_x + 30, box_y + 68))
@@ -2965,8 +2971,8 @@ class SpriteEditor:
         panel_y = self.color_wheel_pos[1]
 
         # Main panel background
-        pygame.draw.rect(screen, (50, 50, 58), (panel_x, panel_y, panel_width, panel_height), border_radius=8)
-        pygame.draw.rect(screen, (80, 80, 90), (panel_x, panel_y, panel_width, panel_height), 2, border_radius=8)
+        screen.draw_rect((50, 50, 58), (panel_x, panel_y, panel_width, panel_height), border_radius=8)
+        screen.draw_rect((80, 80, 90), (panel_x, panel_y, panel_width, panel_height), 2, border_radius=8)
 
         # Title
         title = self.fonts['medium'].render("Colors", True, (220, 220, 220))
@@ -3006,9 +3012,9 @@ class SpriteEditor:
                                            self.selected_saturation * wheel_radius)
 
         # Outer white circle
-        pygame.draw.circle(screen, (255, 255, 255), (indicator_x, indicator_y), 5, 2)
+        screen.draw_circle((255, 255, 255), (indicator_x, indicator_y), 5, 2)
         # Inner black circle
-        pygame.draw.circle(screen, (0, 0, 0), (indicator_x, indicator_y), 6, 1)
+        screen.draw_circle((0, 0, 0), (indicator_x, indicator_y), 6, 1)
 
         # === VALUE SLIDER (below wheel) ===
         slider_y = wheel_center_y - 10 + wheel_radius + 25
@@ -3020,19 +3026,19 @@ class SpriteEditor:
         for i in range(slider_width):
             progress = i / slider_width
             color = self.hsv_to_rgb(self.selected_hue, self.selected_saturation, progress)
-            pygame.draw.line(screen, color,
+            screen.draw_line(color,
                              (slider_x + i, slider_y),
                              (slider_x + i, slider_y + slider_height))
 
         # Slider border
-        pygame.draw.rect(screen, (100, 100, 110), (slider_x, slider_y, slider_width, slider_height + 1), 1)
+        screen.draw_rect((100, 100, 110), (slider_x, slider_y, slider_width, slider_height + 1), 1)
 
         # Value indicator
         value_pos = slider_x + int(self.selected_value * slider_width)
-        pygame.draw.line(screen, (255, 255, 255),
+        screen.draw_line((255, 255, 255),
                          (value_pos, slider_y - 2),
                          (value_pos, slider_y + slider_height + 2), 3)
-        pygame.draw.line(screen, (0, 0, 0),
+        screen.draw_line((0, 0, 0),
                          (value_pos, slider_y - 2),
                          (value_pos, slider_y + slider_height + 2), 1)
 
@@ -3056,16 +3062,16 @@ class SpriteEditor:
         for i in range(rgb_slider_width):
             r_val = int((i / rgb_slider_width) * 255)
             color = (r_val, self.current_color[1], self.current_color[2])
-            pygame.draw.line(screen, color,
+            screen.draw_line(color,
                              (rgb_slider_x + i, r_slider_y),
                              (rgb_slider_x + i, r_slider_y + rgb_slider_height))
 
-        pygame.draw.rect(screen, (100, 100, 110), (rgb_slider_x, r_slider_y, rgb_slider_width, rgb_slider_height + 1),
+        screen.draw_rect((100, 100, 110), (rgb_slider_x, r_slider_y, rgb_slider_width, rgb_slider_height + 1),
                          1)
 
         # R indicator
         r_pos = rgb_slider_x + int((self.current_color[0] / 255) * rgb_slider_width)
-        pygame.draw.line(screen, (255, 255, 255),
+        screen.draw_line((255, 255, 255),
                          (r_pos, r_slider_y - 2),
                          (r_pos, r_slider_y + rgb_slider_height + 2), 2)
 
@@ -3082,16 +3088,16 @@ class SpriteEditor:
         for i in range(rgb_slider_width):
             g_val = int((i / rgb_slider_width) * 255)
             color = (self.current_color[0], g_val, self.current_color[2])
-            pygame.draw.line(screen, color,
+            screen.draw_line(color,
                              (rgb_slider_x + i, g_slider_y),
                              (rgb_slider_x + i, g_slider_y + rgb_slider_height))
 
-        pygame.draw.rect(screen, (100, 100, 110), (rgb_slider_x, g_slider_y, rgb_slider_width, rgb_slider_height + 1),
+        screen.draw_rect((100, 100, 110), (rgb_slider_x, g_slider_y, rgb_slider_width, rgb_slider_height + 1),
                          1)
 
         # G indicator
         g_pos = rgb_slider_x + int((self.current_color[1] / 255) * rgb_slider_width)
-        pygame.draw.line(screen, (255, 255, 255),
+        screen.draw_line((255, 255, 255),
                          (g_pos, g_slider_y - 2),
                          (g_pos, g_slider_y + rgb_slider_height + 2), 2)
 
@@ -3108,16 +3114,16 @@ class SpriteEditor:
         for i in range(rgb_slider_width):
             b_val = int((i / rgb_slider_width) * 255)
             color = (self.current_color[0], self.current_color[1], b_val)
-            pygame.draw.line(screen, color,
+            screen.draw_line(color,
                              (rgb_slider_x + i, b_slider_y),
                              (rgb_slider_x + i, b_slider_y + rgb_slider_height))
 
-        pygame.draw.rect(screen, (100, 100, 110), (rgb_slider_x, b_slider_y, rgb_slider_width, rgb_slider_height + 1),
+        screen.draw_rect((100, 100, 110), (rgb_slider_x, b_slider_y, rgb_slider_width, rgb_slider_height + 1),
                          1)
 
         # B indicator
         b_pos = rgb_slider_x + int((self.current_color[2] / 255) * rgb_slider_width)
-        pygame.draw.line(screen, (255, 255, 255),
+        screen.draw_line((255, 255, 255),
                          (b_pos, b_slider_y - 2),
                          (b_pos, b_slider_y + rgb_slider_height + 2), 2)
 
@@ -3145,16 +3151,16 @@ class SpriteEditor:
         for i in range(hsv_slider_width):
             hue = (i / hsv_slider_width) * 360
             color = self.hsv_to_rgb(hue, 1.0, 1.0)
-            pygame.draw.line(screen, color,
+            screen.draw_line(color,
                              (hsv_slider_x + i, h_slider_y),
                              (hsv_slider_x + i, h_slider_y + hsv_slider_height))
 
-        pygame.draw.rect(screen, (100, 100, 110),
+        screen.draw_rect((100, 100, 110),
                          (hsv_slider_x, h_slider_y, hsv_slider_width, hsv_slider_height + 1), 1)
 
         # H indicator
         h_pos = hsv_slider_x + int((self.selected_hue / 360) * hsv_slider_width)
-        pygame.draw.line(screen, (255, 255, 255),
+        screen.draw_line((255, 255, 255),
                          (h_pos, h_slider_y - 2),
                          (h_pos, h_slider_y + hsv_slider_height + 2), 2)
 
@@ -3171,16 +3177,16 @@ class SpriteEditor:
         for i in range(hsv_slider_width):
             saturation = i / hsv_slider_width
             color = self.hsv_to_rgb(self.selected_hue, saturation, 1.0)
-            pygame.draw.line(screen, color,
+            screen.draw_line(color,
                              (hsv_slider_x + i, s_slider_y),
                              (hsv_slider_x + i, s_slider_y + hsv_slider_height))
 
-        pygame.draw.rect(screen, (100, 100, 110),
+        screen.draw_rect((100, 100, 110),
                          (hsv_slider_x, s_slider_y, hsv_slider_width, hsv_slider_height + 1), 1)
 
         # S indicator
         s_pos = hsv_slider_x + int(self.selected_saturation * hsv_slider_width)
-        pygame.draw.line(screen, (255, 255, 255),
+        screen.draw_line((255, 255, 255),
                          (s_pos, s_slider_y - 2),
                          (s_pos, s_slider_y + hsv_slider_height + 2), 2)
 
@@ -3197,16 +3203,16 @@ class SpriteEditor:
         for i in range(hsv_slider_width):
             value = i / hsv_slider_width
             color = self.hsv_to_rgb(self.selected_hue, self.selected_saturation, value)
-            pygame.draw.line(screen, color,
+            screen.draw_line(color,
                              (hsv_slider_x + i, v_slider_y),
                              (hsv_slider_x + i, v_slider_y + hsv_slider_height))
 
-        pygame.draw.rect(screen, (100, 100, 110),
+        screen.draw_rect((100, 100, 110),
                          (hsv_slider_x, v_slider_y, hsv_slider_width, hsv_slider_height + 1), 1)
 
         # V indicator
         v_pos = hsv_slider_x + int(self.selected_value * hsv_slider_width)
-        pygame.draw.line(screen, (255, 255, 255),
+        screen.draw_line((255, 255, 255),
                          (v_pos, v_slider_y - 2),
                          (v_pos, v_slider_y + hsv_slider_height + 2), 2)
 
@@ -3221,13 +3227,13 @@ class SpriteEditor:
 
         # Input box
         hex_input_rect = pygame.Rect(hsv_slider_x, hex_input_y, hsv_slider_width, 25)
-        pygame.draw.rect(screen, (60, 60, 70), hex_input_rect)
+        screen.draw_rect((60, 60, 70), hex_input_rect)
 
         # Highlight if active
         if self.hex_input_active:
-            pygame.draw.rect(screen, (255, 255, 255), hex_input_rect, 2)
+            screen.draw_rect((255, 255, 255), hex_input_rect, 2)
         else:
-            pygame.draw.rect(screen, (100, 100, 110), hex_input_rect, 1)
+            screen.draw_rect((100, 100, 110), hex_input_rect, 1)
 
         # Display hex text
         hex_display = self.hex_input_text if self.hex_input_active else \
@@ -3239,7 +3245,7 @@ class SpriteEditor:
         if self.hex_input_active:
             cursor_x = hsv_slider_x + 5 + hex_text.get_width()
             cursor_y = hex_input_y + 5
-            pygame.draw.line(screen, (255, 255, 255),
+            screen.draw_line((255, 255, 255),
                              (cursor_x, cursor_y),
                              (cursor_x, cursor_y + 15), 2)
 
@@ -3254,11 +3260,11 @@ class SpriteEditor:
             for px in range(0, preview_size, checker_size):
                 color = (180, 180, 180) if (px // checker_size + py // checker_size) % 2 == 0 else (140, 140, 140)
 
-                pygame.draw.rect(screen, color, (preview_x + px, preview_y + py - 55, checker_size, checker_size))
+                screen.draw_rect(color, (preview_x + px, preview_y + py - 55, checker_size, checker_size))
 
         # Current color
-        pygame.draw.rect(screen, (*self.current_color, 255), (preview_x, preview_y - 55, preview_size, preview_size))
-        pygame.draw.rect(screen, (255, 255, 255), (preview_x, preview_y, preview_size - 55, preview_size), 2)
+        screen.draw_rect((*self.current_color, 255), (preview_x, preview_y - 55, preview_size, preview_size))
+        screen.draw_rect((255, 255, 255), (preview_x, preview_y, preview_size - 55, preview_size), 2)
 
         # Close hint
         hint = self.fonts['small'].render("ESC to close", True, (120, 120, 120))
@@ -3286,8 +3292,8 @@ class SpriteEditor:
             else:
                 btn_color, border_color, text_color = (60, 60, 70), (100, 100, 110), (200, 200, 200)
 
-            pygame.draw.rect(screen, btn_color, (dir_x, dir_btn_y, dir_width, dir_height), border_radius=5)
-            pygame.draw.rect(screen, border_color, (dir_x, dir_btn_y, dir_width, dir_height), 2, border_radius=5)
+            screen.draw_rect(btn_color, (dir_x, dir_btn_y, dir_width, dir_height), border_radius=5)
+            screen.draw_rect(border_color, (dir_x, dir_btn_y, dir_width, dir_height), 2, border_radius=5)
 
             # Text
             arrow_text = self.fonts['small'].render(direction['label'], True, text_color)
@@ -3304,18 +3310,18 @@ class SpriteEditor:
             else:
                 checkbox_color, border_color = (60, 60, 70), (100, 100, 110)
 
-            pygame.draw.rect(screen, checkbox_color, (checkbox_x, checkbox_y, checkbox_size, checkbox_size),
+            screen.draw_rect(checkbox_color, (checkbox_x, checkbox_y, checkbox_size, checkbox_size),
                              border_radius=4)
-            pygame.draw.rect(screen, border_color, (checkbox_x, checkbox_y, checkbox_size, checkbox_size),
+            screen.draw_rect(border_color, (checkbox_x, checkbox_y, checkbox_size, checkbox_size),
                              2, border_radius=4)
 
             # Checkmark
             if self.anim_flip_left:
                 check_color = (255, 255, 255)
-                pygame.draw.line(screen, check_color,
+                screen.draw_line(check_color,
                                  (checkbox_x + 5, checkbox_y + checkbox_size // 2),
                                  (checkbox_x + checkbox_size // 2 - 2, checkbox_y + checkbox_size - 7), 3)
-                pygame.draw.line(screen, check_color,
+                screen.draw_line(check_color,
                                  (checkbox_x + checkbox_size // 2 - 2, checkbox_y + checkbox_size - 7),
                                  (checkbox_x + checkbox_size - 7, checkbox_y + 5), 3)
 
@@ -3339,7 +3345,7 @@ class SpriteEditor:
             for y in range(0, scaled_height, checker_size):
                 for x in range(0, scaled_width, checker_size):
                     color = (42, 42, 52) if (x // checker_size + y // checker_size) % 2 == 0 else (48, 48, 58)
-                    pygame.draw.rect(screen, color,
+                    screen.draw_rect(color,
                                      (preview_x - scaled_width // 2 + x,
                                       preview_y - scaled_height // 2 + y,
                                       checker_size, checker_size))
@@ -3350,7 +3356,7 @@ class SpriteEditor:
                          preview_y - scaled_height // 2))
 
             # Border
-            pygame.draw.rect(screen, (100, 100, 110),
+            screen.draw_rect((100, 100, 110),
                              (preview_x - scaled_width // 2 - 2,
                               preview_y - scaled_height // 2 - 2,
                               scaled_width + 4, scaled_height + 4), 2)
@@ -3365,15 +3371,15 @@ class SpriteEditor:
             play_btn_size = 24
 
             btn_color = (64, 200, 64) if self.anim_playing else (64, 128, 255)
-            pygame.draw.rect(screen, btn_color, (play_btn_x, play_btn_y, play_btn_size, play_btn_size), border_radius=4)
-            pygame.draw.rect(screen, (255, 255, 255), (play_btn_x, play_btn_y, play_btn_size, play_btn_size),
+            screen.draw_rect(btn_color, (play_btn_x, play_btn_y, play_btn_size, play_btn_size), border_radius=4)
+            screen.draw_rect((255, 255, 255), (play_btn_x, play_btn_y, play_btn_size, play_btn_size),
                              1, border_radius=4)
 
             # Play/pause icon
             if self.anim_playing:
-                pygame.draw.rect(screen, (255, 255, 255),
+                screen.draw_rect((255, 255, 255),
                                  (play_btn_x + 7, play_btn_y + 6, 3, 12))
-                pygame.draw.rect(screen, (255, 255, 255),
+                screen.draw_rect((255, 255, 255),
                                  (play_btn_x + 14, play_btn_y + 6, 3, 12))
             else:
                 points = [
@@ -3381,7 +3387,7 @@ class SpriteEditor:
                     (play_btn_x + 8, play_btn_y + 18),
                     (play_btn_x + 18, play_btn_y + 12)
                 ]
-                pygame.draw.polygon(screen, (255, 255, 255), points)
+                screen.draw_polygon((255, 255, 255), points)
 
             # Frame text
             screen.blit(frame_surface,
@@ -3398,15 +3404,15 @@ class SpriteEditor:
             minus_btn_x, plus_btn_x = preview_x - 50, preview_x + 10
 
             # Minus button
-            pygame.draw.rect(screen, (60, 60, 70), (minus_btn_x, speed_btn_y, 40, 25), border_radius=4)
-            pygame.draw.rect(screen, (255, 255, 255), (minus_btn_x, speed_btn_y, 40, 25), 1, border_radius=4)
+            screen.draw_rect((60, 60, 70), (minus_btn_x, speed_btn_y, 40, 25), border_radius=4)
+            screen.draw_rect((255, 255, 255), (minus_btn_x, speed_btn_y, 40, 25), 1, border_radius=4)
             minus_text = self.fonts['medium'].render("-", True, (255, 255, 255))
             minus_rect = minus_text.get_rect(center=(minus_btn_x + 20, speed_btn_y + 12))
             screen.blit(minus_text, minus_rect)
 
             # Plus button
-            pygame.draw.rect(screen, (60, 60, 70), (plus_btn_x, speed_btn_y, 40, 25), border_radius=4)
-            pygame.draw.rect(screen, (255, 255, 255), (plus_btn_x, speed_btn_y, 40, 25), 1, border_radius=4)
+            screen.draw_rect((60, 60, 70), (plus_btn_x, speed_btn_y, 40, 25), border_radius=4)
+            screen.draw_rect((255, 255, 255), (plus_btn_x, speed_btn_y, 40, 25), 1, border_radius=4)
             plus_text = self.fonts['medium'].render("+", True, (255, 255, 255))
             plus_rect = plus_text.get_rect(center=(plus_btn_x + 20, speed_btn_y + 12))
             screen.blit(plus_text, plus_rect)
@@ -3425,7 +3431,7 @@ class SpriteEditor:
                 for y in range(0, filmstrip_frame_size, 8):
                     for x in range(0, filmstrip_frame_size, 8):
                         color = (42, 42, 52) if (x // 8 + y // 8) % 2 == 0 else (48, 48, 58)
-                        pygame.draw.rect(screen, color, (frame_x + x, filmstrip_y + y, 8, 8))
+                        screen.draw_rect(color, (frame_x + x, filmstrip_y + y, 8, 8))
 
                 small_frame = pygame.transform.scale(frame, (filmstrip_frame_size, filmstrip_frame_size))
                 screen.blit(small_frame, (frame_x, filmstrip_y))
@@ -3433,7 +3439,7 @@ class SpriteEditor:
                 # Border
                 border_color = (255, 200, 0) if i == self.anim_frame_index else (80, 80, 90)
                 border_width = 3 if i == self.anim_frame_index else 1
-                pygame.draw.rect(screen, border_color,
+                screen.draw_rect(border_color,
                                  (frame_x, filmstrip_y, filmstrip_frame_size, filmstrip_frame_size),
                                  border_width)
         else:

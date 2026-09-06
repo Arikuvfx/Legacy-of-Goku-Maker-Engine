@@ -894,7 +894,7 @@ def render_text_cached(font: pygame.font.Font, text: str, color) -> pygame.Surfa
 def draw_rect_outline(surf: pygame.Surface, rect: pygame.Rect,
                       color=C_BORDER, radius=4, width=1) -> None:
     """Draw a rounded outline only (no fill) — used for panel/box borders."""
-    pygame.draw.rect(surf, color, rect, width, border_radius=radius)
+    surf.draw_rect(color, rect, width, border_radius=radius)
 
 
 def draw_label(surf: pygame.Surface, font: pygame.font.Font,
@@ -909,7 +909,7 @@ def draw_section_header(surf: pygame.Surface, font: pygame.font.Font,
     """Draw a horizontal divider line with a small caption label on top of
     it, used to separate groups of widgets within a tab (e.g. 'Equipped
     Attacks', 'Edit Selected')."""
-    pygame.draw.line(surf, C_BORDER,
+    surf.draw_line(C_BORDER,
                      (rect.x, rect.y + 8), (rect.right, rect.y + 8))
     lbl = render_text_cached(font, f"  {text}  ", C_TEXT_DIM)
     surf.blit(lbl, (rect.x + 12, rect.y))
@@ -964,8 +964,8 @@ class TextInput:
              dt: float) -> None:
         self._blink = (self._blink + dt) % 1.2
         border_col = C_ACCENT if self.active else C_BORDER
-        pygame.draw.rect(surf, C_PANEL_DARK, self.rect, border_radius=4)
-        pygame.draw.rect(surf, border_col, self.rect, 1, border_radius=4)
+        surf.draw_rect(C_PANEL_DARK, self.rect, border_radius=4)
+        surf.draw_rect(border_col, self.rect, 1, border_radius=4)
         clip = self.rect.inflate(-8, -4)
         txt  = font.render(self.value, True, C_TEXT)
         surf.blit(txt, (clip.x, self.rect.y + (self.rect.h - txt.get_height()) // 2),
@@ -973,7 +973,7 @@ class TextInput:
         if self.active and self._blink < 0.6:
             cx = clip.x + font.size(self.value[:self.cursor])[0]
             cy = self.rect.y + 4
-            pygame.draw.line(surf, C_TEXT, (cx, cy), (cx, self.rect.bottom - 4))
+            surf.draw_line(C_TEXT, (cx, cy), (cx, self.rect.bottom - 4))
 
 
 class TextArea:
@@ -989,17 +989,25 @@ class TextArea:
     paragraph breaks survive re-wrapping instead of being swallowed into
     one run-on paragraph. Ctrl+Enter (or Tab/Escape) defocuses instead,
     since plain Enter is needed for line breaks.
-    """
-    H = 100   # default box height if the caller doesn't override rect.h
 
-    def __init__(self, rect: pygame.Rect, value: str = "", max_len: int = 600):
-        self.rect     = rect
-        self.value    = value
-        self.max_len  = max_len
-        self.active   = False
-        self.cursor   = len(value)
-        self._blink   = 0.0
-        self._scroll  = 0   # index of the first visible wrapped line
+    Pass multiline=False for single-line uses (e.g. a display-name field
+    reusing this widget for its wrap-instead-of-clip behavior): plain
+    Enter then defocuses just like Tab/Escape, instead of inserting a
+    '\\n' that a one-line field has no business containing.
+    """
+    H = 100        # default box height if the caller doesn't override rect.h
+    H_SINGLE = 36  # box height for single-line (multiline=False) uses
+
+    def __init__(self, rect: pygame.Rect, value: str = "", max_len: int = 600,
+                 multiline: bool = True):
+        self.rect      = rect
+        self.value     = value
+        self.max_len   = max_len
+        self.multiline = multiline
+        self.active    = False
+        self.cursor    = len(value)
+        self._blink    = 0.0
+        self._scroll   = 0   # index of the first visible wrapped line
 
     def handle_event(self, event: pygame.event.Event) -> bool:
         """Returns True if value changed."""
@@ -1028,7 +1036,7 @@ class TextArea:
             elif event.key == pygame.K_END:
                 self.cursor = len(self.value)
             elif event.key == pygame.K_RETURN:
-                if (pygame.key.get_mods() & pygame.KMOD_CTRL):
+                if not self.multiline or (pygame.key.get_mods() & pygame.KMOD_CTRL):
                     self.active = False
                 elif len(self.value) < self.max_len:
                     self.value  = self.value[:self.cursor] + "\n" + self.value[self.cursor:]
@@ -1077,8 +1085,8 @@ class TextArea:
              dt: float, placeholder: str = "Click to add a description...") -> None:
         self._blink = (self._blink + dt) % 1.2
         border_col = C_ACCENT if self.active else C_BORDER
-        pygame.draw.rect(surf, C_PANEL_DARK, self.rect, border_radius=4)
-        pygame.draw.rect(surf, border_col, self.rect, 1, border_radius=4)
+        surf.draw_rect(C_PANEL_DARK, self.rect, border_radius=4)
+        surf.draw_rect(border_col, self.rect, 1, border_radius=4)
 
         pad   = 8
         inner = self.rect.inflate(-pad * 2, -pad * 2)
@@ -1111,7 +1119,7 @@ class TextArea:
             rel = max(0, min(self.cursor - start, len(text)))
             cx = inner.x + font.size(text[:rel])[0]
             cy = inner.y + (cur_line - self._scroll) * line_h
-            pygame.draw.line(surf, C_TEXT, (cx, cy), (cx, cy + line_h - 2))
+            surf.draw_line(C_TEXT, (cx, cy), (cx, cy + line_h - 2))
         surf.set_clip(old_clip)
 
         # Scroll hint so it's obvious there's more text than fits.
@@ -1159,17 +1167,17 @@ class Slider:
     def draw(self, surf: pygame.Surface, font: pygame.font.Font) -> None:
         track = pygame.Rect(self.rect.x, self.rect.centery - 3,
                             self.rect.w, 6)
-        pygame.draw.rect(surf, C_BAR_BG,  track, border_radius=3)
+        surf.draw_rect(C_BAR_BG,  track, border_radius=3)
         t = (self.value - self.min) / (self.max - self.min)
         fill_w = int(track.w * t)
         if fill_w > 0:
-            pygame.draw.rect(surf, C_BAR_FILL,
+            surf.draw_rect(C_BAR_FILL,
                              pygame.Rect(track.x, track.y, fill_w, 6),
                              border_radius=3)
         kx = self.rect.x + int(self.rect.w * t)
         ky = self.rect.centery
-        pygame.draw.circle(surf, C_ACCENT, (kx, ky), 8)
-        pygame.draw.circle(surf, C_BG,     (kx, ky), 5)
+        surf.draw_circle(C_ACCENT, (kx, ky), 8)
+        surf.draw_circle(C_BG,     (kx, ky), 5)
         val_txt = font.render(self.fmt.format(self.value), True, C_TEXT)
         surf.blit(val_txt, (self.rect.right + 8, self.rect.centery - val_txt.get_height() // 2))
 
@@ -1188,7 +1196,7 @@ class StatBar:
     @staticmethod
     def draw(surf: pygame.Surface, font: pygame.font.Font,
              rect: pygame.Rect, value: int, max_val: int = 255) -> None:
-        pygame.draw.rect(surf, C_BAR_BG,   rect, border_radius=3)
+        surf.draw_rect(C_BAR_BG,   rect, border_radius=3)
         t = max(0, min(1, value / max_val))
         # Colour gradient: blue → green → yellow → red
         r = int(min(255, 2 * 255 * t))
@@ -1196,7 +1204,7 @@ class StatBar:
         col = (max(30, 255 - int(200 * t)), max(80, int(160 * t)), C_BAR_FILL[2])
         fill = rect.copy(); fill.w = int(rect.w * t)
         if fill.w > 0:
-            pygame.draw.rect(surf, C_BAR_FILL, fill, border_radius=3)
+            surf.draw_rect(C_BAR_FILL, fill, border_radius=3)
         txt = font.render(str(value), True, C_TEXT)
         surf.blit(txt, (rect.right + 6, rect.y + (rect.h - txt.get_height()) // 2))
 
@@ -1211,8 +1219,8 @@ def draw_button(surf: pygame.Surface, font: pygame.font.Font,
     same handful of labels get redrawn every single frame."""
     base = (200, 60, 60) if danger else color
     bg   = tuple(min(255, c + 30) for c in base) if hover else C_PANEL
-    pygame.draw.rect(surf, bg, rect, border_radius=5)
-    pygame.draw.rect(surf, base, rect, 1, border_radius=5)
+    surf.draw_rect(bg, rect, border_radius=5)
+    surf.draw_rect(base, rect, 1, border_radius=5)
     txt = render_text_cached(font, label, base if not hover else C_TEXT)
     surf.blit(txt, txt.get_rect(center=rect.center))
 
@@ -1344,8 +1352,8 @@ class SpritePreview:
         surf.blit(shadow, (sx, sy))
 
     def draw(self, surf: pygame.Surface, font_sm: pygame.font.Font) -> None:
-        pygame.draw.rect(surf, C_PANEL_DARK, self.rect, border_radius=6)
-        pygame.draw.rect(surf, C_BORDER,     self.rect, 1, border_radius=6)
+        surf.draw_rect(C_PANEL_DARK, self.rect, border_radius=6)
+        surf.draw_rect(C_BORDER,     self.rect, 1, border_radius=6)
 
         if self.frames:
             frame = self.frames[int(self.frame_i)]
@@ -1382,7 +1390,7 @@ class SpritePreview:
             )
             feet_y = self.rect.centery + (ph_h / 2.25)
             self._blit_shadow(surf, self.rect.centerx, feet_y)
-            pygame.draw.rect(surf, C_BORDER, ph, border_radius=6)
+            surf.draw_rect(C_BORDER, ph, border_radius=6)
             lbl = render_text_cached(font_sm, "no sprites", C_TEXT_DIM)
             surf.blit(lbl, lbl.get_rect(centerx=self.rect.centerx,
                                          top=ph.bottom + 6))
@@ -1512,8 +1520,8 @@ class AnimationGridPanel:
                 continue
 
             cell = pygame.Rect(cx, cy, cw, ch)
-            pygame.draw.rect(surf, C_PANEL_DARK, cell, border_radius=8)
-            pygame.draw.rect(surf, C_BORDER,     cell, 1, border_radius=8)
+            surf.draw_rect(C_PANEL_DARK, cell, border_radius=8)
+            surf.draw_rect(C_BORDER,     cell, 1, border_radius=8)
 
             # Label (cached — the animation name itself never changes)
             lbl_text = name if len(name) <= 20 else name[:18] + "…"
@@ -1544,7 +1552,7 @@ class AnimationGridPanel:
             bar_y   = self.rect.y + int(self.scroll / self._max_scroll
                                         * (self.rect.h - bar_h))
             bar = pygame.Rect(self.rect.right - 8, bar_y, 5, bar_h)
-            pygame.draw.rect(surf, C_BORDER, bar, border_radius=3)
+            surf.draw_rect(C_BORDER, bar, border_radius=3)
 
         surf.set_clip(old_clip)
 
@@ -1588,7 +1596,8 @@ class CharacterEditor:
 
         # ── Identity tab ────────────────────────────────────────────
         y = panel.y + 60
-        self.name_input    = TextInput(pygame.Rect(fx, y, fw, 28), cfg["display_name"])
+        self.name_input    = TextArea(pygame.Rect(fx, y, fw, TextArea.H_SINGLE),
+                                       cfg["display_name"], multiline=False)
 
         y += row_h
         self.costume_idx   = costumes.index(cfg["costume"]) if cfg["costume"] in costumes else 0
@@ -1690,7 +1699,7 @@ class CharacterEditor:
         self.transformations: list[dict] = self.cfg["transformations"]
         self.transform_idx          = 0 if self.visible_transformations() else -1
         self.transform_costume_idx  = 0
-        self.transform_name_input: Optional[TextInput] = None
+        self.transform_name_input: Optional[TextArea] = None
         self.transform_sliders: dict[str, Slider] = {}
 
         # Per-form ki-bar color override (hue-strip + SV-square picker,
@@ -1938,8 +1947,9 @@ class CharacterEditor:
         # entries (old configs saved before this feature existed) default
         # to True, same as TransformationSystem._resolve_transform_ki_bar_enabled.
         self.transform_ki_bar_enabled = tf.get("ki_bar_enabled", True)
-        self.transform_name_input = TextInput(
-            pygame.Rect(fx, 0, fw, 28), tf.get("display_name", "")
+        self.transform_name_input = TextArea(
+            pygame.Rect(fx, 0, fw, TextArea.H_SINGLE), tf.get("display_name", ""),
+            multiline=False,
         )
         # The costume field is stored as e.g. "base/transformations/ssj".
         # Extract just the form name ("ssj") for the transform_forms picker index.
@@ -2204,8 +2214,8 @@ class CharacterEditor:
         hov_btn  = btn_rect.collidepoint(mx, my)
         btn_bg   = C_HOVER if (hov_btn or self.preview_dropdown_open) else C_PANEL_DARK
         btn_bord = C_ACCENT if self.preview_dropdown_open else C_BORDER
-        pygame.draw.rect(surf, btn_bg,   btn_rect, border_radius=5)
-        pygame.draw.rect(surf, btn_bord, btn_rect, 1, border_radius=5)
+        surf.draw_rect(btn_bg,   btn_rect, border_radius=5)
+        surf.draw_rect(btn_bord, btn_rect, 1, border_radius=5)
         lbl = render_text_cached(font, display + counter, C_TEXT)
         surf.blit(lbl, (btn_rect.x + 10,
                         btn_rect.y + (BTN_H - lbl.get_height()) // 2))
@@ -2235,8 +2245,8 @@ class CharacterEditor:
         drop_h    = vis_count * ROW_H + PAD * 2
         drop_rect = pygame.Rect(lx, btn_rect.bottom + 2, DROP_W, drop_h)
 
-        pygame.draw.rect(surf, C_PANEL,  drop_rect, border_radius=6)
-        pygame.draw.rect(surf, C_ACCENT, drop_rect, 1, border_radius=6)
+        surf.draw_rect(C_PANEL,  drop_rect, border_radius=6)
+        surf.draw_rect(C_ACCENT, drop_rect, 1, border_radius=6)
 
         self._preview_dropdown_rows = []
         for vis_i in range(vis_count):
@@ -2254,8 +2264,8 @@ class CharacterEditor:
             is_hov    = item_rect.collidepoint(mx, my)
             item_bg   = C_SELECTED if is_sel else (C_HOVER if is_hov else C_PANEL_DARK)
             item_bord = C_ACCENT   if is_sel else C_BORDER
-            pygame.draw.rect(surf, item_bg,   item_rect, border_radius=5)
-            pygame.draw.rect(surf, item_bord, item_rect, 1, border_radius=5)
+            surf.draw_rect(item_bg,   item_rect, border_radius=5)
+            surf.draw_rect(item_bord, item_rect, 1, border_radius=5)
 
             # Animated walk thumbnail
             frames = self.preview_form_thumbnails.get(form, [])
@@ -2341,8 +2351,8 @@ class CharacterEditor:
         form, label = forms[idx]
 
         rect = pygame.Rect(x, y, box, box)
-        pygame.draw.rect(surf, C_PANEL_DARK, rect, border_radius=8)
-        pygame.draw.rect(surf, C_BORDER,     rect, 1, border_radius=8)
+        surf.draw_rect(C_PANEL_DARK, rect, border_radius=8)
+        surf.draw_rect(C_BORDER,     rect, 1, border_radius=8)
 
         img = self._load_portrait(form)
         if img:
@@ -2369,7 +2379,7 @@ class CharacterEditor:
             dy      = rect.bottom + 28
             for i in range(n):
                 col = C_ACCENT if i == idx else C_BORDER
-                pygame.draw.circle(surf, col, (dx + i * gap, dy), dot_r)
+                surf.draw_circle(col, (dx + i * gap, dy), dot_r)
 
     def _draw_identity(self, surf, font, font_sm, lx, fx, fw, row_h, dt):
         y = self.panel.y + 60
@@ -2381,7 +2391,7 @@ class CharacterEditor:
 
         draw_label(surf, font_sm, "Display Name", lx, y + 6)
         self.name_input.rect.y = y
-        self.name_input.draw(surf, font_sm, dt)
+        self.name_input.draw(surf, font_sm, dt, placeholder="Click to add a display name...")
         y += row_h
 
         draw_label(surf, font_sm, "Costume", lx, y + 6)
@@ -2414,8 +2424,8 @@ class CharacterEditor:
         draw_label(surf, font_sm, "Gate Color", lx, y + 6)
 
         preview_rect = pygame.Rect(fx, y + 2, 30, 22)
-        pygame.draw.rect(surf, hex_to_rgb(self.selected_color), preview_rect, border_radius=4)
-        pygame.draw.rect(surf, C_BORDER, preview_rect, 1, border_radius=4)
+        surf.draw_rect(hex_to_rgb(self.selected_color), preview_rect, border_radius=4)
+        surf.draw_rect(C_BORDER, preview_rect, 1, border_radius=4)
         hex_lbl = render_text_cached(font_sm, self.selected_color.upper(), C_TEXT_DIM)
         surf.blit(hex_lbl, (preview_rect.right + 10, y + 7))
         y += 32
@@ -2426,23 +2436,23 @@ class CharacterEditor:
         sv_rect = pygame.Rect(fx, y, sv_w, sv_h)
         sv_surf = self._get_sv_square_surface(hue, sv_w, sv_h)
         surf.blit(sv_surf, sv_rect.topleft)
-        pygame.draw.rect(surf, C_BORDER, sv_rect, 1)
+        surf.draw_rect(C_BORDER, sv_rect, 1)
 
         # Cursor ring — white on dark colors, black on light ones so it's
         # always visible against whatever's under it.
         sv_cursor_x = sv_rect.left + int(sat * sv_rect.width)
         sv_cursor_y = sv_rect.top + int((1 - val) * sv_rect.height)
         ring_color = (255, 255, 255) if val < 0.6 else (0, 0, 0)
-        pygame.draw.circle(surf, ring_color, (sv_cursor_x, sv_cursor_y), 6, 2)
+        surf.draw_circle(ring_color, (sv_cursor_x, sv_cursor_y), 6, 2)
 
         hue_rect = pygame.Rect(sv_rect.right + gap, y, hue_w, sv_h)
         hue_surf = self._get_hue_strip_surface(hue_w, sv_h)
         surf.blit(hue_surf, hue_rect.topleft)
-        pygame.draw.rect(surf, C_BORDER, hue_rect, 1)
+        surf.draw_rect(C_BORDER, hue_rect, 1)
 
         hue_marker_y = hue_rect.top + int(hue * hue_rect.height)
         marker_rect = pygame.Rect(hue_rect.left - 2, hue_marker_y - 2, hue_rect.width + 4, 4)
-        pygame.draw.rect(surf, (255, 255, 255), marker_rect, 1)
+        surf.draw_rect((255, 255, 255), marker_rect, 1)
 
         self._color_sv_rect  = sv_rect
         self._color_hue_rect = hue_rect
@@ -2614,8 +2624,8 @@ class CharacterEditor:
             frame      = draw_rect.inflate(8, 8)
             bg_col     = C_SELECTED if selected else (C_HOVER if hovered else C_PANEL_DARK)
             border_col = C_ACCENT   if selected else C_BORDER
-            pygame.draw.rect(surf, bg_col, frame, border_radius=6)
-            pygame.draw.rect(surf, border_col, frame, 2 if selected else 1, border_radius=6)
+            surf.draw_rect(bg_col, frame, border_radius=6)
+            surf.draw_rect(border_col, frame, 2 if selected else 1, border_radius=6)
             surf.blit(icon, draw_rect.topleft)
 
             # Cached: attack id is fixed, "selected" only ever toggles
@@ -2681,7 +2691,8 @@ class CharacterEditor:
         draw_label(surf, font_sm, "Display Name", lx, y + 6)
         if self.transform_name_input:
             self.transform_name_input.rect.y = y
-            self.transform_name_input.draw(surf, font_sm, dt)
+            self.transform_name_input.draw(surf, font_sm, dt,
+                                            placeholder="Click to add a display name...")
         y += row_h
 
         draw_label(surf, font_sm, "Form", lx, y + 6)
@@ -2743,11 +2754,11 @@ class CharacterEditor:
         # the player lands in the transformed state the moment it finishes.
         draw_label(surf, font_sm, "Show Charge Bar", lx, y + 6)
         bar_cb_rect = pygame.Rect(fx, y + 4, 20, 20)
-        pygame.draw.rect(surf, C_PANEL_DARK, bar_cb_rect, border_radius=3)
-        pygame.draw.rect(surf, C_BORDER, bar_cb_rect, 1, border_radius=3)
+        surf.draw_rect(C_PANEL_DARK, bar_cb_rect, border_radius=3)
+        surf.draw_rect(C_BORDER, bar_cb_rect, 1, border_radius=3)
         if self.transform_ki_bar_enabled:
-            pygame.draw.line(surf, C_ACCENT, bar_cb_rect.topleft, bar_cb_rect.bottomright, 2)
-            pygame.draw.line(surf, C_ACCENT, bar_cb_rect.topright, bar_cb_rect.bottomleft, 2)
+            surf.draw_line(C_ACCENT, bar_cb_rect.topleft, bar_cb_rect.bottomright, 2)
+            surf.draw_line(C_ACCENT, bar_cb_rect.topright, bar_cb_rect.bottomleft, 2)
         self._tf_ki_bar_enabled_checkbox_rect = bar_cb_rect
         y += row_h
 
@@ -2774,11 +2785,11 @@ class CharacterEditor:
         # current lightness pattern (see SpriteHUD._get_recolored_bar_surface).
         draw_label(surf, font_sm, "Ki Bar Color", lx, y + 6)
         cb_rect = pygame.Rect(fx, y + 4, 20, 20)
-        pygame.draw.rect(surf, C_PANEL_DARK, cb_rect, border_radius=3)
-        pygame.draw.rect(surf, C_BORDER, cb_rect, 1, border_radius=3)
+        surf.draw_rect(C_PANEL_DARK, cb_rect, border_radius=3)
+        surf.draw_rect(C_BORDER, cb_rect, 1, border_radius=3)
         if self.transform_ki_color_enabled:
-            pygame.draw.line(surf, C_ACCENT, cb_rect.topleft, cb_rect.bottomright, 2)
-            pygame.draw.line(surf, C_ACCENT, cb_rect.topright, cb_rect.bottomleft, 2)
+            surf.draw_line(C_ACCENT, cb_rect.topleft, cb_rect.bottomright, 2)
+            surf.draw_line(C_ACCENT, cb_rect.topright, cb_rect.bottomleft, 2)
         self._tf_ki_color_checkbox_rect = cb_rect
         cb_lbl = render_text_cached(font_sm, "Custom", C_TEXT_DIM)
         surf.blit(cb_lbl, (cb_rect.right + 8, y + 7))
@@ -2786,8 +2797,8 @@ class CharacterEditor:
 
         if self.transform_ki_color_enabled:
             preview_rect = pygame.Rect(fx, y + 2, 30, 22)
-            pygame.draw.rect(surf, hex_to_rgb(self.transform_ki_color), preview_rect, border_radius=4)
-            pygame.draw.rect(surf, C_BORDER, preview_rect, 1, border_radius=4)
+            surf.draw_rect(hex_to_rgb(self.transform_ki_color), preview_rect, border_radius=4)
+            surf.draw_rect(C_BORDER, preview_rect, 1, border_radius=4)
             hex_lbl = render_text_cached(font_sm, self.transform_ki_color.upper(), C_TEXT_DIM)
             surf.blit(hex_lbl, (preview_rect.right + 10, y + 7))
             y += 32
@@ -2798,21 +2809,21 @@ class CharacterEditor:
             sv_rect = pygame.Rect(fx, y, sv_w, sv_h)
             sv_surf = self._get_sv_square_surface(hue, sv_w, sv_h)
             surf.blit(sv_surf, sv_rect.topleft)
-            pygame.draw.rect(surf, C_BORDER, sv_rect, 1)
+            surf.draw_rect(C_BORDER, sv_rect, 1)
 
             sv_cursor_x = sv_rect.left + int(sat * sv_rect.width)
             sv_cursor_y = sv_rect.top + int((1 - val) * sv_rect.height)
             ring_color = (255, 255, 255) if val < 0.6 else (0, 0, 0)
-            pygame.draw.circle(surf, ring_color, (sv_cursor_x, sv_cursor_y), 6, 2)
+            surf.draw_circle(ring_color, (sv_cursor_x, sv_cursor_y), 6, 2)
 
             hue_rect = pygame.Rect(sv_rect.right + gap, y, hue_w, sv_h)
             hue_surf = self._get_hue_strip_surface(hue_w, sv_h)
             surf.blit(hue_surf, hue_rect.topleft)
-            pygame.draw.rect(surf, C_BORDER, hue_rect, 1)
+            surf.draw_rect(C_BORDER, hue_rect, 1)
 
             hue_marker_y = hue_rect.top + int(hue * hue_rect.height)
             marker_rect = pygame.Rect(hue_rect.left - 2, hue_marker_y - 2, hue_rect.width + 4, 4)
-            pygame.draw.rect(surf, (255, 255, 255), marker_rect, 1)
+            surf.draw_rect((255, 255, 255), marker_rect, 1)
 
             self._tf_color_sv_rect  = sv_rect
             self._tf_color_hue_rect = hue_rect
@@ -2912,8 +2923,8 @@ class CharacterList:
 
     def draw(self, surf: pygame.Surface, font: pygame.font.Font,
              font_sm: pygame.font.Font, dirty_id: str) -> None:
-        pygame.draw.rect(surf, C_PANEL_DARK, self.rect, border_radius=6)
-        pygame.draw.rect(surf, C_BORDER,     self.rect, 1, border_radius=6)
+        surf.draw_rect(C_PANEL_DARK, self.rect, border_radius=6)
+        surf.draw_rect(C_BORDER,     self.rect, 1, border_radius=6)
 
         hdr = render_text_cached(font_sm, "CHARACTERS", C_TEXT_DIM)
         surf.blit(hdr, (self.rect.x + 12, self.rect.y + 10))
@@ -2937,10 +2948,10 @@ class CharacterList:
             is_sel = (cid == self.selected)
             is_hov = item_r.collidepoint(mx, my)
             bg = C_SELECTED if is_sel else (C_HOVER if is_hov else C_PANEL_DARK)
-            pygame.draw.rect(surf, bg, item_r, border_radius=4)
+            surf.draw_rect(bg, item_r, border_radius=4)
 
             dot_col = C_ACCENT2 if cid == dirty_id else C_TEXT_DIM
-            pygame.draw.circle(surf, dot_col,
+            surf.draw_circle(dot_col,
                                (item_r.x + 12, item_r.centery), 4)
 
             # Cached: character ids are a small, fixed set, and each one
@@ -2952,7 +2963,7 @@ class CharacterList:
 
         # ── Reorder controls ──────────────────────────────────────
         btn_up, btn_down = self._reorder_button_rects()
-        pygame.draw.line(surf, C_BORDER,
+        surf.draw_line(C_BORDER,
                          (self.rect.x + 4, btn_up.y - 6),
                          (self.rect.right - 4, btn_up.y - 6))
 
@@ -3310,8 +3321,8 @@ class CharacterCreator:
         if d["kind"] == "confirm":
             W, H = 420, 160
             dlg = pygame.Rect((sw - W) // 2, (sh - H) // 2, W, H)
-            pygame.draw.rect(screen, C_DIALOG_BG, dlg, border_radius=8)
-            pygame.draw.rect(screen, C_BORDER,    dlg, 1, border_radius=8)
+            screen.draw_rect(C_DIALOG_BG, dlg, border_radius=8)
+            screen.draw_rect(C_BORDER,    dlg, 1, border_radius=8)
 
             msg = render_text_cached(self.font, d["message"], C_TEXT)
             screen.blit(msg, msg.get_rect(centerx=dlg.centerx, top=dlg.y + 28))
@@ -3325,8 +3336,8 @@ class CharacterCreator:
         elif d["kind"] == "input":
             W, H = 440, 170
             dlg = pygame.Rect((sw - W) // 2, (sh - H) // 2, W, H)
-            pygame.draw.rect(screen, C_DIALOG_BG, dlg, border_radius=8)
-            pygame.draw.rect(screen, C_BORDER,    dlg, 1, border_radius=8)
+            screen.draw_rect(C_DIALOG_BG, dlg, border_radius=8)
+            screen.draw_rect(C_BORDER,    dlg, 1, border_radius=8)
 
             msg = render_text_cached(self.font, d["message"], C_TEXT)
             screen.blit(msg, (dlg.x + 24, dlg.y + 24))
@@ -3567,16 +3578,16 @@ class CharacterCreator:
         screen.fill(C_BG)
 
         hdr_rect = pygame.Rect(0, 0, sw, HEADER_H)
-        pygame.draw.rect(screen, C_PANEL, hdr_rect)
-        pygame.draw.line(screen, C_BORDER, (0, HEADER_H - 1), (sw, HEADER_H - 1))
+        screen.draw_rect(C_PANEL, hdr_rect)
+        screen.draw_line(C_BORDER, (0, HEADER_H - 1), (sw, HEADER_H - 1))
         title = render_text_cached(font_hd, "CHARACTER CREATOR", C_TEXT)
         screen.blit(title, (16, (HEADER_H - title.get_height()) // 2))
         hint = render_text_cached(font_sm, "ESC to close  •  Ctrl+S to save", C_TEXT_DIM)
         screen.blit(hint, (sw - hint.get_width() - 16, (HEADER_H - hint.get_height()) // 2))
 
         footer_rect = pygame.Rect(0, sh - FOOTER_H, sw, FOOTER_H)
-        pygame.draw.rect(screen, C_PANEL, footer_rect)
-        pygame.draw.line(screen, C_BORDER, (0, sh - FOOTER_H), (sw, sh - FOOTER_H))
+        screen.draw_rect(C_PANEL, footer_rect)
+        screen.draw_line(C_BORDER, (0, sh - FOOTER_H), (sw, sh - FOOTER_H))
 
         if self.status_timer > 0:
             # Cached: a given status message ("Saved x.json", ...) is shown
@@ -3610,22 +3621,22 @@ class CharacterCreator:
             self.preview.shadow_width = self.editor.shadow_slider.value
         self.preview.draw(screen, font_sm)
 
-        pygame.draw.rect(screen, C_PANEL, self.editor_rect.union(
+        screen.draw_rect(C_PANEL, self.editor_rect.union(
             pygame.Rect(self.editor_rect.x, HEADER_H + PAD, self.editor_rect.w, TAB_H)
         ), border_radius=6)
-        pygame.draw.rect(screen, C_BORDER, self.editor_rect.inflate(0, TAB_H), 1, border_radius=6)
+        screen.draw_rect(C_BORDER, self.editor_rect.inflate(0, TAB_H), 1, border_radius=6)
 
         for i, (name, tr) in enumerate(zip(TAB_NAMES, self.tab_rects)):
             is_act = (i == self.active_tab)
             bg = C_TAB_ACT if is_act else C_TAB_INACT
-            pygame.draw.rect(screen, bg, tr,
+            screen.draw_rect(bg, tr,
                              border_radius=6 if i == 0 else (6 if i == len(TAB_NAMES)-1 else 0))
             col = C_BORDER if not is_act else C_ACCENT
-            pygame.draw.rect(screen, col, tr, 1)
+            screen.draw_rect(col, tr, 1)
             lbl = render_text_cached(font, name, C_TEXT if is_act else C_TEXT_DIM)
             screen.blit(lbl, lbl.get_rect(center=tr.center))
         tr = self.tab_rects[self.active_tab]
-        pygame.draw.line(screen, C_TAB_ACT, (tr.x + 1, tr.bottom), (tr.right - 1, tr.bottom), 2)
+        screen.draw_line(C_TAB_ACT, (tr.x + 1, tr.bottom), (tr.right - 1, tr.bottom), 2)
 
         if self.editor:
             self.editor.panel = self.editor_rect

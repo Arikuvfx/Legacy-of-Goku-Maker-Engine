@@ -80,6 +80,19 @@ class LevelGate:
         self.gate_color = (255, 215, 0)
         self._load_gate_color()
 
+        # Draw-time caches so draw() doesn't rescale the sprite / destruction
+        # frames / level-requirement label from scratch every single frame —
+        # only rebuilt when RENDER_SCALE (or, for the label, the text/color
+        # it depends on) actually changes.
+        self._scaled_sprite = None
+        self._scaled_unlocked_sprite = None
+        self._scaled_sprite_at = None
+        self._scaled_destruction_frames = None
+        self._scaled_destruction_at = None
+        self._label_cache_key = None
+        self._label_outline = None
+        self._label_surface = None
+
     def _load_gate_color(self):
         if not self.required_character:
             return
@@ -229,11 +242,6 @@ class LevelGate:
         if player is None:
             player = getattr(attack, 'owner', None)
 
-        if not player or not self.can_be_destroyed_by(player):
-            # Flash to communicate "nope, too weak"
-            self.flash_timer = 0.05
-            return False
-
         gate_rect = pygame.Rect(
             self.x - self.width  // 2,
             self.y - self.height // 2,
@@ -256,6 +264,13 @@ class LevelGate:
             collided = dist < max(self.width, self.height) / 2
 
         if not collided:
+            return False
+
+        if not player or not self.can_be_destroyed_by(player):
+            # Flash to communicate "nope, too weak" — only once the attack
+            # has actually landed on the gate, not just because the player
+            # swung somewhere in the room.
+            self.flash_timer = 0.05
             return False
 
         # Metal gate unlocks on melee hit instead of taking damage
@@ -321,20 +336,33 @@ class LevelGate:
             if self.destruction_frame_index < len(self.destruction_frames):
                 base = 32
                 size = int(base * RENDER_SCALE)
-                scaled = pygame.transform.scale(self.destruction_frames[self.destruction_frame_index], (size, size))
+                if self._scaled_destruction_at != RENDER_SCALE:
+                    self._scaled_destruction_frames = [
+                        pygame.transform.scale(f, (size, size)) for f in self.destruction_frames
+                    ]
+                    self._scaled_destruction_at = RENDER_SCALE
+                scaled = self._scaled_destruction_frames[self.destruction_frame_index]
                 screen.blit(scaled, (int(sx - size // 2), int(sy - size // 2)))
         else:
             current = (self.unlocked_sprite
                        if self.gate_type == 'metal' and self.is_unlocked and self.unlocked_sprite
                        else self.sprite)
             if current:
-                scaled = pygame.transform.scale(current, (sw, sh))
+                if self._scaled_sprite_at != RENDER_SCALE:
+                    self._scaled_sprite = pygame.transform.scale(self.sprite, (sw, sh)) if self.sprite else None
+                    self._scaled_unlocked_sprite = (
+                        pygame.transform.scale(self.unlocked_sprite, (sw, sh)) if self.unlocked_sprite else None
+                    )
+                    self._scaled_sprite_at = RENDER_SCALE
+                scaled = (self._scaled_unlocked_sprite
+                          if self.gate_type == 'metal' and self.is_unlocked and self._scaled_unlocked_sprite
+                          else self._scaled_sprite)
                 if self.flash_timer > 0:
                     flash = scaled.copy()
                     if self.gate_type == 'metal' and self.is_unlocked:
-                        flash.fill((100, 255, 100, 150), special_flags=pygame.BLEND_RGBA_ADD)
+                        flash.fill((60, 120, 60, 0), special_flags=pygame.BLEND_RGBA_ADD)
                     else:
-                        flash.fill((255, 255, 255, 100), special_flags=pygame.BLEND_RGBA_ADD)
+                        flash.fill((90, 90, 90, 0), special_flags=pygame.BLEND_RGBA_ADD)
                     scaled = flash
                 screen.blit(scaled, (int(sx - sw // 2), int(sy - sh // 2)))
 
@@ -350,13 +378,20 @@ class LevelGate:
         fy   = sy - 4 + self.float_offset
         scale = 1.5
 
-        outline = font.render(text, True, (0, 0, 0))
-        outline = pygame.transform.scale(outline, (int(outline.get_width() * scale), int(outline.get_height() * scale)))
-        screen.blit(outline, outline.get_rect(center=(int(sx + 2), int(fy + 2))))
+        cache_key = (text, self.gate_color, scale)
+        if self._label_cache_key != cache_key:
+            outline = font.render(text, True, (0, 0, 0))
+            self._label_outline = pygame.transform.scale(
+                outline, (int(outline.get_width() * scale), int(outline.get_height() * scale)))
 
-        label = font.render(text, True, self.gate_color)
-        label = pygame.transform.scale(label, (int(label.get_width() * scale), int(label.get_height() * scale)))
-        screen.blit(label, label.get_rect(center=(int(sx), int(fy))))
+            label = font.render(text, True, self.gate_color)
+            self._label_surface = pygame.transform.scale(
+                label, (int(label.get_width() * scale), int(label.get_height() * scale)))
+
+            self._label_cache_key = cache_key
+
+        screen.blit(self._label_outline, self._label_outline.get_rect(center=(int(sx + 2), int(fy + 2))))
+        screen.blit(self._label_surface, self._label_surface.get_rect(center=(int(sx), int(fy))))
 
     def _draw_health_bar(self, screen, sx, sy, sw, colors):
         bh = max(2, int(6 / RENDER_SCALE))

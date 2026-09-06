@@ -44,6 +44,9 @@ TILESET_DIR = os.path.join("assets", "tilesets", "world_map")
 MAP_TILE_W   = 362   # map width in tiles
 MAP_TILE_H   = 263   # map height in tiles
 NATIVE_TILE  = 8      # source tile size in pixels
+CHUNK_TILES  = 16     # tiles per side of a pre-composited chunk (see
+                       # WorldMapEditor._get_chunk_surface) — the viewport
+                       # draw loop blits whole chunks, not individual tiles.
 
 ZOOM_LEVELS  = [1, 2, 3, 4, 6, 8]
 ZOOM_DEFAULT = 2      # index into ZOOM_LEVELS
@@ -139,6 +142,18 @@ class WorldMap:
         self.entities:  list[WMEntity]   = []
         self.music      = ''   # track stem to play during the mode7 flying scene ('' = none)
 
+        # Pre-composited CHUNK_TILES×CHUNK_TILES native-resolution chunk
+        # surfaces, keyed (frame_idx, chunk_x, chunk_y) -> Surface|None
+        # (None = chunk has no tiles, cached so empty chunks aren't
+        # recomposed every frame either). Built lazily by
+        # WorldMapEditor._get_chunk_surface() the first time a chunk is
+        # visible, and invalidated per-chunk by _place_tiles/_erase_tile
+        # below rather than rebuilt from scratch on every edit — see
+        # those methods' comments for why this exists (the viewport used
+        # to blit one texture per tile, which was fine at native zoom but
+        # became 10,000+ draw calls a frame zoomed all the way out).
+        self._chunk_cache: dict[tuple, Optional[pygame.Surface]] = {}
+
         # Designer-painted Scouter WORLD MAP silhouette — set of (tx, ty)
         # map-tile cells, same coordinate space as WMTile positions. This is
         # NOT derived from the tile art (see Scouter mode / game.py's
@@ -177,7 +192,20 @@ class WorldMap:
         if len(self._frames) <= 1:
             return 0
         self._frames.pop(idx)
+        # Frame indices shift after a removal, which would leave stale
+        # chunk-cache entries keyed under the old indices — simplest
+        # correct fix is to drop the whole cache; frame add/remove/dup
+        # are rare, editor-only actions, not something that needs to
+        # stay fast the way painting or zooming does.
+        self._chunk_cache.clear()
         return max(0, min(self.frame_idx, len(self._frames) - 1))
+
+    def invalidate_chunk_at(self, tx: int, ty: int):
+        """Drop the cached chunk surface covering tile (tx, ty) in the
+        *current* frame, so the next draw recomposes it. Call this after
+        any edit to wm.tiles."""
+        cx, cy = tx // CHUNK_TILES, ty // CHUNK_TILES
+        self._chunk_cache.pop((self.frame_idx, cx, cy), None)
 
     # ── serialisation ──────────────────────────────────────────────────────────
 
@@ -227,7 +255,25 @@ class WorldMap:
 # ─────────────────────────────── tileset loader ───────────────────────────────
 
 class WMTileset:
-    """Minimal 8 × 8 tileset loader with a per-zoom surface cache."""
+    """Minimal 8 × 8 tileset loader.
+
+    get_tile_raw() below replaces what used to be get_tile()'s
+    per-(tile, zoom-level) pygame.transform.scale() cache. That cache
+    is exactly the CPU cost gpu_renderer.py's docstring calls out:
+    every new zoom level meant a fresh burst of transform.scale() calls
+    for every tile newly visible at that size — a visible stutter the
+    instant you zoomed out to a level you hadn't visited yet, and a
+    _cache dict that grew one entry per (tile, zoom) pair forever.
+
+    Now get_tile_raw() hands back the *same* native-resolution Surface
+    object every time, cached once per tile regardless of zoom.
+    Combined with GPUScreen.blit_scaled() (see _draw_viewport below),
+    scaling happens on the GPU at draw time instead of on the CPU at
+    zoom time, and — just as importantly — GPUScreen's own texture
+    cache (keyed by Surface identity) uploads each tile exactly once
+    for the whole session, instead of re-uploading a new scaled copy
+    every time the zoom level changes.
+    """
 
     def __init__(self, name: str, path: str):
         self.name  = name
@@ -235,6 +281,7 @@ class WMTileset:
         self.cols  = 0
         self.rows  = 0
         self._cache: dict[tuple, Optional[pygame.Surface]] = {}
+        self._raw_cache: dict[tuple, Optional[pygame.Surface]] = {}
         try:
             self.image = pygame.image.load(path).convert_alpha()
             w, h = self.image.get_size()
@@ -243,18 +290,33 @@ class WMTileset:
         except Exception as exc:
             print(f"[WorldMapEditor] Could not load tileset '{name}': {exc}")
 
-    def get_tile(self, tx: int, ty: int, display_size: int
-                 ) -> Optional[pygame.Surface]:
-        """Return a scaled surface for tile (tx, ty); cached per display_size."""
-        key = (tx, ty, display_size)
-        if key not in self._cache:
+    def get_tile_raw(self, tx: int, ty: int) -> Optional[pygame.Surface]:
+        """Native NATIVE_TILE×NATIVE_TILE Surface for tile (tx, ty), cached
+        once (not per zoom). Scale this to whatever size you need at draw
+        time via GPUScreen.blit_scaled() rather than pre-scaling here."""
+        key = (tx, ty)
+        if key not in self._raw_cache:
             if (self.image is None or tx < 0 or ty < 0
                     or tx >= self.cols or ty >= self.rows):
-                self._cache[key] = None
+                self._raw_cache[key] = None
             else:
                 rect = pygame.Rect(tx * NATIVE_TILE, ty * NATIVE_TILE,
                                    NATIVE_TILE, NATIVE_TILE)
-                raw = self.image.subsurface(rect).copy()
+                self._raw_cache[key] = self.image.subsurface(rect).copy()
+        return self._raw_cache[key]
+
+    def get_tile(self, tx: int, ty: int, display_size: int
+                 ) -> Optional[pygame.Surface]:
+        """Return a scaled surface for tile (tx, ty); cached per display_size.
+        Kept for any remaining CPU-surface callers (e.g. thumbnail/export
+        code that isn't drawing through GPUScreen) — the live viewport draw
+        loop uses get_tile_raw() + blit_scaled() instead, see above."""
+        key = (tx, ty, display_size)
+        if key not in self._cache:
+            raw = self.get_tile_raw(tx, ty)
+            if raw is None:
+                self._cache[key] = None
+            else:
                 self._cache[key] = pygame.transform.scale(
                     raw, (display_size, display_size))
         return self._cache[key]
@@ -332,9 +394,26 @@ class WMVehicleSprite:
         except Exception as exc:
             print(f"[WorldMapEditor] Could not load vehicle sprite '{name}': {exc}")
 
+    def get_frame_raw(self, dir_row: int, frame_idx: int) -> Optional[pygame.Surface]:
+        """Native-resolution frame for *dir_row*/*frame_idx*, cached once —
+        no per-zoom dict. Scale to the destination size at draw time via
+        GPUScreen.blit_scaled() instead of pre-scaling here (see get_frame's
+        docstring note below and WMTileset.get_tile_raw for the same fix
+        applied to map tiles)."""
+        dir_row = max(0, min(dir_row, self.num_dirs - 1))
+        row_frames = self._frames_by_row.get(dir_row, self._frames_by_row.get(0))
+        if not row_frames:
+            return None
+        return row_frames[frame_idx % len(row_frames)]
+
     def get_frame(self, dir_row: int, frame_idx: int,
                   display_h: int) -> Optional[pygame.Surface]:
-        """Return a scaled frame for *dir_row* (0-based) and *frame_idx*, cached."""
+        """Return a scaled frame for *dir_row* (0-based) and *frame_idx*, cached.
+        Kept for any remaining CPU-surface callers — the live viewport draw
+        loop uses get_frame_raw() + blit_scaled() instead (same rationale as
+        WMTileset.get_tile vs get_tile_raw above: this cache used to mean a
+        fresh pygame.transform.scale() burst for every animated entity the
+        first time you visited a new zoom level)."""
         dir_row   = max(0, min(dir_row, self.num_dirs - 1))
         row_frames = self._frames_by_row.get(dir_row, self._frames_by_row.get(0))
         if not row_frames:
@@ -782,11 +861,13 @@ class WorldMapEditor:
                 if 0 <= ptx < MAP_TILE_W and 0 <= pty < MAP_TILE_H:
                     wm.tiles[(ptx, pty)] = WMTile(
                         ptx, pty, ts.name, min_tx + dx, min_ty + dy)
+                    wm.invalidate_chunk_at(ptx, pty)
 
     def _erase_tile(self, tx: int, ty: int):
         wm = self.current_map
         if wm:
             wm.tiles.pop((tx, ty), None)
+            wm.invalidate_chunk_at(tx, ty)
 
     # ─────────────────────── scouter paint helpers ────────────────────────────
 
@@ -1699,7 +1780,7 @@ class WorldMapEditor:
                 int(60  + 80  * t_sky),
                 int(100 + 100 * t_sky),
             )
-            pygame.draw.line(screen, sky_col,
+            screen.draw_line(sky_col,
                              (INNER_X, INNER_Y + _row),
                              (INNER_X + INNER_W - 1, INNER_Y + _row))
 
@@ -1711,7 +1792,7 @@ class WorldMapEditor:
                 int(50  + 60  * t_gnd),
                 int(15  + 25  * t_gnd),
             )
-            pygame.draw.line(screen, gnd_col,
+            screen.draw_line(gnd_col,
                              (INNER_X, INNER_Y + sky_h_p + _row),
                              (INNER_X + INNER_W - 1, INNER_Y + sky_h_p + _row))
 
@@ -1744,14 +1825,14 @@ class WorldMapEditor:
         # Draw a small stem from ground to elevated icon if height > 0
         if height_val > 0 and lift_scaled > 0:
             stem_col = self.C['accent'] if not is_entity else self.C['entity_path']
-            pygame.draw.line(screen, stem_col,
+            screen.draw_line(stem_col,
                              (icon_cx, INNER_Y + ground_y),
                              (icon_cx, INNER_Y + icon_y), 1)
-            pygame.draw.circle(screen, stem_col, (icon_cx, INNER_Y + ground_y), 2)
+            screen.draw_circle(stem_col, (icon_cx, INNER_Y + ground_y), 2)
 
         # Draw ground reference dot
         ground_dot_col = (120, 120, 120)
-        pygame.draw.circle(screen, ground_dot_col, (icon_cx, INNER_Y + ground_y), 3, 1)
+        screen.draw_circle(ground_dot_col, (icon_cx, INNER_Y + ground_y), 3, 1)
 
         # Icon or sprite
         ICON_SZ = max(8, int(24 * persp))
@@ -1774,7 +1855,7 @@ class WorldMapEditor:
         if not drawn:
             # Fallback: simple coloured circle
             dot_col = self.C['entity_path'] if is_entity else self.C['pin']
-            pygame.draw.circle(screen, dot_col,
+            screen.draw_circle(dot_col,
                                (icon_cx, INNER_Y + icon_y - ICON_SZ // 2),
                                max(4, ICON_SZ // 2))
 
@@ -1784,6 +1865,53 @@ class WorldMapEditor:
             midtop=(px_off + PW // 2, py_off + PH - 18)))
 
     # ── viewport ──────────────────────────────────────────────────────────────
+
+    def _get_chunk_surface(self, wm: WorldMap, cx: int, cy: int) -> Optional[pygame.Surface]:
+        """Composed CHUNK_TILES×CHUNK_TILES native-resolution Surface for
+        chunk (cx, cy) in wm's current frame, cached on the WorldMap
+        itself (see WorldMap._chunk_cache). This is the fix for the
+        zoomed-out slowdown: the viewport used to call screen.blit_scaled()
+        once per visible *tile* — 10,000+ individual SDL draw calls a
+        frame once tiles got small enough on screen — because each call
+        costs real Python overhead (texture lookup, Rect construction,
+        clip math) on top of the actual GPU draw, and that overhead is
+        what scaled with tile count, not the GPU-side scaling itself.
+        Composing a whole chunk once and blitting *that* one texture
+        turns "one draw call per visible tile" into "one draw call per
+        visible chunk" — a ~CHUNK_TILES² reduction — and the composed
+        chunk is cached and reused every frame until a tile inside it
+        changes (see invalidate_chunk_at)."""
+        key = (wm.frame_idx, cx, cy)
+        cache = wm._chunk_cache
+        if key in cache:
+            return cache[key]
+
+        base_tx = cx * CHUNK_TILES
+        base_ty = cy * CHUNK_TILES
+        surf = None
+        for ly in range(CHUNK_TILES):
+            ty = base_ty + ly
+            if ty >= MAP_TILE_H:
+                break
+            for lx in range(CHUNK_TILES):
+                tx = base_tx + lx
+                if tx >= MAP_TILE_W:
+                    break
+                tile = wm.tiles.get((tx, ty))
+                if tile is None:
+                    continue
+                ts = self._ts_lookup.get(tile.tileset)
+                if ts is None:
+                    continue
+                raw = ts.get_tile_raw(tile.tx, tile.ty)
+                if raw is None:
+                    continue
+                if surf is None:
+                    side = CHUNK_TILES * NATIVE_TILE
+                    surf = pygame.Surface((side, side), pygame.SRCALPHA)
+                surf.blit(raw, (lx * NATIVE_TILE, ly * NATIVE_TILE))
+        cache[key] = surf  # None cached too, so empty chunks aren't rebuilt every frame
+        return surf
 
     def _draw_viewport(self, screen: pygame.Surface):
         clip = pygame.Rect(self.vp_x, self.vp_y, self.vp_w, self.vp_h)
@@ -1809,19 +1937,26 @@ class WorldMapEditor:
         etx = min(MAP_TILE_W, (cam_xi + self.vp_w) // ds + 2)
         ety = min(MAP_TILE_H, (cam_yi + self.vp_h) // ds + 2)
 
-        # Draw tiles
-        for ty in range(sty, ety):
-            sy = ty * ds - cam_yi + self.vp_y
-            for tx in range(stx, etx):
-                tile = wm.tiles.get((tx, ty))
-                if tile is None:
-                    continue
-                ts = self._ts_lookup.get(tile.tileset)
-                if ts is None:
-                    continue
-                surf = ts.get_tile(tile.tx, tile.ty, ds)
-                if surf:
-                    screen.blit(surf, (tx * ds - cam_xi + self.vp_x, sy))
+        # Draw tiles, one chunk at a time (see _get_chunk_surface) rather
+        # than one blit_scaled() call per tile — at low zoom a viewport
+        # this size can have 10,000+ tiles visible, and that many
+        # individual draw calls (not the GPU scaling itself) is what was
+        # costing hundreds of ms a frame.
+        chunk_px = CHUNK_TILES * ds
+        if etx > stx and ety > sty:
+            scx0 = stx // CHUNK_TILES
+            scy0 = sty // CHUNK_TILES
+            scx1 = (etx - 1) // CHUNK_TILES
+            scy1 = (ety - 1) // CHUNK_TILES
+            for cy in range(scy0, scy1 + 1):
+                chunk_sy = cy * CHUNK_TILES * ds - cam_yi + self.vp_y
+                for cx in range(scx0, scx1 + 1):
+                    chunk = self._get_chunk_surface(wm, cx, cy)
+                    if chunk is None:
+                        continue
+                    chunk_sx = cx * CHUNK_TILES * ds - cam_xi + self.vp_x
+                    dst = pygame.Rect(chunk_sx, chunk_sy, chunk_px, chunk_px)
+                    screen.blit_scaled(chunk, dst)
 
         # Grid (only when tiles are large enough to make it readable)
         if self.show_grid and ds >= 8:
@@ -1882,7 +2017,7 @@ class WorldMapEditor:
         # Map boundary rect
         bx = self.vp_x - cam_xi
         by = self.vp_y - cam_yi
-        pygame.draw.rect(screen, self.C['map_border'],
+        screen.draw_rect(self.C['map_border'],
                          (bx, by, MAP_TILE_W * ds, MAP_TILE_H * ds), 2)
 
         # Location pins
@@ -1913,11 +2048,11 @@ class WorldMapEditor:
                 # so it's clear the pin is floating above its map tile.
                 ground_cy = int(py + ds / 2)
                 if loc.height != 0:
-                    pygame.draw.line(screen, color,
+                    screen.draw_line(color,
                                      (cx, ground_cy), (cx, cy + r), 1)
-                    pygame.draw.circle(screen, color, (cx, ground_cy), 2)
-                pygame.draw.circle(screen, color, (cx, cy), r)
-                pygame.draw.circle(screen, (255, 255, 255), (cx, cy), r, 1)
+                    screen.draw_circle(color, (cx, ground_cy), 2)
+                screen.draw_circle(color, (cx, cy), r)
+                screen.draw_circle((255, 255, 255), (cx, cy), r, 1)
                 # Sprite icon inside the pin
                 icon_stem = getattr(loc, 'icon', '')
                 if icon_stem:
@@ -1972,15 +2107,15 @@ class WorldMapEditor:
                         ay = int(p0y + t0 * (p1y - p0y))
                         bx = int(p0x + t1 * (p1x - p0x))
                         by = int(p0y + t1 * (p1y - p0y))
-                        pygame.draw.line(screen, path_col, (ax, ay), (bx, by),
+                        screen.draw_line(path_col, (ax, ay), (bx, by),
                                          2 if is_sel else 1)
 
             # ── Draw waypoint nodes ────────────────────────────────────────
             NODE_R = max(3, ds // 3)
             for k, (sx, sy) in enumerate(pts_screen):
                 col = self.C['entity_sel'] if (is_sel and k == 0) else node_col
-                pygame.draw.circle(screen, col, (sx, sy), NODE_R)
-                pygame.draw.circle(screen, (255, 255, 255), (sx, sy), NODE_R, 1)
+                screen.draw_circle(col, (sx, sy), NODE_R)
+                screen.draw_circle((255, 255, 255), (sx, sy), NODE_R, 1)
                 if is_sel and k == 0:
                     # Mark start
                     s_lbl = self.font_small.render('S', True, (0, 0, 0))
@@ -1989,9 +2124,9 @@ class WorldMapEditor:
             # ── Rubber-band line (only for selected entity being edited) ──
             if is_sel and self.entity_placing and self._entity_rubber and pts_screen:
                 rx, ry = tc(*self._entity_rubber)
-                pygame.draw.line(screen, (180, 220, 255),
+                screen.draw_line((180, 220, 255),
                                  pts_screen[-1], (rx, ry), 1)
-                pygame.draw.circle(screen, (180, 220, 255), (rx, ry), max(2, ds // 4))
+                screen.draw_circle((180, 220, 255), (rx, ry), max(2, ds // 4))
 
             # ── Animated sprite along path ─────────────────────────────────
             pos = self._entity_pos_at_t(e, self._entity_anim_t)
@@ -2010,21 +2145,26 @@ class WorldMapEditor:
                     dir_row  = _vehicle_dir_row(mdx, mdy, vs.num_dirs)
                     ANIM_FPS = 4.0
                     frame_idx = int(self._entity_anim_t * ANIM_FPS)
-                    surf = vs.get_frame(dir_row, frame_idx, max(ds, 8))
-                    if surf:
-                        r = surf.get_rect(center=(spr_cx, spr_cy))
-                        screen.blit(surf, r)
+                    raw = vs.get_frame_raw(dir_row, frame_idx)
+                    if raw:
+                        display_h = max(ds, 8)
+                        aspect = vs.frame_w / vs.frame_h
+                        new_h = display_h
+                        new_w = max(1, int(new_h * aspect))
+                        r = pygame.Rect(0, 0, new_w, new_h)
+                        r.center = (spr_cx, spr_cy)
+                        screen.blit_scaled(raw, r)
                         # Draw a thin stem from ground level up to the elevated sprite
                         ground_cy = int(sy_f + half)
                         if e.height != 0:
-                            pygame.draw.line(screen, path_col,
-                                             (spr_cx, ground_cy), (spr_cx, spr_cy + surf.get_height() // 2), 1)
-                            pygame.draw.circle(screen, path_col, (spr_cx, ground_cy), 2)
+                            screen.draw_line(path_col,
+                                             (spr_cx, ground_cy), (spr_cx, spr_cy + r.height // 2), 1)
+                            screen.draw_circle(path_col, (spr_cx, ground_cy), 2)
                         if is_sel:
-                            pygame.draw.rect(screen, self.C['entity_sel'], r, 1)
+                            screen.draw_rect(self.C['entity_sel'], r, 1)
                 else:
                     # Fallback: coloured circle
-                    pygame.draw.circle(screen, path_col, (spr_cx, spr_cy),
+                    screen.draw_circle(path_col, (spr_cx, spr_cy),
                                        max(4, ds // 2))
 
             # ── Entity name label (selected only) ──────────────────────────
@@ -2038,8 +2178,8 @@ class WorldMapEditor:
     def _draw_top_bar(self, screen: pygame.Surface):
         self.ui.clear()
         bar = pygame.Rect(0, 0, self.screen_width, TOP_BAR_H)
-        pygame.draw.rect(screen, self.C['topbar'], bar)
-        pygame.draw.line(screen, self.C['panel_border'],
+        screen.draw_rect(self.C['topbar'], bar)
+        screen.draw_line(self.C['panel_border'],
                          (0, TOP_BAR_H - 1), (self.screen_width, TOP_BAR_H - 1))
 
         x = 6
@@ -2053,8 +2193,8 @@ class WorldMapEditor:
             bg = (self.C['btn_active'] if active
                   else self.C['btn_hover'] if hover
                   else self.C['btn'])
-            pygame.draw.rect(screen, bg, rect, border_radius=4)
-            pygame.draw.rect(screen, self.C['accent'] if active else self.C['panel_border'],
+            screen.draw_rect(bg, rect, border_radius=4)
+            screen.draw_rect(self.C['accent'] if active else self.C['panel_border'],
                              rect, 1, border_radius=4)
             surf = self.font_medium.render(label, True, self.C['text'])
             screen.blit(surf, surf.get_rect(center=rect.center))
@@ -2110,9 +2250,8 @@ class WorldMapEditor:
             rect      = pygame.Rect(tab_x, 6, tab_w, TOP_BAR_H - 12)
             hover_bg  = self.C['btn_hover'] if not is_active else self.C['accent']
             draw_bg   = hover_bg if rect.collidepoint(mx2, my2) and my2 < TOP_BAR_H and not is_active else bg
-            pygame.draw.rect(screen, draw_bg, rect, border_radius=4)
-            pygame.draw.rect(screen,
-                             self.C['accent'] if is_active else self.C['panel_border'],
+            screen.draw_rect(draw_bg, rect, border_radius=4)
+            screen.draw_rect(self.C['accent'] if is_active else self.C['panel_border'],
                              rect, 1, border_radius=4)
             # Name label (leave room for × button on the right)
             name_surf = self.font_medium.render(label, True, self.C['text'])
@@ -2125,7 +2264,7 @@ class WorldMapEditor:
             del_hover = del_r.collidepoint(mx2, my2) and my2 < TOP_BAR_H
             del_bg    = self.C['danger'] if del_hover else (
                 (80, 30, 30) if is_active else (50, 30, 30))
-            pygame.draw.rect(screen, del_bg, del_r, border_radius=3)
+            screen.draw_rect(del_bg, del_r, border_radius=3)
             x_surf = self.font_medium.render('×', True, self.C['text'])
             screen.blit(x_surf, x_surf.get_rect(center=del_r.center))
             self.ui[f'map_tab_{i}']    = rect
@@ -2144,8 +2283,8 @@ class WorldMapEditor:
             fc_label = f'Frame {wm_cur.frame_idx + 1}/{wm_cur.frame_count}'
             fc_w = self.font_medium.size(fc_label)[0] + 12
             fc_rect = pygame.Rect(x, 6, fc_w, TOP_BAR_H - 12)
-            pygame.draw.rect(screen, self.C['panel'], fc_rect, border_radius=4)
-            pygame.draw.rect(screen, self.C['panel_border'], fc_rect, 1, border_radius=4)
+            screen.draw_rect(self.C['panel'], fc_rect, border_radius=4)
+            screen.draw_rect(self.C['panel_border'], fc_rect, 1, border_radius=4)
             fc_surf = self.font_medium.render(fc_label, True, self.C['text'])
             screen.blit(fc_surf, fc_surf.get_rect(center=fc_rect.center))
             self.ui['frame_label'] = fc_rect
@@ -2164,12 +2303,12 @@ class WorldMapEditor:
         right_x -= 30
         zi_rect = pygame.Rect(right_x, 6, 28, TOP_BAR_H - 12)
         mx2, my2 = pygame.mouse.get_pos()
-        pygame.draw.rect(screen, (self.C['btn_hover'] if zi_rect.collidepoint(mx2, my2) and my2 < TOP_BAR_H else self.C['btn']), zi_rect, border_radius=4)
+        screen.draw_rect((self.C['btn_hover'] if zi_rect.collidepoint(mx2, my2) and my2 < TOP_BAR_H else self.C['btn']), zi_rect, border_radius=4)
         screen.blit(self.font_medium.render('+', True, self.C['text']), self.font_medium.render('+', True, self.C['text']).get_rect(center=zi_rect.center))
         self.ui['btn_zoom_in'] = zi_rect
         right_x -= 32
         zo_rect = pygame.Rect(right_x, 6, 28, TOP_BAR_H - 12)
-        pygame.draw.rect(screen, (self.C['btn_hover'] if zo_rect.collidepoint(mx2, my2) and my2 < TOP_BAR_H else self.C['btn']), zo_rect, border_radius=4)
+        screen.draw_rect((self.C['btn_hover'] if zo_rect.collidepoint(mx2, my2) and my2 < TOP_BAR_H else self.C['btn']), zo_rect, border_radius=4)
         screen.blit(self.font_medium.render('−', True, self.C['text']), self.font_medium.render('−', True, self.C['text']).get_rect(center=zo_rect.center))
         self.ui['btn_zoom_out'] = zo_rect
         right_x -= 6
@@ -2180,8 +2319,8 @@ class WorldMapEditor:
         bg_loc = (self.C['btn_active'] if self.mode == 'location'
                   else self.C['btn_hover'] if loc_rect.collidepoint(mx2, my2) and my2 < TOP_BAR_H
                   else self.C['btn'])
-        pygame.draw.rect(screen, bg_loc, loc_rect, border_radius=4)
-        pygame.draw.rect(screen, self.C['panel_border'], loc_rect, 1, border_radius=4)
+        screen.draw_rect(bg_loc, loc_rect, border_radius=4)
+        screen.draw_rect(self.C['panel_border'], loc_rect, 1, border_radius=4)
         screen.blit(self.font_medium.render('Location', True, self.C['text']),
                     self.font_medium.render('Location', True, self.C['text']).get_rect(center=loc_rect.center))
         self.ui['btn_mode_location'] = loc_rect
@@ -2191,8 +2330,8 @@ class WorldMapEditor:
         bg_ent = (self.C['btn_active'] if self.mode == 'entity'
                   else self.C['btn_hover'] if ent_rect.collidepoint(mx2, my2) and my2 < TOP_BAR_H
                   else self.C['btn'])
-        pygame.draw.rect(screen, bg_ent, ent_rect, border_radius=4)
-        pygame.draw.rect(screen, self.C['panel_border'], ent_rect, 1, border_radius=4)
+        screen.draw_rect(bg_ent, ent_rect, border_radius=4)
+        screen.draw_rect(self.C['panel_border'], ent_rect, 1, border_radius=4)
         screen.blit(self.font_medium.render('Entity', True, self.C['text']),
                     self.font_medium.render('Entity', True, self.C['text']).get_rect(center=ent_rect.center))
         self.ui['btn_mode_entity'] = ent_rect
@@ -2202,8 +2341,8 @@ class WorldMapEditor:
         bg_pnt = (self.C['btn_active'] if self.mode == 'paint'
                   else self.C['btn_hover'] if pnt_rect.collidepoint(mx2, my2) and my2 < TOP_BAR_H
                   else self.C['btn'])
-        pygame.draw.rect(screen, bg_pnt, pnt_rect, border_radius=4)
-        pygame.draw.rect(screen, self.C['panel_border'], pnt_rect, 1, border_radius=4)
+        screen.draw_rect(bg_pnt, pnt_rect, border_radius=4)
+        screen.draw_rect(self.C['panel_border'], pnt_rect, 1, border_radius=4)
         screen.blit(self.font_medium.render('Paint', True, self.C['text']),
                     self.font_medium.render('Paint', True, self.C['text']).get_rect(center=pnt_rect.center))
         self.ui['btn_mode_paint'] = pnt_rect
@@ -2213,8 +2352,8 @@ class WorldMapEditor:
         bg_sct = (self.C['btn_active'] if self.mode == 'scouter'
                   else self.C['btn_hover'] if sct_rect.collidepoint(mx2, my2) and my2 < TOP_BAR_H
                   else self.C['btn'])
-        pygame.draw.rect(screen, bg_sct, sct_rect, border_radius=4)
-        pygame.draw.rect(screen, self.C['panel_border'], sct_rect, 1, border_radius=4)
+        screen.draw_rect(bg_sct, sct_rect, border_radius=4)
+        screen.draw_rect(self.C['panel_border'], sct_rect, 1, border_radius=4)
         screen.blit(self.font_medium.render('Scouter', True, self.C['text']),
                     self.font_medium.render('Scouter', True, self.C['text']).get_rect(center=sct_rect.center))
         self.ui['btn_mode_scouter'] = sct_rect
@@ -2224,8 +2363,8 @@ class WorldMapEditor:
     def _draw_panel(self, screen: pygame.Surface):
         panel_rect = pygame.Rect(self.vp_x + self.vp_w, TOP_BAR_H,
                                  PANEL_W, self.screen_height - TOP_BAR_H)
-        pygame.draw.rect(screen, self.C['panel'], panel_rect)
-        pygame.draw.line(screen, self.C['panel_border'],
+        screen.draw_rect(self.C['panel'], panel_rect)
+        screen.draw_line(self.C['panel_border'],
                          panel_rect.topleft, panel_rect.bottomleft, 2)
 
         px = panel_rect.x + 10
@@ -2263,8 +2402,8 @@ class WorldMapEditor:
         focused  = self.music_dropdown_open
         border_col = self.C['accent'] if focused else self.C['input_border']
         bg_col     = self.C['btn_hover'] if focused else self.C['input_bg']
-        pygame.draw.rect(screen, bg_col, btn_rect, border_radius=4)
-        pygame.draw.rect(screen, border_col, btn_rect, 1, border_radius=4)
+        screen.draw_rect(bg_col, btn_rect, border_radius=4)
+        screen.draw_rect(border_col, btn_rect, 1, border_radius=4)
 
         track = wm.music if wm else ''
         label = track if track else '<no music>'
@@ -2292,7 +2431,7 @@ class WorldMapEditor:
             self.ui.pop('music_clear', None)
 
         py += 6
-        pygame.draw.line(screen, self.C['panel_border'], (px, py), (px + PANEL_W - 40, py), 1)
+        screen.draw_line(self.C['panel_border'], (px, py), (px + PANEL_W - 40, py), 1)
         py += 10
         return py
 
@@ -2319,7 +2458,7 @@ class WorldMapEditor:
         list_bg = pygame.Surface((list_rect.w, list_rect.h), pygame.SRCALPHA)
         list_bg.fill((30, 30, 45, 240))
         screen.blit(list_bg, list_rect.topleft)
-        pygame.draw.rect(screen, self.C['accent'], list_rect, 1)
+        screen.draw_rect(self.C['accent'], list_rect, 1)
 
         self.ui['music_dropdown_list_rect'] = list_rect
         for key in [k for k in self.ui if k.startswith('music_dd_')]:
@@ -2338,9 +2477,9 @@ class WorldMapEditor:
                 is_sel = name == cur_track
                 hovered = item_rect.collidepoint(mx2, my2)
                 if is_sel:
-                    pygame.draw.rect(screen, self.C['accent'], item_rect)
+                    screen.draw_rect(self.C['accent'], item_rect)
                 elif hovered:
-                    pygame.draw.rect(screen, self.C['btn_hover'], item_rect)
+                    screen.draw_rect(self.C['btn_hover'], item_rect)
                 col = self.C['text'] if (is_sel or hovered) else self.C['dim']
                 item_surf = self.font_small.render(name, True, col)
                 screen.blit(item_surf, (item_rect.x + 6, item_rect.y + 4))
@@ -2469,9 +2608,9 @@ class WorldMapEditor:
         # ── Add Entity button ──────────────────────────────────────────────
         add_rect = pygame.Rect(px, py, PANEL_W - 20, 26)
         hover = add_rect.collidepoint(mx2, my2)
-        pygame.draw.rect(screen, self.C['btn_hover'] if hover else self.C['btn'],
+        screen.draw_rect(self.C['btn_hover'] if hover else self.C['btn'],
                          add_rect, border_radius=4)
-        pygame.draw.rect(screen, self.C['accent'], add_rect, 1, border_radius=4)
+        screen.draw_rect(self.C['accent'], add_rect, 1, border_radius=4)
         screen.blit(self.font_medium.render('+ Add Entity', True, self.C['text']),
                     self.font_medium.render('+ Add Entity', True, self.C['text']).get_rect(
                         center=add_rect.center))
@@ -2489,7 +2628,7 @@ class WorldMapEditor:
             is_sel   = (i == self.entity_selected_idx)
             row_rect = pygame.Rect(px - 4, py, PANEL_W - 30, 34)
             bg = self.C['btn_active'] if is_sel else self.C['btn']
-            pygame.draw.rect(screen, bg, row_rect, border_radius=3)
+            screen.draw_rect(bg, row_rect, border_radius=3)
 
             # Sprite thumbnail
             vs = self._get_vehicle_sprite(e.sprite) if e.sprite else None
@@ -2497,7 +2636,7 @@ class WorldMapEditor:
             if thumb:
                 screen.blit(thumb, (px, py + 3))
             else:
-                pygame.draw.rect(screen, self.C['entity_node'],
+                screen.draw_rect(self.C['entity_node'],
                                  (px, py + 5, 28, 24), border_radius=3)
 
             # Name + info
@@ -2514,15 +2653,15 @@ class WorldMapEditor:
             if e.room:
                 dot_x = row_rect.right - 38
                 dot_y = py + 7
-                pygame.draw.circle(screen, self.C['entity_path'], (dot_x, dot_y), 5)
-                pygame.draw.circle(screen, self.C['text'],        (dot_x, dot_y), 5, 1)
+                screen.draw_circle(self.C['entity_path'], (dot_x, dot_y), 5)
+                screen.draw_circle(self.C['text'],        (dot_x, dot_y), 5, 1)
                 tip_s = self.font_small.render('⇒', True, self.C['entity_path'])
                 screen.blit(tip_s, (dot_x - tip_s.get_width() // 2, dot_y + 7))
 
             # Delete button
             del_rect = pygame.Rect(px + PANEL_W - 34, py + 7, 20, 20)
             del_bg   = self.C['danger'] if del_rect.collidepoint(mx2, my2) else (80, 40, 40)
-            pygame.draw.rect(screen, del_bg, del_rect, border_radius=3)
+            screen.draw_rect(del_bg, del_rect, border_radius=3)
             screen.blit(self.font_small.render('×', True, (255, 255, 255)),
                         self.font_small.render('×', True, (255, 255, 255)).get_rect(
                             center=del_rect.center))
@@ -2539,7 +2678,7 @@ class WorldMapEditor:
         if eidx is not None and wm and 0 <= eidx < len(wm.entities):
             e = wm.entities[eidx]
             # Divider
-            pygame.draw.line(screen, self.C['panel_border'],
+            screen.draw_line(self.C['panel_border'],
                              (px - 4, py), (px + PANEL_W - 20, py), 1)
             py += 8
 
@@ -2551,7 +2690,7 @@ class WorldMapEditor:
             if self.entity_placing:
                 done_rect = pygame.Rect(px, py, (PANEL_W - 24) // 2 - 2, 26)
                 hover = done_rect.collidepoint(mx2, my2)
-                pygame.draw.rect(screen, self.C['success'] if hover else (40, 120, 40),
+                screen.draw_rect(self.C['success'] if hover else (40, 120, 40),
                                  done_rect, border_radius=4)
                 screen.blit(self.font_medium.render('✓ Done', True, (255, 255, 255)),
                             self.font_medium.render('✓ Done', True, (255, 255, 255)).get_rect(
@@ -2560,9 +2699,9 @@ class WorldMapEditor:
             else:
                 place_rect = pygame.Rect(px, py, (PANEL_W - 24) // 2 - 2, 26)
                 hover = place_rect.collidepoint(mx2, my2)
-                pygame.draw.rect(screen, self.C['btn_hover'] if hover else self.C['btn'],
+                screen.draw_rect(self.C['btn_hover'] if hover else self.C['btn'],
                                  place_rect, border_radius=4)
-                pygame.draw.rect(screen, self.C['entity_path'], place_rect, 1, border_radius=4)
+                screen.draw_rect(self.C['entity_path'], place_rect, 1, border_radius=4)
                 screen.blit(self.font_medium.render('✎ Edit Path', True, self.C['text']),
                             self.font_medium.render('✎ Edit Path', True, self.C['text']).get_rect(
                                 center=place_rect.center))
@@ -2571,7 +2710,7 @@ class WorldMapEditor:
             clear_rect = pygame.Rect(
                 px + (PANEL_W - 24) // 2 + 2, py, (PANEL_W - 24) // 2 - 2, 26)
             chover = clear_rect.collidepoint(mx2, my2)
-            pygame.draw.rect(screen, (120, 40, 40) if chover else (80, 30, 30),
+            screen.draw_rect((120, 40, 40) if chover else (80, 30, 30),
                              clear_rect, border_radius=4)
             screen.blit(self.font_medium.render('Clear Path', True, self.C['text']),
                         self.font_medium.render('Clear Path', True, self.C['text']).get_rect(
@@ -2586,8 +2725,8 @@ class WorldMapEditor:
             bg_closed = (self.C['btn_active'] if e.closed
                          else self.C['btn_hover'] if is_closed_hover
                          else self.C['btn'])
-            pygame.draw.rect(screen, bg_closed, closed_rect, border_radius=4)
-            pygame.draw.rect(screen, self.C['panel_border'], closed_rect, 1, border_radius=4)
+            screen.draw_rect(bg_closed, closed_rect, border_radius=4)
+            screen.draw_rect(self.C['panel_border'], closed_rect, 1, border_radius=4)
             screen.blit(self.font_medium.render(closed_label, True, self.C['text']),
                         self.font_medium.render(closed_label, True, self.C['text']).get_rect(
                             center=closed_rect.center))
@@ -2603,21 +2742,21 @@ class WorldMapEditor:
             track_w = PANEL_W - 20
             track_h = 8
             track_rect = pygame.Rect(track_x, track_y, track_w, track_h)
-            pygame.draw.rect(screen, self.C['btn'], track_rect, border_radius=4)
+            screen.draw_rect(self.C['btn'], track_rect, border_radius=4)
             t_h = (e.height - EHEIGHT_MIN) / (EHEIGHT_MAX - EHEIGHT_MIN)
             t_h = max(0.0, min(1.0, t_h))
             thumb_x = int(track_x + t_h * track_w)
             fill_rect = pygame.Rect(track_x, track_y, thumb_x - track_x, track_h)
-            pygame.draw.rect(screen, self.C['entity_path'], fill_rect, border_radius=4)
-            pygame.draw.rect(screen, self.C['panel_border'], track_rect, 1, border_radius=4)
-            pygame.draw.line(screen, self.C['dim'],
+            screen.draw_rect(self.C['entity_path'], fill_rect, border_radius=4)
+            screen.draw_rect(self.C['panel_border'], track_rect, 1, border_radius=4)
+            screen.draw_line(self.C['dim'],
                              (track_x, track_y - 3), (track_x, track_y + track_h + 3), 1)
             THUMB_R = 8
             thumb_hover = (abs(mx2 - thumb_x) <= THUMB_R + 4
                            and abs(my2 - (track_y + track_h // 2)) <= THUMB_R + 4)
             thumb_col = self.C['entity_path'] if (self._entity_height_slider_drag or thumb_hover) else self.C['text']
-            pygame.draw.circle(screen, thumb_col, (thumb_x, track_y + track_h // 2), THUMB_R)
-            pygame.draw.circle(screen, self.C['bg'], (thumb_x, track_y + track_h // 2), THUMB_R - 3)
+            screen.draw_circle(thumb_col, (thumb_x, track_y + track_h // 2), THUMB_R)
+            screen.draw_circle(self.C['bg'], (thumb_x, track_y + track_h // 2), THUMB_R - 3)
             val_s = self.font_medium.render(str(e.height), True, self.C['text'])
             screen.blit(val_s, val_s.get_rect(center=(thumb_x, track_y - 14)))
             min_s = self.font_small.render(str(EHEIGHT_MIN), True, self.C['dim'])
@@ -2639,8 +2778,8 @@ class WorldMapEditor:
             ent_room_focused = self.entity_room_dropdown_open
             border_col = self.C['entity_path'] if ent_room_focused else self.C['input_border']
             bg_col     = self.C['btn_hover'] if ent_room_focused else self.C['input_bg']
-            pygame.draw.rect(screen, bg_col, btn_rect, border_radius=4)
-            pygame.draw.rect(screen, border_col, btn_rect, 1, border_radius=4)
+            screen.draw_rect(bg_col, btn_rect, border_radius=4)
+            screen.draw_rect(border_col, btn_rect, 1, border_radius=4)
             room_label = e.room if e.room else '(no room — no collision)'
             lbl_col    = self.C['text'] if e.room else self.C['dim']
             lbl_surf   = self.font_medium.render(room_label, True, lbl_col)
@@ -2657,7 +2796,7 @@ class WorldMapEditor:
             # Clear button (×) to the right of the dropdown
             clr_r = pygame.Rect(btn_rect.right + 4, py, 20, 28)
             clr_bg = self.C['danger'] if clr_r.collidepoint(mx2, my2) else (80, 40, 40)
-            pygame.draw.rect(screen, clr_bg, clr_r, border_radius=3)
+            screen.draw_rect(clr_bg, clr_r, border_radius=3)
             screen.blit(self.font_small.render('×', True, (255, 255, 255)),
                         self.font_small.render('×', True, (255, 255, 255)).get_rect(
                             center=clr_r.center))
@@ -2699,9 +2838,8 @@ class WorldMapEditor:
                     vbg = (self.C['accent'] if v_sel
                            else self.C['btn_hover'] if v_hover
                            else self.C['btn'])
-                    pygame.draw.rect(screen, vbg, cell_rect, border_radius=4)
-                    pygame.draw.rect(screen,
-                                     self.C['accent'] if v_sel else self.C['panel_border'],
+                    screen.draw_rect(vbg, cell_rect, border_radius=4)
+                    screen.draw_rect(self.C['accent'] if v_sel else self.C['panel_border'],
                                      cell_rect, 1, border_radius=4)
                     vs = self._get_vehicle_sprite(vname)
                     thumb = vs.get_panel_thumb(VCELL - 6) if vs else None
@@ -2742,8 +2880,8 @@ class WorldMapEditor:
             else:
                 pop_y = TOP_BAR_H + 60
             popup_rect = pygame.Rect(pop_x, pop_y, pop_w, pop_h)
-            pygame.draw.rect(screen, self.C['panel'], popup_rect, border_radius=4)
-            pygame.draw.rect(screen, self.C['entity_path'], popup_rect, 1, border_radius=4)
+            screen.draw_rect(self.C['panel'], popup_rect, border_radius=4)
+            screen.draw_rect(self.C['entity_path'], popup_rect, 1, border_radius=4)
             if not room_names:
                 ns = self.font_small.render('(no rooms found)', True, self.C['dim'])
                 screen.blit(ns, (pop_x + 6, pop_y + 5))
@@ -2758,10 +2896,10 @@ class WorldMapEditor:
                     hovered   = item_rect.collidepoint(mx2, my2)
                     selected  = (rname == cur_ent_room)
                     if selected:
-                        pygame.draw.rect(screen, self.C['entity_path'],
+                        screen.draw_rect(self.C['entity_path'],
                                          item_rect, border_radius=3)
                     elif hovered:
-                        pygame.draw.rect(screen, self.C['btn_hover'],
+                        screen.draw_rect(self.C['btn_hover'],
                                          item_rect, border_radius=3)
                     col = self.C['text'] if (selected or hovered) else self.C['dim']
                     ns  = self.font_medium.render(rname, True, col)
@@ -2824,7 +2962,7 @@ class WorldMapEditor:
                     self._sel_surf.fill((255, 215, 0, 55))
                     self._sel_surf_size = (sel_w, sel_h)
                 screen.blit(self._sel_surf, (sel_x, sel_y))
-                pygame.draw.rect(screen, self.C['accent'],
+                screen.draw_rect(self.C['accent'],
                                  (sel_x, sel_y, sel_w, sel_h), 2)
 
         screen.set_clip(None)
@@ -2867,8 +3005,8 @@ class WorldMapEditor:
             bg = (self.C['btn_active'] if active
                   else self.C['btn_hover'] if hover
                   else self.C['btn'])
-            pygame.draw.rect(screen, bg, rect, border_radius=4)
-            pygame.draw.rect(screen, self.C['accent'] if active else self.C['panel_border'],
+            screen.draw_rect(bg, rect, border_radius=4)
+            screen.draw_rect(self.C['accent'] if active else self.C['panel_border'],
                              rect, 1, border_radius=4)
             s = self.font_small.render(str(size), True, self.C['text'])
             screen.blit(s, s.get_rect(center=rect.center))
@@ -2882,9 +3020,9 @@ class WorldMapEditor:
 
         clr_rect = pygame.Rect(px, py, 104, 26)
         hover = clr_rect.collidepoint(mx, my)
-        pygame.draw.rect(screen, self.C['danger'] if hover else self.C['btn'],
+        screen.draw_rect(self.C['danger'] if hover else self.C['btn'],
                          clr_rect, border_radius=4)
-        pygame.draw.rect(screen, self.C['panel_border'], clr_rect, 1, border_radius=4)
+        screen.draw_rect(self.C['panel_border'], clr_rect, 1, border_radius=4)
         clr_surf = self.font_small.render('Clear all', True, self.C['text'])
         screen.blit(clr_surf, clr_surf.get_rect(center=clr_rect.center))
         self.ui['btn_scouter_clear'] = clr_rect
@@ -2927,12 +3065,11 @@ class WorldMapEditor:
             is_sel = (loc is self.selected_loc)
             row_rect = pygame.Rect(px - 4, py, PANEL_W - 30, 36)
             bg = self.C['btn_active'] if is_sel else self.C['btn']
-            pygame.draw.rect(screen, bg, row_rect, border_radius=3)
+            screen.draw_rect(bg, row_rect, border_radius=3)
 
             # Icon badge (sprite or coloured circle fallback)
             badge_cx, badge_cy = px + 14, py + 18
-            pygame.draw.circle(screen,
-                               self.C['pin_sel'] if is_sel else self.C['pin'],
+            screen.draw_circle(self.C['pin_sel'] if is_sel else self.C['pin'],
                                (badge_cx, badge_cy), 12)
             icon_stem = getattr(loc, 'icon', '')
             if icon_stem:
@@ -2950,7 +3087,7 @@ class WorldMapEditor:
             mx2, my2 = pygame.mouse.get_pos()
             del_rect = pygame.Rect(px + PANEL_W - 34, py + 8, 20, 20)
             del_bg = self.C['danger'] if del_rect.collidepoint(mx2, my2) else (80, 40, 40)
-            pygame.draw.rect(screen, del_bg, del_rect, border_radius=3)
+            screen.draw_rect(del_bg, del_rect, border_radius=3)
             x_s = self.font_small.render('×', True, (255, 255, 255))
             screen.blit(x_s, x_s.get_rect(center=del_rect.center))
 
@@ -2970,9 +3107,9 @@ class WorldMapEditor:
         screen.blit(overlay, (0, 0))
         box_x = (self.screen_width - w) // 2
         box_y = (self.screen_height - h) // 2
-        pygame.draw.rect(screen, self.C['panel'], (box_x, box_y, w, h),
+        screen.draw_rect(self.C['panel'], (box_x, box_y, w, h),
                          border_radius=8)
-        pygame.draw.rect(screen, self.C['accent'], (box_x, box_y, w, h),
+        screen.draw_rect(self.C['accent'], (box_x, box_y, w, h),
                          2, border_radius=8)
         title_s = self.font_large.render(title, True, self.C['text'])
         screen.blit(title_s, (box_x + (w - title_s.get_width()) // 2, box_y + 14))
@@ -2986,8 +3123,8 @@ class WorldMapEditor:
         cursor = '|' if (active and int(self.cursor_blink * 2) % 2 == 0) else ''
         field_rect = pygame.Rect(x, y + 18, w, 28)
         border_col = self.C['accent'] if active else self.C['input_border']
-        pygame.draw.rect(screen, self.C['input_bg'], field_rect, border_radius=4)
-        pygame.draw.rect(screen, border_col, field_rect, 1, border_radius=4)
+        screen.draw_rect(self.C['input_bg'], field_rect, border_radius=4)
+        screen.draw_rect(border_col, field_rect, 1, border_radius=4)
         val_s = self.font_medium.render(value + cursor, True, self.C['text'])
         screen.blit(val_s, (field_rect.x + 6, field_rect.y + 5))
         return field_rect
@@ -3006,9 +3143,9 @@ class WorldMapEditor:
         mx, my = pygame.mouse.get_pos()
         for rect, key, label in ((ok_r, 'ok', 'CREATE'), (can_r, 'cancel', 'CANCEL')):
             hover = rect.collidepoint(mx, my)
-            pygame.draw.rect(screen, self.C['btn_hover'] if hover else self.C['btn'],
+            screen.draw_rect(self.C['btn_hover'] if hover else self.C['btn'],
                              rect, border_radius=4)
-            pygame.draw.rect(screen, self.C['accent'], rect, 1, border_radius=4)
+            screen.draw_rect(self.C['accent'], rect, 1, border_radius=4)
             s = self.font_medium.render(label, True, self.C['text'])
             screen.blit(s, s.get_rect(center=rect.center))
             self.loc_dialog_rects[key] = rect
@@ -3043,8 +3180,8 @@ class WorldMapEditor:
         focused  = (self.loc_dialog_field == 'room')
         border_col = self.C['accent'] if focused else self.C['input_border']
         bg_col     = self.C['btn_hover'] if (focused or self.room_dropdown_open) else self.C['input_bg']
-        pygame.draw.rect(screen, bg_col, btn_rect, border_radius=4)
-        pygame.draw.rect(screen, border_col, btn_rect, 1, border_radius=4)
+        screen.draw_rect(bg_col, btn_rect, border_radius=4)
+        screen.draw_rect(border_col, btn_rect, 1, border_radius=4)
         # Label: current value or placeholder
         room_label = self.loc_dialog_room if self.loc_dialog_room else '(select a room…)'
         lbl_col    = self.C['text'] if self.loc_dialog_room else self.C['dim']
@@ -3067,24 +3204,24 @@ class WorldMapEditor:
         track_h = 8
         track_rect = pygame.Rect(track_x, track_y, track_w, track_h)
         # Draw track
-        pygame.draw.rect(screen, self.C['btn'], track_rect, border_radius=4)
+        screen.draw_rect(self.C['btn'], track_rect, border_radius=4)
         # Fill from left (0 / ground level) to thumb position
         t = (self.loc_dialog_height - HEIGHT_MIN) / (HEIGHT_MAX - HEIGHT_MIN)
         t = max(0.0, min(1.0, t))
         thumb_x   = int(track_x + t * track_w)
         fill_rect = pygame.Rect(track_x, track_y, thumb_x - track_x, track_h)
-        pygame.draw.rect(screen, self.C['accent'], fill_rect, border_radius=4)
-        pygame.draw.rect(screen, self.C['panel_border'], track_rect, 1, border_radius=4)
+        screen.draw_rect(self.C['accent'], fill_rect, border_radius=4)
+        screen.draw_rect(self.C['panel_border'], track_rect, 1, border_radius=4)
         # Ground-level notch at the left edge
-        pygame.draw.line(screen, self.C['dim'],
+        screen.draw_line(self.C['dim'],
                          (track_x, track_y - 3), (track_x, track_y + track_h + 3), 1)
         # Draw thumb
         THUMB_R = 8
         thumb_hover = (abs(mx - thumb_x) <= THUMB_R + 4
                        and abs(my - (track_y + track_h // 2)) <= THUMB_R + 4)
         thumb_col = self.C['accent'] if (self._height_slider_drag or thumb_hover) else self.C['text']
-        pygame.draw.circle(screen, thumb_col, (thumb_x, track_y + track_h // 2), THUMB_R)
-        pygame.draw.circle(screen, self.C['bg'], (thumb_x, track_y + track_h // 2), THUMB_R - 3)
+        screen.draw_circle(thumb_col, (thumb_x, track_y + track_h // 2), THUMB_R)
+        screen.draw_circle(self.C['bg'], (thumb_x, track_y + track_h // 2), THUMB_R - 3)
         # Value label + range hints
         val_s = self.font_medium.render(str(self.loc_dialog_height), True, self.C['text'])
         screen.blit(val_s, val_s.get_rect(center=(thumb_x, track_y - 14)))
@@ -3123,9 +3260,8 @@ class WorldMapEditor:
                 bg = (self.C['accent'] if selected
                       else self.C['btn_hover'] if hovered
                       else self.C['btn'])
-                pygame.draw.rect(screen, bg, cell_rect, border_radius=5)
-                pygame.draw.rect(screen,
-                                 self.C['accent'] if selected else self.C['panel_border'],
+                screen.draw_rect(bg, cell_rect, border_radius=5)
+                screen.draw_rect(self.C['accent'] if selected else self.C['panel_border'],
                                  cell_rect, 1, border_radius=5)
                 surf = self._get_icon(stem, CELL - 6)
                 if surf:
@@ -3145,9 +3281,9 @@ class WorldMapEditor:
         can_r = pygame.Rect(bx + w // 2 + 10,  by + h - 44, 100, 30)
         for rect, key, label in ((ok_r, 'ok', 'OK'), (can_r, 'cancel', 'CANCEL')):
             hover = rect.collidepoint(mx, my)
-            pygame.draw.rect(screen, self.C['btn_hover'] if hover else self.C['btn'],
+            screen.draw_rect(self.C['btn_hover'] if hover else self.C['btn'],
                              rect, border_radius=4)
-            pygame.draw.rect(screen, self.C['accent'], rect, 1, border_radius=4)
+            screen.draw_rect(self.C['accent'], rect, 1, border_radius=4)
             s = self.font_medium.render(label, True, self.C['text'])
             screen.blit(s, s.get_rect(center=rect.center))
             self.loc_dialog_rects[key] = rect
@@ -3173,8 +3309,8 @@ class WorldMapEditor:
                 pop_y = btn_bottom
             pop_x = ix
             popup_rect = pygame.Rect(pop_x, pop_y, pop_w, pop_h)
-            pygame.draw.rect(screen, self.C['panel'], popup_rect, border_radius=4)
-            pygame.draw.rect(screen, self.C['accent'], popup_rect, 1, border_radius=4)
+            screen.draw_rect(self.C['panel'], popup_rect, border_radius=4)
+            screen.draw_rect(self.C['accent'], popup_rect, 1, border_radius=4)
             if not room_names:
                 ns = self.font_small.render('(no rooms found)', True, self.C['dim'])
                 screen.blit(ns, (pop_x + 6, pop_y + 5))
@@ -3188,9 +3324,9 @@ class WorldMapEditor:
                     hovered   = item_rect.collidepoint(mx2, my2)
                     selected  = (name == self.loc_dialog_room)
                     if selected:
-                        pygame.draw.rect(screen, self.C['accent'], item_rect, border_radius=3)
+                        screen.draw_rect(self.C['accent'], item_rect, border_radius=3)
                     elif hovered:
-                        pygame.draw.rect(screen, self.C['btn_hover'], item_rect, border_radius=3)
+                        screen.draw_rect(self.C['btn_hover'], item_rect, border_radius=3)
                     col  = self.C['text'] if (selected or hovered) else self.C['dim']
                     ns   = self.font_medium.render(name, True, col)
                     screen.blit(ns, (item_rect.x + 6, item_rect.y + 4))

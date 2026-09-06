@@ -106,10 +106,32 @@ class MapPaintEditor:
     def draw_dim_overlay(self, screen):
         """Call BEFORE drawing painted cells, right after the room's normal
         tile surface is blit — tones the room down so painted cells (and
-        the grid) read clearly on top, per the original request."""
-        overlay = pygame.Surface((self.screen_width, self.screen_height), pygame.SRCALPHA)
-        overlay.fill(self.colors['dim_overlay'])
-        screen.blit(overlay, (0, 0))
+        the grid) read clearly on top, per the original request.
+
+        Fills the real display directly (a native SDL fill_rect via
+        `screen.fill()`, no Surface involved) instead of building a
+        screen-sized SRCALPHA Surface and blitting it. Two reasons:
+
+        1. Zoom: `screen` during continuous editor zoom is a `_ZoomedScreen`
+           wrapper whose `fill(color, rect=None)` intentionally fills the
+           *real* window when no rect is given — exactly right here, since
+           dimming is a screen-space effect (it should always cover the
+           whole visible viewport) rather than a world-space one that
+           should shrink/grow with zoom. A Surface sized from
+           self.screen_width/self.screen_height and blit at (0, 0) would
+           NOT get this for free: those dims are the real window size
+           captured once at construction, but `screen.blit((0,0))` under
+           `_ZoomedScreen` scales the blit's inferred size by the current
+           zoom, so the dim rect would shrink to cover only part of the
+           window whenever zoomed out.
+        2. Perf: a fresh `pygame.Surface(...)` built and blit() 'd every
+           single frame is a guaranteed GPUScreen texture-cache miss
+           (cached by id(surface)), forcing a full screen-sized texture
+           upload every frame just to paint one flat color — the same
+           anti-pattern the animated-region overlay had. `screen.fill()`
+           skips Surfaces and textures entirely.
+        """
+        screen.fill(self.colors['dim_overlay'])
 
     def draw(self, screen, camera_x, camera_y, room_width, room_height):
         if not self.active:
@@ -119,27 +141,45 @@ class MapPaintEditor:
 
         cell_screen = CELL_SIZE * RENDER_SCALE
 
-        # Grid — only within the room's own bounds, not the whole screen.
-        grid_surf = pygame.Surface((self.screen_width, self.screen_height), pygame.SRCALPHA)
-        x0 = -int(camera_x) % cell_screen
-        for sx in range(int(x0), self.screen_width, int(cell_screen)):
-            pygame.draw.line(grid_surf, self.colors['grid'], (sx, 0), (sx, self.screen_height))
-        y0 = -int(camera_y) % cell_screen
-        for sy in range(int(y0), self.screen_height, int(cell_screen)):
-            pygame.draw.line(grid_surf, self.colors['grid'], (0, sy), (self.screen_width, sy))
-        screen.blit(grid_surf, (0, 0))
+        # Drawn straight through screen.draw_line()/draw_rect() in the same
+        # pre-zoom "world * RENDER_SCALE" space camera_x/camera_y already
+        # live in — matching every other editor overlay (see
+        # animated_region.py). During continuous editor zoom, `screen` is
+        # a `_ZoomedScreen` wrapper that scales every draw_line()/
+        # draw_rect() call by the current zoom before it reaches the real
+        # GPUScreen, so the grid and painted cells now zoom the same way
+        # tiles, regions, and everything else in the room do.
+        #
+        # The previous version rasterized the grid and painted cells onto
+        # a pygame.Surface sized to self.screen_width/self.screen_height
+        # (the real window size, fixed at construction) and blit it at a
+        # literal (0, 0) — that can't respect zoom at all: zoomed out, more
+        # of the room becomes visible and cells should appear smaller, but
+        # a pre-rasterized Surface blit at native size just stays pinned to
+        # the real window's pixel dimensions regardless of zoom level. It
+        # also rebuilt that full-screen Surface from scratch every frame,
+        # which under GPUScreen is a fresh id(surface) every call — a
+        # guaranteed texture-cache miss, so every frame re-uploaded a
+        # full-screen texture just to draw a handful of grid lines and
+        # colored rects. draw_line()/draw_rect() skip Surfaces and
+        # textures entirely, same fix as the animated-region overlay.
+        vw, vh = screen.get_size()
+
+        # Grid — only within the visible area.
+        x0 = -int(camera_x) % int(cell_screen)
+        for sx in range(int(x0), int(vw), int(cell_screen)):
+            screen.draw_line(self.colors['grid'], (sx, 0), (sx, vh))
+        y0 = -int(camera_y) % int(cell_screen)
+        for sy in range(int(y0), int(vh), int(cell_screen)):
+            screen.draw_line(self.colors['grid'], (0, sy), (vw, sy))
 
         # Painted cells
         cells = self.manager.get_painted_cells(self.current_room_name)
-        if not cells:
-            return
-        paint_surf = pygame.Surface((self.screen_width, self.screen_height), pygame.SRCALPHA)
         for gx, gy in cells:
             sx = gx * cell_screen - camera_x
             sy = gy * cell_screen - camera_y
-            if sx < -cell_screen or sy < -cell_screen or sx > self.screen_width or sy > self.screen_height:
+            if sx < -cell_screen or sy < -cell_screen or sx > vw or sy > vh:
                 continue
             rect = pygame.Rect(int(sx), int(sy), int(cell_screen), int(cell_screen))
-            pygame.draw.rect(paint_surf, self.colors['painted'], rect)
-            pygame.draw.rect(paint_surf, self.colors['painted_line'], rect, 1)
-        screen.blit(paint_surf, (0, 0))
+            screen.draw_rect(self.colors['painted'], rect)
+            screen.draw_rect(self.colors['painted_line'], rect, 1)

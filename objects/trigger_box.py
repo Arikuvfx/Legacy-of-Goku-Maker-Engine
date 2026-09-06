@@ -33,6 +33,13 @@ To open the editor for a box (e.g. from a dev-mode object inspector):
 
 import pygame
 
+# draw_trigger_box() below used to build a fresh pygame.font.Font every
+# call — i.e. every box, every frame, in dev mode. Font construction
+# re-parses the font file and is far pricier than reusing one you already
+# have, so this is cached module-wide instead (same fix as
+# collision_object.py's _DIM_FONT / animated_region.py's _label_font).
+_LABEL_FONT = None
+
 
 class TriggerBox:
     """Base class — do not instantiate directly, use OverlapTriggerBox or
@@ -338,7 +345,10 @@ def draw_trigger_box(screen, box, camera_x, camera_y, render_scale, dev_mode=Tru
     border_color = (255, 255, 255) if selected else base_color
     pygame.draw.rect(screen, border_color, rect, 3 if selected else 2)
 
-    font = pygame.font.Font(None, 16)
+    global _LABEL_FONT
+    if _LABEL_FONT is None:
+        _LABEL_FONT = pygame.font.Font(None, 16)
+    font = _LABEL_FONT
     label = box.box_id or '<unnamed>'
     if getattr(box, 'always_run', False):
         label += ' [ALWAYS]'

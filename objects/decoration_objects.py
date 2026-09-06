@@ -31,6 +31,7 @@ import pygame
 
 from core.draw_layers import DrawLayer
 from config.settings import RENDER_SCALE
+from objects.collision_object import beam_block_distance_for_rect
 
 
 # Per-decoration-type sprite sheet + animation configuration.
@@ -226,6 +227,29 @@ class Decoration:
         scaled, screen_x, screen_y = self.get_render_info(camera, RENDER_SCALE)
         screen.blit(scaled, (screen_x, screen_y))
 
+    def get_visual_rect(self):
+        """WORLD-space pygame.Rect for the full sprite footprint — bottom-
+        center anchored at (self.x, self.y), same convention as
+        get_render_info()/draw() (unscaled, since this is world space, not
+        screen space).
+
+        Deliberately NOT the same rect as get_collision_rect(): that one
+        is a small trunk-only hitbox by design (see its own docstring —
+        so the player can walk behind/under a wide canopy), which makes it
+        the wrong rect for anything that needs to know where the sprite is
+        actually DRAWN — e.g. LayerManager._apply_decoration_occlusion
+        (draw_layers.py), which tests whether an attack visually overlaps
+        the canopy, not just the narrow trunk.
+        """
+        if not self.active:
+            return None
+        return pygame.Rect(
+            self.x - self.width / 2,
+            self.y - self.height,
+            self.width,
+            self.height,
+        )
+
     def get_collision_rect(self):
         """Small blocking rect near the trunk/base — deliberately much
         smaller than the full canopy sprite (see DECORATION_STYLES'
@@ -239,6 +263,21 @@ class Decoration:
             int(self._collision_w),
             int(self._collision_h),
         )
+
+    def get_beam_block_distance(self, attack):
+        """Same contract as CollisionObject.get_beam_block_distance — return
+        the SCREEN-space distance at which `attack` (a BeamAttack) should
+        stop growing because this decoration's trunk hitbox (see
+        get_collision_rect) is in its path, or None if it isn't this
+        frame. Uses the small trunk rect, not the full canopy sprite —
+        same "only the trunk actually blocks" reasoning as
+        get_collision_rect's docstring — so a beam correctly grazes past a
+        wide canopy but stops at the trunk.
+        """
+        rect = self.get_collision_rect()
+        if rect is None:
+            return None
+        return beam_block_distance_for_rect(rect, attack)
 
     def to_dict(self):
         return {

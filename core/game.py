@@ -11,6 +11,7 @@ Main loop:      handle_events → update → draw → clock.tick(FPS)
 
 import sys
 import os
+from collections import OrderedDict
 
 # ── Single-instance guard ────────────────────────────────────────────────────
 # Prevents the game (or the exported .exe) from being launched a second time
@@ -84,6 +85,8 @@ from core.event_actions import EventRunner
 from core.game_config import GameConfig
 from core.transformation_system import TransformationSystem
 from core.transition_controller import TransitionController
+from pygame._sdl2 import video as sdl2_video
+from core.gpu_renderer import GPUScreen
 from dev_tools.dev_menu import DevMenu
 from dev_tools.npc_config import NPCConfigMenu
 from dev_tools.transition_config import TransitionConfigMenu
@@ -335,6 +338,10 @@ class Game:
             pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP,
             pygame.MOUSEMOTION, pygame.MOUSEWHEEL,
             pygame.WINDOWRESIZED, pygame.WINDOWFOCUSGAINED, pygame.WINDOWFOCUSLOST,
+            # WINDOWCLOSE is what the X button posts on the separate SDL2
+            # Window (self.window). Without this, set_blocked(None) drops
+            # the event and the game never sees the close request.
+            pygame.WINDOWCLOSE,
             pygame.JOYBUTTONDOWN, pygame.JOYBUTTONUP,
             pygame.JOYAXISMOTION, pygame.JOYHATMOTION,
             pygame.JOYDEVICEADDED, pygame.JOYDEVICEREMOVED,
@@ -344,15 +351,41 @@ class Game:
         for ev_type in ALLOWED:
             pygame.event.set_allowed(ev_type)
 
-        # SCALED mode: pygame handles window-resize scaling in hardware for free,
-        # eliminating the per-frame pygame.transform.scale() call on the full surface.
-        self.screen = pygame.display.set_mode(
-            (SCREEN_WIDTH, SCREEN_HEIGHT), pygame.RESIZABLE | pygame.SCALED
-        )
-        pygame.display.set_caption("Legacy of Goku Style Engine")
+        # GPU-backed rendering: an SDL2 Window + Renderer instead of a plain
+        # display-mode Surface. Renderer.logical_size gives us the same
+        # free hardware letterbox/scale that pygame.SCALED used to, but every
+        # draw call before that point (screen.blit, pygame.draw.*) now goes
+        # through GPUScreen and costs GPU time instead of CPU SDL-software-
+        # blitter time. See core/gpu_renderer.py for why this exists and what
+        # was verified about it.
+        #
+        # SDL refuses to give a window both a classic window-surface (which
+        # pygame.display.set_mode() creates internally to back its Surface
+        # object) AND an SDL_Renderer -- that's exactly the "Surface already
+        # associated with window" error. Window.from_display_module() wraps
+        # that same set_mode() window, so Renderer() on it always hits this.
+        #
+        # convert_alpha() (which sprite_system.py calls on every sprite
+        # sheet it loads) only needs *some* video mode to exist -- it
+        # doesn't care which window backs it -- so a tiny hidden window
+        # satisfies that requirement on its own, while the actual game
+        # window is a completely separate Window+Renderer pair that the
+        # player sees and that every draw call in the engine targets.
+        pygame.display.set_mode((1, 1), pygame.HIDDEN)
 
-        # With SCALED mode the screen IS the logical surface — no extra blit needed.
-        self.logical_surface = self.screen
+        self.window = sdl2_video.Window(
+            "Legacy of Goku Style Engine",
+            size=(SCREEN_WIDTH, SCREEN_HEIGHT),
+            resizable=True,
+        )
+        self.renderer = sdl2_video.Renderer(self.window, vsync=True)
+        self.renderer.logical_size = (SCREEN_WIDTH, SCREEN_HEIGHT)
+
+        # logical_surface is now a GPUScreen, not a Surface. Every draw()
+        # method in the engine still calls .blit()/.draw_rect()/etc on it —
+        # see core/gpu_renderer.py's module docstring for which Surface
+        # methods carried over unchanged vs which needed call-site changes.
+        self.logical_surface = GPUScreen(self.renderer, (SCREEN_WIDTH, SCREEN_HEIGHT))
         self.clock   = pygame.time.Clock()
         self.running = True
         self.colors  = get_colors()
@@ -624,8 +657,33 @@ class Game:
         # Tiles are baked in layer order, and an animated tile splits the run
         # into a fresh segment right where it occurs instead of always
         # landing on top of the whole bucket — see _build_room_tile_surface().
-        self._room_tile_surfaces: dict = {}
+        # OrderedDict so we can LRU-evict — see _remember_room_tile_surface().
+        # Unlike _scaled_tile_cache below (bounded by art assets), this cache
+        # is bounded by *rooms visited*, which has no natural ceiling over a
+        # long session — that unboundedness was accumulating one full baked
+        # Surface per room ever entered and never releasing them, which is
+        # what was driving RAM up over long sessions even after the GPUScreen
+        # texture-cache leak was fixed. Capped at the most recently used
+        # _ROOM_SURF_CACHE_MAX rooms; a room that falls out of the cache just
+        # gets rebuilt (cheap-ish, see _build_room_tile_surface) next time
+        # it's entered.
+        self._ROOM_SURF_CACHE_MAX = 12
+        self._room_tile_surfaces: OrderedDict = OrderedDict()
         self._dirty_tile_rooms:   set  = set()   # rooms pending a full surface rebuild
+        # Memoizes tileset.get_scaled_tile_surface() results, keyed by
+        # (id(tileset), tile_x, tile_y, RENDER_SCALE). _build_room_tile_surface
+        # calls this once per STATIC TILE INSTANCE in the room, but most rooms
+        # reuse a small handful of distinct source tiles hundreds/thousands of
+        # times (a whole floor of the same ground tile, a wall run, etc.) —
+        # without this cache every one of those instances pays its own
+        # scale/lookup cost on every room open (the bake itself is uncached —
+        # see _room_tile_surfaces above), which is what was making "open room"
+        # cost 1-2+ seconds on tile-heavy rooms. Persists for the whole
+        # session (not just one bake) since the same tilesets are shared
+        # across rooms. Never invalidated because a given (tileset, tile_x,
+        # tile_y, scale) always maps to the same pixels — tileset art doesn't
+        # change at runtime, only which tiles are placed where does.
+        self._scaled_tile_cache:  dict = {}
         # Memoizes the current-frame (disp_x, disp_y) lookup for animated tiles,
         # keyed by (id(tileset), tile_x, tile_y). Cleared whenever the game tick
         # advances (see _draw_animated_tile_segment), so within a single frame
@@ -640,9 +698,31 @@ class Game:
         # rebuild since it never reallocates the room-sized surface or
         # re-iterates every tile in the room — see _patch_tile_cell().
         self._dirty_tile_cells:  dict = {}
+        # Monotonic counter bumped any time tile content actually changes
+        # (full room rebuild, per-cell patch, or the test-room pre-bake) —
+        # see _flush_dirty_tile_rooms(). Cheap and coarse (bumping for any
+        # room invalidates the cache below for every room) rather than
+        # tracking per-room versions, since a stale cache costs one extra
+        # rebuild, not a correctness bug — unlike keying on id(plan), which
+        # can silently collide after the old list is garbage-collected and
+        # a new one reuses the same address.
+        self._tile_content_generation = 0
+        # Editor-only whole-block cache for the background tile layer (see
+        # blit_room_tiles). Profiling from
+        # Sept 2026 found the per-frame alpha-composited blit of the baked
+        # tile surface onto the editor's viewport costing 45-55ms even when
+        # the camera hadn't moved and nothing had been edited — the room
+        # editor was re-running the exact same alpha blend every single
+        # frame for no reason. This caches the *result* of that blend (an
+        # opaque, already-blended snapshot) and reuses it with a cheap
+        # opaque blit instead, only re-blending when the camera, zoom, or
+        # tile data actually changed. Restricted to rooms with no animated
+        # tiles/regions (see can_cache in blit_room_tiles) so animated water
+        # etc. keeps ticking correctly instead of freezing.
+        # key: room_name → {'key': (cam_x, cam_y, vw, vh, generation), 'surface': Surface}
+        self._editor_bg_frame_cache: dict = {}
         # key: font_size → pygame.Font  (avoids allocating a Font every frame)
         self._font_cache: dict = {}
-        self._scaled_tile_cache: dict = {}
         # Scrolling background (room.scrolling_bg): key: image filename → scaled Surface
         self._bg_image_cache: dict = {}
         # Per-room autonomous scroll offset accumulators, so each room's background
@@ -1443,7 +1523,7 @@ class Game:
     def _get_logical_mouse_pos(self):
         """Translate the real window mouse position to logical resolution coords."""
         mx, my = pygame.mouse.get_pos()
-        wx, wy = self.screen.get_size()
+        wx, wy = self.window.size
         return (int(mx * SCREEN_WIDTH / wx), int(my * SCREEN_HEIGHT / wy))
 
     def _rescale_event(self, event):
@@ -1455,7 +1535,7 @@ class Game:
         if event.type not in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION):
             return event
 
-        wx, wy  = self.screen.get_size()
+        wx, wy  = self.window.size
         ox, oy  = event.pos
         new_pos = (int(ox * SCREEN_WIDTH / wx), int(oy * SCREEN_HEIGHT / wy))
 
@@ -1494,7 +1574,10 @@ class Game:
 
             event = self._rescale_event(event)
 
-            if event.type == pygame.QUIT:
+            # WINDOWCLOSE is the event the X button posts on our separate SDL2
+            # Window; QUIT covers the hidden display-module window / Alt+F4
+            # style paths. Treat both as a clean exit request.
+            if event.type in (pygame.QUIT, pygame.WINDOWCLOSE):
                 self.running = False
 
             # ── Title screen ────────────────────────────────────────────────
@@ -1932,7 +2015,8 @@ class Game:
         # doesn't fall back to a melee swing while one is active.
         _ATTACK_CAPABLE_KEYS = (pygame.K_q, pygame.K_TAB, pygame.K_f)
         if event.key in _ATTACK_CAPABLE_KEYS and (
-                self.dialogue_box.active or self._levelup_active or self.save_flow_active):
+                self.dialogue_box.active or self._levelup_active or self.save_flow_active
+                or self.active_cutscene_runtime):
             return
 
         if event.key == pygame.K_F1:
@@ -2079,6 +2163,15 @@ class Game:
                             ts.start_transform(target_form)
 
         elif event.key == pygame.K_e:
+            # During a cutscene, E is only ever allowed to advance/close
+            # the dialogue box the cutscene itself opened — never treated
+            # as a melee/interact button (no charged-melee tracking either,
+            # since nothing here can start a swing for it to roll into).
+            # See _handle_interact()'s matching cutscene guard.
+            if self.active_cutscene_runtime:
+                if self.dialogue_box.active and self.dialogue_box._state != 'closing':
+                    self._advance_npc_dialogue()
+                return
             # Tracked so Player.update() can tell, once the normal melee
             # swing finishes, whether E is still held (roll into the
             # charged-melee wind-up — see start_charging_melee()) or not
@@ -2122,6 +2215,17 @@ class Game:
           5. Flying pad.
           6. Default melee attack.
         """
+        # During a cutscene, E must never reach any of the branches below
+        # (NPC/save-point/chest/item/flying-pad interact, or the default
+        # melee swing) — only the dialogue-box advance/close. The KEYDOWN
+        # handler already short-circuits this before calling in, but this
+        # guard is kept here too in case _handle_interact ever gets called
+        # from elsewhere while a cutscene is active.
+        if self.active_cutscene_runtime:
+            if self.dialogue_box.active and self.dialogue_box._state != 'closing':
+                self._advance_npc_dialogue()
+            return
+
         # Don't allow interact while a flying sequence is in progress.
         if self.flying_controller.is_active():
             return
@@ -2929,8 +3033,10 @@ class Game:
         # so flush it now and build both layers immediately rather than lazily
         # on the first rendered frame.
         self._flush_dirty_tile_rooms()
-        self._room_tile_surfaces[(room_name, True)] = self._build_room_tile_surface(room_name, True)
-        self._room_tile_surfaces[(room_name, False)] = self._build_room_tile_surface(room_name, False)
+        self._remember_room_tile_surface((room_name, True), self._build_room_tile_surface(room_name, True))
+        self._remember_room_tile_surface((room_name, False), self._build_room_tile_surface(room_name, False))
+        self._tile_content_generation += 1
+        self._editor_bg_frame_cache.pop(room_name, None)
         # ────────────────────────────────────────────────────────────────────────
 
         # Determine where to place the player — prefer the room's spawn point.
@@ -5309,19 +5415,29 @@ class Game:
                             if not (_live and hasattr(_live, 'entity')):
                                 continue
 
-                            # Position/direction sync is unconditional: wherever you stood and
-                            # whichever way you faced in the room carries into the cutscene,
-                            # regardless of what character this actor is scripted to become.
+                            # Position sync is unconditional: wherever you stood carries
+                            # into the cutscene. Direction/animation only fall back to
+                            # your pre-cutscene state when no t=0 move_to/fly_to action
+                            # already set its own (see the tween check below).
                             _live.entity.x = self.player.x
                             _live.entity.y = self.player.y
-                            _live.entity.direction = self.player.direction
-                            _live.set_animation(
-                                getattr(self.player, 'current_animation_state', 'idle'),
-                                self.player.direction,
-                            )
+
                             if _live._tween is not None:
+                                # A move_to/fly_to action already fired during seek(0.0)
+                                # and set its own anim_state/direction (e.g. authored
+                                # 'walk' + auto-computed facing) — don't clobber that
+                                # with the player's pre-cutscene state (which could be
+                                # 'run' facing whatever way they walked into the
+                                # trigger). Just correct where the tween starts from
+                                # so it begins at the player's real position.
                                 _live._tween.start_x = self.player.x
                                 _live._tween.start_y = self.player.y
+                            else:
+                                _live.entity.direction = self.player.direction
+                                _live.set_animation(
+                                    getattr(self.player, 'current_animation_state', 'idle'),
+                                    self.player.direction,
+                                )
 
                             # Character/transformation overrides stay gated on the match —
                             # don't force the player's real character onto an actor that's
@@ -6962,7 +7078,7 @@ class Game:
             self.logical_surface.set_clip(None)
 
         elif not texture:
-            pygame.draw.rect(self.logical_surface, (28, 65, 28),
+            self.logical_surface.draw_rect((28, 65, 28),
                              (0, horizon_y, sw, ground_h))
 
         # ── Horizon blend overlay ─────────────────────────────────────────────
@@ -7063,8 +7179,8 @@ class Game:
             for _ry, (_li, _ri) in enumerate(_rows):
                 _rw = (_tw - _li - _ri) * RS
                 if _rw > 0:
-                    pygame.draw.rect(
-                        self.logical_surface, (0, 0, 0),
+                    self.logical_surface.draw_rect(
+                        (0, 0, 0),
                         (_sx + _li * RS, _sy + _ry * RS, _rw, RS)
                     )
             # ── End shadow ────────────────────────────────────────────────
@@ -7159,10 +7275,10 @@ class Game:
                     self.logical_surface.blit(
                         _arrow_rot, _arrow_rot.get_rect(center=(_dot_x, _dot_y)))
                 else:
-                    pygame.draw.circle(
-                        self.logical_surface, (255, 255, 80), (_dot_x, _dot_y), RENDER_SCALE + 1)
-                    pygame.draw.circle(
-                        self.logical_surface, (255, 50, 50),  (_dot_x, _dot_y), RENDER_SCALE)
+                    self.logical_surface.draw_circle(
+                        (255, 255, 80), (_dot_x, _dot_y), RENDER_SCALE + 1)
+                    self.logical_surface.draw_circle(
+                        (255, 50, 50),  (_dot_x, _dot_y), RENDER_SCALE)
 
                 # ── Location markers on minimap ────────────────────────────────
                 if not hasattr(self, '_world_map_loc_sprite'):
@@ -8766,10 +8882,7 @@ class Game:
             # beam fired right as a cutscene ends still finishes growing/
             # decaying out normally instead of freezing mid-flight.
             for beam in self.cutscene_beams[:]:
-                for wall in self.collision_objects:
-                    distance = wall.get_beam_block_distance(beam)
-                    if distance is not None:
-                        beam.report_obstruction(distance)
+                self._report_beam_obstructions(beam)
 
                 # _cutscene_release_timer (set in _cutscene_spawn_attack) is
                 # how much longer the beam stays fully out before closing
@@ -8827,6 +8940,11 @@ class Game:
             # dialogue_box, or the dialogue_choice_menu), same reasoning as
             # player movement being suppressed below: nothing should be
             # able to sneak up on or hit the player while they're reading.
+            # Also frozen for the whole duration of a cutscene — previously
+            # only dialogue_box.active froze this, which covers a cutscene's
+            # own dialogue lines but not the rest of it (pans, actor moves,
+            # waiting beats), so enemies kept running their AI/attacks
+            # (audibly hitting the player) the instant a cutscene started.
             # Deliberately NOT frozen for the death-notice box itself (see
             # _update_death_sequence) — the player is already fully locked
             # out via is_dead, but the rest of the world (and whatever
@@ -8838,9 +8956,10 @@ class Game:
             # dialogue instead of staying turned toward the player. Since
             # _update_enemies() is already skipped whenever this branch
             # runs, the enemy just holds whatever animation/facing it had
-            # the instant the dialogue box opened.
+            # the instant the dialogue box (or cutscene) opened.
             if (not self.dialogue_box.active or self._death_state == 'box') \
-                    and not self.dialogue_choice_menu.active and not self._levelup_active:
+                    and not self.dialogue_choice_menu.active and not self._levelup_active \
+                    and not self.active_cutscene_runtime:
                 enemies_defeated_this_frame = self._update_enemies(dt)
 
             # Grow/decay the beam now that enemies have moved (and reported
@@ -9180,10 +9299,7 @@ class Game:
         this runs after _update_enemies(dt).
         """
         if self.player.current_kamekameha:
-            for wall in self.collision_objects:
-                distance = wall.get_beam_block_distance(self.player.current_kamekameha)
-                if distance is not None:
-                    self.player.current_kamekameha.report_obstruction(distance)
+            self._report_beam_obstructions(self.player.current_kamekameha)
 
             self.player.current_kamekameha.update(dt)
             if not self.player.current_kamekameha.active:
@@ -9210,10 +9326,7 @@ class Game:
         _grow_beam(dt)'s docstring for why this runs after _update_enemies().
         """
         if self.player.current_banshee_blast:
-            for wall in self.collision_objects:
-                distance = wall.get_beam_block_distance(self.player.current_banshee_blast)
-                if distance is not None:
-                    self.player.current_banshee_blast.report_obstruction(distance)
+            self._report_beam_obstructions(self.player.current_banshee_blast)
 
             self.player.current_banshee_blast.update(dt)
             if not self.player.current_banshee_blast.active:
@@ -9237,6 +9350,28 @@ class Game:
             if not self.player.current_flame_kamehameha.active:
                 self.player.current_flame_kamehameha = None
 
+    def _report_beam_obstructions(self, attack):
+        """Report every collision wall's AND every decoration's (tree,
+        etc.) blocking distance to `attack` (a BeamAttack) for this frame.
+
+        Both CollisionObject and Decoration expose the same
+        get_beam_block_distance(attack) contract (Decoration checks its
+        small trunk hitbox, not the full canopy sprite — see
+        Decoration.get_beam_block_distance's docstring), so a beam stops
+        at whichever wall, tree trunk, or enemy it reaches first. Shared
+        by every _grow_*(dt) method below (and the cutscene beam loop) so
+        this list only needs updating in one place.
+        """
+        for wall in self.collision_objects:
+            distance = wall.get_beam_block_distance(attack)
+            if distance is not None:
+                attack.report_obstruction(distance)
+
+        for decoration in self.decorations:
+            distance = decoration.get_beam_block_distance(attack)
+            if distance is not None:
+                attack.report_obstruction(distance)
+
     def _grow_beam(self, dt):
         """Report obstructions and grow/decay the current beam.
 
@@ -9256,10 +9391,7 @@ class Game:
         keeps everything in one place.
         """
         if self.player.current_beam:
-            for wall in self.collision_objects:
-                distance = wall.get_beam_block_distance(self.player.current_beam)
-                if distance is not None:
-                    self.player.current_beam.report_obstruction(distance)
+            self._report_beam_obstructions(self.player.current_beam)
 
             self.player.current_beam.update(dt)
             if not self.player.current_beam.active:
@@ -9285,10 +9417,7 @@ class Game:
         this runs after _update_enemies(dt).
         """
         if self.player.current_final_flash:
-            for wall in self.collision_objects:
-                distance = wall.get_beam_block_distance(self.player.current_final_flash)
-                if distance is not None:
-                    self.player.current_final_flash.report_obstruction(distance)
+            self._report_beam_obstructions(self.player.current_final_flash)
 
             self.player.current_final_flash.update(dt)
             if not self.player.current_final_flash.active:
@@ -9318,10 +9447,7 @@ class Game:
         _grow_beam's docstring for why this runs after _update_enemies(dt).
         """
         if self.player.current_big_bang_kamehameha:
-            for wall in self.collision_objects:
-                distance = wall.get_beam_block_distance(self.player.current_big_bang_kamehameha)
-                if distance is not None:
-                    self.player.current_big_bang_kamehameha.report_obstruction(distance)
+            self._report_beam_obstructions(self.player.current_big_bang_kamehameha)
 
             self.player.current_big_bang_kamehameha.update(dt)
             if not self.player.current_big_bang_kamehameha.active:
@@ -10404,13 +10530,13 @@ class Game:
         # Title screen — replaces the entire frame while it's up.
         if self.game_mode == 'title':
             self.title_screen.draw(self.logical_surface)
-            pygame.display.flip()
+            self.renderer.present()
             return
 
         # Hand off completely to the room editor when it's the active view.
         if self.room_editor.active and self.room_editor.current_view == 'view_room':
             self.room_editor.draw(self.logical_surface)
-            pygame.display.flip()
+            self.renderer.present()
             return
 
         # World-map flying sequence — replace the entire game scene with the
@@ -10420,7 +10546,7 @@ class Game:
         if self._mjf_state in ('pending_fade_in', 'fade_in', 'flying',
                                'landing_fade_out'):
             self._draw_world_map_flying_scene()
-            pygame.display.flip()
+            self.renderer.present()
             return
 
         # Flush any stale baked tile surfaces once per frame before anything
@@ -10452,7 +10578,7 @@ class Game:
             while x <= visible_x_end:
                 screen_x = (x * RENDER_SCALE) - self.camera.x
                 if -50 <= screen_x <= SCREEN_WIDTH + 50:
-                    pygame.draw.line(self.logical_surface, (44, 149, 44),
+                    self.logical_surface.draw_line((44, 149, 44),
                                      (int(screen_x), 0), (int(screen_x), SCREEN_HEIGHT), 1)
                 x += TILE_SIZE
 
@@ -10460,11 +10586,11 @@ class Game:
             while y <= visible_y_end:
                 screen_y = (y * RENDER_SCALE) - self.camera.y
                 if -50 <= screen_y <= SCREEN_HEIGHT + 50:
-                    pygame.draw.line(self.logical_surface, (44, 149, 44),
+                    self.logical_surface.draw_line((44, 149, 44),
                                      (0, int(screen_y)), (SCREEN_WIDTH, int(screen_y)), 1)
                 y += TILE_SIZE
 
-            pygame.draw.rect(self.logical_surface, self.colors['RED'], (
+            self.logical_surface.draw_rect(self.colors['RED'], (
                 (0 * RENDER_SCALE) - self.camera.x,
                 (0 * RENDER_SCALE) - self.camera.y,
                 self.current_room.width  * RENDER_SCALE,
@@ -10846,7 +10972,7 @@ class Game:
 
         # With pygame.SCALED the display handles window-resize scaling in hardware —
         # just flip; no manual surface scale needed.
-        pygame.display.flip()
+        self.renderer.present()
 
     def _get_timer_glyphs(self):
         """Lazy-load the event timer's bitmap font from assets/ui/fonts/timer,
@@ -10982,15 +11108,25 @@ class Game:
         any pending per-cell patch for that room, since the rebuild already
         covers it); remaining per-cell patches are then applied in place.
         """
+        if self._dirty_tile_rooms or self._dirty_tile_cells:
+            # Any tile content changing invalidates the editor's whole-block
+            # bg-frame cache (see blit_room_tiles / _editor_bg_frame_cache).
+            # Bumped once here regardless of how many rooms/cells are
+            # involved — coarser than per-room tracking, but a stale cache
+            # only costs one extra rebuild rather than a correctness bug.
+            self._tile_content_generation += 1
+
         if self._dirty_tile_rooms:
             if None in self._dirty_tile_rooms:
                 self._room_tile_surfaces.clear()
                 self._dirty_tile_cells.clear()
+                self._editor_bg_frame_cache.clear()
             else:
                 for room in self._dirty_tile_rooms:
                     self._room_tile_surfaces.pop((room, True),  None)
                     self._room_tile_surfaces.pop((room, False), None)
                     self._dirty_tile_cells.pop(room, None)
+                    self._editor_bg_frame_cache.pop(room, None)
             self._dirty_tile_rooms.clear()
 
         if self._dirty_tile_cells:
@@ -11085,13 +11221,35 @@ class Game:
             # Fast path: no animated tiles involved at all for this layer
             # group, so the plan is just a single static Surface — patch it
             # in place exactly as before.
-            surf = plan[0][1] if plan else None
-            if surf is None:
+            #
+            # The surface's own bounding box (see _build_room_tile_surface's
+            # Sept 2026 PERFORMANCE NOTE) may be smaller than the room, so
+            # world-pixel coordinates have to be translated into
+            # surface-local ones by subtracting its origin — and if this
+            # edit falls (even partly) outside the box the surface was
+            # originally sized to (e.g. painting into a previously-empty
+            # corner of the room), an in-place patch can't grow that
+            # Surface. Falling back to a full rebuild for this room/layer
+            # is the same safety net already used above for animated tiles
+            # — correctness over patch-speed for what should be a rare edit
+            # shape (painting is usually within/near already-painted area).
+            if not plan or plan[0][0] != 'static':
+                continue
+            surf, origin_x, origin_y = plan[0][1]
+
+            patch_x0 = int(cell_x * RENDER_SCALE)
+            patch_y0 = int(cell_y * RENDER_SCALE)
+            patch_x1 = patch_x0 + int(cell_w * RENDER_SCALE)
+            patch_y1 = patch_y0 + int(cell_h * RENDER_SCALE)
+            surf_w, surf_h = surf.get_size()
+            if (patch_x0 < origin_x or patch_y0 < origin_y or
+                    patch_x1 > origin_x + surf_w or patch_y1 > origin_y + surf_h):
+                self._room_tile_surfaces.pop(key, None)
                 continue
 
             # Clear just this cell's real footprint back to transparent.
             rect = pygame.Rect(
-                int(cell_x * RENDER_SCALE), int(cell_y * RENDER_SCALE),
+                patch_x0 - origin_x, patch_y0 - origin_y,
                 int(cell_w * RENDER_SCALE), int(cell_h * RENDER_SCALE),
             )
             surf.fill((0, 0, 0, 0), rect)
@@ -11102,16 +11260,46 @@ class Game:
                     continue
                 scaled = tileset.get_scaled_tile_surface(tile.tile_x, tile.tile_y, RENDER_SCALE)
                 if scaled:
-                    surf.blit(scaled, (int(tile.x * RENDER_SCALE), int(tile.y * RENDER_SCALE)))
+                    surf.blit(scaled, (
+                        int(tile.x * RENDER_SCALE) - origin_x,
+                        int(tile.y * RENDER_SCALE) - origin_y,
+                    ))
+
+    def _remember_room_tile_surface(self, key: tuple, plan: list):
+        """Insert a freshly-baked room tile plan into self._room_tile_surfaces
+        and evict the least-recently-used entry past the cap.
+
+        Every read hit should call _touch_room_tile_surface() below so the
+        LRU order reflects actual use (which room the player is in / the
+        editor is viewing), not just build order.
+        """
+        self._room_tile_surfaces[key] = plan
+        self._room_tile_surfaces.move_to_end(key)
+        while len(self._room_tile_surfaces) > self._ROOM_SURF_CACHE_MAX:
+            self._room_tile_surfaces.popitem(last=False)
+
+    def _touch_room_tile_surface(self, key: tuple):
+        """Mark a cache hit as recently-used so it survives eviction longer
+        than rooms that haven't been drawn in a while."""
+        if key in self._room_tile_surfaces:
+            self._room_tile_surfaces.move_to_end(key)
 
     def _build_room_tile_surface(self, room_name: str, bg: bool) -> list:
         """Pre-render one layer group ('background' bg=True / 'foreground'
         bg=False) into an ordered list of render segments.
 
         Each segment is either:
-          ('static', Surface)   — a run of consecutive (in layer order)
+          ('static', (Surface, origin_x_px, origin_y_px))
+                                 — a run of consecutive (in layer order)
                                    non-animated tiles, baked into ONE Surface
-          ('anim',   [Tile...]) — a run of consecutive (in layer order)
+                                   sized to THAT RUN's own bounding box (not
+                                   the whole room — see PERFORMANCE NOTE
+                                   below), with origin_x_px/origin_y_px the
+                                   world-pixel position of that surface's
+                                   top-left corner (subtract camera from
+                                   these, not from (0, 0), when blitting —
+                                   see _draw_room_tile_plan).
+          ('anim',   [Tile...])  — a run of consecutive (in layer order)
                                    animated tiles, drawn fresh every frame
 
         Segments are emitted in layer order and a new one only starts when
@@ -11134,6 +11322,25 @@ class Game:
         static segment and one animated segment regardless of layer order to
         avoid that cost entirely, but that meant every animated tile always
         drew on top of every static tile no matter its layer value.
+
+        PERFORMANCE NOTE (see profiling from Sept 2026): each static
+        segment's Surface used to be allocated at the room's FULL pixel
+        dimensions regardless of how much of the room that segment's tiles
+        actually covered — a room 14400x10800px paid for a ~600MB
+        SRCALPHA-then-convert_alpha() allocation for EVERY static segment,
+        including one that only had 581 tiles scattered through it. That's
+        what made "opening a room" stall for 1-2+ seconds on any
+        reasonably large or multi-layer room: profiling showed 90%+ of this
+        function's time going to Surface()+convert_alpha() alone, not to
+        scaling or blitting tiles (both of which were already cheap/cached).
+        Each static segment's Surface is now sized to that segment's own
+        tile bounding box instead, so a sparse foreground layer costs
+        roughly what its content actually occupies rather than the whole
+        room. This needs the bounding box of the FULL run before any
+        Surface can be allocated (a run can span several layer values via
+        the same-kind-collapsing above), so tiles are first grouped into
+        segment plans in one pass, then each static plan's Surface is sized
+        and painted in a second pass.
 
         Tiles are first grouped by their exact layer value. Tiles that share
         the same layer value have no ordering requirement relative to each
@@ -11173,16 +11380,36 @@ class Game:
         if not tiles:
             return []
 
-        room_px_w = int(room.width * RENDER_SCALE)
-        room_px_h = int(room.height * RENDER_SCALE)
         tileset_mgr = te.tileset_manager
 
-        segments = []
-        current_surf = None
+        # ── Diagnostic sub-timing (temporary — chasing the "opening a room"
+        # stall on top of the FrameProfiler's coarser per-section numbers).
+        # Splits this function's own cost into sort/group vs surface
+        # alloc+convert_alpha vs the actual tile-blit loop, since all three
+        # are plausible causes of a multi-second one-time bake and the
+        # section-level timing alone can't tell them apart. Only prints
+        # when the whole build is slow enough to matter. Remove once the
+        # real cost is identified and fixed.
+        _bt0 = time.perf_counter()
+        _t_alloc = 0.0
+        _t_blit = 0.0
+        _n_tiles_blitted = 0
+        _n_segments = 0
+
+        _sorted_tiles = sorted(tiles, key=lambda t: t.layer)
+        _t_sort = time.perf_counter() - _bt0
+
+        # ── Pass 1: group tiles into segment plans (no Surfaces yet) ────────
+        # raw_plan entries are ('static', [(tile, tileset), ...]) or
+        # ('anim', [tile, ...]) — same merge/collapse semantics as before,
+        # just deferring Surface allocation until we know each static run's
+        # full tile list (and therefore its bounding box).
+        raw_plan = []
+        current_statics = None
         current_anim = None
 
         for layer_value, layer_group in itertools.groupby(
-                sorted(tiles, key=lambda t: t.layer), key=lambda t: t.layer):
+                _sorted_tiles, key=lambda t: t.layer):
             is_bg_tile = layer_value < 0
             if bg != is_bg_tile:
                 continue
@@ -11203,22 +11430,10 @@ class Game:
                     layer_statics.append((tile, tileset))
 
             if layer_statics:
-                # Extend the in-progress static surface, or start a new one
-                # if the previous layer (in layer order) ended on an
-                # animated run — this is what keeps a static tile at the
-                # correct depth relative to animated tiles instead of always
-                # drawing underneath all of them. Only an actual switch
-                # between layer values pays for an extra segment; every tile
-                # sharing this layer value collapses into the same blit no
-                # matter how it was interleaved with animated tiles when
-                # painted.
-                if current_surf is None:
-                    current_surf = pygame.Surface((room_px_w, room_px_h), pygame.SRCALPHA)
-                    segments.append(('static', current_surf))
-                for tile, tileset in layer_statics:
-                    scaled = tileset.get_scaled_tile_surface(tile.tile_x, tile.tile_y, RENDER_SCALE)
-                    if scaled:
-                        current_surf.blit(scaled, (int(tile.x * RENDER_SCALE), int(tile.y * RENDER_SCALE)))
+                if current_statics is None:
+                    current_statics = []
+                    raw_plan.append(('static', current_statics))
+                current_statics.extend(layer_statics)
                 # A later layer's animated tiles must start a fresh run
                 # rather than silently extending an animated run that sits
                 # BEFORE this layer's statics in the segment list — that
@@ -11229,13 +11444,93 @@ class Game:
             if layer_animateds:
                 if current_anim is None:
                     current_anim = []
-                    segments.append(('anim', current_anim))
+                    raw_plan.append(('anim', current_anim))
                 current_anim.extend(layer_animateds)
                 # Symmetric reset: a later layer's static tiles must start a
                 # brand-new Surface/segment rather than being blitted into
                 # whatever static surface preceded this animated run (see
                 # the z-order bug this whole function exists to avoid).
-                current_surf = None
+                current_statics = None
+
+        # ── Pass 2: allocate + paint each static run's own right-sized
+        # Surface, now that its full tile list (and bounding box) is known.
+        segments = []
+        for kind, payload in raw_plan:
+            if kind == 'anim':
+                segments.append(('anim', payload))
+                continue
+
+            layer_statics = payload  # [(tile, tileset), ...]
+
+            # Bounding box, in world pixels, of every tile this run will
+            # actually paint — this (not the room's full size) is what the
+            # backing Surface gets sized to.
+            min_x = min_y = None
+            max_x = max_y = None
+            for tile, tileset in layer_statics:
+                x0 = tile.x * RENDER_SCALE
+                y0 = tile.y * RENDER_SCALE
+                x1 = x0 + tileset.tile_width * RENDER_SCALE
+                y1 = y0 + tileset.tile_height * RENDER_SCALE
+                if min_x is None or x0 < min_x:
+                    min_x = x0
+                if min_y is None or y0 < min_y:
+                    min_y = y0
+                if max_x is None or x1 > max_x:
+                    max_x = x1
+                if max_y is None or y1 > max_y:
+                    max_y = y1
+
+            if min_x is None:
+                continue  # shouldn't happen (layer_statics is non-empty), but be safe
+
+            origin_x = int(min_x)
+            origin_y = int(min_y)
+            surf_w = max(1, int(math.ceil(max_x)) - origin_x)
+            surf_h = max(1, int(math.ceil(max_y)) - origin_y)
+
+            # .convert_alpha() matters here, not just for correctness —
+            # a plain SRCALPHA surface isn't in the display's native
+            # pixel format, so every blit of it in _draw_room_tile_plan
+            # has to convert pixels on the fly instead of a fast
+            # native-format blit. Blit cost is bounded by the
+            # destination viewport (see PERFORMANCE NOTE above), and at
+            # low room-editor zoom that viewport can be ~3.3x normal
+            # screen area — same root cause the offscreen zoom canvas
+            # in room_editor.py already works around with .convert().
+            _a0 = time.perf_counter()
+            current_surf = pygame.Surface((surf_w, surf_h), pygame.SRCALPHA).convert_alpha()
+            _t_alloc += time.perf_counter() - _a0
+            _n_segments += 1
+            if not getattr(self, '_printed_tile_patch_marker', False):
+                print(">>> PATCHED BUILD: static tile surfaces now .convert_alpha()'d <<<")
+                self._printed_tile_patch_marker = True
+
+            _b0 = time.perf_counter()
+            for tile, tileset in layer_statics:
+                scale_key = (id(tileset), tile.tile_x, tile.tile_y, RENDER_SCALE)
+                scaled = self._scaled_tile_cache.get(scale_key)
+                if scaled is None:
+                    scaled = tileset.get_scaled_tile_surface(tile.tile_x, tile.tile_y, RENDER_SCALE)
+                    if scaled:
+                        self._scaled_tile_cache[scale_key] = scaled
+                if scaled:
+                    current_surf.blit(scaled, (
+                        int(tile.x * RENDER_SCALE) - origin_x,
+                        int(tile.y * RENDER_SCALE) - origin_y,
+                    ))
+                    _n_tiles_blitted += 1
+            _t_blit += time.perf_counter() - _b0
+
+            segments.append(('static', (current_surf, origin_x, origin_y)))
+
+        _t_total = time.perf_counter() - _bt0
+        if _t_total * 1000 >= 20:
+            print(f"[_build_room_tile_surface] room={room_name} bg={bg}  "
+                  f"total={_t_total*1000:.1f}ms  sort={_t_sort*1000:.1f}ms  "
+                  f"surface_alloc={_t_alloc*1000:.1f}ms  tile_blit={_t_blit*1000:.1f}ms  "
+                  f"tiles_in_room={len(tiles)}  tiles_blitted={_n_tiles_blitted}  "
+                  f"segments={_n_segments}")
 
         return segments
 
@@ -11313,13 +11608,22 @@ class Game:
         segment is blitted, then each animated segment right after it, in
         the same sequence they were baked in — instead of drawing every
         animated tile in one pass after all of the static content.
+
+        Static segments are no longer anchored at world (0, 0) — each one
+        is only as big as its own tiles' bounding box (see
+        _build_room_tile_surface's Sept 2026 PERFORMANCE NOTE), so its own
+        origin has to be subtracted from the camera rather than assuming
+        the surface starts at the room's top-left corner.
         """
-        plan = self._room_tile_surfaces.get((room_name, bg))
+        key = (room_name, bg)
+        plan = self._room_tile_surfaces.get(key)
         if not plan:
             return
+        self._touch_room_tile_surface(key)
         for kind, payload in plan:
             if kind == 'static':
-                target_surface.blit(payload, (-camera_x, -camera_y))
+                surf, origin_x, origin_y = payload
+                target_surface.blit(surf, (origin_x - camera_x, origin_y - camera_y))
             else:
                 self._draw_animated_tile_segment(target_surface, payload, camera_x, camera_y)
 
@@ -12082,7 +12386,9 @@ class Game:
 
         key = (room_name, bg)
         if key not in self._room_tile_surfaces:
-            self._room_tile_surfaces[key] = self._build_room_tile_surface(room_name, bg)
+            self._remember_room_tile_surface(key, self._build_room_tile_surface(room_name, bg))
+        else:
+            self._touch_room_tile_surface(key)
 
         # Animated regions (layer -100) are meant to be the floor everything
         # else sits on, so they still need to go in before the rest of the
@@ -12111,12 +12417,61 @@ class Game:
             return
         key = (room_name, bg)
         if key not in self._room_tile_surfaces:
-            self._room_tile_surfaces[key] = self._build_room_tile_surface(room_name, bg)
+            self._remember_room_tile_surface(key, self._build_room_tile_surface(room_name, bg))
+        else:
+            self._touch_room_tile_surface(key)
 
-        # See _draw_room_tiles for why this has to go before the rest of the
-        # bg group: animated regions are the floor everything else sits on.
+        # ── Whole-block bg-frame cache (editor only) ────────────────────────
+        # Only applies to the background pass: it's the one that draws
+        # animated regions first (see below), and — unlike the foreground
+        # pass, which is interleaved with entities/decorations/stones that
+        # move and animate independently in the editor — nothing else is
+        # drawn into this block, so its output is a pure function of camera
+        # position, viewport size, and tile/region content whenever there's
+        # no animated content in the mix.
+        #
+        # PERFORMANCE NOTE (profiling from Sept 2026): this block's alpha
+        # blit of the baked tile surface onto the editor's viewport cost
+        # 45-55ms per frame even with the camera stationary and nothing
+        # edited — SDL still had to blend every touched pixel every frame
+        # regardless. Caching the *blended result* once and reusing it with
+        # a plain opaque blit (no per-pixel blend) until something that
+        # would actually change the picture — camera, zoom, or tile data —
+        # moves is the fix. Skipped entirely (can_cache False) whenever the
+        # room has animated tiles or animated regions, since those need to
+        # keep ticking every frame even while the camera holds still; the
+        # block then falls straight back to today's always-redraw path with
+        # no behavior change.
         if bg:
+            plan = self._room_tile_surfaces.get(key) or []
+            has_anim_tiles = any(kind == 'anim' for kind, _ in plan)
+            room = self.room_manager.get_room_by_name(room_name)
+            animated_regions = getattr(room, 'animated_regions', None) if room else None
+            can_cache = not has_anim_tiles and not animated_regions
+
+            if not can_cache:
+                self._editor_bg_frame_cache.pop(room_name, None)
+                self._draw_animated_regions_overlay(screen, room_name, camera_x, camera_y)
+                self._draw_room_tile_plan(screen, room_name, bg, camera_x, camera_y)
+                return
+
+            vw, vh = screen.get_size()
+            cache_entry_key = (camera_x, camera_y, vw, vh, self._tile_content_generation)
+            cached = self._editor_bg_frame_cache.get(room_name)
+            if cached is not None and cached['key'] == cache_entry_key \
+                    and cached['surface'].get_size() == (vw, vh):
+                screen.blit(cached['surface'], (0, 0))
+                return
+
+            # Cache miss: draw fresh once, then snapshot the result as an
+            # opaque surface (no per-surface alpha) so future re-blits are
+            # a fast copy instead of a blend.
             self._draw_animated_regions_overlay(screen, room_name, camera_x, camera_y)
+            self._draw_room_tile_plan(screen, room_name, bg, camera_x, camera_y)
+            snapshot = screen.copy()
+            self._editor_bg_frame_cache[room_name] = {'key': cache_entry_key, 'surface': snapshot}
+            return
+
         self._draw_room_tile_plan(screen, room_name, bg, camera_x, camera_y)
 
     def _draw_tile(self, tile):
@@ -12623,6 +12978,8 @@ class Game:
         """Flush all editor and room data to disk before quitting.
 
         Exits test mode first so temporary test state never gets saved.
+        Also releases GPU textures / the SDL2 window so the process can
+        exit without leaving a half-destroyed window.
         """
         if self.is_test_mode:
             self._exit_test_mode()
@@ -12641,6 +12998,31 @@ class Game:
 
         if hasattr(self, 'room_manager'):
             self.room_manager.save_all_rooms()
+
+        # Drop GPU texture caches and destroy the SDL2 window. Order matters:
+        # clear textures first so nothing tries to draw into a dead window,
+        # then destroy the window itself. Failures here are non-fatal — we
+        # still want pygame.quit() / sys.exit() to run.
+        try:
+            ls = getattr(self, 'logical_surface', None)
+            if ls is not None and hasattr(ls, 'clear_caches'):
+                ls.clear_caches()
+        except Exception:
+            pass
+
+        try:
+            if getattr(self, 'renderer', None) is not None:
+                self.renderer = None
+        except Exception:
+            pass
+
+        try:
+            window = getattr(self, 'window', None)
+            if window is not None:
+                window.destroy()
+                self.window = None
+        except Exception:
+            pass
 
     def run(self):
         """Main loop — runs until self.running is False or an unhandled exception occurs."""

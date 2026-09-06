@@ -249,6 +249,12 @@ class EntityEditor:
         self.screen_height = screen_height
         self.active = False
 
+        # Continuous editor zoom (Ctrl+scroll), kept in sync by RoomEditor
+        # each frame. Click placement gets its position pre-converted by
+        # RoomEditor._zoom_adjust_event(), but draw_preview reads the live
+        # cursor directly and has to do that conversion itself, using this.
+        self.editor_zoom = 1.0
+
         self.font_small = pygame.font.Font(None, 16)
         self.font_medium = pygame.font.Font(None, 20)
         self.font_large = pygame.font.Font(None, 24)
@@ -592,8 +598,8 @@ class EntityEditor:
         rect = self._panel_toggle_rect()
         bg = self.COLORS['button_hover'] if self._hover_panel_toggle else self.COLORS['button']
         border = self.COLORS['accent'] if self._hover_panel_toggle else (60, 60, 80)
-        pygame.draw.rect(screen, bg, rect, border_radius=6)
-        pygame.draw.rect(screen, border, rect, 1, border_radius=6)
+        screen.draw_rect(bg, rect, border_radius=6)
+        screen.draw_rect(border, rect, 1, border_radius=6)
         arrow = '◀' if self.palette_visible else '▶'
         label = self.font_small.render(
             arrow, True,
@@ -1286,7 +1292,7 @@ class EntityEditor:
         bg = pygame.Surface((self.palette_width, self.palette_height), pygame.SRCALPHA)
         bg.fill(self.COLORS['bg_transparent'])
         screen.blit(bg, (self.palette_x, self.palette_y))
-        pygame.draw.rect(screen, self.COLORS['accent'], rect, 2)
+        screen.draw_rect(self.COLORS['accent'], rect, 2)
 
     def _draw_title(self, screen):
         title = self.font_medium.render("Entity Palette", True, self.COLORS['text'])
@@ -1325,8 +1331,8 @@ class EntityEditor:
 
             bg_col = self.COLORS['panel_light'] if is_sel else self.COLORS['panel']
             border_col = self.COLORS['accent'] if is_sel else self.COLORS['grid']
-            pygame.draw.rect(screen, bg_col, tab_rect, border_radius=5)
-            pygame.draw.rect(screen, border_col, tab_rect, 2, border_radius=5)
+            screen.draw_rect(bg_col, tab_rect, border_radius=5)
+            screen.draw_rect(border_col, tab_rect, 2, border_radius=5)
 
             txt_col = self.COLORS['text'] if is_sel else self.COLORS['text_dim']
             surf = self.font_medium.render(key, True, txt_col)
@@ -1337,7 +1343,7 @@ class EntityEditor:
             y += 40
 
         # separator line
-        pygame.draw.line(screen, self.COLORS['accent'],
+        screen.draw_line(self.COLORS['accent'],
                          (self.palette_x + self.palette_padding, y),
                          (self.palette_x + self.palette_width - self.palette_padding, y), 1)
 
@@ -1404,19 +1410,37 @@ class EntityEditor:
 
         bg_col = self.COLORS['panel_light'] if is_selected else self.COLORS['panel']
         border_col = self.COLORS['accent'] if is_selected else self.COLORS['grid']
-        pygame.draw.rect(screen, bg_col, item_rect, border_radius=5)
-        pygame.draw.rect(screen, border_col, item_rect, 2 if is_selected else 1, border_radius=5)
+        screen.draw_rect(bg_col, item_rect, border_radius=5)
+        screen.draw_rect(border_col, item_rect, 2 if is_selected else 1, border_radius=5)
 
         # sprite fills tile at correct proportions (no squishing)
         if entity['sprite']:
             src = entity['sprite']
-            sw, sh = src.get_size()
-            scale = min((item_w - 8) / sw, (item_h - 8) / sh)
-            scaled = pygame.transform.scale(src, (max(1, int(sw * scale)), max(1, int(sh * scale))))
+            # Same fix as ObjectEditor._draw_object_item: this runs every
+            # frame for every visible palette tile, so an uncached
+            # transform.scale() here was a steady per-frame tax the whole
+            # time the entity palette is open — not something that only
+            # shows up while zooming the room view. Cache the scaled
+            # thumbnail per (sprite identity, item size).
+            if not hasattr(self, '_palette_thumb_cache'):
+                self._palette_thumb_cache = {}
+            thumb_key = (id(src), item_w, item_h)
+            scaled = self._palette_thumb_cache.get(thumb_key)
+            if scaled is None:
+                sw, sh = src.get_size()
+                scale = min((item_w - 8) / sw, (item_h - 8) / sh)
+                scaled = pygame.transform.scale(src, (max(1, int(sw * scale)), max(1, int(sh * scale))))
+                self._palette_thumb_cache[thumb_key] = scaled
             screen.blit(scaled, scaled.get_rect(center=item_rect.center))
 
-        # name label below tile
-        name_surf = self.font_small.render(entity['name'], True, self.COLORS['text_dim'])
+        # name label below tile — cached per (text, color) for the same reason.
+        if not hasattr(self, '_palette_label_cache'):
+            self._palette_label_cache = {}
+        label_key = (entity['name'], self.COLORS['text_dim'])
+        name_surf = self._palette_label_cache.get(label_key)
+        if name_surf is None:
+            name_surf = self.font_small.render(entity['name'], True, self.COLORS['text_dim'])
+            self._palette_label_cache[label_key] = name_surf
         screen.blit(name_surf, name_surf.get_rect(centerx=item_rect.centerx,
                                                   top=item_rect.bottom + 2))
 
@@ -1469,8 +1493,8 @@ class EntityEditor:
 
         # background
         strip_rect = pygame.Rect(strip_x, strip_y, self.palette_width, strip_height)
-        pygame.draw.rect(screen, self.COLORS['variant_bg'], strip_rect)
-        pygame.draw.line(screen, self.COLORS['accent'],
+        screen.draw_rect(self.COLORS['variant_bg'], strip_rect)
+        screen.draw_line(self.COLORS['accent'],
                          (strip_x, strip_y),
                          (strip_x + self.palette_width, strip_y), 2)
 
@@ -1499,11 +1523,11 @@ class EntityEditor:
                 bg_col = self.COLORS['panel_light']
             else:
                 bg_col = self.COLORS['panel']
-            pygame.draw.rect(screen, bg_col, rect, border_radius=4)
+            screen.draw_rect(bg_col, rect, border_radius=4)
 
             # border
             border_col = self.COLORS['accent'] if is_sel else self.COLORS['grid']
-            pygame.draw.rect(screen, border_col, rect, 2 if is_sel else 1, border_radius=4)
+            screen.draw_rect(border_col, rect, 2 if is_sel else 1, border_radius=4)
 
             # variant sprite (or colour swatch fallback)
             if variant.get('sprite'):
@@ -1516,7 +1540,7 @@ class EntityEditor:
                 screen.blit(spr, spr.get_rect(center=rect.center))
             else:
                 inner = rect.inflate(-6, -6)
-                pygame.draw.rect(screen, variant.get('color', (128, 128, 128)), inner, border_radius=2)
+                screen.draw_rect(variant.get('color', (128, 128, 128)), inner, border_radius=2)
 
             # name below swatch
             name = self.font_small.render(variant['name'], True, self.COLORS['text_dim'])
@@ -1532,8 +1556,8 @@ class EntityEditor:
         panel_y = self.palette_y + self.palette_height - panel_h
 
         panel_rect = pygame.Rect(self.palette_x, panel_y, self.palette_width, panel_h)
-        pygame.draw.rect(screen, self.COLORS['bg'], panel_rect)
-        pygame.draw.line(screen, self.COLORS['accent'],
+        screen.draw_rect(self.COLORS['bg'], panel_rect)
+        screen.draw_line(self.COLORS['accent'],
                          (self.palette_x, panel_y),
                          (self.palette_x + self.palette_width, panel_y), 2)
 
@@ -1580,8 +1604,8 @@ class EntityEditor:
                 is_hov  = (self.hover_npc_mode_idx == i)
                 bg_col  = self.COLORS['variant_selected'] if is_sel else (self.COLORS['panel_light'] if is_hov else self.COLORS['panel'])
                 bd_col  = self.COLORS['accent'] if is_sel else self.COLORS['grid']
-                pygame.draw.rect(screen, bg_col,  button_rect, border_radius=4)
-                pygame.draw.rect(screen, bd_col,  button_rect, 2 if is_sel else 1, border_radius=4)
+                screen.draw_rect(bg_col,  button_rect, border_radius=4)
+                screen.draw_rect(bd_col,  button_rect, 2 if is_sel else 1, border_radius=4)
                 txt_col = self.COLORS['text'] if is_sel else self.COLORS['text_dim']
                 screen.blit(self.font_small.render(mode.capitalize(), True, txt_col),
                             self.font_small.render(mode.capitalize(), True, txt_col).get_rect(center=button_rect.center))
@@ -1605,8 +1629,8 @@ class EntityEditor:
                     bg_col  = self.COLORS['variant_selected'] if is_sel else (self.COLORS['panel_light'] if is_hov else self.COLORS['panel'])
                     bd_col  = self.COLORS['accent'] if is_sel else self.COLORS['grid']
                     txt_col = self.COLORS['text'] if is_sel else self.COLORS['text_dim']
-                pygame.draw.rect(screen, bg_col, button_rect, border_radius=4)
-                pygame.draw.rect(screen, bd_col, button_rect, 2 if is_sel else 1, border_radius=4)
+                screen.draw_rect(bg_col, button_rect, border_radius=4)
+                screen.draw_rect(bd_col, button_rect, 2 if is_sel else 1, border_radius=4)
                 screen.blit(self.font_small.render(facing.capitalize(), True, txt_col),
                             self.font_small.render(facing.capitalize(), True, txt_col).get_rect(center=button_rect.center))
                 self.ui_rects['npc_facing_rects'].append({'rect': button_rect, 'facing': facing, 'index': i})
@@ -1656,8 +1680,8 @@ class EntityEditor:
         py = max(10, (sh - ph) // 2)
 
         box = pygame.Rect(px, py, pw, ph)
-        pygame.draw.rect(screen, self.COLORS['panel'], box, border_radius=8)
-        pygame.draw.rect(screen, self.COLORS['accent'], box, 2, border_radius=8)
+        screen.draw_rect(self.COLORS['panel'], box, border_radius=8)
+        screen.draw_rect(self.COLORS['accent'], box, 2, border_radius=8)
 
         # ── Tab bar ──────────────────────────────────────────────────────────
         self._dialogue_popup_rects = []
@@ -1670,8 +1694,8 @@ class EntityEditor:
             is_sel = (tab_key == active_tab)
             bg  = self.COLORS['panel_light'] if is_sel else self.COLORS['panel']
             bd  = self.COLORS['accent']      if is_sel else self.COLORS['grid']
-            pygame.draw.rect(screen, bg, tr, border_radius=4)
-            pygame.draw.rect(screen, bd, tr, 2 if is_sel else 1, border_radius=4)
+            screen.draw_rect(bg, tr, border_radius=4)
+            screen.draw_rect(bd, tr, 2 if is_sel else 1, border_radius=4)
             tc  = self.COLORS['accent'] if is_sel else self.COLORS['text_dim']
             lbl = self.font_medium.render(tab_label, True, tc)
             screen.blit(lbl, lbl.get_rect(center=tr.center))
@@ -1716,8 +1740,8 @@ class EntityEditor:
             field = pygame.Rect(px + 72, ry + 4, pw - 72 - 46, row_h - 8)
             bg    = self.COLORS['panel_light'] if is_sel else self.COLORS['bg']
             bd    = self.COLORS['accent']      if is_sel else self.COLORS['grid']
-            pygame.draw.rect(screen, bg, field, border_radius=4)
-            pygame.draw.rect(screen, bd, field, 2 if is_sel else 1, border_radius=4)
+            screen.draw_rect(bg, field, border_radius=4)
+            screen.draw_rect(bd, field, 2 if is_sel else 1, border_radius=4)
             display = text + ("_" if is_sel else "")
             if len(display) > 58: display = "..." + display[-55:]
             screen.blit(self.font_medium.render(display, True, self.COLORS['text']),
@@ -1726,8 +1750,8 @@ class EntityEditor:
 
             rm = pygame.Rect(field.right + 6, ry + 6, 28, row_h - 12)
             rc = self.COLORS['danger'] if n > 1 else self.COLORS['disabled']
-            pygame.draw.rect(screen, self.COLORS['panel'], rm, border_radius=3)
-            pygame.draw.rect(screen, rc, rm, 1, border_radius=3)
+            screen.draw_rect(self.COLORS['panel'], rm, border_radius=3)
+            screen.draw_rect(rc, rm, 1, border_radius=3)
             xs = self.font_small.render("x", True, rc)
             screen.blit(xs, xs.get_rect(center=rm.center))
             if n > 1:
@@ -1735,22 +1759,22 @@ class EntityEditor:
 
         footer_y = rows_top + vis * row_h + 8
         add_r = pygame.Rect(px + 14, footer_y, 110, 28)
-        pygame.draw.rect(screen, self.COLORS['panel_light'], add_r, border_radius=4)
-        pygame.draw.rect(screen, self.COLORS['success'],     add_r, 1, border_radius=4)
+        screen.draw_rect(self.COLORS['panel_light'], add_r, border_radius=4)
+        screen.draw_rect(self.COLORS['success'],     add_r, 1, border_radius=4)
         at  = self.font_small.render("+ Add Line", True, self.COLORS['success'])
         screen.blit(at, at.get_rect(center=add_r.center))
         self._dialogue_popup_rects.append({'rect': add_r, 'action': 'add'})
 
         ok_r = pygame.Rect(px + pw - 220, footer_y, 96, 28)
-        pygame.draw.rect(screen, self.COLORS['panel_light'], ok_r, border_radius=4)
-        pygame.draw.rect(screen, self.COLORS['success'],     ok_r, 2, border_radius=4)
+        screen.draw_rect(self.COLORS['panel_light'], ok_r, border_radius=4)
+        screen.draw_rect(self.COLORS['success'],     ok_r, 2, border_radius=4)
         screen.blit(self.font_medium.render("Confirm", True, self.COLORS['success']),
                     self.font_medium.render("Confirm", True, self.COLORS['success']).get_rect(center=ok_r.center))
         self._dialogue_popup_rects.append({'rect': ok_r, 'action': 'confirm'})
 
         cl_r = pygame.Rect(px + pw - 114, footer_y, 96, 28)
-        pygame.draw.rect(screen, self.COLORS['panel_light'], cl_r, border_radius=4)
-        pygame.draw.rect(screen, self.COLORS['danger'],      cl_r, 2, border_radius=4)
+        screen.draw_rect(self.COLORS['panel_light'], cl_r, border_radius=4)
+        screen.draw_rect(self.COLORS['danger'],      cl_r, 2, border_radius=4)
         screen.blit(self.font_medium.render("Cancel", True, self.COLORS['danger']),
                     self.font_medium.render("Cancel", True, self.COLORS['danger']).get_rect(center=cl_r.center))
         self._dialogue_popup_rects.append({'rect': cl_r, 'action': 'cancel'})
@@ -1776,8 +1800,8 @@ class EntityEditor:
             is_f = (af == field_key)
             bg   = C['panel_light'] if is_f else C['bg']
             bd   = C['accent']      if is_f else C['grid']
-            pygame.draw.rect(screen, bg, r, border_radius=3)
-            pygame.draw.rect(screen, bd, r, 2 if is_f else 1, border_radius=3)
+            screen.draw_rect(bg, r, border_radius=3)
+            screen.draw_rect(bd, r, 2 if is_f else 1, border_radius=3)
             disp = value + ("_" if is_f else "")
             if len(disp) > 52: disp = "..." + disp[-49:]
             screen.blit(self.font_small.render(disp, True, C['text']), (r.x + 5, r.y + 5))
@@ -1787,8 +1811,8 @@ class EntityEditor:
         en_r = pygame.Rect(bx, y, 160, 28)
         en_bg = C['success'] if enabled else C['panel_light']
         en_bd = C['success'] if enabled else C['grid']
-        pygame.draw.rect(screen, en_bg, en_r, border_radius=5)
-        pygame.draw.rect(screen, en_bd, en_r, 2, border_radius=5)
+        screen.draw_rect(en_bg, en_r, border_radius=5)
+        screen.draw_rect(en_bd, en_r, 2, border_radius=5)
         en_lbl = self.font_medium.render(
             "Mission ON" if enabled else "Mission OFF",
             True, C['panel'] if enabled else C['text_dim'])
@@ -1806,8 +1830,8 @@ class EntityEditor:
         qt_colors = {'main': (255, 200, 50), 'side': (100, 200, 255), 'other': (180, 180, 180)}
         qt_col   = qt_colors.get(qt, C['accent'])
         qt_r     = pygame.Rect(bx, y, 140, 24)
-        pygame.draw.rect(screen, C['panel_light'], qt_r, border_radius=4)
-        pygame.draw.rect(screen, qt_col, qt_r, 2, border_radius=4)
+        screen.draw_rect(C['panel_light'], qt_r, border_radius=4)
+        screen.draw_rect(qt_col, qt_r, 2, border_radius=4)
         qt_lbl   = self.font_small.render(f"Type: {qt.capitalize()}  >>", True, qt_col)
         screen.blit(qt_lbl, qt_lbl.get_rect(center=qt_r.center))
         self._dialogue_popup_rects.append({'rect': qt_r, 'action': 'toggle_quest_type'})
@@ -1817,8 +1841,8 @@ class EntityEditor:
         seq    = m.get('sequential', False)
         seq_r  = pygame.Rect(bx, y, 140, 24)
         seq_bg = C['variant_selected'] if seq else C['panel']
-        pygame.draw.rect(screen, seq_bg, seq_r, border_radius=4)
-        pygame.draw.rect(screen, C['accent'] if seq else C['grid'], seq_r, 1, border_radius=4)
+        screen.draw_rect(seq_bg, seq_r, border_radius=4)
+        screen.draw_rect(C['accent'] if seq else C['grid'], seq_r, 1, border_radius=4)
         sl = self.font_small.render("Sequential: " + ("YES" if seq else "NO"), True,
                                     C['text'] if seq else C['text_dim'])
         screen.blit(sl, sl.get_rect(center=seq_r.center))
@@ -1835,8 +1859,8 @@ class EntityEditor:
 
             # Type cycle button
             type_r = pygame.Rect(row_x, y, 84, 24)
-            pygame.draw.rect(screen, C['panel_light'], type_r, border_radius=3)
-            pygame.draw.rect(screen, C['accent'], type_r, 1, border_radius=3)
+            screen.draw_rect(C['panel_light'], type_r, border_radius=3)
+            screen.draw_rect(C['accent'], type_r, 1, border_radius=3)
             tl = self.font_small.render(obj_type, True, C['accent'])
             screen.blit(tl, tl.get_rect(center=type_r.center))
             self._dialogue_popup_rects.append({'rect': type_r, 'action': 'obj_cycle_type', 'index': i})
@@ -1865,8 +1889,8 @@ class EntityEditor:
                     btn_r = pygame.Rect(row_x, y, avail_w, 24)
                     bg    = C['panel_light'] if is_open else C['bg']
                     bd    = C['accent']      if is_open else C['grid']
-                    pygame.draw.rect(screen, bg, btn_r, border_radius=3)
-                    pygame.draw.rect(screen, bd, btn_r, 2 if is_open else 1, border_radius=3)
+                    screen.draw_rect(bg, btn_r, border_radius=3)
+                    screen.draw_rect(bd, btn_r, 2 if is_open else 1, border_radius=3)
 
                     # Value text (clipped)
                     disp_trim = disp
@@ -1908,8 +1932,8 @@ class EntityEditor:
 
             # Remove button
             rm_r = pygame.Rect(bx + rw - 28, y, 24, 24)
-            pygame.draw.rect(screen, C['panel'], rm_r, border_radius=3)
-            pygame.draw.rect(screen, C['danger'], rm_r, 1, border_radius=3)
+            screen.draw_rect(C['panel'], rm_r, border_radius=3)
+            screen.draw_rect(C['danger'], rm_r, 1, border_radius=3)
             xs = self.font_small.render("x", True, C['danger'])
             screen.blit(xs, xs.get_rect(center=rm_r.center))
             self._dialogue_popup_rects.append({'rect': rm_r, 'action': 'obj_remove', 'index': i})
@@ -1917,15 +1941,15 @@ class EntityEditor:
 
         # Add objective
         add_r = pygame.Rect(bx, y, 130, 24)
-        pygame.draw.rect(screen, C['panel_light'], add_r, border_radius=4)
-        pygame.draw.rect(screen, C['success'], add_r, 1, border_radius=4)
+        screen.draw_rect(C['panel_light'], add_r, border_radius=4)
+        screen.draw_rect(C['success'], add_r, 1, border_radius=4)
         al = self.font_small.render("+ Add Objective", True, C['success'])
         screen.blit(al, al.get_rect(center=add_r.center))
         self._dialogue_popup_rects.append({'rect': add_r, 'action': 'obj_add'})
         y += 32
 
         # ── Rewards ───────────────────────────────────────────────────────
-        pygame.draw.line(screen, C['grid'], (bx, y), (bx + rw, y), 1)
+        screen.draw_line(C['grid'], (bx, y), (bx + rw, y), 1)
         y += 8
         xp_val = str(m.get('rewards', {}).get('xp', 0))
         text_field('reward_xp', xp_val, bx, y, 80, label="XP Reward:")
@@ -1974,8 +1998,8 @@ class EntityEditor:
         screen.blit(shadow, (ax - 2, ay + 2))
 
         # Background + border
-        pygame.draw.rect(screen, C['bg'],     list_r, border_radius=4)
-        pygame.draw.rect(screen, C['accent'], list_r, 1, border_radius=4)
+        screen.draw_rect(C['bg'],     list_r, border_radius=4)
+        screen.draw_rect(C['accent'], list_r, 1, border_radius=4)
 
         # Clip to list area
         clip_r = pygame.Rect(ax + 1, ay + 2, w - 2, list_h - 4)
@@ -1990,7 +2014,7 @@ class EntityEditor:
             item_r = pygame.Rect(ax + 1, ry, w - 2, row_h)
             hovered = item_r.collidepoint(mx, my)
             bg = C['variant_selected'] if hovered else (C['panel_light'] if real_idx % 2 == 0 else C['bg'])
-            pygame.draw.rect(screen, bg, item_r)
+            screen.draw_rect(bg, item_r)
 
             disp = opt if opt else '(any)' if dd['param'] in ('enemy_id', 'room') else '—'
             trim = disp
@@ -2027,15 +2051,15 @@ class EntityEditor:
         """Draw shared Confirm / Cancel buttons."""
         C = self.COLORS
         ok_r = pygame.Rect(px + pw - 220, footer_y, 96, 28)
-        pygame.draw.rect(screen, C['panel_light'], ok_r, border_radius=4)
-        pygame.draw.rect(screen, C['success'],     ok_r, 2, border_radius=4)
+        screen.draw_rect(C['panel_light'], ok_r, border_radius=4)
+        screen.draw_rect(C['success'],     ok_r, 2, border_radius=4)
         ok_t = self.font_medium.render("Confirm", True, C['success'])
         screen.blit(ok_t, ok_t.get_rect(center=ok_r.center))
         self._dialogue_popup_rects.append({'rect': ok_r, 'action': 'confirm'})
 
         cl_r = pygame.Rect(px + pw - 114, footer_y, 96, 28)
-        pygame.draw.rect(screen, C['panel_light'], cl_r, border_radius=4)
-        pygame.draw.rect(screen, C['danger'],      cl_r, 2, border_radius=4)
+        screen.draw_rect(C['panel_light'], cl_r, border_radius=4)
+        screen.draw_rect(C['danger'],      cl_r, 2, border_radius=4)
         cl_t = self.font_medium.render("Cancel", True, C['danger'])
         screen.blit(cl_t, cl_t.get_rect(center=cl_r.center))
         self._dialogue_popup_rects.append({'rect': cl_r, 'action': 'cancel'})
@@ -2060,6 +2084,7 @@ class EntityEditor:
         if self._mouse_in_palette(mx, my):
             return
 
+        mx, my = mx / self.editor_zoom, my / self.editor_zoom
         world_x = (mx + camera_x) / RENDER_SCALE
         world_y = (my + camera_y) / RENDER_SCALE
 
@@ -2090,7 +2115,7 @@ class EntityEditor:
             screen.blit(sprite, (int(sx - ew // 2), int(sy - eh // 2)))
 
             outline_color = (220, 50, 50) if blocked else self.COLORS['accent']
-            pygame.draw.rect(screen, outline_color,
+            screen.draw_rect(outline_color,
                              (int(sx - ew // 2), int(sy - eh // 2), ew, eh), 2)
 
     # =========================================================================

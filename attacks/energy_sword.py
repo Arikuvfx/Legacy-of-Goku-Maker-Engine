@@ -410,6 +410,18 @@ class EnergySwordSpinEffect:
     def get_center(self):
         return (self.x, self.y)
 
+    def get_world_bounds(self):
+        """World-space pygame.Rect covering the spin's hit radius around
+        its current (possibly offset) position — used by
+        LayerManager._apply_decoration_occlusion (draw_layers.py) so a
+        decoration the player is spinning next to can still redraw on top
+        of this effect. Named explicitly (rather than relying on the
+        generic x/y+radius fallback in _get_occlusion_rect) since this
+        class's size lives in self.hit_radius, not self.radius.
+        """
+        d = self.hit_radius * 2
+        return pygame.Rect(self.x - self.hit_radius, self.y - self.hit_radius, d, d)
+
     def get_sort_key(self):
         return (self.draw_layer, self.y)
 

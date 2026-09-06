@@ -262,7 +262,18 @@ class NPC:
             del self.dialogue_config['_shuffled_dialogues']
 
     def draw(self, screen, camera, colors):
-        """Draw the NPC body, facing indicator, and speech-bubble when talking."""
+        """Draw the NPC body, facing indicator, and speech-bubble when talking.
+
+        NOTE (GPU render pass): the sprite branch below (self.sprite.draw(...))
+        delegates to core/sprite_system.py, which is the module that actually
+        does per-frame pixel scaling/blitting for every character in the
+        engine (player, enemy, NPC all share it). That file hasn't been
+        converted yet -- see the note at the bottom of this file. The
+        placeholder-rect fallback below (used when no sprite asset was
+        found) is the only drawing this method does itself, and is
+        converted: pygame.draw.rect(screen, ...) -> screen.draw_rect(...),
+        now that `screen` is a GPUScreen instead of a raw Surface.
+        """
         if not self.active:
             return
 
@@ -277,6 +288,13 @@ class NPC:
             npc_color = (100, 200, 100) if self.npc_type == 'moving' else (50, 150, 200)
             if self.is_talking:
                 npc_color = (200, 200, 50)
-            pygame.draw.rect(screen, npc_color,
+            screen.draw_rect(npc_color,
                              (screen_x - scaled_width // 2, screen_y - scaled_height // 2,
                               scaled_width, scaled_height))
+
+
+# ── GPU MIGRATION STATUS (this file) ────────────────────────────────────────
+# Done: the one pygame.draw.* call site (placeholder-rect fallback).
+# Not this file's problem: self.sprite.draw(...) -- that's core/sprite_system.py,
+# not uploaded yet. NPC itself has nothing else to convert; everything else
+# in this file is game logic (dialogue, wandering AI) with no rendering calls.

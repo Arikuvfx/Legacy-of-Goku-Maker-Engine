@@ -70,6 +70,57 @@ from core.sprite_system import (create_character_sprite, create_enemy_sprite,
                                  create_npc_sprite, create_boss_sprite)
 
 
+class _BlitScaledShim:
+    """Wraps a plain pygame.Surface so it also answers to GPUScreen's
+    blit_scaled(surface, dst_rect, area=None) — see gpu_renderer.py.
+
+    AnimatedSprite.draw() (core/sprite_system.py) was migrated to call
+    screen.blit_scaled(...) directly, on the assumption that every
+    "screen" it's ever handed is now a GPUScreen (true for the main game
+    surface, which game.py wraps once at startup). This module still
+    draws onto plain throwaway pygame.Surface scratch canvases for
+    off-screen snapshotting (see _capture_entity_sprite,
+    _capture_data_viewer_frame), so a raw Surface has to be dressed up
+    with the same interface here rather than assuming AnimatedSprite
+    will ever fall back to plain .blit() again.
+
+    This only wraps the *target* passed into draw() calls — the
+    underlying pygame.Surface is unchanged and still what every other
+    line in this file (subsurface, pygame.mask.from_surface, etc.)
+    keeps operating on directly.
+    """
+
+    def __init__(self, surface):
+        self._surface = surface
+
+    def blit(self, source, dest, area=None, special_flags=0):
+        return self._surface.blit(source, dest, area, special_flags)
+
+    def blit_scaled(self, surface, dst_rect, area=None):
+        if area is not None and not isinstance(area, pygame.Rect):
+            area = pygame.Rect(area)
+        src = surface.subsurface(area) if area is not None else surface
+        if isinstance(dst_rect, pygame.Rect):
+            pos, size = dst_rect.topleft, (dst_rect.width, dst_rect.height)
+        else:
+            pos, size = dst_rect, src.get_size()
+        size = (max(1, size[0]), max(1, size[1]))
+        if size != src.get_size():
+            # Nearest-neighbor, not smoothscale — GPUScreen.blit_scaled
+            # goes through SDL's texture draw, which (with no
+            # SDL_HINT_RENDER_SCALE_QUALITY override in gpu_renderer.py)
+            # defaults to nearest-neighbor sampling. smoothscale's
+            # bilinear filtering blurs pixel art that's meant to stay
+            # crisp when scaled, so this has to match, not just "scale".
+            src = pygame.transform.scale(src, size)
+        self._surface.blit(src, pos)
+
+    def __getattr__(self, name):
+        # Anything else (get_size, fill, etc.) falls straight through to
+        # the real Surface.
+        return getattr(self._surface, name)
+
+
 class _LetterSpriteFont:
     """Loads per-letter (a-z) PNG glyphs from a folder, keyed by
     lowercase filename stem — e.g. assets/ui/fonts/scouter_stats/h.png,
@@ -1139,8 +1190,8 @@ class ScouterMenu:
         body_scratch = pygame.Surface((self.screen_width, self.screen_height), pygame.SRCALPHA)
         try:
             if layer_manager is not None:
-                layer_manager._draw_shadow(shadow_scratch, obj, camera)
-            obj.draw(body_scratch, camera, colors)
+                layer_manager._draw_shadow(_BlitScaledShim(shadow_scratch), obj, camera)
+            obj.draw(_BlitScaledShim(body_scratch), camera, colors)
         except Exception as e:
             print(f'[scouter_menu] could not snapshot sprite for {type(obj).__name__}: {e}')
             return None
@@ -1484,7 +1535,7 @@ class ScouterMenu:
         # whatever RENDER_SCALE actually is.
         c = (size / 2) / RENDER_SCALE
         try:
-            sprite.draw(scratch, c, c, camera=None)
+            sprite.draw(_BlitScaledShim(scratch), c, c, camera=None)
         except Exception as e:
             print(f'[scouter_menu] could not draw data viewer sprite: {e}')
             return None
@@ -2638,8 +2689,8 @@ class ScouterMenu:
             # Art missing — same dot fallback the player marker uses when
             # player.png can't be loaded (see _draw_map_player_marker), so
             # the marker never just silently vanishes.
-            pygame.draw.circle(surface, (255, 255, 255), (int(screen_x), int(screen_y)), 3)
-            pygame.draw.circle(surface, (0, 0, 0), (int(screen_x), int(screen_y)), 3, 1)
+            surface.draw_circle((255, 255, 255), (int(screen_x), int(screen_y)), 3)
+            surface.draw_circle((0, 0, 0), (int(screen_x), int(screen_y)), 3, 1)
             return
 
         surface.blit(icon, (screen_x - icon.get_width() / 2,
@@ -2691,8 +2742,8 @@ class ScouterMenu:
             # player.png missing — fall back to the same style of dot the
             # zone map already draws for spawn points, so the marker never
             # just silently vanishes.
-            pygame.draw.circle(surface, (90, 255, 120), (int(screen_x), int(screen_y)), 3)
-            pygame.draw.circle(surface, (0, 0, 0), (int(screen_x), int(screen_y)), 3, 1)
+            surface.draw_circle((90, 255, 120), (int(screen_x), int(screen_y)), 3)
+            surface.draw_circle((0, 0, 0), (int(screen_x), int(screen_y)), 3, 1)
             return
 
         surface.blit(frame, (screen_x - frame.get_width() / 2,
@@ -2763,7 +2814,7 @@ class ScouterMenu:
                 # snapshot time (see _capture_entity_sprite) — same
                 # missing-asset tolerance as the rest of this file. Still
                 # pulses if targeted, via the color swap above.
-                pygame.draw.circle(surface, color, (e['x'], e['y']), 6)
+                surface.draw_circle(color, (e['x'], e['y']), 6)
 
     def _get_glow_tinted_sprite(self, entity, sprite, strength):
         """Green-tinted copy of a captured entity sprite, cached on the
@@ -2805,11 +2856,11 @@ class ScouterMenu:
             # tolerance as map_overlay.png/grid.png elsewhere in this file.
             r = 14
             col = (255, 220, 60)
-            pygame.draw.line(surface, col, (cx - r, cy), (cx - r + 6, cy), 2)
-            pygame.draw.line(surface, col, (cx + r, cy), (cx + r - 6, cy), 2)
-            pygame.draw.line(surface, col, (cx, cy - r), (cx, cy - r + 6), 2)
-            pygame.draw.line(surface, col, (cx, cy + r), (cx, cy + r - 6), 2)
-            pygame.draw.circle(surface, col, (cx, cy), r, 1)
+            surface.draw_line(col, (cx - r, cy), (cx - r + 6, cy), 2)
+            surface.draw_line(col, (cx + r, cy), (cx + r - 6, cy), 2)
+            surface.draw_line(col, (cx, cy - r), (cx, cy - r + 6), 2)
+            surface.draw_line(col, (cx, cy + r), (cx, cy + r - 6), 2)
+            surface.draw_circle(col, (cx, cy), r, 1)
 
     def _resolve_world_map_attachment(self, current_room, room_manager, world_map_lookup):
         """BFS every room reachable from current_room via room_transitions
@@ -2971,8 +3022,8 @@ class ScouterMenu:
                 # own player marker uses, so a pin never just vanishes.
                 color = (255, 220, 60) if is_current else (255, 255, 255)
                 radius = 6 if is_current else 4
-                pygame.draw.circle(surface, color, (int(lx), int(ly)), radius)
-                pygame.draw.circle(surface, (0, 0, 0), (int(lx), int(ly)), radius, 1)
+                surface.draw_circle(color, (int(lx), int(ly)), radius)
+                surface.draw_circle((0, 0, 0), (int(lx), int(ly)), radius, 1)
             else:
                 surface.blit(pin, (lx - pin.get_width() / 2, ly - pin.get_height() / 2))
 
@@ -3786,9 +3837,9 @@ class ScouterMenu:
 
         top_bar, bottom_bar = geo['top_bar'], geo['bottom_bar']
         if top_bar.width > 0 and top_bar.height > 0:
-            pygame.draw.rect(surface, self._DATA_DESCRIPTION_BAR_COLOR, top_bar)
+            surface.draw_rect(self._DATA_DESCRIPTION_BAR_COLOR, top_bar)
         if bottom_bar.width > 0 and bottom_bar.height > 0:
-            pygame.draw.rect(surface, self._DATA_DESCRIPTION_BAR_COLOR, bottom_bar)
+            surface.draw_rect(self._DATA_DESCRIPTION_BAR_COLOR, bottom_bar)
 
         self._draw_data_description_scroll_arrows(surface)
 

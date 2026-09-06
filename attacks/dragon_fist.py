@@ -225,6 +225,27 @@ class DragonFistAttack:
         """Sort key for the layer manager (fixed layer, no y-sorting)."""
         return (self.draw_layer, 0)
 
+    def get_world_bounds(self):
+        """World-space pygame.Rect enclosing the head and every body/anchor
+        segment at their current positions — used by
+        LayerManager._apply_decoration_occlusion (draw_layers.py) so a
+        decoration in front of the chain can still redraw on top of it.
+        Only matters for the 'down' throw direction in practice — that's
+        the only one using DrawLayer.EFFECTS_FRONT (see
+        get_dragon_fist_layer's docstring); up/left/right already draw
+        behind everything via EFFECTS_BEHIND, so occlusion by a decoration
+        there is a non-issue. Still computed for every direction, since
+        it's cheap and correct either way.
+        """
+        half_head_w, half_head_h = self.head_size[0] / 2, self.head_size[1] / 2
+        bounds = pygame.Rect(self.head_x - half_head_w, self.head_y - half_head_h,
+                              self.head_size[0], self.head_size[1])
+        half_body_w, half_body_h = self.body_size[0] / 2, self.body_size[1] / 2
+        for bx, by in self.body_positions:
+            bounds = bounds.union(
+                pygame.Rect(bx - half_body_w, by - half_body_h, self.body_size[0], self.body_size[1]))
+        return bounds
+
     # ------------------------------------------------------------------
     # Sprite loading
     # ------------------------------------------------------------------

@@ -331,6 +331,36 @@ class BeamAttack:
         self.draw_layer = get_beam_layer(self.direction, self.direction)
         self.y_sort = False
 
+    def get_world_bounds(self):
+        """World-space pygame.Rect enclosing this beam's current visual
+        extent, from its origin (self.x, self.y) out to wherever its tip
+        is ACTUALLY drawn right now (see get_tip_world_length() — NOT
+        self.length alone, for the same reason get_tip_world_length()
+        itself exists: the rendered tip sits _min_reach() further out).
+
+        Used by LayerManager._apply_decoration_occlusion (draw_layers.py)
+        to test whether a decoration's trunk sits inside this beam's
+        corridor and should redraw on top of it — mirrors the same
+        beam_rect construction beam-vs-wall blocking already uses (see
+        beam_block_distance_for_rect in collision_object.py), except sized
+        to the beam's actual current reach rather than a large fixed
+        "reach" constant, since here we only care where the beam is
+        actually drawn right now, not its full hypothetical corridor.
+        """
+        world_width = self.width / self.scale
+        reach = self.get_tip_world_length()
+
+        if self.direction == 'up':
+            return pygame.Rect(self.x - world_width / 2, self.y - reach, world_width, reach)
+        elif self.direction == 'down':
+            return pygame.Rect(self.x - world_width / 2, self.y, world_width, reach)
+        elif self.direction == 'left':
+            return pygame.Rect(self.x - reach, self.y - world_width / 2, reach, world_width)
+        elif self.direction == 'right':
+            return pygame.Rect(self.x, self.y - world_width / 2, reach, world_width)
+        else:
+            return pygame.Rect(self.x - world_width / 2, self.y - world_width / 2, world_width, world_width)
+
     def get_sort_key(self):
         # Secondary key was hardcoded to 0 — for left/right, draw_layer is
         # DrawLayer.PLAYER, the SAME bucket enemies sort into via

@@ -399,7 +399,7 @@ def _load_preview_sprite(kind: str, entity_id: str, variant_type: str, entity_ty
         scale = min(size / frame_w, size / frame_h)
         scaled_w = max(1, round(frame_w * scale))
         scaled_h = max(1, round(frame_h * scale))
-        scaled = pygame.transform.smoothscale(frame, (scaled_w, scaled_h))
+        scaled = pygame.transform.scale(frame, (scaled_w, scaled_h))
 
         canvas = pygame.Surface((size, size), pygame.SRCALPHA)
         canvas.blit(scaled, ((size - scaled_w) // 2, (size - scaled_h) // 2))
@@ -509,8 +509,8 @@ class EntityList:
         return None
 
     def draw(self, surf, font, font_sm) -> None:
-        pygame.draw.rect(surf, C_PANEL_DARK, self.rect, border_radius=6)
-        pygame.draw.rect(surf, C_BORDER, self.rect, 1, border_radius=6)
+        surf.draw_rect(C_PANEL_DARK, self.rect, border_radius=6)
+        surf.draw_rect(C_BORDER, self.rect, 1, border_radius=6)
 
         visible_rect = self._visible_rect()
         old_clip = surf.get_clip()
@@ -524,7 +524,7 @@ class EntityList:
             hovered = item_r.collidepoint(mx, my)
             is_sel = (eid == self.selected)
             bg = C_SELECTED if is_sel else (C_HOVER if hovered else C_PANEL_DARK)
-            pygame.draw.rect(surf, bg, item_r)
+            surf.draw_rect(bg, item_r)
 
             unconfigured = eid not in self.configured
             col = C_ACCENT2 if unconfigured else (C_TEXT if is_sel else C_TEXT_DIM)
@@ -539,7 +539,7 @@ class EntityList:
 
         # ── Reorder controls ──────────────────────────────────────
         btn_up, btn_down = self._reorder_button_rects()
-        pygame.draw.line(surf, C_BORDER,
+        surf.draw_line(C_BORDER,
                          (self.rect.x + 4, btn_up.y - 6),
                          (self.rect.right - 4, btn_up.y - 6))
 
@@ -802,16 +802,16 @@ class EntityEditorPanel:
         sprite = variant.get('sprite')
         if sprite is not None:
             surf.blit(sprite, rect)
-            pygame.draw.rect(surf, C_BORDER, rect, 1)
+            surf.draw_rect(C_BORDER, rect, 1)
         else:
             # dashed placeholder — no art found for this variant yet
-            pygame.draw.rect(surf, C_PANEL_DARK, rect)
+            surf.draw_rect(C_PANEL_DARK, rect)
             dash = 4
             xx = rect.left
             while xx < rect.right:
-                pygame.draw.line(surf, C_TEXT_DIM,
+                surf.draw_line(C_TEXT_DIM,
                                   (xx, rect.top), (min(xx + dash, rect.right), rect.top))
-                pygame.draw.line(surf, C_TEXT_DIM,
+                surf.draw_line(C_TEXT_DIM,
                                   (xx, rect.bottom - 1), (min(xx + dash, rect.right), rect.bottom - 1))
                 xx += dash * 2
             label = render_text_cached(font_sm, "?", C_TEXT_DIM)
@@ -1137,15 +1137,15 @@ class EntityCreator:
             label = "Enemies" if i == 0 else "NPCs"
             active = (self.kind == (KIND_ENEMY if i == 0 else KIND_NPC))
             bg = C_TAB_ACT if active else C_TAB_INACT
-            pygame.draw.rect(screen, bg, rect, border_radius=6)
-            pygame.draw.rect(screen, C_ACCENT if active else C_BORDER, rect, 1, border_radius=6)
+            screen.draw_rect(bg, rect, border_radius=6)
+            screen.draw_rect(C_ACCENT if active else C_BORDER, rect, 1, border_radius=6)
             txt = render_text_cached(self.font_sm, label, C_TEXT if active else C_TEXT_DIM)
             screen.blit(txt, txt.get_rect(center=rect.center))
 
         self.entity_list.draw(screen, self.font, self.font_sm)
 
-        pygame.draw.rect(screen, C_PANEL, self.editor_rect, border_radius=6)
-        pygame.draw.rect(screen, C_BORDER, self.editor_rect, 1, border_radius=6)
+        screen.draw_rect(C_PANEL, self.editor_rect, border_radius=6)
+        screen.draw_rect(C_BORDER, self.editor_rect, 1, border_radius=6)
         if self.editor:
             old_clip = screen.get_clip()
             screen.set_clip(self.editor_rect)
@@ -1175,8 +1175,8 @@ class EntityCreator:
         screen.blit(dim, (0, 0))
 
         box = pygame.Rect(sw // 2 - 220, sh // 2 - 70, 440, 140)
-        pygame.draw.rect(screen, C_DIALOG_BG, box, border_radius=8)
-        pygame.draw.rect(screen, C_ACCENT, box, 1, border_radius=8)
+        screen.draw_rect(C_DIALOG_BG, box, border_radius=8)
+        screen.draw_rect(C_ACCENT, box, 1, border_radius=8)
 
         prompt = "New enemy id (folder-safe, e.g. 'saibaman')" if self.kind == KIND_ENEMY \
             else "New NPC id (folder-safe, e.g. 'blacksmith')"

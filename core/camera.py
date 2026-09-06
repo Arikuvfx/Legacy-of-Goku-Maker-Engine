@@ -6,15 +6,28 @@ class Camera:
     """
     Tracks and centres the viewport on a target entity.
 
-    Converts world-space coordinates to screen-space coordinates using the
-    RENDER_SCALE constant.  Supports a camera-shake effect that gradually
-    dampens over its duration.
+    CHANGED FOR GPU RENDERING: apply() still exists unchanged for any
+    code that just needs a screen-space (x, y) pair. NEW: apply_rect()
+    is what draw() methods should switch to when they currently do
 
-    Coordinate contract
-    -------------------
-    - camera.x / camera.y  — screen-space offset used in rendering.
-    - target.x / target.y  — world-space position of the tracked entity.
-    - world_width / world_height — world-space room dimensions.
+        screen_x, screen_y = camera.apply(obj.x, obj.y)
+        scaled = pygame.transform.scale(sprite, (w * RENDER_SCALE, h * RENDER_SCALE))
+        screen.blit(scaled, (screen_x, screen_y))
+
+    That pattern is exactly what caused the room editor's zoom-out
+    blowup: a CPU pixel resample (transform.scale) on every sprite,
+    every frame, at a size that grows as zoom shrinks. apply_rect()
+    replaces the whole thing with one call:
+
+        dst_rect = camera.apply_rect(obj.x, obj.y, sprite_w, sprite_h)
+        screen.blit_scaled(sprite, dst_rect)   # gpu_renderer.GPUScreen
+
+    No transform.scale, no intermediate surface. self.zoom (already
+    present below, previously only consumed by the room editor's
+    fit-to-screen overview via getattr-with-fallback) is now the single
+    place zoom lives -- the room editor should set camera.zoom directly
+    from its Ctrl+scroll editor_zoom instead of building its own
+    offscreen canvas and shrinking it afterwards.
     """
 
     def __init__(self, screen_width, screen_height):
@@ -23,45 +36,22 @@ class Camera:
         self.x = 0
         self.y = 0
 
-        # Internal, un-rounded camera position. The exponential ease below
-        # needs a continuous float to accumulate against each frame — if we
-        # fed it the rounded/shaken self.x/self.y instead, snapping to whole
-        # pixels every frame would re-inject noise into the ease itself.
-        # self.x/self.y (set at the end of update()) become the *rendered*
-        # position: this true position plus shake, rounded once, so every
-        # consumer (player sprite, shadow, anything calling camera.apply)
-        # works off the exact same integer offset instead of each
-        # independently truncating a moving sub-pixel value.
         self._true_x = 0.0
         self._true_y = 0.0
 
-        # Smooth-follow state — the camera always eases toward the target
-        # rather than snapping to it. This is what gives walking/running a
-        # slight, deliberate follow-lag that catches up once the player
-        # stops. _lerp_active is kept only so external code (e.g. the
-        # cutscene runtime) can still force an instant snap for one frame
-        # when it needs to reposition the camera directly; day-to-day
-        # gameplay follow no longer depends on it being toggled on.
+        # No longer just an editor-only convenience for callers that
+        # bypass apply() -- this is now the canonical zoom value that
+        # apply_rect() reads on every call. Room editor: set this
+        # directly from editor_zoom each frame; ordinary gameplay never
+        # touches it, same as before.
+        self.zoom = 1.0
+
         self._lerp_active  = True
-        self._lerp_speed   = 4.0   # higher = faster catch-up (good range: 3–8)
+        self._lerp_speed   = 4.0
 
-        # True until the camera has positioned itself at least once. _true_x/
-        # _true_y start at (0, 0) above — the top-left corner — because the
-        # camera has no target yet at construction time. Without this flag,
-        # the *first* update() call would ease from that (0, 0) origin all
-        # the way to the target's actual position, visibly sliding in from
-        # the corner instead of appearing on the target immediately (most
-        # noticeable at game start, but the same gap can appear any time
-        # code repositions the target without also calling snap()). The flag
-        # forces exactly one instant, non-eased positioning, then clears.
         self._needs_snap = True
-
-        # When True the camera position is frozen — the player is no longer tracked.
-        # Used during the world-map jump sequence so the camera doesn't follow
-        # the player off-screen.
         self.locked = False
 
-        # Camera shake state
         self.shake_intensity = 0
         self.shake_duration  = 0
         self.shake_timer     = 0
@@ -69,48 +59,14 @@ class Camera:
         self.shake_offset_y  = 0
 
     def start_shake(self, intensity=10, duration=0.3):
-        """
-        Begin a camera-shake effect.
-
-        Args:
-            intensity: Maximum pixel displacement at the start of the shake.
-            duration:  Duration of the shake in seconds.
-        """
         self.shake_intensity = intensity
         self.shake_duration  = duration
         self.shake_timer     = duration
 
     def snap(self):
-        """
-        Force the *next* update() call to position the camera on its target
-        instantly, bypassing the smooth-follow ease for one frame.
-
-        Call this any time the target has just been placed or moved
-        directly (game start, room spawn, save load, teleport) rather than
-        hand-computing and assigning camera.x/camera.y yourself — a manual
-        assignment only sets the rendered position for one frame, but
-        leaves _true_x/_true_y stale, so the very next tracked update()
-        would lerp from that old internal position back up to the correct
-        one, reproducing the same corner-to-target slide this exists to
-        prevent.
-        """
         self._needs_snap = True
 
     def update(self, target, world_width, world_height, dt=0):
-        """
-        Reposition the camera to follow *target*.
-
-        For rooms narrower or shorter than the screen the camera stays
-        centred on the room.  For larger rooms it clamps so the viewport
-        never shows empty space outside the room boundary.
-
-        Args:
-            target:       Entity with .x and .y world-space attributes.
-            world_width:  Room width in world units.
-            world_height: Room height in world units.
-            dt:           Delta time in seconds (used for shake decay).
-        """
-        # Update the shake offset, decaying intensity over time.
         if self.shake_timer > 0:
             self.shake_timer -= dt
             shake_amount = self.shake_intensity * (self.shake_timer / self.shake_duration) if self.shake_duration > 0 else 0.0
@@ -120,13 +76,9 @@ class Camera:
             self.shake_offset_x = 0
             self.shake_offset_y = 0
 
-        # When locked the camera doesn't track the target — it stays exactly
-        # where it is.  Shake still runs above so an impact on the same frame
-        # as the lock isn't silently dropped.
         if self.locked:
             return
 
-        # Centre the viewport on the target (in screen space).
         target_screen_x = target.x * RENDER_SCALE
         target_screen_y = target.y * RENDER_SCALE
 
@@ -134,17 +86,6 @@ class Camera:
         desired_y = target_screen_y - self.screen_height // 2
 
         if self._lerp_active and dt > 0 and not self._needs_snap:
-            # Exponential ease toward the target. This is what produces the
-            # deliberate follow-lag while walking/running — the camera keeps
-            # chasing a moving target, so the gap never closes until the
-            # player actually stops. Left permanently on (not deactivated
-            # once "close enough") so it applies to ordinary gameplay, not
-            # just the moment right after a cutscene.
-            #
-            # This eases against _true_x/_true_y (not the rounded, shaken
-            # self.x/self.y) so the accumulator stays a clean float from
-            # frame to frame — rounding it here would make the ease chase a
-            # jittery, pixel-snapped target instead of a smooth one.
             t = 1.0 - (1.0 / (1.0 + self._lerp_speed * dt))
             self._true_x = self._true_x + (desired_x - self._true_x) * t
             self._true_y = self._true_y + (desired_y - self._true_y) * t
@@ -153,8 +94,6 @@ class Camera:
             self._true_y = desired_y
             self._needs_snap = False
 
-        # Clamp the true (un-shaken) position to room bounds, or centre for
-        # rooms smaller than the screen.
         world_screen_width  = world_width  * RENDER_SCALE
         world_screen_height = world_height * RENDER_SCALE
 
@@ -168,27 +107,31 @@ class Camera:
         else:
             self._true_y = max(0, min(self._true_y, world_screen_height - self.screen_height))
 
-        # Rendered position: shake added on top of the true position, then
-        # snapped to a whole pixel exactly once, here. Every consumer
-        # (player sprite, ground shadow, tile draws, camera.apply(), ...)
-        # now works from the same integer camera offset each frame instead
-        # of each independently truncating a continuously-drifting float —
-        # that mismatch (not the shake or the ease itself) was what made
-        # the shadow appear to jitter relative to the player while moving.
         self.x = round(self._true_x + self.shake_offset_x)
         self.y = round(self._true_y + self.shake_offset_y)
 
     def apply(self, x, y):
-        """
-        Convert world-space coordinates to screen-space coordinates.
-
-        Args:
-            x: World-space X position.
-            y: World-space Y position.
-
-        Returns:
-            Tuple (screen_x, screen_y).
-        """
-        screen_x = (x * RENDER_SCALE) - self.x
-        screen_y = (y * RENDER_SCALE) - self.y
+        """Unchanged: screen-space (x, y) for callers that only need a
+        position, not a scaled draw rect (e.g. mouse-coordinate math,
+        collision debug lines)."""
+        screen_x = (x * RENDER_SCALE - self.x) * self.zoom
+        screen_y = (y * RENDER_SCALE - self.y) * self.zoom
         return screen_x, screen_y
+
+    def apply_rect(self, world_x, world_y, sprite_w, sprite_h):
+        """
+        World position + a sprite's native pixel size -> the destination
+        pygame.Rect to hand to GPUScreen.blit_scaled(). This is the
+        replacement for "compute screen_x/y, then pygame.transform.scale
+        the sprite, then blit" -- the GPU does the scaling as part of
+        the draw, at the cost of one Rect, regardless of zoom level.
+
+        sprite_w/sprite_h should be the sprite's UNSCALED native size
+        (before RENDER_SCALE) -- same inputs you'd currently pass to
+        pygame.transform.scale(sprite, (w * RENDER_SCALE, h * RENDER_SCALE)).
+        """
+        screen_x, screen_y = self.apply(world_x, world_y)
+        scaled_w = sprite_w * RENDER_SCALE * self.zoom
+        scaled_h = sprite_h * RENDER_SCALE * self.zoom
+        import pygame
+        return pygame.Rect(round(screen_x), round(screen_y), round(scaled_w), round(scaled_h))

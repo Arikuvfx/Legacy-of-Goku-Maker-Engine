@@ -16,6 +16,37 @@ from typing import List, Tuple, Callable
 from config.settings import RENDER_SCALE
 
 
+class _MaskableSurface(pygame.Surface):
+    """A real pygame.Surface -- usable directly by pygame.mask.from_surface()
+    and .subsurface(), both of which need actual CPU pixel storage, not a
+    GPUScreen wrapper -- that also answers the couple of GPUScreen-only
+    methods (blit_scaled, blit_transient) that sprite_system.py's sprite
+    draw() calls unconditionally regardless of what "screen" turns out to
+    be. draw_player_silhouette below renders the player onto one of these
+    instead of onto the real GPUScreen used for the visible frame, because
+    building the occlusion silhouette needs per-pixel mask operations that
+    only work on CPU-backed Surface data.
+
+    Scaling here costs a real pygame.transform.scale() CPU call, unlike
+    GPUScreen.blit_scaled()'s free GPU stretch -- that's fine since this
+    surface is only ever the player's own sprite-sized area, not a full
+    screen, and only built once per frame.
+    """
+
+    def blit_scaled(self, surface, dst_rect, area=None):
+        dst_rect = pygame.Rect(dst_rect)
+        src = surface.subsurface(area) if area is not None else surface
+        if src.get_size() != dst_rect.size:
+            src = pygame.transform.scale(src, dst_rect.size)
+        self.blit(src, dst_rect.topleft)
+
+    def blit_transient(self, surface, dest, area=None):
+        if isinstance(dest, pygame.Rect):
+            self.blit_scaled(surface, dest, area=area)
+        else:
+            self.blit(surface, dest, area)
+
+
 class DrawLayer:
     """Standard layer constants — edit these if the draw order ever needs adjusting."""
     # Background layers (behind player)
@@ -187,9 +218,129 @@ class LayerManager:
             if hasattr(obj, 'draw'):
                 obj.draw(screen, camera, colors)
 
+        # See _apply_decoration_occlusion's docstring — this deliberately
+        # runs as a SEPARATE pass after the main sort/draw loop above,
+        # rather than folding decorations into the same (layer, y) sort
+        # attacks use. Attacks that always draw in front of the player and
+        # every enemy (DrawLayer.EFFECTS_FRONT — see get_beam_layer() and
+        # its siblings below) intentionally opt OUT of normal y-sorting for
+        # that exact reason: a single anchor-y comparison can't correctly
+        # represent "in front of an enemy/player at any point along a long
+        # beam's own length" (see get_beam_layer's and
+        # GhostKamikazeAttack.get_sort_key's docstrings for the history of
+        # why that was tried and rejected). Folding decorations into that
+        # same sort would reopen exactly that problem for them too, so
+        # instead this second pass only ever redraws a decoration ON TOP of
+        # an already-drawn front-locked effect — it never changes whether
+        # the effect itself draws over the player or an enemy.
+        self._apply_decoration_occlusion(screen, camera, colors, sorted_objects)
+
         # Debug visualization
         if self.debug_mode:
             self._draw_debug_info(screen, sorted_objects)
+
+    def _get_occlusion_rect(self, obj):
+        """Best-effort WORLD-space pygame.Rect for `obj`'s current visual
+        footprint, used only by _apply_decoration_occlusion below to test
+        overlap against a decoration's trunk hitbox — never used for real
+        collision/damage.
+
+        Prefers obj.get_world_bounds() when the attack provides one (see
+        BeamAttack.get_world_bounds, FlameKamehamehaAttack.get_world_bounds,
+        UltraVolleyballAttack.get_world_bounds — these already cover the
+        full extent of a long/chained attack, not just its anchor point).
+        Falls back to a simple centered rect from x/y plus width/height or
+        radius for simpler ball-shaped attacks (e.g. GenkidamaBlast,
+        BigBangAttackBlast, MasenkoProjectile) that don't need — and don't
+        have — a dedicated bounds method. Returns None if `obj` doesn't
+        expose enough geometry either way, in which case that attack simply
+        isn't considered for decoration occlusion (same as today).
+        """
+        get_bounds = getattr(obj, 'get_world_bounds', None)
+        if callable(get_bounds):
+            try:
+                return get_bounds()
+            except Exception:
+                return None
+
+        x = getattr(obj, 'x', None)
+        y = getattr(obj, 'y', None)
+        if x is None or y is None:
+            return None
+
+        width = getattr(obj, 'width', None)
+        height = getattr(obj, 'height', None)
+        if width is None or height is None:
+            radius = getattr(obj, 'radius', None)
+            if radius is None:
+                return None
+            width = height = radius * 2
+
+        return pygame.Rect(x - width / 2, y - height / 2, width, height)
+
+    def _apply_decoration_occlusion(self, screen, camera, colors, sorted_objects):
+        """Redraw any decoration on top of an EFFECTS_FRONT-layer attack it
+        overlaps AND sits in front of (decoration.y > attack's own y),
+        using the same "bigger y draws on top" convention every y-sorted
+        object in this engine already follows (see DrawableObject.
+        get_sort_key). This is what makes a beam/blast correctly pass
+        BEHIND a tree's canopy positioned further down/across its path
+        while every other guarantee (always in front of the player and
+        any enemy it's hitting — see get_beam_layer's docstring) stays
+        exactly as it was, since this never touches those objects' own
+        sort keys or draw order — it only ever adds one more decoration
+        blit on top.
+
+        Cheap by construction: bails immediately if there are no active
+        front-locked effects or no active decorations this frame, and
+        otherwise is only O(decorations x front effects), both normally
+        small numbers.
+        """
+        front_effects = [
+            obj for obj in sorted_objects
+            if getattr(obj, 'draw_layer', None) == DrawLayer.EFFECTS_FRONT
+            and getattr(obj, 'active', True)
+        ]
+        if not front_effects:
+            return
+
+        # Duck-typed rather than an isinstance/import check — draw_layers.py
+        # has no dependency on objects/decoration_objects.py (which already
+        # imports FROM here), so importing Decoration here would be
+        # circular. decoration_type + get_collision_rect together are
+        # specific enough to Decoration that nothing else drawable is
+        # expected to accidentally match both.
+        decorations = [
+            obj for obj in sorted_objects
+            if getattr(obj, 'active', True)
+            and hasattr(obj, 'decoration_type')
+            and hasattr(obj, 'get_collision_rect')
+        ]
+        if not decorations:
+            return
+
+        effect_rects = [(effect, self._get_occlusion_rect(effect)) for effect in front_effects]
+        effect_rects = [(effect, rect) for effect, rect in effect_rects if rect is not None]
+        if not effect_rects:
+            return
+
+        for decoration in decorations:
+            get_visual_rect = getattr(decoration, 'get_visual_rect', None)
+            # Fall back to the small trunk hitbox only if a decoration
+            # type doesn't expose the full sprite rect — better than
+            # skipping occlusion for it entirely, just less accurate for
+            # a wide canopy.
+            deco_rect = get_visual_rect() if callable(get_visual_rect) else decoration.get_collision_rect()
+            if deco_rect is None:
+                continue
+            for effect, effect_rect in effect_rects:
+                effect_y = getattr(effect, 'y', None)
+                if effect_y is None or decoration.y <= effect_y:
+                    continue  # decoration isn't "in front" of this effect — leave as drawn
+                if not deco_rect.colliderect(effect_rect):
+                    continue
+                decoration.draw(screen, camera, colors)
+                break  # already redrawn on top; no need to check the rest for this decoration
 
     def draw_player_silhouette(self, screen, player, camera, fg_tile_surfaces=None):
         OCCLUSION_ALPHA_THRESHOLD = 128
@@ -197,7 +348,7 @@ class LayerManager:
 
         if self._silhouette_screen_size != (w, h):
             self._silhouette_screen_size = (w, h)
-            self._silhouette_temp = pygame.Surface((w, h), pygame.SRCALPHA)
+            self._silhouette_temp = _MaskableSurface((w, h), pygame.SRCALPHA)
             self._silhouette_black = pygame.Surface((w, h), pygame.SRCALPHA)
             self._silhouette_black.fill((0, 0, 0, 255))
             self._silhouette_alpha = pygame.Surface((w, h), pygame.SRCALPHA)

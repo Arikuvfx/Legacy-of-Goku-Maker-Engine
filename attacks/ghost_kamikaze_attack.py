@@ -943,6 +943,28 @@ class GhostKamikazeAttack:
         collision loop, which iterates this each frame."""
         return [g for g in self.ghosts if g.is_hittable()]
 
+    def get_world_bounds(self):
+        """World-space pygame.Rect enclosing every active ghost's current
+        position — used by LayerManager._apply_decoration_occlusion
+        (draw_layers.py) so a decoration in front of the swarm can still
+        redraw on top of it, without touching this attack's own
+        get_sort_key()/draw_layer (see that method's docstring for why
+        down/left/right deliberately use a flat DrawLayer.EFFECTS_FRONT
+        instead of y-sorting against the player/enemies).
+
+        Returns None if there are no ghosts yet (e.g. still in the
+        'creating' phase before the first one spawns) — same
+        "not enough geometry, skip occlusion this frame" contract
+        _get_occlusion_rect already expects from any get_world_bounds().
+        """
+        active_ghosts = [g for g in self.ghosts if getattr(g, 'state', None) != 'done']
+        if not active_ghosts:
+            return None
+        bounds = active_ghosts[0].get_collision_rect()
+        for ghost in active_ghosts[1:]:
+            bounds = bounds.union(ghost.get_collision_rect())
+        return bounds
+
     # ------------------------------------------------------------------
     # Drawing
     # ------------------------------------------------------------------

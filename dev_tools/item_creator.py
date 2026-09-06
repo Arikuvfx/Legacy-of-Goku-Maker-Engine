@@ -248,8 +248,8 @@ class ItemList:
         return None
 
     def draw(self, surf, font_sm) -> None:
-        pygame.draw.rect(surf, C_PANEL_DARK, self.rect, border_radius=6)
-        pygame.draw.rect(surf, C_BORDER, self.rect, 1, border_radius=6)
+        surf.draw_rect(C_PANEL_DARK, self.rect, border_radius=6)
+        surf.draw_rect(C_BORDER, self.rect, 1, border_radius=6)
 
         old_clip = surf.get_clip()
         surf.set_clip(self.rect)
@@ -261,7 +261,7 @@ class ItemList:
             hovered = item_r.collidepoint(mx, my)
             is_sel = (iid == self.selected)
             bg = C_SELECTED if is_sel else (C_HOVER if hovered else C_PANEL_DARK)
-            pygame.draw.rect(surf, bg, item_r)
+            surf.draw_rect(bg, item_r)
 
             is_custom = iid in self.custom
             col = C_ACCENT2 if is_custom else (C_TEXT if is_sel else C_TEXT_DIM)
@@ -491,14 +491,14 @@ class ItemEditorPanel:
         rect = pygame.Rect(px, py, 96, 96)
         if self._icon is not None:
             surf.blit(self._icon, rect)
-            pygame.draw.rect(surf, C_BORDER, rect, 1)
+            surf.draw_rect(C_BORDER, rect, 1)
         else:
-            pygame.draw.rect(surf, C_PANEL_DARK, rect)
+            surf.draw_rect(C_PANEL_DARK, rect)
             dash = 4
             xx = rect.left
             while xx < rect.right:
-                pygame.draw.line(surf, C_TEXT_DIM, (xx, rect.top), (min(xx + dash, rect.right), rect.top))
-                pygame.draw.line(surf, C_TEXT_DIM, (xx, rect.bottom - 1), (min(xx + dash, rect.right), rect.bottom - 1))
+                surf.draw_line(C_TEXT_DIM, (xx, rect.top), (min(xx + dash, rect.right), rect.top))
+                surf.draw_line(C_TEXT_DIM, (xx, rect.bottom - 1), (min(xx + dash, rect.right), rect.bottom - 1))
                 xx += dash * 2
             label = render_text_cached(font_sm, "no icon", C_TEXT_DIM)
             surf.blit(label, label.get_rect(center=rect.center))
@@ -785,8 +785,8 @@ class ItemCreator:
         for rect, label, cat in zip(self.filter_tab_rects, labels, cats):
             active = (self.item_list.category_filter == cat)
             bg = C_TAB_ACT if active else C_TAB_INACT
-            pygame.draw.rect(screen, bg, rect, border_radius=6)
-            pygame.draw.rect(screen, C_ACCENT if active else C_BORDER, rect, 1, border_radius=6)
+            screen.draw_rect(bg, rect, border_radius=6)
+            screen.draw_rect(C_ACCENT if active else C_BORDER, rect, 1, border_radius=6)
             txt = render_text_cached(self.font_sm, label, C_TEXT if active else C_TEXT_DIM)
             # Shrink-to-fit so longer labels ("Equip: Accessory") don't
             # spill past narrow tabs on smaller screen widths.
@@ -798,8 +798,8 @@ class ItemCreator:
 
         self.item_list.draw(screen, self.font_sm)
 
-        pygame.draw.rect(screen, C_PANEL, self.editor_rect, border_radius=6)
-        pygame.draw.rect(screen, C_BORDER, self.editor_rect, 1, border_radius=6)
+        screen.draw_rect(C_PANEL, self.editor_rect, border_radius=6)
+        screen.draw_rect(C_BORDER, self.editor_rect, 1, border_radius=6)
         if self.editor:
             old_clip = screen.get_clip()
             screen.set_clip(self.editor_rect)
@@ -828,8 +828,8 @@ class ItemCreator:
         screen.blit(dim, (0, 0))
 
         box = pygame.Rect(sw // 2 - 220, sh // 2 - 70, 440, 140)
-        pygame.draw.rect(screen, C_DIALOG_BG, box, border_radius=8)
-        pygame.draw.rect(screen, C_ACCENT, box, 1, border_radius=8)
+        screen.draw_rect(C_DIALOG_BG, box, border_radius=8)
+        screen.draw_rect(C_ACCENT, box, 1, border_radius=8)
 
         prompt = "New item id (e.g. 'power_pole')"
         txt = render_text_cached(self.font_sm, prompt, C_TEXT)

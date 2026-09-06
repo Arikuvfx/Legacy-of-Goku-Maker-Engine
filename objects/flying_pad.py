@@ -3,6 +3,22 @@ from typing import List, Tuple, Optional
 from config.settings import RENDER_SCALE
 from core.draw_layers import LayeredDrawMixin, DrawLayer
 
+# Fonts used by draw_path_preview()/_draw_id_label() below. Constructing a
+# pygame.font.Font is far more expensive than rendering text with one you
+# already have (it re-parses the font file), so — same fix as
+# animated_region.py's module-level _label_font / collision_object.py's
+# _DIM_FONT — these are built once per size and reused forever instead of
+# once per waypoint per frame.
+_FONT_CACHE = {}
+
+
+def _get_font(size):
+    font = _FONT_CACHE.get(size)
+    if font is None:
+        font = pygame.font.Font(None, size)
+        _FONT_CACHE[size] = font
+    return font
+
 
 class FlyingPadWaypoint:
     """A single waypoint in a flying path"""
@@ -67,6 +83,12 @@ class FlyingPad(LayeredDrawMixin):
         # Sprite
         self.sprite = None
         self._load_sprite()
+
+        # Cache of the sprite pre-scaled to a given render_scale, so draw()
+        # doesn't call pygame.transform.scale() on the same source sprite
+        # every single frame — only when render_scale actually changes.
+        self._scaled_sprite = None
+        self._scaled_sprite_scale = None
 
     def _load_sprite(self):
         """Load the flying pad sprite"""
@@ -251,7 +273,10 @@ class FlyingPad(LayeredDrawMixin):
         if self.sprite:
             scaled_width = self.width * render_scale
             scaled_height = self.height * render_scale
-            scaled_sprite = pygame.transform.scale(self.sprite, (scaled_width, scaled_height))
+            if self._scaled_sprite_scale != render_scale:
+                self._scaled_sprite = pygame.transform.scale(self.sprite, (scaled_width, scaled_height))
+                self._scaled_sprite_scale = render_scale
+            scaled_sprite = self._scaled_sprite
 
             sprite_x = int(screen_x - scaled_width // 2)
             sprite_y = int(screen_y - scaled_height // 2)
@@ -310,7 +335,7 @@ class FlyingPad(LayeredDrawMixin):
 
                 # Draw room name if set
                 if wp.target_room:
-                    font = pygame.font.Font(None, 16)
+                    font = _get_font(16)
                     text = font.render(wp.target_room, True, (255, 255, 255))
                     text_rect = text.get_rect(center=(x, y - 15))
 
@@ -331,7 +356,7 @@ class FlyingPad(LayeredDrawMixin):
 
                     pygame.draw.line(screen, (150, 200, 150), (int(x), int(y)), (int(spawn_x), int(spawn_y)), 1)
 
-                    font_small = pygame.font.Font(None, 16)
+                    font_small = _get_font(16)
                     spawn_label = font_small.render("Spawn", True, (255, 255, 255))
                     spawn_rect = spawn_label.get_rect(center=(spawn_x, spawn_y + 15))
 
@@ -346,13 +371,13 @@ class FlyingPad(LayeredDrawMixin):
                 pygame.draw.circle(screen, (0, 0, 0), (int(x), int(y)), 6, 2)
 
             # Draw waypoint number
-            font = pygame.font.Font(None, 14)
+            font = _get_font(14)
             num_text = font.render(str(i + 1), True, (255, 255, 255))
             num_rect = num_text.get_rect(center=(x, y))
             screen.blit(num_text, num_rect)
 
         # Draw pad type indicator
-        font = pygame.font.Font(None, 18)
+        font = _get_font(18)
         if self.is_return_pad:
             if self.source_room:
                 pad_type_text = f"RETURN → {self.source_room}"
@@ -380,7 +405,7 @@ class FlyingPad(LayeredDrawMixin):
     def _draw_id_label(self, screen: pygame.Surface, camera, render_scale: int = 2):
         """Small standalone pad_id tag, used when there's no path yet to
         piggyback the label onto (see draw_path_preview)."""
-        font = pygame.font.Font(None, 18)
+        font = _get_font(18)
         text = font.render(f"[id: {self.pad_id}]", True, (100, 200, 255))
         x = (self.x * render_scale) - camera.x
         y = (self.y * render_scale) - camera.y - 30

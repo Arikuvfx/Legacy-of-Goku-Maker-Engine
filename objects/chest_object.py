@@ -53,6 +53,16 @@ class Chest:
         self.open_sprite = None
         self._load_sprites()
 
+        # Pre-scaled render-ready copies of closed_sprite/open_sprite, built
+        # lazily the first time each is actually drawn and cached from then
+        # on — draw() used to call pygame.transform.scale() on the source
+        # sprite fresh every single frame, which is wasted work for a
+        # sprite that only has two possible states and never actually
+        # changes size at runtime.
+        self._scaled_closed = None
+        self._scaled_open = None
+        self._scaled_render_scale = None
+
         # LayerManager (core/draw_layers.py) requires every drawable to
         # expose get_sort_key() — same (layer, y) shape as Door/SavePoint/
         # LevelGate/etc. y_sort=True so the chest draws in front of or
@@ -163,10 +173,16 @@ class Chest:
             return
         screen_x = int(self.x * RENDER_SCALE - camera.x)
         screen_y = int(self.y * RENDER_SCALE - camera.y)
-        scaled = pygame.transform.scale(
-            sprite,
-            (max(1, int(self.width * RENDER_SCALE)), max(1, int(self.height * RENDER_SCALE)))
-        )
+
+        # Rebuild the scaled cache if RENDER_SCALE changed (or hasn't been
+        # built yet) — otherwise reuse it instead of rescaling every frame.
+        if self._scaled_render_scale != RENDER_SCALE:
+            size = (max(1, int(self.width * RENDER_SCALE)), max(1, int(self.height * RENDER_SCALE)))
+            self._scaled_closed = pygame.transform.scale(self.closed_sprite, size)
+            self._scaled_open = pygame.transform.scale(self.open_sprite, size)
+            self._scaled_render_scale = RENDER_SCALE
+
+        scaled = self._scaled_open if self.opened else self._scaled_closed
         screen.blit(scaled, scaled.get_rect(center=(screen_x, screen_y)))
 
     def to_dict(self):

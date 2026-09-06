@@ -249,9 +249,17 @@ _label_font = None
 
 def draw_animated_region(screen, region: AnimatedRegion, camera_x: int, camera_y: int,
                           render_scale: int, dev_mode: bool = True, selected: bool = False,
-                          show_handles: bool = True):
+                          show_handles: bool = True, show_fill: bool = True):
     """Editor-only overlay — colored by region_type, with corner handles like
-    the collision box overlay, so it's visually distinct at a glance."""
+    the collision box overlay, so it's visually distinct at a glance.
+
+    show_fill=False skips the translucent color fill entirely (border and
+    handles still draw) — for call sites where a caller-guaranteed opaque
+    draw (e.g. the real background tile blit) covers this exact rect
+    immediately afterward, making the fill's alpha-blend cost pure waste.
+    Only pass False when that cover-up is actually guaranteed; otherwise
+    the region would flash as a bare outline with nothing marking it.
+    """
     if not dev_mode:
         return
 
@@ -277,22 +285,40 @@ def draw_animated_region(screen, region: AnimatedRegion, camera_x: int, camera_y
 
     base_alpha = 150 if selected else 100
     alpha = round(base_alpha * (region_opacity / 100))
-    fill_color = tuple(min(255, c + 60) for c in base_color) + (alpha,) if selected else base_color + (alpha,)
+    fill_rgb = tuple(min(255, c + 60) for c in base_color) if selected else base_color
 
     # The region box can be dragged far larger than the viewport, but only the
     # portion overlapping the screen is ever visible. Clip to that overlap
-    # before allocating/filling a surface — otherwise a big region means
-    # allocating and filling a multi-megapixel SRCALPHA surface every single
-    # frame, most of which is off-screen and never seen.
-    visible = rect.clip(screen.get_rect())
-    if visible.width > 0 and visible.height > 0:
-        fill_surf = pygame.Surface((visible.width, visible.height), pygame.SRCALPHA)
-        fill_surf.fill(fill_color)
-        screen.blit(fill_surf, (visible.x, visible.y))
+    # before touching a fill surface — otherwise a big region means filling
+    # a multi-megapixel area every single frame, most of which is off-screen
+    # and never seen.
+    visible = rect.clip(screen.get_rect()) if show_fill else pygame.Rect(0, 0, 0, 0)
+    if show_fill and visible.width > 0 and visible.height > 0:
+        # Drawn as a native GPU rect fill (screen.draw_rect(..., width=0)),
+        # not a Surface blit. This used to go through a persistent scratch
+        # Surface that was fill()'d, alpha'd, and blitted every frame — a
+        # leftover optimization from the pre-GPU CPU renderer, where
+        # avoiding a fresh Surface allocation and a per-pixel SRCALPHA blend
+        # were the real costs. Under GPUScreen the fill was taken via
+        # `scratch.subsurface(...)`, which returns a brand-new Python object
+        # every call; GPUScreen.blit() caches uploaded textures keyed by
+        # id(surface), so a fresh object every frame was a guaranteed cache
+        # miss — meaning every visible region, every frame, paid for a full
+        # Texture.from_surface() upload (the thing the GPU migration was
+        # supposed to eliminate), on top of cache bookkeeping for an entry
+        # that could never be reused. That cost scaled with how many
+        # regions were visible and how many (virtual, pre-zoom) pixels each
+        # one covered — which is exactly why it only showed up when zoomed
+        # all the way out. screen.draw_rect() with a flat RGBA color skips
+        # Surfaces and textures entirely: SDL fills the rect straight on
+        # the GPU. (Requires the renderer's blend mode to be BLEND_BLEND
+        # for the alpha channel to actually apply — see GPUScreen.__init__
+        # in gpu_renderer.py.)
+        screen.draw_rect((*fill_rgb, alpha), visible, width=0)
 
     border_color = tuple(min(255, c + 60) for c in base_color) if selected else base_color
     border_width = 3 if selected else 2
-    pygame.draw.rect(screen, border_color, rect, border_width)
+    screen.draw_rect(border_color, rect, border_width)
 
     # Corner drag handles — only relevant while actually dragging/resizing
     # the region itself, so they're skipped while the tile editor is active
@@ -309,8 +335,8 @@ def draw_animated_region(screen, region: AnimatedRegion, camera_x: int, camera_y
         for cx, cy in corners:
             hx = int(cx - handle // 2)
             hy = int(cy - handle // 2)
-            pygame.draw.rect(screen, handle_color, (hx, hy, int(handle), int(handle)))
-            pygame.draw.rect(screen, (0, 0, 0),    (hx, hy, int(handle), int(handle)), 1)
+            screen.draw_rect(handle_color, (hx, hy, int(handle), int(handle)))
+            screen.draw_rect((0, 0, 0),    (hx, hy, int(handle), int(handle)), 1)
 
     # Dimension + type label — skip if the box is too small to fit text
     if sw > 50 and sh > 30:

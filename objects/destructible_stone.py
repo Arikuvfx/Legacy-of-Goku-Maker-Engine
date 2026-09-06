@@ -46,6 +46,15 @@ class DestructibleStone:
         self.destruction_frame_timer = 0
         self._load_destruction_animation()
 
+        # Pre-scaled copies, built lazily and cached by RENDER_SCALE so
+        # draw() doesn't call pygame.transform.scale() on the source
+        # sprite/frames every single frame (previously it did, for both the
+        # normal sprite and, during destruction, every animation frame).
+        self._scaled_sprite = None
+        self._scaled_sprite_scale = None
+        self._scaled_destruction_frames = None
+        self._scaled_destruction_scale = None
+
         # Shake effect
         self.is_shaking = False
         self.shake_timer = 0
@@ -311,18 +320,28 @@ class DestructibleStone:
                 base_anim_size = 32
                 anim_render_size = int(base_anim_size * RENDER_SCALE)
 
-                if self.destruction_frame_index < len(self.destruction_frames):
-                    frame = self.destruction_frames[self.destruction_frame_index]
-                    # Scale the 32x32 frame by RENDER_SCALE only
-                    scaled_frame = pygame.transform.scale(frame, (anim_render_size, anim_render_size))
+                # Rebuild the whole scaled set once (or whenever RENDER_SCALE
+                # changes) rather than rescaling one frame every frame of
+                # the destruction animation.
+                if self._scaled_destruction_scale != RENDER_SCALE:
+                    self._scaled_destruction_frames = [
+                        pygame.transform.scale(f, (anim_render_size, anim_render_size))
+                        for f in self.destruction_frames
+                    ]
+                    self._scaled_destruction_scale = RENDER_SCALE
 
-                    # Center the 32x32 animation over the stone's center
-                    sprite_x = int(screen_x - anim_render_size // 2)
-                    sprite_y = int(screen_y - anim_render_size // 2)
-                    screen.blit(scaled_frame, (sprite_x, sprite_y))
+                scaled_frame = self._scaled_destruction_frames[self.destruction_frame_index]
+
+                # Center the 32x32 animation over the stone's center
+                sprite_x = int(screen_x - anim_render_size // 2)
+                sprite_y = int(screen_y - anim_render_size // 2)
+                screen.blit(scaled_frame, (sprite_x, sprite_y))
         else:
-            # Normal render
-            scaled_sprite = pygame.transform.scale(self.sprite, (scaled_width, scaled_height))
+            # Normal render — cached, only rescale when RENDER_SCALE changes
+            if self._scaled_sprite_scale != RENDER_SCALE:
+                self._scaled_sprite = pygame.transform.scale(self.sprite, (scaled_width, scaled_height))
+                self._scaled_sprite_scale = RENDER_SCALE
+            scaled_sprite = self._scaled_sprite
 
             sprite_x = int(screen_x - scaled_width // 2)
             sprite_y = int(screen_y - scaled_height // 2)

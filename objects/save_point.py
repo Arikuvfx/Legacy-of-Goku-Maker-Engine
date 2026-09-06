@@ -3,6 +3,18 @@ import os
 from config.settings import RENDER_SCALE
 from core.bitmap_font import BitmapFont
 
+# "Press E" indicator font, cached module-wide instead of rebuilt every
+# frame a player stands near a save point (same fix applied across
+# flying_pad.py/nimbus_cloud.py/room_transition.py/trigger_box.py).
+_INDICATOR_FONT = None
+
+
+def _get_indicator_font():
+    global _INDICATOR_FONT
+    if _INDICATOR_FONT is None:
+        _INDICATOR_FONT = pygame.font.Font(None, 20)
+    return _INDICATOR_FONT
+
 
 class SavePoint:
     """Interactive save point that player can activate"""
@@ -48,6 +60,12 @@ class SavePoint:
         self.sprite = None
         self._load_sprite()
 
+        # Cache of the sprite pre-scaled to a given render_scale, so draw()
+        # only calls pygame.transform.scale() when render_scale changes
+        # instead of on every frame.
+        self._scaled_sprite = None
+        self._scaled_sprite_scale = None
+
     def get_sort_key(self):
         """Used by LayerManager to sort against other world objects."""
         return (self.draw_layer, 0)
@@ -91,10 +109,14 @@ class SavePoint:
 
         # If we have a custom sprite, use it
         if self.sprite:
-            # Scale sprite to appropriate size
+            # Scale sprite to appropriate size (cached — only rescale when
+            # render_scale actually changes, not on every frame)
             scaled_width = int(self.width * render_scale)
             scaled_height = int(self.height * render_scale)
-            scaled_sprite = pygame.transform.scale(self.sprite, (scaled_width, scaled_height))
+            if self._scaled_sprite_scale != render_scale:
+                self._scaled_sprite = pygame.transform.scale(self.sprite, (scaled_width, scaled_height))
+                self._scaled_sprite_scale = render_scale
+            scaled_sprite = self._scaled_sprite
 
             # Draw the sprite
             sprite_rect = scaled_sprite.get_rect(
@@ -130,7 +152,7 @@ class SavePoint:
         if self.is_player_nearby:
             indicator_y = screen_y - (self.height * render_scale) - 10
             indicator_text = "Press E"
-            font = pygame.font.Font(None, 20)
+            font = _get_indicator_font()
             text_surface = font.render(indicator_text, True, (255, 255, 255))
             text_rect = text_surface.get_rect(center=(screen_x, indicator_y))
 

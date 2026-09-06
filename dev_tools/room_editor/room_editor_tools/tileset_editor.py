@@ -378,6 +378,13 @@ class TilesetEditor:
         self.screen_width = screen_width
         self.screen_height = screen_height
 
+        # Continuous editor zoom (Ctrl+scroll), kept in sync by RoomEditor
+        # each frame. Click/drag placement gets its position pre-converted
+        # by RoomEditor._zoom_adjust_event(), but anything here that reads
+        # the live cursor directly (draw_tile_preview, the Delete/X-at-
+        # cursor shortcut) has to do that conversion itself, using this.
+        self.editor_zoom = 1.0
+
         self.tileset_manager = TilesetManager()
         self.tileset_manager.load_default_tilesets()
 
@@ -471,6 +478,37 @@ class TilesetEditor:
         # removes, or reloads room_tiles).
         self._sorted_tiles_cache: dict[str, List[Tile]] = {}
 
+        # Bumped by _invalidate_sorted_tiles_cache (i.e. on every paint/erase/
+        # reload) so the background-pass frame cache below knows when the
+        # tile data underneath it has actually changed, as opposed to just
+        # being redrawn identically frame after frame.
+        self._tile_content_generation = 0
+
+        # ── Painting-mode background frame cache ────────────────────────────
+        # draw_tiles() re-blends every visible tile every frame — most of them
+        # through get_dimmed_tile_surface(), which is an SRCALPHA surface, so
+        # this is a full per-pixel alpha blend pass every frame even when the
+        # camera hasn't moved and nothing was edited. That's the same cost
+        # profile documented in game.py's blit_room_tiles() PERFORMANCE NOTE,
+        # and the fix is the same one applied there: cache the *blended
+        # result* keyed on everything that could change it, and reuse it with
+        # a plain opaque blit until the key actually changes.
+        #
+        # Restricted to the background pass only, same reasoning as
+        # blit_room_tiles: the foreground pass is interleaved with entities/
+        # decorations that move independently every frame, so a full-screen
+        # snapshot of it would go stale immediately. The background pass is
+        # the first thing drawn each frame, so snapshotting the whole screen
+        # after drawing it is safe.
+        #
+        # Skipped for any frame where an animated tile is actually on
+        # screen (see _has_visible_animated_tile) — those keep ticking
+        # regardless of camera/tile-data staying put. A room can freely
+        # contain animated tiles elsewhere without disabling this; only
+        # what's currently visible matters.
+        self._paint_bg_frame_cache: dict[str, dict] = {}
+        self._animated_tiles_cache: dict[str, List[Tile]] = {}
+
         self.is_dragging = False
         self.is_erasing = False
         self.drag_start_pos = None
@@ -513,8 +551,8 @@ class TilesetEditor:
         rect   = self._panel_toggle_rect()
         bg     = self.colors['button_hover'] if self._hover_panel_toggle else self.colors['button']
         border = self.colors['accent']       if self._hover_panel_toggle else (60, 60, 80)
-        pygame.draw.rect(screen, bg,     rect, border_radius=6)
-        pygame.draw.rect(screen, border, rect, 1, border_radius=6)
+        screen.draw_rect( bg,     rect, border_radius=6)
+        screen.draw_rect( border, rect, 1, border_radius=6)
         arrow = '◀' if self.palette_visible else '▶'
         label = self.font_small.render(
             arrow, True,
@@ -599,7 +637,8 @@ class TilesetEditor:
         """Returns True when the mouse is over the palette panel."""
         if not self.palette_visible:
             return False
-        return mouse_x >= self.palette_x and mouse_y >= self.palette_y
+        return (self.palette_x <= mouse_x < self.palette_x + self.palette_width
+                and self.palette_y <= mouse_y < self.palette_y + self.palette_height)
 
     def _is_in_ui_rect(self, mouse_x: int, mouse_y: int, rect_name: str) -> bool:
         """Returns True when the mouse is inside a named UI rect."""
@@ -733,6 +772,7 @@ class TilesetEditor:
 
             elif event.key == pygame.K_DELETE or event.key == pygame.K_x:
                 mouse_x, mouse_y = pygame.mouse.get_pos()
+                mouse_x, mouse_y = mouse_x / self.editor_zoom, mouse_y / self.editor_zoom
                 world_x = (mouse_x + camera_x) // RENDER_SCALE
                 world_y = (mouse_y + camera_y) // RENDER_SCALE
                 self._delete_tile_at_position(world_x, world_y, current_room_name)
@@ -800,8 +840,17 @@ class TilesetEditor:
                         max_scroll_y = max(0, tileset.rows * self.grid_cell_size - self.palette_content_height)
                         self.palette_scroll_y = min(max_scroll_y, self.palette_scroll_y + self.grid_cell_size)
 
+            # Gate on the real screen position, not (mouse_x, mouse_y) — those
+            # may already be zoom/room-space coordinates rewritten upstream by
+            # room_editor._zoom_adjust_event (continuous zoom, or the
+            # fit-to-room overview), and palette_x/palette_y are fixed screen
+            # constants. Checking the rewritten coords against them makes
+            # every off-palette click in a room bigger than the screen look
+            # like it landed on the palette once zoomed out far enough.
+            real_x, real_y = pygame.mouse.get_pos()
+
             if event.button == 1:
-                if self._is_in_palette(mouse_x, mouse_y):
+                if self._is_in_palette(real_x, real_y):
                     self._handle_palette_click(mouse_x, mouse_y, ctrl_pressed)
                     self.is_palette_dragging = True
                 else:
@@ -812,7 +861,7 @@ class TilesetEditor:
                     self._place_tiles(world_x, world_y, current_room_name)
 
             elif event.button == 3:
-                if not self._is_in_palette(mouse_x, mouse_y):
+                if not self._is_in_palette(real_x, real_y):
                     self.is_erasing = True
                     world_x = (mouse_x + camera_x) // RENDER_SCALE
                     world_y = (mouse_y + camera_y) // RENDER_SCALE
@@ -829,19 +878,22 @@ class TilesetEditor:
                 self._last_stroke_cell = None
 
         elif event.type == pygame.MOUSEMOTION:
-            if self.is_dragging and not self._is_in_palette(event.pos[0], event.pos[1]):
+            # Same real-screen-position gating as MOUSEBUTTONDOWN above —
+            # event.pos here may already be zoom/room-space.
+            real_x, real_y = pygame.mouse.get_pos()
+            if self.is_dragging and not self._is_in_palette(real_x, real_y):
                 mouse_x, mouse_y = event.pos
                 world_x = (mouse_x + camera_x) // RENDER_SCALE
                 world_y = (mouse_y + camera_y) // RENDER_SCALE
                 self._place_tiles(world_x, world_y, current_room_name)
-            elif self.is_erasing and not self._is_in_palette(event.pos[0], event.pos[1]):
+            elif self.is_erasing and not self._is_in_palette(real_x, real_y):
                 mouse_x, mouse_y = event.pos
                 world_x = (mouse_x + camera_x) // RENDER_SCALE
                 world_y = (mouse_y + camera_y) // RENDER_SCALE
                 self._delete_tile_at_position(world_x, world_y, current_room_name)
             elif self.is_palette_dragging:
                 mouse_x, mouse_y = event.pos
-                if self._is_in_palette(mouse_x, mouse_y):
+                if self._is_in_palette(real_x, real_y):
                     self._handle_palette_drag(mouse_x, mouse_y)
 
     def _palette_to_tile_coords(self, mouse_x: int, mouse_y: int):
@@ -857,7 +909,7 @@ class TilesetEditor:
         if rel_x < 0 or rel_y < 0:
             return None
 
-        return rel_x // self.grid_cell_size, rel_y // self.grid_cell_size
+        return int(rel_x // self.grid_cell_size), int(rel_y // self.grid_cell_size)
 
     def _handle_palette_click(self, mouse_x: int, mouse_y: int, ctrl_pressed: bool):
         """Select a tile (or keep the anchor point when Ctrl is held) from a palette click."""
@@ -1108,6 +1160,7 @@ class TilesetEditor:
         if not tileset:
             return
 
+        mouse_x, mouse_y = mouse_x / self.editor_zoom, mouse_y / self.editor_zoom
         world_x = (mouse_x + camera_x) // RENDER_SCALE
         world_y = (mouse_y + camera_y) // RENDER_SCALE
         grid_x, grid_y = self._snap_anchor(world_x, world_y)
@@ -1144,13 +1197,19 @@ class TilesetEditor:
                 screen.blit(preview_surface, (screen_x, screen_y))
 
                 # Accent border so it reads clearly over any background
-                pygame.draw.rect(screen, self.colors['accent'],
+                screen.draw_rect( self.colors['accent'],
                                  (screen_x, screen_y, scaled_width, scaled_height), 2)
 
     def _invalidate_sorted_tiles_cache(self, room_name: str):
         """Drop the cached layer-sorted tile order for a room. Call this
         anywhere room_tiles[room_name] is reassigned or appended to."""
         self._sorted_tiles_cache.pop(room_name, None)
+        self._animated_tiles_cache.pop(room_name, None)
+        # Any edit invalidates the painting-mode background frame cache too —
+        # bumping the generation is enough to miss the cache key everywhere
+        # it's checked, without having to also track room_name here.
+        self._tile_content_generation += 1
+        self._paint_bg_frame_cache.pop(room_name, None)
 
     def _get_sorted_tiles(self, room_name: str) -> List[Tile]:
         """Layer-sorted view of room_tiles[room_name], cached across frames.
@@ -1164,6 +1223,23 @@ class TilesetEditor:
             self._sorted_tiles_cache[room_name] = cached
         return cached
 
+    def _get_animated_tiles(self, room_name: str) -> List[Tile]:
+        """The (usually small) subset of placed tiles in this room that are
+        animated, cached alongside the sorted-tiles cache.
+
+        Used to cheaply check whether *any* animated tile is currently on
+        screen, without re-scanning the whole tile list every frame.
+        """
+        cached = self._animated_tiles_cache.get(room_name)
+        if cached is None:
+            cached = []
+            for tile in self.room_tiles.get(room_name, []):
+                tileset = self.tileset_manager.get_tileset(tile.tileset_name)
+                if tileset and tileset.is_tile_animated(tile.tile_x, tile.tile_y):
+                    cached.append(tile)
+            self._animated_tiles_cache[room_name] = cached
+        return cached
+
     def draw_tiles(self, screen: pygame.Surface, camera_x: int, camera_y: int,
                    room_name: str, layer: str = 'background'):
         """Draw all tiles for a room at the specified rendering pass ('background' or 'foreground').
@@ -1174,10 +1250,58 @@ class TilesetEditor:
         drawn at full opacity; every other layer is always dimmed, so surrounding layers stay
         visible as context without obscuring what's being edited. Uses the tileset's
         scaled/dimmed surface caches to avoid per-frame transform.scale() calls.
+
+        The background pass splits static tiles from animated ones. Static
+        tiles are baked into a cached composite (see _paint_bg_frame_cache)
+        and reused with a single opaque blit as long as the camera, layer
+        selection, hidden-layer set, and tile data haven't changed — no
+        per-pixel alpha blending on frames where nothing moved. Animated
+        tiles are deliberately excluded from that composite (their frame
+        advances independently of all of that) and are instead redrawn
+        individually on top every frame — but that's normally a small
+        fraction of the room's tiles, so the per-frame cost scales with how
+        many animated tiles exist, not with total tile count.
         """
         if room_name not in self.room_tiles:
             return
 
+        if layer == 'background':
+            cache_key = (
+                camera_x, camera_y, self.screen_width, self.screen_height,
+                self.current_layer, frozenset(self.hidden_layers),
+                self._tile_content_generation,
+            )
+            cached = self._paint_bg_frame_cache.get(room_name)
+            if cached is not None and cached['key'] == cache_key \
+                    and cached['surface'].get_size() == screen.get_size():
+                screen.blit(cached['surface'], (0, 0))
+            else:
+                self._draw_tiles_pass(screen, camera_x, camera_y, room_name, layer,
+                                       skip_animated=True)
+                # A GPUScreen has no software framebuffer to snapshot. Do not
+                # read GPU pixels back to the CPU just to populate this cache:
+                # that would erase the performance benefit of GPU zooming.
+                if hasattr(screen, 'copy'):
+                    snapshot = screen.copy()
+                    self._paint_bg_frame_cache[room_name] = {
+                        'key': cache_key,
+                        'surface': snapshot,
+                    }
+
+            self._draw_animated_tiles_pass(screen, camera_x, camera_y, room_name, layer)
+            return
+
+        self._draw_tiles_pass(screen, camera_x, camera_y, room_name, layer)
+
+    def _draw_tiles_pass(self, screen: pygame.Surface, camera_x: int, camera_y: int,
+                          room_name: str, layer: str, skip_animated: bool = False):
+        """Do the actual per-tile draw loop for one pass.
+
+        Called directly for the foreground pass (never frame-cached — see
+        draw_tiles) and for the background pass on a cache miss, where
+        skip_animated=True leaves animated tiles out of the composite being
+        baked (see _draw_animated_tiles_pass, which draws them separately).
+        """
         tick_ms = pygame.time.get_ticks()
 
         # If the currently-selected layer is itself hidden, there's no visible
@@ -1202,34 +1326,70 @@ class TilesetEditor:
             if not tileset:
                 continue
 
-            screen_x = (tile.x * RENDER_SCALE) - camera_x
-            screen_y = (tile.y * RENDER_SCALE) - camera_y
-
-            scaled_width = tileset.tile_width * RENDER_SCALE
-            scaled_height = tileset.tile_height * RENDER_SCALE
-
-            # Skip tiles that are entirely off-screen
-            if not (-scaled_width <= screen_x <= self.screen_width and
-                    -scaled_height <= screen_y <= self.screen_height):
+            if skip_animated and tileset.is_tile_animated(tile.tile_x, tile.tile_y):
                 continue
 
-            # Resolve to the current animation frame (no-op for static tiles)
-            disp_x, disp_y = tileset.get_animated_coords(tile.tile_x, tile.tile_y, tick_ms)
+            self._draw_single_tile(screen, tile, tileset, camera_x, camera_y,
+                                    tick_ms, active_layer_is_visible)
 
-            # Active layer stays full-strength; every other layer is dimmed —
-            # but only while the active layer itself is actually visible.
-            # Using a cached, pre-alpha'd surface so this costs nothing extra per frame.
-            if active_layer_is_visible and tile.layer != self.current_layer:
-                draw_surface = tileset.get_dimmed_tile_surface(
-                    disp_x, disp_y, RENDER_SCALE, self.INACTIVE_LAYER_ALPHA
-                )
-            else:
-                draw_surface = tileset.get_scaled_tile_surface(disp_x, disp_y, RENDER_SCALE)
+    def _draw_animated_tiles_pass(self, screen: pygame.Surface, camera_x: int, camera_y: int,
+                                   room_name: str, layer: str):
+        """Redraw just the room's animated tiles for one pass — the
+        counterpart to skip_animated in _draw_tiles_pass. Iterates the
+        (usually short) _get_animated_tiles list instead of every tile in
+        the room, so this stays cheap regardless of total tile count."""
+        tick_ms = pygame.time.get_ticks()
+        active_layer_is_visible = self.current_layer not in self.hidden_layers
 
-            if not draw_surface:
+        for tile in self._get_animated_tiles(room_name):
+            if tile.layer in self.hidden_layers:
+                continue
+            if layer == 'background' and tile.layer >= 0:
+                continue
+            if layer == 'foreground' and tile.layer < 0:
                 continue
 
-            screen.blit(draw_surface, (int(screen_x), int(screen_y)))
+            tileset = self.tileset_manager.get_tileset(tile.tileset_name)
+            if not tileset:
+                continue
+
+            self._draw_single_tile(screen, tile, tileset, camera_x, camera_y,
+                                    tick_ms, active_layer_is_visible)
+
+    def _draw_single_tile(self, screen: pygame.Surface, tile: Tile, tileset: 'Tileset',
+                           camera_x: int, camera_y: int, tick_ms: int,
+                           active_layer_is_visible: bool):
+        """Shared per-tile draw logic used by both _draw_tiles_pass and
+        _draw_animated_tiles_pass, so the two draw loops can't drift apart
+        on positioning, culling, or dimming behavior."""
+        screen_x = (tile.x * RENDER_SCALE) - camera_x
+        screen_y = (tile.y * RENDER_SCALE) - camera_y
+
+        scaled_width = tileset.tile_width * RENDER_SCALE
+        scaled_height = tileset.tile_height * RENDER_SCALE
+
+        # Skip tiles that are entirely off-screen
+        if not (-scaled_width <= screen_x <= self.screen_width and
+                -scaled_height <= screen_y <= self.screen_height):
+            return
+
+        # Resolve to the current animation frame (no-op for static tiles)
+        disp_x, disp_y = tileset.get_animated_coords(tile.tile_x, tile.tile_y, tick_ms)
+
+        # Active layer stays full-strength; every other layer is dimmed —
+        # but only while the active layer itself is actually visible.
+        # Using a cached, pre-alpha'd surface so this costs nothing extra per frame.
+        if active_layer_is_visible and tile.layer != self.current_layer:
+            draw_surface = tileset.get_dimmed_tile_surface(
+                disp_x, disp_y, RENDER_SCALE, self.INACTIVE_LAYER_ALPHA
+            )
+        else:
+            draw_surface = tileset.get_scaled_tile_surface(disp_x, disp_y, RENDER_SCALE)
+
+        if not draw_surface:
+            return
+
+        screen.blit(draw_surface, (int(screen_x), int(screen_y)))
 
     def draw_palette(self, screen: pygame.Surface):
         """Draw the tileset palette UI with layer controls"""
@@ -1258,7 +1418,7 @@ class TilesetEditor:
         palette_bg = pygame.Surface((self.palette_width, palette_height), pygame.SRCALPHA)
         palette_bg.fill((*self.colors['bg'], 230))
         screen.blit(palette_bg, (self.palette_x, self.palette_y))
-        pygame.draw.rect(screen, self.colors['accent'], palette_rect, 2)
+        screen.draw_rect( self.colors['accent'], palette_rect, 2)
 
         # Title
         title_text = self.font_medium.render(f"Tileset: {tileset.name}", True, self.colors['text'])
@@ -1291,12 +1451,12 @@ class TilesetEditor:
             # Draw grid overlay
             for row in range(tileset.rows + 1):
                 y = draw_y + row * self.grid_cell_size
-                pygame.draw.line(screen, self.colors['grid_dim'][:3],
+                screen.draw_line( self.colors['grid_dim'][:3],
                                  (draw_x, y), (draw_x + scaled_width, y), 1)
 
             for col in range(tileset.cols + 1):
                 x = draw_x + col * self.grid_cell_size
-                pygame.draw.line(screen, self.colors['grid_dim'][:3],
+                screen.draw_line( self.colors['grid_dim'][:3],
                                  (x, draw_y), (x, draw_y + scaled_height), 1)
 
             # Mark animated anchor tiles with a small badge so they're
@@ -1306,8 +1466,8 @@ class TilesetEditor:
                     continue
                 badge_x = draw_x + anim_tx * self.grid_cell_size + self.grid_cell_size - 9
                 badge_y = draw_y + anim_ty * self.grid_cell_size + 2
-                pygame.draw.circle(screen, self.colors['accent'], (badge_x, badge_y), 5)
-                pygame.draw.circle(screen, (20, 20, 30), (badge_x, badge_y), 5, 1)
+                screen.draw_circle( self.colors['accent'], (badge_x, badge_y), 5)
+                screen.draw_circle( (20, 20, 30), (badge_x, badge_y), 5, 1)
 
             # Draw selection rectangle
             min_x, max_x, min_y, max_y = self._get_selection_bounds()
@@ -1324,7 +1484,7 @@ class TilesetEditor:
             screen.blit(sel_surf, (sel_x, sel_y))
 
             # Selection border
-            pygame.draw.rect(screen, self.colors['accent'],
+            screen.draw_rect( self.colors['accent'],
                              (sel_x, sel_y, sel_w, sel_h), 3)
 
         screen.set_clip(None)
@@ -1371,15 +1531,15 @@ class TilesetEditor:
         checkbox_rect = pygame.Rect(checkbox_x, checkbox_y, checkbox_size, checkbox_size)
         self.ui_rects['delete_checkbox'] = checkbox_rect
 
-        pygame.draw.rect(screen, self.colors['checkbox'], checkbox_rect)
-        pygame.draw.rect(screen, self.colors['accent'], checkbox_rect, 1)
+        screen.draw_rect( self.colors['checkbox'], checkbox_rect)
+        screen.draw_rect( self.colors['accent'], checkbox_rect, 1)
 
         if self.delete_underlying:
             # Draw checkmark
-            pygame.draw.line(screen, self.colors['success'],
+            screen.draw_line( self.colors['success'],
                              (checkbox_x + 3, checkbox_y + 9),
                              (checkbox_x + 7, checkbox_y + 13), 2)
-            pygame.draw.line(screen, self.colors['success'],
+            screen.draw_line( self.colors['success'],
                              (checkbox_x + 7, checkbox_y + 13),
                              (checkbox_x + 15, checkbox_y + 5), 2)
 
@@ -1394,15 +1554,15 @@ class TilesetEditor:
         hide_checkbox_rect = pygame.Rect(hide_checkbox_x, hide_checkbox_y, checkbox_size, checkbox_size)
         self.ui_rects['hide_layer_checkbox'] = hide_checkbox_rect
 
-        pygame.draw.rect(screen, self.colors['checkbox'], hide_checkbox_rect)
-        pygame.draw.rect(screen, self.colors['accent'], hide_checkbox_rect, 1)
+        screen.draw_rect( self.colors['checkbox'], hide_checkbox_rect)
+        screen.draw_rect( self.colors['accent'], hide_checkbox_rect, 1)
 
         if self.current_layer in self.hidden_layers:
             # Draw checkmark
-            pygame.draw.line(screen, self.colors['success'],
+            screen.draw_line( self.colors['success'],
                              (hide_checkbox_x + 3, hide_checkbox_y + 9),
                              (hide_checkbox_x + 7, hide_checkbox_y + 13), 2)
-            pygame.draw.line(screen, self.colors['success'],
+            screen.draw_line( self.colors['success'],
                              (hide_checkbox_x + 7, hide_checkbox_y + 13),
                              (hide_checkbox_x + 15, hide_checkbox_y + 5), 2)
 
@@ -1422,8 +1582,8 @@ class TilesetEditor:
 
         self.ui_rects['layer_dropdown'] = pygame.Rect(dropdown_x, dropdown_y, dropdown_width, dropdown_height)
 
-        pygame.draw.rect(screen, self.colors['button'], self.ui_rects['layer_dropdown'])
-        pygame.draw.rect(screen, self.colors['accent'], self.ui_rects['layer_dropdown'], 1)
+        screen.draw_rect( self.colors['button'], self.ui_rects['layer_dropdown'])
+        screen.draw_rect( self.colors['accent'], self.ui_rects['layer_dropdown'], 1)
 
         # Current layer text
         if self.layer_input_active:
@@ -1446,7 +1606,7 @@ class TilesetEditor:
         # Dropdown arrow
         arrow_x = dropdown_x + dropdown_width - 20
         arrow_y = dropdown_y + 14
-        pygame.draw.polygon(screen, self.colors['text'], [
+        screen.draw_polygon( self.colors['text'], [
             (arrow_x, arrow_y - 4),
             (arrow_x + 8, arrow_y - 4),
             (arrow_x + 4, arrow_y + 2)
@@ -1462,11 +1622,11 @@ class TilesetEditor:
                 # Highlight hovered option
                 mouse_pos = pygame.mouse.get_pos()
                 if option_rect.collidepoint(mouse_pos):
-                    pygame.draw.rect(screen, self.colors['button_hover'], option_rect)
+                    screen.draw_rect( self.colors['button_hover'], option_rect)
                 else:
-                    pygame.draw.rect(screen, self.colors['button'], option_rect)
+                    screen.draw_rect( self.colors['button'], option_rect)
 
-                pygame.draw.rect(screen, self.colors['accent'], option_rect, 1)
+                screen.draw_rect( self.colors['accent'], option_rect, 1)
 
                 display_text = name if value is None else f"{name} ({value})"
                 option_text = self.font_small.render(display_text, True, self.colors['text'])
@@ -1516,7 +1676,7 @@ class TilesetEditor:
         for x in range(start_x, visible_x_end + step, step):
             screen_x = (x * RENDER_SCALE) - camera_x
             if -10 <= screen_x <= self.screen_width + 10:
-                pygame.draw.line(screen, self.colors['grid'][:3],
+                screen.draw_line( self.colors['grid'][:3],
                                  (int(screen_x), 0), (int(screen_x), self.screen_height), 1)
 
         # Draw horizontal lines
@@ -1524,7 +1684,7 @@ class TilesetEditor:
         for y in range(start_y, visible_y_end + step, step):
             screen_y = (y * RENDER_SCALE) - camera_y
             if -10 <= screen_y <= self.screen_height + 10:
-                pygame.draw.line(screen, self.colors['grid'][:3],
+                screen.draw_line( self.colors['grid'][:3],
                                  (0, int(screen_y)), (self.screen_width, int(screen_y)), 1)
 
     def save_room_tiles(self, room_name: str, filepath: str):

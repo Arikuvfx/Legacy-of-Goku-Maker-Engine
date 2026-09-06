@@ -4,6 +4,20 @@ from config.settings import RENDER_SCALE
 from core.draw_layers import LayeredDrawMixin, DrawLayer
 from objects.flying_pad import FlyingPadWaypoint
 
+# See flying_pad.py's identical _FONT_CACHE/_get_font — constructing a
+# pygame.font.Font every waypoint every frame (as draw_path_preview() used
+# to) re-parses the font file each time, which is far pricier than just
+# rendering text with a Font you already have.
+_FONT_CACHE = {}
+
+
+def _get_font(size):
+    font = _FONT_CACHE.get(size)
+    if font is None:
+        font = pygame.font.Font(None, size)
+        _FONT_CACHE[size] = font
+    return font
+
 
 class NimbusCloudWaypoint(FlyingPadWaypoint):
     """
@@ -120,6 +134,12 @@ class NimbusCloud(LayeredDrawMixin):
         # Sprite
         self.sprite = None
         self._load_sprite()
+
+        # Cache of the sprite pre-scaled to a given render_scale — see
+        # FlyingPad's identical cache for why (avoids rescaling from the
+        # source sprite every frame).
+        self._scaled_sprite = None
+        self._scaled_sprite_scale = None
 
     def _load_sprite(self):
         """Load the nimbus cloud sprite.
@@ -278,7 +298,10 @@ class NimbusCloud(LayeredDrawMixin):
         if self.sprite:
             scaled_width = self.width * render_scale
             scaled_height = self.height * render_scale
-            scaled_sprite = pygame.transform.scale(self.sprite, (scaled_width, scaled_height))
+            if self._scaled_sprite_scale != render_scale:
+                self._scaled_sprite = pygame.transform.scale(self.sprite, (scaled_width, scaled_height))
+                self._scaled_sprite_scale = render_scale
+            scaled_sprite = self._scaled_sprite
 
             sprite_x = int(screen_x - scaled_width // 2)
             sprite_y = int(screen_y - scaled_height // 2)
@@ -327,7 +350,7 @@ class NimbusCloud(LayeredDrawMixin):
                 pygame.draw.circle(screen, (0, 0, 0), (int(x), int(y)), 8, 2)
 
                 if wp.target_room:
-                    font = pygame.font.Font(None, 16)
+                    font = _get_font(16)
                     text = font.render(wp.target_room, True, (255, 255, 255))
                     text_rect = text.get_rect(center=(x, y - 15))
 
@@ -347,7 +370,7 @@ class NimbusCloud(LayeredDrawMixin):
 
                     pygame.draw.line(screen, (180, 200, 180), (int(x), int(y)), (int(spawn_x), int(spawn_y)), 1)
 
-                    font_small = pygame.font.Font(None, 16)
+                    font_small = _get_font(16)
                     spawn_label = font_small.render("Spawn", True, (255, 255, 255))
                     spawn_rect = spawn_label.get_rect(center=(spawn_x, spawn_y + 15))
 
@@ -361,12 +384,12 @@ class NimbusCloud(LayeredDrawMixin):
                 pygame.draw.circle(screen, wp_color, (int(x), int(y)), 6)
                 pygame.draw.circle(screen, (0, 0, 0), (int(x), int(y)), 6, 2)
 
-            font = pygame.font.Font(None, 14)
+            font = _get_font(14)
             num_text = font.render(str(i + 1), True, (255, 255, 255))
             num_rect = num_text.get_rect(center=(x, y))
             screen.blit(num_text, num_rect)
 
-        font = pygame.font.Font(None, 18)
+        font = _get_font(18)
         if self.is_return_pad:
             type_text = f"RETURN → {self.source_room}" if self.source_room else "RETURN CLOUD (No source set!)"
         else:

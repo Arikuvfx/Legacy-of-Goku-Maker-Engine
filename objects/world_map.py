@@ -105,6 +105,12 @@ class WorldMapObject:
         self.sprite = None
         self._load_sprite()
 
+        # Cached RENDER_SCALE-scaled copy of self.sprite, shared by draw()
+        # and _draw_sign() — built lazily and only rebuilt if RENDER_SCALE
+        # changes, instead of rescaling the source sprite every frame.
+        self._scaled_sprite = None
+        self._scaled_sprite_scale = None
+
     def get_sort_key(self):
         y = self.y if self.y_sort else 0
         return (self.draw_layer, y)
@@ -176,6 +182,14 @@ class WorldMapObject:
     def update(self, dt, player=None):
         pass
 
+    def _get_scaled_sprite(self, w, h):
+        """Cached RENDER_SCALE-sized copy of self.sprite. Shared by draw()
+        and _draw_sign() since a given instance only ever needs one size."""
+        if self._scaled_sprite_scale != (w, h):
+            self._scaled_sprite = pygame.transform.scale(self.sprite, (w, h))
+            self._scaled_sprite_scale = (w, h)
+        return self._scaled_sprite
+
     def draw(self, screen, camera, colors):
         sx = int(self.x * RENDER_SCALE - camera.x)
         sy = int(self.y * RENDER_SCALE - camera.y)
@@ -190,7 +204,7 @@ class WorldMapObject:
         w = int(self.width  * RENDER_SCALE)
         h = int(self.height * RENDER_SCALE)
         if self.sprite:
-            scaled = pygame.transform.scale(self.sprite, (w, h))
+            scaled = self._get_scaled_sprite(w, h)
             screen.blit(scaled, scaled.get_rect(center=(sx, sy)))
         else:
             color = (139, 90, 43)
@@ -201,7 +215,7 @@ class WorldMapObject:
         w = int(self.width  * RENDER_SCALE)
         h = int(self.height * RENDER_SCALE)
         if self.sprite:
-            scaled = pygame.transform.scale(self.sprite, (w, h))
+            scaled = self._get_scaled_sprite(w, h)
             screen.blit(scaled, scaled.get_rect(midbottom=(sx, sy)))
         else:
             pygame.draw.rect(screen, (101, 67, 33),

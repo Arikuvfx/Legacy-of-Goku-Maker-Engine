@@ -165,16 +165,22 @@ class EncasementOverlay:
                     self.finished = True
 
     def draw(self, screen, x, y, camera, render_scale):
+        """GPU render pass: was re-scaling `frame` with pygame.transform.scale
+        on every single call (no cache -- this ran once per frame of every
+        roll/casing animation playing). blit_scaled() draws the original
+        frame and lets SDL do the stretch at draw time, so that per-call
+        CPU resample is just gone, not cached-and-avoided."""
         frames = self._current_frames()
         if not frames:
             return
         frame = frames[self.frame_index % len(frames)]
         size = frame.get_width()
-        scaled = pygame.transform.scale(frame, (int(size * render_scale), int(size * render_scale)))
+        scaled_size = int(size * render_scale)
         screen_x = (x * render_scale) - camera.x
         screen_y = (y * render_scale) - camera.y
-        rect = scaled.get_rect(center=(screen_x, screen_y))
-        screen.blit(scaled, rect)
+        dest_rect = pygame.Rect(0, 0, scaled_size, scaled_size)
+        dest_rect.center = (screen_x, screen_y)
+        screen.blit_scaled(frame, dest_rect)
 
 
 class Enemy:
@@ -3150,7 +3156,14 @@ class Enemy:
     # =========================================================================
 
     def draw(self, screen, camera, colors):
-        """Draw the enemy sprite (or a debug placeholder rect) plus the HP bar."""
+        """Draw the enemy sprite (or a debug placeholder rect) plus the HP bar.
+
+        NOTE (GPU render pass): self.sprite.draw(...) below delegates to
+        core/sprite_system.py (shared with player/NPC), not converted yet.
+        Everything else in this method drew directly and is converted:
+        pygame.transform.scale+blit -> blit_scaled (no cache needed, GPU
+        stretches at draw time), pygame.draw.rect -> screen.draw_rect.
+        """
         if not self.active:
             return
 
@@ -3160,10 +3173,11 @@ class Enemy:
                 base_size = 32
                 render_size = int(base_size * RENDER_SCALE)
                 frame = self.death_frames[self.death_frame_index]
-                scaled_frame = pygame.transform.scale(frame, (render_size, render_size))
                 screen_x = int((self.x * RENDER_SCALE) - camera.x)
                 screen_y = int((self.y * RENDER_SCALE) - camera.y)
-                screen.blit(scaled_frame, (screen_x - render_size // 2, screen_y - render_size // 2))
+                dest_rect = pygame.Rect(screen_x - render_size // 2, screen_y - render_size // 2,
+                                         render_size, render_size)
+                screen.blit_scaled(frame, dest_rect)
             return
 
         if (self.is_encased or self.is_rolling or self.is_releasing) and self.encasement_overlay:
@@ -3188,7 +3202,7 @@ class Enemy:
 
             sw = self.width * RENDER_SCALE
             sh = self.height * RENDER_SCALE
-            pygame.draw.rect(screen, color, (screen_x - sw // 2, screen_y - sh // 2, sw, sh))
+            screen.draw_rect(color, (screen_x - sw // 2, screen_y - sh // 2, sw, sh))
 
         # brown_destruction.png burst — drawn on top of whatever's above,
         # simultaneously with the ball forming/dissolving (see
@@ -3196,7 +3210,20 @@ class Enemy:
         if self.destruction_effect_active and self.death_frames:
             frame = self.death_frames[self.destruction_effect_frame_index % len(self.death_frames)]
             render_size = int(32 * RENDER_SCALE)
-            scaled = pygame.transform.scale(frame, (render_size, render_size))
             screen_x = int((self.destruction_effect_x * RENDER_SCALE) - camera.x)
             screen_y = int((self.destruction_effect_y * RENDER_SCALE) - camera.y)
-            screen.blit(scaled, (screen_x - render_size // 2, screen_y - render_size // 2))
+            dest_rect = pygame.Rect(screen_x - render_size // 2, screen_y - render_size // 2,
+                                     render_size, render_size)
+            screen.blit_scaled(frame, dest_rect)
+
+
+# ── GPU MIGRATION STATUS (this file) ────────────────────────────────────────
+# Done: EncasementOverlay.draw() (per-frame scale+blit, no cache -- now
+# just a dest-rect blit_scaled call), and Enemy.draw()'s three direct draw
+# sites (death animation frame, debug placeholder rect, destruction burst).
+# Not this file's problem: self.sprite.draw(...) and self.encasement_overlay's
+# own delegation into it aside -- core/sprite_system.py is the shared body-
+# rendering code for player/enemy/NPC and hasn't been converted. That's the
+# next highest-value file: converting it once fixes every character's sprite
+# draw across the whole engine, rather than the one-or-two isolated call
+# sites each of player.py/enemy.py/npc.py had.

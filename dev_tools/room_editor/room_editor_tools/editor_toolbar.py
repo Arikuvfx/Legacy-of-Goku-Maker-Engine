@@ -325,7 +325,7 @@ class EditorToolbar:
             toolbar_bg = pygame.Surface((self.screen_width, self.height), pygame.SRCALPHA)
             toolbar_bg.fill(self.colors['bg_transparent'])
             screen.blit(toolbar_bg, (0, 0))
-            pygame.draw.line(screen, self.colors['accent'],
+            screen.draw_line(self.colors['accent'],
                              (0, self.height), (self.screen_width, self.height), 2)
 
             tool_start_x = self.padding
@@ -409,9 +409,9 @@ class EditorToolbar:
         screen.blit(shadow, (PX - 4, PY - 4))
 
         # Panel body
-        pygame.draw.rect(screen, self.colors['panel'],
+        screen.draw_rect(self.colors['panel'],
                          self._item_panel_rect, border_radius=8)
-        pygame.draw.rect(screen, self.colors['accent'],
+        screen.draw_rect(self.colors['accent'],
                          self._item_panel_rect, 2, border_radius=8)
 
         # Title
@@ -466,8 +466,8 @@ class EditorToolbar:
                         border, bw = self.colors['panel_border'], 1
 
                     cell_bg = (45, 40, 15) if is_sel else (18, 18, 32)
-                    pygame.draw.rect(screen, cell_bg, cell, border_radius=4)
-                    pygame.draw.rect(screen, border, cell, bw, border_radius=4)
+                    screen.draw_rect(cell_bg, cell, border_radius=4)
+                    screen.draw_rect(border, cell, bw, border_radius=4)
 
                     icon = self._load_item_icon(item_id, category)
                     if icon:
@@ -509,13 +509,12 @@ class EditorToolbar:
                 dot_y  = grid_rect.top + int(grid_rect.height * d / max(1, n - 1))
                 ratio  = self._item_scroll / max(1, max_scroll)
                 active = abs(d / max(1, n - 1) - ratio) < 0.15
-                pygame.gfxdraw.filled_circle(
-                    screen, dot_x, dot_y, 3,
+                screen.filled_circle(dot_x, dot_y, 3,
                     self.colors['accent'] if active else self.colors['panel_border'])
 
         # ── Hovered item description strip ──────────────────────────────────
         desc_rect = pygame.Rect(PX + 8, PY + PANEL_H - DESC_H, self.ITEM_PANEL_W - 16, DESC_H - 6)
-        pygame.draw.line(screen, self.colors['panel_border'],
+        screen.draw_line(self.colors['panel_border'],
                          (PX + 8, desc_rect.top - 4), (PX + self.ITEM_PANEL_W - 8, desc_rect.top - 4))
 
         if self._item_hover:
@@ -558,8 +557,8 @@ class EditorToolbar:
             bdr_col = self.colors['accent']
             bdr_w   = max(bdr_w, 2)
 
-        pygame.draw.rect(screen, bg_col, button_rect, border_radius=8)
-        pygame.draw.rect(screen, bdr_col, button_rect, bdr_w, border_radius=8)
+        screen.draw_rect(bg_col, button_rect, border_radius=8)
+        screen.draw_rect(bdr_col, button_rect, bdr_w, border_radius=8)
 
         icon = self._get_icon_surface(tool['id'], tool['icon'])
         screen.blit(icon, icon.get_rect(
@@ -588,8 +587,8 @@ class EditorToolbar:
         bdr_col   = action_color if lit else self.colors['tool_border']
         bdr_w     = 3 if is_active else (2 if is_hover else 1)
 
-        pygame.draw.rect(screen, bg_col, button_rect, border_radius=8)
-        pygame.draw.rect(screen, bdr_col, button_rect, bdr_w, border_radius=8)
+        screen.draw_rect(bg_col, button_rect, border_radius=8)
+        screen.draw_rect(bdr_col, button_rect, bdr_w, border_radius=8)
 
         icon = self._get_icon_surface(action['id'], action['icon'])
         screen.blit(icon, icon.get_rect(
@@ -608,8 +607,8 @@ class EditorToolbar:
         tip_x  = max(5, min(mouse_x - tip_w // 2, self.screen_width - tip_w - 5))
         tip_y  = self.height + 10
         tip_r  = pygame.Rect(tip_x, tip_y, tip_w, tip_h)
-        pygame.draw.rect(screen, self.colors['bg'],     tip_r, border_radius=5)
-        pygame.draw.rect(screen, self.colors['accent'], tip_r, 1, border_radius=5)
+        screen.draw_rect(self.colors['bg'],     tip_r, border_radius=5)
+        screen.draw_rect(self.colors['accent'], tip_r, 1, border_radius=5)
         screen.blit(tip_s, tip_s.get_rect(center=tip_r.center))
 
     def _toggle_rect(self):
@@ -621,8 +620,8 @@ class EditorToolbar:
         rect   = self._toggle_rect()
         bg     = self.colors['tool_hover'] if self.hover_toggle else self.colors['tool_bg']
         border = self.colors['accent']     if self.hover_toggle else self.colors['tool_border']
-        pygame.draw.rect(screen, bg, rect, border_radius=6)
-        pygame.draw.rect(screen, border, rect, 1, border_radius=6)
+        screen.draw_rect(bg, rect, border_radius=6)
+        screen.draw_rect(border, rect, 1, border_radius=6)
         arrow = '▲' if self.visible else '▼'
         lbl   = self.font_small.render(
             f'{arrow} Toolbar', True,
