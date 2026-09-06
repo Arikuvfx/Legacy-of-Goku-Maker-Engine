@@ -4,7 +4,7 @@ This is a WIP LOG Series Maker Engine with the goal to have an easy engine to us
 Version 0.2.6 - Performance Update
 ```
 Changes/Additions:
-- Major performance improvements by enabling greater GPU usage for the engine
+- major performance improvements by enabling greater GPU usage for the engine
 - faster loading times on heavy rooms
 - item icons above chest size increased
 Major Bugfixes:
