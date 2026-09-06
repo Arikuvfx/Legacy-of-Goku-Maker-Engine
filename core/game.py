@@ -226,9 +226,10 @@ class _LevelUpPlayerSpriteDrawable:
 
 
 # ── Frame-time profiler ──────────────────────────────────────────────────────
-# Diagnostic tool for chasing the drops Ariku's been seeing — NOT meant to
-# ship. Toggle with the PROFILE_FRAMES env var (defaults on); turn off with
-# PROFILE_FRAMES=0 once done, or just flip _PROFILE_FRAMES_ENABLED below.
+# Diagnostic tool for chasing frame drops — NOT meant to ship, and off by
+# default so a normal run doesn't leave a frame_log.csv behind. Opt in with
+# PROFILE_FRAMES=1 (or flip _PROFILE_FRAMES_ENABLED below) when you're
+# actually chasing a stutter.
 #
 # Splits each frame into handle_events / update / draw and logs the three
 # to frame_log.csv, along with a GC-collections-per-generation count for
@@ -241,7 +242,7 @@ class _LevelUpPlayerSpriteDrawable:
 # Any frame at/above SLOW_FRAME_MS (default 33ms, i.e. below ~30fps) also
 # prints straight to the console, so a drop is visible immediately without
 # opening the CSV.
-_PROFILE_FRAMES_ENABLED = os.environ.get('PROFILE_FRAMES', '1') != '0'
+_PROFILE_FRAMES_ENABLED = os.environ.get('PROFILE_FRAMES', '0') != '0'
 _SLOW_FRAME_MS = float(os.environ.get('SLOW_FRAME_MS', '33'))
 
 
