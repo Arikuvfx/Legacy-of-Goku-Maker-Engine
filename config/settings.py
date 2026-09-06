@@ -16,6 +16,17 @@ WORLD_HEIGHT = 1792
 # Tiles are drawn at TILE_SIZE * RENDER_SCALE pixels on screen (48x48 at 3x).
 RENDER_SCALE = 6
 
+# The Mode7 world-map flying scene (game.py's _draw_world_map_flying_scene)
+# hard-codes all of its sprite/HUD/shadow/icon sizes as multiples of a scale
+# factor, tuned by eye back when RENDER_SCALE was 4. That scene's assets and
+# screen resolution don't change with RENDER_SCALE, so it needs its own fixed
+# constant instead of reusing RENDER_SCALE -- otherwise every future
+# RENDER_SCALE tweak (made for the tile-based overworld) silently re-scales
+# and misaligns the whole Mode7 scene. Keep this at 4 unless you deliberately
+# want to re-tune every Mode7 size (sprite scale, shadow, HUD, minimap dot,
+# location icons, blend overlay height) for a new baseline.
+MODE7_SCALE = 4
+
 # ── Palette ───────────────────────────────────────────────────────────────────
 WHITE      = (255, 255, 255)
 BLACK      = (0,   0,   0  )

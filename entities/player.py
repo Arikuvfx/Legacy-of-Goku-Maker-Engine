@@ -4297,8 +4297,15 @@ class Player:
             # copy, so there's nothing left to cache; recomputing `dest_rect`
             # every call is just arithmetic, not a resample.
             frame = self._map_jump_frames[idx]
-            dest_rect = frame.get_rect(center=(sx, sy))
-            dest_rect.width, dest_rect.height = w, h
+            # Build the rect at the SCALED size first, then center it.
+            # Centering a Rect and then reassigning .width/.height (the old
+            # code here) keeps the top-left corner fixed and grows the rect
+            # from there instead of from its center -- with a 6x RENDER_SCALE
+            # jump from the frame's native size, that drifted the visual
+            # center down-right by roughly half the size difference, which
+            # is why the sprite ended up away from its shadow/spawn point.
+            dest_rect = pygame.Rect(0, 0, w, h)
+            dest_rect.center = (sx, sy)
             screen.blit_scaled(frame, dest_rect)
             return
 

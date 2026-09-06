@@ -5748,7 +5748,7 @@ class Game:
         if (not hasattr(self, '_csf_surf') or self._csf_surf.get_size() != (w, h)):
             self._csf_surf = pygame.Surface((w, h), pygame.SRCALPHA)
         self._csf_surf.fill((0, 0, 0, min(255, alpha)))
-        surface.blit(self._csf_surf, (0, 0))
+        surface.blit_transient(self._csf_surf, (0, 0))
 
     def _draw_map_jump_fade(self, surface):
         """Draw the black fade overlay that plays once the player leaves the camera
@@ -5763,7 +5763,7 @@ class Game:
         if not hasattr(self, '_mjf_surf') or self._mjf_surf.get_size() != (w, h):
             self._mjf_surf = pygame.Surface((w, h), pygame.SRCALPHA)
         self._mjf_surf.fill((0, 0, 0, min(255, alpha)))
-        surface.blit(self._mjf_surf, (0, 0))
+        surface.blit_transient(self._mjf_surf, (0, 0))
 
     def _draw_white_flash(self, surface):
         """Draw the brief screen-wide white flash triggered when a genkidama
@@ -5792,7 +5792,7 @@ class Game:
         if not hasattr(self, '_white_flash_surf') or self._white_flash_surf.get_size() != (w, h):
             self._white_flash_surf = pygame.Surface((w, h), pygame.SRCALPHA)
         self._white_flash_surf.fill((255, 255, 255, alpha))
-        surface.blit(self._white_flash_surf, (0, 0))
+        surface.blit_transient(self._white_flash_surf, (0, 0))
 
     def _draw_death_fade(self, surface):
         """Draw the black fade overlay for the post-death sequence.
@@ -5809,7 +5809,7 @@ class Game:
         if not hasattr(self, '_death_fade_surf') or self._death_fade_surf.get_size() != (w, h):
             self._death_fade_surf = pygame.Surface((w, h), pygame.SRCALPHA)
         self._death_fade_surf.fill((0, 0, 0, min(255, alpha)))
-        surface.blit(self._death_fade_surf, (0, 0))
+        surface.blit_transient(self._death_fade_surf, (0, 0))
 
     # ── World-map flying helpers ──────────────────────────────────────────────
 
@@ -6375,6 +6375,17 @@ class Game:
                     self.camera.x = min(self.camera.x, _target_room.width  * RENDER_SCALE - SCREEN_WIDTH)
                     self.camera.y = min(self.camera.y, _target_room.height * RENDER_SCALE - SCREEN_HEIGHT)
                     self.camera.locked = False
+                    # Without this, Camera.update()'s smooth-follow ease (see
+                    # _check_room_transitions' complete_transition() for the
+                    # same fix on ordinary room transitions) would keep
+                    # chasing from wherever the camera was sitting during the
+                    # Mode7 flying scene toward this new spawn position over
+                    # the next several frames -- visible as the camera
+                    # sliding in from off-target right as the landing fade
+                    # clears, instead of already being centred on the player.
+                    # snap() forces the very next camera.update() call to
+                    # position instantly instead of easing.
+                    self.camera.snap()
                     self.player.is_map_jumping  = False
                     self.player.map_jump_moving = False
                     self.player.on_map_jump_exit = None
@@ -7094,7 +7105,7 @@ class Game:
 
         if self._world_map_blend:
             blend_w = sw
-            blend_h = 86 * RENDER_SCALE
+            blend_h = 86 * MODE7_SCALE
             # Cache the scaled+tinted blend — it never changes unless the window is resized.
             _blend_cache_key = (blend_w, blend_h)
             if (not hasattr(self, '_mjf_blend_cached')
@@ -7115,11 +7126,11 @@ class Game:
             # barely shrinks near the ground, then shrinks faster as altitude
             # climbs toward the top.
             _sprite_zoom_alt = altitude ** 0.6
-            sprite_scale = RENDER_SCALE * (3.0 - 2.3 * _sprite_zoom_alt)
+            sprite_scale = MODE7_SCALE * (3.0 - 2.3 * _sprite_zoom_alt)
             w = int(frame.get_width() * sprite_scale)
             h = int(frame.get_height() * sprite_scale)
 
-            base_scale = RENDER_SCALE * 3.0
+            base_scale = MODE7_SCALE * 3.0
             base_h = int(frame.get_height() * base_scale)
 
             # Pixel-measured from Buu's Fury reference: the sprite barely moves
@@ -7142,7 +7153,7 @@ class Game:
             # Row definitions extracted pixel-by-pixel from the Buu's Fury
             # reference sprites (white = transparent, black = opaque).
             # Shapes are indexed 0 (lowest altitude) → 10 (highest altitude).
-            # All sizes are in GBA native pixels; multiply by RENDER_SCALE for
+            # All sizes are in GBA native pixels; multiply by MODE7_SCALE for
             # logical-surface coordinates.  Drawn as plain black rects – no
             # surfaces, no blending, no ellipses.
             _SHADOW_SHAPES = (
@@ -7173,7 +7184,7 @@ class Game:
             )
             _idx = min(11, int(altitude * 12))
             _tw, _th, _rows = _SHADOW_SHAPES[_idx]
-            RS = RENDER_SCALE
+            RS = MODE7_SCALE
             # Top-left corner of shadow bounding box
             _sx = shadow_x - (_tw * RS) // 2
             _sy = shadow_ground_y - (_th * RS) // 2
@@ -7192,8 +7203,8 @@ class Game:
             # discrete affine-matrix scaling the GBA hardware produced.
             # _STEPS controls how coarsely the size quantises — lower = chunkier.
             _STEPS = 1.5
-            _native_w = max(1, round(w / RENDER_SCALE / _STEPS) * _STEPS // _STEPS)
-            _native_h = max(1, round(h / RENDER_SCALE / _STEPS) * _STEPS // _STEPS)
+            _native_w = max(1, round(w / MODE7_SCALE / _STEPS) * _STEPS // _STEPS)
+            _native_h = max(1, round(h / MODE7_SCALE / _STEPS) * _STEPS // _STEPS)
             _small = pygame.transform.scale(frame, (_native_w, _native_h))
             _mjf_scaled = pygame.transform.scale(_small, (w, h))
             _mjf_rect   = _mjf_scaled.get_rect(center=(int(self._mjf_fly_x), int(sprite_y)))
@@ -7209,7 +7220,7 @@ class Game:
 
         # ── Mini-map HUD (top-right corner) ──────────────────────────────────
         # ── Size control: change _HUD_SCALE to make both sprites bigger/smaller.
-        _HUD_SCALE = RENDER_SCALE * 1.5   # e.g. RENDER_SCALE*2 for double size
+        _HUD_SCALE = MODE7_SCALE * 1.5   # e.g. MODE7_SCALE*2 for double size
         if not hasattr(self, '_world_map_hud'):
             try:
                 _raw_hud = pygame.image.load('assets/map/world_map_hud.png').convert_alpha()
@@ -7241,8 +7252,8 @@ class Game:
             _hud   = self._world_map_hud
             _hud_w = _hud.get_width()
             _hud_h = _hud.get_height()
-            _hud_x = sw - _hud_w - 8 * RENDER_SCALE
-            _hud_y = 8 * RENDER_SCALE
+            _hud_x = sw - _hud_w - 8 * MODE7_SCALE
+            _hud_y = 8 * MODE7_SCALE
             self.logical_surface.blit(_hud, (_hud_x, _hud_y),
                                       special_flags=pygame.BLEND_ADD)
 
@@ -7277,9 +7288,9 @@ class Game:
                         _arrow_rot, _arrow_rot.get_rect(center=(_dot_x, _dot_y)))
                 else:
                     self.logical_surface.draw_circle(
-                        (255, 255, 80), (_dot_x, _dot_y), RENDER_SCALE + 1)
+                        (255, 255, 80), (_dot_x, _dot_y), MODE7_SCALE + 1)
                     self.logical_surface.draw_circle(
-                        (255, 50, 50),  (_dot_x, _dot_y), RENDER_SCALE)
+                        (255, 50, 50),  (_dot_x, _dot_y), MODE7_SCALE)
 
                 # ── Location markers on minimap ────────────────────────────────
                 if not hasattr(self, '_world_map_loc_sprite'):
@@ -7292,7 +7303,7 @@ class Game:
                         self._world_map_loc_sprite = None
 
                 if self._world_map_loc_sprite and getattr(self, '_wm_locations', None):
-                    _loc_size = 4 * RENDER_SCALE
+                    _loc_size = 4 * MODE7_SCALE
                     _loc_spr  = pygame.transform.scale(
                         self._world_map_loc_sprite, (_loc_size, _loc_size)
                     )
@@ -7434,7 +7445,7 @@ class Game:
 
                     _icon_raw = self._wm_icon_cache[_icon_stem]
                     if _icon_raw:
-                        _isz = max(2, int(100 * RENDER_SCALE * _persp))  # ← change 50 to resize icons
+                        _isz = max(2, int(100 * MODE7_SCALE * _persp))  # ← change 50 to resize icons
                         _icon_surf = pygame.transform.scale(_icon_raw, (_isz, _isz))
                         _icon_rect = _icon_surf.get_rect(midbottom=(_screen_x, _screen_y))
                         # Cull on the ground-plane position (_ground_screen_y), not
@@ -7634,7 +7645,7 @@ class Game:
                 _eframe = _efrms[_ent_fidx % len(_efrms)]
 
                 # Scale proportionally to perspective
-                _eish = max(4, int(_vdata['frame_h'] * RENDER_SCALE * _epersp * 2))
+                _eish = max(4, int(_vdata['frame_h'] * MODE7_SCALE * _epersp * 2))
                 _eisw = max(4, int(_eish * _vdata['frame_w'] / _vdata['frame_h']))
                 _esurf = pygame.transform.scale(_eframe, (_eisw, _eish))
                 _erect = _esurf.get_rect(midbottom=(_escreen_x, _escreen_y))
@@ -7684,9 +7695,9 @@ class Game:
 
         if self._world_map_lower_bar:
             _lb      = self._world_map_lower_bar
-            _lb_h    = int(_lb.get_height() * RENDER_SCALE * 2)
+            _lb_h    = int(_lb.get_height() * MODE7_SCALE * 2)
             _lb_surf = pygame.transform.scale(_lb, (sw, _lb_h))
-            _lb_y    = sh - _lb_h - int(4 * RENDER_SCALE) - 50
+            _lb_y    = sh - _lb_h - int(4 * MODE7_SCALE) - 50
             self.logical_surface.blit(_lb_surf, (0, _lb_y))
 
             # ── Bitmap font helpers ───────────────────────────────────────────
@@ -12456,8 +12467,28 @@ class Game:
                 self._draw_room_tile_plan(screen, room_name, bg, camera_x, camera_y)
                 return
 
+            # The frame-cache requires pygame.Surface.copy().
+            # GPUScreen renders directly through SDL2 and intentionally does not
+            # expose Surface.copy(), because reading pixels back from the GPU would
+            # defeat the purpose of the GPU renderer.
+            #
+            # For GPU rendering, just draw the baked tile surface directly.
+            # This is especially important for newly-created empty rooms, where
+            # there is nothing to cache anyway.
+            if not isinstance(screen, pygame.Surface):
+                self._draw_animated_regions_overlay(
+                    screen, room_name, camera_x, camera_y
+                )
+                self._draw_room_tile_plan(
+                    screen, room_name, bg, camera_x, camera_y
+                )
+                return
+
             vw, vh = screen.get_size()
-            cache_entry_key = (camera_x, camera_y, vw, vh, self._tile_content_generation)
+            cache_entry_key = (
+                camera_x, camera_y, vw, vh, self._tile_content_generation
+            )
+
             cached = self._editor_bg_frame_cache.get(room_name)
             if cached is not None and cached['key'] == cache_entry_key \
                     and cached['surface'].get_size() == (vw, vh):
@@ -12465,12 +12496,19 @@ class Game:
                 return
 
             # Cache miss: draw fresh once, then snapshot the result as an
-            # opaque surface (no per-surface alpha) so future re-blits are
-            # a fast copy instead of a blend.
-            self._draw_animated_regions_overlay(screen, room_name, camera_x, camera_y)
-            self._draw_room_tile_plan(screen, room_name, bg, camera_x, camera_y)
+            # opaque Surface so future re-blits are a fast copy.
+            self._draw_animated_regions_overlay(
+                screen, room_name, camera_x, camera_y
+            )
+            self._draw_room_tile_plan(
+                screen, room_name, bg, camera_x, camera_y
+            )
+
             snapshot = screen.copy()
-            self._editor_bg_frame_cache[room_name] = {'key': cache_entry_key, 'surface': snapshot}
+            self._editor_bg_frame_cache[room_name] = {
+                'key': cache_entry_key,
+                'surface': snapshot,
+            }
             return
 
         self._draw_room_tile_plan(screen, room_name, bg, camera_x, camera_y)

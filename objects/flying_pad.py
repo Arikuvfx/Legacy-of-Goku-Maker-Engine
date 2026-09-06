@@ -311,17 +311,25 @@ class FlyingPad(LayeredDrawMixin):
             x2 = (wp2.x * render_scale) - camera.x
             y2 = (wp2.y * render_scale) - camera.y
 
-            # Draw line
+            # Draw line through the renderer abstraction so this works with
+            # GPUScreen and _ZoomedScreen as well as a raw pygame.Surface.
             if self.is_return_pad:
                 color = (255, 100, 255)  # Purple for return pads
             else:
                 color = (255, 200, 0) if wp2.is_boundary else (100, 200, 255)
-            pygame.draw.line(screen, color, (x1, y1), (x2, y2), 2)
 
-            # Draw arrow at midpoint
-            mid_x = (x1 + x2) // 2
-            mid_y = (y1 + y2) // 2
-            pygame.draw.circle(screen, color, (mid_x, mid_y), 4)
+            if hasattr(screen, "draw_line"):
+                screen.draw_line(color, (x1, y1), (x2, y2), 2)
+                # Draw arrow at midpoint
+                mid_x = (x1 + x2) // 2
+                mid_y = (y1 + y2) // 2
+                screen.draw_circle(color, (mid_x, mid_y), 4)
+            else:
+                pygame.draw.line(screen, color, (x1, y1), (x2, y2), 2)
+                # Draw arrow at midpoint
+                mid_x = (x1 + x2) // 2
+                mid_y = (y1 + y2) // 2
+                pygame.draw.circle(screen, color, (mid_x, mid_y), 4)
 
         # Draw waypoint markers
         for i, wp in enumerate(path_to_draw):
@@ -330,8 +338,8 @@ class FlyingPad(LayeredDrawMixin):
 
             if wp.is_boundary:
                 boundary_color = (255, 100, 255) if self.is_return_pad else (255, 200, 0)
-                pygame.draw.circle(screen, boundary_color, (int(x), int(y)), 8)
-                pygame.draw.circle(screen, (0, 0, 0), (int(x), int(y)), 8, 2)
+                screen.draw_circle(boundary_color, (int(x), int(y)), 8) if hasattr(screen, "draw_circle") else pygame.draw.circle(screen, boundary_color, (int(x), int(y)), 8)
+                screen.draw_circle((0, 0, 0), (int(x), int(y)), 8, 2) if hasattr(screen, "draw_circle") else pygame.draw.circle(screen, (0, 0, 0), (int(x), int(y)), 8, 2)
 
                 # Draw room name if set
                 if wp.target_room:
@@ -351,10 +359,10 @@ class FlyingPad(LayeredDrawMixin):
                     spawn_y = (wp.spawn_y * render_scale) - camera.y
 
                     spawn_color = (200, 100, 255) if self.is_return_pad else (100, 255, 100)
-                    pygame.draw.circle(screen, spawn_color, (int(spawn_x), int(spawn_y)), 8)
-                    pygame.draw.circle(screen, (0, 0, 0), (int(spawn_x), int(spawn_y)), 8, 2)
+                    screen.draw_circle(spawn_color, (int(spawn_x), int(spawn_y)), 8) if hasattr(screen, "draw_circle") else pygame.draw.circle(screen, spawn_color, (int(spawn_x), int(spawn_y)), 8)
+                    screen.draw_circle((0, 0, 0), (int(spawn_x), int(spawn_y)), 8, 2) if hasattr(screen, "draw_circle") else pygame.draw.circle(screen, (0, 0, 0), (int(spawn_x), int(spawn_y)), 8, 2)
 
-                    pygame.draw.line(screen, (150, 200, 150), (int(x), int(y)), (int(spawn_x), int(spawn_y)), 1)
+                    screen.draw_line((150, 200, 150), (int(x), int(y)), (int(spawn_x), int(spawn_y)), 1) if hasattr(screen, "draw_line") else pygame.draw.line(screen, (150, 200, 150), (int(x), int(y)), (int(spawn_x), int(spawn_y)), 1)
 
                     font_small = _get_font(16)
                     spawn_label = font_small.render("Spawn", True, (255, 255, 255))
@@ -367,8 +375,8 @@ class FlyingPad(LayeredDrawMixin):
                     screen.blit(spawn_label, spawn_rect)
             else:
                 wp_color = (200, 100, 255) if self.is_return_pad else (100, 200, 255)
-                pygame.draw.circle(screen, wp_color, (int(x), int(y)), 6)
-                pygame.draw.circle(screen, (0, 0, 0), (int(x), int(y)), 6, 2)
+                screen.draw_circle(wp_color, (int(x), int(y)), 6) if hasattr(screen, "draw_circle") else pygame.draw.circle(screen, wp_color, (int(x), int(y)), 6)
+                screen.draw_circle((0, 0, 0), (int(x), int(y)), 6, 2) if hasattr(screen, "draw_circle") else pygame.draw.circle(screen, (0, 0, 0), (int(x), int(y)), 6, 2)
 
             # Draw waypoint number
             font = _get_font(14)

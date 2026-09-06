@@ -1362,6 +1362,26 @@ class RoomEditor:
                     self.camera.x += mouse_x / zoom_old - mouse_x / zoom_new
                     self.camera.y += mouse_y / zoom_old - mouse_y / zoom_new
 
+                    # Nimbus path editing keeps WASD panning locked, but the
+                    # locked frame itself must follow the editor zoom.  The
+                    # camera re-anchor above has already moved the virtual
+                    # viewport to preserve the world point under the cursor;
+                    # promote that new camera position to the Nimbus lock so
+                    # the update loop does not snap it back to the old frame.
+                    nimbus_path_editor = (
+                        getattr(self.object_editor, 'nimbus_cloud_path_editor', None)
+                        if self.object_editor is not None else None
+                    )
+                    if nimbus_path_editor is not None and nimbus_path_editor.active:
+                        nimbus_path_editor.screen_width = max(
+                            1, int(self.screen_width / zoom_new)
+                        )
+                        nimbus_path_editor.screen_height = max(
+                            1, int(self.screen_height / zoom_new)
+                        )
+                        nimbus_path_editor.locked_camera_x = int(self.camera.x)
+                        nimbus_path_editor.locked_camera_y = int(self.camera.y)
+
                 return None
             self.toolbar.handle_scroll(event.y)
 
@@ -1369,6 +1389,17 @@ class RoomEditor:
         if (event.type == pygame.KEYDOWN and event.key == pygame.K_0
                 and (pygame.key.get_mods() & pygame.KMOD_CTRL)):
             self.editor_zoom = 1.0
+
+            nimbus_path_editor = (
+                getattr(self.object_editor, 'nimbus_cloud_path_editor', None)
+                if self.object_editor is not None else None
+            )
+            if nimbus_path_editor is not None and nimbus_path_editor.active:
+                nimbus_path_editor.screen_width = self.screen_width
+                nimbus_path_editor.screen_height = self.screen_height
+                nimbus_path_editor.locked_camera_x = int(self.camera.x)
+                nimbus_path_editor.locked_camera_y = int(self.camera.y)
+
             return None
 
         # F2/F3/F4 are keyboard shortcuts for the same toolbar buttons above.
@@ -2716,11 +2747,14 @@ class RoomEditor:
         self._push_undo(_HistoryEntry('entity_add', copy.deepcopy(entity_data)))
 
     def _effective_editor_zoom(self):
-        """The zoom factor actually in effect right now. Falls back to 1.0
-        (native scale) whenever the fit-to-room overview is showing or a
-        modal/path-editor holds the camera — those overlays are authored
-        against a locked, real-scale frame, so continuous zoom is suspended
-        rather than fighting them."""
+        """The zoom factor actually in effect right now.
+
+        The fit-to-room overview and true modal dialogs still force native
+        scale.  Nimbus/Flying path editors do NOT suspend continuous editor
+        zoom: their room-content drawing goes through the same zoom-aware
+        screen wrapper as the rest of the room, while camera panning remains
+        locked separately.
+        """
         if self.editor_zoom == 1.0 or self.zoom_active or self._zoom_locked():
             return 1.0
         return self.editor_zoom
@@ -2749,14 +2783,15 @@ class RoomEditor:
             return True
         if self.editing_field is not None:
             return True
-        if (self.object_editor is not None and
-                hasattr(self.object_editor, 'nimbus_cloud_path_editor') and
-                self.object_editor.nimbus_cloud_path_editor.active):
-            return True
-        if (self.object_editor is not None and
-                hasattr(self.object_editor, 'flying_pad_path_editor') and
-                self.object_editor.flying_pad_path_editor.active):
-            return True
+        # flying_pad_path_editor used to be pinned here too, for the same
+        # reason Map Paint was (see docstring above): its instruction
+        # panels/boundary-config dialog were built at literal real-window
+        # size and blitted at literal positions, which only looked right
+        # at zoom == 1.0. It now unwraps back to the real screen for those
+        # fixed HUD/dialog draws while its room-content path lines/markers
+        # go through screen.draw_line()/draw_circle() in the same
+        # zoom-aware space every other room overlay uses, so it no longer
+        # needs zoom suspended.
         return False
 
     def _zoom_adjust_event(self, event, is_in_palette_fn=None):
@@ -2782,6 +2817,10 @@ class RoomEditor:
             scale = self._zoom_scale or 1.0
             ox, oy = self._zoom_offset
             new_dict = dict(event.dict)
+            # Preserve the original physical mouse position for fixed UI hit-tests
+            # (entity/object palettes). The converted .pos remains the virtual
+            # world-space position used by placement/editing.
+            new_dict['_room_editor_raw_pos'] = event.pos
             new_dict['pos'] = ((event.pos[0] - ox) / scale, (event.pos[1] - oy) / scale)
             if 'rel' in new_dict:
                 rx, ry = new_dict['rel']
@@ -2794,6 +2833,10 @@ class RoomEditor:
         if is_in_palette_fn is not None and is_in_palette_fn(*event.pos):
             return event
         new_dict = dict(event.dict)
+        # Preserve the original physical mouse position for fixed UI hit-tests
+        # (entity/object palettes). The converted .pos remains the virtual
+        # world-space position used by placement/editing.
+        new_dict['_room_editor_raw_pos'] = event.pos
         new_dict['pos'] = (event.pos[0] / zoom, event.pos[1] / zoom)
         if 'rel' in new_dict:
             rx, ry = new_dict['rel']
@@ -3592,6 +3635,24 @@ class RoomEditor:
                 # to reopen the panel.
                 if hasattr(self.object_editor, 'set_grid_snap_size'):
                     self.object_editor.set_grid_snap_size(self.toolbar.get_grid_size())
+
+                # Nimbus path editing is zoom-aware but keeps its camera
+                # position locked against panning. Its own viewport dimensions
+                # must match the current virtual zoom viewport so its
+                # "reachable" / visible-world calculations stay aligned with
+                # what is actually on screen.
+                nimbus_path_editor = getattr(
+                    self.object_editor, 'nimbus_cloud_path_editor', None
+                )
+                if nimbus_path_editor is not None and nimbus_path_editor.active:
+                    zoom = self._effective_editor_zoom()
+                    nimbus_path_editor.screen_width = max(
+                        1, int(self.screen_width / zoom)
+                    )
+                    nimbus_path_editor.screen_height = max(
+                        1, int(self.screen_height / zoom)
+                    )
+
                 self.object_editor.update(
                     dt,
                     mouse_pos,
@@ -3801,8 +3862,17 @@ class RoomEditor:
 
             # Existing renderers use these dimensions for culling/tile coverage.
             self.screen_width, self.screen_height = vw, vh
+            nimbus_path_editor = (
+                getattr(self.object_editor, 'nimbus_cloud_path_editor', None)
+                if self.object_editor is not None else None
+            )
             _zoom_sub_editors = [
-                e for e in (self.tileset_editor, self.object_editor, self.entity_editor) if e
+                e for e in (
+                    self.tileset_editor,
+                    self.object_editor,
+                    self.entity_editor,
+                    nimbus_path_editor,
+                ) if e
             ]
             for ed in _zoom_sub_editors:
                 _zoom_orig_dims[id(ed)] = (

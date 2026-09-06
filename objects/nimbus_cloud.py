@@ -334,11 +334,19 @@ class NimbusCloud(LayeredDrawMixin):
                 color = (255, 150, 220)  # Pink for return clouds.
             else:
                 color = (255, 210, 120) if wp2.is_boundary else (170, 220, 255)
-            pygame.draw.line(screen, color, (x1, y1), (x2, y2), 2)
+            # Use the renderer abstraction so this works with GPUScreen and
+            # _ZoomedScreen as well as a raw pygame.Surface.
+            if hasattr(screen, "draw_line"):
+                screen.draw_line(color, (x1, y1), (x2, y2), 2)
+            else:
+                pygame.draw.line(screen, color, (x1, y1), (x2, y2), 2)
 
             mid_x = (x1 + x2) // 2
             mid_y = (y1 + y2) // 2
-            pygame.draw.circle(screen, color, (mid_x, mid_y), 4)
+            if hasattr(screen, "draw_circle"):
+                screen.draw_circle(color, (mid_x, mid_y), 4)
+            else:
+                pygame.draw.circle(screen, color, (mid_x, mid_y), 4)
 
         for i, wp in enumerate(path_to_draw):
             x = (wp.x * render_scale) - camera.x
@@ -346,8 +354,14 @@ class NimbusCloud(LayeredDrawMixin):
 
             if wp.is_boundary:
                 boundary_color = (255, 150, 220) if self.is_return_pad else (255, 210, 120)
-                pygame.draw.circle(screen, boundary_color, (int(x), int(y)), 8)
-                pygame.draw.circle(screen, (0, 0, 0), (int(x), int(y)), 8, 2)
+                if hasattr(screen, "draw_circle"):
+                    screen.draw_circle(boundary_color, (int(x), int(y)), 8)
+                else:
+                    pygame.draw.circle(screen, boundary_color, (int(x), int(y)), 8)
+                if hasattr(screen, "draw_circle"):
+                    screen.draw_circle((0, 0, 0), (int(x), int(y)), 8, 2)
+                else:
+                    pygame.draw.circle(screen, (0, 0, 0), (int(x), int(y)), 8, 2)
 
                 if wp.target_room:
                     font = _get_font(16)
@@ -365,10 +379,19 @@ class NimbusCloud(LayeredDrawMixin):
                     spawn_y = (wp.spawn_y * render_scale) - camera.y
 
                     spawn_color = (220, 150, 255) if self.is_return_pad else (150, 255, 220)
-                    pygame.draw.circle(screen, spawn_color, (int(spawn_x), int(spawn_y)), 8)
-                    pygame.draw.circle(screen, (0, 0, 0), (int(spawn_x), int(spawn_y)), 8, 2)
+                    if hasattr(screen, "draw_circle"):
+                        screen.draw_circle(spawn_color, (int(spawn_x), int(spawn_y)), 8)
+                    else:
+                        pygame.draw.circle(screen, spawn_color, (int(spawn_x), int(spawn_y)), 8)
+                    if hasattr(screen, "draw_circle"):
+                        screen.draw_circle((0, 0, 0), (int(spawn_x), int(spawn_y)), 8, 2)
+                    else:
+                        pygame.draw.circle(screen, (0, 0, 0), (int(spawn_x), int(spawn_y)), 8, 2)
 
-                    pygame.draw.line(screen, (180, 200, 180), (int(x), int(y)), (int(spawn_x), int(spawn_y)), 1)
+                    if hasattr(screen, "draw_line"):
+                        screen.draw_line((180, 200, 180), (int(x), int(y)), (int(spawn_x), int(spawn_y)), 1)
+                    else:
+                        pygame.draw.line(screen, (180, 200, 180), (int(x), int(y)), (int(spawn_x), int(spawn_y)), 1)
 
                     font_small = _get_font(16)
                     spawn_label = font_small.render("Spawn", True, (255, 255, 255))
@@ -381,8 +404,14 @@ class NimbusCloud(LayeredDrawMixin):
                     screen.blit(spawn_label, spawn_rect)
             else:
                 wp_color = (220, 150, 255) if self.is_return_pad else (170, 220, 255)
-                pygame.draw.circle(screen, wp_color, (int(x), int(y)), 6)
-                pygame.draw.circle(screen, (0, 0, 0), (int(x), int(y)), 6, 2)
+                if hasattr(screen, "draw_circle"):
+                    screen.draw_circle(wp_color, (int(x), int(y)), 6)
+                else:
+                    pygame.draw.circle(screen, wp_color, (int(x), int(y)), 6)
+                if hasattr(screen, "draw_circle"):
+                    screen.draw_circle((0, 0, 0), (int(x), int(y)), 6, 2)
+                else:
+                    pygame.draw.circle(screen, (0, 0, 0), (int(x), int(y)), 6, 2)
 
             font = _get_font(14)
             num_text = font.render(str(i + 1), True, (255, 255, 255))

@@ -992,8 +992,8 @@ class ConditionBuilder:
                 spec = CONDITION_KINDS[row['kind']]
 
                 kind_rect = pygame.Rect(row_x, row_y, 150, _FIELD_H)
-                pygame.draw.rect(screen, colors['input_bg'], kind_rect, border_radius=4)
-                pygame.draw.rect(screen, colors['accent'], kind_rect, 1, border_radius=4)
+                screen.draw_rect(colors['input_bg'], kind_rect, border_radius=4)
+                screen.draw_rect(colors['accent'], kind_rect, 1, border_radius=4)
                 kind_label = self.font_small.render(spec['label'], True, colors['text'])
                 screen.blit(kind_label, (kind_rect.x + 6, kind_rect.y + 5))
                 row_rects['kind'] = kind_rect
@@ -1018,43 +1018,43 @@ class ConditionBuilder:
 
                     active = self._active_field == (row_index, field_name)
                     bg = colors['input_active'] if active else colors['input_bg']
-                    pygame.draw.rect(screen, bg, field_rect, border_radius=4)
-                    pygame.draw.rect(screen, colors['grid'], field_rect, 1, border_radius=4)
+                    screen.draw_rect(bg, field_rect, border_radius=4)
+                    screen.draw_rect(colors['grid'], field_rect, 1, border_radius=4)
 
                     if field_kind == 'flag_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['flag_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
                     elif field_kind == 'char_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['char_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
                     elif field_kind == 'skill_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['skill_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
                     elif field_kind == 'boss_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['boss_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
                     elif field_kind == 'timer_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['timer_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
                     elif field_kind == 'bar_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['bar_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
 
@@ -1071,7 +1071,7 @@ class ConditionBuilder:
                     field_x = field_rect.right + _FIELD_GAP
 
             delete_rect = pygame.Rect(x + w - 26, row_y, 20, _FIELD_H)
-            pygame.draw.rect(screen, colors['delete'], delete_rect, border_radius=4)
+            screen.draw_rect(colors['delete'], delete_rect, border_radius=4)
             x_label = self.font_small.render('X', True, colors['text'])
             screen.blit(x_label, x_label.get_rect(center=delete_rect.center))
             row_rects['delete'] = delete_rect
@@ -1114,8 +1114,8 @@ class ConditionBuilder:
             cur_y += self._draw_add_kind_grid(screen, x, cur_y, w)
 
         add_rect = pygame.Rect(x, cur_y, 160, _FIELD_H)
-        pygame.draw.rect(screen, colors['input_bg'], add_rect, border_radius=4)
-        pygame.draw.rect(screen, colors['success'], add_rect, 1, border_radius=4)
+        screen.draw_rect(colors['input_bg'], add_rect, border_radius=4)
+        screen.draw_rect(colors['success'], add_rect, 1, border_radius=4)
         add_label = self.font_small.render("+ Add Condition", True, colors['success'])
         screen.blit(add_label, (add_rect.x + 8, add_rect.y + 5))
         self._rects['add_condition_btn'] = add_rect
@@ -1131,8 +1131,8 @@ class ConditionBuilder:
         for i, kind in enumerate(_KIND_ORDER):
             col, row = i % cols, i // cols
             rect = pygame.Rect(x + col * (item_w + gap), y + row * (item_h + gap), item_w, item_h)
-            pygame.draw.rect(screen, colors['panel_light'], rect, border_radius=4)
-            pygame.draw.rect(screen, colors['accent'], rect, 1, border_radius=4)
+            screen.draw_rect(colors['panel_light'], rect, border_radius=4)
+            screen.draw_rect(colors['accent'], rect, 1, border_radius=4)
             clip = pygame.Rect(rect.x + 4, rect.y, rect.w - 8, rect.h)
             screen.set_clip(clip)
             label = self.font_small.render(CONDITION_KINDS[kind]['label'], True, colors['text'])
@@ -1148,8 +1148,8 @@ class ConditionBuilder:
         items = []
         list_w = 180
         list_rect = pygame.Rect(x, list_y, list_w, len(_KIND_ORDER) * 22)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, kind in enumerate(_KIND_ORDER):
             item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
             label = self.font_small.render(CONDITION_KINDS[kind]['label'], True, colors['text'])
@@ -1164,8 +1164,8 @@ class ConditionBuilder:
         names = self._known_flags or ['(no flags used yet)']
         visible = names[:8]
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
             label = self.font_small.render(name, True, colors['text'])
@@ -1181,8 +1181,8 @@ class ConditionBuilder:
         names = self._known_characters or ['(no characters found)']
         visible = names[:8]
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
             label = self.font_small.render(name, True, colors['text'])
@@ -1198,8 +1198,8 @@ class ConditionBuilder:
         names = self._known_skills or ['(no skills found)']
         visible = names[:8]
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
             label = self.font_small.render(name, True, colors['text'])
@@ -1215,8 +1215,8 @@ class ConditionBuilder:
         names = self._known_bosses or ['(no bosses found)']
         visible = names[:8]
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
             label = self.font_small.render(name, True, colors['text'])
@@ -1232,8 +1232,8 @@ class ConditionBuilder:
         names = self._known_timers or ['(no timers made yet)']
         visible = names[:8]
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
             label = self.font_small.render(name, True, colors['text'])
@@ -1249,8 +1249,8 @@ class ConditionBuilder:
         names = self._known_bars or ['(no bars made yet)']
         visible = names[:8]
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
             label = self.font_small.render(name, True, colors['text'])
@@ -2468,8 +2468,8 @@ class ActionSequenceBuilder:
                 schema = ACTION_SCHEMA.get(row['type'], [])
 
                 type_rect = pygame.Rect(row_x, cur_y, 160, _FIELD_H)
-                pygame.draw.rect(screen, colors['input_bg'], type_rect, border_radius=4)
-                pygame.draw.rect(screen, colors['accent'], type_rect, 1, border_radius=4)
+                screen.draw_rect(colors['input_bg'], type_rect, border_radius=4)
+                screen.draw_rect(colors['accent'], type_rect, 1, border_radius=4)
                 clip = pygame.Rect(type_rect.x + 4, type_rect.y, type_rect.w - 8, type_rect.h)
                 screen.set_clip(clip)
                 type_label = self.font_small.render(row['type'], True, colors['text'])
@@ -2498,97 +2498,97 @@ class ActionSequenceBuilder:
                     field_rect = pygame.Rect(field_x, field_y, field_w, _FIELD_H)
                     active = self._active_field == (row_index, field_name)
                     bg = colors['input_active'] if active else colors['input_bg']
-                    pygame.draw.rect(screen, bg, field_rect, border_radius=4)
-                    pygame.draw.rect(screen, colors['grid'], field_rect, 1, border_radius=4)
+                    screen.draw_rect(bg, field_rect, border_radius=4)
+                    screen.draw_rect(colors['grid'], field_rect, 1, border_radius=4)
 
                     if field_kind == 'portrait_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['portrait_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
                     elif field_kind == 'char_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['char_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
                     elif field_kind == 'enemy_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['enemy_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
                     elif field_kind == 'npc_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['npc_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
                     elif field_kind == 'cutscene_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['cutscene_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
                     elif field_kind == 'skill_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['skill_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
                     elif field_kind == 'transformation_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['transformation_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
                     elif field_kind == 'skin_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['skin_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
                     elif field_kind == 'animation_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['animation_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
                     elif field_kind == 'weather_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['weather_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
                     elif field_kind == 'music_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['music_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
                     elif field_kind == 'sound_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['sound_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
                     elif field_kind == 'room_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['room_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
                     elif field_kind == 'world_map_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['world_map_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
                     elif field_kind == 'wm_location_picker':
                         btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
                         row_rects['wm_location_dropdown_btn_' + field_name] = btn_rect
-                        pygame.draw.rect(screen, colors['panel_light'], btn_rect, border_radius=3)
+                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
                         arrow = self.font_small.render('v', True, colors['text_dim'])
                         screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
 
@@ -2646,7 +2646,7 @@ class ActionSequenceBuilder:
                                         (down_rect, 'v', colors['text_dim']),
                                         (delete_rect, 'X', colors['text'])):
                 fill = colors['delete'] if rect is delete_rect else colors['panel_light']
-                pygame.draw.rect(screen, fill, rect, border_radius=4)
+                screen.draw_rect(fill, rect, border_radius=4)
                 lbl = self.font_small.render(label, True, color)
                 screen.blit(lbl, lbl.get_rect(center=rect.center))
             row_rects['up'] = up_rect
@@ -2739,8 +2739,8 @@ class ActionSequenceBuilder:
             cur_y += self._draw_add_type_grid(screen, x, cur_y, w)
 
         add_rect = pygame.Rect(x, cur_y, 160, _FIELD_H)
-        pygame.draw.rect(screen, colors['input_bg'], add_rect, border_radius=4)
-        pygame.draw.rect(screen, colors['success'], add_rect, 1, border_radius=4)
+        screen.draw_rect(colors['input_bg'], add_rect, border_radius=4)
+        screen.draw_rect(colors['success'], add_rect, 1, border_radius=4)
         add_label = self.font_small.render("+ Add Command", True, colors['success'])
         screen.blit(add_label, (add_rect.x + 8, add_rect.y + 5))
         self._rects['add_action_btn'] = add_rect
@@ -2772,8 +2772,8 @@ class ActionSequenceBuilder:
             text_rect = pygame.Rect(x, cur_y, text_w, _FIELD_H)
             active = self._active_option_field == (row_index, option_index)
             bg = colors['input_active'] if active else colors['input_bg']
-            pygame.draw.rect(screen, bg, text_rect, border_radius=4)
-            pygame.draw.rect(screen, colors['grid'], text_rect, 1, border_radius=4)
+            screen.draw_rect(bg, text_rect, border_radius=4)
+            screen.draw_rect(colors['grid'], text_rect, 1, border_radius=4)
 
             display = self._active_option_text if active else option.get('text', '')
             if not active and display == '':
@@ -2786,8 +2786,8 @@ class ActionSequenceBuilder:
 
             edit_rect = pygame.Rect(text_rect.right + _FIELD_GAP, cur_y, 130, _FIELD_H)
             n_actions = len(option.get('actions', []))
-            pygame.draw.rect(screen, colors['panel_light'], edit_rect, border_radius=4)
-            pygame.draw.rect(screen, colors['accent'], edit_rect, 1, border_radius=4)
+            screen.draw_rect(colors['panel_light'], edit_rect, border_radius=4)
+            screen.draw_rect(colors['accent'], edit_rect, 1, border_radius=4)
             edit_label = self.font_small.render("Edit Actions (%d)" % n_actions, True, colors['text'])
             screen.blit(edit_label, (edit_rect.x + 6, edit_rect.y + 5))
 
@@ -2798,7 +2798,7 @@ class ActionSequenceBuilder:
                                       (down_rect, 'v', colors['text_dim']),
                                       (delete_rect, 'X', colors['text'])):
                 fill = colors['delete'] if rect is delete_rect else colors['panel_light']
-                pygame.draw.rect(screen, fill, rect, border_radius=4)
+                screen.draw_rect(fill, rect, border_radius=4)
                 lb = self.font_small.render(lbl, True, color)
                 screen.blit(lb, lb.get_rect(center=rect.center))
 
@@ -2811,8 +2811,8 @@ class ActionSequenceBuilder:
         row_rects['options'] = opt_rects_list
 
         add_option_rect = pygame.Rect(x, cur_y, 130, _FIELD_H)
-        pygame.draw.rect(screen, colors['input_bg'], add_option_rect, border_radius=4)
-        pygame.draw.rect(screen, colors['success'], add_option_rect, 1, border_radius=4)
+        screen.draw_rect(colors['input_bg'], add_option_rect, border_radius=4)
+        screen.draw_rect(colors['success'], add_option_rect, 1, border_radius=4)
         add_label = self.font_small.render("+ Add Option", True, colors['success'])
         screen.blit(add_label, (add_option_rect.x + 8, add_option_rect.y + 5))
         row_rects['add_option_btn'] = add_option_rect
@@ -2836,7 +2836,7 @@ class ActionSequenceBuilder:
         panel_surf = pygame.Surface((panel.width, panel.height), pygame.SRCALPHA)
         panel_surf.fill(colors.get('bg_transparent', (20, 20, 20, 235)))
         screen.blit(panel_surf, panel.topleft)
-        pygame.draw.rect(screen, colors['accent'], panel, 2)
+        screen.draw_rect(colors['accent'], panel, 2)
 
         title = self.font_medium.render("Option Actions", True, colors['text'])
         screen.blit(title, (panel.x + 12, panel.y + 10))
@@ -2855,12 +2855,12 @@ class ActionSequenceBuilder:
         save_rect = pygame.Rect(panel.right - 12 - btn_w, panel.bottom - 12 - _FIELD_H - 6, btn_w, _FIELD_H + 6)
         cancel_rect = pygame.Rect(save_rect.x - btn_w - 10, save_rect.y, btn_w, _FIELD_H + 6)
 
-        pygame.draw.rect(screen, colors['success'], save_rect, border_radius=5)
+        screen.draw_rect(colors['success'], save_rect, border_radius=5)
         save_label = self.font_small.render("Save", True, colors['bg'])
         screen.blit(save_label, save_label.get_rect(center=save_rect.center))
 
-        pygame.draw.rect(screen, colors['panel_light'], cancel_rect, border_radius=5)
-        pygame.draw.rect(screen, colors['grid'], cancel_rect, 1, border_radius=5)
+        screen.draw_rect(colors['panel_light'], cancel_rect, border_radius=5)
+        screen.draw_rect(colors['grid'], cancel_rect, 1, border_radius=5)
         cancel_label = self.font_small.render("Cancel", True, colors['text'])
         screen.blit(cancel_label, cancel_label.get_rect(center=cancel_rect.center))
 
@@ -2875,8 +2875,8 @@ class ActionSequenceBuilder:
         for i, action_type in enumerate(ACTION_TYPES):
             col, row = i % cols, i // cols
             rect = pygame.Rect(x + col * (item_w + gap), y + row * (item_h + gap), item_w, item_h)
-            pygame.draw.rect(screen, colors['panel_light'], rect, border_radius=4)
-            pygame.draw.rect(screen, colors['accent'], rect, 1, border_radius=4)
+            screen.draw_rect(colors['panel_light'], rect, border_radius=4)
+            screen.draw_rect(colors['accent'], rect, 1, border_radius=4)
             clip = pygame.Rect(rect.x + 4, rect.y, rect.w - 8, rect.h)
             screen.set_clip(clip)
             label = self.font_small.render(action_type, True, colors['text'])
@@ -2898,8 +2898,8 @@ class ActionSequenceBuilder:
         shown = ACTION_TYPES[start:start + _TYPE_DROPDOWN_VISIBLE]
 
         list_rect = pygame.Rect(x, list_y, list_w, len(shown) * row_h)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, action_type in enumerate(shown):
             item_rect = pygame.Rect(x, list_y + i * row_h, list_w, row_h)
             label = self.font_small.render(action_type, True, colors['text'])
@@ -2920,8 +2920,8 @@ class ActionSequenceBuilder:
         names = self._known_portraits or ['(no portraits found)']
         visible = names[:8]
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
             label = self.font_small.render(name, True, colors['text'])
@@ -2937,8 +2937,8 @@ class ActionSequenceBuilder:
         names = self._known_characters or ['(no characters found)']
         visible = names[:8]
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
             label = self.font_small.render(name, True, colors['text'])
@@ -2954,8 +2954,8 @@ class ActionSequenceBuilder:
         names = self._known_enemies or ['(no enemies found)']
         visible = names[:8]
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
             label = self.font_small.render(name, True, colors['text'])
@@ -2971,8 +2971,8 @@ class ActionSequenceBuilder:
         names = self._known_npcs or ['(no npcs found)']
         visible = names[:8]
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
             label = self.font_small.render(name, True, colors['text'])
@@ -2988,8 +2988,8 @@ class ActionSequenceBuilder:
         names = self._known_cutscenes or ['(no cutscenes found)']
         visible = names[:8]
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
             label = self.font_small.render(name, True, colors['text'])
@@ -3005,8 +3005,8 @@ class ActionSequenceBuilder:
         names = self._known_weather_types or ['(no weather found)']
         visible = names[:8]
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
             label = self.font_small.render(name, True, colors['text'])
@@ -3027,8 +3027,8 @@ class ActionSequenceBuilder:
         visible = names[start:start + _MUSIC_DROPDOWN_VISIBLE]
 
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * row_h)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * row_h, list_w, row_h)
             label = self.font_small.render(name, True, colors['text'])
@@ -3055,8 +3055,8 @@ class ActionSequenceBuilder:
         visible = names[start:start + _SOUND_DROPDOWN_VISIBLE]
 
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * row_h)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * row_h, list_w, row_h)
             label = self.font_small.render(name, True, colors['text'])
@@ -3078,8 +3078,8 @@ class ActionSequenceBuilder:
         names = self._known_rooms or ['(no rooms found)']
         visible = names[:8]
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
             label = self.font_small.render(name, True, colors['text'])
@@ -3098,8 +3098,8 @@ class ActionSequenceBuilder:
         names = self._known_world_maps or ['(no world maps found)']
         visible = names[:8]
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
             label = self.font_small.render(name, True, colors['text'])
@@ -3120,8 +3120,8 @@ class ActionSequenceBuilder:
         names = real or [placeholder]
         visible = names[:8]
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
             label = self.font_small.render(name, True, colors['text'])
@@ -3242,7 +3242,7 @@ class ActionSequenceBuilder:
         panel_surf = pygame.Surface((panel.width, panel.height), pygame.SRCALPHA)
         panel_surf.fill(colors.get('bg_transparent', (20, 20, 20, 235)))
         screen.blit(panel_surf, panel.topleft)
-        pygame.draw.rect(screen, colors['accent'], panel, 2)
+        screen.draw_rect(colors['accent'], panel, 2)
 
         title = self.font_medium.render("%s — %s" % (picker['title'], picker['room_name']), True, colors['text'])
         screen.blit(title, (panel.x + 12, panel.y + 10))
@@ -3276,7 +3276,7 @@ class ActionSequenceBuilder:
             avail_top + max(0, (avail_h - canvas_h) // 2),
             canvas_w, canvas_h)
 
-        pygame.draw.rect(screen, colors['panel_light'], canvas_rect)
+        screen.draw_rect(colors['panel_light'], canvas_rect)
         if picker['preview_surface'] is not None:
             cache = picker.get('_scaled_preview')
             if cache is None or cache[1] != (canvas_w, canvas_h):
@@ -3288,16 +3288,16 @@ class ActionSequenceBuilder:
         else:
             grid_step = max(16, int(64 * scale))
             for gx in range(canvas_rect.x, canvas_rect.right, grid_step):
-                pygame.draw.line(screen, colors['grid'], (gx, canvas_rect.y), (gx, canvas_rect.bottom), 1)
+                screen.draw_line(colors['grid'], (gx, canvas_rect.y), (gx, canvas_rect.bottom), 1)
             for gy in range(canvas_rect.y, canvas_rect.bottom, grid_step):
-                pygame.draw.line(screen, colors['grid'], (canvas_rect.x, gy), (canvas_rect.right, gy), 1)
-        pygame.draw.rect(screen, colors['accent'], canvas_rect, 2)
+                screen.draw_line(colors['grid'], (canvas_rect.x, gy), (canvas_rect.right, gy), 1)
+        screen.draw_rect(colors['accent'], canvas_rect, 2)
 
         if picker['x'] is not None and picker['y'] is not None:
             mx = canvas_rect.x + int(picker['x'] * scale)
             my = canvas_rect.y + int(picker['y'] * scale)
-            pygame.draw.circle(screen, colors['success'], (mx, my), 6)
-            pygame.draw.circle(screen, colors['bg'], (mx, my), 6, 1)
+            screen.draw_circle(colors['success'], (mx, my), 6)
+            screen.draw_circle(colors['bg'], (mx, my), 6, 1)
             coord_label = self.font_small.render(
                 "(%d, %d)" % (picker['x'], picker['y']), True, colors['text'])
             label_x = min(mx + 10, panel.right - 12 - coord_label.get_width())
@@ -3311,13 +3311,13 @@ class ActionSequenceBuilder:
         cancel_rect = pygame.Rect(done_rect.x - btn_w - 10, done_rect.y, btn_w, _FIELD_H + 6)
 
         done_enabled = picker['x'] is not None and picker['y'] is not None
-        pygame.draw.rect(screen, colors['success'] if done_enabled else colors['panel_light'],
+        screen.draw_rect(colors['success'] if done_enabled else colors['panel_light'],
                           done_rect, border_radius=5)
         done_label = self.font_small.render("Done", True, colors['bg'] if done_enabled else colors['text_dim'])
         screen.blit(done_label, done_label.get_rect(center=done_rect.center))
 
-        pygame.draw.rect(screen, colors['panel_light'], cancel_rect, border_radius=5)
-        pygame.draw.rect(screen, colors['grid'], cancel_rect, 1, border_radius=5)
+        screen.draw_rect(colors['panel_light'], cancel_rect, border_radius=5)
+        screen.draw_rect(colors['grid'], cancel_rect, 1, border_radius=5)
         cancel_label = self.font_small.render("Cancel", True, colors['text'])
         screen.blit(cancel_label, cancel_label.get_rect(center=cancel_rect.center))
 
@@ -3338,8 +3338,8 @@ class ActionSequenceBuilder:
         names = real or [placeholder]
         visible = names[:8]
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
             label = self.font_small.render(name, True, colors['text'])
@@ -3362,8 +3362,8 @@ class ActionSequenceBuilder:
         names = real or [placeholder]
         visible = names[:8]
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
             label = self.font_small.render(name, True, colors['text'])
@@ -3385,8 +3385,8 @@ class ActionSequenceBuilder:
         names = real or [placeholder]
         visible = names[:8]
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
             label = self.font_small.render(name, True, colors['text'])
@@ -3408,8 +3408,8 @@ class ActionSequenceBuilder:
         names = real or [placeholder]
         visible = names[:8]
         list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        pygame.draw.rect(screen, colors['panel_light'], list_rect)
-        pygame.draw.rect(screen, colors['accent'], list_rect, 2)
+        screen.draw_rect(colors['panel_light'], list_rect)
+        screen.draw_rect(colors['accent'], list_rect, 2)
         for i, name in enumerate(visible):
             item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
             label = self.font_small.render(name, True, colors['text'])
@@ -3592,7 +3592,7 @@ class EventEditorWindow:
         win_surf = pygame.Surface((win.width, win.height), pygame.SRCALPHA)
         win_surf.fill(colors['bg_transparent'])
         screen.blit(win_surf, win.topleft)
-        pygame.draw.rect(screen, colors['accent'], win, 2)
+        screen.draw_rect(colors['accent'], win, 2)
 
         title_surf = self.font_title.render(self.title, True, colors['text'])
         screen.blit(title_surf, (win.x + _PADDING, win.y + 12))
@@ -3614,7 +3614,7 @@ class EventEditorWindow:
 
         col_height = max(self.condition_builder.content_height(), self.action_builder.content_height())
         divider_x = right_x - _DIVIDER_GAP // 2
-        pygame.draw.line(screen, colors['grid'], (divider_x, draw_y), (divider_x, draw_y + col_height), 1)
+        screen.draw_line(colors['grid'], (divider_x, draw_y), (divider_x, draw_y + col_height), 1)
 
         screen.set_clip(None)
 
@@ -3629,12 +3629,12 @@ class EventEditorWindow:
         save_rect = pygame.Rect(win.right - _PADDING - btn_w, win.bottom - _PADDING - _BUTTON_H, btn_w, _BUTTON_H)
         cancel_rect = pygame.Rect(save_rect.x - btn_w - 10, save_rect.y, btn_w, _BUTTON_H)
 
-        pygame.draw.rect(screen, colors['success'], save_rect, border_radius=5)
+        screen.draw_rect(colors['success'], save_rect, border_radius=5)
         save_label = self.font_small.render("Save", True, colors['bg'])
         screen.blit(save_label, save_label.get_rect(center=save_rect.center))
 
-        pygame.draw.rect(screen, colors['panel_light'], cancel_rect, border_radius=5)
-        pygame.draw.rect(screen, colors['grid'], cancel_rect, 1, border_radius=5)
+        screen.draw_rect(colors['panel_light'], cancel_rect, border_radius=5)
+        screen.draw_rect(colors['grid'], cancel_rect, 1, border_radius=5)
         cancel_label = self.font_small.render("Cancel", True, colors['text'])
         screen.blit(cancel_label, cancel_label.get_rect(center=cancel_rect.center))
 

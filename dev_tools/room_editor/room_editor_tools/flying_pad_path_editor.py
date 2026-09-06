@@ -382,8 +382,8 @@ class FlyingPadPathEditor:
                 y = (spawn_point[1] * render_scale) - camera.y
 
                 # Draw spawn marker
-                pygame.draw.circle(screen, (100, 255, 100), (int(x), int(y)), 8)
-                pygame.draw.circle(screen, (0, 0, 0), (int(x), int(y)), 8, 2)
+                screen.draw_circle((100, 255, 100), (int(x), int(y)), 8)
+                screen.draw_circle((0, 0, 0), (int(x), int(y)), 8, 2)
 
                 # Label
                 font = pygame.font.Font(None, 16)
@@ -411,16 +411,16 @@ class FlyingPadPathEditor:
 
             # Draw line from spawn to first waypoint
             color = (100, 200, 255)
-            pygame.draw.line(screen, color, (wp1_x, wp1_y), (wp2_x, wp2_y), 2)
+            screen.draw_line(color, (wp1_x, wp1_y), (wp2_x, wp2_y), 2)
 
             # Draw arrow at midpoint
             mid_x = (wp1_x + wp2_x) // 2
             mid_y = (wp1_y + wp2_y) // 2
-            pygame.draw.circle(screen, color, (mid_x, mid_y), 4)
+            screen.draw_circle(color, (mid_x, mid_y), 4)
 
             # Draw spawn point
-            pygame.draw.circle(screen, (100, 255, 100), (int(wp1_x), int(wp1_y)), 8)
-            pygame.draw.circle(screen, (0, 0, 0), (int(wp1_x), int(wp1_y)), 8, 2)
+            screen.draw_circle((100, 255, 100), (int(wp1_x), int(wp1_y)), 8)
+            screen.draw_circle((0, 0, 0), (int(wp1_x), int(wp1_y)), 8, 2)
 
             font = pygame.font.Font(None, 16)
             text = font.render("Spawn", True, (255, 255, 255))
@@ -450,12 +450,12 @@ class FlyingPadPathEditor:
 
             # Draw line
             color = (255, 200, 0) if wp2.is_boundary else (100, 200, 255)
-            pygame.draw.line(screen, color, (x1, y1), (x2, y2), 2)
+            screen.draw_line(color, (x1, y1), (x2, y2), 2)
 
             # Draw arrow at midpoint
             mid_x = (x1 + x2) // 2
             mid_y = (y1 + y2) // 2
-            pygame.draw.circle(screen, color, (mid_x, mid_y), 4)
+            screen.draw_circle(color, (mid_x, mid_y), 4)
 
         # Draw waypoint markers
         for i, wp in enumerate(current_room_waypoints):
@@ -464,8 +464,8 @@ class FlyingPadPathEditor:
 
             if wp.is_boundary:
                 # Boundary waypoint
-                pygame.draw.circle(screen, (255, 200, 0), (int(x), int(y)), 8)
-                pygame.draw.circle(screen, (0, 0, 0), (int(x), int(y)), 8, 2)
+                screen.draw_circle((255, 200, 0), (int(x), int(y)), 8)
+                screen.draw_circle((0, 0, 0), (int(x), int(y)), 8, 2)
 
                 if wp.target_room:
                     font = pygame.font.Font(None, 16)
@@ -479,8 +479,8 @@ class FlyingPadPathEditor:
                     screen.blit(text, text_rect)
             else:
                 # Normal waypoint
-                pygame.draw.circle(screen, (100, 200, 255), (int(x), int(y)), 6)
-                pygame.draw.circle(screen, (0, 0, 0), (int(x), int(y)), 6, 2)
+                screen.draw_circle((100, 200, 255), (int(x), int(y)), 6)
+                screen.draw_circle((0, 0, 0), (int(x), int(y)), 6, 2)
 
             # Draw waypoint number (relative to current room)
             font = pygame.font.Font(None, 14)
@@ -511,15 +511,15 @@ class FlyingPadPathEditor:
                 # Draw preview waypoint
                 if at_boundary and len(self.available_rooms) > 0:
                     # Boundary preview
-                    pygame.draw.circle(screen, self.colors['preview_boundary'],
+                    screen.draw_circle(self.colors['preview_boundary'],
                                        (int(preview_x), int(preview_y)), 8)
-                    pygame.draw.circle(screen, (255, 255, 255),
+                    screen.draw_circle((255, 255, 255),
                                        (int(preview_x), int(preview_y)), 8, 2)
                 else:
                     # Normal preview
-                    pygame.draw.circle(screen, self.colors['preview'],
+                    screen.draw_circle(self.colors['preview'],
                                        (int(preview_x), int(preview_y)), 6)
-                    pygame.draw.circle(screen, (255, 255, 255),
+                    screen.draw_circle((255, 255, 255),
                                        (int(preview_x), int(preview_y)), 6, 2)
                 return
         else:
@@ -576,6 +576,14 @@ class FlyingPadPathEditor:
 
     def _draw_placement_instructions(self, screen: pygame.Surface):
         """Draw instructions for waypoint placement"""
+        # This panel is built at literal real-window size and blitted at a
+        # literal (0, 0)-relative position -- exactly the pattern that used
+        # to force Map Paint's zoom-lock (see room_editor.py's
+        # _zoom_locked() docstring). Unwrap back to the real screen so this
+        # HUD overlay stays fixed-size/fixed-position regardless of the
+        # continuous editor zoom that _draw_current_room_path() above
+        # (correctly) does respect.
+        screen = getattr(screen, '_screen', screen)
         # Semi-transparent panel at top
         panel_height = 180  # Increased to show boundary warning
         panel = pygame.Surface((self.screen_width, panel_height), pygame.SRCALPHA)
@@ -642,16 +650,16 @@ class FlyingPadPathEditor:
         self.return_pad_checkbox_rect = pygame.Rect(checkbox_x, checkbox_y, checkbox_size, checkbox_size)
 
         # Draw checkbox background
-        pygame.draw.rect(screen, (50, 50, 70), self.return_pad_checkbox_rect)
-        pygame.draw.rect(screen, self.colors['accent'], self.return_pad_checkbox_rect, 2)
+        screen.draw_rect((50, 50, 70), self.return_pad_checkbox_rect)
+        screen.draw_rect(self.colors['accent'], self.return_pad_checkbox_rect, 2)
 
         # Draw checkmark if checked
         if self.create_return_pad:
             # Draw X mark
-            pygame.draw.line(screen, self.colors['accent'],
+            screen.draw_line(self.colors['accent'],
                              (checkbox_x + 4, checkbox_y + 4),
                              (checkbox_x + checkbox_size - 4, checkbox_y + checkbox_size - 4), 3)
-            pygame.draw.line(screen, self.colors['accent'],
+            screen.draw_line(self.colors['accent'],
                              (checkbox_x + checkbox_size - 4, checkbox_y + 4),
                              (checkbox_x + 4, checkbox_y + checkbox_size - 4), 3)
 
@@ -665,6 +673,11 @@ class FlyingPadPathEditor:
 
     def _draw_boundary_config(self, screen: pygame.Surface):
         """Draw room selection dialog for boundary waypoints"""
+        # Same fixed real-window-size/position pattern as
+        # _draw_placement_instructions above -- unwrap to the real screen
+        # so this modal dialog doesn't get scaled/repositioned by the
+        # continuous editor zoom.
+        screen = getattr(screen, '_screen', screen)
         # Overlay
         overlay = pygame.Surface((self.screen_width, self.screen_height), pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 150))
@@ -813,8 +826,8 @@ class FlyingPadPathEditor:
             exit_y = (self.pending_boundary_waypoint.y * render_scale) - camera.y
 
             # Draw exit marker
-            pygame.draw.circle(screen, (255, 200, 0), (int(exit_x), int(exit_y)), 8)
-            pygame.draw.circle(screen, (0, 0, 0), (int(exit_x), int(exit_y)), 8, 2)
+            screen.draw_circle((255, 200, 0), (int(exit_x), int(exit_y)), 8)
+            screen.draw_circle((0, 0, 0), (int(exit_x), int(exit_y)), 8, 2)
 
             # Label exit point
             font = pygame.font.Font(None, 16)
@@ -873,6 +886,11 @@ class FlyingPadPathEditor:
 
     def _draw_spawn_placement_instructions(self, screen: pygame.Surface):
         """Draw instructions for spawn point placement"""
+        # Same fixed real-window-size/position pattern as
+        # _draw_placement_instructions above -- unwrap to the real screen
+        # so this HUD panel doesn't get scaled/repositioned by the
+        # continuous editor zoom.
+        screen = getattr(screen, '_screen', screen)
         # Semi-transparent panel at top
         panel_height = 160
         panel = pygame.Surface((self.screen_width, panel_height), pygame.SRCALPHA)

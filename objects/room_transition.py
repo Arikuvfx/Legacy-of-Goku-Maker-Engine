@@ -529,15 +529,16 @@ class TransitionConfigDialog:
         self.ui_rects = {}
 
         # Semi-transparent overlay
-        overlay = pygame.Surface((screen.get_width(), screen.get_height()), pygame.SRCALPHA)
+        screen_width, screen_height = screen.get_size()
+        overlay = pygame.Surface((screen_width, screen_height), pygame.SRCALPHA)
         overlay.fill((0, 0, 0, 150))
         screen.blit(overlay, (0, 0))
 
         # Dialog box
         dialog_width = 600
         dialog_height = 500
-        dialog_x = (screen.get_width() - dialog_width) // 2
-        dialog_y = (screen.get_height() - dialog_height) // 2
+        dialog_x = (screen_width - dialog_width) // 2
+        dialog_y = (screen_height - dialog_height) // 2
 
         dialog_surface = pygame.Surface((dialog_width, dialog_height), pygame.SRCALPHA)
         dialog_surface.fill(self.colors['bg'])

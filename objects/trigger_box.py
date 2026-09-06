@@ -343,7 +343,7 @@ def draw_trigger_box(screen, box, camera_x, camera_y, render_scale, dev_mode=Tru
     screen.blit(fill, rect.topleft)
 
     border_color = (255, 255, 255) if selected else base_color
-    pygame.draw.rect(screen, border_color, rect, 3 if selected else 2)
+    screen.draw_rect(border_color, rect, 3 if selected else 2)
 
     global _LABEL_FONT
     if _LABEL_FONT is None:
