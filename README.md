@@ -1,6 +1,26 @@
 # Legacy-of-Goku-Maker-Engine
 This is a WIP LOG Series Maker Engine with the goal to have an easy engine to use to make fan games of the Legacy of Goku Series, developed by Ariku but being an open source project.
 
+Version 0.3.0
+```
+Changes/Additions:
+- added decoration creator
+- changed melee animation behaviour
+- added halo in character creator
+- added ambient sound object
+- added fishing area object
+- added BGS for rooms
+- added some sounds
+- added shadow-painting to the tileset editor
+- changed ki restore behaviour when using super attacks
+- added collision detection to some super attacks
+- changed flying layering behaviour for the player
+- changed some weather behaviours
+- added super attack silhouettes
+Major Bugfixes:
+- a lot.
+```
+
 Version 0.2.6 - Performance Update - Hotfix
 ```
 Changes/Additions:
