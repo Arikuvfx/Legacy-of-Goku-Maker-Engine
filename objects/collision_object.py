@@ -86,7 +86,8 @@ def beam_block_distance_for_rect(blocking_rect: pygame.Rect, attack):
 class CollisionObject:
     """Invisible wall placed in the editor to block player movement."""
 
-    def __init__(self, x: int, y: int, width: int = 32, height: int = 32, room_name: str = ""):
+    def __init__(self, x: int, y: int, width: int = 32, height: int = 32, room_name: str = "",
+                 diagonal_group_id: str = None, auto_tile: bool = False):
         self.x = x
         self.y = y
         self.width = width
@@ -96,6 +97,23 @@ class CollisionObject:
         self.name = 'Collision Wall'
         self.category = 'System'
         self.active = True
+        # Set (to a shared id) when this box is one segment of a Shift-drag
+        # diagonal wall -- a "staircase" of small, ordinary square
+        # CollisionObjects that approximate a diagonal line. Collision and
+        # beam-blocking math never look at this; it exists purely so the
+        # editor can draw every segment sharing an id as one smooth angled
+        # quad (see draw_collision_group) instead of a visible staircase of
+        # little red squares, and so the editor can tell which boxes belong
+        # to the same drag for selection/undo purposes.
+        self.diagonal_group_id = diagonal_group_id
+        # True when this box was auto-generated from a tile marked "solid"
+        # in the tileset editor's collision paint mode, rather than
+        # hand-placed with the collision tool. Collision/beam math treats
+        # it identically to any other wall -- this only lets the room
+        # editor tell "mine to regenerate" apart from "the user's, leave
+        # alone" when it re-syncs a room's tile-derived collision (see
+        # RoomEditor._sync_tile_collision).
+        self.auto_tile = auto_tile
 
     def check_collision_with_player(self, player) -> bool:
         return player.get_collision_rect().colliderect(self.get_rect())
@@ -125,7 +143,9 @@ class CollisionObject:
             'y': self.y,
             'width': self.width,
             'height': self.height,
-            'room': self.room_name
+            'room': self.room_name,
+            'diagonal_group_id': self.diagonal_group_id,
+            'auto_tile': self.auto_tile,
         }
 
     @staticmethod
@@ -135,7 +155,9 @@ class CollisionObject:
             data.get('y', 0),
             data.get('width', 32),
             data.get('height', 32),
-            room_name
+            room_name,
+            data.get('diagonal_group_id'),
+            data.get('auto_tile', False),
         )
 
 
@@ -232,21 +254,6 @@ def draw_collision_object(screen, collision_obj: CollisionObject, camera_x: int,
 
     screen.blit(line_surf, (int(sx), int(sy)))
 
-    # Corner drag handles
-    handle = 6 * render_scale
-    handle_color = (255, 255, 0) if selected else (255, 200, 0)
-    corners = [
-        (sx,      sy),
-        (sx + sw, sy),
-        (sx,      sy + sh),
-        (sx + sw, sy + sh),
-    ]
-    for cx, cy in corners:
-        hx = int(cx - handle // 2)
-        hy = int(cy - handle // 2)
-        screen.draw_rect(handle_color, (hx, hy, int(handle), int(handle)))
-        screen.draw_rect((0, 0, 0),    (hx, hy, int(handle), int(handle)), 1)
-
     # Dimension label — skip if the box is too small to fit text
     if sw > 50 and sh > 30 and label_bundle is not None:
         bg, label, label_offset = label_bundle
@@ -254,6 +261,91 @@ def draw_collision_object(screen, collision_obj: CollisionObject, camera_x: int,
         label_y = sy + sh // 2 - label_offset[1]
         screen.blit(bg, (label_x - 4, label_y - 2))
         screen.blit(label, (label_x, label_y))
+
+
+def draw_collision_group(screen, boxes: List[CollisionObject], camera_x: int, camera_y: int,
+                          render_scale: int, dev_mode: bool = True, selected: bool = False):
+    """Draws every box in a Shift-drag diagonal run as ONE smooth angled
+    quad instead of the visible staircase of little red squares the
+    underlying boxes actually are. The boxes themselves stay ordinary
+    axis-aligned CollisionObjects (see CollisionObject.diagonal_group_id) --
+    player/beam collision math is completely unaffected, this only changes
+    how the group looks in the editor.
+
+    `boxes` should be the group's boxes in placement order (the order
+    they were walked from drag-start to drag-end); only the first and
+    last box's centers are used to draw the spanning quad, so order
+    matters but gaps/missing middle boxes (e.g. after a partial delete)
+    don't break the drawing, just shorten it slightly less accurately.
+    """
+    if not dev_mode:
+        return
+
+    if len(boxes) < 2:
+        # A group whittled down to one box (partial delete) can't span
+        # anything -- fall back to normal single-box drawing so it
+        # doesn't just disappear.
+        for box in boxes:
+            draw_collision_object(screen, box, camera_x, camera_y, render_scale, dev_mode, selected)
+        return
+
+    def to_screen(box):
+        cx = box.x + box.width / 2
+        cy = box.y + box.height / 2
+        return ((cx * render_scale) - camera_x, (cy * render_scale) - camera_y)
+
+    p0 = to_screen(boxes[0])
+    p1 = to_screen(boxes[-1])
+
+    dx = p1[0] - p0[0]
+    dy = p1[1] - p0[1]
+    length = (dx * dx + dy * dy) ** 0.5
+    if length < 1:
+        draw_collision_object(screen, boxes[0], camera_x, camera_y, render_scale, dev_mode, selected)
+        return
+
+    ux, uy = dx / length, dy / length
+    px, py = -uy, ux  # unit perpendicular to the run
+
+    thickness = boxes[0].width * render_scale
+    half = thickness / 2
+
+    # Extend both ends outward by half the thickness so the quad's flat
+    # ends line up with the outer edge of the first/last box (a square
+    # line-cap), matching where a normal wall's edge would actually sit,
+    # instead of stopping at the box centers and clipping their corners.
+    ex0 = (p0[0] - ux * half, p0[1] - uy * half)
+    ex1 = (p1[0] + ux * half, p1[1] + uy * half)
+
+    quad = [
+        (int(ex0[0] + px * half), int(ex0[1] + py * half)),
+        (int(ex1[0] + px * half), int(ex1[1] + py * half)),
+        (int(ex1[0] - px * half), int(ex1[1] - py * half)),
+        (int(ex0[0] - px * half), int(ex0[1] - py * half)),
+    ]
+
+    alpha = 150 if selected else 100
+    fill_color = (255, 100, 0, alpha) if selected else (255, 0, 0, alpha)
+    screen.draw_polygon(fill_color, quad, 0)
+
+    border_color = (255, 165, 0) if selected else (255, 0, 0)
+    border_width = 3 if selected else 2
+    screen.draw_polygon(border_color, quad, border_width)
+
+    # Length label at the run's midpoint, mirroring the "W x H" label a
+    # normal wall shows in its middle.
+    if length > 40:
+        global _DIM_FONT
+        if _DIM_FONT is None:
+            _DIM_FONT = pygame.font.Font(None, 18)
+        world_length = int(length / render_scale)
+        label = _DIM_FONT.render(f"{world_length}px diagonal", True, (255, 255, 255))
+        bg = pygame.Surface((label.get_width() + 8, label.get_height() + 4), pygame.SRCALPHA)
+        bg.fill((0, 0, 0, 180))
+        mid_x = (p0[0] + p1[0]) / 2 - label.get_width() / 2
+        mid_y = (p0[1] + p1[1]) / 2 - label.get_height() / 2
+        screen.blit(bg, (mid_x - 4, mid_y - 2))
+        screen.blit(label, (mid_x, mid_y))
 
 
 def _build_collision_overlay(collision_obj, sw, sh, render_scale, selected):

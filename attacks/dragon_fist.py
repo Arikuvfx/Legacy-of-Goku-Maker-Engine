@@ -199,6 +199,20 @@ class DragonFistAttack:
 
         self.head_x = anchor_x
         self.head_y = anchor_y
+        # Last wall-resolved head position — NOT the same as "position at
+        # the top of the last update() call". Player._move_dragon_fist_head
+        # steers self.head_x/head_y directly, once per input frame, BEFORE
+        # this frame's update() ever runs (see Game._update_player_movement
+        # vs. player.update() ordering) — so by the time update() would
+        # capture "prev = self.head_x", the head has already been moved
+        # (potentially into a wall) this same frame, making prev and
+        # current identical and any wall resolution against it a no-op.
+        # Tracking the safe position separately, and only ever updating it
+        # AFTER a resolution pass (see _apply_wall_resolution), keeps it
+        # correct regardless of whether input steering, the leash reclamp,
+        # or the shoot-phase step is what moved the head this frame.
+        self._safe_head_x = anchor_x
+        self._safe_head_y = anchor_y
         # Body segments start bunched at the anchor position too.
         # body_positions[-1] is overwritten every frame in update() to
         # track the player (see _update_anchor()); the rest stretch out
@@ -456,6 +470,97 @@ class DragonFistAttack:
         self.head_y = max(min_y, min(self.head_y, max_y))
 
     # ------------------------------------------------------------------
+    # Head vs. walls
+    # ------------------------------------------------------------------
+    def get_head_rect(self, x=None, y=None):
+        """World-space pygame.Rect for the head alone, at (x, y) if given
+        or at the head's current position otherwise. Only the head is
+        wall-tested (see _resolve_head_collision) — the trailing body
+        segments/anchor still bend and slide freely behind it, same as
+        they already do around the leash box, since testing every
+        segment against walls too would fight the spring-damped chain
+        easing and isn't needed for "the head doesn't fly through
+        walls."""
+        hw, hh = self.head_size
+        hx = self.head_x if x is None else x
+        hy = self.head_y if y is None else y
+        return pygame.Rect(hx - hw / 2, hy - hh / 2, hw, hh)
+
+    def _head_blocked_at(self, x, y, collision_objects):
+        if not collision_objects:
+            return False
+        rect = self.get_head_rect(x, y)
+        for wall in collision_objects:
+            if not getattr(wall, 'active', True):
+                continue
+            if rect.colliderect(wall.get_rect()):
+                return True
+        return False
+
+    def _resolve_head_collision(self, prev_x, prev_y, collision_objects):
+        """Slide the head along a wall instead of letting it tunnel
+        through one: resolve a move from (prev_x, prev_y) to the head's
+        current (self.head_x, self.head_y) one axis at a time, reverting
+        whichever axis lands inside a wall — the same axis-separated
+        approach used for ordinary AABB wall sliding elsewhere in the
+        game, so a head moving diagonally along a wall still slides
+        instead of stopping dead.
+
+        Returns True if either axis was blocked.
+        """
+        if not collision_objects:
+            return False
+
+        blocked = False
+        x, y = self.head_x, self.head_y
+
+        if self._head_blocked_at(x, prev_y, collision_objects):
+            x = prev_x
+            blocked = True
+
+        if self._head_blocked_at(x, y, collision_objects):
+            y = prev_y
+            blocked = True
+
+        self.head_x, self.head_y = x, y
+        return blocked
+
+    def _apply_wall_resolution(self, collision_objects):
+        """Resolve self.head_x/head_y against `collision_objects` relative
+        to self._safe_head_x/_safe_head_y (the last position that was
+        itself already confirmed wall-free), then advance that safe
+        position to match.
+
+        Called after EVERY place that can move the head — input steering
+        (move_head_by), the leash reclamp, and the shoot-phase step (see
+        update()) — so _safe_head_x/y is always the true "before this
+        particular move" reference, regardless of which of those actually
+        ran first in a given frame. Calling it twice in the same frame
+        (e.g. move_head_by already resolved this frame, then update()'s
+        controlled-branch reclamp calls it again) is harmless: the second
+        call just finds self.head_x/head_y already equal to
+        _safe_head_x/y and resolves against itself, a no-op.
+        """
+        hit_wall = self._resolve_head_collision(
+            self._safe_head_x, self._safe_head_y, collision_objects)
+        self._safe_head_x, self._safe_head_y = self.head_x, self.head_y
+        return hit_wall
+
+    def move_head_by(self, dx, dy, player_x, player_y, collision_objects=None):
+        """Apply one frame of player-steered head movement: offset the
+        head, re-clamp it into the leash box, then resolve it against
+        walls. Called from Player._move_dragon_fist_head instead of that
+        method touching head_x/head_y and clamp_head_to_leash directly,
+        so wall resolution always happens as part of the same move that
+        caused it — see _apply_wall_resolution's docstring for why that
+        matters given move() runs before this frame's update().
+        """
+        self.head_x += dx
+        self.head_y += dy
+        self.clamp_head_to_leash(player_x, player_y)
+        self._apply_wall_resolution(collision_objects)
+
+    # ------------------------------------------------------------------
     # State control
     # ------------------------------------------------------------------
     def start_retract(self):
@@ -502,6 +607,8 @@ class DragonFistAttack:
         """
         self.head_x += dx
         self.head_y += dy
+        self._safe_head_x += dx
+        self._safe_head_y += dy
         self.origin_x += dx
         self.origin_y += dy
         for seg in self.body_positions[:-1]:
@@ -514,7 +621,7 @@ class DragonFistAttack:
     # ------------------------------------------------------------------
     # Update
     # ------------------------------------------------------------------
-    def update(self, dt, player_x, player_y):
+    def update(self, dt, player_x, player_y, collision_objects=None):
         if not self.active:
             return
 
@@ -532,24 +639,46 @@ class DragonFistAttack:
             dxu, dyu = _DIRECTION_UNIT.get(self.direction, (0, 0))
             self.head_x += dxu * self.shoot_speed * dt
             self.head_y += dyu * self.shoot_speed * dt
+            hit_wall = self._apply_wall_resolution(collision_objects)
             traveled = math.hypot(self.head_x - self.origin_x, self.head_y - self.origin_y)
-            if traveled >= self.shoot_distance:
+            if hit_wall:
+                # Ran into a wall before reaching shoot_distance — hand
+                # control to the player right here instead of continuing
+                # to push into it. self.head_x/head_y is already sitting
+                # at the last wall-free spot (see _apply_wall_resolution),
+                # so nothing further to snap.
+                self.state = 'controlled'
+            elif traveled >= self.shoot_distance:
                 # Snap exactly to shoot_distance so a large dt overshooting
                 # this frame doesn't leave the head further out than the
                 # controlled phase's own leash box would otherwise allow.
+                # This can, in principle, snap back into a wall that a
+                # non-overshooting frame would have caught above — an
+                # edge case for a very large dt on a very thin wall right
+                # at the shoot_distance boundary — so resolve once more
+                # against the now-updated safe position.
                 self.head_x = self.origin_x + dxu * self.shoot_distance
                 self.head_y = self.origin_y + dyu * self.shoot_distance
+                self._apply_wall_resolution(collision_objects)
                 self.state = 'controlled'
 
         elif self.state == 'controlled':
             # Movement input itself is applied directly in
-            # Player._move_dragon_fist_head, once per input frame — this
-            # just re-clamps every update() call in case the leash box
-            # moved since (its "back" edge tracks the player's current
-            # position, which can move during the opening lunge — see
-            # Player._advance_dragon_fist_lunge — or from ordinary
-            # walking once the player's free to move again).
+            # Player._move_dragon_fist_head (via move_head_by(), which
+            # already resolves wall collision as part of that same move)
+            # — this just re-clamps every update() call in case the
+            # leash box moved since (its "back" edge tracks the player's
+            # current position, which can move during the opening lunge
+            # — see Player._advance_dragon_fist_lunge — or from ordinary
+            # walking once the player's free to move again). Resolving
+            # against walls again here is what catches THAT case: the
+            # leash's far edge can itself sit past a wall the head was
+            # already resting against, and moving is what could reveal
+            # it. If input already resolved this same frame,
+            # _apply_wall_resolution below just finds nothing left to
+            # do — see its docstring.
             self.clamp_head_to_leash(player_x, player_y)
+            self._apply_wall_resolution(collision_objects)
 
         # Everything about the chain — target waypoints, the spring easing
         # toward them, and the gap safety clamp — only actually advances

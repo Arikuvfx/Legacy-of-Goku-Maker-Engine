@@ -2,6 +2,7 @@ import pygame
 import math
 from typing import Optional, Callable
 from objects.nimbus_cloud import NimbusCloud, NimbusCloudWaypoint
+from core.draw_layers import DrawLayer
 
 
 class NimbusCloudController:
@@ -57,6 +58,10 @@ class NimbusCloudController:
         self.waypoints              = []
         self.player                 = None
         self.cloud: Optional[NimbusCloud] = None
+
+        # Player's draw_layer from just before boarding, so dismounting can
+        # restore it exactly rather than assuming it was DrawLayer.PLAYER.
+        self._prev_player_draw_layer = None
 
         # Movement
         self.board_speed       = 65   # World units/sec while walking onto the cloud.
@@ -201,6 +206,14 @@ class NimbusCloudController:
         # checks elsewhere in Player/Game apply here too.
         if hasattr(player, 'is_flying'):
             player.is_flying = True
+
+        # Draw above every other layer -- ground, shadows, NPCs, enemies,
+        # foreground objects -- for the whole ride (boarding included), but
+        # still stay underneath particle effects (DrawLayer.PARTICLES).
+        # Restored on dismount in _complete_ride.
+        if hasattr(player, 'draw_layer'):
+            self._prev_player_draw_layer = player.draw_layer
+            player.draw_layer = DrawLayer.FLYING
 
         self.player.is_attacking     = False
         self.player.is_charging_beam = False
@@ -454,6 +467,11 @@ class NimbusCloudController:
 
         if hasattr(self.player, 'is_flying'):
             self.player.is_flying = False
+
+        # Restore whatever draw_layer the player had before boarding.
+        if hasattr(self.player, 'draw_layer') and self._prev_player_draw_layer is not None:
+            self.player.draw_layer = self._prev_player_draw_layer
+        self._prev_player_draw_layer = None
 
         # Player is already in idle pose from _anchor_idle; nothing further
         # to change animation-wise on landing.

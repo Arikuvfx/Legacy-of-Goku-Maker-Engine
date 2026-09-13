@@ -699,3 +699,23 @@ class TransitionConfigDialog:
 
         # Cancel button
         cancel_x = dialog_width - button_width - 50
+        cancel_rect = pygame.Rect(cancel_x, button_y, button_width, 50)
+        cancel_is_hover = cancel_rect.collidepoint(adjusted_mouse)
+        cancel_color = (230, 100, 100) if cancel_is_hover else (200, 80, 80)
+
+        pygame.draw.rect(dialog_surface, cancel_color, cancel_rect, border_radius=5)
+        pygame.draw.rect(dialog_surface, self.colors['accent'], cancel_rect, 2, border_radius=5)
+
+        cancel_text = self.font_large.render("Cancel", True, (255, 255, 255))
+        cancel_text_rect = cancel_text.get_rect(center=cancel_rect.center)
+        dialog_surface.blit(cancel_text, cancel_text_rect)
+
+        self.ui_rects['cancel_button'] = cancel_rect.move(dialog_x, dialog_y)
+
+        # The dialog has been composed entirely on the off-screen
+        # dialog_surface above (title, dropdowns, Save/Cancel buttons).
+        # This final blit is what was missing — without it none of that
+        # ever reached the visible screen, only the dim overlay did.
+        # screen.blit() works whether `screen` is a real pygame.Surface
+        # or a GPUScreen (see gpu_renderer.py) since both implement blit().
+        screen.blit(dialog_surface, (dialog_x, dialog_y))

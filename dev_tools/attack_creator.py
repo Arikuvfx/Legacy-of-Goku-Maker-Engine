@@ -4,12 +4,14 @@ dev_tools/attack_creator.py — In-engine Attack Creator
 Lets you build an attack (currently: beam-family — final_flash /
 banshee_blast / big_bang_kamehameha style — chain-family —
 flame_kamehameha style — projectile-family — burning_attack style —
-sword-family — energy_sword style — dragon-fist-family, or
-genkidama-family — a five-power-state hold-then-throw ball) entirely from
+sword-family — energy_sword style — dragon-fist-family,
+genkidama-family — a five-power-state hold-then-throw ball, or
+ultra-volleyball-family — a fixed-length, three-segment chain that
+travels rigidly to a fixed distance then despawns) entirely from
 data, preview it live on any player character, tweak every parameter
-while it's charging/firing/decaying (firing/stopping for chain, or
-firing/despawning for projectile and genkidama), and save it to
-assets/attack_configs/{id}.json.
+while it's charging/firing/decaying (firing/stopping for chain,
+firing/despawning for projectile, genkidama and ultra volleyball), and
+save it to assets/attack_configs/{id}.json.
 
 This is WYSIWYG on purpose: the stage doesn't simulate the attack, it
 constructs and drives the REAL attacks.beam.BeamAttack and
@@ -138,6 +140,7 @@ ARCHETYPES = {
     "sword": ("Sword", _ATTACK_CONFIG_REGISTRY["sword"]),
     "dragon_fist": ("Dragon Fist", _ATTACK_CONFIG_REGISTRY["dragon_fist"]),
     "genkidama": ("Genkidama", _ATTACK_CONFIG_REGISTRY["genkidama"]),
+    "ultra_volleyball": ("Ultra Volleyball", _ATTACK_CONFIG_REGISTRY["ultra_volleyball"]),
 }
 
 # ── Palette (matches character_creator.py's dark dev-tool look) ─────────
@@ -190,14 +193,15 @@ PREVIEW_WORLD_BOUND = 4000
 # needing its own hand-wired drag code. "charge" is shared by every
 # archetype that has a wind-up beat (see the class docstring's note on
 # that naming convention); "beam"/"chain"/"projectile"/"dragon_fist"/
-# "sword" are each archetype's own fired-attack spawn offset (attacks/
-# attack_config.py's beam_offsets/chain_offsets/projectile_offsets/
-# dragon_fist_offsets/sword_offsets). Two of these need extra handling
-# beyond "add the offset to actor.x/y" — see _offset_anchor_extra() (
-# dragon_fist's crosshair needs to sit at the real anchor point, not the
-# raw player position) and _drag_offset_to()'s per-archetype live-nudge
-# branches (sword's spin re-reads its offset live every frame rather than
-# baking it in once at construction).
+# "sword"/"ultra_volleyball" are each archetype's own fired-attack spawn
+# offset (attacks/attack_config.py's beam_offsets/chain_offsets/
+# projectile_offsets/dragon_fist_offsets/sword_offsets/
+# ultra_volleyball_offsets). Two of these need extra handling beyond "add
+# the offset to actor.x/y" — see _offset_anchor_extra() (dragon_fist's
+# crosshair needs to sit at the real anchor point, not the raw player
+# position) and _drag_offset_to()'s per-archetype live-nudge branches
+# (sword's spin re-reads its offset live every frame rather than baking
+# it in once at construction).
 OFFSET_ATTR_FOR_TAB = {
     "charge": "direction_offsets",
     "beam": "beam_offsets",
@@ -206,6 +210,7 @@ OFFSET_ATTR_FOR_TAB = {
     "dragon_fist": "dragon_fist_offsets",
     "sword": "sword_offsets",
     "genkidama": "genkidama_offsets",
+    "ultra_volleyball": "ultra_volleyball_offsets",
 }
 
 
@@ -643,6 +648,42 @@ class PreviewActor:
             "firing":   [("charge_genkidama", -1), ("charge", None), ("idle", None), ("walk", None)],
             "decaying": [("charge_genkidama", -1), ("charge", None), ("idle", None), ("walk", None)],
         },
+        # Ultra Volleyball (attacks/ultra_volleyball_attack.py): unlike
+        # every archetype above, there's no dedicated 'ultra_volleyball'
+        # clip on disk at all — Player.shoot_ultra_volleyball() reuses the
+        # exact same kiblast.png wind-up/throw sheet a regular blast uses
+        # (see that method's own docstring). Unlike the 'projectile' entry
+        # above though, this archetype has no charge tab at all (goes
+        # straight from press to STATE_FIRING — see
+        # UltraVolleyballAttackConfig's docstring), so there's no separate
+        # "charging" phase to pin frame 0 during and a "firing" phase to
+        # pin frame 1 during the way projectile does — pinning straight to
+        # frame 1 the instant firing starts skipped the wind-up entirely
+        # and just snapped to a static throw pose.
+        #
+        # The (None, 1, 2) here means: play kiblast_{direction} through
+        # once from frame 0 (reset by set_anim_state()'s frame reset on
+        # the idle->firing transition), holding/looping just its last 1
+        # frame once it gets there (frame 1, the throw pose) — same
+        # loop_tail_frames convention 'dragon_fist' uses above — but
+        # capped to the first 2 raw frames before any of that runs (the
+        # max_frames=2 — see _refresh_sprite's own comment on why this
+        # preview's raw kiblast list is longer than what the real game
+        # ever shows). Without the cap, a bare loop_tail would play
+        # through every frame the sheet actually has — including the
+        # extra one the real 'kiblast' animation never uses — before
+        # settling, which is what "plays the whole thing instead of just
+        # specific frames" looked like before this was added. There's
+        # also no decay pose — release doesn't stop this attack early
+        # (see UltraVolleyballAttack.no_release_cancel / _on_fire_release
+        # below), it just keeps flying until it self-despawns — so
+        # "firing" and "decaying" share the same entry.
+        "ultra_volleyball": {
+            "idle":     [("idle", None), ("walk", None), ("run", None)],
+            "charging": [("kiblast", None, 1, 2), ("idle", None), ("walk", None)],
+            "firing":   [("kiblast", None, 1, 2), ("idle", None), ("walk", None)],
+            "decaying": [("kiblast", None, 1, 2), ("idle", None), ("walk", None)],
+        },
     }
     FRAME_DURATION = 0.12  # seconds per frame, animated regardless of state
 
@@ -721,8 +762,26 @@ class PreviewActor:
         instead of cycling — see the class docstring note on kiblast/
         kiblast_hold1 above — or, as a third optional element, a
         loop_tail_frames count (see __init__'s note on _loop_tail and the
-        'dragon_fist' entry below) — entries can be 2- or 3-tuples, mixed
-        freely within the same map."""
+        'dragon_fist' entry below), or, as a fourth optional element,
+        max_frames — entries can be 2-, 3-, or 4-tuples, mixed freely
+        within the same map.
+
+        max_frames caps how much of the loaded sheet this entry actually
+        uses, taken from the front: frames[:max_frames]. This exists
+        because this preview loads character art via
+        character_creator.discover_animations(), which just slices a
+        whole row into frames — it has no idea that the real game's
+        CharacterSpriteLoader only ever registers a SUBSET of kiblast.png
+        under the 'kiblast' key (frame_indices=(0, 1) — see
+        sprite_system.py's own comment: "kiblast.png is laid out as
+        [start, right-hand throw, left-hand throw]", i.e. 3 raw frames on
+        disk, only the first 2 of which the real 'kiblast' animation ever
+        shows; the third is loaded separately under 'kiblast_hold1'). So
+        this preview's raw 'kiblast_{direction}' list is longer than what
+        actually plays in-game, and a loop_tail here without a cap would
+        visibly cycle through that extra frame before settling — see the
+        'ultra_volleyball' entry below, which caps at 2 for exactly this
+        reason."""
         anim_map = self.ANIM_FOR_STATE_BY_ARCHETYPE.get(
             self.anim_archetype, self._BEAM_STYLE_ANIM_FOR_STATE)
         lookup_direction = self._octant_override or self.direction
@@ -730,8 +789,11 @@ class PreviewActor:
             anim_name = entry[0]
             hold_frame = entry[1] if len(entry) > 1 else None
             loop_tail = entry[2] if len(entry) > 2 else None
+            max_frames = entry[3] if len(entry) > 3 else None
             frames = self._frames_for(anim_name, lookup_direction)
             if frames:
+                if max_frames:
+                    frames = frames[:max_frames]
                 self._active_frames = frames
                 self._loop_tail = loop_tail
                 self._finished = False
@@ -879,6 +941,24 @@ class AttackCreator:
         self.charge_obj = None
         self.attack_obj = None
         self.charge_elapsed = 0.0
+        # Ultra-Volleyball-only: mirrors player.py's pending_ultra_volleyball
+        # gate. Set to True in _on_fire_press() instead of building
+        # attack_obj right away, then flips to 'ready' in update() once
+        # _pending_ultra_volleyball_elapsed reaches one frame's worth of
+        # wind-up — see update()'s STATE_FIRING/_pending_ultra_volleyball
+        # branch for why this is tracked as an independent wall-clock
+        # timer rather than read off self.actor's own frame index (that
+        # index isn't refreshed for the new "firing" state until
+        # self.actor.set_anim_state()/update() run at the *bottom* of this
+        # same update(), so checking it earlier in the method — before
+        # those calls — read whatever frame the *previous* animation
+        # happened to be sitting on, which was often already >= 1 and
+        # fired the attack on the very first tick after press regardless).
+        # Same "don't trust art/animation internals to gate real game
+        # logic" reasoning as self.charge_elapsed below.
+        self._pending_ultra_volleyball = None
+        self._pending_direction = None
+        self._pending_ultra_volleyball_elapsed = 0.0
 
         # Real LayerManager (core/draw_layers.py) — the same one game.py
         # uses — so the stage sorts actor/charge_obj/attack_obj by their
@@ -1142,6 +1222,24 @@ class AttackCreator:
             self.charge_obj = self.config.build_charge_effect(self.actor)
             self.charge_elapsed = 0.0
             self.state = self.STATE_CHARGING
+        elif self.active_archetype == "ultra_volleyball":
+            # Don't build the flying attack_obj yet — the actor is only
+            # just starting the shared kiblast wind-up (frame 0). Building
+            # it here made the volleyball launch on the same frame the
+            # wind-up pose first appears, a full throw-frame early compared
+            # to the real game, where shoot_ultra_volleyball() only arms
+            # pending_ultra_volleyball and the actual attack isn't spawned
+            # until the kiblast animation reaches frame index 1 (see
+            # player.py's update(), 'kiblast' branch). Enter STATE_FIRING
+            # now so the wind-up animation starts playing, and let
+            # update() build attack_obj once one frame's worth of wind-up
+            # has elapsed (see _pending_ultra_volleyball_elapsed's own
+            # comment for why that's a separate timer instead of reading
+            # the actor's frame index directly).
+            self._pending_ultra_volleyball = True
+            self._pending_direction = direction
+            self._pending_ultra_volleyball_elapsed = 0.0
+            self.state = self.STATE_FIRING
         else:
             self.attack_obj = self.config.build_attack(self.actor.x, self.actor.y, direction, player=self.actor)
             self.state = self.STATE_FIRING
@@ -1199,7 +1297,22 @@ class AttackCreator:
             # "start*, then let update() run it down to inactive" shape
             # start_decay() already has — so it's handled the same way,
             # just via a different method name.
-            if getattr(self.attack_obj, "no_release_cancel", False):
+            #
+            # Ultra-Volleyball-family attacks (UltraVolleyballAttack) are a
+            # fifth case, same shape as sword: release should do NOTHING —
+            # all three segments travel their fixed travel_distance and
+            # despawn on their own timer regardless of how long the button
+            # was held (see that class's docstring), so it opts out via
+            # no_release_cancel exactly like EnergySwordSpinEffect does.
+            if self._pending_ultra_volleyball is not None:
+                # attack_obj hasn't spawned yet — still mid wind-up waiting
+                # on the frame-1 throw threshold (see the STATE_FIRING
+                # branch in update()). Same no_release_cancel contract as
+                # the spawned case below: release does nothing, the
+                # wind-up keeps playing and the volleyball still launches
+                # on schedule.
+                pass
+            elif getattr(self.attack_obj, "no_release_cancel", False):
                 pass
             elif hasattr(self.attack_obj, "start_decay"):
                 self.attack_obj.start_decay()
@@ -1218,6 +1331,9 @@ class AttackCreator:
         self.state = self.STATE_IDLE
         self.charge_obj = None
         self.attack_obj = None
+        self._pending_ultra_volleyball = None
+        self._pending_direction = None
+        self._pending_ultra_volleyball_elapsed = 0.0
 
     def _toggle_pause(self):
         """Freeze the fire state machine and the actor's own animation so
@@ -1271,6 +1387,26 @@ class AttackCreator:
                     self.actor.x, self.actor.y, self.actor.direction, player=self.actor)
                 self.charge_obj = None
                 self.state = self.STATE_FIRING
+        elif self.state == self.STATE_FIRING and self._pending_ultra_volleyball is not None:
+            # Waiting out one frame's worth of the kiblast wind-up before
+            # spawning the attack — see _pending_ultra_volleyball_elapsed's
+            # comment in __init__ for why this is a standalone dt-driven
+            # timer (self.actor.FRAME_DURATION is the actor's own per-
+            # frame duration, so this waits exactly as long as the wind-up
+            # pose (frame 0) is actually on screen for) rather than reading
+            # self.actor's frame index, which isn't refreshed for this
+            # state until self.actor.set_anim_state()/update() run further
+            # down in this same method.
+            if self._pending_ultra_volleyball is True:
+                self._pending_ultra_volleyball_elapsed += dt
+                if self._pending_ultra_volleyball_elapsed >= self.actor.FRAME_DURATION:
+                    self._pending_ultra_volleyball = 'ready'
+            if self._pending_ultra_volleyball == 'ready':
+                self.attack_obj = self.config.build_attack(
+                    self.actor.x, self.actor.y, self._pending_direction, player=self.actor)
+                self._pending_ultra_volleyball = None
+                self._pending_direction = None
+                self._pending_ultra_volleyball_elapsed = 0.0
         elif self.state in (self.STATE_FIRING, self.STATE_DECAYING) and self.attack_obj:
             # Projectile-family attacks (BurningAttack, inherited from
             # attacks.projectile.Projectile) take world_width/world_height

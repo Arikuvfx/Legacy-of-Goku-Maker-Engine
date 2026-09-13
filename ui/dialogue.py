@@ -141,11 +141,29 @@ class DialogueBox:
 
         self._load_sheet()
 
-        font_scale = 4
+        # Same integer scale factor the textbox art itself is drawn at (see
+        # _box_layout()/draw()'s identical `sf` calc) — previously this was
+        # a hardcoded 4, completely disconnected from how big the box art
+        # actually ends up on screen, so the two only matched by
+        # coincidence. Baking the glyphs at this scale instead keeps text
+        # size locked to the box's actual size, at any screen resolution or
+        # textbox.png source size.
+        font_scale = self._compute_box_scale()
         self._font_upper   = _BitmapFont('assets/ui/fonts/uppercase', scale=font_scale)
         self._font_lower   = _BitmapFont('assets/ui/fonts/lowercase', scale=font_scale)
         self._font_numbers = _BitmapFont('assets/ui/fonts/numbers',   scale=font_scale)
         self._fallback     = pygame.font.Font(None, max(14, int(20 / _S)))
+
+    def _compute_box_scale(self):
+        """Integer scale factor the textbox art is drawn at — box art is
+        scaled up to fill target_h (30% of the screen height) using the
+        largest whole multiple of the sheet's native frame height that
+        fits. Shared by __init__ (to scale the bitmap font to match),
+        _box_layout(), and draw(), so all three always agree."""
+        target_h = max(1, int(self.screen_height * 0.3))
+        if self._frame_h > 0:
+            return max(1, round(target_h / self._frame_h))
+        return 4  # no textbox.png loaded — arbitrary fallback, nothing to match
 
     def _load_sheet(self):
         path = 'assets/ui/textbox/textbox.png'
@@ -296,7 +314,7 @@ class DialogueBox:
         target_h = max(1, int(self.screen_height * 0.3))
 
         if frame:
-            sf    = max(1, round(target_h / self._frame_h)) if self._frame_h > 0 else 1
+            sf    = self._compute_box_scale()
             box_w = self._frame_w * sf
             box_h = self._frame_h * sf
         else:
@@ -401,7 +419,7 @@ class DialogueBox:
         target_h = max(1, int(self.screen_height * 0.3))
 
         if frame:
-            sf    = max(1, round(target_h / self._frame_h)) if self._frame_h > 0 else 1
+            sf    = self._compute_box_scale()
             box_w = self._frame_w * sf
             box_h = self._frame_h * sf
             scaled_box = pygame.transform.scale(frame, (box_w, box_h))
@@ -553,7 +571,48 @@ class DialogueChoiceMenu:
 
     PAGE_SIZE = 3
 
-    def __init__(self, screen_width, screen_height):
+    def __init__(self, screen_width, screen_height, row_gap=16, pad_y_min=24,
+                 bottom_margin=120, text_x_nudge=12, arrow_spacing=10,
+                 arrow_y_offset=0,
+                 text_spacing=6, word_gap=6,
+                 box_height_ratio=0.24, box_scale_round=False,
+                 font_upper_path='assets/ui/fonts/uppercase',
+                 font_lower_path='assets/ui/fonts/lowercase',
+                 font_numbers_path='assets/ui/fonts/numbers'):
+        """row_gap/pad_y_min/bottom_margin/text_x_nudge/arrow_spacing are the
+        box's layout knobs (see draw()), overridable per-instance so a caller
+        that wants different spacing (e.g. FishingPrompt) doesn't have to
+        change it for every DialogueChoiceMenu in the game. Defaults match
+        the original hardcoded values.
+
+        arrow_y_offset shifts the selection arrow/star vertically (positive
+        = down, negative = up) relative to its normal row-centered position,
+        without touching text_y or row_h — so it only nudges the indicator,
+        not the option text. Defaults to 0, i.e. no change from the
+        original centered placement, for every existing caller.
+
+        text_spacing is the per-character gap used when rendering the
+        prompt/option lines (draw()'s hardcoded spacing=6 calls). word_gap
+        is the width of a literal space between words, used inside
+        _text_width()/_render_line() wherever a ' ' character is hit.
+
+        box_height_ratio/box_scale_round control the integer scale factor
+        the menu's box art (and, since font_scale is derived from the same
+        call, its text) is drawn at — see _compute_base_scale(). Defaults
+        (0.24, round-down via int()) match every existing DialogueChoiceMenu
+        caller's original box size exactly. DialogueBox (the box used for
+        NPC/narrator lines and for "You found a/an X!" pickup notices) uses
+        a different ratio (0.3) and rounds to the nearest integer scale
+        instead of always rounding down — pass box_height_ratio=0.3,
+        box_scale_round=True to make a specific DialogueChoiceMenu-based
+        prompt (e.g. FishingPrompt) come out the same on-screen size as
+        that box, without changing the ratio for any other caller.
+
+        font_upper_path/font_lower_path/font_numbers_path point at the
+        glyph-sheet folders for _BitmapFont (see its _load()) — override
+        one to swap in a different glyph set (e.g. a menu-specific
+        uppercase folder with its own question.png) for just this
+        instance, without touching every other DialogueChoiceMenu."""
         self.screen_width  = screen_width
         self.screen_height = screen_height
         self.active  = False
@@ -561,6 +620,17 @@ class DialogueChoiceMenu:
         self.options = []          # list[str] — labels for the CURRENT page only
         self.selected_option = 0
         self._on_choice = None
+
+        self.row_gap       = row_gap
+        self.pad_y_min     = pad_y_min
+        self.bottom_margin = bottom_margin
+        self.text_x_nudge  = text_x_nudge
+        self.arrow_spacing = arrow_spacing
+        self.arrow_y_offset = arrow_y_offset
+        self.text_spacing  = text_spacing
+        self.word_gap      = word_gap
+        self.box_height_ratio = box_height_ratio
+        self.box_scale_round  = box_scale_round
 
         self._all_options = []     # list[str] — the full, unpaginated option list
         self._page = 0
@@ -570,10 +640,17 @@ class DialogueChoiceMenu:
         self.arrow_sprite = None
         self._load_sprites()
 
-        font_scale = 4
-        self._font_upper   = _BitmapFont('assets/ui/fonts/uppercase', scale=font_scale)
-        self._font_lower   = _BitmapFont('assets/ui/fonts/lowercase', scale=font_scale)
-        self._font_numbers = _BitmapFont('assets/ui/fonts/numbers',   scale=font_scale)
+        # Same integer scale factor the menu's own box art is drawn at (see
+        # draw()'s identical `base_scale` calc) — previously this was a
+        # hardcoded 4, disconnected from how big the box art actually ends
+        # up on screen, so text and box only matched by coincidence.
+        # Baking the glyphs at this scale instead keeps text size locked to
+        # the box's actual size, at any screen resolution or menu_sprite
+        # source size.
+        font_scale = self._compute_base_scale()
+        self._font_upper   = _BitmapFont(font_upper_path,   scale=font_scale)
+        self._font_lower   = _BitmapFont(font_lower_path,   scale=font_scale)
+        self._font_numbers = _BitmapFont(font_numbers_path, scale=font_scale)
         self._fallback     = pygame.font.Font(None, max(14, int(20 / _S)))
 
         self.text_color  = (255, 255, 255)
@@ -603,8 +680,35 @@ class DialogueChoiceMenu:
         except Exception:
             self.arrow_sprite = None
 
+    def _compute_base_scale(self):
+        """Integer scale factor the menu's box art is drawn at — mirrors
+        draw()'s own `base_scale` calc exactly, so __init__ (to scale the
+        bitmap font to match) and draw() always agree.
+
+        Ratio and rounding come from box_height_ratio/box_scale_round (see
+        __init__) so a specific instance can be sized to match a different
+        box (e.g. DialogueBox's 0.3-ratio, rounded scale) without changing
+        the default 0.24/round-down behavior every other caller relies on.
+        """
+        if self.menu_sprite:
+            _sprite_w, _sprite_h = self.menu_sprite.get_size()
+        else:
+            _sprite_w, _sprite_h = 144, 40
+        if self.box_scale_round:
+            # Mirrors DialogueBox._compute_box_scale()'s exact math (int()
+            # the target height first, *then* round the division) so a
+            # caller that passes box_scale_round=True lands on precisely
+            # the same integer scale DialogueBox would for the same
+            # screen_height/ratio/sprite — not just an approximately equal
+            # one that happens to agree for most screen sizes.
+            target_h = max(1, int(self.screen_height * self.box_height_ratio))
+            scaled = round(target_h / _sprite_h)
+        else:
+            scaled = int(self.screen_height * self.box_height_ratio / _sprite_h)
+        return max(1, scaled)
+
     # ── mixed-case rendering helpers (mirrors DialogueBox's own) ────────────
-    _DESCENDER_OFFSETS = {'p': 10, 'q': 10, 'g': 10, 'y': 12}
+    _DESCENDER_OFFSETS = {'p': 15, 'q': 15, 'g': 15, 'y': 15}
 
     def _font_for(self, ch):
         return (self._font_numbers if ch.isdigit()
@@ -625,7 +729,7 @@ class DialogueChoiceMenu:
             if ch in font.glyphs:
                 w += font.glyphs[ch].get_width() + spacing
             elif ch == ' ':
-                w += int(6 * max(1, _S))
+                w += int(self.word_gap * max(1, _S))
         return max(0, w - spacing)
 
     def _render_line(self, screen, text, x, y, color, spacing=1):
@@ -645,7 +749,7 @@ class DialogueChoiceMenu:
                 screen.blit(g, (cx, y + oy))
                 cx += g.get_width() + spacing
             elif ch == ' ':
-                cx += int(6 * max(1, _S))
+                cx += int(self.word_gap * max(1, _S))
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -824,10 +928,10 @@ class DialogueChoiceMenu:
             _sprite_w, _sprite_h = self.menu_sprite.get_size()
         else:
             _sprite_w, _sprite_h = 144, 40
-        base_scale = max(1, int(self.screen_height * 0.24 / _sprite_h))
+        base_scale = self._compute_base_scale()
         lh       = self._line_height()
-        pad_y    = max(24, lh // 2)
-        row_gap  = 16
+        pad_y    = max(self.pad_y_min, lh // 2)
+        row_gap  = self.row_gap
         row_h    = lh + row_gap
         prompt_h = (lh + row_gap) if self.prompt else 0
 
@@ -847,7 +951,7 @@ class DialogueChoiceMenu:
         current_height = int(menu_height * scale_factor)
 
         menu_x = (self.screen_width - current_width) // 2
-        menu_y = self.screen_height - current_height - 120
+        menu_y = self.screen_height - current_height - self.bottom_margin
 
         if current_width > 0 and current_height > 0:
             if self.menu_sprite:
@@ -869,9 +973,9 @@ class DialogueChoiceMenu:
             display_prompt = self.prompt[:self._prompt_chars_shown]
             if display_prompt:
                 if self._has_bitmap_font():
-                    pw = self._text_width(display_prompt, spacing=6)
+                    pw = self._text_width(display_prompt, spacing=self.text_spacing)
                     self._render_line(screen, display_prompt, menu_center_x - pw // 2, text_y,
-                                       self.text_color, spacing=6)
+                                       self.text_color, spacing=self.text_spacing)
                 else:
                     surf = self._fallback.render(display_prompt, True, self.text_color)
                     screen.blit(surf, (menu_center_x - surf.get_width() // 2, text_y))
@@ -885,13 +989,13 @@ class DialogueChoiceMenu:
                 continue
 
             if self._has_bitmap_font():
-                tw = self._text_width(display_text, spacing=6)
+                tw = self._text_width(display_text, spacing=self.text_spacing)
             else:
                 tw = self._fallback.size(display_text)[0]
-            text_x = menu_center_x - tw // 2 + 12  # nudge right, leaves room for the arrow on the left
+            text_x = menu_center_x - tw // 2 + self.text_x_nudge  # nudge right, leaves room for the arrow on the left
 
             if i == self.selected_option and chars_to_show > 0 and self.arrow_visible:
-                arrow_spacing = 10
+                arrow_spacing = self.arrow_spacing
                 lh = self._line_height() if self._has_bitmap_font() else self._fallback.get_linesize()
                 if self.arrow_sprite:
                     arrow_scale = lh / self.arrow_sprite.get_height()
@@ -901,11 +1005,11 @@ class DialogueChoiceMenu:
                          int(self.arrow_sprite.get_height() * arrow_scale))
                     )
                     arrow_x = text_x - scaled_arrow.get_width() - arrow_spacing
-                    arrow_y = option_y + (lh - scaled_arrow.get_height()) // 2
+                    arrow_y = option_y + (lh - scaled_arrow.get_height()) // 2 + self.arrow_y_offset
                     screen.blit(scaled_arrow, (arrow_x, arrow_y))
                 else:
                     star_x = text_x - arrow_spacing
-                    star_y = option_y + row_h // 2
+                    star_y = option_y + row_h // 2 + self.arrow_y_offset
                     scale = max(1, base_scale) * 1.2
                     star_points = [
                         (star_x, star_y - int(6 * scale)),
@@ -922,7 +1026,7 @@ class DialogueChoiceMenu:
                     pygame.draw.polygon(screen, self.arrow_color, star_points)
 
             if self._has_bitmap_font():
-                self._render_line(screen, display_text, text_x, option_y, self.text_color, spacing=6)
+                self._render_line(screen, display_text, text_x, option_y, self.text_color, spacing=self.text_spacing)
             else:
                 surf = self._fallback.render(display_text, True, self.text_color)
                 screen.blit(surf, (text_x, option_y))

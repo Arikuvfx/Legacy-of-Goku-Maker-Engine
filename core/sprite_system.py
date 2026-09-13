@@ -1,6 +1,8 @@
 import pygame
 import os
 import random
+import json
+import weakref
 from config.settings import RENDER_SCALE
 
 
@@ -15,6 +17,21 @@ DIRECTION_MAP_4 = {name: index for index, name in enumerate(DIRECTIONS_4)}
 
 DIRECTIONS_8 = ('down', 'down_left', 'left', 'up_left', 'up', 'up_right', 'right', 'down_right')
 DIRECTION_MAP_8 = {name: index for index, name in enumerate(DIRECTIONS_8)}
+
+
+def _normpath(path):
+    """Canonicalize a filepath for use as a cache/lookup key.
+
+    AssetWatcher builds its paths with os.path.join() while sprite-loading
+    code here builds them with hardcoded forward slashes (f"{base}/{name}.png")
+    — on Windows those two styles produce different strings for the same file
+    (mixed slashes vs. all-backslash), which would silently break the
+    file-changed -> cache-key match this module relies on for hot-reload.
+    Routing every path through os.path.normpath() before it's used as a key
+    (both when SpriteSheet caches itself and when a watcher event looks up
+    what to invalidate) keeps both sides speaking the same key format.
+    """
+    return os.path.normpath(path)
 
 
 def _directions(use_8_directions):
@@ -43,6 +60,7 @@ class SpriteSheet:
     _sheet_cache: dict = {}
 
     def __new__(cls, filepath):
+        filepath = _normpath(filepath)
         cached = cls._sheet_cache.get(filepath)
         if cached is not None:
             return cached
@@ -53,6 +71,20 @@ class SpriteSheet:
             instance.sheet = pygame.image.load(filepath).convert_alpha()
         cls._sheet_cache[filepath] = instance
         return instance
+
+    @classmethod
+    def invalidate(cls, filepath):
+        """Drop the cached sheet (and its cut-frame row cache) for `filepath`.
+
+        The next `SpriteSheet(filepath)` call after this misses the cache, so
+        it re-reads the PNG from disk and re-cuts every frame fresh. This is
+        the low-level half of sprite hot-reload — see `reload_sprites_for_path`
+        for the half that also pushes the new frames into every AnimatedSprite
+        already using this sheet. Safe to call with a path that was never
+        cached (e.g. a brand-new file being added rather than an existing one
+        changing).
+        """
+        cls._sheet_cache.pop(_normpath(filepath), None)
 
     def __init__(self, filepath):
         # __new__ does all the real work so a repeat SpriteSheet(filepath)
@@ -266,11 +298,47 @@ class Animation:
         self.time_elapsed = 0
 
 
+def _snapshot_animation(anim):
+    """Capture an Animation's playback progress so it can be reapplied onto a
+    freshly rebuilt Animation object after a hot-reload. Only the "where are
+    we" fields are captured — `frames` itself is deliberately excluded, since
+    the whole point is to drop the old frames and pick up the new ones."""
+    return {
+        'current_frame': anim.current_frame,
+        'time_elapsed': anim.time_elapsed,
+        'finished': anim.finished,
+        'holding': anim.holding,
+        '_hold_released': anim._hold_released,
+        '_blinking': getattr(anim, '_blinking', False),
+    }
+
+
+def _restore_animation(anim, snapshot):
+    """Reapply a snapshot from _snapshot_animation() onto `anim`. current_frame
+    is clamped to the new frame list's length, since a hot-reloaded sheet can
+    legitimately have fewer frames than what was playing when it changed."""
+    if not anim.frames:
+        return
+    anim.current_frame = min(snapshot['current_frame'], len(anim.frames) - 1)
+    anim.time_elapsed = snapshot['time_elapsed']
+    anim.finished = snapshot['finished']
+    anim.holding = snapshot['holding']
+    anim._hold_released = snapshot['_hold_released']
+    anim._blinking = snapshot['_blinking']
+
+
 class AnimatedSprite:
     """
     Entity sprite that plays directional animations loaded from separate files.
     Each animation lives at {base_path}/{animation_name}.png.
     """
+
+    # Every AnimatedSprite that currently exists (player, every enemy/NPC/
+    # critter/boss instance in the room, etc.), held weakly so this registry
+    # never keeps a despawned entity's sprite alive. The sprite watcher walks
+    # this set to find and hot-reload every live sprite built from a PNG that
+    # just changed on disk — see reload_sprites_for_path() below.
+    _live_sprites = weakref.WeakSet()
 
     def __init__(self, character_name, costume_name, sprite_width, sprite_height):
         self.character_name = character_name
@@ -281,12 +349,26 @@ class AnimatedSprite:
         self.base_path = f"assets/sprites/player/{character_name}/{costume_name}"
 
         self.animations = {}
+        # key -> list of spec dicts recording exactly how self.animations[key]
+        # was built (which loader, which file, which kwargs), in the order
+        # those loader calls happened. Hot-reload replays these specs against
+        # a freshly-invalidated SpriteSheet instead of guessing how to rebuild
+        # an animation from scratch — see reload_from_path().
+        self._animation_specs = {}
+        # normalized filepath -> list of spec dicts for load attempts that
+        # failed specifically because the file didn't exist yet at the time.
+        # Retried by reload_from_path() when the watcher reports that exact
+        # path appearing, so an animation added after the entity spawned
+        # doesn't require despawning/respawning it to pick up.
+        self._pending_animation_specs = {}
         self.current_animation = None
         self.current_direction = 'down'
         self.current_variant_index = 0
 
         self.offset_x = sprite_width // 2
         self.offset_y = sprite_height // 2
+
+        AnimatedSprite._live_sprites.add(self)
 
     @classmethod
     def _create_bare(cls, character_name, costume_name, sprite_width, sprite_height, base_path):
@@ -308,15 +390,18 @@ class AnimatedSprite:
         sprite.sprite_height = sprite_height
         sprite.base_path = base_path
         sprite.animations = {}
+        sprite._animation_specs = {}
+        sprite._pending_animation_specs = {}
         sprite.current_animation = None
         sprite.current_direction = 'down'
         sprite.current_variant_index = 0
         sprite.offset_x = sprite_width // 2
         sprite.offset_y = sprite_height // 2
+        cls._live_sprites.add(sprite)
         return sprite
 
     def load_animation(self, animation_name, direction, frame_duration=0.1, loop=True, num_variants=1,
-                       use_8_directions=False, loop_tail_frames=None, hold_frames=None):
+                       use_8_directions=False, loop_tail_frames=None, hold_frames=None, _record=True):
         """Load one directional animation from {base_path}/{animation_name}.png.
 
         Sheet rows map to directions; stacked variant blocks sit below them
@@ -334,6 +419,16 @@ class AnimatedSprite:
         filepath = f"{self.base_path}/{animation_name}.png"
 
         if not os.path.exists(filepath):
+            if _record:
+                self._pending_animation_specs.setdefault(_normpath(filepath), []).append({
+                    'loader': 'load_animation',
+                    'kwargs': dict(
+                        animation_name=animation_name, direction=direction,
+                        frame_duration=frame_duration, loop=loop, num_variants=num_variants,
+                        use_8_directions=use_8_directions, loop_tail_frames=loop_tail_frames,
+                        hold_frames=hold_frames,
+                    ),
+                })
             return False
 
         sprite_sheet = SpriteSheet(filepath)
@@ -379,6 +474,18 @@ class AnimatedSprite:
             return False
 
         self.animations[key] = variants[0] if len(variants) == 1 else variants
+
+        if _record:
+            self._animation_specs.setdefault(key, []).append({
+                'loader': 'load_animation',
+                'filepath': filepath,
+                'kwargs': dict(
+                    animation_name=animation_name, direction=direction,
+                    frame_duration=frame_duration, loop=loop, num_variants=num_variants,
+                    use_8_directions=use_8_directions, loop_tail_frames=loop_tail_frames,
+                    hold_frames=hold_frames,
+                ),
+            })
         return True
 
     def load_animation_all_directions(self, animation_name, frame_duration=0.1, loop=True, num_variants=1,
@@ -396,8 +503,38 @@ class AnimatedSprite:
             self.load_animation(animation_name, direction, frame_duration, loop, num_variants, use_8_directions,
                                 loop_tail_frames, hold_frames)
 
+    def _append_variants_to_key(self, key, sprite_sheet, direction_offset, num_directions,
+                                frame_duration, loop, num_variants):
+        """Cut and append up to `num_variants` extra Animation variants onto
+        self.animations[key] from an already-open `sprite_sheet`, using the
+        same (variant_index*num_directions)+direction_offset row math every
+        direction in append_animation_variants() uses. Split out into its own
+        method (rather than inlined in that loop) so a single direction/key
+        can be replayed on hot-reload without re-looping every direction the
+        original append_animation_variants() call touched — replaying the
+        whole call for every affected key would re-append duplicate variants
+        onto directions that a different key's reload had already redone.
+        Returns how many variants were actually appended (0 if `key` has no
+        base animation yet to append onto).
+        """
+        existing_anim = self.animations.get(key)
+        if not existing_anim:
+            return 0
+
+        if not isinstance(existing_anim, list):
+            self.animations[key] = [existing_anim]
+
+        appended = 0
+        for variant_index in range(num_variants):
+            row = (variant_index * num_directions) + direction_offset
+            frames = sprite_sheet.get_all_frames(self.sprite_width, self.sprite_height, row)
+            if frames:
+                self.animations[key].append(Animation(frames, frame_duration, loop))
+                appended += 1
+        return appended
+
     def append_animation_variants(self, animation_name, source_filename, frame_duration=0.1, loop=True, num_variants=1,
-                                  use_8_directions=False):
+                                  use_8_directions=False, _record=True):
         """Tack extra variants onto an existing animation from a different sheet file.
 
         Useful when overflow variants live in a separate file, e.g. melee_extra.png.
@@ -405,36 +542,51 @@ class AnimatedSprite:
         filepath = f"{self.base_path}/{source_filename}"
 
         if not os.path.exists(filepath):
+            if _record:
+                self._pending_animation_specs.setdefault(_normpath(filepath), []).append({
+                    'loader': 'append_animation_variants',
+                    'kwargs': dict(
+                        animation_name=animation_name, source_filename=source_filename,
+                        frame_duration=frame_duration, loop=loop, num_variants=num_variants,
+                        use_8_directions=use_8_directions,
+                    ),
+                })
             return False
 
         sprite_sheet = SpriteSheet(filepath)
         directions, direction_map, num_directions = _directions(use_8_directions)
 
+        any_appended = False
         for direction in directions:
             direction_offset = direction_map.get(direction, 0)
             key = f"{animation_name}_{direction}"
 
-            existing_anim = self.animations.get(key)
-            if not existing_anim:
+            appended = self._append_variants_to_key(
+                key, sprite_sheet, direction_offset, num_directions,
+                frame_duration, loop, num_variants,
+            )
+            if not appended:
                 continue
+            any_appended = True
 
-            # Convert single animation to list if needed
-            if not isinstance(existing_anim, list):
-                self.animations[key] = [existing_anim]
+            # Recorded per-key (not once for the whole call): each key needs
+            # its own replay record so a hot-reload of just this key can call
+            # _append_variants_to_key() directly instead of re-running this
+            # whole method (which would re-loop every direction again).
+            if _record:
+                self._animation_specs.setdefault(key, []).append({
+                    'loader': '_append_variants_to_key',
+                    'filepath': filepath,
+                    'kwargs': dict(
+                        direction_offset=direction_offset, num_directions=num_directions,
+                        frame_duration=frame_duration, loop=loop, num_variants=num_variants,
+                    ),
+                })
 
-            # Load and append new variants
-            for variant_index in range(num_variants):
-                row = (variant_index * num_directions) + direction_offset
-                frames = sprite_sheet.get_all_frames(self.sprite_width, self.sprite_height, row)
-
-                if frames:
-                    animation = Animation(frames, frame_duration, loop)
-                    self.animations[key].append(animation)
-
-        return True
+        return any_appended
 
     def load_animation_branching(self, animation_name, direction, frame_duration=0.1,
-                                  num_endings=2, use_8_directions=False):
+                                  num_endings=2, use_8_directions=False, _record=True):
         """Load an animation from a sheet laid out as [start_frame, ending_1, ending_2, ...]
         on a single row (e.g. kiblast.png: start, right-hand throw, left-hand throw).
 
@@ -448,6 +600,15 @@ class AnimatedSprite:
         filepath = f"{self.base_path}/{animation_name}.png"
 
         if not os.path.exists(filepath):
+            if _record:
+                self._pending_animation_specs.setdefault(_normpath(filepath), []).append({
+                    'loader': 'load_animation_branching',
+                    'kwargs': dict(
+                        animation_name=animation_name, direction=direction,
+                        frame_duration=frame_duration, num_endings=num_endings,
+                        use_8_directions=use_8_directions,
+                    ),
+                })
             return False
 
         sprite_sheet = SpriteSheet(filepath)
@@ -468,6 +629,17 @@ class AnimatedSprite:
 
         key = f"{animation_name}_{direction}"
         self.animations[key] = variants if len(variants) > 1 else variants[0]
+
+        if _record:
+            self._animation_specs.setdefault(key, []).append({
+                'loader': 'load_animation_branching',
+                'filepath': filepath,
+                'kwargs': dict(
+                    animation_name=animation_name, direction=direction,
+                    frame_duration=frame_duration, num_endings=num_endings,
+                    use_8_directions=use_8_directions,
+                ),
+            })
         return True
 
     def load_animation_branching_all_directions(self, animation_name, frame_duration=0.1,
@@ -479,7 +651,8 @@ class AnimatedSprite:
                                           num_endings, use_8_directions)
 
     def load_animation_fixed_frames(self, animation_name, direction, frame_duration=0.1,
-                                     frame_indices=(0, 2), use_8_directions=False, source_name=None):
+                                     frame_indices=(0, 2), use_8_directions=False, source_name=None,
+                                     _record=True):
         """Load an animation that only plays specific frame indices from the row, in the
         given order — no sequential playback, no randomness. e.g. frame_indices=(0, 2)
         plays frame 0 then frame 2, skipping frame 1 entirely.
@@ -493,6 +666,15 @@ class AnimatedSprite:
         filepath = f"{self.base_path}/{source_name or animation_name}.png"
 
         if not os.path.exists(filepath):
+            if _record:
+                self._pending_animation_specs.setdefault(_normpath(filepath), []).append({
+                    'loader': 'load_animation_fixed_frames',
+                    'kwargs': dict(
+                        animation_name=animation_name, direction=direction,
+                        frame_duration=frame_duration, frame_indices=frame_indices,
+                        use_8_directions=use_8_directions, source_name=source_name,
+                    ),
+                })
             return False
 
         sprite_sheet = SpriteSheet(filepath)
@@ -508,6 +690,17 @@ class AnimatedSprite:
 
         key = f"{animation_name}_{direction}"
         self.animations[key] = Animation(frames, frame_duration, loop=False)
+
+        if _record:
+            self._animation_specs.setdefault(key, []).append({
+                'loader': 'load_animation_fixed_frames',
+                'filepath': filepath,
+                'kwargs': dict(
+                    animation_name=animation_name, direction=direction,
+                    frame_duration=frame_duration, frame_indices=frame_indices,
+                    use_8_directions=use_8_directions, source_name=source_name,
+                ),
+            })
         return True
 
     def load_animation_fixed_frames_all_directions(self, animation_name, frame_duration=0.1,
@@ -766,6 +959,201 @@ class AnimatedSprite:
             anim = anim[0]
         return len(anim.frames) * anim.frame_duration
 
+    # ── Hot-reload ───────────────────────────────────────────────────────────
+
+    def reload_from_path(self, filepath):
+        """Rebuild every animation entry on this sprite that was loaded (in
+        whole or in part) from `filepath`, by replaying the loader calls
+        recorded in self._animation_specs against a freshly-invalidated
+        SpriteSheet. Called on every live sprite by the module-level
+        reload_sprites_for_path() below when the sprite AssetWatcher reports
+        that PNG changed.
+
+        Also retries any load attempt that previously failed specifically
+        because this file didn't exist yet (see self._pending_animation_specs)
+        — so an animation whose PNG shows up *after* this entity was already
+        spawned (e.g. an artist drops in charged_melee.png mid-session) gets
+        picked up without needing to despawn/respawn the entity.
+
+        Only touches keys/attempts that actually reference `filepath` — an
+        entity with a dozen loaded animations doesn't get all of them
+        rebuilt just because one sheet file changed. Returns True if
+        anything was reloaded or newly loaded.
+        """
+        target = _normpath(filepath)
+        touched = False
+
+        affected_keys = [
+            key for key, specs in self._animation_specs.items()
+            if any(_normpath(spec['filepath']) == target for spec in specs)
+        ]
+        for key in affected_keys:
+            self._reload_key(key)
+            touched = True
+
+        pending = self._pending_animation_specs.pop(target, None)
+        if pending:
+            still_pending = []
+            for spec in pending:
+                kwargs = dict(spec['kwargs'])
+                kwargs['_record'] = True
+                if getattr(self, spec['loader'])(**kwargs):
+                    touched = True
+                else:
+                    # Still doesn't work — file exists now but e.g. has too
+                    # few frames for what was requested. Keep it queued for
+                    # a future retry rather than dropping the attempt.
+                    still_pending.append(spec)
+            if still_pending:
+                self._pending_animation_specs[target] = still_pending
+
+        return touched
+
+    def _reload_key(self, key):
+        """Rebuild self.animations[key] from its recorded specs, preserving
+        current playback position if `key` is what's actively playing right
+        now — so hot-swapping art mid-attack doesn't visibly restart it. Any
+        other key just picks up the new art next time it's selected, starting
+        from frame 0 as usual via set_animation()."""
+        specs = self._animation_specs.get(key)
+        if not specs:
+            return
+
+        is_current = (key == self.current_animation)
+        old = self.animations.get(key)
+        old_variant_index = self.current_variant_index if is_current else 0
+        old_snapshot = None
+        if isinstance(old, list):
+            if old:
+                old_variant_index = min(old_variant_index, len(old) - 1)
+                old_snapshot = _snapshot_animation(old[old_variant_index])
+        elif old is not None:
+            old_snapshot = _snapshot_animation(old)
+
+        self.animations.pop(key, None)
+
+        # Replay every loader call that originally built this key, in the
+        # same order they were first applied — e.g. the base load_animation()
+        # call followed by any append_animation_variants() extras — so the
+        # rebuilt entry ends up structurally identical to the original.
+        for spec in specs:
+            kwargs = dict(spec['kwargs'])
+            if spec['loader'] == '_append_variants_to_key':
+                # Not a public load_* method: needs the key plus a live
+                # SpriteSheet for spec['filepath'] rather than a filename.
+                sheet = SpriteSheet(spec['filepath'])
+                self._append_variants_to_key(key, sheet, **kwargs)
+            else:
+                kwargs['_record'] = False
+                getattr(self, spec['loader'])(**kwargs)
+
+        new = self.animations.get(key)
+        if new is None or old_snapshot is None:
+            return
+
+        if isinstance(new, list):
+            if new:
+                idx = min(old_variant_index, len(new) - 1)
+                _restore_animation(new[idx], old_snapshot)
+                if is_current:
+                    self.current_variant_index = idx
+        else:
+            _restore_animation(new, old_snapshot)
+
+
+def reload_sprites_for_path(filepath):
+    """Hot-reload every live AnimatedSprite that has an animation built from
+    `filepath`. This is the entry point the sprite AssetWatcher's events feed
+    into (see apply_watcher_events() below): it first evicts the stale
+    SpriteSheet so the PNG is actually re-read from disk, then walks every
+    AnimatedSprite currently alive — the player, every spawned enemy/NPC/
+    critter/boss — asking each to rebuild whatever it loaded from that path.
+
+    Returns how many sprites were actually touched (0 if nothing currently
+    alive uses this file), useful for a dev-tools log line but not required
+    by callers.
+    """
+    SpriteSheet.invalidate(filepath)
+
+    touched = 0
+    # list(...): reload_from_path() only ever mutates a sprite's own
+    # animations/frames, never adds or removes sprites from the registry, but
+    # copying first is cheap insurance against mutating a WeakSet mid-iterate
+    # if something else's GC happens to run a finalizer in the same tick.
+    for sprite in list(AnimatedSprite._live_sprites):
+        try:
+            if sprite.reload_from_path(filepath):
+                touched += 1
+        except Exception as e:
+            print(f"sprite_system: hot-reload of {filepath!r} failed for "
+                  f"{getattr(sprite, 'character_name', '?')}: {e}")
+    return touched
+
+
+def apply_watcher_events(events):
+    """Feed AssetWatcher.poll_events() output — from a watcher pointed at
+    assets/sprites — into the sprite hot-reload path. Mirrors
+    AudioAssetLoader.apply_watcher_events() / items_module.apply_watcher_events():
+    same call-once-per-frame-from-Game.update() contract, same "just hand it
+    the raw event list" signature.
+
+    Only 'added'/'modified' .png events trigger a reload. 'removed' is left
+    alone on purpose — there's nothing sensible to reload a live entity's
+    on-screen sprite into once its source file is actually gone, so it keeps
+    showing the last frames already cut and cached rather than snapping to
+    the magenta missing-sprite placeholder in the middle of a room.
+    """
+    changed_paths = {
+        path for kind, path in events
+        if kind in ('added', 'modified') and path.lower().endswith('.png')
+    }
+    for path in changed_paths:
+        reload_sprites_for_path(path)
+
+
+def _read_json_config(path):
+    try:
+        if not os.path.isfile(path):
+            return {}
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _valid_size(w, h):
+    try:
+        w, h = int(w), int(h)
+    except (TypeError, ValueError):
+        return None
+    return (w, h) if w > 0 and h > 0 else None
+
+
+def _character_config_sprite_size(character_name, costume_name):
+    data = _read_json_config(os.path.join("assets", "characters", f"{character_name}.json"))
+    if not data:
+        return None
+    default = _valid_size(data.get("sprite_width"), data.get("sprite_height"))
+    costume_name = str(costume_name or "")
+    for tf in data.get("transformations", []) or []:
+        if not isinstance(tf, dict):
+            continue
+        costume = str(tf.get("costume", ""))
+        if costume == costume_name or costume.endswith(f"/transformations/{costume_name}") or tf.get("id") == costume_name:
+            return _valid_size(tf.get("sprite_width"), tf.get("sprite_height")) or default
+    return default
+
+
+def _entity_config_sprite_size(kind, entity_id):
+    directory = {"enemy": "enemies", "boss": "enemies", "npc": "npcs", "critter": "critters"}.get(kind)
+    if not directory:
+        return None
+    data = _read_json_config(os.path.join("assets", directory, f"{entity_id}.json"))
+    if not data:
+        return None
+    return _valid_size(data.get("width"), data.get("height"))
+
 
 def _load_sprite_size(folder, default_w=32, default_h=32):
     """Read frame size from {folder}/sprite_size.txt if it exists.
@@ -838,7 +1226,11 @@ class CharacterSpriteLoader:
     @staticmethod
     def load_character(character_name, costume_name, sprite_width, sprite_height):
         folder = f"assets/sprites/player/{character_name}/{costume_name}"
-        sprite_width, sprite_height = _load_sprite_size(folder, sprite_width, sprite_height)
+        configured = _character_config_sprite_size(character_name, costume_name)
+        if configured:
+            sprite_width, sprite_height = configured
+        else:
+            sprite_width, sprite_height = _load_sprite_size(folder, sprite_width, sprite_height)
         sprite = AnimatedSprite(character_name, costume_name, sprite_width, sprite_height)
 
         # Standard 4-directional animations
@@ -1071,7 +1463,11 @@ class EnemySpriteLoader:
         if base_path is None:
             return None
 
-        sprite_width, sprite_height = _load_sprite_size(base_path, sprite_width, sprite_height)
+        configured = _entity_config_sprite_size("enemy", enemy_type)
+        if configured:
+            sprite_width, sprite_height = configured
+        else:
+            sprite_width, sprite_height = _load_sprite_size(base_path, sprite_width, sprite_height)
 
         sprite = AnimatedSprite._create_bare(enemy_type, variant, sprite_width, sprite_height, base_path)
 
@@ -1135,7 +1531,11 @@ class NPCSpriteLoader:
         if sprite_path is None:
             return None
 
-        sprite_width, sprite_height = _load_sprite_size(sprite_path, sprite_width, sprite_height)
+        configured = _entity_config_sprite_size("npc", npc_type)
+        if configured:
+            sprite_width, sprite_height = configured
+        else:
+            sprite_width, sprite_height = _load_sprite_size(sprite_path, sprite_width, sprite_height)
 
         sprite = AnimatedSprite._create_bare(npc_type, variant, sprite_width, sprite_height, sprite_path)
 
@@ -1213,7 +1613,11 @@ class CritterSpriteLoader:
         if base_path is None:
             return None
 
-        sprite_width, sprite_height = _load_sprite_size(base_path, sprite_width, sprite_height)
+        configured = _entity_config_sprite_size("critter", critter_type)
+        if configured:
+            sprite_width, sprite_height = configured
+        else:
+            sprite_width, sprite_height = _load_sprite_size(base_path, sprite_width, sprite_height)
 
         sprite = AnimatedSprite._create_bare(critter_type, variant, sprite_width, sprite_height, base_path)
 
@@ -1285,7 +1689,11 @@ def create_boss_sprite(boss_id, variant='default', width=48, height=48):
     if not os.path.exists(boss_path):
         return None
 
-    width, height = _load_sprite_size(boss_path, width, height)
+    configured = _entity_config_sprite_size("boss", boss_id)
+    if configured:
+        width, height = configured
+    else:
+        width, height = _load_sprite_size(boss_path, width, height)
 
     sprite = AnimatedSprite._create_bare(boss_id, variant, width, height, boss_path)
 

@@ -2,6 +2,7 @@ import pygame
 import math
 from typing import Optional, Callable
 from objects.flying_pad import FlyingPad, FlyingPadWaypoint
+from core.draw_layers import DrawLayer
 
 
 class FlyingController:
@@ -67,6 +68,10 @@ class FlyingController:
         self.flying_sprite = None
         self._load_flying_sprite()
 
+        # Player's draw_layer from just before takeoff, so landing can
+        # restore it exactly rather than assuming it was DrawLayer.PLAYER.
+        self._prev_player_draw_layer = None
+
     # ── Initialisation ─────────────────────────────────────────────────────────
 
     def _load_flying_sprite(self):
@@ -131,6 +136,14 @@ class FlyingController:
         # Lock player input for the duration of the flight.
         if hasattr(player, 'is_flying'):
             player.is_flying = True
+
+        # Draw above every other layer -- ground, shadows, NPCs, enemies,
+        # foreground objects -- while airborne, but still stay underneath
+        # particle effects (DrawLayer.PARTICLES). Restored on landing in
+        # _complete_flight.
+        if hasattr(player, 'draw_layer'):
+            self._prev_player_draw_layer = player.draw_layer
+            player.draw_layer = DrawLayer.FLYING
 
         # Cancel any in-progress player actions.
         self.player.is_attacking       = False
@@ -408,6 +421,11 @@ class FlyingController:
 
         if hasattr(self.player, 'is_flying'):
             self.player.is_flying = False
+
+        # Restore whatever draw_layer the player had before takeoff.
+        if hasattr(self.player, 'draw_layer') and self._prev_player_draw_layer is not None:
+            self.player.draw_layer = self._prev_player_draw_layer
+        self._prev_player_draw_layer = None
 
         if hasattr(self.player, 'sprite'):
             landing_direction = self.player.direction

@@ -1,11 +1,12 @@
 """
-entity_creator.py  –  Dev-menu enemy / NPC entity editor
-==========================================================
+entity_creator.py  –  Dev-menu enemy / NPC / critter entity editor
+====================================================================
 Sister tool to character_creator.py. Where character_creator defines
 *player* characters (assets/characters/{id}.json), this defines
-*enemies*, *bosses*, and *NPCs* — id, stats, level, XP reward, zeni drop
-table, AI type, dialogue — saved as JSON so new entities can be added
-without touching enemy.py / npc.py / entity_editor.py at all.
+*enemies*, *bosses*, *NPCs*, and *critters* (ambient wildlife) — id,
+stats/behavior, level, XP reward, zeni drop table, AI type, dialogue,
+wander pacing — saved as JSON so new entities can be added without
+touching enemy.py / npc.py / critter.py / entity_editor.py at all.
 
 Wire-up (game.py), mirrors character_creator's:
     from dev_tools import entity_creator
@@ -30,10 +31,15 @@ assets/
     npc/
       {npc_id}/
         variants/{variant}/...
+    critters/
+      {critter_id}/                <- one folder per critter (idle.png and/or
+        variants/{variant}/...        flying.png, per critter.py's profile)
   enemies/
     {enemy_id}.json                <- stats/AI/rewards, written here on Save
   npcs/
     {npc_id}.json                  <- behaviour/dialogue defaults, written here
+  critters/
+    {critter_id}.json              <- size/wander/behavior-profile, written here
 
 This tool does NOT touch sprite art — it only discovers which ids exist
 (same folder scan entity_editor.py already does for NPCs) and lets you
@@ -74,14 +80,20 @@ if getattr(sys, "frozen", False):
 else:
     BASE_DIR = Path(__file__).resolve().parent.parent
 
-ENEMY_SPRITES_ROOT = BASE_DIR / "assets/sprites/enemies"
-BOSS_SPRITES_ROOT  = ENEMY_SPRITES_ROOT / "boss"
-NPC_SPRITES_ROOT    = BASE_DIR / "assets/sprites/npc"
-ENEMIES_DIR         = BASE_DIR / "assets/enemies"
-NPCS_DIR             = BASE_DIR / "assets/npcs"
+ENEMY_SPRITES_ROOT   = BASE_DIR / "assets/sprites/enemies"
+BOSS_SPRITES_ROOT    = ENEMY_SPRITES_ROOT / "boss"
+NPC_SPRITES_ROOT     = BASE_DIR / "assets/sprites/npc"
+CRITTER_SPRITES_ROOT = BASE_DIR / "assets/sprites/critters"
+ENEMIES_DIR          = BASE_DIR / "assets/enemies"
+NPCS_DIR              = BASE_DIR / "assets/npcs"
+CRITTERS_DIR          = BASE_DIR / "assets/critters"
 
-KIND_ENEMY = "enemy"
-KIND_NPC   = "npc"
+KIND_ENEMY   = "enemy"
+KIND_NPC     = "npc"
+KIND_CRITTER = "critter"
+
+# Display order for the kind tabs / _switch_kind cycling.
+KIND_ORDER = (KIND_ENEMY, KIND_NPC, KIND_CRITTER)
 
 # ──────────────────────────────────────────────────────────────────────
 #  Default config skeletons
@@ -137,6 +149,8 @@ DEFAULT_NPC_CONFIG: dict = {
     # ui/scouter_menu.py's _get_entity_description / _draw_data_description).
     "description":       "",
     "npc_type":          "static",   # "static" | "moving"
+    "width":             32,          # sprite/frame size (spritesheet slicing)
+    "height":            32,
     "speed":             1.5,
     "interaction_range": 50,
     # Ground shadow width in px — same slider/units as character_creator.py's
@@ -154,15 +168,53 @@ DEFAULT_NPC_CONFIG: dict = {
     },
 }
 
+# Critters (ambient wildlife — squirrels, birds, butterflies, ...) are the
+# lightest of the three kinds: no stats, no AI, no dialogue. Fields here
+# are exactly Critter.__init__'s tunables (see critter.py) minus x/y/
+# variant, which are set at placement time, not entity-creation time.
+DEFAULT_CRITTER_CONFIG: dict = {
+    "id":            "",
+    "display_name":  "",
+    # Freeform prose shown in the Scouter Data description panel (see
+    # ui/scouter_menu.py's _get_entity_description / _draw_data_description).
+    "description":   "",
+    # Key into Critter.BEHAVIOR_PROFILES — picks the pacing/animation
+    # profile (moving/resting state names, speed, rest/move durations,
+    # flutter/jitter) this id plays. Any value not in BEHAVIOR_PROFILES
+    # quietly falls back to Critter.DEFAULT_PROFILE, so a new critter id
+    # can reuse an existing animal's pacing (e.g. a 'chipmunk' sprite
+    # folder using the 'squirrel' profile) without new code — new profiles
+    # themselves still have to be added to critter.py directly.
+    "critter_type":  "squirrel",
+    "width":  16,           # sprite/frame size (spritesheet slicing)
+    "height": 16,
+    "wander_radius": 32,    # max px from spawn point before turning back
+}
+
+# Behavior profiles Critter.BEHAVIOR_PROFILES actually defines (see
+# critter.py). Kept as its own list rather than imported from critter.py
+# so this dev tool doesn't need the game package importable to run —
+# same standalone-ness character_creator.py's widgets/palette have.
+# Any critter_type outside this list still works at runtime (it just
+# falls back to Critter.DEFAULT_PROFILE), but these are the only ones
+# with a purpose-built pacing/animation profile today.
+CRITTER_PROFILE_OPTIONS = ("squirrel", "bird", "butterfly")
+
 
 def _defaults_for(kind: str) -> dict:
-    return copy.deepcopy(DEFAULT_ENEMY_CONFIG if kind == KIND_ENEMY else DEFAULT_NPC_CONFIG)
+    if kind == KIND_ENEMY:
+        return copy.deepcopy(DEFAULT_ENEMY_CONFIG)
+    if kind == KIND_CRITTER:
+        return copy.deepcopy(DEFAULT_CRITTER_CONFIG)
+    return copy.deepcopy(DEFAULT_NPC_CONFIG)
 
 
 def _dirs_for(kind: str) -> tuple[Path, Path]:
     """Return (sprites_root, data_dir) for *kind*."""
     if kind == KIND_ENEMY:
         return ENEMY_SPRITES_ROOT, ENEMIES_DIR
+    if kind == KIND_CRITTER:
+        return CRITTER_SPRITES_ROOT, CRITTERS_DIR
     return NPC_SPRITES_ROOT, NPCS_DIR
 
 
@@ -289,6 +341,23 @@ def load_config(kind: str, entity_id: str) -> dict:
                 else:
                     cfg[k] = v
 
+            # Migrate legacy frame-size text on first load. Once a creator
+            # config contains explicit width/height, those values remain
+            # authoritative and sprite_size.txt is ignored.
+            if "width" not in saved or "height" not in saved:
+                root, _data_dir = _dirs_for(kind)
+                entity_root = BOSS_SPRITES_ROOT if (
+                    kind == KIND_ENEMY and cfg.get("entity_type") == "boss"
+                ) else root
+                legacy_folder = entity_root / entity_id
+                lw, lh = _read_sprite_size(
+                    legacy_folder, 16 if kind == KIND_CRITTER else 32
+                )
+                if "width" not in saved:
+                    cfg["width"] = lw
+                if "height" not in saved:
+                    cfg["height"] = lh
+
             # -- Migrate pre-STR/POW-split saves ------------------------
             # Old schema had a single "power" stat doing double duty as
             # melee damage *and* base ki-blast/projectile damage. A save
@@ -304,6 +373,19 @@ def load_config(kind: str, entity_id: str) -> dict:
                     cfg["stats"]["power"] = legacy_power
         except Exception as e:
             print(f"Error loading {path}: {e}")
+    # Unconfigured sprite folders can still carry the legacy size text. Seed
+    # the creator UI from it so saving the entity automatically migrates the
+    # size into JSON.
+    if path.exists() is False:
+        root, _data_dir = _dirs_for(kind)
+        entity_root = BOSS_SPRITES_ROOT if (
+            kind == KIND_ENEMY and cfg.get("entity_type") == "boss"
+        ) else root
+        legacy_folder = entity_root / entity_id
+        lw, lh = _read_sprite_size(legacy_folder, 16 if kind == KIND_CRITTER else 32)
+        cfg["width"] = lw
+        cfg["height"] = lh
+
     return cfg
 
 
@@ -340,7 +422,8 @@ def _read_sprite_size(folder: Path, default: int = 32) -> tuple[int, int]:
     return default, default
 
 
-def _load_preview_sprite(kind: str, entity_id: str, variant_type: str, entity_type: str = "", size: int = 96):
+def _load_preview_sprite(kind: str, entity_id: str, variant_type: str, entity_type: str = "", size: int = 96,
+                       frame_w: int | None = None, frame_h: int | None = None):
     """Load the idle-down frame for a sprite-preview thumbnail.
 
     Tries a handful of common sheet filenames under the entity's variant
@@ -356,11 +439,19 @@ def _load_preview_sprite(kind: str, entity_id: str, variant_type: str, entity_ty
     """
     if kind == KIND_ENEMY and entity_type == "boss":
         root = BOSS_SPRITES_ROOT
+    elif kind == KIND_CRITTER:
+        root = CRITTER_SPRITES_ROOT
     else:
         root = ENEMY_SPRITES_ROOT if kind == KIND_ENEMY else NPC_SPRITES_ROOT
     entity_dir = root / entity_id
     search_dirs = [entity_dir / "variants" / variant_type, entity_dir]
     filenames = ["idle.png", "idle_down.png", "walk_down.png", "sprite.png"]
+    if kind == KIND_CRITTER:
+        # Critters with no resting_state (e.g. butterflies — see
+        # critter.py's BEHAVIOR_PROFILES) have no idle pose at all, so
+        # fall back to flying.png — same lookup order entity_editor.py's
+        # room-palette thumbnails use.
+        filenames = filenames + ["flying.png"]
 
     path = None
     found_dir = None
@@ -382,14 +473,25 @@ def _load_preview_sprite(kind: str, entity_id: str, variant_type: str, entity_ty
     # so guessing frame_w == frame_h sliced the wrong region and either
     # threw on subsurface() (silently swallowed below, showing "no sprite
     # yet") or rendered a garbled/cropped thumbnail.
-    frame_w, frame_h = _read_sprite_size(found_dir)
+    if frame_w is None or frame_h is None:
+        fallback = 16 if kind == KIND_CRITTER else 32
+        legacy_w, legacy_h = _read_sprite_size(found_dir, fallback)
+        frame_w = legacy_w if frame_w is None else frame_w
+        frame_h = legacy_h if frame_h is None else frame_h
+    frame_w = max(1, int(frame_w))
+    frame_h = max(1, int(frame_h))
 
     try:
         sheet = pygame.image.load(str(path)).convert_alpha()
         sheet_w, sheet_h = sheet.get_size()
+        # flying.png sheets (critters with no idle pose, e.g. butterflies)
+        # are always 8-directional; everything else on these candidate
+        # paths is the 4-dir layout — same convention entity_editor.py's
+        # _load_idle_down_sprite uses for its room-palette thumbnails.
+        num_rows = 8 if path.name == "flying.png" else 4
         # Clamp in case sprite_size.txt is stale/wrong for this sheet.
         frame_w = min(frame_w, sheet_w)
-        frame_h = min(frame_h, sheet_h // 4 if sheet_h >= 4 else sheet_h)
+        frame_h = min(frame_h, sheet_h // num_rows if sheet_h >= num_rows else sheet_h)
         frame = sheet.subsurface(pygame.Rect(0, 0, frame_w, frame_h))
 
         # Scale to fit the (size, size) box while preserving the sprite's
@@ -591,7 +693,12 @@ class EntityEditorPanel:
         entity_type = self.cfg.get('entity_type', '') if self.kind == KIND_ENEMY else ''
         self.preview_variants = []
         for variant_type in scan_variants(self.kind, self.entity_id, entity_type):
-            sprite = _load_preview_sprite(self.kind, self.entity_id, variant_type, entity_type, size=96)
+            default_size = 16 if self.kind == KIND_CRITTER else 32
+            sprite = _load_preview_sprite(
+                self.kind, self.entity_id, variant_type, entity_type, size=96,
+                frame_w=self.cfg.get("width", default_size),
+                frame_h=self.cfg.get("height", default_size),
+            )
             self.preview_variants.append({
                 'type': variant_type,
                 'name': 'Default' if variant_type == 'default' else variant_type.replace('_', ' ').title(),
@@ -618,8 +725,12 @@ class EntityEditorPanel:
             w["level"]     = Slider(pygame.Rect(lx, y, 220, Slider.H), 1, 99, self.cfg["level"], step=1); y += ROW_H
             w["xp_reward"] = Slider(pygame.Rect(lx, y, 220, Slider.H), 0, 2000, self.cfg["xp_reward"], step=5); y += ROW_H
 
-            # Ground shadow width — same 8-96/step-4 slider as
-            # character_creator.py's Shadow Size control on the Identity tab.
+            w["width"] = Slider(pygame.Rect(lx, y, 220, Slider.H), 4, 256,
+                               self.cfg.get("width", 32), step=1); y += ROW_H
+            w["height"] = Slider(pygame.Rect(lx, y, 220, Slider.H), 4, 256,
+                                self.cfg.get("height", 32), step=1); y += ROW_H
+
+            # Ground shadow width.
             y += 10
             w["shadow_width"] = Slider(pygame.Rect(lx, y, 220, Slider.H), 8, 96,
                                         self.cfg.get("shadow_width", 32), step=4); y += ROW_H
@@ -629,13 +740,17 @@ class EntityEditorPanel:
             # it knows exactly how many cycle-button rows are showing
             # (shooter_style only appears for enemy_category == "shooter").
             w["description"] = TextArea(pygame.Rect(lx, 0, 320, TextArea.H), self.cfg.get("description", ""))
-        else:
+        elif self.kind == KIND_NPC:
             y = y0 + 44
             w["speed"] = Slider(pygame.Rect(lx, y, 220, Slider.H), 0.2, 5, self.cfg["speed"], step=0.1, fmt="{:.1f}"); y += ROW_H
             w["interaction_range"] = Slider(pygame.Rect(lx, y, 220, Slider.H), 20, 150, self.cfg["interaction_range"], step=5); y += ROW_H
 
-            # Ground shadow width — same 8-96/step-4 slider as
-            # character_creator.py's Shadow Size control on the Identity tab.
+            w["width"] = Slider(pygame.Rect(lx, y, 220, Slider.H), 4, 256,
+                               self.cfg.get("width", 32), step=1); y += ROW_H
+            w["height"] = Slider(pygame.Rect(lx, y, 220, Slider.H), 4, 256,
+                                self.cfg.get("height", 32), step=1); y += ROW_H
+
+            # Ground shadow width.
             y += 10
             w["shadow_width"] = Slider(pygame.Rect(lx, y, 220, Slider.H), 8, 96,
                                         self.cfg.get("shadow_width", 32), step=4); y += ROW_H
@@ -651,6 +766,19 @@ class EntityEditorPanel:
             # Description — rect repositioned each frame in _draw_npc()
             # once the fixed dialogue-fields block above it is drawn.
             w["description"] = TextArea(pygame.Rect(lx, y, 320, 80), self.cfg.get("description", ""))
+        else:  # KIND_CRITTER
+            y = y0 + 44
+            w["width"]  = Slider(pygame.Rect(lx, y, 220, Slider.H), 4, 128,
+                                  self.cfg.get("width", 16),  step=1); y += ROW_H
+            w["height"] = Slider(pygame.Rect(lx, y, 220, Slider.H), 4, 128,
+                                  self.cfg.get("height", 16), step=1); y += ROW_H
+            w["wander_radius"] = Slider(pygame.Rect(lx, y, 220, Slider.H), 8, 256,
+                                         self.cfg.get("wander_radius", 32), step=4); y += ROW_H
+
+            # Description sits below the critter_type cycle-button row —
+            # _draw_critter() repositions this rect each frame, same
+            # pattern _draw_enemy()/_draw_npc() use.
+            w["description"] = TextArea(pygame.Rect(lx, 0, 320, TextArea.H), self.cfg.get("description", ""))
 
         self.widgets = w
 
@@ -687,6 +815,10 @@ class EntityEditorPanel:
             self.cfg["interaction_range"] = int(wgt.value)
         elif key == "shadow_width":
             self.cfg["shadow_width"] = int(wgt.value)
+        elif key in ("width", "height") and self.kind in (KIND_ENEMY, KIND_NPC, KIND_CRITTER):
+            self.cfg[key] = int(wgt.value)
+        elif key == "wander_radius":
+            self.cfg["wander_radius"] = int(wgt.value)
         elif key == "dialogue_0":
             dlg = self.cfg["dialogue"]
             if dlg["dialogues"]:
@@ -707,8 +839,13 @@ class EntityEditorPanel:
                         # Boss vs regular enemy reads from a different
                         # sprite folder — reload thumbnails immediately.
                         self._load_preview()
-        else:
+        elif self.kind == KIND_NPC:
             for rect, val, field in self._cycle_rects_npc():
+                if rect.collidepoint(pos):
+                    self.cfg[field] = val
+                    changed = True
+        else:
+            for rect, val, field in self._cycle_rects_critter():
                 if rect.collidepoint(pos):
                     self.cfg[field] = val
                     changed = True
@@ -718,9 +855,8 @@ class EntityEditorPanel:
     #    shooter_style / zeni_pool for enemies; npc_type for NPCs) -----
     def _cycle_rects_enemy(self):
         lx = self.rect.x + 160
-        # +10 + ROW_H accounts for the Shadow Size slider row inserted
-        # between XP Reward and these cycle buttons (see _build_widgets).
-        y = self.rect.y + 16 + 44 + ROW_H * 4 + 10 + ROW_H * 2 + 10 + ROW_H + 20
+        # Width/Height add two rows before Shadow Size.
+        y = self.rect.y + 16 + 44 + ROW_H * 4 + 10 + ROW_H * 2 + ROW_H * 2 + 10 + ROW_H + 20
         out = []
         rows = [
             ("entity_type",    ["enemy", "boss"]),
@@ -743,14 +879,26 @@ class EntityEditorPanel:
 
     def _cycle_rects_npc(self):
         lx = self.rect.x + 160
-        # +ROW_H + 10 accounts for the Shadow Size slider row inserted
-        # between Interact Range and these cycle buttons (see _build_widgets).
-        y = self.rect.y + 16 + 44 + ROW_H * 2 + 10 + ROW_H + 10 + (ROW_H + 10) + ROW_H + 20
+        # Width/Height add two rows before Shadow Size.
+        y = self.rect.y + 16 + 44 + ROW_H * 2 + ROW_H * 2 + 10 + ROW_H + 10 + (ROW_H + 10) + ROW_H + 20
         out = []
         for opt in ("static", "moving"):
             r = pygame.Rect(lx, y, 80, 26)
             out.append((r, opt, "npc_type"))
             lx += 84
+        return out
+
+    def _cycle_rects_critter(self):
+        # +ROW_H*3 accounts for the width/height/wander-radius slider rows
+        # inserted above these buttons (see _build_widgets).
+        lx = self.rect.x + 160
+        y = self.rect.y + 16 + 44 + ROW_H * 3 + 20
+        out = []
+        bx = lx
+        for opt in CRITTER_PROFILE_OPTIONS:
+            r = pygame.Rect(bx, y, 80, 26)
+            out.append((r, opt, "critter_type"))
+            bx += 84
         return out
 
     # -- draw ---------------------------------------------------------
@@ -765,8 +913,10 @@ class EntityEditorPanel:
 
         if self.kind == KIND_ENEMY:
             self._draw_enemy(surf, font, font_sm, y0)
-        else:
+        elif self.kind == KIND_NPC:
             self._draw_npc(surf, font, font_sm, y0)
+        else:
+            self._draw_critter(surf, font, font_sm, y0)
 
     def _draw_preview(self, surf, font, font_sm) -> None:
         """Sprite preview, pinned to the top-right corner of the panel —
@@ -835,6 +985,11 @@ class EntityEditorPanel:
         draw_label(surf, font_sm, "XP Reward", lx, y + 2)
         self.widgets["xp_reward"].draw(surf, font_sm); y += ROW_H
 
+        draw_label(surf, font_sm, "Sprite Width", lx, y + 2)
+        self.widgets["width"].draw(surf, font_sm); y += ROW_H
+        draw_label(surf, font_sm, "Sprite Height", lx, y + 2)
+        self.widgets["height"].draw(surf, font_sm); y += ROW_H
+
         y += 10
         draw_label(surf, font_sm, "Shadow Size", lx, y + 2)
         self.widgets["shadow_width"].draw(surf, font_sm); y += ROW_H
@@ -875,6 +1030,11 @@ class EntityEditorPanel:
         draw_label(surf, font_sm, "Interact Range", lx, y + 2)
         self.widgets["interaction_range"].draw(surf, font_sm); y += ROW_H
 
+        draw_label(surf, font_sm, "Sprite Width", lx, y + 2)
+        self.widgets["width"].draw(surf, font_sm); y += ROW_H
+        draw_label(surf, font_sm, "Sprite Height", lx, y + 2)
+        self.widgets["height"].draw(surf, font_sm); y += ROW_H
+
         y += 10
         draw_label(surf, font_sm, "Shadow Size", lx, y + 2)
         self.widgets["shadow_width"].draw(surf, font_sm); y += ROW_H
@@ -911,6 +1071,42 @@ class EntityEditorPanel:
         )
         surf.blit(hint, (lx, self.rect.bottom - 40))
 
+    def _draw_critter(self, surf, font, font_sm, y0) -> None:
+        lx = self.rect.x + 20
+        y = y0 + 44
+        draw_label(surf, font_sm, "Width", lx, y + 2)
+        self.widgets["width"].draw(surf, font_sm); y += ROW_H
+        draw_label(surf, font_sm, "Height", lx, y + 2)
+        self.widgets["height"].draw(surf, font_sm); y += ROW_H
+        draw_label(surf, font_sm, "Wander Radius", lx, y + 2)
+        self.widgets["wander_radius"].draw(surf, font_sm); y += ROW_H
+
+        y += 20
+        for rect, val, field in self._cycle_rects_critter():
+            hovered = rect.collidepoint(pygame.mouse.get_pos())
+            is_current = (self.cfg.get(field) == val)
+            draw_button(surf, font_sm, rect, val,
+                       color=C_ACCENT if is_current else C_TEXT_DIM, hover=hovered)
+        draw_label(surf, font_sm, "Behavior Profile", lx, y + 5)
+        y += 34
+
+        y += 14
+        draw_label(surf, font_sm, "Description", lx, y + 6)
+        desc_h = max(60, self.rect.bottom - (y + 26) - 46)   # -46 leaves room for the hint below
+        self.widgets["description"].rect = pygame.Rect(lx, y + 26, self.rect.w - 220, desc_h)
+        self.widgets["description"].draw(surf, font_sm, 0)
+
+        hint = render_text_cached(
+            font_sm,
+            "Behavior Profile picks this id's pacing/animation from "
+            "Critter.BEHAVIOR_PROFILES (speed, rest/move timings, flutter, "
+            "jitter) — reuse an existing profile, or wire up a new one in "
+            "critter.py first. Position, variant, and spawn point are still "
+            "set per-placement in the room editor.",
+            C_TEXT_DIM,
+        )
+        surf.blit(hint, (lx, self.rect.bottom - 40))
+
 
 # ══════════════════════════════════════════════════════════════════════
 #  Top-level overlay — same lifecycle contract as CharacterCreator:
@@ -923,6 +1119,18 @@ LIST_W    = 220
 PAD       = 8
 
 KIND_TAB_W = 100
+
+KIND_TAB_LABELS = {KIND_ENEMY: "Enemies", KIND_NPC: "NPCs", KIND_CRITTER: "Critters"}
+KIND_NEW_PROMPTS = {
+    KIND_ENEMY:   "New enemy id (folder-safe, e.g. 'saibaman')",
+    KIND_NPC:     "New NPC id (folder-safe, e.g. 'blacksmith')",
+    KIND_CRITTER: "New critter id (folder-safe, e.g. 'rabbit')",
+}
+KIND_SPRITE_ROOT_LABELS = {
+    KIND_ENEMY:   "assets/sprites/enemies/",
+    KIND_NPC:     "assets/sprites/npc/",
+    KIND_CRITTER: "assets/sprites/critters/",
+}
 
 
 class EntityCreator:
@@ -959,8 +1167,8 @@ class EntityCreator:
     def _build_layout(self) -> None:
         sw, sh = self.screen_width, self.screen_height
         self.kind_tab_rects = [
-            pygame.Rect(PAD, PAD, KIND_TAB_W, HEADER_H - PAD * 2),
-            pygame.Rect(PAD + KIND_TAB_W + 4, PAD, KIND_TAB_W, HEADER_H - PAD * 2),
+            pygame.Rect(PAD + i * (KIND_TAB_W + 4), PAD, KIND_TAB_W, HEADER_H - PAD * 2)
+            for i in range(len(KIND_ORDER))
         ]
         self.list_rect = pygame.Rect(PAD, HEADER_H + PAD, LIST_W,
                                      sh - HEADER_H - FOOTER_H - PAD * 2)
@@ -1073,7 +1281,7 @@ class EntityCreator:
 
         for i, rect in enumerate(self.kind_tab_rects):
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and rect.collidepoint(event.pos):
-                self._switch_kind(KIND_ENEMY if i == 0 else KIND_NPC)
+                self._switch_kind(KIND_ORDER[i])
                 return None
 
         new_sel = self.entity_list.handle_event(event)
@@ -1134,8 +1342,9 @@ class EntityCreator:
         screen.blit(overlay, (0, 0))
 
         for i, rect in enumerate(self.kind_tab_rects):
-            label = "Enemies" if i == 0 else "NPCs"
-            active = (self.kind == (KIND_ENEMY if i == 0 else KIND_NPC))
+            tab_kind = KIND_ORDER[i]
+            label = KIND_TAB_LABELS[tab_kind]
+            active = (self.kind == tab_kind)
             bg = C_TAB_ACT if active else C_TAB_INACT
             screen.draw_rect(bg, rect, border_radius=6)
             screen.draw_rect(C_ACCENT if active else C_BORDER, rect, 1, border_radius=6)
@@ -1152,7 +1361,7 @@ class EntityCreator:
             self.editor.draw(screen, self.font, self.font_sm, dt)
             screen.set_clip(old_clip)
         elif not self.ids:
-            root = "assets/sprites/enemies/" if self.kind == KIND_ENEMY else "assets/sprites/npc/"
+            root = KIND_SPRITE_ROOT_LABELS[self.kind]
             msg = render_text_cached(self.font_sm, f"No folders found in {root}", C_TEXT_DIM)
             screen.blit(msg, msg.get_rect(center=self.editor_rect.center))
 
@@ -1178,8 +1387,7 @@ class EntityCreator:
         screen.draw_rect(C_DIALOG_BG, box, border_radius=8)
         screen.draw_rect(C_ACCENT, box, 1, border_radius=8)
 
-        prompt = "New enemy id (folder-safe, e.g. 'saibaman')" if self.kind == KIND_ENEMY \
-            else "New NPC id (folder-safe, e.g. 'blacksmith')"
+        prompt = KIND_NEW_PROMPTS[self.kind]
         txt = render_text_cached(self.font_sm, prompt, C_TEXT)
         screen.blit(txt, (box.x + 20, box.y + 16))
 

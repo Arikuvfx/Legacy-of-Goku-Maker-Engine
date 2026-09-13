@@ -24,10 +24,11 @@ Wire-up (game.py), mirrors character_creator's / entity_creator's:
 
 This tool does NOT touch item sprite art — it only shows whatever icon
 already exists at item_icon_path(item_id) (assets/sprites/items/{id}.png,
-or .../equipment/{slot}/{id}.png for equip items) as a preview, same
-"discover art, attach data" split entity_creator.py uses for enemy/NPC
-sprites. Dropping in a new icon PNG separately is still up to you; this
-tool is purely the data side (name/description/category/effect).
+.../equipment/{slot}/{id}.png for equip items, or .../story_items/{id}.png
+for story items) as a preview, same "discover art, attach data" split
+entity_creator.py uses for enemy/NPC sprites. Dropping in a new icon PNG
+separately is still up to you; this tool is purely the data side
+(name/description/category/effect).
 
 Reuses widgets/palette from character_creator.py rather than duplicating
 them — TextInput, TextArea, Slider, draw_button, render_text_cached, and

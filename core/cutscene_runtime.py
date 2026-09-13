@@ -92,14 +92,28 @@ class _WeatherEffect:
     # Types that scroll purely horizontally — vertical scroll is suppressed.
     _HORIZONTAL_ONLY = {'dust'}
 
+    # Per-type multiplier on the vertical fall speed (applied on top of
+    # self.speed). Rain should read as a fast, driving downpour rather than
+    # drifting like snow/fog, so it gets a big multiplier here instead of
+    # requiring every call site to pass a special-cased speed. Unlisted
+    # types default to 1.0 (unchanged).
+    _FALL_SPEED_MULT = {
+        'rain':  50,
+        'storm': 3.5,   # storm reuses the same heavy-rain downpour motion
+    }
+
     # Types blitted with BLEND_ADD so bright pixels add light and dark pixels
     # contribute nothing (dark = transparent under additive blending).
     _ADDITIVE_TYPES = {'fog', 'dust'}
 
     # Per-type default alpha. For additive types this scales brightness, not opacity.
+    # Rain/storm previously fell through to the generic 180 fallback below —
+    # bumped up so the downpour reads as a strong overlay instead of a faint tint.
     _DEFAULT_ALPHA = {
-        'fog':  60,
-        'dust': 255,
+        'fog':   60,
+        'dust':  255,
+        'rain':  80,
+        'storm': 245,
     }
 
     # Number of precomputed dimmed variants used while opacity is mid-fade.
@@ -241,7 +255,8 @@ class _WeatherEffect:
         if self.weather_type not in self._HORIZONTAL_ONLY:
             h = self._surf.get_height()
             if h > 0:
-                self.scroll_y = (self.scroll_y + self.speed * dt) % h
+                fall_mult = self._FALL_SPEED_MULT.get(self.weather_type, 1.0)
+                self.scroll_y = (self.scroll_y + self.speed * fall_mult * dt) % h
 
         # Advance spritesheet frame for animated types.
         if self._frames:

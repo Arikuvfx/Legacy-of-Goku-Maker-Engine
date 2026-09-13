@@ -23,7 +23,9 @@ class BeamAttack:
                  ball_frame_width=None, ball_frame_height=None,
                  circle_frame_width=None, circle_frame_height=None,
                  circle_gap=0, ball_gap=0, beam_gap=0,
-                 middle_sync_random=False, rotate_to_direction=False):
+                 middle_sync_random=False, rotate_to_direction=False,
+                 sound_manager=None, fire_sound='beamfire',
+                 loop_sound='beamloop', stop_sound='beamstop'):
         self.x = x
         self.y = y
         self.direction = direction
@@ -330,6 +332,30 @@ class BeamAttack:
         # Set layer based on direction
         self.draw_layer = get_beam_layer(self.direction, self.direction)
         self.y_sort = False
+
+        # Sound: firing the beam plays fire_sound once, then immediately
+        # (as soon as that one-shot finishes) loops loop_sound for as long
+        # as the beam is active, until stop_beam()/start_decay() plays
+        # stop_sound once and stops the loop. sound_manager is optional —
+        # a beam created with sound_manager=None (the default) behaves
+        # exactly as before, with no sound calls at all.
+        self.sound_manager = sound_manager
+        self.fire_sound = fire_sound
+        self.loop_sound = loop_sound
+        self.stop_sound = stop_sound
+        # Channel the one-shot fire_sound is playing on, so update() can
+        # poll get_busy() to know the instant it's finished and start the
+        # loop — see the note on SoundEngine.play_sound() for why polling
+        # is the pattern here rather than an on-finish callback.
+        self._fire_sound_channel = None
+        self._loop_sound_started = False
+        # Guards stop_sound/loop-stop so start_decay() firing more than
+        # once (it's documented as safe to call repeatedly) doesn't also
+        # replay stop_sound or re-issue stop_looping_sfx redundantly.
+        self._stop_sound_played = False
+
+        if self.sound_manager is not None:
+            self._fire_sound_channel = self.sound_manager.play_sfx(self.fire_sound)
 
     def get_world_bounds(self):
         """World-space pygame.Rect enclosing this beam's current visual
@@ -819,6 +845,11 @@ class BeamAttack:
             self.decaying = True
             self.decay_length = 0.0
 
+        if self.sound_manager is not None and not self._stop_sound_played:
+            self._stop_sound_played = True
+            self.sound_manager.stop_looping_sfx(self.loop_sound)
+            self.sound_manager.play_sfx(self.stop_sound)
+
     def report_obstruction(self, distance, source='wall'):
         ...
         if source == 'enemy' and self.ignore_enemy_obstruction:
@@ -839,6 +870,19 @@ class BeamAttack:
             self._reported_block_distance = distance
 
     def update(self, dt):
+        # Sound: as soon as the beamfire one-shot has finished playing,
+        # immediately start looping loop_sound. Checked every frame (not
+        # just once) since the one-shot is still playing on most of the
+        # early update() calls right after firing. Skipped entirely once
+        # the loop has started, and never (re)started after stop_sound has
+        # played (self._stop_sound_played), so a beam that decays before
+        # its fire sound even finishes doesn't start the loop afterward.
+        if (self.sound_manager is not None and not self._loop_sound_started
+                and not self._stop_sound_played):
+            if self._fire_sound_channel is None or not self._fire_sound_channel.get_busy():
+                self.sound_manager.play_looping_sfx(self.loop_sound)
+                self._loop_sound_started = True
+
         # Update animation
         if self.use_sprites:
             self.frame_timer += dt
@@ -1809,7 +1853,8 @@ class KamehamehaChargeEffect:
     def __init__(self, player, scale=_RENDER_SCALE, attack_name='kamehameha',
                  target_charge_duration=1, direction_offsets=None, pulse_steps=4,
                  rotate_to_direction=False, frame_width=16, frame_height=16,
-                 hold_after_pulse=False):
+                 hold_after_pulse=False, sound_manager=None,
+                 charge_sound='beamcharge', chargeloop_sound='beamchargeloop'):
         self.player = player
         # Direction only affects position/draw-order here, not which
         # frames get used (the sheet has no per-direction rows).
@@ -1904,6 +1949,23 @@ class KamehamehaChargeEffect:
         self.frame_h_scaled = 0
 
         self._load_sprite()
+
+        # Sound: starting the charge plays charge_sound once, then
+        # immediately (as soon as that one-shot finishes) loops
+        # chargeloop_sound for as long as the player keeps charging.
+        # Optional — sound_manager=None (the default) means no sound
+        # calls at all, same pattern as BeamAttack. The loop is stopped
+        # by calling stop() (see below), which the code that ends the
+        # charge — either because the beam fires or the charge is
+        # cancelled — is expected to call.
+        self.sound_manager = sound_manager
+        self.charge_sound = charge_sound
+        self.chargeloop_sound = chargeloop_sound
+        self._charge_sound_channel = None
+        self._chargeloop_started = False
+
+        if self.sound_manager is not None:
+            self._charge_sound_channel = self.sound_manager.play_sfx(self.charge_sound)
 
         # get_beam_layer() returns DrawLayer.PLAYER (0) for left/right —
         # the SAME layer value as the player itself. On a tie, LayerManager's
@@ -2028,12 +2090,37 @@ class KamehamehaChargeEffect:
         return total_steps * self.frame_duration
 
     def update(self, dt):
+        # Sound: as soon as the beamcharge one-shot has finished playing,
+        # immediately start looping chargeloop_sound. See BeamAttack.update
+        # for why this is polled every frame rather than driven by a
+        # finish callback.
+        if self.sound_manager is not None and not self._chargeloop_started:
+            if self._charge_sound_channel is None or not self._charge_sound_channel.get_busy():
+                self.sound_manager.play_looping_sfx(self.chargeloop_sound)
+                self._chargeloop_started = True
+
         if not self.frames_scaled:
             return
         self.frame_timer += dt
         if self.frame_timer >= self.frame_duration:
             self.frame_timer -= self.frame_duration
             self.tick += 1
+
+    def stop(self):
+        """Call this the instant charging ends — either because the beam
+        fires or the charge is cancelled/interrupted — to stop
+        chargeloop_sound (or the still-playing charge_sound one-shot, if
+        the player let go before it even finished) and mark this effect
+        inactive. Safe to call even if sound_manager is None or the loop
+        never started. Idempotent-ish: calling it more than once just
+        calls stop_looping_sfx again, which is itself a safe no-op on an
+        already-stopped/never-started loop.
+        """
+        if self.sound_manager is not None:
+            self.sound_manager.stop_looping_sfx(self.chargeloop_sound)
+            if not self._chargeloop_started and self._charge_sound_channel is not None:
+                self._charge_sound_channel.stop()
+        self.active = False
 
     def draw(self, screen, camera, colors=None):
         if not self.active or not self.frames_scaled:

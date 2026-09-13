@@ -1,4 +1,7 @@
 import os
+import uuid
+
+from objects.ambient_sound_object import AmbientSoundObject
 
 import numpy as np
 import pygame
@@ -6,7 +9,8 @@ import pygame.gfxdraw
 
 from config.settings import RENDER_SCALE, TILE_SIZE, WORLD_WIDTH, WORLD_HEIGHT
 from objects.spawn_object import SpawnObject, SpawnObjectManager
-from objects.collision_object import CollisionObject, CollisionObjectManager, draw_collision_object
+from objects.collision_object import (CollisionObject, CollisionObjectManager,
+                                       draw_collision_object, draw_collision_group)
 from objects.animated_region import AnimatedRegion, AnimatedRegionManager, draw_animated_region, REGION_STYLES
 from objects.level_gate import LevelGate, LevelGateManager
 from objects.room_transition import RoomTransition, RoomTransitionManager, TransitionConfigDialog
@@ -14,16 +18,17 @@ from objects.flying_pad import FlyingPad, FlyingPadManager
 from objects.nimbus_cloud import NimbusCloud, NimbusCloudManager
 from objects.save_point import SavePoint, SavePointManager
 from objects.world_map import WorldMapObject, WorldMapObjectManager
+from objects.fishing_area import FishingArea, FishingAreaManager
 from objects.door_object import Door, DoorManager
 from objects.chest_object import Chest, ChestManager
-from objects.decoration_objects import Decoration, DECORATION_STYLES
+from objects.decoration_objects import (Decoration, DECORATION_STYLES,
+                                         reload_decoration_styles)
 from core.items import get_item
 from objects.trigger_box import (OverlapTriggerBox, KeyTriggerBox, TriggerBoxManager,
                                  draw_trigger_box)
 from dev_tools.room_editor.room_editor_tools.flying_pad_path_editor import FlyingPadPathEditor
 from dev_tools.room_editor.room_editor_tools.nimbus_cloud_path_editor import NimbusCloudPathEditor
 from core.event_editor import EventEditorWindow
-
 
 class ObjectEditor:
     """Editor for placing game objects like spawn points, collision walls, and decorations"""
@@ -37,6 +42,7 @@ class ObjectEditor:
         'collision': 'System',
         'transition': 'System',
         'trigger_box': 'System',
+        'ambient_sound': 'System',
         'animated_region': 'Terrain',
         'stone': 'Interactive',
         'gate': 'Interactive',
@@ -44,6 +50,7 @@ class ObjectEditor:
         'nimbus_cloud': 'Interactive',
         'save_point': 'Interactive',
         'world_map_object': 'Interactive',
+        'fishing_area': 'Interactive',
         'chest': 'Interactive',
         'door': 'Interactive',
         'decoration': 'Decorations',
@@ -118,6 +125,14 @@ class ObjectEditor:
         self.collision_start_x = 0
         self.collision_start_y = 0
         self.preview_collision = None
+        # Set when the current collision drag started with Shift held --
+        # instead of one rectangular box, the drag lays down a "staircase"
+        # chain of small square boxes following the drag line (walked in
+        # _build_diagonal_collision_chain), drawn merged into one smooth
+        # angled quad (see draw_collision_group) but functioning as
+        # ordinary axis-aligned collision underneath.
+        self.collision_diagonal_mode = False
+        self.preview_collision_group = []
 
         self.placing_animated_region = False
         self.animated_region_start_x = 0
@@ -197,6 +212,11 @@ class ObjectEditor:
         self.on_world_map_placed = None
         self.on_world_map_deleted = None
 
+        # ── Fishing areas ─────────────────────────────────────────────────────
+        self.fishing_area_manager = FishingAreaManager()
+        self.on_fishing_area_placed = None
+        self.on_fishing_area_deleted = None
+
         # ── Doors ─────────────────────────────────────────────────────────────
         self.door_manager = DoorManager()
         self.on_door_placed = None
@@ -207,6 +227,17 @@ class ObjectEditor:
         # until set_sound_manager() is called (wired up by game.py) — the
         # preview button just no-ops silently until then.
         self.sound_manager = None
+
+        # Positional ambient emitters live independently of the room-wide BGS
+        # slot. room_editor.py aliases each room's persisted list into this
+        # dict, the same way the existing object managers are synchronized.
+        self.ambient_sound_objects = {}
+        self.ambient_sound_options = self._discover_ambient_sound_names()
+        self.ambient_sound_name = self.ambient_sound_options[0] if self.ambient_sound_options else ''
+        self.ambient_sound_max_distance = 256
+        self.on_ambient_sound_placed = None
+        self.on_ambient_sound_deleted = None
+
         _door_sounds = Door.list_door_sounds() or Door.DEFAULT_SOUND_NAMES
         self.door_sound_options = _door_sounds
         self.door_sound_text = _door_sounds[0]  # editor toggle — applies to the next door placed
@@ -335,15 +366,14 @@ class ObjectEditor:
         # instead of going through the variant system.
         self.nimbus_cloud_sprite = NimbusCloud(0, 0).sprite
 
-        # Tree decoration variants come straight off DECORATION_STYLES'
-        # grid_rows — one entry per sheet row (see decoration_objects.py's
-        # module docstring). 'type' holds the row/variant index itself
-        # (an int), which is exactly what Decoration(..., variant) expects,
-        # rather than a string key like doors/chests use.
-        self.tree_variants = [
-            {'type': i, 'name': name, 'sprite': None}
-            for i, name in enumerate(DECORATION_STYLES['tree']['variants'])
-        ]
+        # Decoration catalogue is generated from DECORATION_STYLES. The
+        # 'tree' entry remains fully hardcoded in decoration_objects.py, so
+        # its hand-authored animation sequence can never be replaced by the
+        # automatic asset scanner. Any other decoration folder found under
+        # assets/objects/decorations/ is added automatically.
+        self.decoration_variants_by_type = {}
+        self.decoration_palette_entries = self._build_decoration_palette_entries()
+        self.tree_variants = self.decoration_variants_by_type.get('tree', [])
 
         # Door variants are discovered from assets/sprites/structures/door/ at
         # startup (one sheet per type — see Door.list_door_types()) rather
@@ -445,6 +475,14 @@ class ObjectEditor:
                     'default_variant': 'world_map'
                 },
                 {
+                    'id': 'fishing_area',
+                    'name': 'Fishing Area',
+                    'sprite': None,
+                    'width': 48,
+                    'height': 48,
+                    'object_type': 'fishing_area',
+                },
+                {
                     'id': 'chest',
                     'name': 'Treasure Chest',
                     'sprite': None,
@@ -467,20 +505,7 @@ class ObjectEditor:
                     'default_variant': self.door_variants[0]['type']
                 },
             ],
-            'Decorations': [
-                {
-                    'id': 'tree',
-                    'name': 'Tree',
-                    'sprite': None,
-                    'width': DECORATION_STYLES['tree']['frame_w'],
-                    'height': DECORATION_STYLES['tree']['frame_h'],
-                    'object_type': 'decoration',
-                    'decoration_type': 'tree',
-                    'has_variants': True,
-                    'variants': self.tree_variants,
-                    'default_variant': 0,
-                },
-            ],
+            'Decorations': self.decoration_palette_entries,
         }
 
         # Add spawn point to System category
@@ -576,6 +601,21 @@ class ObjectEditor:
             'is_trigger_box': True
         })
 
+        # Add positional Ambient Sound emitter to System. The icon is editor
+        # only; runtime rendering is just an optional debug marker/radius.
+        ambient_sprite = pygame.Surface((16, 16), pygame.SRCALPHA)
+        pygame.draw.circle(ambient_sprite, (170, 110, 255, 120), (8, 8), 7)
+        pygame.draw.circle(ambient_sprite, (220, 190, 255), (8, 8), 3)
+        pygame.draw.arc(ambient_sprite, (235, 220, 255), (1, 1, 14, 14), -0.8, 0.8, 2)
+        self.categories['System'].append({
+            'id': 'ambient_sound',
+            'name': 'Ambient Sound',
+            'sprite': ambient_sprite,
+            'width': 16,
+            'height': 16,
+            'object_type': 'ambient_sound',
+        })
+
         # Generate sprites and variant sprites
         self._generate_placeholder_sprites()
         self._generate_variant_sprites()
@@ -620,6 +660,154 @@ class ObjectEditor:
         # find out whether an item is armed in the Items panel for the
         # chest-loot-assignment flow — see _try_assign_chest_loot.
         self.toolbar = None
+
+    def _build_decoration_palette_entries(self):
+        """Build one palette card per discovered/hardcoded decoration type.
+
+        Tree is kept first for continuity with the existing editor. Every
+        other decoration is driven by DECORATION_STYLES, so no editor code is
+        needed when a new decoration folder is added.
+        """
+        entries = []
+        decoration_types = list(DECORATION_STYLES.keys())
+        if 'tree' in decoration_types:
+            decoration_types.remove('tree')
+            decoration_types.insert(0, 'tree')
+
+        for decoration_type in decoration_types:
+            style = DECORATION_STYLES.get(decoration_type, {})
+            frame_w = int(style.get('frame_w', 32))
+            frame_h = int(style.get('frame_h', 32))
+            variant_names = style.get('variants', [])
+            if not variant_names:
+                variant_names = [style.get('label', decoration_type.replace('_', ' ').title())]
+
+            variants = [
+                {'type': i, 'name': str(name), 'sprite': None}
+                for i, name in enumerate(variant_names)
+            ]
+            self.decoration_variants_by_type[decoration_type] = variants
+
+            entries.append({
+                'id': decoration_type,
+                'name': style.get('label', decoration_type.replace('_', ' ').replace('-', ' ').title()),
+                'sprite': None,
+                'width': frame_w,
+                'height': frame_h,
+                'object_type': 'decoration',
+                'decoration_type': decoration_type,
+                'has_variants': len(variants) > 0,
+                'variants': variants,
+                'default_variant': 0,
+            })
+
+        return entries
+
+
+    def refresh_decoration_catalog(self):
+        """Reload decoration definitions and rebuild the Decorations palette.
+
+        The Decoration Creator calls this after saving so newly-added or
+        reconfigured decorations appear in the Object Editor without restarting
+        the game. The hardcoded Tree remains protected by
+        reload_decoration_styles().
+        """
+        current_id = None
+        current_variant_type = None
+        if isinstance(getattr(self, 'selected_object', None), dict):
+            if self.selected_object.get('object_type') == 'decoration':
+                current_id = self.selected_object.get('decoration_type')
+        if isinstance(getattr(self, 'selected_variant', None), dict):
+            current_variant_type = self.selected_variant.get('type')
+
+        reload_decoration_styles()
+        self.decoration_variants_by_type = {}
+        self.decoration_palette_entries = self._build_decoration_palette_entries()
+        self.tree_variants = self.decoration_variants_by_type.get('tree', [])
+
+        # The palette is already constructed during __init__, but this method
+        # may be called later after the category dictionary exists.
+        if hasattr(self, 'categories'):
+            self.categories['Decorations'] = self.decoration_palette_entries
+
+        self.showing_variants_for = None
+        if current_id:
+            replacement = next(
+                (obj for obj in self.decoration_palette_entries
+                 if obj.get('decoration_type') == current_id),
+                None,
+            )
+            self.selected_object = replacement
+            if replacement:
+                variants = replacement.get('variants', [])
+                if current_variant_type is not None:
+                    self.selected_variant = next(
+                        (v for v in variants if v.get('type') == current_variant_type),
+                        variants[0] if variants else None,
+                    )
+                else:
+                    self.selected_variant = variants[0] if variants else None
+            else:
+                self.selected_object = None
+                self.selected_variant = None
+        elif getattr(self, 'selected_object', None) and self.selected_object.get('object_type') != 'decoration':
+            # Preserve selections for unrelated categories.
+            pass
+        else:
+            self.selected_object = None
+            self.selected_variant = None
+
+        self._generate_variant_sprites()
+
+    @staticmethod
+    def _discover_ambient_sound_names():
+        """Return extensionless BGS keys from assets/audio/sfx/ambient.
+
+        AudioAssetLoader keys these sounds by bare filename stem even when they
+        live in nested folders, so the editor mirrors that convention.
+        """
+        ambient_dir = os.path.join('assets', 'audio', 'sfx', 'ambient')
+        names = []
+        try:
+            for _root, _dirs, filenames in os.walk(ambient_dir):
+                for filename in filenames:
+                    if filename.lower().endswith(('.wav', '.ogg')):
+                        names.append(os.path.splitext(filename)[0])
+        except OSError:
+            pass
+        return sorted(set(names))
+
+    def set_ambient_sound_objects(self, room_name, objects):
+        """Alias a room's live AmbientSoundObject list into the editor."""
+        self.ambient_sound_objects[room_name] = objects
+
+    def get_ambient_sound_objects(self, room_name):
+        return self.ambient_sound_objects.setdefault(room_name, [])
+
+    def update_positional_ambient_sounds(self, player_x, player_y, room_name):
+        """Update every placed emitter in room_name for the current frame."""
+        for emitter in self.get_ambient_sound_objects(room_name):
+            emitter.update_audio(player_x, player_y, self.sound_manager)
+
+    def stop_positional_ambient_sounds(self, room_name=None):
+        """Stop emitter-owned channels for one room, or every known room."""
+        if room_name is None:
+            groups = list(self.ambient_sound_objects.values())
+        else:
+            groups = [self.get_ambient_sound_objects(room_name)]
+        for emitters in groups:
+            for emitter in emitters:
+                emitter.stop_audio(self.sound_manager)
+
+    def _cycle_ambient_sound(self, direction):
+        if not self.ambient_sound_options:
+            self.ambient_sound_name = ''
+            return
+        try:
+            index = self.ambient_sound_options.index(self.ambient_sound_name)
+        except ValueError:
+            index = 0
+        self.ambient_sound_name = self.ambient_sound_options[(index + direction) % len(self.ambient_sound_options)]
 
     def set_toolbar(self, toolbar):
         """Set the toolbar reference and pass it to sub-editors that need to hide it"""
@@ -1077,6 +1265,8 @@ class ObjectEditor:
             self.scroll_offset = 0
             self.placing_collision = False
             self.preview_collision = None
+            self.collision_diagonal_mode = False
+            self.preview_collision_group = []
             self.gate_level_input_active = False
             self.transition_config.close()
             self.pending_transition = None
@@ -1162,6 +1352,12 @@ class ObjectEditor:
 
         for obj in self.world_map_manager.get_objects(room_name):
             yield obj, 'world_map_object'
+
+        for area in self.fishing_area_manager.get_fishing_areas(room_name):
+            yield area, 'fishing_area'
+
+        for emitter in self.get_ambient_sound_objects(room_name):
+            yield emitter, 'ambient_sound'
 
         for box in self.trigger_box_manager.get_boxes(room_name):
             yield box, 'trigger_box'
@@ -1302,6 +1498,19 @@ class ObjectEditor:
                 distance = ((obj.x - world_x) ** 2 + (obj.y - world_y) ** 2) ** 0.5
                 if distance < max(obj.width, obj.height) / 2:
                     return obj, 'world_map_object'
+
+        if wants('fishing_area'):
+            # Check fishing areas
+            for area in self.fishing_area_manager.get_fishing_areas(self.current_room_name):
+                distance = ((area.x - world_x) ** 2 + (area.y - world_y) ** 2) ** 0.5
+                if distance < max(area.width, area.height) / 2:
+                    return area, 'fishing_area'
+
+        if wants('ambient_sound'):
+            for emitter in reversed(self.get_ambient_sound_objects(self.current_room_name)):
+                distance = ((emitter.x - world_x) ** 2 + (emitter.y - world_y) ** 2) ** 0.5
+                if distance <= max(emitter.width, emitter.height) / 2:
+                    return emitter, 'ambient_sound'
 
         # Check water/grass/etc regions LAST — regions tend to be large,
         # ground-level fills that other system boxes (trigger boxes,
@@ -1464,6 +1673,27 @@ class ObjectEditor:
             if self.on_world_map_deleted:
                 self.on_world_map_deleted(obj, self.current_room_name)
 
+        elif obj_type == 'fishing_area':
+            self.fishing_area_manager.remove_fishing_area(self.current_room_name, obj)
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(self.current_room_name)
+                if room and hasattr(room, 'fishing_areas') and obj in room.fishing_areas:
+                    room.fishing_areas.remove(obj)
+            if self.on_fishing_area_deleted:
+                self.on_fishing_area_deleted(obj, self.current_room_name)
+
+        elif obj_type == 'ambient_sound':
+            obj.stop_audio(self.sound_manager)
+            emitters = self.get_ambient_sound_objects(self.current_room_name)
+            if obj in emitters:
+                emitters.remove(obj)
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(self.current_room_name)
+                if room and hasattr(room, 'ambient_sounds') and obj in room.ambient_sounds:
+                    room.ambient_sounds.remove(obj)
+            if self.on_ambient_sound_deleted:
+                self.on_ambient_sound_deleted(obj, self.current_room_name)
+
         elif obj_type == 'trigger_box':
             self.trigger_box_manager.remove_box(self.current_room_name, obj)
             if self.room_manager:
@@ -1474,6 +1704,43 @@ class ObjectEditor:
 
             if hasattr(self, 'on_trigger_box_deleted') and self.on_trigger_box_deleted:
                 self.on_trigger_box_deleted(obj, self.current_room_name)
+
+    def _delete_collision_group(self, group_id):
+        """Delete every box sharing `group_id` (a Shift-dragged diagonal
+        run -- see CollisionObject.diagonal_group_id) as one action.
+
+        Right-click delete on a diagonal wall used to only remove
+        whichever single little box was under the cursor, leaving the
+        rest of the run behind (looking like only "the tip" got deleted).
+        This finds every box tagged with the same group id, removes them
+        all together, and reports the whole batch through
+        on_collision_group_deleted so the host editor can push one
+        grouped undo entry for it (mirroring on_collision_group_placed),
+        instead of _delete_object's single-object hook.
+        """
+        collision_objs = list(self.collision_manager.get_collision_objects(self.current_room_name))
+        group_boxes = [c for c in collision_objs if getattr(c, 'diagonal_group_id', None) == group_id]
+        if not group_boxes:
+            return
+
+        for box in group_boxes:
+            self.collision_manager.remove_collision_object(box)
+
+        if self.room_manager:
+            room = self.room_manager.get_room_by_name(self.current_room_name)
+            if room and hasattr(room, 'collision_objects'):
+                for box in group_boxes:
+                    if box in room.collision_objects:
+                        room.collision_objects.remove(box)
+                self.room_manager.save_room(room)
+
+        if hasattr(self, 'on_collision_group_deleted') and self.on_collision_group_deleted:
+            self.on_collision_group_deleted(group_boxes, self.current_room_name)
+        elif hasattr(self, 'on_collision_deleted') and self.on_collision_deleted:
+            # Fallback for a host that hasn't wired the group hook yet --
+            # still fully functional, just one undo step per box.
+            for box in group_boxes:
+                self.on_collision_deleted(box, self.current_room_name)
 
     def _is_object_disabled(self, obj) -> bool:
         """Check if we can't place this object (e.g. spawn already exists)"""
@@ -1789,6 +2056,27 @@ class ObjectEditor:
             if hasattr(self, 'on_spawn_placed') and self.on_spawn_placed and spawn_obj:
                 self.on_spawn_placed(spawn_obj, room_name)
 
+        elif self.selected_object.get('object_type') == 'ambient_sound':
+            emitter = AmbientSoundObject(
+                int(self.preview_x), int(self.preview_y),
+                self.ambient_sound_name, self.ambient_sound_max_distance
+            )
+            emitters = self.get_ambient_sound_objects(room_name)
+            if self._too_close_to_existing(self.preview_x, self.preview_y, emitters):
+                return
+            emitters.append(emitter)
+
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(room_name)
+                if room:
+                    if not hasattr(room, 'ambient_sounds'):
+                        room.ambient_sounds = emitters
+                    elif room.ambient_sounds is not emitters and emitter not in room.ambient_sounds:
+                        room.ambient_sounds.append(emitter)
+
+            if self.on_ambient_sound_placed:
+                self.on_ambient_sound_placed(emitter, room_name)
+
         elif self.selected_object.get('object_type') == 'destructible_stone':
             from objects.destructible_stone import DestructibleStone
 
@@ -2034,6 +2322,23 @@ class ObjectEditor:
             if self.on_world_map_placed:
                 self.on_world_map_placed(obj, room_name)
 
+        elif self.selected_object.get('object_type') == 'fishing_area':
+            width = self.selected_object.get('width', 48)
+            height = self.selected_object.get('height', 48)
+            obj = FishingArea(int(self.preview_x), int(self.preview_y), width, height)
+            self.fishing_area_manager.add_fishing_area(room_name, obj)
+
+            if self.room_manager:
+                room = self.room_manager.get_room_by_name(room_name)
+                if room:
+                    if not hasattr(room, 'fishing_areas'):
+                        room.fishing_areas = []
+                    if obj not in room.fishing_areas:
+                        room.fishing_areas.append(obj)
+
+            if self.on_fishing_area_placed:
+                self.on_fishing_area_placed(obj, room_name)
+
         elif self.selected_object.get('object_type') == 'door':
             existing_doors = None
             if self.room_manager:
@@ -2200,7 +2505,7 @@ class ObjectEditor:
                                (int(screen_x), int(screen_y)),
                                scaled_width // 2 + pulse, 3)
 
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos())
         screen.draw_line( self.colors['delete'],
                          (mouse_pos[0] - 10, mouse_pos[1] - 10),
                          (mouse_pos[0] + 10, mouse_pos[1] + 10), 3)
@@ -2208,8 +2513,123 @@ class ObjectEditor:
                          (mouse_pos[0] + 10, mouse_pos[1] - 10),
                          (mouse_pos[0] - 10, mouse_pos[1] + 10), 3)
 
+    def _build_diagonal_collision_chain(self, start_x, start_y, end_x, end_y):
+        """Walk the grid cells from (start_x, start_y) to (end_x, end_y)
+        and return the ordered chain of tile-sized CollisionObjects that
+        approximate that line -- the "staircase" used for a Shift+drag
+        diagonal wall.
+
+        This walks actual grid cells (a Bresenham line over cell indices,
+        matching the same `int(coord / step) * step` snapping the normal
+        rectangular tool already uses) rather than sampling points along
+        the raw, unsnapped drag line -- sampling-and-centering was the
+        earlier bug: it sized boxes to the grid but never actually
+        snapped their *position* to it, so the run drifted off-grid.
+
+        Plain Bresenham can take a diagonal step (x and y both move in the
+        same step), which only touches the previous cell at a corner --
+        enough for a player to slip through on the diagonal. Whenever
+        that happens here, an extra edge-adjacent cell is inserted so the
+        run stays fully edge-connected the whole way (a "supercover"
+        line), the same guarantee a normal rectangular wall gives for
+        free. `step` is the current grid-snap size when snapping is on,
+        or TILE_SIZE otherwise, so the run stays tile-aligned either way.
+        """
+        step = self.grid_snap_size if (self.grid_snap and self.grid_snap_size > 0) else TILE_SIZE
+
+        gx0 = int(start_x / step)
+        gy0 = int(start_y / step)
+        gx1 = int(end_x / step)
+        gy1 = int(end_y / step)
+
+        if gx0 == gx1 and gy0 == gy1:
+            # Too short a drag yet to have crossed into a second cell --
+            # preview a single ordinary box so a fresh/tiny Shift-drag
+            # still shows something instead of an empty list.
+            return [CollisionObject(gx0 * step, gy0 * step, step, step, self.current_room_name)]
+
+        dx = abs(gx1 - gx0)
+        dy = -abs(gy1 - gy0)
+        sx = 1 if gx0 < gx1 else -1
+        sy = 1 if gy0 < gy1 else -1
+        err = dx + dy
+
+        cells = [(gx0, gy0)]
+        gx, gy = gx0, gy0
+        while (gx, gy) != (gx1, gy1):
+            e2 = 2 * err
+            moved_x = False
+            moved_y = False
+            if e2 >= dy:
+                err += dy
+                gx += sx
+                moved_x = True
+            if e2 <= dx:
+                err += dx
+                gy += sy
+                moved_y = True
+            if moved_x and moved_y:
+                # Diagonal step -- insert the in-between cell so this
+                # step stays edge-connected instead of corner-only.
+                cells.append((gx - sx, gy))
+            cells.append((gx, gy))
+
+        return [CollisionObject(cx * step, cy * step, step, step, self.current_room_name)
+                for cx, cy in cells]
+
+    def _finalize_diagonal_collision_placement(self, room_name):
+        """Finish placing a Shift-dragged diagonal collision run.
+
+        Turns the previewed staircase of boxes into real CollisionObjects,
+        tags them all with a shared diagonal_group_id (purely cosmetic --
+        see CollisionObject.diagonal_group_id) and pushes a single undo
+        entry for the whole run via on_collision_group_placed, so Ctrl+Z
+        removes the entire diagonal wall in one step instead of one little
+        box at a time.
+        """
+        boxes = self.preview_collision_group
+        self.preview_collision_group = []
+
+        if len(boxes) < 2:
+            # A drag too short to have produced a real run -- nothing to
+            # place (mirrors a near-zero rectangular drag being dropped).
+            return
+
+        group_id = uuid.uuid4().hex
+        placed = []
+
+        if self.room_manager:
+            room = self.room_manager.get_room_by_name(room_name)
+            if room:
+                if not hasattr(room, 'collision_objects'):
+                    room.collision_objects = []
+                for box in boxes:
+                    collision_obj = CollisionObject(
+                        box.x, box.y, box.width, box.height, room_name, group_id
+                    )
+                    room.collision_objects.append(collision_obj)
+                    placed.append(collision_obj)
+                self.collision_manager.collision_objects[room_name] = room.collision_objects
+
+        if not placed:
+            return
+
+        if hasattr(self, 'on_collision_group_placed') and self.on_collision_group_placed:
+            # Preferred path: host editor records the whole run as one
+            # grouped undo entry (e.g. an 'area_add' with one item per box).
+            self.on_collision_group_placed(placed, room_name)
+        elif hasattr(self, 'on_collision_placed') and self.on_collision_placed:
+            # Fallback if the host hasn't wired the group hook yet -- still
+            # fully functional, just costs one undo step per box in the run.
+            for collision_obj in placed:
+                self.on_collision_placed(collision_obj, room_name)
+
     def _finalize_collision_placement(self, room_name):
         """Finish placing a collision wall after dragging"""
+        if self.collision_diagonal_mode:
+            self._finalize_diagonal_collision_placement(room_name)
+            return
+
         if not self.preview_collision:
             return
 
@@ -2568,7 +2988,7 @@ class ObjectEditor:
             self.selected_object = None
             self.selected_variant = None
             self.showing_variants_for = None
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = event.dict.get('_room_editor_raw_pos', getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos()))
 
         # Handle transition config dialog
         if self.transition_config.active:
@@ -2819,7 +3239,15 @@ class ObjectEditor:
             if event.button == 3:
                 if not self._is_in_palette(mouse_pos[0], mouse_pos[1]):
                     if self.hovered_object and self.hovered_object_type:
-                        self._delete_object(self.hovered_object, self.hovered_object_type)
+                        group_id = (getattr(self.hovered_object, 'diagonal_group_id', None)
+                                    if self.hovered_object_type == 'collision' else None)
+                        if group_id:
+                            # Part of a Shift-dragged diagonal run -- delete
+                            # every segment together instead of just the one
+                            # box under the cursor.
+                            self._delete_collision_group(group_id)
+                        else:
+                            self._delete_object(self.hovered_object, self.hovered_object_type)
                         self.hovered_object = None
                         self.hovered_object_type = None
                 return
@@ -2936,6 +3364,26 @@ class ObjectEditor:
                                 # Click outside list — close without selecting
                                 self.world_map_dropdown_open = False
                                 return
+
+                    # Ambient Sound settings: cycle BGS asset and tune audible radius.
+                    if (self.selected_object and isinstance(self.selected_object, dict)
+                            and self.selected_object.get('object_type') == 'ambient_sound'):
+                        left = self.ui_rects.get('ambient_sound_left')
+                        right = self.ui_rects.get('ambient_sound_right')
+                        minus = self.ui_rects.get('ambient_distance_minus')
+                        plus = self.ui_rects.get('ambient_distance_plus')
+                        if left and left.collidepoint(mouse_pos):
+                            self._cycle_ambient_sound(-1)
+                            return
+                        if right and right.collidepoint(mouse_pos):
+                            self._cycle_ambient_sound(1)
+                            return
+                        if minus and minus.collidepoint(mouse_pos):
+                            self.ambient_sound_max_distance = max(32, self.ambient_sound_max_distance - 32)
+                            return
+                        if plus and plus.collidepoint(mouse_pos):
+                            self.ambient_sound_max_distance = min(4096, self.ambient_sound_max_distance + 32)
+                            return
 
                     # Handle water/grass opacity slider
                     if (self.selected_object and isinstance(self.selected_object, dict)
@@ -3062,6 +3510,7 @@ class ObjectEditor:
                 if self.placing_collision:
                     self._finalize_collision_placement(room_name)
                     self.placing_collision = False
+                    self.collision_diagonal_mode = False
                     return
 
                 # Finish placing water/grass region if we're in the middle of it
@@ -3095,6 +3544,14 @@ class ObjectEditor:
                             self.placing_collision = True
                             self.collision_start_x = self.preview_x
                             self.collision_start_y = self.preview_y
+                            # Shift+drag places a diagonal "staircase" run
+                            # instead of one rectangular box -- decided once
+                            # up front at drag-start, same as every other
+                            # drag gesture here, rather than re-checked every
+                            # frame (which would let releasing Shift
+                            # mid-drag switch modes under the cursor).
+                            self.collision_diagonal_mode = bool(
+                                pygame.key.get_mods() & pygame.KMOD_SHIFT)
                         elif self.selected_object.get('is_animated_region', False):
                             self.placing_animated_region = True
                             self.current_region_type = self.selected_object.get('region_type', 'water')
@@ -3251,6 +3708,8 @@ class ObjectEditor:
                 if self.placing_collision:
                     self.placing_collision = False
                     self.preview_collision = None
+                    self.collision_diagonal_mode = False
+                    self.preview_collision_group = []
                 elif self.placing_animated_region:
                     self.placing_animated_region = False
                     self.preview_animated_region = None
@@ -3357,7 +3816,12 @@ class ObjectEditor:
         # Each draggable zone recalculates its preview rect every frame by
         # snapping or free-dragging from the stored anchor to the current mouse pos.
         if self.placing_collision:
-            if self.grid_snap:
+            if self.collision_diagonal_mode:
+                self.preview_collision_group = self._build_diagonal_collision_chain(
+                    self.collision_start_x, self.collision_start_y,
+                    self.mouse_world_x, self.mouse_world_y)
+                self.preview_collision = None
+            elif self.grid_snap:
                 snap = self.grid_snap_size
                 snap_start_x = int(self.collision_start_x / snap) * snap
                 snap_start_y = int(self.collision_start_y / snap) * snap
@@ -3371,6 +3835,11 @@ class ObjectEditor:
 
                 width = max(snap, max_x - min_x + snap)
                 height = max(snap, max_y - min_y + snap)
+
+                self.preview_collision = CollisionObject(
+                    int(min_x), int(min_y), int(width), int(height), self.current_room_name
+                )
+                self.preview_collision_group = []
             else:
                 end_x = self.mouse_world_x
                 end_y = self.mouse_world_y
@@ -3383,13 +3852,10 @@ class ObjectEditor:
                 width = max(16, max_x - min_x)
                 height = max(16, max_y - min_y)
 
-            self.preview_collision = CollisionObject(
-                int(min_x),
-                int(min_y),
-                int(width),
-                int(height),
-                self.current_room_name
-            )
+                self.preview_collision = CollisionObject(
+                    int(min_x), int(min_y), int(width), int(height), self.current_room_name
+                )
+                self.preview_collision_group = []
 
         if self.placing_animated_region:
             if self.grid_snap:
@@ -3664,6 +4130,11 @@ class ObjectEditor:
 
             return
 
+        if self.placing_collision and self.collision_diagonal_mode and self.preview_collision_group:
+            draw_collision_group(screen, self.preview_collision_group, camera_x, camera_y,
+                                 RENDER_SCALE, dev_mode=True, selected=True)
+            return
+
         if self.placing_collision and self.preview_collision:
             draw_collision_object(screen, self.preview_collision, camera_x, camera_y,
                                   RENDER_SCALE, dev_mode=True, selected=True)
@@ -3689,7 +4160,7 @@ class ObjectEditor:
         if (self.selected_object and isinstance(self.selected_object, dict)
                 and self.selected_object.get('is_trigger_box', False)
                 and self.trigger_box_always_run
-                and not self._is_in_palette(*pygame.mouse.get_pos())):
+                and not self._is_in_palette(*getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos()))):
             # Always Run boxes place instantly on click, so this preview
             # stays on screen continuously (to support stamping down
             # several markers in a row). Drawing it via draw_trigger_box
@@ -3737,7 +4208,7 @@ class ObjectEditor:
         if self._is_object_disabled(self.selected_object):
             return
 
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos())
         if self._is_in_palette(mouse_pos[0], mouse_pos[1]):
             return
 
@@ -3830,7 +4301,7 @@ class ObjectEditor:
             return False
         if self._item_armed():
             return False
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos())
         if self._is_in_palette(mouse_pos[0], mouse_pos[1]):
             return False
         return True
@@ -3948,13 +4419,43 @@ class ObjectEditor:
                               margin=margin, world_w=w, world_h=h)
 
     def draw_collision_objects(self, screen, camera_x, camera_y):
-        """Draw all collision walls in the current room"""
+        """Draw all collision walls in the current room.
+
+        Boxes that share a diagonal_group_id (a Shift-dragged diagonal
+        run -- see CollisionObject.diagonal_group_id) are collected and
+        drawn together as one merged angled quad via draw_collision_group,
+        instead of each rendering its own little red square, so a
+        diagonal wall reads as one smooth line rather than a staircase.
+        Ungrouped boxes still draw individually exactly as before.
+        """
         if not self.current_room_name:
             return
 
         collision_objs = self.collision_manager.get_collision_objects(self.current_room_name)
 
+        diagonal_groups = {}
         for collision_obj in collision_objs:
+            group_id = getattr(collision_obj, 'diagonal_group_id', None)
+            if group_id:
+                diagonal_groups.setdefault(group_id, []).append(collision_obj)
+
+        drawn_group_ids = set()
+        for collision_obj in collision_objs:
+            group_id = getattr(collision_obj, 'diagonal_group_id', None)
+
+            if group_id:
+                if group_id in drawn_group_ids:
+                    continue
+                group_boxes = diagonal_groups[group_id]
+                if not any(self._in_view(b.x, b.y, camera_x, camera_y,
+                                          world_w=b.width, world_h=b.height) for b in group_boxes):
+                    drawn_group_ids.add(group_id)
+                    continue
+                draw_collision_group(screen, group_boxes, camera_x, camera_y,
+                                     RENDER_SCALE, dev_mode=True, selected=False)
+                drawn_group_ids.add(group_id)
+                continue
+
             if not self._in_view(collision_obj.x, collision_obj.y, camera_x, camera_y,
                                   world_w=collision_obj.width, world_h=collision_obj.height):
                 continue
@@ -3962,7 +4463,7 @@ class ObjectEditor:
                                   RENDER_SCALE, dev_mode=True, selected=False)
 
     def draw_animated_regions(self, screen, camera_x, camera_y, show_handles=True,
-                               show_fill=True):
+                               show_fill=True, show_border=True):
         """Draw all water/grass regions in the current room (editor overlay only).
 
         show_handles=False keeps the region fill/border visible but hides the
@@ -3973,6 +4474,11 @@ class ObjectEditor:
         draw) — pass this only when the caller guarantees an opaque draw
         covers this same area immediately afterward (see
         draw_animated_region's docstring for why).
+
+        show_border=False skips each region's outline rect too. Pass the
+        active editor's show_grid state here — with the grid hidden, these
+        outlines (usually tiled edge-to-edge on animated tiles) otherwise
+        read as grid lines that never went away.
         """
         if not self.current_room_name:
             return
@@ -3988,7 +4494,8 @@ class ObjectEditor:
                 continue
             draw_animated_region(screen, region, camera_x, camera_y,
                                  RENDER_SCALE, dev_mode=True, selected=False,
-                                 show_handles=show_handles, show_fill=show_fill)
+                                 show_handles=show_handles, show_fill=show_fill,
+                                 show_border=show_border)
 
     def _make_camera(self, camera_x, camera_y):
         """Lightweight camera-like object used by draw methods that expect a .x/.y camera."""
@@ -4153,7 +4660,7 @@ class ObjectEditor:
             return
 
         # Update hover state and always draw the toggle tab
-        mx, my = pygame.mouse.get_pos()
+        mx, my = getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos())
         self._hover_panel_toggle = self._panel_toggle_rect().collidepoint(mx, my)
         self._draw_panel_toggle_tab(screen)
 
@@ -4541,6 +5048,29 @@ class ObjectEditor:
                 continue
             obj.draw(screen, temp_camera, colors)
 
+    def draw_fishing_areas(self, screen, camera_x, camera_y, colors):
+        """Draw fishing areas in the current room."""
+        if not self.current_room_name:
+            return
+        temp_camera = self._make_camera(camera_x, camera_y)
+        for area in self.fishing_area_manager.get_fishing_areas(self.current_room_name):
+            if not area.active:
+                continue
+            if not self._center_obj_in_view(area, camera_x, camera_y):
+                continue
+            area.draw(screen, temp_camera, colors)
+
+    def draw_ambient_sounds(self, screen, camera_x, camera_y):
+        """Draw editor-only positional sound markers and audible radii."""
+        for emitter in self.get_ambient_sound_objects(self.current_room_name):
+            sx = int(emitter.x * RENDER_SCALE - camera_x)
+            sy = int(emitter.y * RENDER_SCALE - camera_y)
+            radius = max(1, int(emitter.max_distance * RENDER_SCALE))
+            # Radius ring communicates exactly where the linear fade reaches 0.
+            screen.draw_circle((170, 110, 255), (sx, sy), radius, 1)
+            screen.draw_circle((225, 205, 255), (sx, sy), max(4, int(7 * RENDER_SCALE)), 2)
+            screen.draw_circle((225, 205, 255), (sx, sy), max(1, int(2 * RENDER_SCALE)), 0)
+
     def draw_trigger_boxes(self, screen, camera_x, camera_y):
         """Draw all trigger box zones in the current room (dev mode only)."""
         if not self.current_room_name:
@@ -4571,6 +5101,9 @@ class ObjectEditor:
 
             if obj.get('object_type') == 'door':
                 height += 30
+
+            if obj.get('object_type') == 'ambient_sound':
+                height += 60  # sound picker + max-distance row
 
             if obj.get('is_trigger_box', False):
                 height += 30  # Box ID row
@@ -4642,6 +5175,35 @@ class ObjectEditor:
         hint = self.font_small.render("(Press H)", True, self.colors['text_dim'])
         screen.blit(hint, (self.palette_x + self.palette_padding + 120, y_pos + 3))
         y_pos += 25
+
+        if (self.selected_object and isinstance(self.selected_object, dict)
+                and self.selected_object.get('object_type') == 'ambient_sound'):
+            label = self.font_medium.render('Sound:', True, self.colors['text'])
+            screen.blit(label, (self.palette_x + self.palette_padding, y_pos))
+            left = pygame.Rect(self.palette_x + 90, y_pos - 3, 24, 22)
+            right = pygame.Rect(self.palette_x + self.palette_width - self.palette_padding - 24, y_pos - 3, 24, 22)
+            screen.draw_rect(self.colors['panel_light'], left, border_radius=3)
+            screen.draw_rect(self.colors['panel_light'], right, border_radius=3)
+            screen.blit(self.font_medium.render('<', True, self.colors['text']), (left.x + 7, left.y + 1))
+            screen.blit(self.font_medium.render('>', True, self.colors['text']), (right.x + 7, right.y + 1))
+            sound_text = self.ambient_sound_name or '<no ambient files>'
+            sound_surf = self.font_small.render(sound_text, True, self.colors['text_dim'])
+            screen.blit(sound_surf, (left.right + 8, y_pos + 2))
+            self.ui_rects['ambient_sound_left'] = left
+            self.ui_rects['ambient_sound_right'] = right
+            y_pos += 30
+
+            dlabel = self.font_medium.render(f'Radius: {self.ambient_sound_max_distance}px', True, self.colors['text'])
+            screen.blit(dlabel, (self.palette_x + self.palette_padding, y_pos))
+            minus = pygame.Rect(self.palette_x + 180, y_pos - 3, 24, 22)
+            plus = pygame.Rect(self.palette_x + 210, y_pos - 3, 24, 22)
+            screen.draw_rect(self.colors['panel_light'], minus, border_radius=3)
+            screen.draw_rect(self.colors['panel_light'], plus, border_radius=3)
+            screen.blit(self.font_medium.render('-', True, self.colors['text']), (minus.x + 8, minus.y + 1))
+            screen.blit(self.font_medium.render('+', True, self.colors['text']), (plus.x + 7, plus.y + 1))
+            self.ui_rects['ambient_distance_minus'] = minus
+            self.ui_rects['ambient_distance_plus'] = plus
+            y_pos += 30
 
         if self.selected_object and isinstance(self.selected_object, dict) and self.selected_object.get(
                 'object_type') == 'level_gate':
@@ -4782,7 +5344,7 @@ class ObjectEditor:
             # small play triangle + label rather than a unicode ▶ glyph, since
             # the default pygame font doesn't reliably have that character.
             preview_rect = pygame.Rect(btn_x + 6, btn_y, 78, btn_h)
-            preview_hover = preview_rect.collidepoint(pygame.mouse.get_pos())
+            preview_hover = preview_rect.collidepoint(getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos()))
             preview_bg = self.colors['input_active'] if preview_hover else self.colors['input_bg']
             screen.draw_rect( preview_bg, preview_rect)
             screen.draw_rect( self.colors['accent'], preview_rect, 2)

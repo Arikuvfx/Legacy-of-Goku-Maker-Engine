@@ -65,6 +65,7 @@ from attacks.burning_attack import BurningAttack, BurningChargeEffect
 from attacks.energy_sword import EnergySwordChargeEffect, EnergySwordSpinEffect
 from attacks.dragon_fist import DragonFistAttack
 from attacks.genkidama import GenkidamaChargeEffect, GenkidamaBlast
+from attacks.ultra_volleyball_attack import UltraVolleyballAttack
 
 CONFIG_VERSION = 1
 
@@ -1363,12 +1364,139 @@ class GenkidamaAttackConfig(AttackConfigBase):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# SECTION — Ultra Volleyball archetype: a fixed-length, 3-segment rigid
+# chain that travels as a single unit. See
+# attacks/ultra_volleyball_attack.py's class docstring for the full
+# contrast with the beam and chain archetypes above — it doesn't grow/
+# decay in place (BeamAttack) or stay anchored and get whip-steered
+# (FlameKamehamehaAttack/ChainAttackConfig); all three segments (end/
+# middle/decay) move together at travel_speed for a fixed travel_distance
+# and despawn on their own once they reach it, unless something is hit
+# first.
+#
+# Two things set this apart from every archetype above:
+#   - No separate charge-effect object/tab, same reasoning as Dragon Fist
+#     — this fires immediately on press with no wind-up at all, so
+#     charge_enabled is hardcoded False and OPTIONAL_SETS stays empty.
+#   - On enemy contact it doesn't damage or push anything — enemy.py's
+#     'ultra_volleyball' collision branch encases the enemy instead (see
+#     Enemy.encase()), and game.py deactivates the attack the same frame.
+#     That beat lives entirely in enemy.py/game.py, so there's nothing
+#     for this config to expose for it.
+# ═══════════════════════════════════════════════════════════════════════
+
+ULTRA_VOLLEYBALL_GROUPS: List[Tuple[str, List[FieldSpec]]] = [
+    ("Identity", [
+        FieldSpec("attack_name", "Asset folder (attack_name)", "str", "ultra_volleyball_attack",
+                   help="assets/sprites/attacks/{attack_name}/ — end_/middle_/decay_ sheets, "
+                        "single row facing right, rotated per direction"),
+    ]),
+
+    ("Sizing — per-segment", [
+        # Defaults match the shipped ultra_volleyball_attack art (8x4 per
+        # segment) rather than the generic 16x16 other archetypes default
+        # to — unlike beam/chain's attack_name field, this archetype's
+        # default attack_name IS the one specific move, so its defaults
+        # should match that move's real sheets, not an arbitrary guess.
+        FieldSpec("end_frame_width", "End (tip) width", "int", 8, min=1, max=256,
+                   help="the leading segment — this is what 'flies'"),
+        FieldSpec("end_frame_height", "End (tip) height", "int", 4, min=1, max=256),
+        FieldSpec("middle_frame_width", "Middle width", "int", 8, min=1, max=256),
+        FieldSpec("middle_frame_height", "Middle height", "int", 4, min=1, max=256),
+        FieldSpec("decay_frame_width", "Decay (tail) width", "int", 8, min=1, max=256),
+        FieldSpec("decay_frame_height", "Decay (tail) height", "int", 4, min=1, max=256),
+    ]),
+
+    ("Travel", [
+        FieldSpec("travel_speed", "Travel speed (px/s)", "float", 220, min=0, max=5000, step=10,
+                   help="world px/sec the whole 3-segment chain moves as a rigid unit"),
+        FieldSpec("travel_distance", "Travel distance (px)", "float", 220, min=10, max=5000, step=10,
+                   help="fixed total reach — despawns once it's traveled this far without hitting anything"),
+    ]),
+
+    ("Advanced", [
+        FieldSpec("scale", "Render scale override", "float", None, nullable=True, min=0.5, max=8, step=0.5,
+                   help="blank = use the engine's RENDER_SCALE"),
+    ]),
+]
+ULTRA_VOLLEYBALL_FIELDS: List[FieldSpec] = flatten_groups(ULTRA_VOLLEYBALL_GROUPS)
+
+
+class UltraVolleyballAttackConfig(AttackConfigBase):
+    """Fixed-length, 3-segment rigid chain that travels as one unit:
+    `self.params["ultra_volleyball"]` maps 1:1 to UltraVolleyballAttack's
+    kwargs. See class docstring above and attacks/ultra_volleyball_attack.py
+    for how this differs from the beam and chain archetypes.
+
+    ultra_volleyball_offsets is the same per-direction (x, y) spawn-nudge
+    convention as beam_offsets/chain_offsets/projectile_offsets/
+    dragon_fist_offsets — defaults to (0, 0), i.e. exactly where it always
+    spawned before this field existed, so old configs load unchanged
+    until someone drags it.
+    """
+
+    archetype = "ultra_volleyball"
+    PARAM_SETS = {"ultra_volleyball": ULTRA_VOLLEYBALL_FIELDS}
+    OPTIONAL_SETS = frozenset()  # no charge tab at all — see class docstring
+    EXTRA_KEYS = {"ultra_volleyball": ("ultra_volleyball_offsets",)}
+    GROUPS = {"ultra_volleyball": ULTRA_VOLLEYBALL_GROUPS}
+
+    def __init__(self, data: Optional[dict] = None):
+        self.ultra_volleyball_offsets: dict = dict(ZERO_DIRECTION_OFFSETS)
+        super().__init__(data)
+
+    @property
+    def ultra_volleyball(self) -> dict:
+        return self.params["ultra_volleyball"]
+
+    @property
+    def charge_enabled(self) -> bool:
+        # Always off — there's no separate charge-effect object for this
+        # archetype at all (see class docstring); dev_tools/attack_creator.py
+        # reads this unconditionally for every archetype and, when False,
+        # goes straight from press to build_attack().
+        return False
+
+    def build_charge_effect(self, player):
+        return None  # never called while charge_enabled is False, kept for interface parity
+
+    def _extra_from_data(self, set_name: str, incoming: dict) -> None:
+        if set_name == "ultra_volleyball":
+            offsets = incoming.get("ultra_volleyball_offsets") or {}
+            self.ultra_volleyball_offsets = {
+                d: tuple(offsets.get(d, ZERO_DIRECTION_OFFSETS[d])) for d in BEAM_DIRECTIONS
+            }
+
+    def _extra_to_dict(self, set_name: str) -> dict:
+        if set_name == "ultra_volleyball":
+            return {"ultra_volleyball_offsets": {d: list(v) for d, v in self.ultra_volleyball_offsets.items()}}
+        return {}
+
+    # ── building the real object ────────────────────────────────────
+    def build_attack(self, x: float, y: float, direction: str, player=None) -> UltraVolleyballAttack:
+        # player=None accepted-and-ignored — see BeamAttackConfig.build_attack's
+        # comment on why every archetype shares this call signature.
+        ox, oy = self.ultra_volleyball_offsets.get(direction, (0, 0))
+        return UltraVolleyballAttack(x + ox, y + oy, direction, **self._kwargs(self.ultra_volleyball))
+
+    # ── validation ──────────────────────────────────────────────────
+    def missing_asset_warnings(self, assets_root: Path) -> list:
+        warnings = []
+        sprite_dir = assets_root / "sprites" / "attacks" / self.ultra_volleyball["attack_name"]
+        for part in ("end", "middle", "decay"):
+            fname = f"{part}_{self.ultra_volleyball['attack_name']}.png"
+            if not (sprite_dir / fname).exists():
+                warnings.append(f"Missing {fname} (that segment just won't draw)")
+        return warnings
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # SECTION — future archetypes go here, same shape as the ones above:
 #   MELEE_GROUPS / MELEE_FIELDS + MeleeAttackConfig(...)
-# Candidates not yet covered: ghost_kamikaze_attack / ultra_volleyball_attack
-# (each their own bespoke state machine), melee, and instant_transmission
-# (cursor-targeting UI phase, not really a "fire and watch" attack at all
-# in the sense this creator models).
+# Candidates not yet covered: ghost_kamikaze_attack (its own bespoke state
+# machine), melee, and instant_transmission (cursor-targeting UI phase,
+# not really a "fire and watch" attack at all in the sense this creator
+# models).
 # ═══════════════════════════════════════════════════════════════════════
 
 
@@ -1386,4 +1514,5 @@ ARCHETYPES: Dict[str, Type[AttackConfigBase]] = {
     "sword": EnergySwordAttackConfig,
     "dragon_fist": DragonFistAttackConfig,
     "genkidama": GenkidamaAttackConfig,
+    "ultra_volleyball": UltraVolleyballAttackConfig,
 }

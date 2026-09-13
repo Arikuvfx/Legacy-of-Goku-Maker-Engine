@@ -56,10 +56,18 @@ class _SequenceState:
 
 
 class EventRunner:
-    def __init__(self):
+    def __init__(self, condition_evaluator=None):
         self._handlers = {}         # action_type -> callable
         self._blocking_types = set()
         self._active_sequences = []
+        # Callable: evaluate_conditions(condition_list) -> bool. Kept optional
+        # so the runner remains usable by itself; the game should wire this to
+        # FlagManager.evaluate_conditions.
+        self._condition_evaluator = condition_evaluator
+
+    def set_condition_evaluator(self, evaluator):
+        """Set the condition callback used by conditional actions."""
+        self._condition_evaluator = evaluator
 
     # ── Registration ─────────────────────────────────────────────────────────
 
@@ -75,12 +83,13 @@ class EventRunner:
 
     # ── Running sequences ─────────────────────────────────────────────────────
 
-    def run_sequence(self, actions, on_finished=None):
+    def run_sequence(self, actions, on_finished=None, condition_evaluator=None):
         """Start executing an action list. Runs synchronously through any
         non-blocking actions until it hits a blocking one (or the dialogue
         choice special case), then returns — the rest resumes later via the
         registered handlers' on_complete/on_choice callbacks."""
         state = _SequenceState(actions, on_finished)
+        state.condition_evaluator = condition_evaluator or self._condition_evaluator
         self._active_sequences.append(state)
         self._advance(state)
 
@@ -89,6 +98,10 @@ class EventRunner:
             action = state.actions[state.index]
             state.index += 1
             action_type = action.get('type')
+
+            if action_type == 'conditional':
+                self._run_conditional(action, state)
+                return
 
             if action_type == 'dialogue_choice':
                 handler = self._handlers.get('dialogue_choice')
@@ -116,6 +129,33 @@ class EventRunner:
             self._active_sequences.remove(state)
         if state.on_finished:
             state.on_finished()
+
+    def _run_conditional(self, action, state):
+        """Evaluate IF / ELSE IF branches top-to-bottom and splice the
+        first matching branch's actions into the current sequence.
+
+        A branch is {'conditions': [...], 'actions': [...]} and an ELSE branch
+        is represented by an empty/missing conditions list plus 'is_else': True.
+        If no evaluator is wired, only an explicit ELSE branch can run.
+        """
+        branches = action.get('branches') or []
+        evaluator = getattr(state, 'condition_evaluator', None)
+        selected = None
+
+        for branch in branches:
+            if branch.get('is_else'):
+                selected = branch
+                break
+            conditions = branch.get('conditions') or []
+            passed = bool(evaluator(conditions)) if evaluator is not None else False
+            if passed:
+                selected = branch
+                break
+
+        if selected is not None:
+            branch_actions = selected.get('actions') or []
+            state.actions[state.index:state.index] = branch_actions
+        self._advance(state)
 
     def _run_choice(self, handler, action, state):
         def on_choice(index, action=action, state=state):
@@ -354,7 +394,7 @@ def mission(mode, mission_id):
 
 # Every action type name, for a dev-tool's action-type dropdown.
 ACTION_TYPES = [
-    'dialogue_box', 'set_portrait', 'dialogue_choice',
+    'dialogue_box', 'set_portrait', 'dialogue_choice', 'conditional',
     'timer_start', 'timer_pause', 'timer_stop',
     'zeni', 'item', 'level', 'exp', 'stat', 'resource', 'skill', 'transformation',
     'charged_melee',

@@ -1289,6 +1289,9 @@ ACTION_SCHEMA = {
                       ('portrait', 'portrait_picker', None)],
     'set_portrait': [('character_name', 'text', None), ('portrait_id', 'portrait_picker', None)],
     'dialogue_choice': [('prompt', 'text', None)],
+    # Advanced branching action. Its UI is handled by the dedicated branch
+    # editor below rather than ordinary row fields.
+    'conditional': [],
     'timer_start': [('timer_id', 'text', None), ('duration', 'number', None)],
     'timer_pause': [('timer_id', 'text', None)],
     'timer_stop': [('timer_id', 'text', None)],
@@ -1398,6 +1401,28 @@ def _clone_options(options):
             for o in (options or [])]
 
 
+def _clone_branches(branches):
+    """Deep-copy conditional branches so nested editor state never aliases saved data."""
+    result = []
+    for b in (branches or []):
+        result.append({
+            'is_else': bool(b.get('is_else', False)),
+            'conditions': copy.deepcopy(b.get('conditions') or []),
+            'actions': copy.deepcopy(b.get('actions') or []),
+        })
+    return result
+
+
+class _NullFlagManager:
+    def __init__(self):
+        self.flags = {}
+        self.variables = {}
+    def get_condition_names(self):
+        return {}
+    def evaluate_conditions(self, conditions, player=None):
+        return False
+
+
 class ActionSequenceBuilder:
     """Row-based UI for building an ordered action list."""
 
@@ -1496,6 +1521,8 @@ class ActionSequenceBuilder:
         # {'row_index':, 'option_index':, 'builder': ActionSequenceBuilder,
         #  'origin': (x, y), 'save_rect':, 'cancel_rect':} while open, else None.
         self._option_editor = None
+        self._conditional_editor = None
+        self._condition_flag_manager = None
 
         self._rects = {}
 
@@ -1758,6 +1785,7 @@ class ActionSequenceBuilder:
         self._spawn_picker = None
         self._add_picker_open = False
         self._option_editor = None
+        self._conditional_editor = None
 
         if existing_actions is None:
             return
@@ -1793,6 +1821,8 @@ class ActionSequenceBuilder:
                 params['y'] = '' if raw_y is None else str(raw_y)
             if action_type == 'dialogue_choice':
                 row['_options'] = _clone_options(action.get('options'))
+            if action_type == 'conditional':
+                row['_branches'] = _clone_branches(action.get('branches'))
             rows.append(row)
         self.rows = rows
 
@@ -1801,6 +1831,9 @@ class ActionSequenceBuilder:
         for row in self.rows:
             if row['type'] == '__raw__':
                 result.append(row.get('_raw'))
+                continue
+            if row['type'] == 'conditional':
+                result.append({'type': 'conditional', 'branches': _clone_branches(row.get('_branches'))})
                 continue
             schema = ACTION_SCHEMA.get(row['type'])
             if schema is None:
@@ -1843,6 +1876,9 @@ class ActionSequenceBuilder:
         row = {'type': action_type, 'params': self._defaults_for(action_type)}
         if action_type == 'dialogue_choice':
             row['_options'] = []
+        if action_type == 'conditional':
+            row['_branches'] = [{'is_else': False, 'conditions': [], 'actions': []},
+                                {'is_else': True, 'conditions': [], 'actions': []}]
         self.rows.append(row)
 
     def _defaults_for(self, action_type):
@@ -1876,7 +1912,132 @@ class ActionSequenceBuilder:
             row = {'type': action_type, 'params': self._defaults_for(action_type)}
             if action_type == 'dialogue_choice':
                 row['_options'] = []
+            if action_type == 'conditional':
+                row['_branches'] = [{'is_else': False, 'conditions': [], 'actions': []},
+                                    {'is_else': True, 'conditions': [], 'actions': []}]
             self.rows[index] = row
+
+    # ── conditional branch management ───────────────────────────────────────
+
+    def _add_conditional_branch(self, row_index, is_else=False):
+        if 0 <= row_index < len(self.rows) and self.rows[row_index]['type'] == 'conditional':
+            branches = self.rows[row_index].setdefault('_branches', [])
+            if is_else:
+                if any(b.get('is_else') for b in branches):
+                    return
+                branches.append({'is_else': True, 'conditions': [], 'actions': []})
+            else:
+                new_branch = {'is_else': False, 'conditions': [], 'actions': []}
+                else_index = next((i for i, b in enumerate(branches) if b.get('is_else')), len(branches))
+                branches.insert(else_index, new_branch)
+
+    def _remove_conditional_branch(self, row_index, branch_index):
+        if 0 <= row_index < len(self.rows) and self.rows[row_index]['type'] == 'conditional':
+            branches = self.rows[row_index].get('_branches', [])
+            if 0 <= branch_index < len(branches):
+                # Keep at least one branch and never leave an ELSE before another branch.
+                branches.pop(branch_index)
+                if not branches:
+                    branches.append({'is_else': False, 'conditions': [], 'actions': []})
+
+    def _open_conditional_editor(self, row_index, branch_index):
+        if not (0 <= row_index < len(self.rows)):
+            return
+        row = self.rows[row_index]
+        if row.get('type') != 'conditional':
+            return
+        branches = row.get('_branches', [])
+        if not (0 <= branch_index < len(branches)):
+            return
+        branch = branches[branch_index]
+        condition_manager = getattr(self, '_condition_flag_manager', None) or _NullFlagManager()
+        condition_builder = ConditionBuilder(condition_manager, colors=self.colors)
+        # Prefer the host-provided flag manager when the builder has one; nested
+        # action editors created from EventEditorWindow populate this attribute.
+        condition_builder.refresh(branch.get('conditions', []))
+        action_builder = ActionSequenceBuilder(colors=self.colors)
+        action_builder._condition_flag_manager = getattr(self, '_condition_flag_manager', None)
+        action_builder.refresh(branch.get('actions', []))
+        self._conditional_editor = {
+            'row_index': row_index, 'branch_index': branch_index,
+            'condition_builder': condition_builder, 'action_builder': action_builder,
+        }
+
+    def _close_conditional_editor(self, save):
+        editor = self._conditional_editor
+        if editor is None:
+            return
+        if save:
+            cb = editor['condition_builder']
+            ab = editor['action_builder']
+            if ab._active_field is not None:
+                r, f = ab._active_field
+                if 0 <= r < len(ab.rows):
+                    ab.rows[r]['params'][f] = ab._active_text
+                ab._active_field = None
+            ri, bi = editor['row_index'], editor['branch_index']
+            if 0 <= ri < len(self.rows):
+                branches = self.rows[ri].get('_branches', [])
+                if 0 <= bi < len(branches):
+                    branches[bi]['conditions'] = cb.get_condition_list()
+                    branches[bi]['actions'] = ab.get_action_list()
+        self._conditional_editor = None
+
+    def _handle_conditional_editor_input(self, event):
+        editor = self._conditional_editor
+        if editor is None:
+            return
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            self._close_conditional_editor(False)
+            return
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if editor.get('save_rect') and editor['save_rect'].collidepoint(event.pos):
+                self._close_conditional_editor(True)
+                return
+            if editor.get('cancel_rect') and editor['cancel_rect'].collidepoint(event.pos):
+                self._close_conditional_editor(False)
+                return
+        x, y = editor.get('origin', (0, 0))
+        editor['condition_builder'].handle_input(event, x, y)
+        editor['action_builder'].handle_input(event, x + 360, y)
+
+    def _draw_conditional_editor(self, screen):
+        editor = self._conditional_editor
+        if editor is None:
+            return
+        colors = self.colors
+        sw, sh = screen.get_size()
+        overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 190))
+        screen.blit(overlay, (0, 0))
+        margin = 45
+        panel = pygame.Rect(margin, margin, sw - margin * 2, sh - margin * 2)
+        panel_surf = pygame.Surface((panel.width, panel.height), pygame.SRCALPHA)
+        panel_surf.fill(colors.get('bg_transparent', (20, 20, 20, 240)))
+        screen.blit(panel_surf, panel.topleft)
+        screen.draw_rect(colors['accent'], panel, 2)
+        title = self.font_medium.render('Conditional Branch — IF / ELSE IF / ELSE', True, colors['text'])
+        screen.blit(title, (panel.x + 12, panel.y + 10))
+        hint = self.font_small.render('Esc to cancel', True, colors['text_dim'])
+        screen.blit(hint, (panel.right - 12 - hint.get_width(), panel.y + 16))
+        cx, cy = panel.x + 12, panel.y + 42
+        cw = int(panel.width * 0.38)
+        aw = panel.width - cw - 36
+        screen.draw_rect(colors['panel'], pygame.Rect(cx - 6, cy - 4, cw + 12, panel.height - 72), border_radius=5)
+        screen.draw_rect(colors['panel'], pygame.Rect(cx + cw + 18, cy - 4, aw + 12, panel.height - 72), border_radius=5)
+        editor['condition_builder'].draw(screen, cx, cy, cw)
+        editor['action_builder'].draw(screen, cx + cw + 30, cy, aw)
+        editor['origin'] = (cx, cy)
+        btn_w = 90
+        save_rect = pygame.Rect(panel.right - 12 - btn_w, panel.bottom - 14 - 30, btn_w, 30)
+        cancel_rect = pygame.Rect(save_rect.x - btn_w - 10, save_rect.y, btn_w, 30)
+        screen.draw_rect(colors['success'], save_rect, border_radius=5)
+        screen.blit(self.font_small.render('Save', True, colors['bg']), self.font_small.render('Save', True, colors['bg']).get_rect(center=save_rect.center))
+        screen.draw_rect(colors['panel_light'], cancel_rect, border_radius=5)
+        screen.draw_rect(colors['grid'], cancel_rect, 1, border_radius=5)
+        screen.blit(self.font_small.render('Cancel', True, colors['text']), self.font_small.render('Cancel', True, colors['text']).get_rect(center=cancel_rect.center))
+        editor['save_rect'] = save_rect
+        editor['cancel_rect'] = cancel_rect
 
     # ── dialogue_choice option management ────────────────────────────────────
 
@@ -1953,6 +2114,9 @@ class ActionSequenceBuilder:
     # ── Input ────────────────────────────────────────────────────────────────
 
     def handle_input(self, event, x, y):
+        if self._conditional_editor is not None:
+            self._handle_conditional_editor_input(event)
+            return
         if self._spawn_picker is not None:
             self._handle_spawn_picker_input(event)
             return
@@ -2277,6 +2441,23 @@ class ActionSequenceBuilder:
                 self._remove_row(row_index)
                 return
 
+            if self.rows[row_index].get('type') == 'conditional':
+                add_if = row_rects.get('conditional_add_elseif')
+                if add_if and add_if.collidepoint(mouse_pos):
+                    self._add_conditional_branch(row_index, is_else=False)
+                    return
+                add_else = row_rects.get('conditional_add_else')
+                if add_else and add_else.collidepoint(mouse_pos):
+                    self._add_conditional_branch(row_index, is_else=True)
+                    return
+                for bi, br, edit, delete in row_rects.get('conditional_branches', []):
+                    if delete.collidepoint(mouse_pos):
+                        self._remove_conditional_branch(row_index, bi)
+                        return
+                    if edit.collidepoint(mouse_pos) or br.collidepoint(mouse_pos):
+                        self._open_conditional_editor(row_index, bi)
+                        return
+
             add_option_rect = row_rects.get('add_option_btn')
             if add_option_rect and add_option_rect.collidepoint(mouse_pos):
                 self._add_option(row_index)
@@ -2477,6 +2658,47 @@ class ActionSequenceBuilder:
                 screen.set_clip(None)
                 row_rects['type'] = type_rect
 
+                if row['type'] == 'conditional':
+                    branches = row.get('_branches', [])
+                    summary_rect = pygame.Rect(row_x, cur_y + _FIELD_H + 4, max(140, w - 50), _FIELD_H)
+                    screen.draw_rect(colors['panel_light'], summary_rect, border_radius=4)
+                    summary = self.font_small.render('%d branch%s' % (len(branches), '' if len(branches) == 1 else 'es'), True, colors['text'])
+                    screen.blit(summary, (summary_rect.x + 6, summary_rect.y + 5))
+                    row_rects['conditional_summary'] = summary_rect
+                    cur = summary_rect.bottom + 4
+                    branch_rects = []
+                    for bi, branch in enumerate(branches):
+                        label = 'ELSE' if branch.get('is_else') else ('IF' if bi == 0 else 'ELSE IF')
+                        ncond = len(branch.get('conditions') or [])
+                        naction = len(branch.get('actions') or [])
+                        br = pygame.Rect(row_x, cur, max(180, w - 80), _FIELD_H)
+                        screen.draw_rect(colors['input_bg'], br, border_radius=4)
+                        screen.draw_rect(colors['accent_dim'] if branch.get('is_else') else colors['accent'], br, 1, border_radius=4)
+                        txt = '%s  (%d condition%s, %d action%s)' % (label, ncond, '' if ncond == 1 else 's', naction, '' if naction == 1 else 's')
+                        screen.blit(self.font_small.render(txt, True, colors['text']), (br.x + 6, br.y + 5))
+                        edit = pygame.Rect(br.right + 4, cur, 50, _FIELD_H)
+                        screen.draw_rect(colors['panel_light'], edit, border_radius=4)
+                        screen.blit(self.font_small.render('Edit', True, colors['text']), (edit.x + 7, edit.y + 5))
+                        delete = pygame.Rect(edit.right + 4, cur, 20, _FIELD_H)
+                        screen.draw_rect(colors['delete'], delete, border_radius=4)
+                        screen.blit(self.font_small.render('X', True, colors['text']),
+                                    self.font_small.render('X', True, colors['text']).get_rect(center=delete.center))
+                        branch_rects.append((bi, br, edit, delete))
+                        cur += _FIELD_H + 4
+                    add_if = pygame.Rect(row_x, cur, 90, _FIELD_H)
+                    screen.draw_rect(colors['input_bg'], add_if, border_radius=4)
+                    screen.draw_rect(colors['success'], add_if, 1, border_radius=4)
+                    screen.blit(self.font_small.render('+ Else If', True, colors['success']), (add_if.x + 7, add_if.y + 5))
+                    row_rects['conditional_add_elseif'] = add_if
+                    cur += _FIELD_H + 4
+                    if not any(b.get('is_else') for b in branches):
+                        add_else = pygame.Rect(add_if.right + 6, cur - _FIELD_H - 4, 70, _FIELD_H)
+                        screen.draw_rect(colors['input_bg'], add_else, border_radius=4)
+                        screen.draw_rect(colors['success'], add_else, 1, border_radius=4)
+                        screen.blit(self.font_small.render('+ Else', True, colors['success']), (add_else.x + 7, add_else.y + 5))
+                        row_rects['conditional_add_else'] = add_else
+                    row_rects['conditional_branches'] = branch_rects
+                    row_h = max(_FIELD_H * 2 + 12, cur - cur_y)
                 # Fields wrap onto additional lines under the type box when
                 # they'd overflow the panel width, so long rows (dialogue_box
                 # with 4 fields) don't run off the edge.
@@ -2485,7 +2707,7 @@ class ActionSequenceBuilder:
                 line_h = _FIELD_H
                 max_x = x + w - 30
 
-                visible_schema = _row_visible_fields(row['type'], row['params'], schema)
+                visible_schema = [] if row['type'] == 'conditional' else _row_visible_fields(row['type'], row['params'], schema)
                 for field_name, field_kind, extra in visible_schema:
                     field_w = _FIELD_WIDTH.get(field_kind, 90)
                     if field_kind in _WIDE_FIELDS:
@@ -2632,7 +2854,12 @@ class ActionSequenceBuilder:
                     row_rects['fields'].append((field_name, field_rect, field_kind, extra))
                     field_x = field_rect.right + _FIELD_GAP
 
-                row_h = _FIELD_H + line_h + 4
+                if row['type'] == 'conditional':
+                    # Conditional branches are drawn as their own compact block
+                    # above; don't let the generic field layout overwrite its height.
+                    pass
+                else:
+                    row_h = _FIELD_H + line_h + 4
 
                 if row['type'] == 'dialogue_choice':
                     row_h += self._draw_dialogue_choice_options(
@@ -3427,10 +3654,10 @@ class ActionSequenceBuilder:
 
 import pygame
 
-_MARGIN = 40
-_PADDING = 20
-_DIVIDER_GAP = 16
-_BUTTON_H = 32
+_MARGIN = 28
+_PADDING = 24
+_DIVIDER_GAP = 18
+_BUTTON_H = 38
 
 
 class EventEditorWindow:
@@ -3442,9 +3669,20 @@ class EventEditorWindow:
 
         self.condition_builder = ConditionBuilder(flag_manager, colors=self.colors)
         self.action_builder = ActionSequenceBuilder(colors=self.colors)
+        self.action_builder._condition_flag_manager = flag_manager
 
-        self.font_title = pygame.font.Font(None, 24)
-        self.font_small = pygame.font.Font(None, 16)
+        self.font_title = pygame.font.Font(None, 30)
+        self.font_subtitle = pygame.font.Font(None, 18)
+        self.font_section = pygame.font.Font(None, 22)
+        self.font_small = pygame.font.Font(None, 18)
+
+        # The original row builders were intentionally compact.  Inside the
+        # full event workspace, give them a little more breathing room without
+        # changing their data/input model.
+        self.condition_builder.font_small = pygame.font.Font(None, 18)
+        self.condition_builder.font_medium = pygame.font.Font(None, 22)
+        self.action_builder.font_small = pygame.font.Font(None, 18)
+        self.action_builder.font_medium = pygame.font.Font(None, 22)
 
         self.active = False
         self.title = "Edit Event"
@@ -3511,15 +3749,23 @@ class EventEditorWindow:
 
     def _window_rect(self, screen):
         sw, sh = screen.get_size()
-        return pygame.Rect(_MARGIN, _MARGIN, sw - _MARGIN * 2, sh - _MARGIN * 2)
+        # Use nearly the whole logical screen.  The old 40px margin left a
+        # surprising amount of unused space on 720/800px-high editor views.
+        width = max(760, int(sw * 0.94))
+        height = max(500, int(sh * 0.92))
+        width = min(width, sw - 28)
+        height = min(height, sh - 28)
+        return pygame.Rect((sw - width) // 2, (sh - height) // 2, width, height)
 
     def _content_origin(self, screen):
         win = self._window_rect(screen)
         content_x = win.x + _PADDING
-        content_y = win.y + 50
+        content_y = win.y + 108
         content_w = win.width - _PADDING * 2
 
-        left_w = max(300, min(460, int(content_w * 0.34)))
+        # Conditions need a little less room than actions, but not the old
+        # cramped 34/66 split.
+        left_w = max(360, int(content_w * 0.42))
         right_x = content_x + left_w + _DIVIDER_GAP
         right_w = content_w - left_w - _DIVIDER_GAP
         return content_x, content_y, left_w, right_x, right_w
@@ -3530,7 +3776,9 @@ class EventEditorWindow:
         if not self.active:
             return
 
-        if self.action_builder._option_editor is not None or self.action_builder._spawn_picker is not None:
+        if (self.action_builder._option_editor is not None or
+                self.action_builder._conditional_editor is not None or
+                self.action_builder._spawn_picker is not None):
             self.action_builder.handle_input(event, *self._rects.get('action_origin', (0, 0)))
             return
 
@@ -3577,66 +3825,144 @@ class EventEditorWindow:
 
     # ── Draw ─────────────────────────────────────────────────────────────────
 
+    def _draw_card(self, screen, rect, title, subtitle, accent):
+        colors = self.colors
+        screen.draw_rect(colors['panel'], rect, border_radius=10)
+        screen.draw_rect(colors['grid'], rect, 1, border_radius=10)
+        # Accent strip gives each side a clear visual identity without turning
+        # the editor into a rainbow of unrelated colors.
+        strip = pygame.Rect(rect.x, rect.y, 5, rect.height)
+        screen.draw_rect(accent, strip, border_top_left_radius=10, border_bottom_left_radius=10)
+        title_s = self.font_section.render(title, True, colors['text'])
+        screen.blit(title_s, (rect.x + 18, rect.y + 14))
+        sub_s = self.font_subtitle.render(subtitle, True, colors['text_dim'])
+        screen.blit(sub_s, (rect.x + 18, rect.y + 38))
+
+    def _draw_chip(self, screen, rect, text, fill, text_color=None):
+        colors = self.colors
+        screen.draw_rect(fill, rect, border_radius=12)
+        label = self.font_subtitle.render(text, True, text_color or colors['text'])
+        screen.blit(label, label.get_rect(center=rect.center))
+
     def draw(self, screen):
         if not self.active:
+            return
+
+        # Conditional branches are a full-page replacement editor.  Never draw
+        # the main event editor underneath it.
+        if self.action_builder._conditional_editor is not None:
+            self.action_builder._draw_conditional_editor(screen)
             return
 
         colors = self.colors
         sw, sh = screen.get_size()
 
+        # Dim the game behind the editor.
         overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 160))
+        overlay.fill((0, 0, 0, 175))
         screen.blit(overlay, (0, 0))
 
         win = self._window_rect(screen)
         win_surf = pygame.Surface((win.width, win.height), pygame.SRCALPHA)
         win_surf.fill(colors['bg_transparent'])
         screen.blit(win_surf, win.topleft)
-        screen.draw_rect(colors['accent'], win, 2)
+        screen.draw_rect(colors['accent'], win, 2, border_radius=12)
 
-        title_surf = self.font_title.render(self.title, True, colors['text'])
-        screen.blit(title_surf, (win.x + _PADDING, win.y + 12))
+        # ── Header ───────────────────────────────────────────────────────────
+        title_s = self.font_title.render(self.title, True, colors['text'])
+        screen.blit(title_s, (win.x + _PADDING, win.y + 14))
+        subtitle = self.font_subtitle.render(
+            "Build the event from left to right: requirements first, then what happens.",
+            True, colors['text_dim'])
+        screen.blit(subtitle, (win.x + _PADDING, win.y + 48))
 
-        hint = self.font_small.render("Esc to cancel", True, colors['text_dim'])
-        screen.blit(hint, (win.right - _PADDING - hint.get_width(), win.y + 18))
+        # Event summary chips make the otherwise-empty header area useful.
+        cond_count = len(self.condition_builder.rows)
+        action_count = len(self.action_builder.rows)
+        chip_y = win.y + 12
+        chip_h = 28
+        right = win.right - _PADDING
+        save_w = 118
+        esc = self.font_subtitle.render("Esc  Cancel", True, colors['text_dim'])
+        screen.blit(esc, (right - esc.get_width(), win.y + 50))
 
+        # ── Workspace cards ─────────────────────────────────────────────────
         content_x, content_y, left_w, right_x, right_w = self._content_origin(screen)
         content_bottom = win.bottom - _BUTTON_H - _PADDING * 2
+        card_top = content_y - 8
+        card_h = content_bottom - card_top
 
-        clip_rect = pygame.Rect(win.x, content_y, win.width, content_bottom - content_y)
+        left_card = pygame.Rect(content_x, card_top, left_w, card_h)
+        right_card = pygame.Rect(right_x, card_top, right_w, card_h)
+        self._draw_card(
+            screen, left_card, "Conditions",
+            "Everything below must be true before this event fires.",
+            colors['accent'])
+        self._draw_card(
+            screen, right_card, "Actions",
+            "These run from top to bottom once the event starts.",
+            colors['success'])
+
+        chip1 = pygame.Rect(left_card.right - 108, left_card.y + 14, 92, chip_h)
+        self._draw_chip(screen, chip1, f"{cond_count} condition" + ("s" if cond_count != 1 else ""),
+                        colors['input_bg'], colors['text_dim'])
+        chip2 = pygame.Rect(right_card.right - 92, right_card.y + 14, 76, chip_h)
+        self._draw_chip(screen, chip2, f"{action_count} action" + ("s" if action_count != 1 else ""),
+                        colors['input_bg'], colors['text_dim'])
+
+        # Builders start below the card header, leaving a clean visual frame
+        # around their existing controls.
+        inner_top = card_top + 68
+        clip_rect = pygame.Rect(
+            win.x + 1, inner_top, win.width - 2, content_bottom - inner_top)
         screen.set_clip(clip_rect)
 
-        draw_y = content_y - self._scroll_offset
-        cond_origin = (content_x, draw_y)
-        action_origin = (right_x, draw_y)
-        self.condition_builder.draw(screen, content_x, draw_y, left_w)
-        self.action_builder.draw(screen, right_x, draw_y, right_w)
+        draw_y = inner_top - self._scroll_offset
+        cond_origin = (left_card.x + 16, draw_y)
+        action_origin = (right_card.x + 16, draw_y)
+        inner_left_w = left_card.width - 32
+        inner_right_w = right_card.width - 32
 
-        col_height = max(self.condition_builder.content_height(), self.action_builder.content_height())
+        self.condition_builder.draw(screen, cond_origin[0], cond_origin[1], inner_left_w)
+        self.action_builder.draw(screen, action_origin[0], action_origin[1], inner_right_w)
+
+        col_height = max(
+            self.condition_builder.content_height(),
+            self.action_builder.content_height())
+
+        # Keep a subtle centre divider, but let the cards themselves establish
+        # the layout so the divider isn't doing all the visual work.
         divider_x = right_x - _DIVIDER_GAP // 2
-        screen.draw_line(colors['grid'], (divider_x, draw_y), (divider_x, draw_y + col_height), 1)
-
+        screen.draw_line(colors['grid'], (divider_x, inner_top),
+                         (divider_x, min(content_bottom, draw_y + col_height)), 1)
         screen.set_clip(None)
 
-        self._viewport_height = content_bottom - content_y
-        self._total_content_height = col_height
-
+        self._viewport_height = content_bottom - inner_top
+        self._total_content_height = max(0, col_height)
         self._rects['condition_origin'] = cond_origin
         self._rects['action_origin'] = action_origin
 
-        # Save / Cancel
-        btn_w = 100
-        save_rect = pygame.Rect(win.right - _PADDING - btn_w, win.bottom - _PADDING - _BUTTON_H, btn_w, _BUTTON_H)
-        cancel_rect = pygame.Rect(save_rect.x - btn_w - 10, save_rect.y, btn_w, _BUTTON_H)
+        # ── Footer ───────────────────────────────────────────────────────────
+        footer_y = win.bottom - _PADDING - _BUTTON_H
+        # A small guide makes the workflow discoverable for first-time use.
+        guide = self.font_subtitle.render(
+            "Tip: add a Conditional Branch inside Actions for IF / ELSE IF / ELSE logic.",
+            True, colors['text_dim'])
+        screen.blit(guide, (win.x + _PADDING, footer_y + 11))
 
-        screen.draw_rect(colors['success'], save_rect, border_radius=5)
-        save_label = self.font_small.render("Save", True, colors['bg'])
+        btn_w = 112
+        save_rect = pygame.Rect(win.right - _PADDING - btn_w, footer_y, btn_w, _BUTTON_H)
+        cancel_rect = pygame.Rect(save_rect.x - btn_w - 10, footer_y, btn_w, _BUTTON_H)
+
+        screen.draw_rect(colors['success'], save_rect, border_radius=7)
+        save_label = self.font_small.render("Save Event", True, colors['bg'])
         screen.blit(save_label, save_label.get_rect(center=save_rect.center))
 
-        screen.draw_rect(colors['panel_light'], cancel_rect, border_radius=5)
-        screen.draw_rect(colors['grid'], cancel_rect, 1, border_radius=5)
+        screen.draw_rect(colors['panel_light'], cancel_rect, border_radius=7)
+        screen.draw_rect(colors['grid'], cancel_rect, 1, border_radius=7)
         cancel_label = self.font_small.render("Cancel", True, colors['text'])
         screen.blit(cancel_label, cancel_label.get_rect(center=cancel_rect.center))
 
         self._rects['save_btn'] = save_rect
         self._rects['cancel_btn'] = cancel_rect
+

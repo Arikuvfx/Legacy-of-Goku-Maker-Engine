@@ -197,6 +197,15 @@ class PauseMenu:
         self.button_press_timers = {'b': 0.0,   'l': 0.0,   'r': 0.0,  'a': 0.0}
         self.button_press_duration = 0.1
 
+        # close() defers actually clearing self.active by one
+        # button_press_duration beat so the B-button press flash (set via
+        # _press('b') at the ESC/X and b_cancel call sites) has a chance to
+        # actually render — update()/draw() both bail out immediately when
+        # not self.active, so without this hold the menu vanished the same
+        # frame the flash was set and it was never visible.
+        self._pending_close = False
+        self._close_delay   = 0.0
+
         # Item-confirm popup's own A/B press flash — kept separate from
         # self.button_states/self.button_press_timers above. Those are
         # shared by every A/B/L/R sprite drawn on the main panel, so
@@ -512,6 +521,9 @@ class PauseMenu:
     def open(self, player=None):
         self.active              = True
         self.restricted_mode     = False
+        self._pending_close      = False
+        self._close_delay        = 0.0
+        self._play_select_sfx()
         if player is not None:
             self._refresh_name_sprites()
         self.tab_index           = 0
@@ -574,7 +586,12 @@ class PauseMenu:
         self.restricted_mode = True
 
     def close(self):
-        self.active = False
+        # Deactivation itself is deferred — see _pending_close and the
+        # countdown in update() — but this is still the moment the "menu
+        # is closing" sound plays.
+        self._pending_close = True
+        self._close_delay   = self.button_press_duration
+        self._play_select_sfx()
 
     def set_mission_manager(self, mm):
         """Wire in the MissionManager so the journal page can read live quest state."""
@@ -603,6 +620,11 @@ class PauseMenu:
         """Play the confirm/select sound (A button), if a sound engine has been wired up."""
         if self._sound_engine:
             self._sound_engine.play_sound('select')
+
+    def _play_cursor_sfx(self):
+        """Play the cursor-move sound (Up/Down through a scrollable list), if a sound engine has been wired up."""
+        if self._sound_engine:
+            self._sound_engine.play_sound('cursor')
 
     # ── Stat point allocation (Status tab) ──────────────────────────────────
 
@@ -934,6 +956,12 @@ class PauseMenu:
         self.status_scroll_left_timer  = max(0.0, self.status_scroll_left_timer  - dt)
         self.status_scroll_right_timer = max(0.0, self.status_scroll_right_timer - dt)
 
+        if self._pending_close:
+            self._close_delay -= dt
+            if self._close_delay <= 0:
+                self._pending_close = False
+                self.active         = False
+
     # ── Input ─────────────────────────────────────────────────────────────────
 
     def handle_input(self, event):
@@ -950,6 +978,12 @@ class PauseMenu:
           None               — no action taken
         """
         if not self.active:
+            return None
+
+        # B/ESC was just pressed and close() is holding on the press flash
+        # (see _pending_close) — swallow everything else for this last
+        # beat so nothing (e.g. a rapid-fire L/R) sneaks in on the way out.
+        if self._pending_close:
             return None
 
         # While the item-confirm popup is open, it owns all input — the
@@ -1037,12 +1071,12 @@ class PauseMenu:
         if key == pygame.K_LEFT and not self.options_editing and not self.allocating_stats and not self.equip_browsing_items and not self.restricted_mode:
             self.tab_index = 4 if self.tab_index == 0 else self.tab_index - 1
             self._press('l')
-            self._play_switch_sfx()
+            self._play_select_sfx()
 
         elif key == pygame.K_RIGHT and not self.options_editing and not self.allocating_stats and not self.equip_browsing_items and not self.restricted_mode:
             self.tab_index = 0 if self.tab_index == 4 else self.tab_index + 1
             self._press('r')
-            self._play_switch_sfx()
+            self._play_select_sfx()
 
         elif TABS[self.tab_index] == 'STATUS' and self.allocating_stats and key == pygame.K_UP:
             self.stat_alloc_index = (self.stat_alloc_index - 1) % len(STAT_ALLOC_LABELS)
@@ -1099,6 +1133,7 @@ class PauseMenu:
         elif self.tab_index == 4 and key == pygame.K_z:
             self.journal_tab_index = (self.journal_tab_index + 1) % 2
             self._journal_scroll   = 0
+            self._play_select_sfx()
 
         elif self.tab_index == 2 and self.equip_browsing_items and key == pygame.K_UP:
             if self.equip_item_index > 0:
@@ -1108,6 +1143,7 @@ class PauseMenu:
                 # Same as Inventory above: flash on every successful move,
                 # not only when the scroll window shifts.
                 self.scroll_up_timer = self.scroll_press_duration
+                self._play_cursor_sfx()
 
         elif self.tab_index == 2 and self.equip_browsing_items and key == pygame.K_DOWN:
             entry_count = len(self._get_equip_entries(self._player, self.equip_slot_index)) if self._player else 0
@@ -1116,15 +1152,20 @@ class PauseMenu:
                 if self.equip_item_index >= self.equip_item_scroll + self._equip_rows_visible:
                     self.equip_item_scroll = self.equip_item_index - self._equip_rows_visible + 1
                 self.scroll_down_timer = self.scroll_press_duration
+                self._play_cursor_sfx()
 
         elif self.tab_index == 2 and self.equip_browsing_items and key == pygame.K_z:
             return self._select_equip_item()
 
         elif self.tab_index == 2 and not self.equip_browsing_items and key == pygame.K_UP:
-            self.equip_slot_index = max(0, self.equip_slot_index - 1)
+            if self.equip_slot_index > 0:
+                self.equip_slot_index -= 1
+                self._play_cursor_sfx()
 
         elif self.tab_index == 2 and not self.equip_browsing_items and key == pygame.K_DOWN:
-            self.equip_slot_index = min(3, self.equip_slot_index + 1)
+            if self.equip_slot_index < 3:
+                self.equip_slot_index += 1
+                self._play_cursor_sfx()
 
         elif self.tab_index == 2 and not self.equip_browsing_items and key == pygame.K_z:
             self._enter_equip_browse()
@@ -1135,12 +1176,18 @@ class PauseMenu:
                     self.options_editing = False
                 elif key == pygame.K_LEFT:
                     idx = self.options_item_index
+                    old_val = self.options_values[idx]
                     self.options_values[idx] = max(0.0, self.options_values[idx] - self.options_step)
                     self._apply_volume(idx)
+                    if self.options_values[idx] != old_val:
+                        self._play_cursor_sfx()
                 elif key == pygame.K_RIGHT:
                     idx = self.options_item_index
+                    old_val = self.options_values[idx]
                     self.options_values[idx] = min(1.0, self.options_values[idx] + self.options_step)
                     self._apply_volume(idx)
+                    if self.options_values[idx] != old_val:
+                        self._play_cursor_sfx()
             else:
                 if key == pygame.K_z and self.options_item_index <= 2:
                     self.options_editing = True
@@ -1151,13 +1198,21 @@ class PauseMenu:
                     self._play_select_sfx()
                     return 'open_credits'
                 elif key == pygame.K_UP:
+                    old_idx = self.options_item_index
                     self.options_item_index = 3 if self.options_item_index == 4 else max(0, self.options_item_index - 1)
+                    if self.options_item_index != old_idx:
+                        self._play_cursor_sfx()
                 elif key == pygame.K_DOWN:
+                    old_idx = self.options_item_index
                     self.options_item_index = 4 if self.options_item_index == 3 else min(3, self.options_item_index + 1)
+                    if self.options_item_index != old_idx:
+                        self._play_cursor_sfx()
                 elif key == pygame.K_RIGHT and self.options_item_index == 3:
                     self.options_item_index = 4
+                    self._play_cursor_sfx()
                 elif key == pygame.K_LEFT and self.options_item_index == 4:
                     self.options_item_index = 3
+                    self._play_cursor_sfx()
 
         elif TABS[self.tab_index] == 'STATUS' and not self.allocating_stats and key in (pygame.K_s, pygame.K_DOWN):
             return 'open_skills'
@@ -1191,13 +1246,13 @@ class PauseMenu:
         if _hit('l_tab') and not self.options_editing and not self.equip_browsing_items and not self.restricted_mode:
             self.tab_index = 4 if self.tab_index == 0 else self.tab_index - 1
             self._press('l')
-            self._play_switch_sfx()
+            self._play_select_sfx()
             return None
 
         if _hit('r_tab') and not self.options_editing and not self.equip_browsing_items and not self.restricted_mode:
             self.tab_index = 0 if self.tab_index == 4 else self.tab_index + 1
             self._press('r')
-            self._play_switch_sfx()
+            self._play_select_sfx()
             return None
 
         if _hit('a_select') and self.tab_index in (1, 2, 3):
@@ -1242,6 +1297,7 @@ class PauseMenu:
                 self.equip_item_index -= 1
                 self.equip_item_scroll = min(self.equip_item_scroll, self.equip_item_index)
                 self.scroll_up_timer = self.scroll_press_duration
+                self._play_cursor_sfx()
             return None
 
         if _hit('scroll_down'):
@@ -1258,6 +1314,7 @@ class PauseMenu:
                     self.equip_item_index += 1
                     self.equip_item_scroll = max(self.equip_item_scroll, self.equip_item_index - self._equip_rows_visible + 1)
                     self.scroll_down_timer = self.scroll_press_duration
+                    self._play_cursor_sfx()
             return None
 
         if self.tab_index == 1:
@@ -1275,8 +1332,10 @@ class PauseMenu:
         if self.tab_index == 4:
             for i in range(len(self._journal_tabs)):
                 if _hit(f'journal_tab_{i}'):
-                    self.journal_tab_index = i
-                    self._journal_scroll   = 0
+                    if self.journal_tab_index != i:
+                        self.journal_tab_index = i
+                        self._journal_scroll   = 0
+                        self._play_select_sfx()
                     return None
 
         if self.tab_index == 3:
@@ -1355,9 +1414,9 @@ class PauseMenu:
             screen, self.box_sprite, box_x, box_y, inner_w, inner_h, corner_size=20
         )
         if not drawn:
-            pygame.draw.rect(screen, self.border_outer, (box_x-6, box_y-6, inner_w+12, inner_h+12))
-            pygame.draw.rect(screen, self.border_inner, (box_x-3, box_y-3, inner_w+6,  inner_h+6))
-            pygame.draw.rect(screen, self.border_green, (box_x-1, box_y-1, inner_w+2,  inner_h+2))
+            screen.draw_rect(self.border_outer, (box_x-6, box_y-6, inner_w+12, inner_h+12))
+            screen.draw_rect(self.border_inner, (box_x-3, box_y-3, inner_w+6,  inner_h+6))
+            screen.draw_rect(self.border_green, (box_x-1, box_y-1, inner_w+2,  inner_h+2))
             self._draw_tiled_background(screen, pygame.Rect(box_x, box_y, inner_w, inner_h))
 
         # Page content
@@ -1687,9 +1746,9 @@ class PauseMenu:
             screen, self.box_sprite, popup_x, popup_y, popup_w, popup_h, corner_size=20
         )
         if not drawn:
-            pygame.draw.rect(screen, self.border_outer, (popup_x-6, popup_y-6, popup_w+12, popup_h+12))
-            pygame.draw.rect(screen, self.border_inner, (popup_x-3, popup_y-3, popup_w+6,  popup_h+6))
-            pygame.draw.rect(screen, self.border_green, (popup_x-1, popup_y-1, popup_w+2,  popup_h+2))
+            screen.draw_rect(self.border_outer, (popup_x-6, popup_y-6, popup_w+12, popup_h+12))
+            screen.draw_rect(self.border_inner, (popup_x-3, popup_y-3, popup_w+6,  popup_h+6))
+            screen.draw_rect(self.border_green, (popup_x-1, popup_y-1, popup_w+2,  popup_h+2))
 
         # Selected item icon + name (popup box geometry left untouched)
         item_id = self._pending_item_id
@@ -1889,9 +1948,9 @@ class PauseMenu:
             screen, self.box_sprite, popup_x, popup_y, popup_w, popup_h, corner_size=20
         )
         if not drawn:
-            pygame.draw.rect(screen, self.border_outer, (popup_x-6, popup_y-6, popup_w+12, popup_h+12))
-            pygame.draw.rect(screen, self.border_inner, (popup_x-3, popup_y-3, popup_w+6,  popup_h+6))
-            pygame.draw.rect(screen, self.border_green, (popup_x-1, popup_y-1, popup_w+2,  popup_h+2))
+            screen.draw_rect(self.border_outer, (popup_x-6, popup_y-6, popup_w+12, popup_h+12))
+            screen.draw_rect(self.border_inner, (popup_x-3, popup_y-3, popup_w+6,  popup_h+6))
+            screen.draw_rect(self.border_green, (popup_x-1, popup_y-1, popup_w+2,  popup_h+2))
 
         item_id   = self._pending_equip_item_id
         pad       = max(12, int(min(popup_w, popup_h) * 0.06))
@@ -2290,8 +2349,8 @@ class PauseMenu:
             screen.blit(portrait,portrait.get_rect(center=(sprite_cx,sprite_cy)))
         else:
             r=sprite_col_w//3
-            pygame.draw.circle(screen,(80,80,160),(sprite_cx,sprite_cy),r)
-            pygame.draw.circle(screen,(200,200,255),(sprite_cx,sprite_cy),r,2)
+            screen.draw_circle((80,80,160),(sprite_cx,sprite_cy),r)
+            screen.draw_circle((200,200,255),(sprite_cx,sprite_cy),r,2)
 
         bar_h=max(4,int(self.screen_height*0.008)); lh=max(20,int(self.stats_font.get_line_height()+20))
         cy=content_top+int(h-453); _label_gap=max(3,int(self.screen_width*0.004))
@@ -2310,9 +2369,9 @@ class PauseMenu:
                     sl=_yellow(self.stats_numbers_font.render('/')); screen.blit(sl,(vx,cy)); vx+=sl.get_width()
             if fill_ratio is not None:
                 bx=stats_x+int(stats_w*0.62); bw=int(stats_w*0.36); by_=cy+(lh-bar_h)//2
-                pygame.draw.rect(screen,(30,30,30),(bx,by_,bw,bar_h))
-                pygame.draw.rect(screen,fill_col,(bx,by_,int(bw*max(0.0,min(fill_ratio,1.0))),bar_h))
-                pygame.draw.rect(screen,self.border_outer,(bx,by_,bw,bar_h),1)
+                screen.draw_rect((30,30,30),(bx,by_,bw,bar_h))
+                screen.draw_rect(fill_col,(bx,by_,int(bw*max(0.0,min(fill_ratio,1.0))),bar_h))
+                screen.draw_rect(self.border_outer,(bx,by_,bw,bar_h),1)
             cy+=lh
 
         def draw_div():
@@ -3208,6 +3267,17 @@ class PauseMenu:
                     gi+=1
                 gi+=1
             _blit_label(words,top_x,top_y,char_offsets=char_offs if char_offs else None)
+            if i==hovered_item and self.equip_arrow:
+                # Same blinking cursor arrow + timer as _draw_equip_slot_list,
+                # just anchored to this row's label instead of a slot icon.
+                blink_on=(self._levelup_blink_timer%(self._levelup_blink_interval*2))<self._levelup_blink_interval
+                if blink_on:
+                    arr_sc=max(1,int(self.canvas_height*0.05/self.equip_arrow.get_height()))
+                    arr_surf=pygame.transform.scale(self.equip_arrow,(self.equip_arrow.get_width()*arr_sc,self.equip_arrow.get_height()*arr_sc))
+                    arrow_gap=max(2,int(self.canvas_width*0.001))
+                    arrow_x=top_x-arrow_gap-arr_surf.get_width() + 1
+                    arrow_y=top_y+(lh-arr_surf.get_height())//2 - 20
+                    screen.blit(arr_surf,(arrow_x,arrow_y))
             if self.optionbar_empty and self.optionbar_filled:
                 bw_=self.optionbar_empty.get_width()*bar_scale; bh_=self.optionbar_empty.get_height()*bar_scale
                 bx_=top_x+bar_x_offset; by_=top_y+bar_y_offset
@@ -3231,6 +3301,16 @@ class PauseMenu:
         start_x_=x+(w-total_w_)//2-20; bottom_y=y+h-int(h*0.2)-124
         _blit_label(credits_words,start_x_,bottom_y)
         _blit_label(sleep_words,start_x_+_label_w(credits_words)+gap,bottom_y,char_offsets={4:8})
+        if self.equip_arrow and hovered_item in (3,4):
+            blink_on=(self._levelup_blink_timer%(self._levelup_blink_interval*2))<self._levelup_blink_interval
+            if blink_on:
+                arr_sc=max(1,int(self.canvas_height*0.05/self.equip_arrow.get_height()))
+                arr_surf=pygame.transform.scale(self.equip_arrow,(self.equip_arrow.get_width()*arr_sc,self.equip_arrow.get_height()*arr_sc))
+                arrow_gap=max(2,int(self.canvas_width*0.005))
+                label_x=start_x_ if hovered_item==3 else start_x_+_label_w(credits_words)+gap
+                arrow_x=label_x-arrow_gap-arr_surf.get_width() + 8
+                arrow_y=bottom_y+(lh-arr_surf.get_height())//2 - 20
+                screen.blit(arr_surf,(arrow_x,arrow_y))
         self._click_zones['options_row_3']=pygame.Rect(start_x_-10,bottom_y-4,_label_w(credits_words)+20,lh+8)
         self._click_zones['options_row_4']=pygame.Rect(start_x_+_label_w(credits_words)+gap-10,bottom_y-4,_label_w(sleep_words)+20,lh+8)
 
@@ -3239,8 +3319,8 @@ class PauseMenu:
     def _draw_scanlines(self, screen, rect):
         sh=2
         for yy in range(rect.top,rect.bottom,sh*2):
-            pygame.draw.rect(screen,self.bg_scanline_dark, pygame.Rect(rect.left,yy,   rect.width,sh))
-            pygame.draw.rect(screen,self.bg_scanline_light,pygame.Rect(rect.left,yy+sh,rect.width,sh))
+            screen.draw_rect(self.bg_scanline_dark, pygame.Rect(rect.left,yy,   rect.width,sh))
+            screen.draw_rect(self.bg_scanline_light,pygame.Rect(rect.left,yy+sh,rect.width,sh))
 
     def _render_text_with_shadow(self, screen, text, position, anchor='center'):
         shadow=self.bitmap_font.render(text).copy(); shadow.fill(self.text_shadow_color,special_flags=pygame.BLEND_RGBA_MULT)
@@ -3301,5 +3381,5 @@ class PauseMenu:
             if label: self._render_text_with_shadow(screen,label,(x+scaled.get_width()+int(5*RENDER_SCALE),y+btn_h//2),anchor='midleft')
         else:
             r=btn_h//2; col=(140,140,140) if is_pressed else (180,180,180)
-            pygame.draw.circle(screen,col,(x+r,y+r),r); pygame.draw.circle(screen,(100,100,100),(x+r,y+r),r,3)
+            screen.draw_circle(col,(x+r,y+r),r); screen.draw_circle((100,100,100),(x+r,y+r),r,3)
             if label: self._render_text_with_shadow(screen,label,(x+btn_h+10,y+r),anchor='midleft')

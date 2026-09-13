@@ -11,9 +11,23 @@ Layer 0 is the player. Negative values draw behind, positive in front.
          100+    effects and UI overlays
 """
 
+import math
 import pygame
 from typing import List, Tuple, Callable
 from config.settings import RENDER_SCALE
+
+
+def _snap(value: float) -> int:
+    """Round-half-up, unlike Python's built-in round() which is
+    round-half-to-even (banker's rounding). Half-pixel offsets (e.g.
+    Player.shadow_x_offsets_by_direction['left'] = -0.5) combined with
+    round() tie-break inconsistently as the anchor ticks through
+    consecutive integers -- e.g. round(10.5) == 10 but round(11.5) == 12
+    -- which shows up as 1px shadow jitter specifically while the camera
+    is easing back to center after the player stops. floor(x + 0.5) ties
+    the same way every time regardless of parity.
+    """
+    return math.floor(value + 0.5)
 
 
 class _MaskableSurface(pygame.Surface):
@@ -69,6 +83,14 @@ class DrawLayer:
 
     # Top layers
     FOREGROUND_OBJECTS = 75
+    # Airborne player layer (flying pad / nimbus cloud sequences). One below
+    # PARTICLES so the player draws above every other layer -- ground,
+    # shadows, NPCs, enemies, foreground objects -- while still passing
+    # underneath particle effects, matching how they'd look flying above
+    # the scenery but through/below any overlaid FX. Set on Player.draw_layer
+    # by FlyingController.start_flight / NimbusCloudController.start_ride and
+    # restored to PLAYER on landing -- see _complete_flight/_complete_ride.
+    FLYING = 99
     PARTICLES = 100
     UI_OVERLAY = 200
 
@@ -142,41 +164,70 @@ class LayerManager:
         return self._shadow_cache[key]
 
     def _draw_shadow(self, screen, obj, camera):
-        """Draw a ground shadow centred under the entity's feet."""
+        """Draw a ground shadow centred under the entity.
+
+        The shadow tracks the entity's own world position (obj.x, obj.y),
+        same as it always has -- it does not try to track the visible feet
+        pixels of whatever animation frame happens to be showing. Per-
+        direction fine-tuning still lives in shadow_x_offsets_by_direction
+        for the cases where a direction's art looks a hair off otherwise.
+        """
         cls = type(obj)
         casts_shadow = self._shadow_eligible_cache.get(cls)
         if casts_shadow is None:
-            # Only computed once per class ever, not once per object per
-            # frame — with a few thousand non-shadow-casting objects (e.g.
-            # a zeni pickup pile) in play, the old type(obj).__name__ +
-            # substring-scan on every single one, every frame, added up.
             type_name = cls.__name__
             casts_shadow = any(t in type_name for t in self._SHADOW_TYPES)
             self._shadow_eligible_cache[cls] = casts_shadow
         if not casts_shadow:
             return
 
-        use_big = getattr(obj, 'shadow_size', 'small') == 'big'
+        # Hidden entities (e.g. the player once the fishing jump sequence
+        # finishes and sets is_hidden = True) shouldn't leave a shadow
+        # behind — same idea as the `active` check in draw_all(), just
+        # keyed off is_hidden since Player doesn't set `active`.
+        if getattr(obj, 'is_hidden', False):
+            return
 
+        use_big = getattr(obj, 'shadow_size', 'small') == 'big'
         entity_height = getattr(obj, 'height', 32)
-        # shadow_width can be set independently of hitbox width (e.g. on bosses)
         shadow_w = getattr(obj, 'shadow_width', getattr(obj, 'width', 32))
 
         shadow_surf = self._get_scaled_shadow(shadow_w, big=use_big)
         if shadow_surf is None:
             return
 
-        feet_x = (obj.x * RENDER_SCALE) - camera.x + 0.7
-        feet_y = (obj.y * RENDER_SCALE) - camera.y + (entity_height * RENDER_SCALE) // 2.25
-        feet_y += getattr(obj, 'shadow_y_offset', 0)
+        # Reuse the entity sprite's ACTUAL destination rect when available.
+        # This is important for pixel-perfect attachment: the body sprite may
+        # have a fractional world position, but its final screen position is
+        # determined by AnimatedSprite._dst_rect() (via camera.apply_rect()).
+        # Deriving the shadow anchor from that rect means the shadow follows
+        # exactly the same snapped player position instead of independently
+        # rounding obj.x/obj.y a second way.
+        sprite = getattr(obj, 'sprite', None)
+        dst_rect_fn = getattr(sprite, '_dst_rect', None)
+        if callable(dst_rect_fn):
+            body_rect = dst_rect_fn(obj.x, obj.y, camera)
+            anchor_x, anchor_y = body_rect.center
+        else:
+            anchor_x, anchor_y = camera.apply(obj.x, obj.y)
 
-        # round() rather than int()/truncation — with camera.x/camera.y now
-        # snapped to whole pixels in Camera.update(), the only remaining
-        # sub-pixel input here is the entity's own world position, and
-        # round() lines the shadow up a bit more consistently frame to
-        # frame than floor-toward-zero truncation did.
-        sx = round(feet_x - shadow_surf.get_width()  // 2)
-        sy = round(feet_y - shadow_surf.get_height() // 2)
+        feet_y = float(anchor_y) + (entity_height * RENDER_SCALE) / 2.25
+        feet_x = float(anchor_x)
+
+        # Direction-specific tuning is deliberately in SCREEN PIXELS.
+        # That means a value such as -1.0 always means exactly one rendered
+        # pixel left, regardless of RENDER_SCALE. The final rasterization is
+        # still pixel-snapped, so sub-pixel values are not claimed to be visible.
+        direction = getattr(obj, 'direction', None)
+        direction_x_offsets = getattr(obj, 'shadow_x_offsets_by_direction', {})
+        shadow_x_offset = float(getattr(obj, 'shadow_x_offset', 0.0))
+        shadow_x_offset += float(direction_x_offsets.get(direction, 0.0))
+        feet_x += shadow_x_offset
+
+        feet_y += getattr(obj, 'shadow_y_offset', 0.0)
+
+        sx = _snap(feet_x) - shadow_surf.get_width() // 2
+        sy = _snap(feet_y) - shadow_surf.get_height() // 2
         screen.blit(shadow_surf, (sx, sy))
 
     def add_object(self, obj: DrawableObject):
@@ -239,11 +290,14 @@ class LayerManager:
         if self.debug_mode:
             self._draw_debug_info(screen, sorted_objects)
 
-    def _get_occlusion_rect(self, obj):
+    def get_occlusion_rect(self, obj):
         """Best-effort WORLD-space pygame.Rect for `obj`'s current visual
-        footprint, used only by _apply_decoration_occlusion below to test
-        overlap against a decoration's trunk hitbox — never used for real
-        collision/damage.
+        footprint. Originally used only by _apply_decoration_occlusion below
+        to test overlap against a decoration's trunk hitbox; game.py's
+        _draw_far_attack_silhouettes_if_occluded now also calls this
+        (public, no leading underscore, for that reason) to get a
+        free-flying attack's own footprint for its per-object tile-ghosting
+        pass. Never used for real collision/damage either way.
 
         Prefers obj.get_world_bounds() when the attack provides one (see
         BeamAttack.get_world_bounds, FlameKamehamehaAttack.get_world_bounds,
@@ -254,7 +308,7 @@ class LayerManager:
         BigBangAttackBlast, MasenkoProjectile) that don't need — and don't
         have — a dedicated bounds method. Returns None if `obj` doesn't
         expose enough geometry either way, in which case that attack simply
-        isn't considered for decoration occlusion (same as today).
+        isn't considered for occlusion (same as today).
         """
         get_bounds = getattr(obj, 'get_world_bounds', None)
         if callable(get_bounds):
@@ -319,7 +373,7 @@ class LayerManager:
         if not decorations:
             return
 
-        effect_rects = [(effect, self._get_occlusion_rect(effect)) for effect in front_effects]
+        effect_rects = [(effect, self.get_occlusion_rect(effect)) for effect in front_effects]
         effect_rects = [(effect, rect) for effect, rect in effect_rects if rect is not None]
         if not effect_rects:
             return
@@ -342,44 +396,61 @@ class LayerManager:
                 decoration.draw(screen, camera, colors)
                 break  # already redrawn on top; no need to check the rest for this decoration
 
-    def draw_player_silhouette(self, screen, player, camera, fg_tile_surfaces=None):
-        OCCLUSION_ALPHA_THRESHOLD = 128
+    def _ensure_silhouette_surfaces(self, w, h):
+        """Lazily (re)build the full-screen scratch surfaces the ghosting
+        passes below share. Sized to the whole screen (not e.g. just the
+        player's box) because draw_attack_silhouette below needs to ghost
+        an object anywhere on screen, not only near the player, and
+        re-sizing per-call would defeat the point of caching these at all.
+        Both draw_player_silhouette and draw_attack_silhouette call this,
+        and both clear their own region of these surfaces before use, so
+        sharing them across many calls in the same frame is safe.
+        """
+        if self._silhouette_screen_size == (w, h):
+            return
+        self._silhouette_screen_size = (w, h)
+        self._silhouette_temp = _MaskableSurface((w, h), pygame.SRCALPHA)
+        self._silhouette_black = pygame.Surface((w, h), pygame.SRCALPHA)
+        self._silhouette_black.fill((0, 0, 0, 255))
+        self._silhouette_alpha = pygame.Surface((w, h), pygame.SRCALPHA)
+        self._silhouette_alpha.fill((255, 255, 255, 100))
+        self._silhouette_occlusion = pygame.Surface((w, h), pygame.SRCALPHA)
+        self._silhouette_occlusion_dirty = True
+
+    def _render_ghost_pass(self, screen, camera, colors, drawables, anchor_rect, fg_tile_surfaces, crop_pad):
+        """Shared core of draw_player_silhouette and draw_attack_silhouette:
+        draw `drawables` (world objects, via their own .draw(surface, camera,
+        colors)) into an off-screen surface, build an occlusion mask from
+        `fg_tile_surfaces` (tile/decoration surfaces already known to overlap
+        `anchor_rect`, in SCREEN space), and blit a dark ghost onto `screen`
+        wherever the two overlap, cropped to `anchor_rect` padded by
+        `crop_pad`. See the two callers for what differs between ghosting
+        the player (one fixed rect, extra held-attack drawables) and
+        ghosting a free-flying attack (one rect per object, per object).
+        """
         w, h = screen.get_size()
-
-        if self._silhouette_screen_size != (w, h):
-            self._silhouette_screen_size = (w, h)
-            self._silhouette_temp = _MaskableSurface((w, h), pygame.SRCALPHA)
-            self._silhouette_black = pygame.Surface((w, h), pygame.SRCALPHA)
-            self._silhouette_black.fill((0, 0, 0, 255))
-            self._silhouette_alpha = pygame.Surface((w, h), pygame.SRCALPHA)
-            self._silhouette_alpha.fill((255, 255, 255, 100))
-            self._silhouette_occlusion = pygame.Surface((w, h), pygame.SRCALPHA)
-            self._silhouette_occlusion_dirty = True
-
+        self._ensure_silhouette_surfaces(w, h)
         temp = self._silhouette_temp
-        black = self._silhouette_black
-        alpha_surf = self._silhouette_alpha
 
-        # ── 1. Compute player's screen bounding rect ──────────────────────────────
-        pw = int(player.sprite.sprite_width * RENDER_SCALE)
-        ph = int(player.sprite.sprite_height * RENDER_SCALE)
-        cx = int(player.x * RENDER_SCALE - camera.x)
-        cy = int(player.y * RENDER_SCALE - camera.y)
-        px = cx - pw // 2
-        py = cy - ph // 2
-
-        # ── 2. Draw player to temp ────────────────────────────────────────────────
+        # ── Draw the drawables to temp ─────────────────────────────────────
         temp.fill((0, 0, 0, 0))
-        player.draw(temp, camera, {})
+        draw_colors = colors if colors is not None else {}
+        for drawable in drawables:
+            try:
+                drawable.draw(temp, camera, draw_colors)
+            except Exception as e:
+                # One malformed/unexpected drawable shouldn't take down the
+                # whole occlusion pass -- worst case that one isn't ghosted
+                # this frame.
+                print(f'[silhouette] could not draw {drawable!r}: {e}')
 
-        # ── 3. Build occlusion surface from nearby tiles ──────────────────────────
+        # ── Build occlusion surface from the given tile/decoration surfaces ─
         occlusion = self._silhouette_occlusion
         occlusion.fill((0, 0, 0, 0))
-        player_rect = pygame.Rect(px, py, pw, ph)
         for tile_surf, tx, ty, cache_key in fg_tile_surfaces:
             if tile_surf is None:
                 continue
-            if not pygame.Rect(tx, ty, tile_surf.get_width(), tile_surf.get_height()).colliderect(player_rect):
+            if not pygame.Rect(tx, ty, tile_surf.get_width(), tile_surf.get_height()).colliderect(anchor_rect):
                 continue
             if len(self._mask_cache) > 512:
                 keys = list(self._mask_cache.keys())
@@ -391,28 +462,68 @@ class LayerManager:
                     setcolor=(255, 255, 255, 255), unsetcolor=(0, 0, 0, 0))
             occlusion.blit(self._mask_cache[cache_key], (tx, ty))
 
-        # ── 4. Crop both surfaces to player area before any mask operations ───────
+        # ── Crop both surfaces to the anchor area before any mask operations ─
         screen_rect = pygame.Rect(0, 0, w, h)
-        crop_pad = 4
-        crop = pygame.Rect(px - crop_pad, py - crop_pad, pw + crop_pad * 2, ph + crop_pad * 2).clip(screen_rect)
+        crop = pygame.Rect(anchor_rect.x - crop_pad, anchor_rect.y - crop_pad,
+                            anchor_rect.width + crop_pad * 2, anchor_rect.height + crop_pad * 2).clip(screen_rect)
         if crop.width == 0 or crop.height == 0:
             return
 
         occlusion_sub = occlusion.subsurface(crop)
         tile_mask = pygame.mask.from_surface(occlusion_sub, threshold=128)
         if not tile_mask.count():
-            return  # no solid tile pixels in player area at all — bail early, cheaply
+            return  # no solid tile pixels in this area at all — bail early, cheaply
 
-        player_sub = temp.subsurface(crop)
-        player_mask = pygame.mask.from_surface(player_sub, threshold=10)
+        drawable_sub = temp.subsurface(crop)
+        drawable_mask = pygame.mask.from_surface(drawable_sub, threshold=10)
 
-        overlap = player_mask.overlap_mask(tile_mask, (0, 0))
+        overlap = drawable_mask.overlap_mask(tile_mask, (0, 0))
         if not overlap.count():
             return
 
-        # ── 5. Draw silhouette only over the cropped area ─────────────────────────
+        # ── Draw silhouette only over the cropped area ─────────────────────
         silhouette = overlap.to_surface(setcolor=(0, 0, 0, 100), unsetcolor=(0, 0, 0, 0))
         screen.blit(silhouette, crop.topleft)
+
+    def draw_player_silhouette(self, screen, player, camera, fg_tile_surfaces=None,
+                                extra_drawables=None, colors=None, crop_pad=4):
+        # ── Compute player's screen bounding rect ──────────────────────────
+        pw = int(player.sprite.sprite_width * RENDER_SCALE)
+        ph = int(player.sprite.sprite_height * RENDER_SCALE)
+        cx = int(player.x * RENDER_SCALE - camera.x)
+        cy = int(player.y * RENDER_SCALE - camera.y)
+        px = cx - pw // 2
+        py = cy - ph // 2
+        player_rect = pygame.Rect(px, py, pw, ph)
+
+        # Charge poses, held beams/blasts, sword spins, etc. -- drawn the
+        # same way the normal y-sort pass draws them (see game.py's
+        # _get_active_player_attack_effects / the layer_manager.add_object
+        # calls for these same objects) so they end up in the same alpha
+        # mask as the player's own sprite and get ghosted identically,
+        # rather than being hard-clipped by the foreground tile sitting in
+        # front of them. crop_pad defaults to the old tight player-only
+        # padding (4px), but callers passing extra_drawables widen it (see
+        # game.py) so sprites that extend further from the player than its
+        # own bounding box (a held beam, a wide charge pose) aren't clipped
+        # out of the mask.
+        drawables = [player] + (list(extra_drawables) if extra_drawables else [])
+        self._render_ghost_pass(screen, camera, colors, drawables, player_rect, fg_tile_surfaces, crop_pad)
+
+    def draw_attack_silhouette(self, screen, camera, colors, attack, attack_rect,
+                                fg_tile_surfaces, crop_pad=8):
+        """Sibling to draw_player_silhouette, for a single free-flying attack
+        (a projectile, cutscene beam, etc. -- see game.py's
+        _draw_far_attack_silhouettes_if_occluded) that can be anywhere on
+        screen rather than anchored at the player.
+
+        `attack_rect` is that attack's own SCREEN-space bounding rect (see
+        get_occlusion_rect for the WORLD-space version this is derived
+        from) -- ghosting is cropped and masked around it exactly the way
+        draw_player_silhouette crops around the player's own rect, just
+        recentered per-object instead of fixed to the player.
+        """
+        self._render_ghost_pass(screen, camera, colors, [attack], attack_rect, fg_tile_surfaces, crop_pad)
 
     def _draw_debug_info(self, screen: pygame.Surface, sorted_objects: List[DrawableObject]):
         """Overlay layer counts in the top-left corner when debug_mode is on."""

@@ -77,7 +77,7 @@ import csv
 import gc
 
 # ── Game subsystems — import order follows dependency depth ────────────────────
-from attacks import Projectile
+from attacks.projectile import Projectile, KiBlastHitEffect
 from config.settings import *
 from core.camera import Camera
 from core.flag_manager import FlagManager
@@ -110,6 +110,7 @@ from ui.hud import UI
 from ui.notifications import LevelUpNotification
 from ui.damage_number import DamageNumberManager
 from core.sound_engine import SoundEngine, SoundManager, AudioAssetLoader
+from core.asset_watcher import AssetWatcher
 from ui.sprite_hud import SpriteHUD
 from core.draw_layers import LayerManager, DrawLayer
 from dev_tools.sprite_editor import SpriteEditor
@@ -121,12 +122,14 @@ from objects.flying_pad import FlyingPad
 from core.flypad_controller import FlyingController
 from core.nimbus_controller import NimbusCloudController
 from objects.save_point import SavePoint, SavePointMenu, SavePointManager
+from objects.fishing_area import FishingArea, FishingAreaManager, FishingPrompt
 from objects.decoration_objects import Decoration
 from ui.character_switch_menu import CharacterSwitchMenu
 from ui.pause_menu import PauseMenu
 from ui.credits_screen import CreditsScreen
 from ui.scouter_menu import ScouterMenu
-from core.items import ITEMS, spawn_item_pickup
+from core.items import ITEMS, spawn_item_pickup, item_icon_path
+from core import items as items_module
 from core.item_effects import use_item, tick_item_buffs, equip_item, unequip_item
 from dev_tools.room_editor.room_editor_tools.mission_manager import MissionManager
 from dev_tools.cutscene_editor import CutsceneEditor
@@ -135,6 +138,7 @@ from dev_tools import character_creator
 from dev_tools import attack_creator
 from dev_tools import entity_creator
 from dev_tools import item_creator
+from dev_tools import decoration_creator
 from ui.title_screen import TitleScreen
 
 # Flip to False when building an exported/player-facing release — gates the
@@ -405,6 +409,47 @@ class Game:
         self.sound_manager = SoundManager(self.sound_engine)
         AudioAssetLoader.load_from_directory(self.sound_engine)
 
+        # Hot-reload: watches assets/audio in the background and reports
+        # added/changed/removed files. The actual reload work happens on
+        # the main thread inside update() (see the top of that method) by
+        # feeding poll_events() into AudioAssetLoader.apply_watcher_events()
+        # — that keeps every pygame.mixer call on the thread pygame expects.
+        self._audio_watch_base = 'assets/audio'
+        self.audio_watcher = AssetWatcher(
+            [self._audio_watch_base],
+            extensions=(AudioAssetLoader.MUSIC_EXTENSIONS
+                        + AudioAssetLoader.SFX_EXTENSIONS
+                        + AudioAssetLoader.BGS_EXTENSIONS),
+            poll_interval=1.0,
+        )
+        self.audio_watcher.start()
+
+        # Same hot-reload approach for item data/icons: watches both the
+        # override JSON directory and the icon sprite tree, and is drained
+        # in update() via items_module.apply_watcher_events() — see there
+        # for how a changed file gets routed to a reload.
+        self.items_watcher = AssetWatcher(
+            [items_module.ITEMS_DIR, items_module.ITEMS_SPRITE_DIR],
+            extensions=('.json', '.png'),
+            poll_interval=1.0,
+        )
+        self.items_watcher.start()
+
+        # Same hot-reload approach for character/enemy/NPC/critter/boss
+        # sprite sheets: watches the whole assets/sprites tree and is drained
+        # in update() via sprite_system.apply_watcher_events(). Unlike audio
+        # and items, this one is "fully live" — sprite_system.py keeps a
+        # weak registry of every AnimatedSprite currently in play and
+        # rebuilds any of them that were built from the file that changed,
+        # so a re-exported PNG shows up on the player/an enemy/an NPC
+        # immediately, mid-session, without a reload or re-entering the room.
+        self.sprite_watcher = AssetWatcher(
+            ['assets/sprites'],
+            extensions=('.png',),
+            poll_interval=1.0,
+        )
+        self.sprite_watcher.start()
+
         # ── Player ────────────────────────────────────────────────────────────
         # Respect the saved character menu order (character_creator's
         # discover_characters()) instead of silently falling through to
@@ -415,6 +460,7 @@ class Game:
             WORLD_WIDTH // 2, WORLD_HEIGHT // 2,
             character=starting_character,
             game_config=self.game_config,
+            sound_manager=self.sound_manager,
         )
         # Apply the character creator's saved config (stats, equipped attacks,
         # ki mode, and whether this character has any transformations) to the
@@ -453,6 +499,13 @@ class Game:
         self.sprite_hud            = SpriteHUD(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.dialogue_box          = DialogueBox(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.dialogue_box.set_player(self.player)
+        # Tracks dialogue_box.active from the previous frame so
+        # _play_message_sound_if_opened() (called wherever dialogue_box.update()
+        # runs) can detect the instant it goes False -> True and play
+        # message.wav, without every individual dialogue_box.show() call site
+        # (NPC dialogue, level-up, event dialogue_box actions, item/chest
+        # pickups, the death box, etc.) needing to remember to do it itself.
+        self._dialogue_box_prev_active = False
         self.dialogue_choice_menu  = DialogueChoiceMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
         # Bottom-middle mash-E-or-Q QTE bar (see ui/spam_qte.py) — armed by
         # the 'spam_qte' event action, same "one shared instance, started/
@@ -489,6 +542,8 @@ class Game:
         self.attack_creator = attack_creator.AttackCreator(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.entity_creator = entity_creator.EntityCreator(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.item_creator = item_creator.ItemCreator(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.decoration_creator = decoration_creator.DecorationCreator(SCREEN_WIDTH, SCREEN_HEIGHT)
+        self.decoration_creator.on_catalog_changed = self._refresh_decoration_catalog
         self.cutscene_editor = CutsceneEditor(
             self.room_manager,
             self.room_editor,
@@ -596,6 +651,7 @@ class Game:
         self.explosions           = []   # Active ExplosionEffect instances
         self.genkidama_hit_effects = []  # Active GenkidamaHitEffect instances
         self.burning_hit_effects  = []  # Active BurningHitEffect instances
+        self.ki_blast_hit_effects = []  # Active KiBlastHitEffect instances
         # Kept separate from self.projectiles (unlike a regular Projectile
         # or GenkidamaBlast) specifically so it never gets swept into that
         # list's generic 'projectile' collision handling below, which
@@ -635,6 +691,7 @@ class Game:
         self.nimbus_clouds        = []
         self.world_map_objects = []
         self.music_track          = ''   # current room's persisted BGM track; set via trigger box room_music actions
+        self.bgs_track            = ''   # current room's persisted BGS (ambient loop, e.g. rain) track; set via trigger box room_bgs actions
         self.trigger_boxes        = []   # room's placed trigger box zones (see core/event system)
         self.zeni_pickups         = []   # dropped-zeni world pickups; see _update_zeni_pickups
         self.item_pickups         = []   # dropped-item world pickups; see _update_item_pickups
@@ -670,6 +727,16 @@ class Game:
         # it's entered.
         self._ROOM_SURF_CACHE_MAX = 12
         self._room_tile_surfaces: OrderedDict = OrderedDict()
+        # key: (room_name, is_background) → list of (kind, min_layer, max_layer),
+        # index-aligned with the segments list in self._room_tile_surfaces[key].
+        # Lets _patch_tile_cell() find which existing segment a moved/painted
+        # tile belongs to by its layer value alone, without needing the
+        # original per-tile lists that _build_room_tile_surface() discards
+        # once a segment is baked. See _patch_tile_cell() for why this
+        # matters: without it, any edit in a room that has an animated tile
+        # ANYWHERE was forcing a full rebuild of the whole baked surface,
+        # even for edits nowhere near that animated tile.
+        self._room_tile_segment_ranges: dict = {}
         self._dirty_tile_rooms:   set  = set()   # rooms pending a full surface rebuild
         # Memoizes tileset.get_scaled_tile_surface() results, keyed by
         # (id(tileset), tile_x, tile_y, RENDER_SCALE). _build_room_tile_surface
@@ -736,6 +803,31 @@ class Game:
         self.save_point_manager    = SavePointManager()
         self.save_point_menu       = SavePointMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.character_switch_menu = CharacterSwitchMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
+
+        # ── Fishing areas ────────────────────────────────────────────────────
+        self.fishing_areas = []
+        self.nearby_fishing_area = None
+        self.fishing_prompt = FishingPrompt(SCREEN_WIDTH, SCREEN_HEIGHT)
+
+        # What's caught (see _roll_fishing_catch/_update_fishing_catch) — no
+        # reference odds yet, TWEAK THESE VALUES to taste.
+        self.FISHING_NOTHING_CHANCE = 0.25   # odds of catching nothing at all
+        self.FISHING_CATCH_POOL = [
+            'small_blue_fish', 'big_blue_fish', 'small_red_fish', 'old_shoe',
+        ]  # equal odds among these otherwise
+
+        # Two-stage reveal, same shape as _pending_chest/_pending_item_pickup:
+        # stage 1 (_fishing_awaiting_reveal) waits out the rest of the jump
+        # sequence once a catch has been rolled; stage 2
+        # (_pending_fishing_item) holds the actual item through its
+        # start_pickup_item() pose before the "You found a/an X!" textbox
+        # fires. _fishing_catch_result is None (nothing rolled yet) or
+        # either an item_id or the string 'nothing'.
+        self._fishing_catch_result      = None
+        self._fishing_awaiting_reveal   = False
+        self._pending_fishing_item      = None
+        self._pending_fishing_item_icon = None
+        self._fishing_catch_icon_cache: dict = {}  # item_id -> Surface, mirrors _chest_icon_cache
 
         # In-game "Save Game" flow (see _start_save_flow/_update_save_flow/
         # _draw_saving_popup) — reuses TitleScreen's own SAVE SELECT frame
@@ -975,7 +1067,9 @@ class Game:
         # cutscenes, room transitions, enemy spawning...) needs one
         # self.event_runner.register_handler(...) call once its real method
         # names are known.
-        self.event_runner = EventRunner()
+        self.event_runner = EventRunner(
+            condition_evaluator=self.flag_manager.evaluate_conditions
+        )
         self.event_runner.register_handler('set_custom_variable', self._handle_set_custom_variable_action)
         self.event_runner.register_handler('world_map_location', self._handle_world_map_location_action)
         self.event_runner.register_handler('dialogue_box', self._handle_dialogue_box_action, blocking=True)
@@ -999,6 +1093,7 @@ class Game:
         self.event_runner.register_handler('spam_qte', self._handle_spam_qte_action, blocking=True)
         self.event_runner.register_handler('weather', self._handle_weather_action)
         self.event_runner.register_handler('room_music', self._handle_room_music_action)
+        self.event_runner.register_handler('room_bgs', self._handle_room_bgs_action)
         self.event_runner.register_handler('play_sound', self._handle_play_sound_action)
         self.event_runner.register_handler('change_map', self._handle_change_map_action, blocking=True)
         self.event_runner.register_handler('set_player_location', self._handle_set_player_location_action)
@@ -1521,35 +1616,46 @@ class Game:
 
     # ── Event handling ────────────────────────────────────────────────────────
 
+    def _window_to_logical(self, ox, oy):
+        """Normalize a mouse coordinate that SDL has already mapped to logical space.
+
+        IMPORTANT: Renderer.logical_size uses SDL_RenderSetLogicalSize(). SDL then
+        filters mouse events from the real window so MOUSEMOTION/MOUSEBUTTON*
+        ``event.pos`` values are already expressed in the logical resolution.
+        The previous implementation incorrectly treated those values as raw
+        window pixels and scaled them a second time, which only became visible
+        once the window was resized.
+
+        Keep this helper for callers that still use the old name, but make it a
+        pure logical-space clamp rather than a second transform.
+        """
+        lx = max(0, min(SCREEN_WIDTH - 1, int(ox)))
+        ly = max(0, min(SCREEN_HEIGHT - 1, int(oy)))
+        return (lx, ly)
+
     def _get_logical_mouse_pos(self):
-        """Translate the real window mouse position to logical resolution coords."""
-        mx, my = pygame.mouse.get_pos()
-        wx, wy = self.window.size
-        return (int(mx * SCREEN_WIDTH / wx), int(my * SCREEN_HEIGHT / wy))
+        """Return the latest mouse position in renderer logical coordinates.
+
+        Mouse events are already logical because the SDL renderer has a logical
+        size.  Caching the last event also avoids accidentally mixing raw window
+        coordinates from a synchronous mouse query with logical event positions.
+        """
+        return self._logical_mouse_pos
 
     def _rescale_event(self, event):
-        """Scale a mouse event's position from real window coords to logical resolution.
+        """Normalize mouse input for the engine's logical coordinate space.
 
-        Everything runs in logical space (SCREEN_WIDTH × SCREEN_HEIGHT), so raw
-        window mouse positions need to be mapped before they reach any subsystem.
+        SDL_RenderSetLogicalSize() already performs the window->logical mapping
+        before pygame receives the mouse events.  Therefore this function must
+        NOT scale event.pos again.  It only records the already-logical position
+        so per-frame polling (room editor, etc.) uses the same coordinate space.
+        Relative motion is also left untouched because SDL applies its documented
+        logical-size relative scaling to MOUSEMOTION events.
         """
-        if event.type not in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION):
-            return event
-
-        wx, wy  = self.window.size
-        ox, oy  = event.pos
-        new_pos = (int(ox * SCREEN_WIDTH / wx), int(oy * SCREEN_HEIGHT / wy))
-
-        if event.type == pygame.MOUSEMOTION:
-            return pygame.event.Event(event.type,
-                                      pos=new_pos,
-                                      rel=event.rel,
-                                      buttons=event.buttons)
-
-        d = {'pos': new_pos, 'button': event.button}
-        if hasattr(event, 'buttons'):
-            d['buttons'] = event.buttons
-        return pygame.event.Event(event.type, **d)
+        if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION):
+            if hasattr(event, 'pos'):
+                self._logical_mouse_pos = self._window_to_logical(*event.pos)
+        return event
 
     def handle_events(self):
         """
@@ -1736,6 +1842,10 @@ class Game:
                 self.dialogue_choice_menu.handle_input(event)
                 continue
 
+            if self.fishing_prompt.active:
+                self.fishing_prompt.handle_event(event)
+                continue
+
             if self.save_point_menu.active:
                 result = self.save_point_menu.handle_input(event)
                 if result == 'save':
@@ -1830,6 +1940,12 @@ class Game:
                 self.item_creator.handle_input(event)
                 continue
 
+            if self.decoration_creator.active:
+                result = self.decoration_creator.handle_input(event)
+                if result == 'close':
+                    self._refresh_decoration_catalog()
+                continue
+
             if self.room_editor.active:
                 result = self.room_editor.handle_input(event)
                 if result and result.startswith('test_room:'):
@@ -1840,6 +1956,10 @@ class Game:
                 continue
 
             if self.dev_menu.active:
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_F3:
+                    self.dev_menu.active = False
+                    self.decoration_creator.toggle()
+                    continue
                 result = self.dev_menu.handle_input(event)
                 if result == 'open_room_editor':
                     self.dev_menu.active = False
@@ -1875,6 +1995,9 @@ class Game:
                 elif result == 'open_item_creator':
                     self.dev_menu.active = False
                     self.item_creator.toggle()
+                elif result == 'open_decoration_creator':
+                    self.dev_menu.active = False
+                    self.decoration_creator.toggle()
 
             # ── Normal gameplay input ─────────────────────────────────────────
             # Only reached when no overlay is active.
@@ -1970,12 +2093,27 @@ class Game:
                             self.player.begin_teleport_sequence(targets)
                             self.it_selector = None
 
+    def _refresh_decoration_catalog(self):
+        """Push Decoration Creator saves into any already-created Object Editor."""
+        room_editor = getattr(self, 'room_editor', None)
+        object_editor = getattr(room_editor, 'object_editor', None) if room_editor else None
+        if object_editor is not None and hasattr(object_editor, 'refresh_decoration_catalog'):
+            try:
+                object_editor.refresh_decoration_catalog()
+            except Exception:
+                # A dev-tool refresh should never crash the running game. The
+                # saved manifest is still on disk and will be picked up on the
+                # next Object Editor creation/open.
+                pass
+
+
     def _handle_game_keydown(self, event):
         """Key-down events during normal gameplay.
 
         Keybindings at a glance:
           F1      — dev menu toggle
           F2      — exit test mode (returns to room editor)
+          F3      — decoration creator
           ESC     — pause menu
           WASD    — move; double-tap a direction to start running
           Shift   — hold to run
@@ -2022,6 +2160,10 @@ class Game:
 
         if event.key == pygame.K_F1:
             self.dev_menu.toggle()
+
+        elif event.key == pygame.K_F3:
+            if DEV_BUILD:
+                self.decoration_creator.toggle()
 
         elif event.key == pygame.K_F2:
             # F2 exits test mode and drops back into the room editor.
@@ -2187,6 +2329,7 @@ class Game:
             if len(modes) > 1:
                 idx = modes.index(self.player.ki_attack_mode) if self.player.ki_attack_mode in modes else 0
                 self.player.ki_attack_mode = modes[(idx + 1) % len(modes)]
+                self.sound_manager.play_sfx('switch')
 
         elif event.key in (pygame.K_a, pygame.K_d, pygame.K_w, pygame.K_s):
             # Double-tapping a direction key starts a run.
@@ -2282,6 +2425,20 @@ class Game:
         # World-map object — start the jump sequence.
         if self.nearby_world_map_obj and self.player.can_act():
             self._start_map_jump()
+            return
+
+        # Fishing area — open the yes/no prompt. Gated on can_act() so this
+        # can't fire mid-attack/knockback/etc., same as the world-map branch
+        # above, and skipped entirely if the prompt (or dialogue) is already
+        # open so E can't re-trigger it or double-fire the callback.
+        if (self.nearby_fishing_area and self.player.can_act()
+                and not self.dialogue_box.active and not self.fishing_prompt.active):
+            area = self.nearby_fishing_area
+            self.fishing_prompt.open(
+                "Do you want to go fishing?",
+                on_yes=lambda a=area: self._start_fishing_jump(a),
+                player=self.player,
+            )
             return
 
         # Begin talking to a nearby NPC.
@@ -2567,6 +2724,29 @@ class Game:
             screen.blit(shadow, (x + 2, y + oy + 2))
             screen.blit(s, (x, y + oy))
             x += s.get_width() + letter_spacing
+
+    def _start_fishing_jump(self, area):
+        """Kick off the fishing jump sequence once the player picks "Yes"
+        on the fishing prompt. Much simpler than _start_map_jump below —
+        no scene transition, no sprite-sheet swap, just the parabolic hop
+        handled entirely inside player.start_fishing_jump()."""
+        def _on_landed():
+            # Player has finished the arc and is now hidden (player.is_hidden).
+            # Roll the catch now, but don't reveal it yet — the player is
+            # still underwater/mid-exit-jump for a while longer, and the
+            # reveal (pickup pose + "You found..." textbox) shouldn't play
+            # until they've actually reappeared. See _update_fishing_catch.
+            self._fishing_catch_result = self._roll_fishing_catch()
+            self._fishing_awaiting_reveal = True
+
+        self.player.start_fishing_jump(on_complete=_on_landed)
+
+    def _roll_fishing_catch(self):
+        """Rolls what the player finds. Returns None for "nothing", else
+        one of FISHING_CATCH_POOL's item_ids (equal odds among those)."""
+        if random.random() < self.FISHING_NOTHING_CHANCE:
+            return None
+        return random.choice(self.FISHING_CATCH_POOL)
 
     def _start_map_jump(self):
         """Kick off the world-map jump sequence for the player.
@@ -3145,6 +3325,15 @@ class Game:
         if not room:
             return
 
+        # Test mode starts from a clean transient positional-audio state.
+        self.sound_manager.stop_all_positional_bgs()
+
+        # Positional ambient emitters own transient mixer Channels. Those
+        # channels belong to the room we are leaving, so kill them before
+        # switching the active room. The new room's emitters are started on
+        # the next update once the player's new position is known.
+        self.sound_manager.stop_all_positional_bgs()
+
         # Discard any baked tile surface for this room so it is rebuilt fresh.
         self.invalidate_tile_cache(room.name)
 
@@ -3276,10 +3465,22 @@ class Game:
             for obj in room.world_map_objects:
                 self.world_map_objects.append(WorldMapObject.from_dict(obj.to_dict()))
 
+        # Fishing areas — same copy-on-enter treatment as world map objects above.
+        self.fishing_areas       = []
+        self.nearby_fishing_area = None
+        if hasattr(room, 'fishing_areas') and room.fishing_areas:
+            from objects.fishing_area import FishingArea
+            for area in room.fishing_areas:
+                self.fishing_areas.append(FishingArea.from_dict(area.to_dict()))
+
         # Room music track — a plain string, so no copy needed to keep test
         # mode from mutating the editor original.
         self.music_track = getattr(room, 'music_track', '')
         self._apply_room_music(room)
+
+        # Room BGS (ambient loop) track — same reasoning as music_track above.
+        self.bgs_track = getattr(room, 'bgs_track', '')
+        self._apply_room_bgs(room)
         self._apply_room_weather(room)
 
         # Trigger boxes — copy so test mode doesn't latch (once=True) the
@@ -3332,6 +3533,10 @@ class Game:
         """Restore all rooms to their pre-test state and clear test entities."""
         if not self.is_test_mode or not self.test_room_backup:
             return
+        # Do not leave test-mode ambient channels playing after restoring
+        # the editor state.
+        self.sound_manager.stop_all_positional_bgs()
+
 
         # Same reasoning as the reset in _handle_test_room: if the player
         # flew into the world map during the test itself and then pressed F2
@@ -3352,6 +3557,8 @@ class Game:
         # exiting test mode. Cut it instantly here so dropping back into the room editor
         # is silent right away, with no fade-out lag.
         self.sound_manager.stop_music(fade_out=False)
+        # Same reasoning for whatever BGS (ambient loop) the test room started.
+        self.sound_manager.stop_bgs(fade_out=False)
 
         for room_name, backup in self.test_room_backup.items():
             room = self.room_manager.get_room_by_name(room_name)
@@ -3494,7 +3701,9 @@ class Game:
         self.room_transitions    = room.room_transitions[:]    if hasattr(room, 'room_transitions')    and room.room_transitions    else []
         self.save_points         = room.save_points[:]         if hasattr(room, 'save_points')         and room.save_points         else []
         self.world_map_objects   = room.world_map_objects[:]   if hasattr(room, 'world_map_objects')   and room.world_map_objects   else []
+        self.fishing_areas       = room.fishing_areas[:]       if hasattr(room, 'fishing_areas')       and room.fishing_areas       else []
         self.music_track         = getattr(room, 'music_track', '')
+        self.bgs_track           = getattr(room, 'bgs_track', '')
         self.trigger_boxes       = room.trigger_boxes[:]       if hasattr(room, 'trigger_boxes')       and room.trigger_boxes       else []
         # Close out any non-permanent door left open in the room we're leaving
         # — a non-permanent door stays open as long as the player is in its
@@ -3509,6 +3718,7 @@ class Game:
         # opened, so there's no "close on room exit" step needed here).
         self.chests                = room.chests[:]             if hasattr(room, 'chests')              and room.chests              else []
         self._apply_room_music(room)
+        self._apply_room_bgs(room)
         self._apply_room_weather(room)
 
 
@@ -3965,6 +4175,7 @@ class Game:
         self.explosions    = []
         self.genkidama_hit_effects = []
         self.burning_hit_effects  = []
+        self.ki_blast_hit_effects = []
         self.big_bang_attacks = []
         self.big_bang_destruction_effects = []
         self.zeni_pickups   = []
@@ -4011,7 +4222,15 @@ class Game:
                 self.level_gates.remove(gate)
 
     def _on_transition_placed(self, transition, room_name):
-        """Sync game list when a room transition is placed in the editor."""
+        """Sync game list when a room transition is placed in the editor.
+
+        By the time object_editor.py calls this (from
+        _finalize_transition_spawn_placement), the transition has already
+        been fully configured via ObjectEditor's own TransitionConfigDialog
+        (objects/room_transition.py) and had its spawn point placed in the
+        target room — this callback just mirrors it into the live game
+        state, same as _on_transition_deleted below.
+        """
         if self.is_test_mode:
             return
         if self.current_room and self.current_room.name == room_name:
@@ -4776,6 +4995,54 @@ class Game:
 
         self.room_manager.save_room(self.current_room)
 
+    def _handle_room_bgs_action(self, mode, track=None):
+        """EventRunner handler for the 'room_bgs' action — mode: 'set' | 'stop'.
+
+        Mirrors _handle_room_music_action exactly, but for BGS (background
+        sound) ambient loops like rain or wind instead of music: writes the
+        change back onto the *current room's* persisted `bgs_track` string
+        and saves it, so the ambient loop keeps playing on every future
+        entry into this room too — not just this one time.
+
+        'set'  — replaces the room's bgs_track with `track` and applies it
+                 immediately via _apply_room_bgs (which already no-ops if
+                 that ambient loop is already playing).
+        'stop' — actually stops whatever BGS is currently playing (no
+                 matter how it was started) AND clears the room's persisted
+                 bgs_track so future entries don't force it back on.
+
+        Same save-guard reasoning as _handle_room_music_action: skip the
+        room mutation/save when the room's persisted bgs is already in the
+        requested state, since a repeat-fire trigger box (once=False)
+        covering ground the player stands on would otherwise call
+        save_room() every single frame it overlaps.
+        """
+        if not self.current_room:
+            return
+
+        existing = getattr(self.current_room, 'bgs_track', '')
+
+        if mode == 'set':
+            if not track:
+                return
+            if existing == track:
+                self._apply_room_bgs(self.current_room)  # cheap no-op if already playing
+                return
+            self.bgs_track = track
+            self.current_room.bgs_track = track
+            self._apply_room_bgs(self.current_room)
+
+        elif mode == 'stop':
+            # Always actually stop the BGS — regardless of whether this
+            # room has a persisted track, and regardless of what's playing.
+            self.sound_manager.stop_bgs()
+            if not existing:
+                return  # Already no track persisted for this room — nothing to save.
+            self.bgs_track = ''
+            self.current_room.bgs_track = ''
+
+        self.room_manager.save_room(self.current_room)
+
     def _handle_play_sound_action(self, sound_id):
         """EventRunner handler for the 'play_sound' action. Non-blocking —
         fires the one-shot sfx and the sequence continues immediately,
@@ -4978,6 +5245,27 @@ class Game:
                     if self.current_room is room and self.sound_engine.current_music == existing_track:
                         self.sound_manager.stop_music()
 
+            # Same cleanup, mirrored for room_bgs 'set' actions / bgs_track.
+            deleted_bgs_tracks = {
+                a.get('track') for a in getattr(box, 'actions', []) or []
+                if a.get('type') == 'room_bgs' and a.get('mode') == 'set' and a.get('track')
+            }
+            existing_bgs_track = getattr(room, 'bgs_track', '')
+            if deleted_bgs_tracks and existing_bgs_track in deleted_bgs_tracks:
+                remaining_boxes = getattr(room, 'trigger_boxes', None) or []
+                still_owned_bgs = any(
+                    a.get('type') == 'room_bgs' and a.get('mode') == 'set'
+                    and a.get('track') == existing_bgs_track
+                    for other in remaining_boxes
+                    for a in (getattr(other, 'actions', []) or [])
+                )
+                if not still_owned_bgs:
+                    room.bgs_track = ''
+                    if self.bgs_track == existing_bgs_track:
+                        self.bgs_track = ''
+                    if self.current_room is room and self.sound_engine.current_bgs == existing_bgs_track:
+                        self.sound_manager.stop_bgs()
+
             self.room_manager.save_room(room)
 
     # Extensions the room editor's music scan (and AudioAssetLoader) know
@@ -5013,6 +5301,44 @@ class Game:
 
         print(f"[room_music] switching to '{track}' for room '{getattr(room, 'name', '?')}'")
         self.sound_manager.play_music(track)
+
+    # Extensions the room editor's BGS scan (and AudioAssetLoader) know
+    # about — mirrors _MUSIC_EXTENSIONS. AudioAssetLoader currently only
+    # loads .wav/.ogg files from assets/audio/sfx/ambient/, but this stays
+    # defensive the same way _MUSIC_EXTENSIONS does in case a bgs_track was
+    # ever saved with an extension still attached.
+    _BGS_EXTENSIONS = ('.wav', '.ogg')
+
+    def _apply_room_bgs(self, room):
+        """Apply the given room's persisted BGS (background sound ambient
+        loop, e.g. rain) track, if any, to the currently playing ambient
+        loop. Mirrors _apply_room_music exactly, but reads bgs_track /
+        sound_engine.ambient_sounds / current_bgs instead of the music
+        equivalents.
+
+        Design rule: if the room has no BGS track set, do nothing —
+        whatever ambient loop is already playing keeps playing
+        uninterrupted.
+        """
+        if not room:
+            return
+
+        track = getattr(room, 'bgs_track', '')
+        if not track:
+            return  # No BGS set for this room — leave ambient sound as-is
+
+        # Defensive: strip a known extension if one is still attached.
+        # sound_engine.ambient_sounds is keyed by filename stem (no
+        # extension), so an extension here would never match and playback
+        # would silently no-op.
+        if track.lower().endswith(self._BGS_EXTENSIONS):
+            track = os.path.splitext(track)[0]
+
+        if track == self.sound_engine.current_bgs:
+            return  # Already playing this ambient loop — avoid restarting it on every room entry
+
+        print(f"[room_bgs] switching to '{track}' for room '{getattr(room, 'name', '?')}'")
+        self.sound_manager.play_bgs(track)
 
     def _apply_room_weather(self, room):
         """Apply the given room's persisted ambient weather (set via the
@@ -5585,6 +5911,7 @@ class Game:
             self.active_cutscene_runtime.update(dt, w, h)
             if self.dialogue_box:
                 self.dialogue_box.update(dt)
+                self._play_message_sound_if_opened()
             if self.active_cutscene_runtime.finished:
                 _char_before = getattr(self.player, 'character', None)
                 self._sync_player_from_cutscene(self.active_cutscene_runtime)
@@ -8145,6 +8472,12 @@ class Game:
         # every character always drew the same default-width shadow.
         self.player.shadow_width = cfg.get('shadow_size', self.player.width)
 
+        # Halo toggle from the character creator's Identity tab (see
+        # Player.halo_enabled / Player.draw() for the actual rendering;
+        # halo_offset_x/halo_offset_y are tuned manually in player.py,
+        # not synced from cfg).
+        self.player.halo_enabled = cfg.get('halo_enabled', False)
+
         # Charged Melee style — whether holding the melee button lunges
         # forward or spins in place once fully charged (see
         # Player.release_charged_melee()). Always available (unlike the
@@ -8501,6 +8834,42 @@ class Game:
 
     # ── Main update ───────────────────────────────────────────────────────────
 
+    def _update_positional_ambient_sounds(self):
+        """Update every placed positional ambient emitter in the active room.
+
+        The emitter owns its transient pygame mixer Channel and distance
+        calculation. Game supplies the authoritative player position once
+        per frame. Raw dicts are converted defensively for older in-memory
+        room data.
+        """
+        room = self.current_room
+        if room is None:
+            return
+
+        emitters = getattr(room, 'ambient_sounds', None)
+        if not emitters:
+            return
+
+        from objects.ambient_sound_object import AmbientSoundObject
+
+        for index, emitter in enumerate(emitters):
+            if isinstance(emitter, dict):
+                emitter = AmbientSoundObject.from_dict(emitter)
+                emitters[index] = emitter
+
+            if not hasattr(emitter, 'update_audio'):
+                continue
+
+            try:
+                emitter.update_audio(
+                    self.player.x,
+                    self.player.y,
+                    self.sound_manager,
+                )
+            except Exception as e:
+                # Broken/missing ambient audio must never crash gameplay.
+                print(f"[ambient_sound] update failed: {e}")
+
     def update(self):
         """Advance all systems by one frame: input, movement, collision, projectiles,
         enemy AI, item pickups, save points, UI notifications, and dev overlays.
@@ -8514,6 +8883,30 @@ class Game:
         # higher is almost certainly a debugger break, minimize, or OS sleep.
         dt             = min(dt, 4.0 / 60.0)
         self.dt        = dt
+
+        # Asset hot-reload: drain whatever the background AssetWatcher
+        # noticed since last frame and apply it to the live SoundEngine.
+        # Deliberately runs before the title-screen/room-editor early
+        # returns below so audio assets stay hot-reloadable no matter what
+        # screen is up — a designer previewing a track from the title
+        # screen or the room editor shouldn't need to enter gameplay first.
+        if hasattr(self, 'audio_watcher'):
+            audio_events = self.audio_watcher.poll_events()
+            if audio_events:
+                AudioAssetLoader.apply_watcher_events(
+                    self.sound_engine, audio_events, base_path=self._audio_watch_base
+                )
+
+        if hasattr(self, 'items_watcher'):
+            item_events = self.items_watcher.poll_events()
+            if item_events:
+                items_module.apply_watcher_events(item_events)
+
+        if hasattr(self, 'sprite_watcher'):
+            sprite_events = self.sprite_watcher.poll_events()
+            if sprite_events:
+                from core.sprite_system import apply_watcher_events as apply_sprite_watcher_events
+                apply_sprite_watcher_events(sprite_events)
 
         # Title screen — nothing else in the engine ticks while this is up.
         if self.game_mode == 'title':
@@ -8597,6 +8990,7 @@ class Game:
         # Always tick UI overlays even when gameplay is paused.
         self.character_switch_menu.update(dt)
         self.save_point_menu.update(dt)
+        self.fishing_prompt.update(dt)
         self.dialogue_choice_menu.update(dt)
         self.pause_menu.update(dt)
         self.credits_screen.update(dt)
@@ -8668,6 +9062,9 @@ class Game:
             if self.item_creator.active:
                 self.item_creator.update(dt)
                 return
+            if self.decoration_creator.active:
+                self.decoration_creator.update(dt)
+                return
             if self.room_editor.active:
                 self._sync_event_editor_rooms()
                 self.room_editor.update(dt, self._get_logical_mouse_pos())
@@ -8706,7 +9103,8 @@ class Game:
                     and not self.pause_menu.active and not self.active_cutscene_runtime \
                     and not self.dialogue_box.active and not self.dialogue_choice_menu.active \
                     and not self.player.is_teleporting_it and not self.spam_qte_bar.active \
-                    and not self._levelup_active and not self.save_flow_active:
+                    and not self._levelup_active and not self.save_flow_active \
+                    and not self.fishing_prompt.active:
                 self._update_player_movement(dt)
 
             # The character switch menu and save point menu should freeze the
@@ -8714,12 +9112,12 @@ class Game:
             # keep running here would still tick idle_timer forward and let
             # idle_transition/idle_wait kick in while either menu is open
             # (only _update_player_movement above was gated before). The
-            # dialogue choice menu — and the Save Game flow — get the same
-            # treatment.
+            # dialogue choice menu, the Save Game flow, and the fishing
+            # prompt get the same treatment.
             if not self.character_switch_menu.active and not self.save_point_menu.active \
                     and not self.dialogue_choice_menu.active and not self._levelup_active \
-                    and not self.save_flow_active:
-                self.player.update(dt)
+                    and not self.save_flow_active and not self.fishing_prompt.active:
+                self.player.update(dt, collision_objects=self.collision_objects)
 
             # Level-up sequence — drives the player's facing turns and the
             # levelup.png animation directly, so it needs to keep ticking
@@ -8874,6 +9272,11 @@ class Game:
 
             self.level_up_notification.update(dt)
 
+            # Update placed positional ambient sounds after player movement
+            # and room-transition checks, using the final position for this
+            # frame.
+            self._update_positional_ambient_sounds()
+
             # Beam charge and auto-fire mechanics.
             self._update_beam(dt)
             self._update_kamekameha(dt)
@@ -8884,8 +9287,20 @@ class Game:
 
             # Player projectiles.
             for projectile in self.projectiles[:]:
-                projectile.update(self.current_room.width, self.current_room.height, dt)
+                projectile.update(self.current_room.width, self.current_room.height, dt,
+                                   collision_objects=self.collision_objects)
                 if not projectile.active:
+                    # Only plain ki blasts that were actually consumed by a
+                    # collision (hit_something — set at the enemy/stone/gate
+                    # collision sites below) get the explosion. Genkidama/
+                    # BurningAttack already spawn their own distinct hit
+                    # effects directly at their collision sites, and a
+                    # projectile that merely expired out of world bounds
+                    # never had hit_something set, so it's excluded too.
+                    if (getattr(projectile, 'hit_something', False)
+                            and isinstance(projectile, Projectile)
+                            and not isinstance(projectile, (GenkidamaBlast, BurningAttack))):
+                        self._trigger_kiblast_hit(projectile.x, projectile.y)
                     self.projectiles.remove(projectile)
 
             # Scripted 'firebeam' cutscene attacks — spawned via
@@ -9026,6 +9441,13 @@ class Game:
                 if not hit_fx.active:
                     self.burning_hit_effects.remove(hit_fx)
 
+            # Ki blast hit-impact visuals — same one-shot pattern as
+            # burning above, no hitstop/white-flash involved.
+            for hit_fx in self.ki_blast_hit_effects[:]:
+                hit_fx.update(dt)
+                if not hit_fx.active:
+                    self.ki_blast_hit_effects.remove(hit_fx)
+
             # Big Bang Attack's destruction burst — the scattered,
             # staggered brown_destruction puffs left behind once a blast
             # reaches MAX_DISTANCE (see BigBangDestructionBurst). No
@@ -9059,9 +9481,17 @@ class Game:
 
             # Dialogue box animation.
             self.dialogue_box.update(dt)
+            self._play_message_sound_if_opened()
 
             # Save point proximity detection.
             self._update_save_points(dt)
+
+            # Fishing area proximity detection.
+            self._update_fishing_areas(dt)
+
+            # Reveal whatever fishing turned up, once the player has
+            # actually reappeared from the jump sequence.
+            self._update_fishing_catch(dt)
 
             # Chest proximity detection.
             self._update_chests(dt)
@@ -9166,7 +9596,8 @@ class Game:
         if (dx != 0 or dy != 0) and not self.flying_controller.is_active() and not self.nimbus_controller.is_active():
             old_x = self.player.x
             old_y = self.player.y
-            self.player.move(dx, dy, is_running, self.current_room.width, self.current_room.height)
+            self.player.move(dx, dy, is_running, self.current_room.width, self.current_room.height,
+                              collision_objects=self.collision_objects)
 
             actually_moved = (self.player.x != old_x) or (self.player.y != old_y)
 
@@ -9274,6 +9705,23 @@ class Game:
                 )
                 break
 
+    def _play_message_sound_if_opened(self):
+        """Play 'message' (message.wav) the instant self.dialogue_box
+        transitions from closed to open. Called right after every
+        self.dialogue_box.update(dt) site (there are currently two — normal
+        gameplay and cutscene playback — see the call sites) so this covers
+        every dialogue_box.show() caller (NPC dialogue, level-up, event
+        dialogue_box actions, item/chest pickups, the death box, ...)
+        uniformly, without each of them needing to play the sound itself.
+        Safe to call more than once in the same frame: once
+        _dialogue_box_prev_active catches up to True, later calls that
+        frame are no-ops.
+        """
+        is_active = self.dialogue_box.active
+        if is_active and not self._dialogue_box_prev_active:
+            self.sound_manager.play_sfx('message')
+        self._dialogue_box_prev_active = is_active
+
     def _update_beam(self, dt):
         """Tick beam charging and auto-fire once fully charged.
 
@@ -9288,7 +9736,11 @@ class Game:
             beam = self.player.fire_beam_auto()
             if beam:
                 self.player.current_beam = beam
-                self.sound_manager.play_sfx('beam')
+                # No self.sound_manager.play_sfx('beam') here anymore —
+                # BeamAttack itself now plays 'beamfire' (then loops
+                # 'beamloop') via the sound_manager passed into it in
+                # fire_beam_auto(), so calling this too would double up
+                # both sounds firing at once.
 
     def _update_kamekameha(self, dt):
         """Tick Kamekameha charging and auto-fire once fully charged.
@@ -9538,6 +9990,7 @@ class Game:
             for projectile in self.projectiles:
                 if projectile.active and enemy.check_collision_with_attack(projectile, 'projectile', self.game_config):
                     projectile.active = False
+                    projectile.hit_something = True
                     if isinstance(projectile, GenkidamaBlast):
                         self._trigger_genkidama_hit(projectile.x, projectile.y)
                     elif isinstance(projectile, BurningAttack):
@@ -10037,7 +10490,8 @@ class Game:
     def _update_enemy_kiblasts(self, dt):
         """Tick all enemy ki-blasts, check player collision, and prune spent ones."""
         for blast in self.enemy_kiblasts[:]:
-            blast.update(self.current_room.width, self.current_room.height, dt)
+            blast.update(self.current_room.width, self.current_room.height, dt,
+                         collision_objects=self.collision_objects)
 
             if blast.active and not self.player.is_dead:
                 r = blast.radius
@@ -10150,6 +10604,111 @@ class Game:
             (sp for sp in self.save_points if sp.is_player_nearby and sp.active),
             None
         )
+
+    def _update_fishing_areas(self, dt):
+        """Tick fishing areas and record whichever one the player is standing
+        inside, so _handle_interact knows whether E should open the prompt."""
+        for area in self.fishing_areas:
+            area.update(dt, self.player)
+
+        self.nearby_fishing_area = next(
+            (a for a in self.fishing_areas if a.active and a.player_is_inside(self.player)),
+            None
+        )
+
+    def _update_fishing_catch(self, dt):
+        """Reveals what fishing turned up, once the player has actually
+        reappeared — two stages, same idea as _update_chest_pickup/
+        _update_item_pickup_finish:
+
+        Stage 1 (_fishing_awaiting_reveal): set by _start_fishing_jump's
+        _on_landed the moment the catch is rolled, while the player is
+        still underwater/mid-exit-jump. Waits here until both
+        is_fishing_jumping and is_hidden are false again — i.e. the exit
+        jump has actually landed — before doing anything visible.
+
+        Stage 2 (_pending_fishing_item): only entered when something was
+        actually caught. Mirrors the chest/dropped-item flow exactly —
+        start_pickup_item()'s pose plays out (with the icon floating via
+        _draw_fishing_catch_icon) before the "You found a/an X!" textbox
+        finally fires, rather than popping in immediately alongside it.
+        Finding nothing skips this stage entirely — its textbox fires as
+        soon as stage 1 clears.
+        """
+        if self._fishing_awaiting_reveal:
+            if self.player.is_fishing_jumping or self.player.is_hidden:
+                return  # still mid-jump / still underwater
+
+            self._fishing_awaiting_reveal = False
+            result = self._fishing_catch_result
+            self._fishing_catch_result = None
+
+            if result is None:
+                self.dialogue_box.show("You found nothing!", "Fishing", True, None)
+            else:
+                self.player.start_pickup_item()
+                self.sound_manager.play_sfx('itemget')
+                self._pending_fishing_item = result
+                self._pending_fishing_item_icon = self._get_fishing_catch_icon(result)
+            return
+
+        if not self._pending_fishing_item:
+            return
+        if self.player.is_picking_up_item:
+            return
+
+        item_id = self._pending_fishing_item
+        self._pending_fishing_item      = None
+        self._pending_fishing_item_icon = None
+
+        inventory = getattr(self.player, 'inventory', None)
+        if inventory is not None:
+            inventory.append(item_id)
+            # Same generic pickup bookkeeping as _update_item_pickup_finish.
+            self.flag_manager.mark_item_picked_up(item_id)
+            self.flag_manager.add_variable(f'item_count:{item_id}', 1)
+
+        item_name = ITEMS.get(item_id, {}).get('name', item_id)
+        article = 'an' if item_name[:1].lower() in 'aeiou' else 'a'
+        self.dialogue_box.show(f"You found {article} {item_name}!", "Fishing", True, item_id)
+
+    def _get_fishing_catch_icon(self, item_id):
+        """Same cache shape as _get_dropped_item_icon/_get_chest_item_icon,
+        but built on core.items.item_icon_path() rather than duplicating
+        its path convention inline — every current fishing catch is a
+        story item, which those two inline copies don't know how to
+        resolve (they'd miss the story_items/ subfolder)."""
+        if item_id not in self._fishing_catch_icon_cache:
+            try:
+                self._fishing_catch_icon_cache[item_id] = pygame.image.load(
+                    item_icon_path(item_id)
+                ).convert_alpha()
+            except Exception:
+                self._fishing_catch_icon_cache[item_id] = None
+        return self._fishing_catch_icon_cache[item_id]
+
+    def _draw_fishing_catch_icon(self, screen, camera):
+        """Item icon drifting slowly upward above the player's head while
+        the fishing catch's pickup_item pose plays out — same shape as
+        _draw_chest_pickup_icon/_draw_item_pickup_icon."""
+        if not self._pending_fishing_item or not self._pending_fishing_item_icon:
+            return
+
+        duration = max(0.001, self.player.PICKUP_ITEM_DURATION)
+        progress = min(1.0, self.player.pickup_item_timer / duration)
+
+        rise_world = 14
+        base_world_y = self.player.y - self.player.height / 2
+        icon_world_y = base_world_y - progress * rise_world
+
+        icon = self._pending_fishing_item_icon
+        scaled = pygame.transform.scale(icon, (
+            max(1, int(icon.get_width() * RENDER_SCALE)),
+            max(1, int(icon.get_height() * RENDER_SCALE)),
+        ))
+        screen_x = int(self.player.x * RENDER_SCALE - camera.x)
+        screen_y = int(icon_world_y * RENDER_SCALE - camera.y)
+        screen.blit(scaled, scaled.get_rect(midbottom=(screen_x, screen_y)))
 
     def _update_chests(self, dt):
         """Tick chests and record whichever one the player can currently
@@ -10310,6 +10869,7 @@ class Game:
                 collision_type = 'genkidama' if isinstance(projectile, GenkidamaBlast) else 'projectile'
                 if stone.check_collision_with_attack(projectile, collision_type):
                     projectile.active = False
+                    projectile.hit_something = True
                     if isinstance(projectile, GenkidamaBlast):
                         self._trigger_genkidama_hit(projectile.x, projectile.y)
             if not stone.active:
@@ -10352,6 +10912,13 @@ class Game:
         beat; the burning attack's payoff is the stun, not a freeze."""
         self.burning_hit_effects.append(BurningHitEffect(x, y))
 
+    def _trigger_kiblast_hit(self, x, y):
+        """Spawn the explosion effect when a plain ki blast Projectile is
+        consumed by a collision (enemy, destructible stone, level gate) —
+        see the 'hit_something' flag set at each of those sites and read
+        back in the projectile removal loop in update()."""
+        self.ki_blast_hit_effects.append(KiBlastHitEffect(x, y))
+
     def _update_instant_transmission(self, dt):
         """Drive Instant Transmission while the world is frozen for target
         aiming (holding the button, moving the cursor, picking targets).
@@ -10375,13 +10942,13 @@ class Game:
 
             keys = pygame.key.get_pressed()
             dx = dy = 0
-            if keys[pygame.K_LEFT] and not keys[pygame.K_RIGHT]:
+            if keys[pygame.K_a] and not keys[pygame.K_d]:
                 dx = -1
-            elif keys[pygame.K_RIGHT] and not keys[pygame.K_LEFT]:
+            elif keys[pygame.K_d] and not keys[pygame.K_a]:
                 dx = 1
-            if keys[pygame.K_UP] and not keys[pygame.K_DOWN]:
+            if keys[pygame.K_w] and not keys[pygame.K_s]:
                 dy = -1
-            elif keys[pygame.K_DOWN] and not keys[pygame.K_UP]:
+            elif keys[pygame.K_s] and not keys[pygame.K_w]:
                 dy = 1
             if dx or dy:
                 self.it_selector.move(dx, dy, dt)
@@ -10463,6 +11030,7 @@ class Game:
                 if projectile.active:
                     if gate.check_collision_with_attack(projectile, 'projectile', self.player):
                         projectile.active = False
+                        projectile.hit_something = True
 
             if self.player.current_beam:
                 beam = self.player.current_beam
@@ -10689,56 +11257,20 @@ class Game:
                         + self.destructible_stones + self._visible_decorations + self.level_gates + self.doors
                         + self.chests
                         + self.bombs + self.explosions + self.genkidama_hit_effects
-                        + self.burning_hit_effects + self.flying_pads + self.nimbus_clouds
-                        + self.save_points + self.world_map_objects
+                        + self.burning_hit_effects + self.ki_blast_hit_effects + self.flying_pads + self.nimbus_clouds
+                        + self.save_points + self.world_map_objects + self.fishing_areas
                         + self.masenko_projectiles + _visible_zeni_pickups
                         + self.item_pickups
                         + self.big_bang_attacks + self.big_bang_destruction_effects):
                 self.layer_manager.add_object(obj)
             for melee in self.melee_attacks:
                 self.layer_manager.add_object(melee)
-            if self.player.current_beam:
-                self.layer_manager.add_object(self.player.current_beam)
-            if self.player.current_charge_effect:
-                self.layer_manager.add_object(self.player.current_charge_effect)
-            if self.player.current_kamekameha:
-                self.layer_manager.add_object(self.player.current_kamekameha)
-            if self.player.current_kamekameha_charge_effect:
-                self.layer_manager.add_object(self.player.current_kamekameha_charge_effect)
-            if self.player.current_banshee_blast:
-                self.layer_manager.add_object(self.player.current_banshee_blast)
-            if self.player.current_banshee_blast_charge_effect:
-                self.layer_manager.add_object(self.player.current_banshee_blast_charge_effect)
-            if self.player.current_final_flash:
-                self.layer_manager.add_object(self.player.current_final_flash)
-            if self.player.current_big_bang_kamehameha:
-                self.layer_manager.add_object(self.player.current_big_bang_kamehameha)
-            if self.player.current_big_bang_kamehameha_charge_effect:
-                self.layer_manager.add_object(self.player.current_big_bang_kamehameha_charge_effect)
-            if self.player.current_flame_kamehameha:
-                self.layer_manager.add_object(self.player.current_flame_kamehameha)
-            if self.player.current_flame_kamehameha_charge_effect:
-                self.layer_manager.add_object(self.player.current_flame_kamehameha_charge_effect)
-            if self.player.current_final_flash_charge_effect:
-                self.layer_manager.add_object(self.player.current_final_flash_charge_effect)
-            if self.player.genkidama_charge_effect:
-                self.layer_manager.add_object(self.player.genkidama_charge_effect)
-            if self.player.current_big_bang_charge:
-                self.layer_manager.add_object(self.player.current_big_bang_charge)
-            if self.player.masenko_indicator:
-                self.layer_manager.add_object(self.player.masenko_indicator)
-            if self.player.masenko_hold_effect:
-                self.layer_manager.add_object(self.player.masenko_hold_effect)
-            if self.player.burning_charge_effect:
-                self.layer_manager.add_object(self.player.burning_charge_effect)
-            if self.player.current_sword_charge_effect:
-                self.layer_manager.add_object(self.player.current_sword_charge_effect)
-            if self.player.energy_sword_spin:
-                self.layer_manager.add_object(self.player.energy_sword_spin)
-            if self.player.current_dragon_fist:
-                self.layer_manager.add_object(self.player.current_dragon_fist)
-            if self.player.current_ghost_kamikaze:
-                self.layer_manager.add_object(self.player.current_ghost_kamikaze)
+            # See _get_active_player_attack_effects() for what this list is
+            # and why it's factored out (also used by the silhouette pass
+            # below so these "super attack" sprites get the same tree/wall
+            # ghosting treatment as the player's own body).
+            for effect in self._get_active_player_attack_effects():
+                self.layer_manager.add_object(effect)
 
             # Enemy bullets, rockets, and ki-blasts are not y-sorted — draw them directly.
             for bullet in self.enemy_bullets:
@@ -10760,6 +11292,10 @@ class Game:
             # Same, for a dropped-item pickup being collected — see
             # _handle_interact's item-pickup branch / _update_item_pickup_finish.
             self._draw_item_pickup_icon(self.logical_surface, self.camera)
+
+            # Same, for a fishing catch being revealed — see
+            # _start_fishing_jump / _update_fishing_catch.
+            self._draw_fishing_catch_icon(self.logical_surface, self.camera)
 
             # Landing animation — replaces the normal player sprite while descending
             # into the room.  Drawn after layer_manager.draw_all (player was excluded
@@ -10796,7 +11332,7 @@ class Game:
             self.layer_manager.clear()
             for obj in (self.destructible_stones + self.decorations + self.level_gates
                         + self.doors + self.chests + self.flying_pads + self.nimbus_clouds
-                        + self.save_points + self.world_map_objects):
+                        + self.save_points + self.world_map_objects + self.fishing_areas):
                 self.layer_manager.add_object(obj)
             self.layer_manager.draw_all(self.logical_surface, self.camera, self.colors, RENDER_SCALE)
 
@@ -10919,9 +11455,118 @@ class Game:
         # Foreground tile layer (same baked path as background).
         self._draw_room_tiles(bg=False)
 
+        # Level gates are redrawn here ONLY over the exact pixels a
+        # foreground tile actually covers — not the whole gate, and not
+        # unconditionally. Gates already went through the normal y-sorted
+        # layer_manager pass above (draw_layer=0, y_sort=True — see
+        # objects/level_gate.py — same bucket the player uses, so gate-vs-
+        # player ordering there is a plain y compare), but that whole pass
+        # runs BEFORE _draw_room_tiles(bg=False), so a foreground tile
+        # placed at/near a gate was painting over it every time — a gate
+        # that displayed correctly (in front of the tile) in the room
+        # editor's preview (see RoomEditor.draw / ObjectEditor.
+        # draw_level_gates, which always draws gates after foreground tiles)
+        # showed up behind it in actual gameplay/testing instead.
+        #
+        # Two earlier versions of this fix both broke gate-vs-player y-sort:
+        # v1 redrew every active gate unconditionally after fg tiles, so a
+        # gate always won against the player anywhere on screen. v2 only
+        # redrew gates with a foreground tile nearby, which is exactly the
+        # scenario being tested (gate placed right next to a layer-75 tile),
+        # so it still redrew the WHOLE gate sprite over the player whenever
+        # they overlapped there. This version clips the redraw to just the
+        # tile-covered region of the gate, and additionally subtracts the
+        # player's own screen rect from that region whenever the player's
+        # sort key already puts it in front of the gate (self.player.
+        # get_sort_key() > gate.get_sort_key(), the same "bigger y draws on
+        # top" comparison layer_manager itself uses) — so the tile-occlusion
+        # fix can never paint over a player that's correctly standing in
+        # front of the gate.
+        te = getattr(self.room_editor, 'tileset_editor', None)
+
+        def _rect_subtract(base, cut):
+            """base minus its overlap with cut, as a list of 0-4 rects.
+            Same helper as the fog/tree punch-through above — duplicated
+            locally since that one is scoped inside the `if _fog_drawn:`
+            block and isn't defined when fog isn't active this frame."""
+            if not base.colliderect(cut):
+                return [base]
+            inter = base.clip(cut)
+            pieces = []
+            if inter.top > base.top:
+                pieces.append(pygame.Rect(base.left, base.top, base.width, inter.top - base.top))
+            if inter.bottom < base.bottom:
+                pieces.append(pygame.Rect(base.left, inter.bottom, base.width, base.bottom - inter.bottom))
+            if inter.left > base.left:
+                pieces.append(pygame.Rect(base.left, inter.top, inter.left - base.left, inter.height))
+            if inter.right < base.right:
+                pieces.append(pygame.Rect(inter.right, inter.top, base.right - inter.right, inter.height))
+            return pieces
+
+        for gate in self.level_gates:
+            if not gate.active:
+                continue
+            gw = getattr(gate, 'width', TILE_SIZE) or TILE_SIZE
+            gh = getattr(gate, 'height', TILE_SIZE) or TILE_SIZE
+            nearby = self._nearby_foreground_tiles(
+                gate.x, gate.y, gw / 2 + TILE_SIZE, gh / 2 + TILE_SIZE,
+            )
+            if not nearby:
+                continue
+
+            gsx = int(gate.x * RENDER_SCALE - self.camera.x)
+            gsy = int(gate.y * RENDER_SCALE - self.camera.y)
+            gsw = int(gw * RENDER_SCALE)
+            gsh = int(gh * RENDER_SCALE)
+            gate_rect = pygame.Rect(gsx - gsw // 2, gsy - gsh // 2, gsw, gsh)
+
+            covered_pieces = []
+            for tile in nearby:
+                tw = th = TILE_SIZE
+                if te:
+                    tileset = te.tileset_manager.get_tileset(tile.tileset_name)
+                    if tileset:
+                        tw, th = tileset.tile_width, tileset.tile_height
+                tsx = int(tile.x * RENDER_SCALE - self.camera.x)
+                tsy = int(tile.y * RENDER_SCALE - self.camera.y)
+                tsw = int(tw * RENDER_SCALE)
+                tsh = int(th * RENDER_SCALE)
+                tile_rect = pygame.Rect(tsx, tsy, tsw, tsh)
+                if gate_rect.colliderect(tile_rect):
+                    covered_pieces.append(gate_rect.clip(tile_rect))
+
+            if not covered_pieces:
+                continue
+
+            if self.player.get_sort_key() > gate.get_sort_key():
+                ppw = int(self.player.width  * RENDER_SCALE)
+                pph = int(self.player.height * RENDER_SCALE)
+                ppx = int(self.player.x * RENDER_SCALE - self.camera.x)
+                ppy = int(self.player.y * RENDER_SCALE - self.camera.y)
+                player_rect = pygame.Rect(ppx - ppw // 2, ppy - pph // 2, ppw, pph)
+                next_pieces = []
+                for piece in covered_pieces:
+                    next_pieces.extend(_rect_subtract(piece, player_rect))
+                covered_pieces = next_pieces
+
+            for piece in covered_pieces:
+                if piece.width <= 0 or piece.height <= 0:
+                    continue
+                self.logical_surface.set_clip(piece)
+                gate.draw(self.logical_surface, self.camera, self.colors)
+            self.logical_surface.set_clip(None)
+
+
         # Ghost silhouette — drawn immediately after foreground tiles so the
         # player remains readable when standing behind a fence, tree, or wall.
         self._draw_player_silhouette_if_occluded()
+
+        # Same, for free-flying attacks (fired Genkidama, cutscene beams,
+        # enemy ki-blasts, etc.) that can travel well away from the player
+        # — see _draw_far_attack_silhouettes_if_occluded's docstring for why
+        # these need their own, separately-anchored pass rather than
+        # reusing the player's.
+        self._draw_far_attack_silhouettes_if_occluded()
 
         # Test-mode indicator banner — drawn after foreground tiles so it's always on top.
         if self.is_test_mode:
@@ -10967,6 +11612,7 @@ class Game:
         self.attack_creator.draw(self.logical_surface, self.dt)
         self.entity_creator.draw(self.logical_surface, self.dt)
         self.item_creator.draw(self.logical_surface, self.dt)
+        self.decoration_creator.draw(self.logical_surface, self.dt)
         self.room_editor.draw(self.logical_surface)
         self.dev_menu.draw(self.logical_surface)
         self.cutscene_editor.draw(self.logical_surface)
@@ -11131,12 +11777,15 @@ class Game:
         if self._dirty_tile_rooms:
             if None in self._dirty_tile_rooms:
                 self._room_tile_surfaces.clear()
+                self._room_tile_segment_ranges.clear()
                 self._dirty_tile_cells.clear()
                 self._editor_bg_frame_cache.clear()
             else:
                 for room in self._dirty_tile_rooms:
                     self._room_tile_surfaces.pop((room, True),  None)
                     self._room_tile_surfaces.pop((room, False), None)
+                    self._room_tile_segment_ranges.pop((room, True),  None)
+                    self._room_tile_segment_ranges.pop((room, False), None)
                     self._dirty_tile_cells.pop(room, None)
                     self._editor_bg_frame_cache.pop(room, None)
             self._dirty_tile_rooms.clear()
@@ -11176,6 +11825,22 @@ class Game:
             return
 
         tileset_mgr = te.tileset_manager
+
+        # Native shadows are baked into static room surfaces. A shadow edit can
+        # change transparent RGBA pixels independently of a tileset lookup, so
+        # use the safe full rebuild path for that layer whenever a room contains
+        # native shadows. The rebuild is deferred until the next draw.
+        has_native_shadows = any(
+            getattr(t, 'is_shadow', False)
+            for t in te.room_tiles.get(room_name, [])
+        )
+        if has_native_shadows:
+            self._room_tile_surfaces.pop((room_name, True), None)
+            self._room_tile_surfaces.pop((room_name, False), None)
+            self._room_tile_segment_ranges.pop((room_name, True), None)
+            self._room_tile_segment_ranges.pop((room_name, False), None)
+            self._editor_bg_frame_cache.pop(room_name, None)
+            return
 
         # Select every tile whose real footprint overlaps the region being
         # patched, not just tiles whose top-left corner exactly equals
@@ -11217,65 +11882,126 @@ class Game:
                 t_tileset = tileset_mgr.get_tileset(t.tileset_name)
                 return bool(t_tileset) and t_tileset.is_tile_animated(t.tile_x, t.tile_y)
 
-            # If this edit touches an animated tile, or the room already has
-            # one interleaved into its layer stack, the segment boundaries
-            # from _build_room_tile_surface() may need to move (a tile could
-            # start/stop splitting a static run). Patching a single cached
-            # Surface in place can't express that, so just drop the cached
-            # plan and let it rebuild fresh — same as a full invalidation,
-            # and correctness matters far more than the rebuild cost here
-            # since animated tiles are a small minority of any room.
-            has_anim_segment = any(kind == 'anim' for kind, _ in plan)
-            if has_anim_segment or any(_is_animated(t) for t in bg_cell_tiles):
+            # Route this edit to the specific existing segment(s) it
+            # belongs to, using the (kind, min_layer, max_layer) index
+            # recorded alongside `plan` in _build_room_tile_surface(), so a
+            # plain edit only ever touches the segment it actually falls
+            # in — not the whole room's baked surface just because some
+            # OTHER, unrelated segment happens to be animated.
+            #
+            # (Previously this bailed to a full rebuild the instant the
+            # room's plan contained ANY 'anim' segment at all, regardless
+            # of whether this edit was anywhere near it — which meant
+            # dragging tiles around in any room with so much as one
+            # animated tile (water, lava, ...) paid a full room-sized
+            # Surface rebuild on every single mouse-motion event. See the
+            # Sept 2026 PERFORMANCE NOTE on _build_room_tile_surface for
+            # what that full rebuild actually costs on a large room.)
+            #
+            # A tile's own current layer value can, in principle, sit
+            # inside the numeric range of both a static and an animated
+            # segment (a single layer can contain both kinds of tile, and
+            # both runs get their bounds extended to that same layer
+            # value), so segments are matched by (kind, layer) together,
+            # not layer alone.
+            ranges = self._room_tile_segment_ranges.get(key)
+            if ranges is None or len(ranges) != len(plan):
+                # No (or stale/mismatched) range index to route this edit
+                # safely — fall back to the old full-invalidate behavior
+                # rather than guess.
                 self._room_tile_surfaces.pop(key, None)
+                self._room_tile_segment_ranges.pop(key, None)
                 continue
 
-            # Fast path: no animated tiles involved at all for this layer
-            # group, so the plan is just a single static Surface — patch it
-            # in place exactly as before.
-            #
-            # The surface's own bounding box (see _build_room_tile_surface's
-            # Sept 2026 PERFORMANCE NOTE) may be smaller than the room, so
-            # world-pixel coordinates have to be translated into
-            # surface-local ones by subtracting its origin — and if this
-            # edit falls (even partly) outside the box the surface was
-            # originally sized to (e.g. painting into a previously-empty
-            # corner of the room), an in-place patch can't grow that
-            # Surface. Falling back to a full rebuild for this room/layer
-            # is the same safety net already used above for animated tiles
-            # — correctness over patch-speed for what should be a rare edit
-            # shape (painting is usually within/near already-painted area).
-            if not plan or plan[0][0] != 'static':
+            segment_tiles: dict = {}  # segment index -> [tile, ...] (static only)
+            fallback = False
+            for t in bg_cell_tiles:
+                target_kind = 'anim' if _is_animated(t) else 'static'
+                seg_idx = None
+                for i, (kind, lo, hi) in enumerate(ranges):
+                    if kind == target_kind and lo <= t.layer <= hi:
+                        seg_idx = i
+                        break
+                if seg_idx is None:
+                    # This tile's (layer, animated/static) combination
+                    # isn't covered by any existing segment — e.g. it just
+                    # became animated, or landed on a layer value that had
+                    # no tiles before. That can shift segment boundaries
+                    # in ways an in-place patch can't express, so fall
+                    # back to a full rebuild for this room/layer, same as
+                    # the old safety net.
+                    fallback = True
+                    break
+                if target_kind == 'anim':
+                    continue  # animated segments redraw fresh every frame already
+                segment_tiles.setdefault(seg_idx, []).append(t)
+
+            if fallback:
+                self._room_tile_surfaces.pop(key, None)
+                self._room_tile_segment_ranges.pop(key, None)
                 continue
-            surf, origin_x, origin_y = plan[0][1]
+
+            # Which static segments' pixels need clearing at this cell:
+            # every segment a surviving tile maps into, plus — if the edit
+            # removed every tile from this cell (a plain erase) — every
+            # static segment, since with nothing left in bg_cell_tiles
+            # there's no tile left to tell us which segment used to draw
+            # whatever was here.
+            if bg_cell_tiles:
+                target_segment_idxs = set(segment_tiles.keys())
+            else:
+                target_segment_idxs = {i for i, (kind, _, _) in enumerate(ranges) if kind == 'static'}
 
             patch_x0 = int(cell_x * RENDER_SCALE)
             patch_y0 = int(cell_y * RENDER_SCALE)
             patch_x1 = patch_x0 + int(cell_w * RENDER_SCALE)
             patch_y1 = patch_y0 + int(cell_h * RENDER_SCALE)
-            surf_w, surf_h = surf.get_size()
-            if (patch_x0 < origin_x or patch_y0 < origin_y or
-                    patch_x1 > origin_x + surf_w or patch_y1 > origin_y + surf_h):
-                self._room_tile_surfaces.pop(key, None)
-                continue
 
-            # Clear just this cell's real footprint back to transparent.
-            rect = pygame.Rect(
-                patch_x0 - origin_x, patch_y0 - origin_y,
-                int(cell_w * RENDER_SCALE), int(cell_h * RENDER_SCALE),
-            )
-            surf.fill((0, 0, 0, 0), rect)
-
-            for tile in bg_cell_tiles:
-                tileset = tileset_mgr.get_tileset(tile.tileset_name)
-                if not tileset or not tileset.image:
+            for seg_idx in target_segment_idxs:
+                seg_kind, payload = plan[seg_idx]
+                if seg_kind != 'static':
                     continue
-                scaled = tileset.get_scaled_tile_surface(tile.tile_x, tile.tile_y, RENDER_SCALE)
-                if scaled:
-                    surf.blit(scaled, (
-                        int(tile.x * RENDER_SCALE) - origin_x,
-                        int(tile.y * RENDER_SCALE) - origin_y,
-                    ))
+                surf, origin_x, origin_y = payload
+
+                # The surface's own bounding box (see _build_room_tile_surface's
+                # Sept 2026 PERFORMANCE NOTE) may be smaller than the room, so
+                # world-pixel coordinates have to be translated into
+                # surface-local ones by subtracting its origin — and if this
+                # edit falls (even partly) outside the box the surface was
+                # originally sized to (e.g. painting into a previously-empty
+                # corner of the room), an in-place patch can't grow that
+                # Surface. Falling back to a full rebuild for this room/layer
+                # is the same safety net as before — correctness over
+                # patch-speed for what should be a rare edit shape (painting
+                # is usually within/near already-painted area).
+                surf_w, surf_h = surf.get_size()
+                if (patch_x0 < origin_x or patch_y0 < origin_y or
+                        patch_x1 > origin_x + surf_w or patch_y1 > origin_y + surf_h):
+                    self._room_tile_surfaces.pop(key, None)
+                    self._room_tile_segment_ranges.pop(key, None)
+                    fallback = True
+                    break
+
+                # Clear just this cell's real footprint back to transparent.
+                rect = pygame.Rect(
+                    patch_x0 - origin_x, patch_y0 - origin_y,
+                    int(cell_w * RENDER_SCALE), int(cell_h * RENDER_SCALE),
+                )
+                surf.fill((0, 0, 0, 0), rect)
+
+                for tile in segment_tiles.get(seg_idx, []):
+                    tileset = tileset_mgr.get_tileset(tile.tileset_name)
+                    if not tileset or not tileset.image:
+                        continue
+                    scaled = tileset.get_scaled_tile_surface(tile.tile_x, tile.tile_y, RENDER_SCALE)
+                    if scaled:
+                        surf.blit(scaled, (
+                            int(tile.x * RENDER_SCALE) - origin_x,
+                            int(tile.y * RENDER_SCALE) - origin_y,
+                        ))
+
+            if fallback:
+                continue
 
     def _remember_room_tile_surface(self, key: tuple, plan: list):
         """Insert a freshly-baked room tile plan into self._room_tile_surfaces
@@ -11288,7 +12014,8 @@ class Game:
         self._room_tile_surfaces[key] = plan
         self._room_tile_surfaces.move_to_end(key)
         while len(self._room_tile_surfaces) > self._ROOM_SURF_CACHE_MAX:
-            self._room_tile_surfaces.popitem(last=False)
+            evicted_key, _ = self._room_tile_surfaces.popitem(last=False)
+            self._room_tile_segment_ranges.pop(evicted_key, None)
 
     def _touch_room_tile_surface(self, key: tuple):
         """Mark a cache hit as recently-used so it survives eviction longer
@@ -11362,7 +12089,7 @@ class Game:
         painted. Only a change in layer VALUE can force a new segment.
         Without this, a single layer that freely interleaves animated and
         static tiles (e.g. a pond of water tiles dotted with static rocks,
-        all on the Shadows layer) fragments into one segment per tile —
+        on any layer) fragments into one segment per tile —
         which is what caused the severe frame-rate regression after the
         z-order fix above, since alternation like that costs nothing
         visually but was being charged a full segment each time.
@@ -11417,8 +12144,19 @@ class Game:
         # just deferring Surface allocation until we know each static run's
         # full tile list (and therefore its bounding box).
         raw_plan = []
+        # Index-aligned with raw_plan: [min_layer, max_layer] spanned by that
+        # run. Layer values are visited in ascending order (groupby over
+        # _sorted_tiles), so the min is fixed when a run starts and the max
+        # is just whatever layer_value we're on when the run is last
+        # extended. Carried through Pass 2 into self._room_tile_segment_ranges
+        # so _patch_tile_cell() can route an edit to the right segment by
+        # layer value instead of falling back to a full rebuild whenever the
+        # room has an animated segment anywhere at all.
+        raw_plan_ranges = []
         current_statics = None
         current_anim = None
+        current_static_range = None
+        current_anim_range = None
 
         for layer_value, layer_group in itertools.groupby(
                 _sorted_tiles, key=lambda t: t.layer):
@@ -11427,12 +12165,15 @@ class Game:
                 continue
 
             # Split this single layer's tiles into statics and animateds.
-            # Their relative order within the layer doesn't matter (same
-            # depth), so we can always emit statics-then-animated for this
-            # layer regardless of how they were originally interleaved.
+            # Native shadow tiles are texture-free static overlays; they stay
+            # in the same layer stack but are rendered as translucent black
+            # rectangles directly into the composite surface.
             layer_statics = []
             layer_animateds = []
             for tile in layer_group:
+                if getattr(tile, 'is_shadow', False):
+                    layer_statics.append((tile, None))
+                    continue
                 tileset = tileset_mgr.get_tileset(tile.tileset_name)
                 if not tileset or not tileset.image:
                     continue
@@ -11445,6 +12186,10 @@ class Game:
                 if current_statics is None:
                     current_statics = []
                     raw_plan.append(('static', current_statics))
+                    current_static_range = [layer_value, layer_value]
+                    raw_plan_ranges.append(current_static_range)
+                else:
+                    current_static_range[1] = layer_value
                 current_statics.extend(layer_statics)
                 # A later layer's animated tiles must start a fresh run
                 # rather than silently extending an animated run that sits
@@ -11452,24 +12197,32 @@ class Game:
                 # would draw them underneath these statics regardless of
                 # their actual layer value.
                 current_anim = None
+                current_anim_range = None
 
             if layer_animateds:
                 if current_anim is None:
                     current_anim = []
                     raw_plan.append(('anim', current_anim))
+                    current_anim_range = [layer_value, layer_value]
+                    raw_plan_ranges.append(current_anim_range)
+                else:
+                    current_anim_range[1] = layer_value
                 current_anim.extend(layer_animateds)
                 # Symmetric reset: a later layer's static tiles must start a
                 # brand-new Surface/segment rather than being blitted into
                 # whatever static surface preceded this animated run (see
                 # the z-order bug this whole function exists to avoid).
                 current_statics = None
+                current_static_range = None
 
         # ── Pass 2: allocate + paint each static run's own right-sized
         # Surface, now that its full tile list (and bounding box) is known.
         segments = []
-        for kind, payload in raw_plan:
+        ranges = []  # index-aligned with segments — see raw_plan_ranges above
+        for (kind, payload), layer_range in zip(raw_plan, raw_plan_ranges):
             if kind == 'anim':
                 segments.append(('anim', payload))
+                ranges.append((kind, layer_range[0], layer_range[1]))
                 continue
 
             layer_statics = payload  # [(tile, tileset), ...]
@@ -11482,8 +12235,14 @@ class Game:
             for tile, tileset in layer_statics:
                 x0 = tile.x * RENDER_SCALE
                 y0 = tile.y * RENDER_SCALE
-                x1 = x0 + tileset.tile_width * RENDER_SCALE
-                y1 = y0 + tileset.tile_height * RENDER_SCALE
+                if getattr(tile, 'is_shadow', False):
+                    tile_w = max(1, int(getattr(tile, 'shadow_width', TILE_SIZE)))
+                    tile_h = max(1, int(getattr(tile, 'shadow_height', TILE_SIZE)))
+                else:
+                    tile_w = tileset.tile_width
+                    tile_h = tileset.tile_height
+                x1 = x0 + tile_w * RENDER_SCALE
+                y1 = y0 + tile_h * RENDER_SCALE
                 if min_x is None or x0 < min_x:
                     min_x = x0
                 if min_y is None or y0 < min_y:
@@ -11495,6 +12254,12 @@ class Game:
 
             if min_x is None:
                 continue  # shouldn't happen (layer_statics is non-empty), but be safe
+            # NOTE: this early-continue intentionally leaves this raw_plan
+            # entry's range out of `ranges` too, since no segment was
+            # appended for it — the zip(raw_plan, raw_plan_ranges) pairing
+            # stays index-consistent with `segments` because we only ever
+            # append to `ranges` in lockstep with `segments`, never on the
+            # `raw_plan` side.
 
             origin_x = int(min_x)
             origin_y = int(min_y)
@@ -11520,6 +12285,19 @@ class Game:
 
             _b0 = time.perf_counter()
             for tile, tileset in layer_statics:
+                local_x = int(tile.x * RENDER_SCALE) - origin_x
+                local_y = int(tile.y * RENDER_SCALE) - origin_y
+
+                if getattr(tile, 'is_shadow', False):
+                    shadow_w = max(1, int(getattr(tile, 'shadow_width', TILE_SIZE))) * RENDER_SCALE
+                    shadow_h = max(1, int(getattr(tile, 'shadow_height', TILE_SIZE))) * RENDER_SCALE
+                    shadow_alpha = max(0, min(255, int(getattr(tile, 'shadow_alpha', 128))))
+                    current_surf.fill(
+                        (0, 0, 0, shadow_alpha),
+                        pygame.Rect(local_x, local_y, shadow_w, shadow_h),
+                    )
+                    continue
+
                 scale_key = (id(tileset), tile.tile_x, tile.tile_y, RENDER_SCALE)
                 scaled = self._scaled_tile_cache.get(scale_key)
                 if scaled is None:
@@ -11527,14 +12305,14 @@ class Game:
                     if scaled:
                         self._scaled_tile_cache[scale_key] = scaled
                 if scaled:
-                    current_surf.blit(scaled, (
-                        int(tile.x * RENDER_SCALE) - origin_x,
-                        int(tile.y * RENDER_SCALE) - origin_y,
-                    ))
+                    current_surf.blit(scaled, (local_x, local_y))
                     _n_tiles_blitted += 1
             _t_blit += time.perf_counter() - _b0
 
             segments.append(('static', (current_surf, origin_x, origin_y)))
+            ranges.append((kind, layer_range[0], layer_range[1]))
+
+        self._room_tile_segment_ranges[(room_name, bg)] = ranges
 
         _t_total = time.perf_counter() - _bt0
         if _t_total * 1000 >= 20:
@@ -12637,45 +13415,105 @@ class Game:
                         result.append(tile)
         return result
 
-    def _draw_player_silhouette_if_occluded(self):
-        """After the foreground tile layer is drawn, check whether any opaque
-        foreground tile pixel — or any decoration (tree, etc.) currently
-        drawn in front of the player by Y-sort — overlaps the player. If so,
-        blit a pixel-accurate dark ghost so the player stays readable
-        through walls/fences/trees/canopies.
+    def _get_active_player_attack_effects(self):
+        """Every 'super attack' visual currently anchored to the player --
+        charge poses, held beams/blasts, spin/slash effects, etc.
 
-        Tile and decoration surfaces are retrieved and scaled here, then
-        forwarded to draw_player_silhouette which builds an occlusion mask
-        from their opaque pixels. Transparent borders are excluded, so the
-        ghost only appears where something genuinely solid sits on top of
-        the player sprite.
+        Factored out of the normal y-sort draw pass so the exact same list
+        can be reused by _draw_player_silhouette_if_occluded(): those
+        effects are drawn right next to (or on top of) the player, so
+        without this they'd just get hard-clipped by whatever foreground
+        tile/tree is occluding the player, instead of getting the same
+        soft dark ghosting the player's own body gets.
         """
-        if self.active_cutscene_runtime:
-            return
+        effects = (
+            self.player.current_beam,
+            self.player.current_charge_effect,
+            self.player.current_kamekameha,
+            self.player.current_kamekameha_charge_effect,
+            self.player.current_banshee_blast,
+            self.player.current_banshee_blast_charge_effect,
+            self.player.current_final_flash,
+            self.player.current_big_bang_kamehameha,
+            self.player.current_big_bang_kamehameha_charge_effect,
+            self.player.current_flame_kamehameha,
+            self.player.current_flame_kamehameha_charge_effect,
+            self.player.current_final_flash_charge_effect,
+            self.player.genkidama_charge_effect,
+            self.player.current_big_bang_charge,
+            self.player.masenko_indicator,
+            self.player.masenko_hold_effect,
+            self.player.burning_charge_effect,
+            self.player.current_sword_charge_effect,
+            self.player.energy_sword_spin,
+            self.player.current_dragon_fist,
+            self.player.current_ghost_kamikaze,
+        )
+        return [effect for effect in effects if effect]
 
+    def _split_player_attack_effects_by_reach(self):
+        """Split _get_active_player_attack_effects() into (local, far_reaching).
+
+        Most of those effects (charge poses, held indicators) are small and
+        stay hugging the player, so the player's own local occlusion query
+        (a tile beyond its own box — see _draw_player_silhouette_if_occluded)
+        always covers their full extent. Beam-style attacks (current_beam,
+        current_flame_kamehameha, ...) are different: they're still anchored
+        at the player, but their VISIBLE reach can stretch clear across the
+        screen (see BeamAttack.get_world_bounds), so cropping their ghost to
+        that same small player-local area silently dropped the ghost for
+        everything past the first tile or so -- exactly the "beam doesn't
+        show a silhouette" bug this split fixes.
+
+        Split is done generically (by whether the effect exposes a callable
+        get_world_bounds -- see LayerManager.get_occlusion_rect, which
+        already prefers that method for exactly this reason) rather than by
+        hardcoding which attack names are beams, so any future attack type
+        that grows its own get_world_bounds is picked up automatically.
+        Far-reaching effects get routed into
+        _draw_far_attack_silhouettes_if_occluded's per-object pass instead,
+        which queries around the effect's own full extent rather than the
+        player's.
+        """
+        effects = self._get_active_player_attack_effects()
+        local, far_reaching = [], []
+        for effect in effects:
+            if callable(getattr(effect, 'get_world_bounds', None)):
+                far_reaching.append(effect)
+            else:
+                local.append(effect)
+        return local, far_reaching
+
+    def _gather_occluding_surfaces(self, world_cx, world_cy, half_w, half_h, anchor_rect, front_of_sort_key=None):
+        """Shared tile/decoration gathering for both
+        _draw_player_silhouette_if_occluded and
+        _draw_far_attack_silhouettes_if_occluded: find every foreground
+        tile and (optionally) decoration whose bounding rect overlaps
+        `anchor_rect` (a SCREEN-space rect) near world point
+        (world_cx, world_cy), together with its scaled surface, in the
+        [(scaled_surface | None, screen_x, screen_y, cache_key), ...]
+        shape draw_player_silhouette/draw_attack_silhouette expect.
+
+        `front_of_sort_key` is the (layer, y) sort key of whatever is being
+        ghosted (the player, or a single free-flying attack). Decorations
+        are only included when this frame's Y-sort actually put them in
+        front of that key — matching LayerManager's own (layer, y) compare
+        — otherwise e.g. a tree the player/attack is visually in front of
+        would incorrectly get ghosted through. Pass None to skip decoration
+        occlusion entirely (see _draw_far_attack_silhouettes_if_occluded's
+        cutscene branch, where attacks aren't part of any Y-sort at all).
+        """
         # Query the spatial grid instead of scanning every foreground tile
         # in the room — see _get_foreground_tile_grid's docstring. Padded by
-        # one TILE_SIZE beyond the player's own half-extents so tiles whose
-        # top-left cell falls just outside the player's box, but whose full
-        # extent still reaches it, aren't missed.
+        # one TILE_SIZE beyond the caller's own half-extents so tiles whose
+        # top-left cell falls just outside the box, but whose full extent
+        # still reaches it, aren't missed.
         fg_tiles = self._nearby_foreground_tiles(
-            self.player.x, self.player.y,
-            self.player.width / 2 + TILE_SIZE, self.player.height / 2 + TILE_SIZE,
+            world_cx, world_cy, half_w + TILE_SIZE, half_h + TILE_SIZE,
         )
-
-        # Build the player's screen-space bounding rect.
-        pw = int(self.player.width  * RENDER_SCALE)
-        ph = int(self.player.height * RENDER_SCALE)
-        px = int(self.player.x * RENDER_SCALE - self.camera.x)
-        py = int(self.player.y * RENDER_SCALE - self.camera.y)
-        player_rect = pygame.Rect(px - pw // 2, py - ph // 2, pw, ph)
 
         te = getattr(self.room_editor, 'tileset_editor', None)
 
-        # Collect every tile/decoration whose bounding rect overlaps the
-        # player, together with its scaled surface. draw_player_silhouette
-        # will then mask the silhouette to only the pixels those surfaces
-        # actually cover.
         overlapping: list = []   # [(scaled_surface | None, screen_x, screen_y, cache_key)]
 
         for tile in fg_tiles:
@@ -12683,17 +13521,18 @@ class Game:
             ty = int(tile.y * RENDER_SCALE - self.camera.y)
 
             tw = th = TILE_SIZE * RENDER_SCALE
+            tileset = None
             if te:
                 tileset = te.tileset_manager.get_tileset(tile.tileset_name)
                 if tileset:
                     tw = int(tileset.tile_width * RENDER_SCALE)
                     th = int(tileset.tile_height * RENDER_SCALE)
 
-            if not player_rect.colliderect(pygame.Rect(tx, ty, tw, th)):
+            if not anchor_rect.colliderect(pygame.Rect(tx, ty, tw, th)):
                 continue
 
             tile_surf = None
-            if te and tileset:
+            if tileset:
                 raw = tileset.get_tile_surface(tile.tile_x, tile.tile_y)
                 if raw:
                     scale_key = (tile.tileset_name, tile.tile_x, tile.tile_y, tw, th)
@@ -12705,34 +13544,180 @@ class Game:
             overlapping.append((tile_surf, tx, ty, cache_key))
 
         # Decorations (trees, etc.) — unlike painted foreground tiles, these
-        # are Y-sorted against the player (see Decoration's class docstring),
-        # so they don't ALWAYS draw in front. Only fold one in here when
-        # this frame's Y-sort actually put it in front of the player —
-        # matching LayerManager's own (layer, y) compare — otherwise a tree
-        # the player is standing in front of (visually correct, no occlusion
-        # needed) would incorrectly ghost the player out.
+        # are Y-sorted against whatever they might occlude (see Decoration's
+        # class docstring), so they don't ALWAYS draw in front.
         #
         # Scoped to self._visible_decorations (already active + on-screen,
         # built once this frame by _update_decorations) instead of
         # self.decorations — a room full of trees would otherwise mean this
         # runs the same off-screen-heavy full-room scan a second time every
         # single frame, right after the main draw pass already did it once.
-        for decoration in self._visible_decorations:
-            if decoration.get_sort_key() < self.player.get_sort_key():
-                continue  # drawn behind the player this frame — nothing to occlude
+        if front_of_sort_key is not None:
+            for decoration in self._visible_decorations:
+                if decoration.get_sort_key() < front_of_sort_key:
+                    continue  # drawn behind this frame — nothing to occlude
 
-            scaled, dx, dy = decoration.get_render_info(self.camera, RENDER_SCALE)
-            if not player_rect.colliderect(pygame.Rect(dx, dy, scaled.get_width(), scaled.get_height())):
-                continue
+                scaled, dx, dy = decoration.get_render_info(self.camera, RENDER_SCALE)
+                if not anchor_rect.colliderect(pygame.Rect(dx, dy, scaled.get_width(), scaled.get_height())):
+                    continue
 
-            cache_key = ('decoration', decoration.decoration_type, decoration.variant,
-                         decoration.current_frame_index(), RENDER_SCALE)
-            overlapping.append((scaled, dx, dy, cache_key))
+                cache_key = ('decoration', decoration.decoration_type, decoration.variant,
+                             decoration.current_frame_index(), RENDER_SCALE)
+                overlapping.append((scaled, dx, dy, cache_key))
+
+        return overlapping
+
+    def _draw_player_silhouette_if_occluded(self):
+        """After the foreground tile layer is drawn, check whether any opaque
+        foreground tile pixel — or any decoration (tree, etc.) currently
+        drawn in front of the player by Y-sort — overlaps the player. If so,
+        blit a pixel-accurate dark ghost so the player stays readable
+        through walls/fences/trees/canopies.
+
+        Tile and decoration surfaces are retrieved and scaled by
+        _gather_occluding_surfaces, then forwarded to draw_player_silhouette
+        which builds an occlusion mask from their opaque pixels. Transparent
+        borders are excluded, so the ghost only appears where something
+        genuinely solid sits on top of the player sprite.
+
+        Covers only attacks anchored at/near the player (charges, held
+        beams, spins — see _get_active_player_attack_effects). Free-flying
+        attacks that can be anywhere in the room get their own, separately-
+        anchored pass — see _draw_far_attack_silhouettes_if_occluded.
+        """
+        if self.active_cutscene_runtime:
+            return
+
+        # Build the player's screen-space bounding rect.
+        pw = int(self.player.width  * RENDER_SCALE)
+        ph = int(self.player.height * RENDER_SCALE)
+        px = int(self.player.x * RENDER_SCALE - self.camera.x)
+        py = int(self.player.y * RENDER_SCALE - self.camera.y)
+        player_rect = pygame.Rect(px - pw // 2, py - ph // 2, pw, ph)
+
+        overlapping = self._gather_occluding_surfaces(
+            self.player.x, self.player.y,
+            self.player.width / 2, self.player.height / 2,
+            player_rect, front_of_sort_key=self.player.get_sort_key(),
+        )
 
         if overlapping:
             self.layer_manager.draw_player_silhouette(
                 self.logical_surface, self.player, self.camera,
                 fg_tile_surfaces=overlapping,
+                # Only the effects that stay hugging the player -- see
+                # _split_player_attack_effects_by_reach for why beam-style
+                # (get_world_bounds) effects are deliberately left out here
+                # and ghosted separately by
+                # _draw_far_attack_silhouettes_if_occluded instead, using
+                # their own full extent rather than this tight player crop.
+                extra_drawables=self._split_player_attack_effects_by_reach()[0],
+                colors=self.colors,
+                # Widened to match the padding _gather_occluding_surfaces
+                # used to gather fg_tiles above -- attack sprites (a held
+                # beam, a wide charge pose) commonly extend further from the
+                # player's own bounding box than the default player-only
+                # crop, and the occlusion surface never has data past that
+                # same padding anyway, so this can't over-draw.
+                crop_pad=int(TILE_SIZE * RENDER_SCALE),
+            )
+
+    # Free-flying attacks that can travel well away from the player and so
+    # need their own per-object occlusion pass (see
+    # _draw_far_attack_silhouettes_if_occluded) rather than the player's
+    # anchored one above. Extend this list if a new travelling
+    # projectile/beam type is added — everything here just needs a .draw()
+    # and enough geometry for LayerManager.get_occlusion_rect to work with
+    # (x/y + width/height or radius, or its own get_world_bounds()).
+    def _get_far_flying_attack_objects(self):
+        # Player-anchored effects whose visible reach can still stretch
+        # across the whole screen (beams, etc.) — see
+        # _split_player_attack_effects_by_reach — get the same per-object
+        # treatment as true free-flying projectiles below, since a fixed
+        # small crop around the player would cut their ghost off exactly
+        # where it left the player's own box.
+        far_reaching_player_effects = self._split_player_attack_effects_by_reach()[1]
+        return (
+            self.projectiles + self.cutscene_beams + self.ultra_volleyballs
+            + self.masenko_projectiles + self.big_bang_attacks
+            + self.enemy_bullets + self.enemy_rockets + self.enemy_kiblasts
+            + far_reaching_player_effects
+        )
+
+    def _draw_far_attack_silhouettes_if_occluded(self):
+        """Sibling to _draw_player_silhouette_if_occluded, for attacks that
+        fly well away from the player -- a fired Genkidama, a cutscene beam,
+        enemy ki-blasts, etc. (see _get_far_flying_attack_objects for the
+        exact list). These pass through foreground tiles/decorations
+        anywhere in the room, well outside the small area
+        _draw_player_silhouette_if_occluded queries around the player, so
+        each one needs its own occlusion query centered on ITS OWN
+        position instead.
+
+        Kept cheap by construction: get_occlusion_rect + an off-screen cull
+        happen before touching the (much more expensive) spatial-grid query
+        or any per-pixel mask work, so the common case of "no free-flying
+        attacks active, or none of them near any foreground tile" costs
+        almost nothing.
+        """
+        objects = [obj for obj in self._get_far_flying_attack_objects() if getattr(obj, 'active', True)]
+        if not objects:
+            return
+
+        # During a cutscene, self.projectiles/cutscene_beams are drawn
+        # directly rather than through the normal Y-sort (see the
+        # active_cutscene_runtime branch in the main draw pass), always on
+        # top of decorations -- there's no "decoration currently in front
+        # of it" for them the way get_sort_key comparisons give the
+        # gameplay list below, so decoration occlusion is skipped for
+        # these; tile occlusion (fences, walls) still applies fine.
+        in_cutscene = bool(self.active_cutscene_runtime)
+        if in_cutscene:
+            objects = [obj for obj in (self.projectiles + self.cutscene_beams) if getattr(obj, 'active', True)]
+            if not objects:
+                return
+
+        screen_rect = pygame.Rect(0, 0, *self.logical_surface.get_size())
+
+        for obj in objects:
+            world_rect = self.layer_manager.get_occlusion_rect(obj)
+            if world_rect is None:
+                continue
+
+            sx = int(world_rect.x * RENDER_SCALE - self.camera.x)
+            sy = int(world_rect.y * RENDER_SCALE - self.camera.y)
+            sw = int(world_rect.width * RENDER_SCALE)
+            sh = int(world_rect.height * RENDER_SCALE)
+            obj_rect = pygame.Rect(sx, sy, sw, sh)
+
+            # Cheap cull: nothing to ghost for an attack the camera can't
+            # even see this frame.
+            if not obj_rect.colliderect(screen_rect):
+                continue
+
+            front_of_sort_key = None
+            if not in_cutscene:
+                get_sort_key = getattr(obj, 'get_sort_key', None)
+                if callable(get_sort_key):
+                    front_of_sort_key = get_sort_key()
+
+            overlapping = self._gather_occluding_surfaces(
+                world_rect.centerx, world_rect.centery,
+                world_rect.width / 2, world_rect.height / 2,
+                obj_rect, front_of_sort_key=front_of_sort_key,
+            )
+            if not overlapping:
+                continue
+
+            self.layer_manager.draw_attack_silhouette(
+                self.logical_surface, self.camera, self.colors,
+                obj, obj_rect, overlapping,
+                # Same reasoning as the player pass's crop_pad: the
+                # occlusion surface never has data past the same padding
+                # _gather_occluding_surfaces used above, so this can't
+                # over-draw, and it comfortably covers attacks somewhat
+                # larger than their own world_rect (e.g. a glow/trail).
+                crop_pad=int(TILE_SIZE * RENDER_SCALE),
             )
 
     def _draw_ui(self, dt):
@@ -12747,6 +13732,7 @@ class Game:
         self.npc_config_menu.draw(self.logical_surface, self.colors)
         self.dialogue_box.draw(self.logical_surface, self.colors)
         self.save_point_menu.draw(self.logical_surface)
+        self.fishing_prompt.draw(self.logical_surface)
         self.dialogue_choice_menu.draw(self.logical_surface)
         self.character_switch_menu.draw(self.logical_surface)
         self.pause_menu.draw(self.logical_surface, self.player, self.play_time)
@@ -12911,6 +13897,9 @@ class Game:
             if not hasattr(room, 'music_track'):
                 room.music_track = ''
 
+            if not hasattr(room, 'bgs_track'):
+                room.bgs_track = ''
+
     # ── Player death sequence ────────────────────────────────────────────────
 
     def _update_death_sequence(self, dt):
@@ -13022,6 +14011,19 @@ class Game:
         """
         if self.is_test_mode:
             self._exit_test_mode()
+
+        # Stop the background asset watcher thread before anything else so
+        # it can't fire a reload callback while the rest of cleanup() is
+        # tearing subsystems down. join(timeout=2.0) inside stop() means
+        # this can't hang the shutdown even if the thread is mid-sleep.
+        if hasattr(self, 'audio_watcher'):
+            self.audio_watcher.stop()
+
+        if hasattr(self, 'items_watcher'):
+            self.items_watcher.stop()
+
+        if hasattr(self, 'sprite_watcher'):
+            self.sprite_watcher.stop()
 
         # Flush the cutscene editor — catches crashes and abrupt window closes.
         if hasattr(self, 'cutscene_editor') and self.cutscene_editor:

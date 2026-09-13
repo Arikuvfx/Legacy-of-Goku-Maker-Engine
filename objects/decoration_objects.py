@@ -27,6 +27,11 @@ tiles already get (see Game._draw_player_silhouette_if_occluded) — that
 wiring lives in game.py, not here.
 """
 
+import copy
+import json
+import os
+import sys
+
 import pygame
 
 from core.draw_layers import DrawLayer
@@ -69,6 +74,294 @@ DECORATION_STYLES = {
         'variants': ['Tree', 'Tree (Variant 2)'],
     },
 }
+
+
+# Decorations that are already explicitly configured above are never replaced
+# by auto-discovery.  This is intentional: the tree's hand-authored animation
+# sequence is part of its design and must remain exactly as it is.
+if getattr(sys, 'frozen', False):
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    # decoration_objects.py lives in objects/, so its parent is the project root.
+    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+DECORATIONS_ROOT = os.path.join(BASE_DIR, 'assets', 'objects', 'decorations')
+_DECORATION_IMAGE_EXTENSIONS = ('.png', '.webp', '.jpg', '.jpeg')
+
+
+def _resolve_asset_path(path):
+    """Resolve a decoration asset path against the project root.
+
+    Existing hardcoded paths in room data remain relative strings such as
+    ``assets/objects/decorations/tree/tree.png``; the runtime simply resolves
+    those against the actual project/executable directory when loading them.
+    Absolute paths are passed through unchanged.
+    """
+    if not path:
+        return path
+    if os.path.isabs(path):
+        return path
+    return os.path.join(BASE_DIR, path)
+
+
+def _decoration_display_name(decoration_type):
+    """Turn an asset/folder id into a readable editor label."""
+    return decoration_type.replace('_', ' ').replace('-', ' ').strip().title()
+
+
+def _safe_json_load(path):
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _find_decoration_image(folder, decoration_type, metadata):
+    """Resolve the sprite/spritesheet used by an auto-discovered decoration."""
+    configured = metadata.get('sheet_path') or metadata.get('sheet') or metadata.get('sprite')
+    if isinstance(configured, str) and configured.strip():
+        configured = configured.strip()
+        if os.path.isabs(configured):
+            candidates = [configured]
+        else:
+            candidates = [os.path.join(folder, configured), configured]
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                return candidate
+
+    preferred = os.path.join(folder, f'{decoration_type}.png')
+    if os.path.isfile(preferred):
+        return preferred
+
+    try:
+        files = sorted(
+            name for name in os.listdir(folder)
+            if name.lower().endswith(_DECORATION_IMAGE_EXTENSIONS)
+            and os.path.isfile(os.path.join(folder, name))
+        )
+    except OSError:
+        files = []
+
+    return os.path.join(folder, files[0]) if files else None
+
+
+def _normalise_discovered_style(decoration_type, folder, metadata):
+    """Build a runtime decoration style from a folder + optional JSON manifest.
+
+    A PNG dropped into a decoration folder needs no metadata: it becomes one
+    static frame.  A sidecar ``decoration.json`` is only needed for custom
+    spritesheet layouts, animation, variants, or a manual collision rectangle.
+    """
+    image_path = _find_decoration_image(folder, decoration_type, metadata)
+    if not image_path:
+        return None
+
+    try:
+        image = pygame.image.load(image_path)
+        image_w, image_h = image.get_width(), image.get_height()
+    except (pygame.error, OSError, FileNotFoundError):
+        return None
+
+    frame_w = int(metadata.get('frame_w', image_w))
+    frame_h = int(metadata.get('frame_h', image_h))
+    frame_w = max(1, min(frame_w, image_w))
+    frame_h = max(1, min(frame_h, image_h))
+
+    max_columns = max(1, image_w // frame_w)
+    max_rows = max(1, image_h // frame_h)
+    frame_count = max(1, min(int(metadata.get('frame_count', 1)), max_columns))
+    grid_rows = max(1, min(int(metadata.get('grid_rows', 1)), max_rows))
+
+    raw_variants = metadata.get('variants')
+    variants = []
+    if isinstance(raw_variants, list):
+        for item in raw_variants:
+            if isinstance(item, str):
+                variants.append(item)
+            elif isinstance(item, dict):
+                variants.append(str(item.get('name') or item.get('label') or f'Variant {len(variants) + 1}'))
+
+    if not variants:
+        base_label = metadata.get('label') or _decoration_display_name(decoration_type)
+        variants = [base_label]
+        for i in range(1, grid_rows):
+            variants.append(f'{base_label} (Variant {i + 1})')
+    elif len(variants) < grid_rows:
+        base_label = metadata.get('label') or _decoration_display_name(decoration_type)
+        while len(variants) < grid_rows:
+            variants.append(f'{base_label} (Variant {len(variants) + 1})')
+    else:
+        variants = variants[:grid_rows]
+
+    sequence = metadata.get('sequence', [1])
+    if not isinstance(sequence, list) or not sequence:
+        sequence = [1]
+    sequence = [max(1, min(int(n), frame_count)) for n in sequence]
+
+    style = {
+        'label': metadata.get('label') or _decoration_display_name(decoration_type),
+        # Keep paths relative to the project root so saved room files remain
+        # portable just like the existing hardcoded tree path.
+        'sheet_path': (
+            os.path.relpath(image_path, start=BASE_DIR).replace(os.sep, '/')
+            if not os.path.isabs(image_path) else image_path
+        ),
+        'frame_w': frame_w,
+        'frame_h': frame_h,
+        'grid_rows': grid_rows,
+        'frame_count': frame_count,
+        'sequence': sequence,
+        'fps': max(0, float(metadata.get('fps', 0))),
+        'variants': variants,
+        'auto_discovered': True,
+        # No collision_size means Decoration will infer a small base hitbox
+        # from the visible pixels in the lower part of the sprite.
+    }
+
+    if 'collision_size' in metadata:
+        try:
+            w, h = metadata['collision_size']
+            style['collision_size'] = (int(w), int(h))
+        except (TypeError, ValueError):
+            pass
+
+    if 'collision_rect' in metadata:
+        try:
+            x, y, w, h = metadata['collision_rect']
+            style['collision_rect'] = (int(x), int(y), int(w), int(h))
+        except (TypeError, ValueError):
+            pass
+
+    return style
+
+
+def discover_decoration_styles(root=DECORATIONS_ROOT):
+    """Discover new decoration types from the assets tree.
+
+    Each subfolder becomes one decoration type. The folder may contain a PNG
+    named after the folder (preferred) or any other supported image. A folder
+    can optionally contain ``decoration.json`` for advanced animation/layout
+    settings. Existing definitions in ``DECORATION_STYLES`` always win.
+
+    Root-level PNGs are also supported as a convenience: ``assets/.../rock.png``
+    becomes decoration type ``rock`` when that type is not already configured.
+    """
+    discovered = {}
+    if not os.path.isdir(root):
+        return discovered
+
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        return discovered
+
+    # First support the recommended folder-per-decoration layout.
+    for entry in entries:
+        folder = os.path.join(root, entry)
+        if not os.path.isdir(folder):
+            continue
+
+        decoration_type = entry.strip().lower()
+        if not decoration_type or decoration_type in DECORATION_STYLES:
+            continue
+
+        metadata = _safe_json_load(os.path.join(folder, 'decoration.json'))
+        style = _normalise_discovered_style(decoration_type, folder, metadata)
+        if style:
+            discovered[decoration_type] = style
+
+    # Also allow a simple root-level PNG for quick static decorations.
+    for entry in entries:
+        path = os.path.join(root, entry)
+        if not os.path.isfile(path) or not entry.lower().endswith(_DECORATION_IMAGE_EXTENSIONS):
+            continue
+
+        decoration_type = os.path.splitext(entry)[0].strip().lower()
+        if not decoration_type or decoration_type in DECORATION_STYLES or decoration_type in discovered:
+            continue
+
+        style = _normalise_discovered_style(decoration_type, root, {'label': _decoration_display_name(decoration_type)})
+        if style:
+            discovered[decoration_type] = style
+
+    return discovered
+
+
+# Keep a pristine copy of every hand-authored definition. Auto-discovery
+# may add new decoration types, but it must never replace a built-in entry.
+_HARDCODED_DECORATION_STYLES = copy.deepcopy(DECORATION_STYLES)
+
+
+def _apply_builtin_collision_overrides():
+    """Apply optional collision-only overrides to built-in decorations.
+
+    The creator is allowed to edit the Tree's collision visually, but its
+    hand-authored animation/sheet configuration stays completely protected.
+    Only collision_rect/collision_size are read from the sidecar manifest for
+    built-ins.
+    """
+    for decoration_type in _HARDCODED_DECORATION_STYLES:
+        folder = os.path.join(DECORATIONS_ROOT, decoration_type)
+        if not os.path.isdir(folder):
+            continue
+        metadata = _safe_json_load(os.path.join(folder, 'decoration.json'))
+        if not metadata:
+            continue
+
+        style = DECORATION_STYLES.get(decoration_type)
+        if style is None:
+            continue
+
+        if 'collision_rect' in metadata:
+            try:
+                x, y, w, h = metadata['collision_rect']
+                if int(w) > 0 and int(h) > 0:
+                    style['collision_rect'] = (int(x), int(y), int(w), int(h))
+                    # A manual rect is authoritative over the legacy size.
+                    style.pop('collision_size', None)
+            except (TypeError, ValueError):
+                pass
+        elif 'collision_size' in metadata:
+            try:
+                w, h = metadata['collision_size']
+                if int(w) > 0 and int(h) > 0:
+                    style['collision_size'] = (int(w), int(h))
+                    style.pop('collision_rect', None)
+            except (TypeError, ValueError):
+                pass
+
+
+def reload_decoration_styles():
+    """Reload discovered decoration manifests without replacing built-ins.
+
+    The global dictionary is mutated in-place so modules such as ObjectEditor
+    that imported DECORATION_STYLES keep seeing the refreshed catalogue.
+    """
+    DECORATION_STYLES.clear()
+    DECORATION_STYLES.update(copy.deepcopy(_HARDCODED_DECORATION_STYLES))
+    _apply_builtin_collision_overrides()
+    discovered = discover_decoration_styles()
+    DECORATION_STYLES.update(discovered)
+
+    # New definitions can change the frame cache; existing Decoration objects
+    # retain their own runtime state, but newly-created instances must use the
+    # freshly saved sheet/sequence immediately.
+    decoration_cls = globals().get('Decoration')
+    if decoration_cls is not None:
+        decoration_cls._frame_cache.clear()
+        decoration_cls._scaled_cache.clear()
+
+    return DECORATION_STYLES
+
+
+# Initial catalogue load. Built-ins are copied first and optional collision
+# overrides are applied before adding newly-discovered decoration types.
+DECORATION_STYLES.clear()
+DECORATION_STYLES.update(copy.deepcopy(_HARDCODED_DECORATION_STYLES))
+_apply_builtin_collision_overrides()
+DECORATION_STYLES.update(discover_decoration_styles())
 
 
 class Decoration:
@@ -126,6 +419,14 @@ class Decoration:
 
         self.frames = self._load_frames(decoration_type, variant)
 
+        # Hardcoded decorations such as the tree keep their existing
+        # collision_size behavior. Auto-discovered decorations get a small
+        # base hitbox inferred from their visible pixels unless a manifest
+        # supplied collision_rect/collision_size explicitly.
+        self._collision_rect = style.get('collision_rect')
+        if self._collision_rect is None and style.get('auto_discovered') and 'collision_size' not in style:
+            self._collision_rect = self._infer_auto_collision_rect(self.frames)
+
         # LAYER SYSTEM INTEGRATION — same DrawLayer/Y-sort scheme
         # DestructibleStone already uses, so decorations slot straight into
         # the existing y-sorted draw pass alongside the player/NPCs/enemies.
@@ -145,7 +446,7 @@ class Decoration:
         frames = []
 
         try:
-            sheet = pygame.image.load(style['sheet_path']).convert_alpha()
+            sheet = pygame.image.load(_resolve_asset_path(style['sheet_path'])).convert_alpha()
             row_y = variant * frame_h
             if row_y + frame_h <= sheet.get_height():
                 for i in range(frame_count):
@@ -170,6 +471,60 @@ class Decoration:
 
         cls._frame_cache[cache_key] = frames
         return frames
+
+    @staticmethod
+    def _infer_auto_collision_rect(frames):
+        """Infer a compact collision rectangle near the sprite's base.
+
+        Only the lower 35%% of each frame is considered, which avoids letting a
+        wide canopy/fan of leaves become a blocking wall. The result is capped
+        so unusual art still gets a small, character-sized obstacle.
+        """
+        if not frames:
+            return None
+
+        frame = frames[0]
+        frame_w, frame_h = frame.get_width(), frame.get_height()
+        bottom_start = min(frame_h - 1, max(0, int(frame_h * 0.65)))
+        region_h = max(1, frame_h - bottom_start)
+
+        try:
+            region = frame.subsurface((0, bottom_start, frame_w, region_h))
+            bbox = region.get_bounding_rect(min_alpha=32)
+        except (pygame.error, ValueError):
+            bbox = pygame.Rect(0, 0, 0, 0)
+
+        if bbox.width <= 0 or bbox.height <= 0:
+            # No visible pixels near the base. Use a conservative fallback.
+            width = max(4, int(frame_w * 0.22))
+            height = max(4, int(frame_h * 0.14))
+            return (
+                max(0, (frame_w - width) // 2),
+                max(0, frame_h - height - 2),
+                width,
+                height,
+            )
+
+        x = bbox.x
+        y = bottom_start + bbox.y
+        width = bbox.width
+        height = bbox.height
+
+        # Keep the inferred obstacle deliberately smaller than the visible
+        # lower silhouette. This is scenery collision, not a pixel-perfect
+        # mask, and prevents large leaves/grass from feeling like walls.
+        max_width = max(4, int(frame_w * 0.45))
+        max_height = max(4, int(frame_h * 0.30))
+        width = min(width, max_width)
+        height = min(height, max_height)
+
+        center_x = x + bbox.width / 2.0
+        x = int(round(center_x - width / 2.0))
+        y = min(y, frame_h - height - 1)
+        x = max(0, min(x, frame_w - width))
+        y = max(0, min(y, frame_h - height))
+
+        return (x, y, width, height)
 
     def get_sort_key(self):
         """(layer, y) — sorted by the base/trunk position, see class docstring."""
@@ -257,6 +612,20 @@ class Decoration:
         and only actually gets blocked right at the trunk."""
         if not self.active:
             return None
+
+        # Auto-discovered/manual frame-local rectangle. Frame-local x/y are
+        # measured from the sprite's top-left corner; the world anchor is the
+        # sprite's bottom-center point at (self.x, self.y).
+        if self._collision_rect is not None:
+            rx, ry, rw, rh = self._collision_rect
+            return pygame.Rect(
+                int(self.x - self.width / 2 + rx),
+                int(self.y - self.height + ry),
+                int(rw),
+                int(rh),
+            )
+
+        # Existing hardcoded behavior (notably the tree) stays untouched.
         return pygame.Rect(
             int(self.x - self._collision_w // 2),
             int(self.y - 10 - self._collision_h),

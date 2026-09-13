@@ -57,8 +57,89 @@ _OCTANT_TO_CARDINAL = {
 }
 
 
+# Halo sprite — loaded once and shared across every Player instance
+# (it's the same image regardless of character/costume), same
+# load-once-cache-forever pattern as the icon caches in game.py.
+_HALO_SPRITE = None
+_HALO_SPRITE_BOUNDS = None   # non-transparent bounding rect within the file
+_HALO_SPRITE_LOAD_ATTEMPTED = False
+
+# TEST TUNING: maximum amount (in native sprite pixels) that the current
+# frame's top-pixel tracking is allowed to move the halo DOWN from the
+# sprite's normal top anchor. Smaller values keep the halo from following
+# deep/crouched poses too far downward. Upward tracking remains unrestricted.
+HALO_MAX_DOWNWARD_TRACK_PIXELS = 8
+
+
+def _get_halo_sprite():
+    """Returns (surface, bounds) or (None, None) on load failure.
+
+    bounds is the bounding rect of the ring's actual non-transparent
+    pixels within halo.png, NOT the full image size. Sprite files often
+    carry transparent padding around the visible art (for alignment with
+    other frames, canvas-size conventions, etc.) -- centering on the raw
+    image size would then center on that padding instead of the ring
+    itself, which is what was pushing the halo off to one side no matter
+    how the on-screen anchor math was adjusted. Trimming to the mask's
+    bounding rect once here, and drawing only that sub-rect (see
+    Player.draw()'s `area=` arg), makes the on-screen anchor land on the
+    ring regardless of how much padding is baked into the file.
+    """
+    global _HALO_SPRITE, _HALO_SPRITE_BOUNDS, _HALO_SPRITE_LOAD_ATTEMPTED
+    if not _HALO_SPRITE_LOAD_ATTEMPTED:
+        _HALO_SPRITE_LOAD_ATTEMPTED = True
+        try:
+            _HALO_SPRITE = pygame.image.load(
+                'assets/sprites/universal/halo.png'
+            ).convert_alpha()
+        except Exception as e:
+            print(f'[halo] could not load assets/sprites/universal/halo.png: {e}')
+            _HALO_SPRITE = None
+            _HALO_SPRITE_BOUNDS = None
+            return _HALO_SPRITE, _HALO_SPRITE_BOUNDS
+
+        # Trimming is a nice-to-have, kept in its own try so that if mask
+        # computation fails for any reason (surface format quirk, etc.) the
+        # sprite we just successfully loaded still draws — just at its full
+        # untrimmed size — instead of the whole halo silently vanishing.
+        _HALO_SPRITE_BOUNDS = _HALO_SPRITE.get_rect()
+        try:
+            bounds = pygame.mask.from_surface(_HALO_SPRITE).get_bounding_rects()[0]
+            if bounds.width > 0 and bounds.height > 0:
+                _HALO_SPRITE_BOUNDS = bounds
+        except Exception as e:
+            print(f'[halo] could not compute trim bounds, using full image: {e}')
+    return _HALO_SPRITE, _HALO_SPRITE_BOUNDS
+
+
 class Player:
-    def __init__(self, x, y, character='goku', costume='base', game_config=None):
+    # Animation states during which the player is actively charging/holding/
+    # firing a ki-based attack. Passive ki regen (see __init__'s
+    # ki_regen_interval block and its use in update()) is suppressed while
+    # current_animation_state is any of these, so e.g. holding a Kamehameha
+    # charge doesn't get the trickle-back tick fighting the ki you're
+    # spending to charge/fire it. Kept as one explicit set rather than
+    # deriving it from the is_charging_*/is_firing_* flags so it's easy to
+    # audit/extend as new attacks are added.
+    _KI_ATTACK_STATES = frozenset({
+        'charge',                          # basic beam
+        'kamekameha_charge', 'kamekameha_fire',
+        'banshee_blast_charge', 'banshee_blast_fire',
+        'final_flash_charge', 'final_flash_fire',
+        'big_bang_kamehameha_charge', 'big_bang_kamehameha_fire',
+        'genkidama_charge', 'genkidama_fire',
+        'burning_charge',
+        'big_bang_attack_charge', 'big_bang_attack_fire',
+        'masenko_hold',
+        'firebeam',
+        'flame_kamehameha_charge', 'flame_kamehameha_fire',
+        'sword_charge',
+        'dragon_fist',
+        'ghost_kamikaze_cast', 'ghost_kamikaze_hold',
+        'it_targeting', 'it_teleport',
+    })
+
+    def __init__(self, x, y, character='goku', costume='base', game_config=None, sound_manager=None):
         """Create the player at world position (*x*, *y*).
 
         Args:
@@ -67,12 +148,58 @@ class Player:
             costume:     Costume/variant string passed to the sprite loader.
             game_config: Optional GameConfig — used to initialise the
                          TransformationSystem and derive stat scaling.
+            sound_manager: Optional SoundManager (see sound_engine.py) —
+                         passed straight through to KamehamehaChargeEffect/
+                         BeamAttack (and friends) so beam charge/fire sfx
+                         play. None (the default) means no sound calls at
+                         all, so the player still works standalone without
+                         a sound_manager wired up.
         """
         self.x = x
         self.y = y
         self.width = 32
         self.height = 32
         self.shadow_size = 'small'  # 'small' or 'big'
+        # Manual nudge for LayerManager._draw_shadow's feet-anchor calc —
+        # tune these until the shadow sits under the sprite's feet.
+        # Positive x = right, positive y = down.
+        # Fine-tuning is in SCREEN pixels.  Negative = left, positive = right.
+        self.shadow_x_offsets_by_direction = {
+            'left': -0.5,
+            'right': -1,
+            'up': -1,
+            'down': 0.0,
+        }
+        self.shadow_y_offset = -1
+
+        # Halo — draws assets/sprites/universal/halo.png on top of the
+        # player sprite (character_creator.py's "Halo" checkbox on the
+        # Identity tab, cfg["halo_enabled"]; synced onto this flag in
+        # game.py's _reload_attack_config). Same draw layer as the player,
+        # just drawn after the sprite so it renders on top of it.
+        # halo_offset_x/halo_offset_y are a manual nudge in SCREEN pixels
+        # (same idea as shadow_x_offsets_by_direction/shadow_y_offset
+        # above) — tune these until the halo sits where you want it;
+        # normally that's just above the top of the player sprite.
+        self.halo_enabled  = False
+        self.halo_offset_x = 0
+        self.halo_offset_y = 12
+        # Extra per-animation-state Y nudge, added on top of halo_offset_y
+        # above, keyed by self.current_animation_state (e.g. 'pickup_item',
+        # 'hurt'). For animations where the character visually dips down —
+        # baked into that animation's frame art, not a change to self.y, so
+        # there's nothing to read this from automatically — add an entry
+        # here (screen pixels, positive = down) to make the halo follow it.
+        # Left empty by default; states not listed get 0.
+        self.halo_offset_y_by_state: dict = {}
+        # Cache of frame Surface identity -> that frame's topmost
+        # non-transparent pixel row (see _get_halo_anchor_y()). Lets the
+        # halo auto-track the sprite's actual silhouette per animation
+        # frame (a crouch pose sits lower in its own frame canvas than an
+        # idle pose, etc.) instead of a single flat height assumption.
+        self._halo_frame_top_cache: dict = {}
+
+        self.sound_manager = sound_manager
 
         # Divide by RENDER_SCALE so world-unit speed stays consistent across resolutions
         self.speed = 3 / RENDER_SCALE
@@ -541,6 +668,14 @@ class Player:
         self.final_flash_ki_drain = 20      # Ki drained per second while firing — tune independently of the beam
         self.big_bang_kamehameha_ki_drain = 20  # Ki drained per second while firing — tune independently of the beam
         self.melee_duration = 0.3
+        # Purely visual forward lean for left/right melee swings — shifts
+        # where the sprite is DRAWN (not self.x/hitbox) while
+        # current_animation_state == 'melee', so it reads as a step forward
+        # like the original game without touching movement/collision.
+        # Only applied for left/right (see draw()) since up/down idle and
+        # melee poses are already front-facing and don't need it. Tune this
+        # number to taste — it's in world units, before RENDER_SCALE.
+        self.melee_step_distance = 4
 
         # Charged Melee — holding E (rather than tapping it) rolls the
         # normal melee swing into a wind-up once it finishes: frame 0 of
@@ -680,7 +815,7 @@ class Player:
         self.collision_knockback_duration = 0.4
         self.collision_knockback_velocity_x = 0
         self.collision_knockback_velocity_y = 0
-        self.collision_knockback_strength = 400
+        self.collision_knockback_strength = 200
         # Cooldown after knockback ends so holding the key doesn't immediately
         # re-trigger another knockback on the very next frame.
         self._knockback_cooldown       = 0.0
@@ -727,6 +862,100 @@ class Player:
         self._map_jump_frame_idx      = 0
         self._map_jump_frame_timer    = 0.0
 
+        # -----------------------------------------------------------------
+        # Fishing jump sequence
+        # Started by game.py when the player selects "Yes" on a fishing-area
+        # prompt (see objects/fishing_area.py and core/fishing_prompt.py).
+        # Unlike the world-map jump, this is a simple parabolic hop in place:
+        # the player's world position never changes, only the on-screen
+        # vertical offset while airborne.
+        #
+        # The full sequence is now a self-contained round trip, driven
+        # entirely inside this class (no further calls from game.py needed
+        # after the initial start_fishing_jump()):
+        #   1. "enter" jump  — plays facing the direction the player was
+        #      already facing; on landing, on_fishing_jump_complete fires
+        #      (unchanged contract: "landed/hidden") and the player is hidden.
+        #   2. hidden wait   — is_hidden stays True for fishing_hidden_duration
+        #      seconds; can_act()/can_move() stay locked via is_hidden.
+        #   3. "exit" jump   — mirrors the enter jump but facing the OPPOSITE
+        #      direction; is_hidden clears and the splash plays immediately
+        #      (once) as the player pops back into view, then the same
+        #      pre/rise/fall/post frame sequence plays before control
+        #      returns automatically.
+        # -----------------------------------------------------------------
+        self.is_fishing_jumping     = False
+        self.fishing_jump_timer     = 0.0
+        # Up/down arc duration only (excludes the flat pre/post snaps below).
+        # Tuned together with fishing_jump_pre_duration so pre + this ≈ 2.0s
+        # of total time from the start of the sequence to the player's feet
+        # touching the ground — applies to both the enter and exit jumps.
+        self.fishing_jump_duration  = 1.9
+        self.fishing_jump_height    = 40      # world units, peak height above start
+        # Horizontal/vertical world-space distance actually traveled during
+        # each half of the jump (enter hops this far forward into the water,
+        # exit hops this far back out to the original spot). No reference
+        # art/measurement for this yet — starting at a guess, TWEAK THIS
+        # VALUE to taste.
+        self.fishing_jump_distance  = 64      # world units
+        self.on_fishing_jump_complete = None  # Callback: fired once landed/hidden
+        self.is_hidden = False                # True while hidden between enter/exit
+
+        # map_land.png frame sequence — loaded directly from the current
+        # form's character folder, same bypass-the-sprite-system approach
+        # as map_jump.png above. fishing_jump_timer runs continuously across
+        # three back-to-back phases per jump (enter or exit): a quick
+        # pre-jump snap to frame 3, the up-and-down arc (frame 1 while
+        # rising, frame 2 while falling), and a quick snap back to frame 3.
+        self.fishing_jump_pre_duration  = 0.1   # seconds, frame 3 before hopping
+        self.fishing_jump_post_duration = 0.1   # seconds, frame 3 after landing
+        # Populated by start_fishing_jump()/_start_fishing_exit_jump() —
+        # raw pygame surfaces, one per frame.
+        self._fishing_jump_frames    = []
+        self._fishing_jump_frame_idx = 2   # frame 3 (index 2) is the resting pose
+        # True only while the EXIT half of the sequence is playing — lets
+        # update() tell the two jumps apart (what happens when the arc
+        # finishes, and which way the splash timing works).
+        self._fishing_is_exit = False
+        # Direction the player was facing when the enter jump started;
+        # the exit jump plays facing the opposite of this.
+        self._fishing_entry_direction = None
+        # World position to interpolate between during the current jump
+        # half's arc — (from_x, from_y) -> (to_x, to_y). Set by
+        # start_fishing_jump() (origin -> forward into the water) and
+        # _start_fishing_exit_jump() (underwater spot -> back to origin).
+        self._fishing_jump_move_from = (0.0, 0.0)
+        self._fishing_jump_move_to   = (0.0, 0.0)
+        self._fishing_jump_origin    = (0.0, 0.0)
+        # Fires once per jump — on the enter jump, right as the descending
+        # arc reaches the ground (see update()); on the exit jump it's
+        # pre-set True at kickoff instead (see _start_fishing_exit_jump())
+        # so the landing-triggered check here doesn't ALSO fire a second
+        # splash at the end of the exit arc.
+        self._fishing_splash_triggered = False
+
+        # Hidden-wait phase (step 2 above) — counts up while is_hidden is
+        # True and is_fishing_jumping is False, then auto-starts the exit
+        # jump once fishing_hidden_duration elapses.
+        self.fishing_hidden_duration = 4.0   # seconds fully hidden before popping back up
+        self._fishing_hidden_timer   = 0.0
+        self._fishing_hidden_waiting = False
+
+        # splash.png — plays once at the landing spot the moment the player
+        # touches down (enter jump) or pops back into view (exit jump). Not
+        # character-specific (single shared sheet under assets/objects/
+        # fishing/, unlike map_land.png), so it's loaded lazily on first use
+        # and cached on the instance rather than reloaded per jump. Runs
+        # independent of is_fishing_jumping/is_hidden so it keeps animating
+        # for its own duration even after the player disappears/reappears.
+        self._FISHING_SPLASH_FRAME_DURATION = 0.06  # seconds per frame
+        self._fishing_splash_frames      = None     # None = not loaded yet, [] = load failed
+        self._fishing_splash_active      = False
+        self._fishing_splash_frame_idx   = 0
+        self._fishing_splash_frame_timer = 0.0
+        self._fishing_splash_x           = 0.0      # world position captured at trigger time
+        self._fishing_splash_y           = 0.0
+
         # Injected by the room/game system after construction
         self.obstacles = []
 
@@ -767,6 +996,10 @@ class Player:
             return False
         if self.is_map_jumping:
             return False
+        if self.is_fishing_jumping:
+            return False
+        if self.is_hidden:
+            return False
         if self.is_collision_knockback:
             return False
         if self.transformation and not self.transformation.can_player_act():
@@ -806,6 +1039,10 @@ class Player:
         if self.is_transitioning:
             return False
         if self.is_map_jumping:
+            return False
+        if self.is_fishing_jumping:
+            return False
+        if self.is_hidden:
             return False
         if self.is_collision_knockback:
             return False
@@ -1093,7 +1330,7 @@ class Player:
     # Movement
     # =========================================================================
 
-    def move(self, dx, dy, is_running, world_width, world_height):
+    def move(self, dx, dy, is_running, world_width, world_height, collision_objects=None):
         """Apply one frame of directional input.
 
         dx/dy are the raw -1/0/1 input axes (not yet scaled by speed). Movement
@@ -1103,6 +1340,11 @@ class Player:
         picks walk/run animation, and sets self._blocked_x/_blocked_y so
         game.py can trigger collision knockback when a real wall stops motion.
         No-ops entirely if can_move() is False (mid-attack, knocked back, etc.).
+
+        collision_objects (CollisionObject walls for the current room) is
+        only forwarded to _move_dragon_fist_head when is_using_dragon_fist —
+        the player's own per-axis wall collision above still goes through
+        check_collision_with_obstacles, unrelated to this param.
         """
         if not self.can_move():
             return
@@ -1150,7 +1392,7 @@ class Player:
             # deliberately left untouched here: the player stays on the
             # 'dragon_fist' pose for the whole hold no matter which way
             # the head gets steered.
-            self._move_dragon_fist_head(dx, dy)
+            self._move_dragon_fist_head(dx, dy, collision_objects)
             return
 
         if dx != 0 or dy != 0:
@@ -1217,11 +1459,15 @@ class Player:
         self.sprite.set_animation(anim, self.direction)
         self.current_animation_state = anim
 
-    def _move_dragon_fist_head(self, dx, dy):
+    def _move_dragon_fist_head(self, dx, dy, collision_objects=None):
         """Steer the Dragon Fist head by one frame of raw input, then clamp
-        it back into its current leash box — recomputed every call since
-        the box's "back" edge tracks the player's own position (see
-        DragonFistAttack.clamp_head_to_leash / ._leash_bounds).
+        it back into its current leash box and resolve it against walls —
+        see DragonFistAttack.move_head_by, which does all three as one
+        step specifically so wall resolution happens against the position
+        from right before THIS move, not a stale one (this runs before
+        update_dragon_fist()/DragonFistAttack.update() this same frame —
+        see Game's update-order — so update() can't be the one to resolve
+        input-driven movement without comparing against itself).
 
         No-ops during the initial 'shooting' launch or the release
         'retracting' sweep — the player only gets manual control once the
@@ -1230,9 +1476,8 @@ class Player:
         fist = self.current_dragon_fist
         if not fist or fist.state != 'controlled':
             return
-        fist.head_x += dx * self.dragon_fist_head_speed
-        fist.head_y += dy * self.dragon_fist_head_speed
-        fist.clamp_head_to_leash(self.x, self.y)
+        fist.move_head_by(dx * self.dragon_fist_head_speed, dy * self.dragon_fist_head_speed,
+                           self.x, self.y, collision_objects=collision_objects)
 
     def tick_footsteps(self, dt):
         """Advance the sprint-footstep timer. Returns True the frame a footstep should play.
@@ -1534,7 +1779,7 @@ class Player:
     def _can_continue_blast_hold(self):
         """Like can_act(), but ignores is_attacking — we're evaluating this from
         inside the attack's own finish handler, so is_attacking is still True."""
-        if self.is_transitioning or self.is_map_jumping or self.is_collision_knockback:
+        if self.is_transitioning or self.is_map_jumping or self.is_fishing_jumping or self.is_collision_knockback:
             return False
         if self.transformation and not self.transformation.can_player_act():
             return False
@@ -1601,7 +1846,7 @@ class Player:
             self.is_q_pressed = True
             self.sprite.set_animation('charge', self.direction)
             self.current_animation_state = 'charge'
-            self.current_charge_effect = KamehamehaChargeEffect(self)
+            self.current_charge_effect = KamehamehaChargeEffect(self, sound_manager=self.sound_manager)
             # Sync the auto-fire threshold to however long the charge-up
             # sprite actually takes to play through all of its frames, so
             # the beam can never fire before that animation has finished.
@@ -1627,13 +1872,18 @@ class Player:
         self.is_charging_beam = False
         self.is_firing_beam = True
         self.beam_charge_time = 0
+        # Stop the charge sound (beamcharge one-shot or beamchargeloop,
+        # whichever is currently playing) right as we hand off to the
+        # BeamAttack below, which starts beamfire the instant it's created.
+        if self.current_charge_effect:
+            self.current_charge_effect.stop()
         self.current_charge_effect = None
         self.sprite.set_animation('firebeam', self.direction)
         self.current_animation_state = 'firebeam'
 
         # Spawn the beam slightly in front of the player based on facing direction
         ox, oy = self._get_spawn_offset()
-        self.current_beam = BeamAttack(self.x + ox, self.y + oy, self.direction)
+        self.current_beam = BeamAttack(self.x + ox, self.y + oy, self.direction, sound_manager=self.sound_manager)
         return self.current_beam
 
     def stop_beam(self):
@@ -1652,6 +1902,13 @@ class Player:
         self.is_firing_beam = False
         self.beam_charge_time = 0
         self.is_q_pressed = False
+        # If charging was cancelled before the beam ever fired, this stops
+        # whatever charge sound is currently playing (beamcharge one-shot
+        # or beamchargeloop). If the beam DID fire, current_charge_effect
+        # is already None (see fire_beam_auto, which stops it there) so
+        # this is a no-op.
+        if self.current_charge_effect:
+            self.current_charge_effect.stop()
         self.current_charge_effect = None
 
         if self.current_beam:
@@ -2835,7 +3092,7 @@ class Player:
             self.pending_dragon_fist = False
             self.is_using_dragon_fist = False
 
-    def update_dragon_fist(self, dt):
+    def update_dragon_fist(self, dt, collision_objects=None):
         """Advance the fist itself (shoot-out / chain-follow / retract),
         carry the player through the opening lunge if it's still running,
         and drain Ki — stopping the attack (via stop_dragon_fist(), which
@@ -2886,7 +3143,7 @@ class Player:
             self._advance_dragon_fist_lunge(dt)
 
         if self.current_dragon_fist:
-            self.current_dragon_fist.update(dt, self.x, self.y)
+            self.current_dragon_fist.update(dt, self.x, self.y, collision_objects=collision_objects)
 
         if not self.has_free_ki():
             self.ki = max(0.0, self.ki - self.dragon_fist_ki_drain * dt)
@@ -3195,6 +3452,203 @@ class Player:
         # reads it sees a meaningful value.  Direction is intentionally left
         # unchanged so the player faces whichever way they were looking.
         self.current_animation_state = 'map_jump'
+
+    def _fishing_jump_direction_vector(self, direction):
+        """Unit (dx, dy) for a cardinal direction, used to displace the
+        player during the fishing jump's hop. Defaults to no movement for
+        an unrecognized direction rather than raising."""
+        return {
+            'down':  (0, 1),
+            'up':    (0, -1),
+            'left':  (-1, 0),
+            'right': (1, 0),
+        }.get(direction, (0, 0))
+
+    def _load_fishing_jump_frames(self, direction):
+        """Load map_land.png sliced for the given direction's row.
+
+        Shared by start_fishing_jump() (enter) and _start_fishing_exit_jump()
+        (exit) since the exit jump needs the OPPOSITE direction's row, not
+        whatever self.direction happens to be at load time.
+        """
+        path = f'{self.sprite.base_path}/map_land.png'
+        frames = []
+        try:
+            sheet      = pygame.image.load(path).convert_alpha()
+            frame_w    = self.width   # 32 px per frame (horizontal strip)
+            frame_h    = self.height  # 32 px per frame (one row per direction)
+            num_frames = max(1, sheet.get_width() // frame_w)
+            # Match the standard 4-dir row layout: down=0, left=1, right=2, up=3
+            direction_row = {'down': 0, 'left': 1, 'right': 2, 'up': 3}.get(direction, 0)
+            row_y = direction_row * frame_h
+            frames = [
+                sheet.subsurface(pygame.Rect(i * frame_w, row_y, frame_w, frame_h))
+                for i in range(num_frames)
+            ]
+        except Exception as e:
+            # Sheet not found — sequence still runs (draw() falls back to
+            # the normal sprite instead of hard-crashing, see below).
+            print(f'[fishing_jump] could not load {path}: {e}')
+        return frames
+
+    def start_fishing_jump(self, on_complete=None):
+        """Begin the fishing jump sequence's ENTER half.
+
+        Called by game.py once the player selects "Yes" on a fishing-area
+        prompt. The player hops straight up along a parabolic arc and back
+        down to their starting spot (no horizontal/world movement), then is
+        hidden — on_complete fires at exactly that point, same as before.
+
+        From here the rest of the round trip (hidden wait, then the exit
+        jump facing the opposite direction, complete with its own splash)
+        runs automatically inside update() — no further calls needed.
+        """
+        if self.is_fishing_jumping:
+            return
+
+        # Snap to standing idle right as the interaction kicks off — belt
+        # and suspenders alongside FishingPrompt.open()'s player.enter_idle()
+        # call (see objects/fishing_area.py), in case this ever gets invoked
+        # without going through that prompt. enter_idle() also resets the
+        # idle-wait timer, which just setting current_animation_state below
+        # doesn't do on its own.
+        self.enter_idle()
+
+        # Cancel anything that could conflict mid-sequence, same idea as
+        # start_map_jump() above.
+        self.is_attacking      = False
+        self.is_charging_beam  = False
+        self.is_firing_beam    = False
+        self.pending_blast     = None
+        self.blast_input_buffered = False
+        self.is_q_pressed      = False
+        self.is_punching       = False
+        self.is_charging_kamekameha = False
+        self.is_firing_kamekameha = False
+        self.is_charging_sword = False
+        self.is_spinning_sword = False
+        self.is_using_dragon_fist = False
+
+        self._fishing_entry_direction = self.direction
+        self._fishing_jump_frames     = self._load_fishing_jump_frames(self.direction)
+        self._fishing_jump_frame_idx  = 2   # start pre-jump on frame 3
+
+        # Actual world movement for this half: hop forward, in whichever
+        # direction the player is facing, by fishing_jump_distance.
+        self._fishing_jump_origin    = (self.x, self.y)
+        vec_x, vec_y = self._fishing_jump_direction_vector(self.direction)
+        self._fishing_jump_move_from = (self.x, self.y)
+        self._fishing_jump_move_to   = (
+            self.x + vec_x * self.fishing_jump_distance,
+            self.y + vec_y * self.fishing_jump_distance,
+        )
+
+        self.is_fishing_jumping = True
+        self._fishing_is_exit   = False
+        self.fishing_jump_timer = 0.0
+        self.on_fishing_jump_complete = on_complete
+        self.is_hidden = False
+        self._fishing_splash_triggered = False
+        self._fishing_hidden_waiting   = False
+        self._fishing_hidden_timer     = 0.0
+
+        # Reuse the idle/jump-facing pose as a fallback if map_land.png
+        # fails to load — direction is left as-is so the player keeps
+        # facing whichever way they were.
+        self.current_animation_state = 'idle'
+
+    def _start_fishing_exit_jump(self):
+        """Begin the fishing jump sequence's EXIT half.
+
+        Called automatically from update() once fishing_hidden_duration has
+        elapsed. Pops the player back into view facing the OPPOSITE
+        direction from the enter jump — set immediately here, and left that
+        way afterward (no turning back once landed) — plays the splash
+        immediately (once, right at pop-up rather than at landing), then
+        runs the same pre/rise/fall/post frame sequence before control
+        returns.
+        """
+        opposite = {'down': 'up', 'up': 'down', 'left': 'right', 'right': 'left'}
+        exit_direction = opposite.get(self._fishing_entry_direction, self.direction)
+        self.direction = exit_direction
+
+        self._fishing_jump_frames    = self._load_fishing_jump_frames(exit_direction)
+        self._fishing_jump_frame_idx = 2   # start pre-jump on frame 3
+
+        # Move back from the underwater spot to wherever the enter jump
+        # started from — self.x/self.y are currently the enter jump's
+        # move-to (they haven't changed during the hidden wait).
+        self._fishing_jump_move_from = (self.x, self.y)
+        self._fishing_jump_move_to   = self._fishing_jump_origin
+
+        self.is_hidden          = False
+        self._fishing_is_exit   = True
+        self.fishing_jump_timer = 0.0
+        self.is_fishing_jumping = True
+
+        # Splash plays immediately as he pops up, not at landing this time —
+        # mark it already-triggered so the shared landing-trigger check in
+        # update() doesn't ALSO fire a second one at the end of this arc.
+        self._fishing_splash_triggered = True
+        self._start_fishing_splash()
+
+        self.current_animation_state = 'idle'
+
+    def _load_fishing_splash_frames(self):
+        """Load splash.png once and cache it on the instance.
+
+        Not tied to a character's sprite folder (unlike map_jump.png/
+        map_land.png), so there's no per-direction row to pick — just one
+        shared horizontal strip: 4 frames, 32x22 each.
+        """
+        path = 'assets/objects/fishing/splash.png'
+        self._fishing_splash_frames = []
+        try:
+            sheet   = pygame.image.load(path).convert_alpha()
+            frame_w, frame_h = 32, 22
+            num_frames = max(1, sheet.get_width() // frame_w)
+            self._fishing_splash_frames = [
+                sheet.subsurface(pygame.Rect(i * frame_w, 0, frame_w, frame_h))
+                for i in range(num_frames)
+            ]
+        except Exception as e:
+            print(f'[fishing_splash] could not load {path}: {e}')
+
+    def _start_fishing_splash(self):
+        """Kick off the splash.png animation at the player's current
+        (landing) position. Called once, right as the fishing jump's
+        descending arc reaches the ground — see update()."""
+        if self._fishing_splash_frames is None:
+            self._load_fishing_splash_frames()
+        if not self._fishing_splash_frames:
+            return  # sheet missing/failed to load — silently skip the effect
+
+        self._fishing_splash_active      = True
+        self._fishing_splash_frame_idx   = 0
+        self._fishing_splash_frame_timer = 0.0
+        # Anchor at the feet, not the body center — same offset LayerManager.
+        # _draw_shadow() uses to sit the shadow under the sprite (entity
+        # height / 2.25), so the splash lines up with where the shadow was.
+        self._fishing_splash_x = self.x
+        self._fishing_splash_y = self.y + self.height / 2.25
+
+    def _update_fishing_splash(self, dt):
+        """Advance the splash animation, if one is currently playing.
+
+        Deliberately called unconditionally at the very top of update(),
+        ahead of every other early-return (is_dead/is_map_jumping/
+        is_fishing_jumping) — the splash plays at a fixed world position
+        once triggered and has nothing to do with those states, including
+        continuing to animate after is_hidden becomes True.
+        """
+        if not self._fishing_splash_active:
+            return
+        self._fishing_splash_frame_timer += dt
+        if self._fishing_splash_frame_timer >= self._FISHING_SPLASH_FRAME_DURATION:
+            self._fishing_splash_frame_timer = 0.0
+            self._fishing_splash_frame_idx += 1
+            if self._fishing_splash_frame_idx >= len(self._fishing_splash_frames):
+                self._fishing_splash_active = False
 
     # =========================================================================
     # Combat — taking damage
@@ -3691,8 +4145,24 @@ class Player:
     # Main update loop
     # =========================================================================
 
-    def update(self, dt):
-        """Advance timers, physics, and animation state for one frame."""
+    def update(self, dt, collision_objects=None):
+        """Advance timers, physics, and animation state for one frame.
+
+        collision_objects (CollisionObject walls for the current room, if
+        given) is only threaded through to update_dragon_fist() so the
+        Dragon Fist head can be blocked by/slide along walls the same way
+        Projectiles and enemy ki-blasts already are — see
+        DragonFistAttack.update()'s own collision_objects param. Nothing
+        else here uses it; ordinary player-vs-wall movement collision is
+        still resolved by the caller (Game._update_player_movement), same
+        as before.
+        """
+
+        # Unconditional — runs every frame regardless of is_dead/
+        # is_map_jumping/is_fishing_jumping/is_hidden, since the splash is a
+        # fire-and-forget effect at a fixed world position, not part of any
+        # of those states once triggered.
+        self._update_fishing_splash(dt)
 
         # Reset per-frame block flags here (not just inside move()) so they
         # are always False during knockback frames when move() is never called.
@@ -3774,6 +4244,105 @@ class Player:
                         self.on_map_jump_exit()
 
             return  # Skip all other update logic during the jump sequence
+
+        # ------------------------------------------------------------------
+        # Fishing jump sequence — runs exclusively; all other state frozen.
+        # draw() applies a vertical visual offset on top of this
+        # (self.get_fishing_jump_y_offset()) for the hop's height — but
+        # self.x/self.y themselves DO move here now, horizontally/
+        # vertically (whichever the facing direction implies) from
+        # _fishing_jump_move_from to _fishing_jump_move_to, in step with
+        # the same rise/fall arc timing as the frame selection below.
+        # ------------------------------------------------------------------
+        if self.is_fishing_jumping:
+            self.fishing_jump_timer += dt
+
+            pre  = self.fishing_jump_pre_duration
+            arc  = self.fishing_jump_duration
+            post = self.fishing_jump_post_duration
+            t    = self.fishing_jump_timer
+
+            # Pick the map_land.png frame for whichever phase we're in:
+            # frame 3 (idx 2) snapped-to before the hop and again after
+            # landing, frame 1 (idx 0) while rising, frame 2 (idx 1) while
+            # falling — the switch from rising to falling happens exactly
+            # at the arc's midpoint, matching get_fishing_jump_y_offset()'s
+            # peak below.
+            if t < pre:
+                self._fishing_jump_frame_idx = 2
+                move_frac = 0.0
+            elif t < pre + arc:
+                arc_t = (t - pre) / arc if arc > 0 else 1.0
+                self._fishing_jump_frame_idx = 0 if arc_t < 0.5 else 1
+                move_frac = arc_t
+            else:
+                self._fishing_jump_frame_idx = 2
+                move_frac = 1.0
+                # First frame of the "landed" phase — fire the splash right
+                # at the ground, exactly once per jump.
+                if not self._fishing_splash_triggered:
+                    self._fishing_splash_triggered = True
+                    self._start_fishing_splash()
+
+            # Only actually travel during the arc itself — holds still on
+            # the flat pre/post frame-3 snaps, same as the frame selection
+            # above.
+            from_x, from_y = self._fishing_jump_move_from
+            to_x, to_y     = self._fishing_jump_move_to
+            self.x = from_x + (to_x - from_x) * move_frac
+            self.y = from_y + (to_y - from_y) * move_frac
+
+            if t >= pre + arc + post:
+                self.is_fishing_jumping = False
+                if self._fishing_is_exit:
+                    # Exit jump finished — player is already visible again
+                    # (is_hidden cleared back in _start_fishing_exit_jump()),
+                    # so control returns automatically via can_act()/
+                    # can_move() now that is_fishing_jumping is False too.
+                    # Direction stays whatever _start_fishing_exit_jump() set
+                    # it to (the opposite of the entry direction) — no turn
+                    # back after landing.
+                    #
+                    # While the jump was playing, draw() drew the custom
+                    # map_land.png frames directly and never touched
+                    # self.sprite — so self.sprite's own cached animation is
+                    # still stuck facing whatever enter_idle() last set it to
+                    # (the entry direction), even though self.direction has
+                    # since flipped to the exit direction. Resync it here so
+                    # the very next frame's normal draw (self.sprite.draw())
+                    # actually shows the player facing the right way instead
+                    # of the stale entry-direction pose.
+                    self.enter_idle()
+                    self._fishing_is_exit = False
+                else:
+                    # Enter jump finished — hide the player and fire the
+                    # completion callback (unchanged contract: "landed/
+                    # hidden"), then queue the automatic hidden wait before
+                    # the exit jump kicks off on its own.
+                    self.is_hidden = True
+                    callback = self.on_fishing_jump_complete
+                    self.on_fishing_jump_complete = None
+                    if callable(callback):
+                        callback()
+                    self._fishing_hidden_waiting = True
+                    self._fishing_hidden_timer   = 0.0
+
+            return  # Skip all other update logic during the jump sequence
+
+        # ------------------------------------------------------------------
+        # Fishing hidden-wait — the gap between the enter and exit jumps.
+        # is_fishing_jumping is False here (neither jump is actively
+        # playing), so this needs its own exclusive block: same as the jump
+        # phases, everything else stays frozen, and is_hidden already keeps
+        # can_act()/can_move() locked for the whole span.
+        # ------------------------------------------------------------------
+        if self._fishing_hidden_waiting:
+            self._fishing_hidden_timer += dt
+            if self._fishing_hidden_timer >= self.fishing_hidden_duration:
+                self._fishing_hidden_waiting = False
+                self._start_fishing_exit_jump()
+
+            return  # Skip all other update logic during the hidden wait
 
         # ------------------------------------------------------------------
         # Collision knockback (wall-bounce) — runs independently of damage knockback
@@ -3888,11 +4457,19 @@ class Player:
             self.attack_cooldown -= dt
 
         # ------------------------------------------------------------------
-        # Passive ki regen — ticks continuously regardless of what else the
-        # player is doing (uses a running timer so it's independent of
-        # attack_cooldown and doesn't get reset by combat).
+        # Passive ki regen — ticks while the player is out of combat-ish
+        # (uses a running timer so it's independent of attack_cooldown and
+        # doesn't get reset by combat). Suppressed while actively charging/
+        # holding/firing a ki attack (see _KI_ATTACK_STATES) — e.g. holding
+        # a Kamehameha shouldn't get a trickle-back tick fighting the ki
+        # you're actively spending on it.
         # ------------------------------------------------------------------
-        if self.ki < self.max_ki:
+        using_ki_attack = self.current_animation_state in self._KI_ATTACK_STATES
+        if using_ki_attack:
+            # Don't let the timer build up while a ki attack is active, so
+            # regen doesn't "fast forward" the instant the attack ends.
+            self.ki_regen_timer = 0.0
+        elif self.ki < self.max_ki:
             self.ki_regen_timer += dt
             if self.ki_regen_timer >= self.ki_regen_interval:
                 self.ki_regen_timer -= self.ki_regen_interval
@@ -4180,7 +4757,7 @@ class Player:
 
         elif self.current_animation_state == 'dragon_fist':
             if self.is_using_dragon_fist:
-                self.update_dragon_fist(dt)
+                self.update_dragon_fist(dt, collision_objects)
             else:
                 # Stopped externally (e.g. enemy killed us mid-attack), or
                 # the retract sweep finished last frame and got cleaned up
@@ -4239,7 +4816,7 @@ class Player:
         # 'walk'/'run' while is_using_dragon_fist is True (unlike the sword
         # spin), but kept for the same robustness reasons as the others.
         if self.is_using_dragon_fist and self.current_animation_state != 'dragon_fist':
-            self.update_dragon_fist(dt)
+            self.update_dragon_fist(dt, collision_objects)
 
         # Sword spin ticks every frame regardless of current_animation_state —
         # see update_sword_spin()'s docstring for why (moving during the
@@ -4275,6 +4852,101 @@ class Player:
     # Rendering
     # =========================================================================
 
+    # Animation states that always play on a hardcoded 'down' key inside
+    # core/sprite_system.py regardless of which way the player is actually
+    # facing (see enter_idle()/update()'s idle-wait handling) — so the halo
+    # frame lookup below needs to ask for 'down' too, not self.direction,
+    # or it'll never find them.
+    _HALO_FORCE_DOWN_STATES = ('idle_wait', 'idle_transition')
+
+    def _get_current_sprite_frame(self):
+        """Best-effort lookup of the actual Surface currently being drawn
+        for the player's body, for _get_halo_anchor_y() below. Mirrors the
+        lookup pattern already used by update_it_teleport() (self.sprite.
+        animations['{anim}_{direction}'].frames[current_frame]).
+
+        Returns (frame_surface, cache_key) or (None, None) if anything
+        about the lookup doesn't line up. cache_key identifies the frame
+        by (state, direction, index) rather than id(frame) — some sprite
+        pipelines build frame Surfaces dynamically (flips/recolors/etc.),
+        so a short-lived Surface can get garbage-collected and have its
+        id() reused by a totally different frame; keying the trim-bounds
+        cache on the frame object's identity risked silently serving a
+        stale bounding rect from a different pose. (state, direction,
+        index) is stable and can't collide like that.
+        """
+        try:
+            direction = 'down' if self.current_animation_state in self._HALO_FORCE_DOWN_STATES else self.direction
+            anim = self.sprite.animations.get(f'{self.current_animation_state}_{direction}')
+            if anim is None:
+                return None, None
+            frames = getattr(anim, 'frames', None)
+            idx = getattr(anim, 'current_frame', None)
+            if not frames or idx is None:
+                return None, None
+            idx = idx % len(frames)
+            return frames[idx], (self.current_animation_state, direction, idx)
+        except Exception:
+            return None, None
+
+    def _get_halo_anchor_y(self):
+        """World-space Y of the highest non-transparent pixel drawn
+        anywhere in the current frame — not a flat height/2 above center —
+        so the halo tracks wherever the sprite's actual art sits this
+        frame, whatever pose it's in. Same mask-trim trick as
+        _get_halo_sprite() uses on halo.png itself.
+
+        Falls back to the old flat self.height-based top if the current
+        frame can't be resolved (see _get_current_sprite_frame()).
+        """
+        frame, cache_key = self._get_current_sprite_frame()
+        if frame is None:
+            return self.y - self.height / 2
+
+        cache = self._halo_frame_top_cache
+        if cache_key not in cache:
+            try:
+                bounds = pygame.mask.from_surface(frame).get_bounding_rects()[0]
+                cache[cache_key] = bounds.top if bounds.height > 0 else 0
+            except Exception:
+                cache[cache_key] = 0
+        top_px = cache[cache_key]
+
+        # Frame canvas is centered on self.y (same convention as
+        # self.height above) — its own height may differ from self.height
+        # if this costume's sprite_width/sprite_height (character creator)
+        # don't match the hardcoded 32x32, so use the frame's real height.
+        anchor_y = self.y - frame.get_height() / 2 + top_px
+
+        # Cap only downward influence from the frame. The sprite can still
+        # pull the halo upward freely, but a crouched/low frame cannot push
+        # the halo more than HALO_MAX_DOWNWARD_TRACK_PIXELS below the normal
+        # top-of-frame anchor. This is intentionally a test knob.
+        normal_anchor_y = self.y - frame.get_height() / 2
+        max_anchor_y = normal_anchor_y + HALO_MAX_DOWNWARD_TRACK_PIXELS
+        return min(anchor_y, max_anchor_y)
+
+    def get_fishing_jump_y_offset(self):
+        """World-unit vertical offset (negative = up) for the fishing jump's
+        parabolic arc, based on how far through fishing_jump_duration we are.
+        0 at the start and end (on the ground), -fishing_jump_height at the
+        midpoint (peak of the hop).
+
+        The arc itself doesn't start until fishing_jump_pre_duration has
+        elapsed (the frame-3 snap plays flat-footed first) and is clamped
+        at 0 again once it's finished (the frame-3 snap after landing is
+        also flat-footed) — so this reads naturally as "0 before/after the
+        hop, sin-arc during it" without the caller needing to know about
+        the pre/post phases at all.
+        """
+        if not self.is_fishing_jumping or self.fishing_jump_duration <= 0:
+            return 0
+        t = self.fishing_jump_timer - self.fishing_jump_pre_duration
+        arc_t = min(1.0, max(0.0, t / self.fishing_jump_duration))
+        # sin(0) = 0, sin(pi/2) = 1 (peak at t=0.5), sin(pi) = 0 — a smooth
+        # up-then-down arc that starts and ends exactly on the floor.
+        return -self.fishing_jump_height * math.sin(math.pi * arc_t)
+
     def draw(self, screen, camera, colors):
         """Draw the player sprite with the current hurt tint applied.
 
@@ -4282,6 +4954,42 @@ class Player:
         delegates to core/sprite_system.py (shared by player/enemy/NPC),
         not yet converted -- see MIGRATION note at the end of this file.
         """
+        if self._fishing_splash_active and self._fishing_splash_frames:
+            frame = self._fishing_splash_frames[self._fishing_splash_frame_idx]
+            sx = int(self._fishing_splash_x * RENDER_SCALE - camera.x)
+            sy = int(self._fishing_splash_y * RENDER_SCALE - camera.y)
+            w  = int(frame.get_width() * RENDER_SCALE)
+            h  = int(frame.get_height() * RENDER_SCALE)
+            dest_rect = pygame.Rect(0, 0, w, h)
+            dest_rect.center = (sx, sy)
+            screen.blit_scaled(frame, dest_rect)
+
+        if self.is_hidden:
+            return  # Player has finished the fishing jump and disappeared
+
+        if self.is_fishing_jumping:
+            draw_y = self.y + self.get_fishing_jump_y_offset()
+
+            if self._fishing_jump_frames:
+                idx   = self._fishing_jump_frame_idx
+                frame = self._fishing_jump_frames[idx]
+                sx    = int(self.x * RENDER_SCALE - camera.x)
+                sy    = int(draw_y * RENDER_SCALE - camera.y)
+                w     = int(self.width * RENDER_SCALE)
+                h     = int(frame.get_height() * RENDER_SCALE)
+
+                # Same blit_scaled() approach as the map_jump draw below —
+                # draw the original unscaled frame and let the GPU stretch
+                # it to the dest rect, centered on the player's position.
+                dest_rect = pygame.Rect(0, 0, w, h)
+                dest_rect.center = (sx, sy)
+                screen.blit_scaled(frame, dest_rect)
+            else:
+                # map_land.png failed to load — fall back to the normal
+                # sprite so the jump still runs instead of hard-crashing.
+                self.sprite.draw(screen, self.x, draw_y, camera, scale=RENDER_SCALE)
+            return
+
         if self.is_map_jumping and self._map_jump_frames:
             idx    = self._map_jump_frame_idx
             sx     = int(self.x * RENDER_SCALE - camera.x)
@@ -4311,8 +5019,45 @@ class Player:
 
         tint = getattr(self, 'hurt_tint', 0.0)
         flash_white = getattr(self, 'charged_melee_flash_amount', 0.0)
-        self.sprite.draw(screen, self.x, self.y, camera, scale=RENDER_SCALE,
+
+        # Visual-only step forward for left/right melee swings (see
+        # melee_step_distance in __init__). Derived from
+        # current_animation_state each frame rather than stored/toggled
+        # elsewhere, so it can't get "stuck" — the instant the state stops
+        # being 'melee' (swing finishes, gets interrupted by hurt/knockback,
+        # chains into charged melee, etc.) this just goes back to 0 on its
+        # own, no extra reset bookkeeping needed anywhere else.
+        draw_x = self.x
+        if self.current_animation_state == 'melee' and self.direction in ('left', 'right'):
+            draw_x += self.melee_step_distance if self.direction == 'right' else -self.melee_step_distance
+
+        self.sprite.draw(screen, draw_x, self.y, camera, scale=RENDER_SCALE,
                          hurt_tint=tint, flash_white=flash_white)
+
+        # Halo — same layer as the player, drawn right after the sprite so
+        # it renders on top of it. See halo_enabled/halo_offset_x/
+        # halo_offset_y in __init__ for the toggle and manual position nudge.
+        if self.halo_enabled:
+            halo, halo_bounds = _get_halo_sprite()
+            if halo is not None:
+                # self.x/self.y are the player's CENTER (see get_collision_rect/
+                # the width//2/height//2 clamping elsewhere in this file), same
+                # as the map_jump draw above — so sx/sy below are already a
+                # center point, not a left/top edge. midbottom is set straight
+                # to (sx, sy) shifted up by half the sprite height to land at
+                # the top of the sprite by default; no extra x nudge needed.
+                # halo_bounds trims out any transparent padding baked into
+                # the source file so the ring itself (not its canvas) is
+                # what gets centered — see _get_halo_sprite().
+                sx = int(draw_x * RENDER_SCALE - camera.x) + self.halo_offset_x
+                sy = (int(self._get_halo_anchor_y() * RENDER_SCALE - camera.y)
+                      + self.halo_offset_y
+                      + self.halo_offset_y_by_state.get(self.current_animation_state, 0))
+                w  = int(halo_bounds.width * RENDER_SCALE)
+                h  = int(halo_bounds.height * RENDER_SCALE)
+                dest_rect = pygame.Rect(0, 0, w, h)
+                dest_rect.midbottom = (sx, sy)
+                screen.blit_scaled(halo, dest_rect, area=halo_bounds)
 
 
 # ── GPU MIGRATION STATUS (this file) ────────────────────────────────────────

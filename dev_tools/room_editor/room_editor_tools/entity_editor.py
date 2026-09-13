@@ -1,5 +1,6 @@
 import pygame
 import pygame.gfxdraw
+import os
 
 from dev_tools import entity_creator
 
@@ -389,9 +390,21 @@ class EntityEditor:
         self.categories['Enemy Bosses'] = enemy_catalogue['Enemy Bosses']
 
         # ── Critters (ambient wildlife — no hitbox, no AI, no dialogue) ────────
-        squirrel_w, squirrel_h = self._resolve_critter_frame_size('squirrel', 'default', 16, 16)
-        bird_w, bird_h = self._resolve_critter_frame_size('bird', 'default', 16, 16)
-        butterfly_w, butterfly_h = self._resolve_critter_frame_size('butterfly', 'default', 16, 16)
+        squirrel_cfg = entity_creator.load_config(entity_creator.KIND_CRITTER, 'squirrel')
+        bird_cfg = entity_creator.load_config(entity_creator.KIND_CRITTER, 'bird')
+        butterfly_cfg = entity_creator.load_config(entity_creator.KIND_CRITTER, 'butterfly')
+
+        def _critter_size(entity_id, cfg, default=(16, 16)):
+            cfg_path = CRITTER_CONFIG_PATH = os.path.join(
+                "assets", "critters", f"{entity_id}.json"
+            )
+            if os.path.isfile(cfg_path):
+                return cfg.get("width", default[0]), cfg.get("height", default[1])
+            return self._resolve_critter_frame_size(entity_id, "default", *default)
+
+        squirrel_w, squirrel_h = _critter_size('squirrel', squirrel_cfg)
+        bird_w, bird_h = _critter_size('bird', bird_cfg)
+        butterfly_w, butterfly_h = _critter_size('butterfly', butterfly_cfg)
 
         self.categories['Critters'] = [
             {
@@ -672,22 +685,9 @@ class EntityEditor:
         Scroll wheel scrolls the item grid.  Left-click selects categories,
         entities, and variants.  Right-click in the world deletes placed
         entities (handled upstream; this editor does not own placed objects).
-
-        When RoomEditor is zoomed out, event.pos is intentionally converted
-        into the zoomed virtual/world viewport before it reaches us.  That
-        coordinate is correct for placement, but it must NOT be used for
-        fixed-size palette/UI hit-testing. RoomEditor preserves the original
-        physical mouse position in _room_editor_raw_pos for that purpose.
         """
         if not self.active:
             return False
-
-        # UI controls live in real window coordinates; world placement uses
-        # event.pos, which RoomEditor may have converted into zoom-space.
-        ui_mouse_pos = event.dict.get(
-            '_room_editor_raw_pos',
-            getattr(event, 'pos', pygame.mouse.get_pos())
-        )
 
         if event.type == pygame.MOUSEWHEEL:
             if self._mouse_in_palette(*pygame.mouse.get_pos()):
@@ -704,10 +704,8 @@ class EntityEditor:
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             mouse_pos = event.pos
 
-            # Panel show/hide toggle — checked first so it always fires.
-            # Use the raw physical cursor position because the panel is fixed
-            # to the real window while the world may be zoomed.
-            if self._panel_toggle_rect().collidepoint(ui_mouse_pos):
+            # Panel show/hide toggle — checked first so it always fires
+            if self._panel_toggle_rect().collidepoint(mouse_pos):
                 self.palette_visible = not self.palette_visible
                 return True
 
@@ -717,7 +715,7 @@ class EntityEditor:
                 if self._open_dropdown is not None:
                     for entry in reversed(self._dialogue_popup_rects):
                         if entry.get('action') == 'obj_dropdown_select':
-                            if entry['rect'].collidepoint(ui_mouse_pos):
+                            if entry['rect'].collidepoint(mouse_pos):
                                 dd      = self._open_dropdown
                                 opt     = dd['options'][entry['opt_idx']]
                                 objs    = self._dialogue_popup['mission']['objectives']
@@ -735,7 +733,7 @@ class EntityEditor:
                     return True
 
                 for entry in self._dialogue_popup_rects:
-                    if entry['rect'].collidepoint(ui_mouse_pos):
+                    if entry['rect'].collidepoint(mouse_pos):
                         action = entry['action']
                         p = self._dialogue_popup
                         if action == 'switch_tab':
@@ -808,19 +806,19 @@ class EntityEditor:
 
             # ── NPC mode selector click ────────────────────────────────────
             for entry in self.ui_rects.get('npc_mode_rects', []):
-                if entry['rect'].collidepoint(ui_mouse_pos):
+                if entry['rect'].collidepoint(mouse_pos):
                     self.selected_npc_mode = entry['mode']
                     return True
 
             # ── NPC facing selector click ──────────────────────────────────
             for entry in self.ui_rects.get('npc_facing_rects', []):
-                if entry['rect'].collidepoint(ui_mouse_pos):
+                if entry['rect'].collidepoint(mouse_pos):
                     self.selected_npc_facing = entry['facing']
                     return True
 
             # ── NPC dialogue clicks ────────────────────────────────────────
             for entry in self.ui_rects.get('npc_dialogue_rects', []):
-                if entry['rect'].collidepoint(ui_mouse_pos):
+                if entry['rect'].collidepoint(mouse_pos):
                     action = entry.get('action')
                     if action == 'edit':
                         self.npc_dialogue_index = entry['index']
@@ -843,7 +841,7 @@ class EntityEditor:
 
             # ── variant selector click ─────────────────────────────────────
             for i, entry in enumerate(self.ui_rects.get('variant_rects', [])):
-                if entry['rect'].collidepoint(ui_mouse_pos):
+                if entry['rect'].collidepoint(mouse_pos):
                     self.selected_variant = entry['variant']
                     # update main sprite so the grid thumbnail reflects choice
                     if self.selected_entity:
@@ -852,7 +850,7 @@ class EntityEditor:
 
             # ── category tab click ─────────────────────────────────────────
             for entry in self.ui_rects.get('category_rects', []):
-                if entry['rect'].collidepoint(ui_mouse_pos):
+                if entry['rect'].collidepoint(mouse_pos):
                     self.current_category = entry['key']
                     self.selected_entity = None
                     self.selected_variant = None
@@ -861,14 +859,14 @@ class EntityEditor:
 
             # ── entity item click ──────────────────────────────────────────
             for entry in self.ui_rects.get('entity_rects', []):
-                if entry['rect'].collidepoint(ui_mouse_pos):
+                if entry['rect'].collidepoint(mouse_pos):
                     self.selected_variant = None  # clear old variant before switching entity
                     self.selected_entity = entry['entity']
                     self.selected_variant = self._get_current_variant(entry['entity'])
                     return True
 
             # ── world click → place entity ─────────────────────────────────
-            if self.selected_entity and not self._mouse_in_palette(*ui_mouse_pos):
+            if self.selected_entity and not self._mouse_in_palette(*mouse_pos):
                 if self.selected_entity.get('entity_type') == 'npc':
                     # Open dialogue popup before placing
                     from config.settings import RENDER_SCALE, TILE_SIZE

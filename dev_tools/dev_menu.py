@@ -63,6 +63,7 @@ class DevMenu:
             {'id': 'attack_creator',  'label': 'ATTACK CREATOR',  'icon': 'attack'},
             {'id': 'entity_creator',  'label': 'ENTITY CREATOR',  'icon': 'character'},
             {'id': 'item_creator',    'label': 'ITEM CREATOR',    'icon': 'item'},
+            {'id': 'decoration_creator', 'label': 'DECORATION CREATOR', 'icon': 'decoration'},
             {'id': 'config',          'label': 'CONFIGURATION',   'icon': 'config'},
             {'id': 'close',           'label': 'CLOSE MENU',      'icon': 'close'},
         ]
@@ -82,7 +83,10 @@ class DevMenu:
         # Animation timers
         self.anim_timer = 0
         self.cursor_blink = 0
-        self.icon_bob_offset = [0.0] * 10  # One bob value per visible menu slot
+        # One bob value per visible menu slot — sized to the largest option list
+        # (main menu) so it never falls short as options are added.
+        self._max_menu_slots = max(len(self.main_options), len(self.config_options))
+        self.icon_bob_offset = [0.0] * self._max_menu_slots
 
         # Rebuilt every frame in draw() — holds rects for mouse hit-testing
         self.clickable_rects = []
@@ -186,7 +190,7 @@ class DevMenu:
         """
         self.icons = {}
 
-        icon_types = ['room', 'map', 'sprite', 'cutscene', 'character', 'attack', 'item', 'config', 'close', 'xp', 'transform', 'back']
+        icon_types = ['room', 'map', 'sprite', 'cutscene', 'character', 'attack', 'item', 'decoration', 'config', 'close', 'xp', 'transform', 'back']
 
         # Fallback colors keyed by icon type — used when no PNG is present
         icon_colors = {
@@ -197,6 +201,7 @@ class DevMenu:
             'character': (255, 120, 220),
             'attack':    (255,  90,  90),
             'item':      ( 80, 220, 180),
+            'decoration': (140, 220, 100),
             'config':    (100, 100, 255),
             'close':     (255,  50,  50),
             'xp':        (255, 215,   0),
@@ -265,7 +270,7 @@ class DevMenu:
             self.selected_index = -1
             self.hover_index = -1
             self.editing_text = False
-            self.icon_bob_offset = [0.0] * 10
+            self.icon_bob_offset = [0.0] * self._max_menu_slots
 
             if self.sound_manager:
                 self.previous_context = self.sound_manager.get_current_context()
@@ -611,6 +616,8 @@ class DevMenu:
                 return 'open_entity_creator'
             elif option_id == 'item_creator':
                 return 'open_item_creator'
+            elif option_id == 'decoration_creator':
+                return 'open_decoration_creator'
             elif option_id == 'config':
                 self._enter_menu('config')
             elif option_id == 'close':
@@ -649,4 +656,5 @@ class DevMenu:
             'attack_creator':    'ATTACK CREATOR',
             'entity_creator':    'ENTITY CREATOR',
             'item_creator':      'ITEM CREATOR',
+            'decoration_creator': 'DECORATION CREATOR',
         }.get(self.current_menu, 'DEV MENU')

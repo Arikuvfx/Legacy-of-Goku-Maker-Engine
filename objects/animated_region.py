@@ -249,7 +249,8 @@ _label_font = None
 
 def draw_animated_region(screen, region: AnimatedRegion, camera_x: int, camera_y: int,
                           render_scale: int, dev_mode: bool = True, selected: bool = False,
-                          show_handles: bool = True, show_fill: bool = True):
+                          show_handles: bool = True, show_fill: bool = True,
+                          show_border: bool = True):
     """Editor-only overlay — colored by region_type, with corner handles like
     the collision box overlay, so it's visually distinct at a glance.
 
@@ -259,6 +260,14 @@ def draw_animated_region(screen, region: AnimatedRegion, camera_x: int, camera_y
     immediately afterward, making the fill's alpha-blend cost pure waste.
     Only pass False when that cover-up is actually guaranteed; otherwise
     the region would flash as a bare outline with nothing marking it.
+
+    show_border=False skips the region's own outline rect. Adjacent regions
+    (water/grass/lava tiled edge-to-edge, which is the common case) each
+    draw this outline independently, so with the grid hidden it should be
+    hidden too — otherwise it reads as leftover grid lines sitting on top
+    of the animated tiles even with the room editor's grid toggled off.
+    Selection still needs to be visible, so a selected region always draws
+    its border regardless of this flag.
     """
     if not dev_mode:
         return
@@ -316,9 +325,10 @@ def draw_animated_region(screen, region: AnimatedRegion, camera_x: int, camera_y
         # in gpu_renderer.py.)
         screen.draw_rect((*fill_rgb, alpha), visible, width=0)
 
-    border_color = tuple(min(255, c + 60) for c in base_color) if selected else base_color
-    border_width = 3 if selected else 2
-    screen.draw_rect(border_color, rect, border_width)
+    if show_border or selected:
+        border_color = tuple(min(255, c + 60) for c in base_color) if selected else base_color
+        border_width = 3 if selected else 2
+        screen.draw_rect(border_color, rect, border_width)
 
     # Corner drag handles — only relevant while actually dragging/resizing
     # the region itself, so they're skipped while the tile editor is active

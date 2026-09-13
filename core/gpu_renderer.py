@@ -248,6 +248,21 @@ class GPUScreen:
         # wrap it (game.py's tile-layer blit batches pass plain tuples).
         if area is not None and not isinstance(area, pygame.Rect):
             area = pygame.Rect(area)
+        if area is not None:
+            # Real pygame.Surface.blit() silently clips an out-of-bounds
+            # or oversized `area` down to the source Surface's own rect --
+            # it never stretches. Callers rely on that to *clip* rather
+            # than scale (e.g. TextInput.draw() passes area=Rect(0, 0,
+            # field_width, text_height) purely to truncate long text to
+            # the field's visible width). Without clamping here first,
+            # handing an oversized area straight to SDL as srcrect makes
+            # it scale the actual (smaller) texture content to fill that
+            # declared size -- which is exactly why short text stretched
+            # to fill the whole field instead of just sitting at its
+            # native size.
+            area = area.clip(pygame.Rect(0, 0, tex.width, tex.height))
+            if area.width <= 0 or area.height <= 0:
+                return
         if isinstance(dest, pygame.Rect):
             dst_rect = dest
         else:
@@ -322,6 +337,13 @@ class GPUScreen:
         tex = sdl2_video.Texture.from_surface(self.renderer, surface)
         if area is not None and not isinstance(area, pygame.Rect):
             area = pygame.Rect(area)
+        if area is not None:
+            # Same real-Surface.blit() semantics as blit() above: clamp
+            # an oversized/out-of-bounds area to the actual texture size
+            # instead of letting SDL stretch into it.
+            area = area.clip(pygame.Rect(0, 0, tex.width, tex.height))
+            if area.width <= 0 or area.height <= 0:
+                return
         if isinstance(dest, pygame.Rect):
             dst_rect = dest
         else:
@@ -488,6 +510,15 @@ class GPUScreen:
     def draw_line(self, color, start_pos, end_pos, width=1):
         r, g, b = color[:3]
         a = color[3] if len(color) > 3 else 255
+        if self._clip_rect is not None:
+            # Unlike draw_rect/blit, this had no clip handling at all --
+            # draw_line went straight to the renderer regardless of
+            # self._clip_rect, so any clipped-viewport grid/line overlay
+            # (tileset palette grid, room grid, etc.) bled outside its box.
+            clipped = self._clip_rect.clipline(start_pos, end_pos)
+            if not clipped:
+                return
+            start_pos, end_pos = clipped
         self.renderer.draw_color = (r, g, b, a)
         self.renderer.draw_line(start_pos, end_pos)
         # SDL draw_line is always 1px. For width > 1 (used sparingly --

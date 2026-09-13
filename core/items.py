@@ -1498,6 +1498,40 @@ ITEMS = {
         'slot': 'feet',
         'effect': {'type': 'equip_stat', 'stats': {'vitality': 25, 'speed': 28}},
     },
+
+    # ── Story items ──────────────────────────────────────────────────────
+    # Fishing-area catches (see game.py's _update_fishing_catch) — no
+    # 'effect', same as any other story item: nothing to "use" from the
+    # pause menu, they're just held. Sprites live in
+    # assets/sprites/items/story_items/ (see item_icon_path() above).
+    'small_blue_fish': {
+        'name': 'Small Blue Fish',
+        'description': 'A small, plain-looking blue fish.',
+        'effect_text': 'Restores 30 HP',
+        'category': CATEGORY_STORY_ITEMS,
+        'effect': {'type': 'heal_hp', 'amount': 30},
+    },
+    'big_blue_fish': {
+        'name': 'Big Blue Fish',
+        'description': 'A big, plump blue fish.',
+        'effect_text': 'Restores 20 HP',
+        'category': CATEGORY_STORY_ITEMS,
+        'effect': {'type': 'heal_hp', 'amount': 20},
+    },
+    'small_red_fish': {
+        'name': 'Small Red Fish',
+        'description': 'A small, brightly-colored red fish.',
+        'effect_text': 'Restores 20 HP',
+        'category': CATEGORY_STORY_ITEMS,
+        'effect': {'type': 'heal_hp', 'amount': 20},
+    },
+    'old_shoe': {
+        'name': 'Old Shoe',
+        'description': 'A worn-out old shoe. Not exactly what you were fishing for.',
+        'effect_text': 'Restores 20 HP',
+        'category': CATEGORY_STORY_ITEMS,
+        'effect': {'type': 'heal_hp', 'amount': 20},
+    },
 }
 
 
@@ -1545,15 +1579,27 @@ def _load_item_overrides():
     for fname in sorted(os.listdir(ITEMS_DIR)):
         if not fname.endswith('.json'):
             continue
-        item_id = fname[:-5]
-        path = os.path.join(ITEMS_DIR, fname)
-        try:
-            with open(path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-        except Exception as e:
-            print(f"Error loading item override {path}: {e}")
-            continue
-        ITEMS[item_id] = data
+        reload_item_override(fname[:-5])
+
+
+def reload_item_override(item_id):
+    """Re-read assets/items/{item_id}.json from disk and apply it to the
+    live ITEMS dict in place. This is _load_item_overrides()'s per-file
+    logic pulled out into its own function so it can also be called for a
+    single changed file after startup — the hot-reload counterpart used
+    when item_creator.py (or someone hand-editing the JSON) saves a change
+    while the game is running. See apply_watcher_events() below for how a
+    file-watcher event routes here."""
+    path = os.path.join(ITEMS_DIR, f'{item_id}.json')
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"Error loading item override {path}: {e}")
+        return False
+    ITEMS[item_id] = data
+    print(f"🔄 Reloaded item: {item_id}")
+    return True
 
 
 _load_item_overrides()
@@ -1592,6 +1638,79 @@ def discover_custom_item_ids():
     if not os.path.isdir(ITEMS_DIR):
         return set()
     return {fname[:-5] for fname in os.listdir(ITEMS_DIR) if fname.endswith('.json')}
+
+
+# ---------------------------------------------------------------------------
+# Hot-reload — lets a running game pick up item changes from disk without a
+# restart: editing/adding/deleting an override JSON in assets/items/, or
+# swapping an icon .png under assets/sprites/items/ (flat consumables,
+# equipment/<slot>/, or story_items/ — item_icon_path()'s three cases).
+# Driven by an AssetWatcher (see core/asset_watcher.py) that game.py points
+# at both of those directories; classify_asset_path() figures out what a
+# changed file is, and apply_watcher_events() applies it.
+# ---------------------------------------------------------------------------
+
+ITEMS_SPRITE_DIR = os.path.join('assets', 'sprites', 'items')
+
+
+def classify_asset_path(filepath):
+    """Given a filepath that changed under either ITEMS_DIR (override
+    JSON) or ITEMS_SPRITE_DIR (icon images, any subfolder depth — covers
+    the flat/equipment/story_items layout item_icon_path() uses), figure
+    out what it is and which item_id it affects.
+
+    Returns (kind, item_id) where kind is 'override' or 'icon', or None if
+    the path isn't a recognized item asset (wrong extension, or outside
+    both directories).
+    """
+    filepath = os.path.normpath(filepath)
+    ext = os.path.splitext(filepath)[1].lower()
+
+    items_dir = os.path.normpath(ITEMS_DIR)
+    sprite_dir = os.path.normpath(ITEMS_SPRITE_DIR)
+
+    def _is_within(path, folder):
+        return path == folder or path.startswith(folder + os.sep)
+
+    if _is_within(filepath, items_dir) and ext == '.json':
+        item_id = os.path.splitext(os.path.basename(filepath))[0]
+        return ('override', item_id)
+
+    if _is_within(filepath, sprite_dir) and ext == '.png':
+        item_id = os.path.splitext(os.path.basename(filepath))[0]
+        return ('icon', item_id)
+
+    return None
+
+
+def apply_watcher_events(events):
+    """Apply a batch of ('added'|'modified'|'removed', filepath) events —
+    as produced by core.asset_watcher.AssetWatcher.poll_events() — onto the
+    live ITEMS table and ItemPickup's icon cache. Call this once per frame
+    (e.g. from Game.update()) with whatever the watcher returns; a no-op on
+    an empty list.
+    """
+    for kind, filepath in events:
+        classified = classify_asset_path(filepath)
+        if classified is None:
+            continue
+        asset_kind, item_id = classified
+
+        if asset_kind == 'override':
+            if kind == 'removed':
+                # revert_item_override already no-ops the file-delete step
+                # (os.path.exists check) when the file is already gone —
+                # exactly the case here — so it's also the right cleanup
+                # for a watcher-reported deletion: restore the built-in
+                # definition if there was one, else drop the item entirely.
+                revert_item_override(item_id)
+                print(f"🗑️ Item override removed, reverted: {item_id}")
+            else:
+                reload_item_override(item_id)
+
+        elif asset_kind == 'icon':
+            ItemPickup.invalidate_icon(item_id)
+            print(f"🔄 Reloaded item icon: {item_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -1723,12 +1842,16 @@ def _lerp_by_distance(distance, near_value, far_value):
 def item_icon_path(item_id):
     """Same convention pause_menu.py's _item_icon_path uses: equip items
     (body/hands/feet/accessory) live under a per-slot equipment/
-    subfolder rather than the flat items/ folder consumables and story
-    items use."""
+    subfolder, and story items live under their own story_items/
+    subfolder (assets/sprites/items/story_items/) — everything else
+    (plain consumables/supplies) sits directly in the flat items/
+    folder."""
     data = get_item(item_id) or {}
     slot = data.get('slot')
     if slot:
         return os.path.join('assets', 'sprites', 'items', 'equipment', slot, f'{item_id}.png')
+    if data.get('category') == CATEGORY_STORY_ITEMS:
+        return os.path.join('assets', 'sprites', 'items', 'story_items', f'{item_id}.png')
     return os.path.join('assets', 'sprites', 'items', f'{item_id}.png')
 
 
@@ -1803,6 +1926,17 @@ class ItemPickup:
                 scaled = None
             cls._icon_cache[item_id] = scaled
         return cls._icon_cache[item_id]
+
+    @classmethod
+    def invalidate_icon(cls, item_id):
+        """Drop item_id's cached icon Surface, if any, so the next
+        _load_icon() call (from draw() or get_collision_rect()/
+        get_sort_key()) re-reads it from disk instead of reusing the stale
+        cached image. This is the hot-reload hook for icon art — see
+        apply_watcher_events() above. Safe to call for an item_id that was
+        never cached (e.g. no ItemPickup of that item currently exists in
+        the world) — it's just a no-op dict pop in that case."""
+        cls._icon_cache.pop(item_id, None)
 
     @classmethod
     def _load_shadow(cls):

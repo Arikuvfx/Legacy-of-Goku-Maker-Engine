@@ -43,6 +43,14 @@ class UltraVolleyballAttack:
         self.attack_name = attack_name
         self.active = True
         self.y_sort = False
+        # dev_tools/attack_creator.py's release handling reads this off
+        # the built object (same convention as EnergySwordSpinEffect) to
+        # know release should do nothing: every segment travels the fixed
+        # travel_distance and despawns on its own timer regardless of how
+        # long the button was held, so there's no decay/stop beat to run
+        # early — see that method's own comment for the full archetype
+        # rundown.
+        self.no_release_cancel = True
 
         self.end_frame_width = end_frame_width
         self.end_frame_height = end_frame_height
@@ -103,10 +111,23 @@ class UltraVolleyballAttack:
         (rather than raising) if the sheet is missing, so a not-yet-drawn
         segment just doesn't render instead of crashing the attack."""
         try:
-            sheet = pygame.image.load(
-                f'assets/sprites/attacks/{self.attack_name}/{part_name}_{self.attack_name}.png'
-            ).convert_alpha()
+            path = f'assets/sprites/attacks/{self.attack_name}/{part_name}_{self.attack_name}.png'
+            sheet = pygame.image.load(path).convert_alpha()
             frames_per_row = sheet.get_width() // frame_width
+            if frames_per_row == 0:
+                # The file loaded fine (no exception below) but is narrower
+                # than one configured frame, so range(frames_per_row) below
+                # would just never run and silently hand back an empty
+                # list — read from the outside as "no sprites loaded" with
+                # no clue why. Surface the actual numbers instead: this is
+                # almost always frame_width/frame_height (Sizing tab, or
+                # this class's own end_/middle_/decay_frame_width kwargs)
+                # not matching the real sheet dimensions, not a missing file.
+                print(f"Ultra volleyball {part_name} sheet ({path}) is "
+                      f"{sheet.get_width()}x{sheet.get_height()}px, but "
+                      f"frame_width is {frame_width}px — 0 frames fit. "
+                      f"Check the sheet's actual size against {part_name}_frame_width/height.")
+                return None
             frames = []
             for i in range(frames_per_row):
                 x = i * frame_width

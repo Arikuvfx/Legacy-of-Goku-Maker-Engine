@@ -35,7 +35,9 @@ class Tile:
     """A single placed tile — tracks position, tileset source, and render layer."""
 
     def __init__(self, x: int, y: int, tileset_name: str, tile_x: int, tile_y: int,
-                 layer: int = -100, foreground: bool = False):
+                 layer: int = -100, foreground: bool = False,
+                 is_shadow: bool = False, shadow_alpha: int = 128,
+                 shadow_width: int = TILE_SIZE, shadow_height: int = TILE_SIZE):
         self.x = x
         self.y = y
         self.tileset_name = tileset_name
@@ -45,9 +47,15 @@ class Tile:
         self.foreground = foreground
         self.draw_layer = layer
 
+        # Native shadow tile: texture-free translucent overlay data.
+        self.is_shadow = bool(is_shadow)
+        self.shadow_alpha = max(0, min(255, int(shadow_alpha)))
+        self.shadow_width = max(1, int(shadow_width))
+        self.shadow_height = max(1, int(shadow_height))
+
     def to_dict(self):
         """Pack tile data into a dict for JSON serialization."""
-        return {
+        data = {
             'x': self.x,
             'y': self.y,
             'tileset': self.tileset_name,
@@ -56,6 +64,14 @@ class Tile:
             'layer': self.layer,
             'foreground': self.foreground
         }
+        if self.is_shadow:
+            data.update({
+                'is_shadow': True,
+                'shadow_alpha': self.shadow_alpha,
+                'shadow_width': self.shadow_width,
+                'shadow_height': self.shadow_height,
+            })
+        return data
 
     @staticmethod
     def from_dict(data):
@@ -65,10 +81,14 @@ class Tile:
             data['x'],
             data['y'],
             data.get('tileset') or data.get('tileset_name', ''),
-            data['tile_x'],
-            data['tile_y'],
+            data.get('tile_x', -1),
+            data.get('tile_y', -1),
             layer,
-            data.get('foreground', False)
+            data.get('foreground', False),
+            data.get('is_shadow', False),
+            data.get('shadow_alpha', 128),
+            data.get('shadow_width', TILE_SIZE),
+            data.get('shadow_height', TILE_SIZE),
         )
 
 
@@ -96,6 +116,14 @@ class Tileset:
         # is the sequence cycled through at runtime (anchor is usually frames[0]).
         self.tile_animations = {}
 
+        # Set of (tile_x, tile_y) tileset coordinates marked "solid" (blocks
+        # movement) in the tileset editor's collision paint mode. Any room
+        # tile painted from one of these coordinates gets an automatic
+        # full-tile CollisionObject generated for it -- see
+        # RoomEditor._sync_tile_collision. Purely tileset-graphic-level data;
+        # has no notion of which rooms use it.
+        self.solid_tiles = set()
+
         try:
             self.image = pygame.image.load(image_path).convert_alpha()
             self.tile_width = detect_tile_size(self.image)
@@ -105,6 +133,7 @@ class Tileset:
             self.rows = h // self.tile_height
             self._build_transparency_cache()
             self._load_tile_animations(image_path)
+            self._load_tile_collision(image_path)
         except (pygame.error, ValueError) as e:
             print(f"Error loading tileset {name}: {e}")
 
@@ -138,6 +167,56 @@ class Tileset:
                     self.tile_animations[anchor] = {'frames': frames, 'fps': fps}
         except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError) as e:
             print(f"Error loading tile animations for {self.name}: {e}")
+
+    def _load_tile_collision(self, image_path):
+        """Load which tiles are marked solid from a sidecar JSON file.
+
+        Looked up next to the tileset image as '<name>.collision.json'. Format:
+            { "solid": [[3, 1], [3, 2], [4, 1]] }
+        Each entry is a (tile_x, tile_y) tileset coordinate. Missing/malformed
+        files are silently ignored so a tileset with no collision data
+        defined behaves exactly as before (nothing is solid).
+        """
+        collision_path = os.path.splitext(image_path)[0] + '.collision.json'
+        if not os.path.exists(collision_path):
+            return
+
+        try:
+            with open(collision_path, 'r') as f:
+                data = json.load(f)
+            self.solid_tiles = {tuple(coord) for coord in data.get('solid', [])}
+        except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError) as e:
+            print(f"Error loading tile collision for {self.name}: {e}")
+
+    def is_tile_solid(self, tile_x, tile_y):
+        """True if (tile_x, tile_y) is marked as blocking movement."""
+        return (tile_x, tile_y) in self.solid_tiles
+
+    def set_tile_solid(self, tile_x, tile_y, solid):
+        """Set (or clear) the solid flag for one tile and persist immediately."""
+        key = (tile_x, tile_y)
+        if solid:
+            self.solid_tiles.add(key)
+        else:
+            self.solid_tiles.discard(key)
+        self.save_tile_collision()
+
+    def save_tile_collision(self):
+        """Write self.solid_tiles back out to the '<name>.collision.json' sidecar.
+
+        Overwrites the whole file with the current in-memory state, same
+        convention as save_tile_animations -- the palette UI is the single
+        source of truth, no manual JSON editing required.
+        """
+        if not self.image_path:
+            return
+        collision_path = os.path.splitext(self.image_path)[0] + '.collision.json'
+        data = {'solid': [list(coord) for coord in sorted(self.solid_tiles)]}
+        try:
+            with open(collision_path, 'w') as f:
+                json.dump(data, f, indent=2)
+        except OSError as e:
+            print(f"Error saving tile collision for {self.name}: {e}")
 
     def get_animated_coords(self, tile_x, tile_y, tick_ms):
         """Resolve (tile_x, tile_y) to its current animation frame, if animated.
@@ -413,6 +492,15 @@ class TilesetEditor:
         self.layer_input_text = ""
 
         self.foreground_mode = False
+
+        # Native shadow brush is independent of the layer value.
+        # Enable it explicitly; the current layer still determines the shadow's
+        # z-order, so a shadow can live on Ground, Base, Foreground, Top, etc.
+        self.native_shadow_enabled = False
+        self.native_shadow_alpha = 128
+        self.native_shadow_cell_w = TILE_SIZE
+        self.native_shadow_cell_h = TILE_SIZE
+
         self._last_stroke_cell = None  # (grid_x, grid_y) of last placed/erased cell
 
         # ── Animated tile authoring (palette: select frames, press A) ──────────
@@ -467,6 +555,14 @@ class TilesetEditor:
         # correct for 8px, 16px, 32px, etc. tilesets automatically.)
         self.snap_size = self.grid_size
         self.room_tiles: dict[str, List[Tile]] = {}
+
+        # Extra subscribers notified whenever notify_tile_changed() fires,
+        # alongside (not instead of) the single external on_tile_changed
+        # hook game.py installs for baked-surface cache invalidation. Lets
+        # the room editor keep tile-derived collision in sync without
+        # fighting over who owns on_tile_changed. See notify_tile_changed()
+        # and add_tile_change_listener().
+        self._tile_change_listeners = []
 
         # Cache of room_tiles sorted by layer, keyed by room name. draw_tiles()
         # is called twice per frame (background + foreground passes) and used
@@ -633,6 +729,67 @@ class TilesetEditor:
         self._pending_anim_anchor = None
         self._pending_anim_frames = None
 
+    def add_tile_change_listener(self, fn):
+        """Register an extra callback for notify_tile_changed() (see below),
+        without disturbing the single on_tile_changed hook game.py owns.
+        `fn` is called as fn(room_name, cells) — room_name may be None for
+        a global change (e.g. a tile's solid flag changed, which can't be
+        pinned to one room)."""
+        self._tile_change_listeners.append(fn)
+
+    def notify_tile_changed(self, room_name=None, cells=None):
+        """Central dispatch for 'tiles changed' notifications.
+
+        Every place that mutates room_tiles — this file's own paint/erase/
+        native-shadow code, and room_editor.py's undo/redo, copy-paste, and
+        quick-delete paths — funnels through here instead of calling
+        on_tile_changed directly, so a single change fans out to: (1) the
+        external on_tile_changed hook game.py installs to invalidate the
+        baked room-surface cache, and (2) any listeners registered via
+        add_tile_change_listener (the room editor's auto tile-collision
+        resync).
+        """
+        if callable(getattr(self, 'on_tile_changed', None)):
+            self.on_tile_changed(room_name, cells=cells)
+        for listener in self._tile_change_listeners:
+            listener(room_name, cells)
+
+    def _toggle_solid_selection(self):
+        """'C' in the palette: toggle the 'solid' (blocks movement) flag for
+        every non-empty tile in the current selection, and immediately
+        resync whichever room is open so the effect is visible without
+        needing to repaint anything.
+
+        A mixed selection (some solid, some not) is set fully solid on the
+        first press; a further press clears all of them — same one-key
+        toggle feel as animation's 'N'.
+        """
+        tileset = self.get_current_tileset()
+        if not tileset:
+            return
+
+        min_x, max_x, min_y, max_y = self._get_selection_bounds()
+        cells = [
+            (tx, ty)
+            for ty in range(min_y, max_y + 1)
+            for tx in range(min_x, max_x + 1)
+            if not tileset.is_tile_empty(tx, ty)
+        ]
+        if not cells:
+            return
+
+        make_solid = not all(tileset.is_tile_solid(tx, ty) for tx, ty in cells)
+        for tx, ty in cells:
+            tileset.set_tile_solid(tx, ty, make_solid)
+
+        verb = "Marked solid" if make_solid else "Marked non-solid"
+        self._set_anim_feedback(f"{verb}: {len(cells)} tile(s)")
+
+        # Solid state is a tileset-level property, not tied to one room, so
+        # there's no single room_name to pass — the room editor's listener
+        # resyncs whichever room is currently open.
+        self.notify_tile_changed(None)
+
     def _is_in_palette(self, mouse_x: int, mouse_y: int) -> bool:
         """Returns True when the mouse is over the palette panel."""
         if not self.palette_visible:
@@ -771,7 +928,7 @@ class TilesetEditor:
                         self.selection_end_y = min(tileset.rows - 1, self.selection_end_y + 1)
 
             elif event.key == pygame.K_DELETE or event.key == pygame.K_x:
-                mouse_x, mouse_y = pygame.mouse.get_pos()
+                mouse_x, mouse_y = getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos())
                 mouse_x, mouse_y = mouse_x / self.editor_zoom, mouse_y / self.editor_zoom
                 world_x = (mouse_x + camera_x) // RENDER_SCALE
                 world_y = (mouse_y + camera_y) // RENDER_SCALE
@@ -779,6 +936,21 @@ class TilesetEditor:
 
             elif event.key == pygame.K_n and not ctrl_pressed:
                 self._toggle_animate_selection()
+
+            elif event.key == pygame.K_c and not ctrl_pressed:
+                self._toggle_solid_selection()
+
+            elif event.key == pygame.K_k and not ctrl_pressed:
+                self.native_shadow_enabled = not self.native_shadow_enabled
+                self._last_stroke_cell = None
+
+            elif event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
+                if self._is_native_shadow_mode():
+                    self.native_shadow_alpha = max(0, self.native_shadow_alpha - 16)
+
+            elif event.key in (pygame.K_EQUALS, pygame.K_KP_PLUS):
+                if self._is_native_shadow_mode():
+                    self.native_shadow_alpha = min(255, self.native_shadow_alpha + 16)
 
         elif event.type == pygame.MOUSEBUTTONDOWN:
             mouse_x, mouse_y = event.pos
@@ -819,26 +991,30 @@ class TilesetEditor:
                     self.hidden_layers.add(self.current_layer)
                 # Invalidate the baked tile cache so the visibility change is
                 # reflected immediately — without this the old surface persists.
-                if callable(getattr(self, 'on_tile_changed', None)):
-                    self.on_tile_changed(current_room_name)
+                self.notify_tile_changed(current_room_name)
                 return
 
             # Pygame 1.x scroll convention: button 4 = scroll up, button 5 = scroll down
             # (MOUSEWHEEL event is preferred in newer pygame but both work)
-            if event.button == 4:
-                if shift_pressed:
-                    self.palette_scroll_x = max(0, self.palette_scroll_x - self.grid_cell_size)
-                else:
-                    self.palette_scroll_y = max(0, self.palette_scroll_y - self.grid_cell_size)
-            elif event.button == 5:
-                tileset = self.get_current_tileset()
-                if tileset:
+            # Only scroll the palette when the wheel happens over the palette
+            # box itself, and consume the event (return) so it doesn't also
+            # fall through to the room camera pan handler.
+            if event.button in (4, 5) and self._is_in_palette(mouse_x, mouse_y):
+                if event.button == 4:
                     if shift_pressed:
-                        max_scroll_x = max(0, tileset.cols * self.grid_cell_size - self.palette_width + 40)
-                        self.palette_scroll_x = min(max_scroll_x, self.palette_scroll_x + self.grid_cell_size)
+                        self.palette_scroll_x = max(0, self.palette_scroll_x - self.grid_cell_size)
                     else:
-                        max_scroll_y = max(0, tileset.rows * self.grid_cell_size - self.palette_content_height)
-                        self.palette_scroll_y = min(max_scroll_y, self.palette_scroll_y + self.grid_cell_size)
+                        self.palette_scroll_y = max(0, self.palette_scroll_y - self.grid_cell_size)
+                else:
+                    tileset = self.get_current_tileset()
+                    if tileset:
+                        if shift_pressed:
+                            max_scroll_x = max(0, tileset.cols * self.grid_cell_size - self.palette_width + 40)
+                            self.palette_scroll_x = min(max_scroll_x, self.palette_scroll_x + self.grid_cell_size)
+                        else:
+                            max_scroll_y = max(0, tileset.rows * self.grid_cell_size - self.palette_content_height)
+                            self.palette_scroll_y = min(max_scroll_y, self.palette_scroll_y + self.grid_cell_size)
+                return
 
             # Gate on the real screen position, not (mouse_x, mouse_y) — those
             # may already be zoom/room-space coordinates rewritten upstream by
@@ -847,7 +1023,7 @@ class TilesetEditor:
             # constants. Checking the rewritten coords against them makes
             # every off-palette click in a room bigger than the screen look
             # like it landed on the palette once zoomed out far enough.
-            real_x, real_y = pygame.mouse.get_pos()
+            real_x, real_y = event.dict.get('_room_editor_raw_pos', getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos()))
 
             if event.button == 1:
                 if self._is_in_palette(real_x, real_y):
@@ -880,7 +1056,7 @@ class TilesetEditor:
         elif event.type == pygame.MOUSEMOTION:
             # Same real-screen-position gating as MOUSEBUTTONDOWN above —
             # event.pos here may already be zoom/room-space.
-            real_x, real_y = pygame.mouse.get_pos()
+            real_x, real_y = getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos())
             if self.is_dragging and not self._is_in_palette(real_x, real_y):
                 mouse_x, mouse_y = event.pos
                 world_x = (mouse_x + camera_x) // RENDER_SCALE
@@ -962,6 +1138,121 @@ class TilesetEditor:
         return (int(world_x) // self.snap_size) * self.snap_size, \
                (int(world_y) // self.snap_size) * self.snap_size
 
+    def _is_native_shadow_mode(self) -> bool:
+        """True when the texture-free native shadow brush is active.
+
+        Shadows are deliberately independent of the selected layer. The current
+        layer is still stored on the shadow tile and therefore controls its z-order.
+        """
+        return self.native_shadow_enabled
+
+    # Backwards-compatible helper name for any external callers.
+    def _is_native_shadow_layer(self) -> bool:
+        return self._is_native_shadow_mode()
+
+    def _native_shadow_size(self, tileset=None):
+        """Return the native shadow brush size.
+
+        When the room editor's Grid control is active, native shadows use that
+        exact grid spacing (8px, 16px, etc.) instead of the global TILE_SIZE.
+        With Grid Off, fall back to the selected tileset's native footprint.
+        """
+        if self.snap_size > 0:
+            size = max(1, int(self.snap_size))
+            return size, size
+
+        if tileset is not None:
+            return (
+                max(1, int(getattr(tileset, 'tile_width', TILE_SIZE))),
+                max(1, int(getattr(tileset, 'tile_height', TILE_SIZE))),
+            )
+
+        return (
+            max(1, int(self.native_shadow_cell_w)),
+            max(1, int(self.native_shadow_cell_h)),
+        )
+
+    def _make_native_shadow_tile(self, x, y):
+        return Tile(
+            int(x), int(y), '__native_shadow__', -1, -1,
+            self.current_layer, self.current_layer >= 75,
+            is_shadow=True,
+            shadow_alpha=self.native_shadow_alpha,
+            shadow_width=self.native_shadow_cell_w,
+            shadow_height=self.native_shadow_cell_h,
+        )
+
+    def _place_native_shadow(self, world_x: int, world_y: int, room_name: str):
+        """Paint one native translucent-black shadow cell on the current layer."""
+        grid_x, grid_y = self._snap_anchor(world_x, world_y)
+        if (grid_x, grid_y) == self._last_stroke_cell:
+            return
+        self._last_stroke_cell = (grid_x, grid_y)
+
+        if room_name not in self.room_tiles:
+            self.room_tiles[room_name] = []
+
+        self._invalidate_sorted_tiles_cache(room_name)
+
+        new_w = max(1, int(self.native_shadow_cell_w))
+        new_h = max(1, int(self.native_shadow_cell_h))
+
+        kept = []
+        touched_cells = []
+        for tile in self.room_tiles[room_name]:
+            if not (tile.layer == self.current_layer and getattr(tile, 'is_shadow', False)):
+                kept.append(tile)
+                continue
+            old_w = max(1, int(getattr(tile, 'shadow_width', TILE_SIZE)))
+            old_h = max(1, int(getattr(tile, 'shadow_height', TILE_SIZE)))
+            fully_covered = (
+                grid_x <= tile.x and grid_y <= tile.y and
+                grid_x + new_w >= tile.x + old_w and
+                grid_y + new_h >= tile.y + old_h
+            )
+            if not fully_covered:
+                kept.append(tile)
+            else:
+                touched_cells.append((tile.x, tile.y, old_w, old_h))
+
+        kept.append(self._make_native_shadow_tile(grid_x, grid_y))
+        self.room_tiles[room_name] = kept
+        touched_cells.append((grid_x, grid_y, new_w, new_h))
+
+        self.notify_tile_changed(room_name, cells=touched_cells)
+
+    def _erase_native_shadow_at_position(self, world_x: int, world_y: int, room_name: str):
+        if room_name not in self.room_tiles:
+            return
+
+        removed = []
+        kept = []
+        for tile in self.room_tiles[room_name]:
+            if tile.layer != self.current_layer or not getattr(tile, 'is_shadow', False):
+                kept.append(tile)
+                continue
+            w = max(1, int(getattr(tile, 'shadow_width', TILE_SIZE)))
+            h = max(1, int(getattr(tile, 'shadow_height', TILE_SIZE)))
+            if tile.x <= world_x < tile.x + w and tile.y <= world_y < tile.y + h:
+                removed.append(tile)
+            else:
+                kept.append(tile)
+
+        if not removed:
+            return
+
+        self.room_tiles[room_name] = kept
+        self._invalidate_sorted_tiles_cache(room_name)
+        touched_cells = [
+            (
+                tile.x, tile.y,
+                max(1, int(getattr(tile, 'shadow_width', TILE_SIZE))),
+                max(1, int(getattr(tile, 'shadow_height', TILE_SIZE))),
+            )
+            for tile in removed
+        ]
+        self.notify_tile_changed(room_name, cells=touched_cells)
+
     def _place_tiles(self, world_x: int, world_y: int, room_name: str):
         """Stamp the current selection pattern into the room at the snapped world position.
 
@@ -973,6 +1264,14 @@ class TilesetEditor:
         tiles only partially overlapped are left alone since part of their
         sprite would still be visible.
         """
+        # Native shadows do not require a darkened tileset sprite and may live on any layer.
+        if self._is_native_shadow_mode():
+            self.native_shadow_cell_w, self.native_shadow_cell_h = self._native_shadow_size(
+                self.get_current_tileset()
+            )
+            self._place_native_shadow(world_x, world_y, room_name)
+            return
+
         tileset = self.get_current_tileset()
         if not tileset:
             return
@@ -1066,11 +1365,11 @@ class TilesetEditor:
                 # (e.g. 8px) and erases their already-baked pixels.
                 touched_cells.append((tile_x, tile_y, tileset.tile_width, tileset.tile_height))
 
-        # Notify listeners (e.g. auto-save) that the room content changed.
-        # Pass the exact cells touched so the renderer can patch just those
-        # spots in the baked surface instead of rebuilding the whole room.
-        if callable(getattr(self, 'on_tile_changed', None)):
-            self.on_tile_changed(room_name, cells=touched_cells)
+        # Notify listeners (e.g. auto-save, tile-collision resync) that the
+        # room content changed. Pass the exact cells touched so the
+        # renderer can patch just those spots in the baked surface instead
+        # of rebuilding the whole room.
+        self.notify_tile_changed(room_name, cells=touched_cells)
 
     def _delete_tile_at_position(self, world_x: int, world_y: int, room_name: str):
         """Remove tile(s) at the given world position on the current layer.
@@ -1091,6 +1390,10 @@ class TilesetEditor:
         removal, no matter what size it is or what grid you're currently
         placing with.
         """
+        if self._is_native_shadow_mode():
+            self._erase_native_shadow_at_position(world_x, world_y, room_name)
+            return
+
         if room_name not in self.room_tiles:
             return
 
@@ -1140,30 +1443,46 @@ class TilesetEditor:
                 cell_w, cell_h = self.grid_size, self.grid_size
             touched_cells.append((tile.x, tile.y, cell_w, cell_h))
 
-        # Notify listeners (e.g. auto-save) that the room content changed.
-        # Pass the exact cell(s) touched so the renderer can patch just
-        # those spots in the baked surface instead of rebuilding the whole
-        # room.
-        if callable(getattr(self, 'on_tile_changed', None)):
-            self.on_tile_changed(room_name, cells=touched_cells)
+        # Notify listeners (e.g. auto-save, tile-collision resync) that the
+        # room content changed. Pass the exact cell(s) touched so the
+        # renderer can patch just those spots in the baked surface instead
+        # of rebuilding the whole room.
+        self.notify_tile_changed(room_name, cells=touched_cells)
 
     def draw_tile_preview(self, screen: pygame.Surface, camera_x: int, camera_y: int):
         """Draw a semi-transparent ghost of the selected tile pattern under the cursor."""
         if not self.active:
             return
 
-        mouse_x, mouse_y = pygame.mouse.get_pos()
+        mouse_x, mouse_y = getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos())
         if self._is_in_palette(mouse_x, mouse_y):
             return
 
-        tileset = self.get_current_tileset()
-        if not tileset:
-            return
 
         mouse_x, mouse_y = mouse_x / self.editor_zoom, mouse_y / self.editor_zoom
         world_x = (mouse_x + camera_x) // RENDER_SCALE
         world_y = (mouse_y + camera_y) // RENDER_SCALE
         grid_x, grid_y = self._snap_anchor(world_x, world_y)
+
+        tileset = self.get_current_tileset()
+        if self._is_native_shadow_mode():
+            shadow_w, shadow_h = self._native_shadow_size(tileset)
+            screen_x = int(grid_x * RENDER_SCALE - camera_x)
+            screen_y = int(grid_y * RENDER_SCALE - camera_y)
+            preview_surface = pygame.Surface(
+                (shadow_w * RENDER_SCALE, shadow_h * RENDER_SCALE), pygame.SRCALPHA
+            )
+            preview_surface.fill((0, 0, 0, max(0, min(255, int(self.native_shadow_alpha)))))
+            screen.blit(preview_surface, (screen_x, screen_y))
+            screen.draw_rect(
+                self.colors['accent'],
+                (screen_x, screen_y, shadow_w * RENDER_SCALE, shadow_h * RENDER_SCALE),
+                2,
+            )
+            return
+
+        if not tileset:
+            return
 
         min_x, max_x, min_y, max_y = self._get_selection_bounds()
         scaled_width = tileset.tile_width * RENDER_SCALE
@@ -1234,6 +1553,8 @@ class TilesetEditor:
         if cached is None:
             cached = []
             for tile in self.room_tiles.get(room_name, []):
+                if getattr(tile, 'is_shadow', False):
+                    continue
                 tileset = self.tileset_manager.get_tileset(tile.tileset_name)
                 if tileset and tileset.is_tile_animated(tile.tile_x, tile.tile_y):
                     cached.append(tile)
@@ -1322,6 +1643,13 @@ class TilesetEditor:
             if layer == 'foreground' and tile.layer < 0:
                 continue
 
+            if getattr(tile, 'is_shadow', False):
+                self._draw_native_shadow(
+                    screen, tile, camera_x, camera_y,
+                    active_layer_is_visible
+                )
+                continue
+
             tileset = self.tileset_manager.get_tileset(tile.tileset_name)
             if not tileset:
                 continue
@@ -1349,12 +1677,40 @@ class TilesetEditor:
             if layer == 'foreground' and tile.layer < 0:
                 continue
 
+            if getattr(tile, 'is_shadow', False):
+                self._draw_native_shadow(
+                    screen, tile, camera_x, camera_y,
+                    active_layer_is_visible
+                )
+                continue
+
             tileset = self.tileset_manager.get_tileset(tile.tileset_name)
             if not tileset:
                 continue
 
             self._draw_single_tile(screen, tile, tileset, camera_x, camera_y,
                                     tick_ms, active_layer_is_visible)
+
+    def _draw_native_shadow(self, screen: pygame.Surface, tile: Tile,
+                            camera_x: int, camera_y: int,
+                            active_layer_is_visible: bool):
+        """Draw a native translucent black overlay."""
+        screen_x = (tile.x * RENDER_SCALE) - camera_x
+        screen_y = (tile.y * RENDER_SCALE) - camera_y
+        width = max(1, int(getattr(tile, 'shadow_width', TILE_SIZE))) * RENDER_SCALE
+        height = max(1, int(getattr(tile, 'shadow_height', TILE_SIZE))) * RENDER_SCALE
+
+        if not (-width <= screen_x <= self.screen_width and
+                -height <= screen_y <= self.screen_height):
+            return
+
+        alpha = max(0, min(255, int(getattr(tile, 'shadow_alpha', 128))))
+        if active_layer_is_visible and tile.layer != self.current_layer:
+            alpha = int(alpha * (self.INACTIVE_LAYER_ALPHA / 255.0))
+
+        overlay = pygame.Surface((width, height), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, alpha))
+        screen.blit(overlay, (int(screen_x), int(screen_y)))
 
     def _draw_single_tile(self, screen: pygame.Surface, tile: Tile, tileset: 'Tileset',
                            camera_x: int, camera_y: int, tick_ms: int,
@@ -1397,7 +1753,7 @@ class TilesetEditor:
             return
 
         # Update hover state for the toggle tab
-        mx, my = pygame.mouse.get_pos()
+        mx, my = getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos())
         self._hover_panel_toggle = self._panel_toggle_rect().collidepoint(mx, my)
 
         # Always draw the toggle tab so the panel can be recalled when hidden
@@ -1469,6 +1825,23 @@ class TilesetEditor:
                 screen.draw_circle( self.colors['accent'], (badge_x, badge_y), 5)
                 screen.draw_circle( (20, 20, 30), (badge_x, badge_y), 5, 1)
 
+            # Mark solid (collision) tiles with a red hatch overlay so their
+            # footprint is visible at a glance — echoes the red hatched look
+            # collision walls get drawn with in the room editor itself, so
+            # "red = blocks movement" reads consistently in both places.
+            for (solid_tx, solid_ty) in tileset.solid_tiles:
+                if not (0 <= solid_tx < tileset.cols and 0 <= solid_ty < tileset.rows):
+                    continue
+                cell_x = draw_x + solid_tx * self.grid_cell_size
+                cell_y = draw_y + solid_ty * self.grid_cell_size
+                size = self.grid_cell_size
+                hatch = pygame.Surface((size, size), pygame.SRCALPHA)
+                hatch.fill((255, 0, 0, 60))
+                for i in range(-size, size * 2, 6):
+                    pygame.draw.line(hatch, (255, 0, 0, 130), (i, 0), (i + size, size), 1)
+                screen.blit(hatch, (cell_x, cell_y))
+                screen.draw_rect((255, 0, 0), (cell_x, cell_y, size, size), 1)
+
             # Draw selection rectangle
             min_x, max_x, min_y, max_y = self._get_selection_bounds()
             sel_width = max_x - min_x + 1
@@ -1509,16 +1882,36 @@ class TilesetEditor:
                 hint_surf = self.font_small.render(hint_text, True, hint_color)
                 screen.blit(hint_surf, (self.palette_x + 20 + sel_surf.get_width() + 12, sel_y))
 
+        # Collision hint — shown for any selection (unlike the animation
+        # hint above, which only makes sense for a multi-tile run). Reflects
+        # whether every non-empty tile in the selection is already solid,
+        # so it's accurate even right after a mixed selection gets toggled.
+        solid_cells = [
+            (tx, ty)
+            for ty in range(min_y, max_y + 1)
+            for tx in range(min_x, max_x + 1)
+            if not tileset.is_tile_empty(tx, ty)
+        ]
+        if solid_cells:
+            all_solid = all(tileset.is_tile_solid(tx, ty) for tx, ty in solid_cells)
+            if all_solid:
+                collision_hint_text, collision_hint_color = "Solid \u2014 press C to clear", (255, 100, 100)
+            else:
+                collision_hint_text, collision_hint_color = "Press C to mark solid (blocks movement)", self.colors['text_dim']
+            collision_hint_surf = self.font_small.render(collision_hint_text, True, collision_hint_color)
+            screen.blit(collision_hint_surf, (self.palette_x + 20, sel_y + 18))
+
         # Inline FPS prompt while confirming a new animation
         if self.fps_input_active:
             prompt_text = f"New animation \u2014 FPS: {self.fps_input_text}_  (Enter to confirm, Esc to cancel)"
             prompt_surf = self.font_small.render(prompt_text, True, self.colors['accent'])
-            screen.blit(prompt_surf, (self.palette_x + 20, sel_y))
+            screen.blit(prompt_surf, (self.palette_x + 20, sel_y + 36))
 
-        # Brief confirmation after animating/un-animating a selection
+        # Brief confirmation after animating/un-animating a selection, or
+        # after toggling solid/collision on a selection.
         elif self.anim_feedback_text and pygame.time.get_ticks() < self.anim_feedback_until_ms:
             fb_surf = self.font_small.render(self.anim_feedback_text, True, self.colors['success'])
-            screen.blit(fb_surf, (self.palette_x + 20, sel_y + 18))
+            screen.blit(fb_surf, (self.palette_x + 20, sel_y + 36))
 
         # Controls below the palette content
         controls_y = tileset_y + self.palette_content_height + 10
@@ -1620,7 +2013,7 @@ class TilesetEditor:
                 self.ui_rects[f'layer_option_{i}'] = option_rect
 
                 # Highlight hovered option
-                mouse_pos = pygame.mouse.get_pos()
+                mouse_pos = getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos())
                 if option_rect.collidepoint(mouse_pos):
                     screen.draw_rect( self.colors['button_hover'], option_rect)
                 else:
@@ -1631,6 +2024,17 @@ class TilesetEditor:
                 display_text = name if value is None else f"{name} ({value})"
                 option_text = self.font_small.render(display_text, True, self.colors['text'])
                 screen.blit(option_text, (dropdown_x + 8, menu_y + i * 25 + 5))
+
+        shadow_status = self.font_small.render(
+            f"Native Shadow: {'ON' if self.native_shadow_enabled else 'OFF'}  ({round(self.native_shadow_alpha / 255 * 100)}%)",
+            True, self.colors['success'] if self.native_shadow_enabled else self.colors['text_dim']
+        )
+        screen.blit(shadow_status, (self.palette_x + 340, layer_y + 35))
+        shadow_help = self.font_small.render(
+            "K: toggle  Click/drag = shadow  -/+ = opacity",
+            True, self.colors['text_dim']
+        )
+        screen.blit(shadow_help, (self.palette_x + 340, layer_y + 53))
 
         # Instructions
         instructions = [
@@ -1644,6 +2048,8 @@ class TilesetEditor:
             "Scroll: Pan Tileset",
             "Click World: Place Pattern",
             "Right Click: Delete Tile",
+            "K: Toggle Native Shadow brush (works on any layer)",
+            "Shadow opacity: - / +",
             "Select frames, A: Animate",
             "\u25cf on tile = animated",
             "F2: Close Editor"
@@ -1666,26 +2072,53 @@ class TilesetEditor:
 
         step = self.snap_size
 
+        # Room viewport is everything left of the palette panel (when it's
+        # open). During continuous editor zoom, `screen` is a virtual
+        # coordinate space (screen_width == real_width / zoom), while
+        # palette_x is still a REAL screen coordinate. Convert the palette edge
+        # into that virtual space before clipping.
+        if self.palette_visible:
+            zoom = max(0.001, float(getattr(self, 'editor_zoom', 1.0)))
+            viewport_width = min(
+                self.screen_width,
+                int(math.ceil(self.palette_x / zoom))
+            )
+        else:
+            viewport_width = self.screen_width
+
         visible_x_start = camera_x // RENDER_SCALE
         visible_y_start = camera_y // RENDER_SCALE
-        visible_x_end = (camera_x + self.screen_width) // RENDER_SCALE
+        visible_x_end = (camera_x + viewport_width) // RENDER_SCALE
         visible_y_end = (camera_y + self.screen_height) // RENDER_SCALE
 
+        clip_rect = pygame.Rect(0, 0, viewport_width, self.screen_height)
+        screen.set_clip(clip_rect)
+
         # Draw vertical lines
+        # Use floor rather than int() to convert to a pixel column: int()
+        # truncates toward zero, so lines left of world x=0 (negative
+        # screen_x) get rounded the opposite way from lines to the right
+        # (positive screen_x). That mismatch lands exactly on the grid cell
+        # straddling the origin, shrinking it by a pixel and making its
+        # bounding lines look merged/thicker than the rest of the grid.
         start_x = (visible_x_start // step) * step
         for x in range(start_x, visible_x_end + step, step):
             screen_x = (x * RENDER_SCALE) - camera_x
-            if -10 <= screen_x <= self.screen_width + 10:
+            if -10 <= screen_x <= viewport_width + 10:
+                px = math.floor(screen_x)
                 screen.draw_line( self.colors['grid'][:3],
-                                 (int(screen_x), 0), (int(screen_x), self.screen_height), 1)
+                                 (px, 0), (px, self.screen_height), 1)
 
         # Draw horizontal lines
         start_y = (visible_y_start // step) * step
         for y in range(start_y, visible_y_end + step, step):
             screen_y = (y * RENDER_SCALE) - camera_y
             if -10 <= screen_y <= self.screen_height + 10:
+                py = math.floor(screen_y)
                 screen.draw_line( self.colors['grid'][:3],
-                                 (0, int(screen_y)), (self.screen_width, int(screen_y)), 1)
+                                 (0, py), (viewport_width, py), 1)
+
+        screen.set_clip(None)
 
     def save_room_tiles(self, room_name: str, filepath: str):
         """Serialize all tiles for a room to a JSON file."""

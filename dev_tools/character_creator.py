@@ -143,6 +143,10 @@ DEFAULT_CONFIG: dict = {
     # ui/scouter_menu.py's _get_entity_description / _draw_data_description).
     "description":  "",
     "costume":      "default",
+    # Sprite-sheet frame dimensions for normal/base art.
+    # Individual transformations can override these per form.
+    "sprite_width":  32,
+    "sprite_height": 32,
     "shadow_size":  32,
     # This character's assigned color — used to color-code anything tied
     # to a specific character in-game (e.g. a level gate's number, so the
@@ -366,7 +370,7 @@ def load_walk_frames(char_id: str, form: str) -> list[pygame.Surface]:
     if not folder.exists():
         return []
 
-    frame_w, frame_h = _read_sprite_size(folder)
+    frame_w, frame_h = get_form_sprite_size(char_id, form)
 
     for stem in ("walk", "idle", "run"):
         png = folder / f"{stem}.png"
@@ -552,7 +556,7 @@ def discover_animations(char_id: str, form: str) -> dict[str, list[pygame.Surfac
     if not folder.exists():
         return {}
 
-    frame_w, frame_h = _read_sprite_size(folder)
+    frame_w, frame_h = get_form_sprite_size(char_id, form)
     result: dict[str, list[pygame.Surface]] = {}
 
     for png in sorted(folder.glob("*.png")):
@@ -584,6 +588,14 @@ def load_config(char_id: str) -> dict:
             for sub in ("stats", "attacks"):
                 merged[sub].update(data.get(sub, {}))
             merged["id"] = char_id
+            if "sprite_width" not in data or "sprite_height" not in data:
+                legacy_folder = SPRITES_DIR / char_id / merged.get("costume", "")
+                if not legacy_folder.is_dir():
+                    discovered = discover_costumes(char_id)
+                    legacy_folder = SPRITES_DIR / char_id / (discovered[0] if discovered else "base")
+                lw, lh = _read_sprite_size(legacy_folder)
+                merged["sprite_width"] = lw
+                merged["sprite_height"] = lh
             return merged
         except Exception:
             pass
@@ -609,6 +621,63 @@ def load_config(char_id: str) -> dict:
     cfg["costume"] = real_costumes[0] if real_costumes else "base"
     return cfg
 
+
+def get_form_sprite_size(char_id: str, form: str = "base") -> tuple[int, int]:
+    """Return the frame size for a character form.
+
+    Saved creator JSON is authoritative. For characters that have not been
+    migrated/saved yet, the old sprite_size.txt is still honored so opening
+    the creator does not change how legacy art is sliced.
+    """
+    config_path = CHARACTERS_DIR / f"{char_id}.json"
+    raw = {}
+    if config_path.exists():
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                loaded = json.load(f)
+            raw = loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            raw = {}
+
+    base_w = raw.get("sprite_width")
+    base_h = raw.get("sprite_height")
+    try:
+        base_size = (max(1, int(base_w)), max(1, int(base_h)))             if base_w is not None and base_h is not None else None
+    except (TypeError, ValueError):
+        base_size = None
+
+    form = str(form or "")
+    if "/transformations/" in form:
+        for tf in raw.get("transformations", []) or []:
+            if isinstance(tf, dict) and tf.get("costume") == form:
+                try:
+                    if tf.get("sprite_width") is not None and tf.get("sprite_height") is not None:
+                        return max(1, int(tf["sprite_width"])), max(1, int(tf["sprite_height"]))
+                except (TypeError, ValueError):
+                    pass
+                break
+
+        if base_size:
+            return base_size
+        legacy_folder = SPRITES_DIR / char_id / form
+        return _read_sprite_size(legacy_folder)
+
+    for tf in raw.get("transformations", []) or []:
+        if not isinstance(tf, dict):
+            continue
+        costume = str(tf.get("costume", ""))
+        if costume.endswith(f"/transformations/{form}") or tf.get("id") == form:
+            try:
+                if tf.get("sprite_width") is not None and tf.get("sprite_height") is not None:
+                    return max(1, int(tf["sprite_width"])), max(1, int(tf["sprite_height"]))
+            except (TypeError, ValueError):
+                pass
+            break
+
+    if base_size:
+        return base_size
+
+    return _read_sprite_size(SPRITES_DIR / char_id / form)
 
 def save_config(cfg: dict) -> None:
     CHARACTERS_DIR.mkdir(parents=True, exist_ok=True)
@@ -814,10 +883,17 @@ def sync_transformations(cfg: dict, costumes: list[str],
         # silently re-adding it every time the character is loaded.
         if costume_path in removed:
             continue
+        transform_folder = SPRITES_DIR / cfg.get("id", "") / costume_path
+        legacy_w, legacy_h = _read_sprite_size(
+            transform_folder,
+            int(cfg.get("sprite_width", 32)),
+        )
         transformations.append({
             "id":            form,
             "display_name":  form.replace("_", " ").upper(),
             "costume":       costume_path,
+            "sprite_width":  legacy_w,
+            "sprite_height": legacy_h,
             "power_mult":    1.0,
             "defense_mult":  1.0,
             "speed_mult":    1.0,
@@ -1602,6 +1678,16 @@ class CharacterEditor:
         y += row_h
         self.costume_idx   = costumes.index(cfg["costume"]) if cfg["costume"] in costumes else 0
 
+        # Sprite-sheet frame size for normal/base art.
+        self.sprite_width_slider = Slider(
+            pygame.Rect(fx, 0, fw - 50, 20), 4, 256,
+            cfg.get("sprite_width", 32), step=1
+        )
+        self.sprite_height_slider = Slider(
+            pygame.Rect(fx, 0, fw - 50, 20), 4, 256,
+            cfg.get("sprite_height", 32), step=1
+        )
+
         # Gate/identity color — picked via a hue-strip + saturation/value
         # square (see _draw_identity), same widget style as the animated
         # region color picker in dev_tools/object_editor.py. Rects are
@@ -1640,6 +1726,14 @@ class CharacterEditor:
             pygame.Rect(fx, y + 6, fw - 50, 20),
             8, 96, cfg["shadow_size"], step=4
         )
+
+        # Halo — toggles drawing assets/sprites/universal/halo.png on top of
+        # the player sprite (same layer, drawn after so it renders above).
+        # Position is not exposed here — it's tuned manually in player.py
+        # via halo_offset_x/halo_offset_y, same pattern as the shadow
+        # offset constants there. This is just the on/off switch.
+        self.halo_enabled = bool(cfg.get("halo_enabled", False))
+        self._halo_checkbox_rect: Optional[pygame.Rect] = None
 
         # ── Stats tab ───────────────────────────────────────────────
         stats = cfg["stats"]
@@ -1964,6 +2058,12 @@ class CharacterEditor:
             if form_name in picker_list else 0
         )
         self.transform_sliders = {
+            "sprite_width":  Slider(pygame.Rect(fx, 0, fw - 50, 20), 4, 256,
+                                    tf.get("sprite_width", self.cfg.get("sprite_width", 32)),
+                                    1, "{:.0f}px"),
+            "sprite_height": Slider(pygame.Rect(fx, 0, fw - 50, 20), 4, 256,
+                                    tf.get("sprite_height", self.cfg.get("sprite_height", 32)),
+                                    1, "{:.0f}px"),
             "power_mult":   Slider(pygame.Rect(fx, 0, fw - 50, 20),
                                     0.5, 5.0, tf.get("power_mult", 1.0), 0.05, "{:.2f}x"),
             "defense_mult": Slider(pygame.Rect(fx, 0, fw - 50, 20),
@@ -2030,7 +2130,10 @@ class CharacterEditor:
         self.cfg["display_name"] = self.name_input.value.strip() or self.char_id
         self.cfg["description"]  = self.desc_input.value.strip()
         self.cfg["costume"]      = self.costumes[self.costume_idx]
+        self.cfg["sprite_width"]  = int(self.sprite_width_slider.value)
+        self.cfg["sprite_height"] = int(self.sprite_height_slider.value)
         self.cfg["shadow_size"]  = int(self.shadow_slider.value)
+        self.cfg["halo_enabled"] = self.halo_enabled
         self.cfg["color"]       = self.selected_color
 
         for key, sl in self.stat_sliders.items():
@@ -2057,7 +2160,12 @@ class CharacterEditor:
             else:
                 tf.setdefault("costume", f"{base_costume}/transformations/{tf.get('id', '')}")
             for key, sl in self.transform_sliders.items():
-                tf[key] = round(sl.value, 2) if key != "ki_drain" else round(sl.value, 1)
+                if key in ("sprite_width", "sprite_height"):
+                    tf[key] = int(sl.value)
+                elif key == "ki_drain":
+                    tf[key] = round(sl.value, 1)
+                else:
+                    tf[key] = round(sl.value, 2)
             tf["ki_color"] = self.transform_ki_color if self.transform_ki_color_enabled else None
             tf["ki_bar_enabled"] = self.transform_ki_bar_enabled
             tf["requires"] = self.transform_requires
@@ -2076,9 +2184,14 @@ class CharacterEditor:
         if active_tab == TAB_IDENTITY:
             changed |= self.name_input.handle_event(event)
             changed |= self.desc_input.handle_event(event)
+            changed |= self.sprite_width_slider.handle_event(event)
+            changed |= self.sprite_height_slider.handle_event(event)
             changed |= self.shadow_slider.handle_event(event)
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if self._color_sv_rect and self._color_sv_rect.collidepoint(event.pos):
+                if self._halo_checkbox_rect and self._halo_checkbox_rect.collidepoint(event.pos):
+                    self.halo_enabled = not self.halo_enabled
+                    changed = True
+                elif self._color_sv_rect and self._color_sv_rect.collidepoint(event.pos):
                     self._color_sv_dragging = True
                     self._set_color_sv_from_mouse(event.pos, self._color_sv_rect)
                     changed = True
@@ -2409,9 +2522,32 @@ class CharacterEditor:
         surf.blit(costume_lbl, (fx + 34, y + 5))
         y += row_h
 
+        draw_label(surf, font_sm, "Sprite Width", lx, y + 6)
+        self.sprite_width_slider.rect.y = y + 6
+        self.sprite_width_slider.draw(surf, font_sm)
+        y += row_h
+
+        draw_label(surf, font_sm, "Sprite Height", lx, y + 6)
+        self.sprite_height_slider.rect.y = y + 6
+        self.sprite_height_slider.draw(surf, font_sm)
+        y += row_h
+
         draw_label(surf, font_sm, "Shadow Size", lx, y + 6)
         self.shadow_slider.rect.y = y + 6
         self.shadow_slider.draw(surf, font_sm)
+        y += row_h
+
+        # ── Halo — draws assets/sprites/universal/halo.png on top of the
+        # player sprite when checked. Position is tuned manually in
+        # player.py (halo_offset_x/halo_offset_y), not here.
+        draw_label(surf, font_sm, "Halo", lx, y + 6)
+        halo_cb_rect = pygame.Rect(fx, y + 4, 20, 20)
+        surf.draw_rect(C_PANEL_DARK, halo_cb_rect, border_radius=3)
+        surf.draw_rect(C_BORDER, halo_cb_rect, 1, border_radius=3)
+        if self.halo_enabled:
+            surf.draw_line(C_ACCENT, halo_cb_rect.topleft, halo_cb_rect.bottomright, 2)
+            surf.draw_line(C_ACCENT, halo_cb_rect.topright, halo_cb_rect.bottomleft, 2)
+        self._halo_checkbox_rect = halo_cb_rect
         y += row_h
 
         # ── Assigned color — hue-strip + saturation/value picker. Used to
@@ -2732,12 +2868,14 @@ class CharacterEditor:
         y += row_h
 
         LABELS = {
+            "sprite_width":  "Sprite Width",
+            "sprite_height": "Sprite Height",
             "power_mult":   "Power x",
             "defense_mult": "Defense x",
             "speed_mult":   "Speed x",
             "ki_drain":     "Ki Drain /s",
         }
-        for key in ("power_mult", "defense_mult", "speed_mult", "ki_drain"):
+        for key in ("sprite_width", "sprite_height", "power_mult", "defense_mult", "speed_mult", "ki_drain"):
             sl = self.transform_sliders.get(key)
             if not sl:
                 continue
@@ -3218,6 +3356,8 @@ class CharacterCreator:
             "id":            new_id,
             "display_name":  new_id.replace("_", " ").title(),
             "costume":       default_costume,
+            "sprite_width":  int(ed.cfg.get("sprite_width", 32)),
+            "sprite_height": int(ed.cfg.get("sprite_height", 32)),
             "power_mult":    1.0,
             "defense_mult":  1.0,
             "speed_mult":    1.0,

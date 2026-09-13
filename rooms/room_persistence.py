@@ -34,6 +34,8 @@ class RoomPersistence:
                 'nimbus_clouds':        self._serialize_nimbus_clouds(room),
                 'save_points':          self._serialize_save_points(room),
                 'world_map_objects':     self._serialize_world_map_objects(room),
+                'fishing_areas':         self._serialize_fishing_areas(room),
+                'ambient_sounds':        self._serialize_ambient_sounds(room),
                 'music_track':           getattr(room, 'music_track', ''),
                 'ambient_weather':       getattr(room, 'ambient_weather', 'none'),
                 'can_attack':            getattr(room, 'can_attack', True),
@@ -101,9 +103,27 @@ class RoomPersistence:
     def _serialize_tiles(self, room):
         if not getattr(room, 'tiles', None):
             return []
-        return [{'x': t.x, 'y': t.y, 'tileset_name': t.tileset_name,
-                 'tile_x': t.tile_x, 'tile_y': t.tile_y, 'layer': t.layer}
-                for t in room.tiles]
+        out = []
+        for t in room.tiles:
+            d = {
+                'x': t.x,
+                'y': t.y,
+                'tileset_name': t.tileset_name,
+                'tile_x': t.tile_x,
+                'tile_y': t.tile_y,
+                'layer': t.layer,
+            }
+            if getattr(t, 'foreground', False):
+                d['foreground'] = True
+            if getattr(t, 'is_shadow', False):
+                d.update({
+                    'is_shadow': True,
+                    'shadow_alpha': getattr(t, 'shadow_alpha', 128),
+                    'shadow_width': getattr(t, 'shadow_width', 16),
+                    'shadow_height': getattr(t, 'shadow_height', 16),
+                })
+            out.append(d)
+        return out
 
     def _serialize_map_paint(self, room):
         """Scouter minimap silhouette painted in the room editor's Map Paint
@@ -120,7 +140,14 @@ class RoomPersistence:
         if not getattr(room, 'collision_objects', None):
             return []
         return [{'x': o.x, 'y': o.y, 'width': o.width, 'height': o.height,
-                 'collision_type': getattr(o, 'collision_type', 'wall')}
+                 'collision_type': getattr(o, 'collision_type', 'wall'),
+                 # Shared id tagging every box in a Shift-dragged diagonal
+                 # run (see CollisionObject.diagonal_group_id) so the
+                 # editor can still draw/select/delete the whole run as
+                 # one merged wall after a save/reload -- omitted (falls
+                 # back to None on load) for the common case of an
+                 # ordinary, non-diagonal wall.
+                 'diagonal_group_id': getattr(o, 'diagonal_group_id', None)}
                 for o in room.collision_objects]
 
     def _serialize_level_gates(self, room):
@@ -248,10 +275,44 @@ class RoomPersistence:
         from objects.world_map import WorldMapObject
         return [WorldMapObject.from_dict(o) for o in data]
 
+    def _serialize_fishing_areas(self, room):
+        if not getattr(room, 'fishing_areas', None):
+            return []
+        return [a.to_dict() for a in room.fishing_areas]
+
+    def deserialize_fishing_areas(self, data):
+        from objects.fishing_area import FishingArea
+        return [FishingArea.from_dict(a) for a in data]
+
+    def _serialize_ambient_sounds(self, room):
+        """Serialize positional ambient sound emitters without mixer state."""
+        sounds = getattr(room, 'ambient_sounds', None)
+        if not sounds:
+            return []
+        out = []
+        for sound in sounds:
+            if hasattr(sound, 'to_dict'):
+                out.append(sound.to_dict())
+            elif isinstance(sound, dict):
+                out.append({
+                    'x': sound.get('x', 0),
+                    'y': sound.get('y', 0),
+                    'sound_name': sound.get('sound_name', sound.get('sound', '')),
+                    'max_distance': sound.get('max_distance', sound.get('radius', 256)),
+                })
+        return out
+
     def _serialize_doors(self, room):
         if not getattr(room, 'doors', None):
             return []
         return [d.to_dict() for d in room.doors]
+
+    def deserialize_ambient_sounds(self, data):
+        """Create AmbientSoundObject instances from saved room data."""
+        if not data:
+            return []
+        from objects.ambient_sound_object import AmbientSoundObject
+        return [AmbientSoundObject.from_dict(d) for d in data]
 
     def deserialize_doors(self, data):
         from objects.door_object import Door
@@ -302,9 +363,22 @@ class RoomPersistence:
 
     def deserialize_tiles(self, tiles_data):
         from dev_tools.room_editor.room_editor_tools.tileset_editor import Tile
-        return [Tile(x=t['x'], y=t['y'], tileset_name=t['tileset_name'],
-                     tile_x=t['tile_x'], tile_y=t['tile_y'], layer=t['layer'])
-                for t in tiles_data]
+        return [
+            Tile(
+                x=t['x'],
+                y=t['y'],
+                tileset_name=t.get('tileset_name') or t.get('tileset', ''),
+                tile_x=t.get('tile_x', -1),
+                tile_y=t.get('tile_y', -1),
+                layer=t.get('layer', -100),
+                foreground=t.get('foreground', False),
+                is_shadow=t.get('is_shadow', False),
+                shadow_alpha=t.get('shadow_alpha', 128),
+                shadow_width=t.get('shadow_width', 16),
+                shadow_height=t.get('shadow_height', 16),
+            )
+            for t in tiles_data
+        ]
 
     def deserialize_map_paint(self, map_paint_data):
         """Plain [gx, gy] pairs, same shape written by _serialize_map_paint
@@ -319,6 +393,7 @@ class RoomPersistence:
             obj = CollisionObject(x=d['x'], y=d['y'], width=d['width'], height=d['height'])
             if 'collision_type' in d:
                 obj.collision_type = d['collision_type']
+            obj.diagonal_group_id = d.get('diagonal_group_id')
             out.append(obj)
         return out
 
@@ -515,6 +590,8 @@ class RoomManagerWithPersistence:
         room.nimbus_clouds       = self.persistence.deserialize_nimbus_clouds(data['nimbus_clouds'])   if data.get('nimbus_clouds')       else []
         room.save_points         = self.persistence.deserialize_save_points(data['save_points'])      if data.get('save_points')         else []
         room.world_map_objects   = self.persistence.deserialize_world_map_objects(data['world_map_objects']) if data.get('world_map_objects') else []
+        room.fishing_areas       = self.persistence.deserialize_fishing_areas(data['fishing_areas'])   if data.get('fishing_areas')       else []
+        room.ambient_sounds      = self.persistence.deserialize_ambient_sounds(data.get('ambient_sounds', []))
         room.music_track         = data.get('music_track', '')
         room.ambient_weather     = data.get('ambient_weather', 'none')
         room.can_attack          = data.get('can_attack', True)

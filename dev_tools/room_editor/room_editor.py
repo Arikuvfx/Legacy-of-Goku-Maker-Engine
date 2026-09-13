@@ -20,6 +20,7 @@ from collections import deque
 from core.camera import Camera
 from config.settings import RENDER_SCALE, TILE_SIZE
 from dev_tools.room_editor.room_editor_tools.object_editor import ObjectEditor
+from objects.ambient_sound_object import AmbientSoundObject
 from dev_tools.room_editor.room_editor_tools.entity_editor import EntityEditor
 from dev_tools import entity_creator
 
@@ -32,6 +33,13 @@ _MAX_UNDO = 50
 # mouse-up is treated as "finish the box select" rather than "plain click,
 # deselect everything".
 _RUBBER_BAND_CLICK_THRESHOLD = 4
+
+# Same deadzone, but in screen pixels rather than world units. Used for the
+# actual click-vs-drag decision (see _handle_select_drag_event) so a given
+# physical mouse movement reads the same way regardless of the editor's
+# current zoom level — the world-space threshold above shrinks or grows in
+# screen terms as you zoom, which made clicks vs. drags feel inconsistent.
+_RUBBER_BAND_CLICK_THRESHOLD_PX = 4
 
 
 class _SurfaceDrawCompat:
@@ -165,11 +173,28 @@ class _ZoomedScreen:
 
     def _rect(self, rect):
         r = pygame.Rect(rect)
-        return pygame.Rect(
-            round(r.x * self._zoom), round(r.y * self._zoom),
-            max(1, round(r.w * self._zoom)),
-            max(1, round(r.h * self._zoom)),
-        )
+        # Width/height come from the *difference* of the two rounded edges,
+        # not from rounding r.w/r.h on their own. Rounding position and size
+        # independently means two tiles sharing an edge in world space (tile
+        # A at x=0 w=16, tile B at x=16 w=16) can each round to a slightly
+        # different pixel span once zoom isn't a clean integer — e.g. at
+        # zoom=0.9, round(16*0.9)=14 for A's width, but B starts at
+        # round(16*0.9)=14 too, and A's own start rounds to 0, so A actually
+        # only fills [0,14) while B starts at 14 — that happens to line up,
+        # but the general case doesn't: round(w*zoom) drifts independently
+        # of round(x*zoom) as x grows, opening a 1px gap (background
+        # bleeding through) or overlap at essentially every tile boundary
+        # once you're a few tiles from the origin. That shows up as
+        # seam/grid-like lines across zoomed tiles that have nothing to do
+        # with the actual grid overlay or its show_grid toggle. Deriving
+        # width from edge-to-edge rounding instead guarantees adjacent
+        # rects always share a pixel-exact boundary, same as how
+        # _draw_default_grid already avoids this for its own lines.
+        x0 = round(r.x * self._zoom)
+        y0 = round(r.y * self._zoom)
+        x1 = round((r.x + r.w) * self._zoom)
+        y1 = round((r.y + r.h) * self._zoom)
+        return pygame.Rect(x0, y0, max(1, x1 - x0), max(1, y1 - y0))
 
     def _point(self, point):
         return (round(point[0] * self._zoom), round(point[1] * self._zoom))
@@ -184,11 +209,7 @@ class _ZoomedScreen:
             x, y = dest
             a = area if isinstance(area, pygame.Rect) else (pygame.Rect(area) if area is not None else None)
             w, h = a.size if a else surface.get_size()
-            dst = pygame.Rect(
-                round(x * self._zoom), round(y * self._zoom),
-                max(1, round(w * self._zoom)),
-                max(1, round(h * self._zoom)),
-            )
+            dst = self._rect((x, y, w, h))
         return self._screen.blit(surface, dst, area=area, special_flags=special_flags)
 
     def blit_scaled(self, surface, dst_rect, area=None):
@@ -210,11 +231,7 @@ class _ZoomedScreen:
                     x, y = dest
                     a = area if isinstance(area, pygame.Rect) else (pygame.Rect(area) if area is not None else None)
                     w, h = a.size if a else surface.get_size()
-                    rects.append(pygame.Rect(
-                        round(x * self._zoom), round(y * self._zoom),
-                        max(1, round(w * self._zoom)),
-                        max(1, round(h * self._zoom)),
-                    ))
+                    rects.append(self._rect((x, y, w, h)))
         return rects
 
     def blit_transient(self, surface, dest, area=None):
@@ -224,11 +241,7 @@ class _ZoomedScreen:
             x, y = dest
             a = area if isinstance(area, pygame.Rect) else (pygame.Rect(area) if area is not None else None)
             w, h = a.size if a else surface.get_size()
-            dst = pygame.Rect(
-                round(x * self._zoom), round(y * self._zoom),
-                max(1, round(w * self._zoom)),
-                max(1, round(h * self._zoom)),
-            )
+            dst = self._rect((x, y, w, h))
         return self._screen.blit_transient(surface, dst, area=area)
 
     def fill(self, color, rect=None, special_flags=0):
@@ -317,6 +330,10 @@ class _HistoryEntry:
                        (kind, item, obj_type, old_x, old_y, new_x, new_y);
                        kind is 'entity' | 'object' | 'tile')
     'area_remove'   – a box-selected group was deleted (data: {'room', 'items': list of (kind, item, obj_type)})
+    'area_add'      – a pasted tile group was added    (data: {'room', 'items': list of (kind, item, obj_type)})
+                       — same shape as 'area_remove' but with add/remove
+                       reversed: forward (redo) adds the items, reverse
+                       (undo) removes them.
     """
     # __slots__ keeps each entry lean — we store thousands of these over a session
     __slots__ = ('action', 'data')
@@ -334,6 +351,8 @@ class RoomEditor:
         self.screen_width = screen_width
         self.screen_height = screen_height
         self.active = False
+        # Always stored in renderer logical coordinates.
+        self._logical_mouse_pos = (screen_width // 2, screen_height // 2)
 
         self.font_title = pygame.font.Font(None, 48)
         self.font_large = pygame.font.Font(None, 32)
@@ -365,6 +384,10 @@ class RoomEditor:
         # caused the cache to be poisoned on the very first frame of gameplay.
         from dev_tools.room_editor.room_editor_tools.tileset_editor import TilesetEditor
         self.tileset_editor = TilesetEditor(screen_width, screen_height)
+        # Keep tile-derived collision in sync with whatever's marked solid
+        # in the tileset editor, on every tile add/remove/undo/paste — see
+        # _on_tiles_changed_resync_collision and _sync_tile_collision.
+        self.tileset_editor.add_tile_change_listener(self._on_tiles_changed_resync_collision)
         self.object_editor = None
         self.flag_manager = None
         self.entity_editor = None
@@ -421,6 +444,16 @@ class RoomEditor:
         self._music_dropdown_rects: dict = {}
         self._music_dropdown_scroll  = 0
 
+        # Room BGS (ambient loop, e.g. rain/wind) dropdown state — same
+        # popup-list convention as Room Music, but scans
+        # assets/audio/sfx/ambient instead of assets/audio/music.
+        self._bgs_files: list = []
+        self._bgs_scan_done  = False
+        self._bgs_dropdown_open    = False
+        self._bgs_field_rect       = pygame.Rect(0, 0, 0, 0)
+        self._bgs_dropdown_rects: dict = {}
+        self._bgs_dropdown_scroll  = 0
+
         # Background sub-panel state (ported from EditorToolbar — see that
         # file's history for the original implementation)
         self._bg_panel_open   = False
@@ -466,7 +499,20 @@ class RoomEditor:
         self._group_drag_anchor = None    # (world_x, world_y) at the start of a group drag
         self._group_was_dragging = False  # True once the group has actually moved this drag
         self._single_drag_click_origin = None  # (world_x, world_y) at mousedown, for the click-vs-drag deadzone below
+        self._single_drag_click_origin_screen = None  # screen-space counterpart, used for the actual deadzone check
         self._cutscene_drag_click_origin = None  # (world_x, world_y) at mousedown, same deadzone for the cutscene-trigger intercept below
+        self._rubber_band_start_screen = None   # (mx, my) screen coords at mousedown — click-vs-drag deadzone is judged in screen space so it feels the same at any zoom level
+        self._group_drag_anchor_screen = None   # screen-space counterpart of _group_drag_anchor, same reason
+
+        # ── Copy / paste (Ctrl+C / Ctrl+V) ──────────────────────────────────
+        # Holds copied *tiles* only — objects/entities have per-type manager
+        # bookkeeping (singleton spawns, linked transition targets, etc.) that
+        # makes a blind duplicate risky, so the clipboard is scoped to the
+        # map layer, which is what "copy this section of the map" means in
+        # practice. Each entry is a dict of tile fields plus (dx, dy): the
+        # offset from the top-left of the copied selection, so pasting can
+        # re-anchor the whole shape under the cursor.
+        self._tile_clipboard = []
 
         # ── Undo / redo ──────────────────────────────────────────────────────
         self._undo_stack = deque(maxlen=_MAX_UNDO)
@@ -661,6 +707,11 @@ class RoomEditor:
         if not self.active:
             return None
 
+        # Events entering RoomEditor have already been normalized by Game/SDL
+        # into renderer-logical coordinates. Keep that as the authoritative cursor.
+        if hasattr(event, 'pos'):
+            self._logical_mouse_pos = tuple(event.pos)
+
         # Text-field modal is open — swallow all input until confirmed/cancelled
         if self.editing_field is not None:
             if event.type == pygame.KEYDOWN:
@@ -693,6 +744,10 @@ class RoomEditor:
         # Room Music dropdown (Room Settings) is open — same convention.
         if self.current_view == 'edit' and self._music_dropdown_open:
             return self.handle_music_dropdown_event(event)
+
+        # Room BGS dropdown (Room Settings) is open — same convention.
+        if self.current_view == 'edit' and self._bgs_dropdown_open:
+            return self.handle_bgs_dropdown_event(event)
 
         # Room viewing mode gets special treatment (includes mouse)
         if self.current_view == 'view_room':
@@ -851,7 +906,7 @@ class RoomEditor:
 
         elif self.current_view == 'edit':
             edit_fields = ['name', 'width', 'height', 'group',
-                           'weather', 'music', 'can_attack', 'background',
+                           'weather', 'music', 'bgs', 'can_attack', 'background',
                            'save', 'delete', 'cancel']
             field = edit_fields[self.selected_index]
 
@@ -886,6 +941,10 @@ class RoomEditor:
                 self._ensure_music_scanned()
                 self._music_dropdown_scroll = 0
                 self._music_dropdown_open = True
+            elif field == 'bgs':
+                self._ensure_bgs_scanned()
+                self._bgs_dropdown_scroll = 0
+                self._bgs_dropdown_open = True
             elif field == 'can_attack':
                 self.editing_room.can_attack = not getattr(self.editing_room, 'can_attack', True)
             elif field == 'background':
@@ -922,6 +981,41 @@ class RoomEditor:
 
         return None
 
+    def _ensure_ambient_sound_objects(self, room):
+        """Normalize a room's persisted ambient sound list to AmbientSoundObject instances.
+
+        Older rooms simply do not have this field; newer saves may contain plain
+        dictionaries after JSON serialization. Runtime audio channels are always
+        transient and are recreated by AmbientSoundObject as needed.
+        """
+        if room is None:
+            return []
+
+        raw = getattr(room, 'ambient_sounds', None)
+        if raw is None:
+            raw = []
+            room.ambient_sounds = raw
+
+        normalized = []
+        changed = False
+        for item in raw:
+            if isinstance(item, AmbientSoundObject):
+                normalized.append(item)
+            elif isinstance(item, dict):
+                try:
+                    normalized.append(AmbientSoundObject.from_dict(item))
+                    changed = True
+                except (TypeError, ValueError):
+                    # Ignore malformed legacy entries instead of preventing the
+                    # room editor from opening.
+                    changed = True
+            else:
+                changed = True
+
+        if changed or normalized is not raw:
+            room.ambient_sounds = normalized
+        return room.ambient_sounds
+
     def _enter_view_room(self, room_index):
         """Open the room viewer for the room at *room_index* in the current group."""
         rooms_in_group = self.room_manager.get_rooms_in_group(self.selected_group) if self.selected_group else []
@@ -930,6 +1024,15 @@ class RoomEditor:
         self.viewing_room = rooms_in_group[room_index]
         self.selected_index = room_index
         room_name = self.viewing_room.name
+
+        # Sync positional ambient sound emitters as live object instances.
+        # This remains separate from the room-wide BGS setting below/elsewhere.
+        self._ensure_ambient_sound_objects(self.viewing_room)
+        if self.object_editor and hasattr(self.object_editor, 'set_ambient_sound_objects'):
+            self.object_editor.set_ambient_sound_objects(
+                room_name, self.viewing_room.ambient_sounds
+            )
+            self.object_editor.current_room_name = room_name
 
         # Same alias-init as _sync_room_to_editor: only load from room.tiles
         # the first time this room is opened (key not yet present). Once
@@ -1015,6 +1118,12 @@ class RoomEditor:
             if not hasattr(self.viewing_room, 'world_map_objects'):
                 self.viewing_room.world_map_objects = []
             self.object_editor.world_map_manager._objects[room_name] = self.viewing_room.world_map_objects
+
+        # Sync fishing areas
+        if self.object_editor and hasattr(self.object_editor, 'fishing_area_manager'):
+            if not hasattr(self.viewing_room, 'fishing_areas'):
+                self.viewing_room.fishing_areas = []
+            self.object_editor.fishing_area_manager._areas[room_name] = self.viewing_room.fishing_areas
 
         # Sync doors
         if self.object_editor and hasattr(self.object_editor, 'door_manager'):
@@ -1105,19 +1214,20 @@ class RoomEditor:
     def _handle_edit_input(self, event):
         """Handle form inputs for editing a room"""
         edit_fields = ['name', 'width', 'height', 'group',
-                       'weather', 'music', 'can_attack', 'background',
+                       'weather', 'music', 'bgs', 'can_attack', 'background',
                        'save', 'delete', 'cancel']
-        WEATHER_MUSIC_ROW = (4, 5)       # weather, music — side by side
-        BUTTON_INDICES    = (8, 9, 10)   # save, delete, cancel — laid out horizontally
-        LAST_FIELD        = 7            # 'background' — the row just above the buttons
+        WEATHER_MUSIC_BGS_ROW = (4, 5, 6)   # weather, music, bgs — side by side
+        CAN_ATTACK_INDEX      = 7           # checkbox row just below the above
+        BUTTON_INDICES        = (9, 10, 11) # save, delete, cancel — laid out horizontally
+        LAST_FIELD            = 8           # 'background' — the row just above the buttons
 
         if event.key in (pygame.K_UP, pygame.K_w):
             if self.selected_index in BUTTON_INDICES:
                 # All three buttons are in the same row — UP goes to the field above
                 self.selected_index = LAST_FIELD
-            elif self.selected_index == 6:
+            elif self.selected_index == CAN_ATTACK_INDEX:
                 self.selected_index = 4
-            elif self.selected_index in WEATHER_MUSIC_ROW:
+            elif self.selected_index in WEATHER_MUSIC_BGS_ROW:
                 self.selected_index = 3
             else:
                 self.selected_index = (self.selected_index - 1) % len(edit_fields)
@@ -1127,24 +1237,24 @@ class RoomEditor:
                 self.selected_index = BUTTON_INDICES[0]
             elif self.selected_index == 3:
                 self.selected_index = 4
-            elif self.selected_index in WEATHER_MUSIC_ROW:
-                self.selected_index = 6
+            elif self.selected_index in WEATHER_MUSIC_BGS_ROW:
+                self.selected_index = CAN_ATTACK_INDEX
             elif self.selected_index not in BUTTON_INDICES:
                 self.selected_index = (self.selected_index + 1) % len(edit_fields)
         elif event.key in (pygame.K_LEFT, pygame.K_a):
             if self.selected_index in BUTTON_INDICES:
                 idx = list(BUTTON_INDICES).index(self.selected_index)
                 self.selected_index = BUTTON_INDICES[(idx - 1) % len(BUTTON_INDICES)]
-            elif self.selected_index in WEATHER_MUSIC_ROW:
-                idx = list(WEATHER_MUSIC_ROW).index(self.selected_index)
-                self.selected_index = WEATHER_MUSIC_ROW[(idx - 1) % len(WEATHER_MUSIC_ROW)]
+            elif self.selected_index in WEATHER_MUSIC_BGS_ROW:
+                idx = list(WEATHER_MUSIC_BGS_ROW).index(self.selected_index)
+                self.selected_index = WEATHER_MUSIC_BGS_ROW[(idx - 1) % len(WEATHER_MUSIC_BGS_ROW)]
         elif event.key in (pygame.K_RIGHT, pygame.K_d):
             if self.selected_index in BUTTON_INDICES:
                 idx = list(BUTTON_INDICES).index(self.selected_index)
                 self.selected_index = BUTTON_INDICES[(idx + 1) % len(BUTTON_INDICES)]
-            elif self.selected_index in WEATHER_MUSIC_ROW:
-                idx = list(WEATHER_MUSIC_ROW).index(self.selected_index)
-                self.selected_index = WEATHER_MUSIC_ROW[(idx + 1) % len(WEATHER_MUSIC_ROW)]
+            elif self.selected_index in WEATHER_MUSIC_BGS_ROW:
+                idx = list(WEATHER_MUSIC_BGS_ROW).index(self.selected_index)
+                self.selected_index = WEATHER_MUSIC_BGS_ROW[(idx + 1) % len(WEATHER_MUSIC_BGS_ROW)]
         elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
             return self._handle_item_action()
 
@@ -1188,6 +1298,23 @@ class RoomEditor:
             if ctrl and event.key == pygame.K_s:
                 self._save_current_room()
                 return None
+            # Copy / paste the box-selected tiles — only meaningful in the
+            # no-editor-panel select/drag mode, same gating as the rest of
+            # the selection tool (Delete, right-click delete, etc.).
+            # SELECTION TOOL DISABLED — see the comment above the
+            # _handle_select_drag_event call site further down. self.selection
+            # can never be non-empty while that's off, so copy would be a
+            # no-op anyway; commented out alongside it for clarity, not left
+            # active-but-inert.
+            # if ctrl and event.key == pygame.K_c and self._no_editor_active():
+            #     self._copy_selection_to_clipboard()
+            #     return None
+            # if ctrl and event.key == pygame.K_v and self._no_editor_active():
+            #     mx, my = pygame.mouse.get_pos()
+            #     if my >= self.toolbar.height:
+            #         wx, wy = self._screen_to_world(mx, my)
+            #         self._paste_clipboard_at(wx, wy)
+            #     return None
 
         # Check if we're in transition spawn placement mode
         is_placing_spawn = (self.object_editor and
@@ -1214,6 +1341,7 @@ class RoomEditor:
                 return None
 
             if self.object_editor:
+                self.object_editor._logical_mouse_pos = tuple(event.dict.get('_room_editor_raw_pos', getattr(event, 'pos', self._logical_mouse_pos)))
                 self.object_editor.handle_input(
                     self._zoom_adjust_event(event, self.object_editor._is_in_palette),
                     0 if self.zoom_active else int(self.camera.x),
@@ -1340,7 +1468,7 @@ class RoomEditor:
         if event.type == pygame.MOUSEWHEEL:
             if (pygame.key.get_mods() & pygame.KMOD_CTRL) and not self.zoom_active:
                 zoom_old = self._effective_editor_zoom()
-                mouse_x, mouse_y = pygame.mouse.get_pos()
+                mouse_x, mouse_y = self._logical_mouse_pos
 
                 self.editor_zoom = max(
                     self._editor_zoom_min,
@@ -1476,6 +1604,7 @@ class RoomEditor:
                 ]
 
             self.tileset_editor.editor_zoom = self._effective_editor_zoom()
+            self.tileset_editor._logical_mouse_pos = tuple(event.dict.get('_room_editor_raw_pos', getattr(event, 'pos', self._logical_mouse_pos)))
             self.tileset_editor.handle_input(
                 self._zoom_adjust_event(event, self.tileset_editor._is_in_palette),
                 0 if self.zoom_active else int(self.camera.x),
@@ -1719,6 +1848,7 @@ class RoomEditor:
 
             # Delegate scroll / click / hotkeys to entity editor
             self.entity_editor.editor_zoom = self._effective_editor_zoom()
+            self.entity_editor._logical_mouse_pos = tuple(event.dict.get('_room_editor_raw_pos', getattr(event, 'pos', self._logical_mouse_pos)))
             consumed = self.entity_editor.handle_event(
                 self._zoom_adjust_event(event, self.entity_editor._mouse_in_palette),
                 0 if self.zoom_active else int(self.camera.x),
@@ -1741,6 +1871,9 @@ class RoomEditor:
             return None
 
         # Delete key removes the box-selected group, if any (no-panel mode).
+        # SELECTION TOOL DISABLED (see below) — self.selection can no longer
+        # become non-empty, so this is inert. Left in place so it comes back
+        # automatically once the selection tool is reinstated.
         if (event.type == pygame.KEYDOWN and event.key == pygame.K_DELETE
                 and self._no_editor_active() and self.selection):
             self._delete_selection()
@@ -1765,15 +1898,29 @@ class RoomEditor:
                 self.selection = []
                 self._rubber_band_start = None
                 self._rubber_band_current = None
+                self._rubber_band_start_screen = None
                 self._group_drag_origin = {}
+                self._group_drag_anchor_screen = None
                 pygame.key.set_repeat(400, 50)
 
             return None
 
         # Select / drag / right-click-delete when no panel is open
-        if self._no_editor_active():
-            if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEMOTION, pygame.MOUSEBUTTONUP):
-                self._handle_select_drag_event(event)
+        #
+        # SELECTION TOOL TEMPORARILY DISABLED — see the perf investigation
+        # that led here: dragging a box-selection (or a single tile/object
+        # through this same code path) was forcing a full room-tile-surface
+        # rebuild on every mouse-motion event. Rather than ship the partial
+        # fix, the tool is switched off here until it's remade properly.
+        # Everything it depends on (_handle_select_drag_event,
+        # _draw_area_select, self.selection, rubber-band state, group-drag
+        # state, copy/paste of a selection, Delete/right-click delete) is
+        # left in place untouched — re-enable by uncommenting the three
+        # calls below (this one, _draw_area_select in draw(), and the
+        # Ctrl+C/Ctrl+V handlers above) once the tool is reworked.
+        # if self._no_editor_active():
+        #     if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEMOTION, pygame.MOUSEBUTTONUP):
+        #         self._handle_select_drag_event(event)
 
         return None
 
@@ -2014,6 +2161,16 @@ class RoomEditor:
             if not hasattr(self.viewing_room, 'trigger_boxes'):
                 self.viewing_room.trigger_boxes = []
 
+        # Move positional ambient sound emitters from the object editor to the room.
+        # Keep object instances in memory; their mixer channel is transient and
+        # is intentionally excluded by AmbientSoundObject.to_dict().
+        if self.object_editor and hasattr(self.object_editor, 'get_ambient_sound_objects'):
+            self.viewing_room.ambient_sounds = list(
+                self.object_editor.get_ambient_sound_objects(self.viewing_room.name)
+            )
+        else:
+            self._ensure_ambient_sound_objects(self.viewing_room)
+
         # Write everything to disk
         self.room_manager.save_room(self.viewing_room)
 
@@ -2028,6 +2185,16 @@ class RoomEditor:
                     room = self.room_manager.get_room_by_name(room_name)
                     if room:
                         room.tiles = tiles
+                        transferred_count += 1
+
+        # Transfer positional ambient sound emitters. Unlike the room-wide BGS
+        # field, each emitter is its own persistent room object.
+        if self.object_editor and hasattr(self.object_editor, 'get_ambient_sound_objects'):
+            for room in self.room_manager.rooms:
+                emitters = self.object_editor.get_ambient_sound_objects(room.name)
+                if emitters or hasattr(room, 'ambient_sounds'):
+                    room.ambient_sounds = list(emitters)
+                    if emitters:
                         transferred_count += 1
 
         # Transfer objects
@@ -2134,6 +2301,76 @@ class RoomEditor:
 
         return transferred_count
 
+    def _on_tiles_changed_resync_collision(self, room_name=None, cells=None):
+        """Listener registered on tileset_editor.notify_tile_changed().
+
+        Fires on every tile paint/erase/undo/redo/paste/quick-delete, and
+        also (with room_name=None) whenever a tile's solid flag itself is
+        toggled in the tileset editor's palette — in that case there's no
+        single affected room, so this resyncs whichever room is currently
+        open, matching the same "next time you look at a room it's
+        correct" behavior _sync_room_to_editor gives every other room.
+        """
+        target_room = room_name or (self.viewing_room.name if self.viewing_room else None)
+        if target_room:
+            self._sync_tile_collision(target_room)
+
+    def _sync_tile_collision(self, room_name):
+        """Regenerate this room's auto-generated ("from tile") collision
+        boxes from whatever tiles are currently painted in it, using each
+        tileset's per-tile 'solid' flags (Tileset.solid_tiles, set via the
+        tileset editor's Collision Paint mode — select tiles in the
+        palette, press C).
+
+        Every solid tile gets one full-tile CollisionObject, tagged
+        auto_tile=True so a later call can tell it apart from a wall you
+        placed by hand with the collision tool — hand-placed walls are
+        never touched here. Called after every tile edit (see
+        _on_tiles_changed_resync_collision) and unconditionally every time
+        a room is opened (see _sync_room_to_editor), so retroactively
+        marking a tile solid/non-solid takes effect the next time you
+        visit any room that uses it, with no need to repaint anything.
+        """
+        if not self.tileset_editor or not self.object_editor:
+            return
+        if not hasattr(self.object_editor, 'collision_manager'):
+            return
+
+        room = self.room_manager.get_room_by_name(room_name)
+        if not room:
+            return
+        if not hasattr(room, 'collision_objects'):
+            room.collision_objects = []
+
+        from objects.collision_object import CollisionObject
+
+        # One box per unique (x, y, w, h) footprint, so two solid tiles
+        # stacked on different layers at the same spot don't produce two
+        # redundant overlapping collision boxes.
+        desired_rects = set()
+        for tile in self.tileset_editor.room_tiles.get(room_name, []):
+            if getattr(tile, 'is_shadow', False):
+                continue
+            tileset = self.tileset_editor.tileset_manager.get_tileset(tile.tileset_name)
+            if not tileset or not tileset.is_tile_solid(tile.tile_x, tile.tile_y):
+                continue
+            desired_rects.add((tile.x, tile.y, tileset.tile_width, tileset.tile_height))
+
+        # Drop this room's previously auto-generated boxes; anything the
+        # user placed by hand (auto_tile is False/absent) is left exactly
+        # where it is.
+        room.collision_objects = [
+            obj for obj in room.collision_objects if not getattr(obj, 'auto_tile', False)
+        ]
+        for (x, y, w, h) in desired_rects:
+            room.collision_objects.append(CollisionObject(x, y, w, h, room_name, auto_tile=True))
+
+        # collision_manager's dict entry is meant to be the same list object
+        # as room.collision_objects (see _sync_room_to_editor below) — since
+        # we just reassigned room.collision_objects to a new list, re-point
+        # the manager at it rather than relying on the old shared reference.
+        self.object_editor.collision_manager.collision_objects[room_name] = room.collision_objects
+
     def _sync_room_to_editor(self, room):
         """Sync room data to editor managers when switching rooms"""
         if not room:
@@ -2162,6 +2399,16 @@ class RoomEditor:
             if not hasattr(room, 'collision_objects'):
                 room.collision_objects = []
             self.object_editor.collision_manager.collision_objects[room_name] = room.collision_objects
+
+        # Regenerate this room's auto-generated tile collision from
+        # whatever's currently marked solid, every time the room is opened
+        # — not just when its tiles happen to change. This is what makes
+        # retroactively flipping a tile's solid flag in the tileset editor
+        # take effect on existing rooms without repainting anything: the
+        # next time you switch into a room that uses that tile, its
+        # collision is recomputed fresh. Runs after both the tiles and
+        # collision_objects syncs above, since it depends on both.
+        self._sync_tile_collision(room_name)
 
         # Sync map-paint cells. Unlike collision_objects above this can't be
         # a shared-reference alias — room.map_paint is a plain JSON list of
@@ -2249,6 +2496,12 @@ class RoomEditor:
                 room.world_map_objects = []
             self.object_editor.world_map_manager._objects[room_name] = room.world_map_objects
 
+        # Sync fishing areas
+        if self.object_editor and hasattr(self.object_editor, 'fishing_area_manager'):
+            if not hasattr(room, 'fishing_areas'):
+                room.fishing_areas = []
+            self.object_editor.fishing_area_manager._areas[room_name] = room.fishing_areas
+
         # Sync cutscene triggers
         if self.object_editor and hasattr(self.object_editor, 'cutscene_trigger_manager'):
             if not hasattr(room, 'cutscene_triggers'):
@@ -2276,6 +2529,16 @@ class RoomEditor:
         def _on_collision_placed(obj, room):
             self._push_undo(_HistoryEntry('object_add', {'obj': obj, 'obj_type': 'collision', 'room': room}))
         oe.on_collision_placed = _on_collision_placed
+
+        def _on_collision_group_placed(objs, room):
+            # A Shift-dragged diagonal wall places many small boxes at
+            # once (see ObjectEditor._finalize_diagonal_collision_placement).
+            # Reuse the same 'area_add' entry shape the paste/rect-select
+            # tools already use for a group of items, so Ctrl+Z removes the
+            # whole diagonal run in one step instead of one box at a time.
+            items = [('collision', obj, 'collision') for obj in objs]
+            self._push_undo(_HistoryEntry('area_add', {'room': room, 'items': items}))
+        oe.on_collision_group_placed = _on_collision_group_placed
 
         def _on_animated_region_placed(obj, room):
             self._push_undo(_HistoryEntry('object_add', {'obj': obj, 'obj_type': 'animated_region', 'room': room}))
@@ -2322,6 +2585,10 @@ class RoomEditor:
             self._push_undo(_HistoryEntry('object_add', {'obj': obj, 'obj_type': 'chest', 'room': room}))
         oe.on_chest_placed = _on_chest_placed
 
+        def _on_ambient_sound_placed(obj, room):
+            self._push_undo(_HistoryEntry('object_add', {'obj': obj, 'obj_type': 'ambient_sound', 'room': room}))
+        oe.on_ambient_sound_placed = _on_ambient_sound_placed
+
         # Loot assignment mutates an existing chest in place.  Do NOT push
         # object_add (that made Ctrl+Z delete the whole chest).  No undo entry
         # for now — room data is already live on the shared chest instance.
@@ -2331,6 +2598,16 @@ class RoomEditor:
         def _on_collision_deleted(obj, room):
             self._push_undo(_HistoryEntry('object_remove', {'obj': obj, 'obj_type': 'collision', 'room': room}))
         oe.on_collision_deleted = _on_collision_deleted
+
+        def _on_collision_group_deleted(objs, room):
+            # A Shift-dragged diagonal wall is deleted as a whole run (see
+            # ObjectEditor._delete_collision_group) -- push it as one
+            # 'area_remove' entry (same shape used elsewhere for a
+            # rect-selected group) so Ctrl+Z restores the entire diagonal
+            # wall in one step instead of one box at a time.
+            items = [('collision', obj, 'collision') for obj in objs]
+            self._push_undo(_HistoryEntry('area_remove', {'room': room, 'items': items}))
+        oe.on_collision_group_deleted = _on_collision_group_deleted
 
         def _on_animated_region_deleted(obj, room):
             self._push_undo(_HistoryEntry('object_remove', {'obj': obj, 'obj_type': 'animated_region', 'room': room}))
@@ -2376,6 +2653,10 @@ class RoomEditor:
         def _on_chest_deleted(obj, room):
             self._push_undo(_HistoryEntry('object_remove', {'obj': obj, 'obj_type': 'chest', 'room': room}))
         oe.on_chest_deleted = _on_chest_deleted
+
+        def _on_ambient_sound_deleted(obj, room):
+            self._push_undo(_HistoryEntry('object_remove', {'obj': obj, 'obj_type': 'ambient_sound', 'room': room}))
+        oe.on_ambient_sound_deleted = _on_ambient_sound_deleted
 
     def _push_undo(self, entry: _HistoryEntry):
         """Record a new action; doing so discards the redo stack.
@@ -2481,8 +2762,8 @@ class RoomEditor:
                 if kind == 'tile':
                     tiles_touched = True
             if tiles_touched and self.viewing_room is not None:
-                if callable(getattr(self.tileset_editor, 'on_tile_changed', None)):
-                    self.tileset_editor.on_tile_changed(self.viewing_room.name)
+                if self.tileset_editor:
+                    self.tileset_editor.notify_tile_changed(self.viewing_room.name)
 
         elif action == 'area_remove':
             room_name = data['room']
@@ -2516,9 +2797,43 @@ class RoomEditor:
                                 room_tiles.append(item)
                     else:
                         self._readd_object(item, obj_type, room_name)
-            if callable(getattr(self.tileset_editor, 'on_tile_changed', None)):
-                if any(k == 'tile' for k, _, _ in data['items']):
-                    self.tileset_editor.on_tile_changed(room_name)
+            if self.tileset_editor and any(k == 'tile' for k, _, _ in data['items']):
+                self.tileset_editor.notify_tile_changed(room_name)
+
+        elif action == 'area_add':
+            room_name = data['room']
+            # forward=True  → redo the paste (add them again)
+            # forward=False → undo the paste (remove them)
+            if forward:
+                for kind, item, obj_type in data['items']:
+                    if kind == 'tile':
+                        if self.tileset_editor is not None:
+                            room_tiles = self.tileset_editor.room_tiles.setdefault(room_name, [])
+                            if item not in room_tiles:
+                                room_tiles.append(item)
+                    elif kind == 'entity':
+                        if self.viewing_room is not None:
+                            if not hasattr(self.viewing_room, 'entities'):
+                                self.viewing_room.entities = []
+                            if item not in self.viewing_room.entities:
+                                self.viewing_room.entities.append(item)
+                    else:
+                        self._readd_object(item, obj_type, room_name)
+            else:
+                for kind, item, obj_type in data['items']:
+                    if kind == 'tile':
+                        room_tiles = self.tileset_editor.room_tiles.get(room_name, []) if self.tileset_editor else []
+                        if item in room_tiles:
+                            room_tiles.remove(item)
+                    elif kind == 'entity':
+                        if self.viewing_room and item in self.viewing_room.entities:
+                            self.viewing_room.entities.remove(item)
+                    else:
+                        if self.object_editor:
+                            self.object_editor.current_room_name = room_name
+                            self.object_editor._delete_object(item, obj_type)
+            if self.tileset_editor and any(k == 'tile' for k, _, _ in data['items']):
+                self.tileset_editor.notify_tile_changed(room_name)
 
         # ── tiles ────────────────────────────────────────────────────────────
         elif action == 'tiles_stroke':
@@ -2530,10 +2845,10 @@ class RoomEditor:
             self.tileset_editor.room_tiles[room] = [Tile.from_dict(t) for t in tile_list]
             self.tileset_editor._invalidate_sorted_tiles_cache(room)
 
-            # Invalidate the baked tile surface so the change is visible immediately
-            # without needing to place another tile to trigger a cache rebuild.
-            if callable(getattr(self.tileset_editor, 'on_tile_changed', None)):
-                self.tileset_editor.on_tile_changed(room)
+            # Invalidate the baked tile surface (and resync tile collision)
+            # so the change is visible immediately without needing to place
+            # another tile to trigger a cache rebuild.
+            self.tileset_editor.notify_tile_changed(room)
 
         # ── map paint ────────────────────────────────────────────────────────
         elif action == 'map_paint_stroke':
@@ -2637,6 +2952,18 @@ class RoomEditor:
                     room.nimbus_clouds = []
                 if obj not in room.nimbus_clouds:
                     room.nimbus_clouds.append(obj)
+
+        elif obj_type == 'ambient_sound':
+            if room is not None:
+                emitters = self._ensure_ambient_sound_objects(room)
+                if obj not in emitters:
+                    emitters.append(obj)
+                if hasattr(oe, 'set_ambient_sound_objects'):
+                    oe.set_ambient_sound_objects(room_name, emitters)
+            else:
+                emitters = oe.get_ambient_sound_objects(room_name)
+                if obj not in emitters:
+                    emitters.append(obj)
 
         elif obj_type == 'transition':
             oe.transition_manager.add_transition(room_name, obj)
@@ -2898,6 +3225,24 @@ class RoomEditor:
         self.object_editor.current_room_name = self.viewing_room.name
         return self.object_editor._check_object_at_position(world_x, world_y)
 
+    def _find_tile_at(self, world_x, world_y):
+        """Return the topmost placed tile under world_x/y, or None.
+
+        Mirrors _find_entity_at / _find_object_at so a plain click can select
+        a single tile directly, the same way it already does for entities
+        and objects — previously tiles had no single-click hit test at all,
+        so clicking one just cleared the selection and you had to drag a
+        rubber-band box around it (even for one tile) to select anything.
+        """
+        if not self.tileset_editor or not self.viewing_room:
+            return None
+        tiles = self.tileset_editor.room_tiles.get(self.viewing_room.name, [])
+        # Later entries paint on top, so hit-test back-to-front.
+        for tile in reversed(tiles):
+            if self._item_rect('tile', tile, None).collidepoint(world_x, world_y):
+                return tile
+        return None
+
     def _find_cutscene_trigger_at(self, world_x, world_y):
         """Return the CutsceneTrigger object whose rect contains (world_x, world_y), or None.
 
@@ -3041,8 +3386,85 @@ class RoomEditor:
         # Objects stay selected (they weren't touched); only the deleted
         # kinds drop out of the selection.
         self.selection = [item for item in self.selection if item[0] == 'object']
-        if callable(getattr(self.tileset_editor, 'on_tile_changed', None)) and any(k == 'tile' for k, _, _ in removed):
-            self.tileset_editor.on_tile_changed(room_name)
+        if self.tileset_editor and any(k == 'tile' for k, _, _ in removed):
+            self.tileset_editor.notify_tile_changed(room_name)
+
+    def _copy_selection_to_clipboard(self):
+        """Ctrl+C: snapshot the box-selected tiles into the internal clipboard.
+
+        Scoped to tiles only — see the _tile_clipboard comment in __init__
+        for why objects/entities aren't included. Silently does nothing if
+        the current selection has no tiles in it, so Ctrl+C is harmless to
+        press with, say, only an entity selected.
+        """
+        tiles = [item for kind, item, _ in self.selection if kind == 'tile']
+        if not tiles:
+            return
+        min_x = min(t.x for t in tiles)
+        min_y = min(t.y for t in tiles)
+        self._tile_clipboard = [
+            {
+                'tileset_name': t.tileset_name,
+                'tile_x': t.tile_x,
+                'tile_y': t.tile_y,
+                'layer': t.layer,
+                'foreground': t.foreground,
+                'dx': t.x - min_x,
+                'dy': t.y - min_y,
+            }
+            for t in tiles
+        ]
+
+    def _paste_clipboard_at(self, world_x, world_y):
+        """Ctrl+V: stamp a copy of the clipboard tiles into the room, anchored
+        under (world_x, world_y), and select the freshly-pasted tiles so they
+        can be nudged into their final spot right away.
+
+        The anchor snaps to the footprint of the first clipboard tile (same
+        idea as the existing snap-on-drop for a dragged selection) so a
+        pasted block lands on a sane grid instead of at a sub-pixel mouse
+        position — pasting the same block a few times in a row then lines up
+        edge-to-edge instead of overlapping at odd offsets.
+        """
+        if not self._tile_clipboard or not self.viewing_room or not self.tileset_editor:
+            return
+        room_name = self.viewing_room.name
+
+        tileset = self.tileset_editor.tileset_manager.get_tileset(self._tile_clipboard[0]['tileset_name'])
+        if tileset:
+            snap_w, snap_h = tileset.tile_width, tileset.tile_height
+        else:
+            snap_w = snap_h = getattr(self.tileset_editor, 'grid_size', TILE_SIZE)
+        anchor_x = round(world_x / snap_w) * snap_w
+        anchor_y = round(world_y / snap_h) * snap_h
+
+        from dev_tools.room_editor.room_editor_tools.tileset_editor import Tile
+        room_tiles = self.tileset_editor.room_tiles.setdefault(room_name, [])
+        pasted = []
+        for entry in self._tile_clipboard:
+            new_tile = Tile(
+                anchor_x + entry['dx'], anchor_y + entry['dy'],
+                entry['tileset_name'], entry['tile_x'], entry['tile_y'],
+                entry['layer'], entry['foreground'],
+            )
+            room_tiles.append(new_tile)
+            pasted.append(('tile', new_tile, None))
+
+        self._push_undo(_HistoryEntry('area_add', {'room': room_name, 'items': pasted}))
+        self._invalidate_sorted_tiles_cache_safe(room_name)
+        self.selection = pasted
+        if self.tileset_editor:
+            self.tileset_editor.notify_tile_changed(room_name)
+
+    def _invalidate_sorted_tiles_cache_safe(self, room_name):
+        """Best-effort call to the tileset editor's per-room render-order
+        cache invalidation — pasting bypasses the tileset editor's own
+        paint path (which normally does this itself), so freshly pasted
+        tiles need this nudged manually or they can render in the wrong
+        layer order until something else invalidates the cache."""
+        fn = getattr(self.tileset_editor, '_invalidate_sorted_tiles_cache', None)
+        if callable(fn):
+            fn(room_name)
 
     def _draw_area_select(self, screen, camera_x, camera_y):
         """Draw the live rubber-band box (while dragging) and a highlight
@@ -3102,6 +3524,22 @@ class RoomEditor:
                     self.drag_target_type = None
                     self.is_dragging = False
                 return True
+            # Try a lone (not box-selected) tile next — same "right-click
+            # deletes it" convenience the entity branch above has, so tiles
+            # aren't the only selectable kind you can't quick-delete.
+            tile = self._find_tile_at(world_x, world_y)
+            if tile:
+                room_name = self.viewing_room.name
+                room_tiles = self.tileset_editor.room_tiles.get(room_name, [])
+                if tile in room_tiles:
+                    room_tiles.remove(tile)
+                    self._push_undo(_HistoryEntry('area_remove', {
+                        'room': room_name, 'items': [('tile', tile, None)]
+                    }))
+                    self.selection = [it for it in self.selection if it[1] is not tile]
+                    if self.tileset_editor:
+                        self.tileset_editor.notify_tile_changed(room_name)
+                return True
             # Objects are NOT right-click-deletable here on purpose — this
             # branch only runs when no editor panel is open, so deleting an
             # object from it would let a stray right-click in the tileset
@@ -3121,6 +3559,7 @@ class RoomEditor:
                     for kind, item, _ in self.selection
                 }
                 self._group_drag_anchor = (world_x, world_y)
+                self._group_drag_anchor_screen = (mx, my)
                 self._group_was_dragging = False
                 self.drag_target = None
                 self.drag_target_type = None
@@ -3151,6 +3590,7 @@ class RoomEditor:
                 self.drag_offset_y = ent['y'] - world_y
                 self.is_dragging = False
                 self._single_drag_click_origin = (world_x, world_y)
+                self._single_drag_click_origin_screen = (mx, my)
                 # snapshot position at drag start for undo
                 self._drag_start_world_x = ent['x']
                 self._drag_start_world_y = ent['y']
@@ -3165,9 +3605,42 @@ class RoomEditor:
                 self.drag_offset_y = obj.y - world_y
                 self.is_dragging = False
                 self._single_drag_click_origin = (world_x, world_y)
+                self._single_drag_click_origin_screen = (mx, my)
                 # snapshot position at drag start for undo
                 self._drag_start_world_x = obj.x
                 self._drag_start_world_y = obj.y
+                return True
+            # Try a lone tile — same click-to-select convenience entities
+            # and objects already have above. Previously tiles had no
+            # single-click hit test at all: clicking directly on one fell
+            # straight through to "clicked empty space" below, which
+            # cleared the selection and armed a rubber-band box instead of
+            # selecting the tile you actually clicked on. You could still
+            # grab it, but only by dragging a box around it first — the #1
+            # thing that made this tool feel broken for tiles specifically.
+            tile = self._find_tile_at(world_x, world_y)
+            if tile:
+                shift = pygame.key.get_mods() & pygame.KMOD_SHIFT
+                if shift:
+                    if not any(k == 'tile' and it is tile for k, it, _ in self.selection):
+                        self.selection.append(('tile', tile, None))
+                else:
+                    self.selection = [('tile', tile, None)]
+                # Arm the same group-drag machinery used for "clicked an
+                # already-selected item" so this single click can be
+                # dragged immediately, with no second click needed — and so
+                # it gets the tile-footprint snap-on-drop behavior instead
+                # of the generic object/entity grid snap.
+                self._group_drag_origin = {
+                    id(item): (item['x'], item['y']) if kind == 'entity' else (item.x, item.y)
+                    for kind, item, _ in self.selection
+                }
+                self._group_drag_anchor = (world_x, world_y)
+                self._group_drag_anchor_screen = (mx, my)
+                self._group_was_dragging = False
+                self.drag_target = None
+                self.drag_target_type = None
+                self.is_dragging = False
                 return True
             # Clicked empty space. Might be a plain deselect click or the
             # start of a rubber-band box select — can't tell yet, so stash
@@ -3181,6 +3654,7 @@ class RoomEditor:
                 self.selection = []
             self._rubber_band_start = (world_x, world_y)
             self._rubber_band_current = (world_x, world_y)
+            self._rubber_band_start_screen = (mx, my)
             return False
 
         # ── mouse motion while held: drag ─────────────────────────────────
@@ -3196,10 +3670,16 @@ class RoomEditor:
                 # alone was enough to start "dragging" — the group would
                 # visibly jump/snap the instant you clicked it instead of
                 # only moving once you actually dragged.
+                # Judged in screen pixels, not world units: at any zoom
+                # level a small deliberate mouse nudge should read the same
+                # way. World-space distance used to scale with zoom, so the
+                # same physical mouse jitter could either fail to register a
+                # real drag when zoomed in, or falsely trigger one when
+                # zoomed out — a big part of why the tool felt inconsistent.
                 if not self._group_was_dragging:
-                    ax, ay = self._group_drag_anchor
-                    if (abs(world_x - ax) <= _RUBBER_BAND_CLICK_THRESHOLD and
-                            abs(world_y - ay) <= _RUBBER_BAND_CLICK_THRESHOLD):
+                    asx, asy = self._group_drag_anchor_screen or (mx, my)
+                    if (abs(mx - asx) <= _RUBBER_BAND_CLICK_THRESHOLD_PX and
+                            abs(my - asy) <= _RUBBER_BAND_CLICK_THRESHOLD_PX):
                         return True
                 self._group_was_dragging = True
                 dx = world_x - self._group_drag_anchor[0]
@@ -3237,8 +3717,8 @@ class RoomEditor:
                     # That full rebuild every frame, not the drag logic
                     # itself, is what made dragging feel laggy in rooms
                     # with a lot of tiles.
-                    if callable(getattr(self.tileset_editor, 'on_tile_changed', None)):
-                        self.tileset_editor.on_tile_changed(self.viewing_room.name, cells=changed_tile_cells)
+                    if self.tileset_editor:
+                        self.tileset_editor.notify_tile_changed(self.viewing_room.name, cells=changed_tile_cells)
                 return True
 
         if event.type == pygame.MOUSEMOTION and self.drag_target is not None:
@@ -3246,10 +3726,12 @@ class RoomEditor:
                 # Same click-vs-drag deadzone as the group drag above — a
                 # plain click's incidental mouse jitter shouldn't move the
                 # object; only a deliberate drag past a few pixels should.
-                if not self.is_dragging and self._single_drag_click_origin is not None:
-                    ox, oy = self._single_drag_click_origin
-                    if (abs(world_x - ox) <= _RUBBER_BAND_CLICK_THRESHOLD and
-                            abs(world_y - oy) <= _RUBBER_BAND_CLICK_THRESHOLD):
+                # Judged in screen pixels (see the group-drag deadzone
+                # comment above) so it feels consistent at any zoom level.
+                if not self.is_dragging and self._single_drag_click_origin_screen is not None:
+                    osx, osy = self._single_drag_click_origin_screen
+                    if (abs(mx - osx) <= _RUBBER_BAND_CLICK_THRESHOLD_PX and
+                            abs(my - osy) <= _RUBBER_BAND_CLICK_THRESHOLD_PX):
                         return True
                 self.is_dragging = True
                 new_x = world_x + self.drag_offset_x
@@ -3273,7 +3755,18 @@ class RoomEditor:
         # ── left mouse up: finish rubber-band select ────────────────────────
         if event.type == pygame.MOUSEBUTTONUP and event.button == 1 and self._rubber_band_start is not None:
             sx, sy = self._rubber_band_start
-            moved = abs(world_x - sx) > _RUBBER_BAND_CLICK_THRESHOLD or abs(world_y - sy) > _RUBBER_BAND_CLICK_THRESHOLD
+            # Screen-space, same reasoning as the other two deadzones above:
+            # this used to compare world-space distance, so at high zoom a
+            # real deliberate drag could fail to clear the threshold (the
+            # box-select just silently didn't happen), and at low zoom tiny
+            # jitter could clear it by accident (an unwanted micro box-select
+            # instead of the plain click the user intended).
+            if self._rubber_band_start_screen is not None:
+                ssx, ssy = self._rubber_band_start_screen
+                moved = (abs(mx - ssx) > _RUBBER_BAND_CLICK_THRESHOLD_PX or
+                         abs(my - ssy) > _RUBBER_BAND_CLICK_THRESHOLD_PX)
+            else:
+                moved = abs(world_x - sx) > _RUBBER_BAND_CLICK_THRESHOLD or abs(world_y - sy) > _RUBBER_BAND_CLICK_THRESHOLD
             if moved:
                 new_items = self._items_in_rect(sx, sy, world_x, world_y)
                 if pygame.key.get_mods() & pygame.KMOD_SHIFT:
@@ -3321,8 +3814,8 @@ class RoomEditor:
                 if moves:
                     self._push_undo(_HistoryEntry('area_move', moves))
                 if changed_tile_cells and self.viewing_room is not None:
-                    if callable(getattr(self.tileset_editor, 'on_tile_changed', None)):
-                        self.tileset_editor.on_tile_changed(self.viewing_room.name, cells=changed_tile_cells)
+                    if self.tileset_editor:
+                        self.tileset_editor.notify_tile_changed(self.viewing_room.name, cells=changed_tile_cells)
             self._group_drag_origin = {}
             self._group_drag_anchor = None
             self._group_was_dragging = False
@@ -3581,6 +4074,14 @@ class RoomEditor:
             screen.blit(label_surf,
                         label_surf.get_rect(centerx=rect.centerx, bottom=rect.top - 2))
 
+    def _sync_editor_mouse_pos(self, mouse_pos):
+        """Propagate the renderer-logical cursor position to child editors."""
+        pos = tuple(mouse_pos) if mouse_pos is not None else self._logical_mouse_pos
+        self._logical_mouse_pos = pos
+        for editor in (self.tileset_editor, self.object_editor, self.entity_editor):
+            if editor is not None:
+                editor._logical_mouse_pos = pos
+
     def update(self, dt, mouse_pos=None):
         """Update animations and camera"""
         if not self.active:
@@ -3617,8 +4118,11 @@ class RoomEditor:
 
         # Update toolbar in room view
         if self.current_view == 'view_room':
-            mouse_pos = mouse_pos if mouse_pos is not None else pygame.mouse.get_pos()
-            self._logical_mouse_pos = mouse_pos  # cache for draw() hover checks
+            mouse_pos = mouse_pos if mouse_pos is not None else self._logical_mouse_pos
+            self._logical_mouse_pos = tuple(mouse_pos)  # cache for draw() hover checks
+            # All child editors use logical renderer coordinates for their
+            # hover/preview polling.
+            self._sync_editor_mouse_pos(mouse_pos)
             self.toolbar.update(dt, mouse_pos)
 
             # Keep the tileset editor's placement-snap grid in sync with the
@@ -3666,7 +4170,7 @@ class RoomEditor:
 
         # Handle camera movement
         if self.current_view == 'view_room' and self.viewing_room:
-            mouse_pos = getattr(self, '_logical_mouse_pos', None) or pygame.mouse.get_pos()
+            mouse_pos = self._logical_mouse_pos
             mouse_over_palette = False
 
             # Check if mouse is hovering over an editor palette
@@ -3771,6 +4275,7 @@ class RoomEditor:
         """Draw the current view"""
         if not self.active:
             return
+        self._sync_editor_mouse_pos(self._logical_mouse_pos)
 
         # Clear clickable rects at start of each frame
         self.clickable_rects = []
@@ -3817,7 +4322,7 @@ class RoomEditor:
             if not is_placing_spawn and not is_editing_flying_pad_path and not is_editing_nimbus_cloud_path:
                 self.toolbar.draw(screen)
             # Mouse coords (converted for zoom space)
-            mouse_sx, mouse_sy = pygame.mouse.get_pos()
+            mouse_sx, mouse_sy = self._logical_mouse_pos
             world_x = int((mouse_sx - self._zoom_offset[0]) / (RENDER_SCALE * self._zoom_scale))
             world_y = int((mouse_sy - self._zoom_offset[1]) / (RENDER_SCALE * self._zoom_scale))
             coord_text = f"X: {world_x}  Y: {world_y}"
@@ -3962,6 +4467,22 @@ class RoomEditor:
         # reads as a blank color square.
         _isolating_layer = bool(self.tileset_editor and self.tileset_editor.active)
 
+        # Whichever editor is active decides grid visibility (see the "Draw
+        # the grid" block below, which this mirrors) — used so the animated
+        # region overlay's own outline can be hidden along with it. Without
+        # this, each region's border (drawn unconditionally, regardless of
+        # any show_grid flag) kept showing on water/grass/lava tiles even
+        # with the grid toggled off, since adjacent regions tile edge-to-edge
+        # and their outlines read exactly like leftover grid lines.
+        if self.tileset_editor and self.tileset_editor.active:
+            _grid_visible = self.tileset_editor.show_grid
+        elif self.object_editor and self.object_editor.active:
+            _grid_visible = self.object_editor.show_grid
+        elif self.entity_editor and self.entity_editor.active:
+            _grid_visible = self.entity_editor.show_grid
+        else:
+            _grid_visible = True
+
         if self.object_editor:
             self.object_editor.current_room_name = self.viewing_room.name
             if _isolating_layer and callable(self.draw_animated_overlay_callback):
@@ -3978,7 +4499,8 @@ class RoomEditor:
                     screen,
                     int(self.camera.x),
                     int(self.camera.y),
-                    show_handles=not _isolating_layer
+                    show_handles=not _isolating_layer,
+                    show_border=_grid_visible
                 )
         # Background tiles — use baked surface if available (O(1) blit),
         # fall back to per-tile loop when the callback isn't wired OR when
@@ -4195,6 +4717,15 @@ class RoomEditor:
                 self.colors
             )
 
+        # Draw fishing areas
+        if self.object_editor:
+            self.object_editor.draw_fishing_areas(
+                screen,
+                int(self.camera.x),
+                int(self.camera.y),
+                self.colors
+            )
+
         # Draw level gates
         if self.object_editor:
             self.object_editor.draw_level_gates(
@@ -4230,6 +4761,15 @@ class RoomEditor:
                 int(self.camera.y)
             )
 
+        # Draw positional ambient sound markers / audible radii. These are
+        # editor-only overlays and are intentionally separate from room-wide BGS.
+        if self.object_editor:
+            self.object_editor.draw_ambient_sounds(
+                screen,
+                int(self.camera.x),
+                int(self.camera.y)
+            )
+
         # Draw trigger boxes
         if self.object_editor:
             self.object_editor.draw_trigger_boxes(
@@ -4256,8 +4796,14 @@ class RoomEditor:
             )
 
         # Highlight selected/dragged item (no-panel mode)
+        # SELECTION TOOL DISABLED — _draw_drag_highlight is left active since
+        # it's a no-op now anyway (self.drag_target can no longer be set with
+        # the event handler below commented out), but _draw_area_select drew
+        # the rubber-band box and selection outlines, so it's commented out
+        # to match. Re-enable together with the other spots noted in
+        # handle_room_view_events().
         self._draw_drag_highlight(screen, int(self.camera.x), int(self.camera.y))
-        self._draw_area_select(screen, int(self.camera.x), int(self.camera.y))
+        # self._draw_area_select(screen, int(self.camera.x), int(self.camera.y))
 
         # Editor previews
         if self.object_editor and self.object_editor.active:
@@ -4327,7 +4873,7 @@ class RoomEditor:
                 self.entity_editor.draw(screen)
 
         # ── Mouse coordinates overlay (bottom-left) ───────────────────────────
-        mouse_sx, mouse_sy = pygame.mouse.get_pos()
+        mouse_sx, mouse_sy = self._logical_mouse_pos
         world_x, world_y = self._screen_to_world(mouse_sx, mouse_sy)
         world_x, world_y = int(world_x), int(world_y)
         coord_text = f"X: {world_x}  Y: {world_y}"
@@ -4396,14 +4942,54 @@ class RoomEditor:
         # Animated regions draw before tiles here too, so they stay beneath
         # painted tiles instead of tinting them (see the normal-view render
         # path above for the full explanation).
+        #
+        # show_border mirrors whichever editor's show_grid is active, same
+        # as the normal view — otherwise this cache gets rebuilt (any time
+        # _zoom_dirty flips, e.g. zooming in/out) with each region's outline
+        # forced back on regardless of the grid toggle, which is exactly
+        # what looked like a "new grid" appearing on zoom. show_handles is
+        # always off here since the zoom overview has no live editing —
+        # there's nothing to drag, so the corner handles would just be
+        # visual noise.
+        if self.tileset_editor and self.tileset_editor.active:
+            _grid_visible = self.tileset_editor.show_grid
+        elif self.object_editor and self.object_editor.active:
+            _grid_visible = self.object_editor.show_grid
+        elif self.entity_editor and self.entity_editor.active:
+            _grid_visible = self.entity_editor.show_grid
+        else:
+            _grid_visible = True
+
         if self.object_editor:
             self.object_editor.current_room_name = room_name
-            self.object_editor.draw_animated_regions(zoom_screen, cam_x, cam_y)
+            self.object_editor.draw_animated_regions(
+                zoom_screen, cam_x, cam_y,
+                show_handles=False,
+                show_border=_grid_visible
+            )
 
         if self.blit_tiles_callback:
             self.blit_tiles_callback(zoom_screen, room_name, cam_x, cam_y, True)
         elif self.tileset_editor:
             self.tileset_editor.draw_tiles(zoom_screen, cam_x, cam_y, room_name, layer='background')
+
+        # Keep the room grid visible in the fit-to-room overview too. The
+        # overview renders the entire room into `zoom_surf`, so temporarily
+        # treat the full room as the viewport and then let the final fit-scale
+        # carry the grid to the screen.
+        if self.tileset_editor and self.tileset_editor.active and self.tileset_editor.show_grid:
+            old_palette_visible = self.tileset_editor.palette_visible
+            old_editor_zoom = self.tileset_editor.editor_zoom
+            try:
+                self.tileset_editor.palette_visible = False
+                self.tileset_editor.editor_zoom = 1.0
+                self.tileset_editor.draw_grid(
+                    zoom_screen, cam_x, cam_y,
+                    room.width, room.height
+                )
+            finally:
+                self.tileset_editor.palette_visible = old_palette_visible
+                self.tileset_editor.editor_zoom = old_editor_zoom
 
         pygame.draw.rect(zoom_surf, self.colors['accent'], (0, 0, room_pw, room_ph), 3)
 
@@ -4432,10 +5018,12 @@ class RoomEditor:
         if self.object_editor:
             self.object_editor.current_room_name = room_name
             self.object_editor.draw_collision_objects(zoom_screen, cam_x, cam_y)
+            self.object_editor.draw_ambient_sounds(zoom_screen, cam_x, cam_y)
             self.object_editor.draw_flying_pads(zoom_screen, cam_x, cam_y, self.colors)
             self.object_editor.draw_nimbus_clouds(zoom_screen, cam_x, cam_y, self.colors)
             self.object_editor.draw_save_points(zoom_screen, cam_x, cam_y, self.colors)
             self.object_editor.draw_world_map_objects(zoom_screen, cam_x, cam_y, self.colors)
+            self.object_editor.draw_fishing_areas(zoom_screen, cam_x, cam_y, self.colors)
             self.object_editor.draw_level_gates(zoom_screen, cam_x, cam_y, self.colors)
             self.object_editor.draw_doors(zoom_screen, cam_x, cam_y, self.colors)
             self.object_editor.draw_chests(zoom_screen, cam_x, cam_y, self.colors)
@@ -4477,9 +5065,16 @@ class RoomEditor:
         for x in range(start_x, end_x, TILE_SIZE):
             screen_x = (x * RENDER_SCALE) - self.camera.x
             if -TILE_SIZE * RENDER_SCALE <= screen_x <= self.screen_width:
+                # floor (not int()) — int() truncates toward zero, so once
+                # the camera has a fractional position, lines with a
+                # negative screen_x get rounded the opposite way from ones
+                # with a positive screen_x. That flips right at world x=0,
+                # squeezing the grid cell straddling the origin by a pixel
+                # and making its two bounding lines look merged/thicker.
+                px = math.floor(screen_x)
                 screen.draw_line((44, 149, 44),
-                                 (int(screen_x), 0),
-                                 (int(screen_x), self.screen_height), 1)
+                                 (px, 0),
+                                 (px, self.screen_height), 1)
 
         start_y = int((visible_y_start // TILE_SIZE)) * TILE_SIZE
         end_y = int(visible_y_end + TILE_SIZE)
@@ -4487,9 +5082,10 @@ class RoomEditor:
         for y in range(start_y, end_y, TILE_SIZE):
             screen_y = (y * RENDER_SCALE) - self.camera.y
             if -TILE_SIZE * RENDER_SCALE <= screen_y <= self.screen_height:
+                py = math.floor(screen_y)
                 screen.draw_line((44, 149, 44),
-                                 (0, int(screen_y)),
-                                 (self.screen_width, int(screen_y)), 1)
+                                 (0, py),
+                                 (self.screen_width, py), 1)
 
     def _draw_background(self, screen):
         """Draw the menu background with gradient and animated grid.
@@ -4700,7 +5296,7 @@ class RoomEditor:
         view_btn_rect     = pygame.Rect(settings_btn_rect.x - btn_gap - btn_w,
                                         y + (self.item_height - btn_h) // 2, btn_w, btn_h)
 
-        _lm = getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos())
+        _lm = self._logical_mouse_pos
         view_hovered     = view_btn_rect.collidepoint(_lm)
         settings_hovered = settings_btn_rect.collidepoint(_lm)
 
@@ -4904,7 +5500,7 @@ class RoomEditor:
                     break
             return None
         if event.type == pygame.MOUSEWHEEL:
-            if self._bg_grid_rect.collidepoint(pygame.mouse.get_pos()):
+            if self._bg_grid_rect.collidepoint(self._logical_mouse_pos):
                 self._bg_scroll = max(0, self._bg_scroll - event.y * 80)
             return None
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
@@ -4953,7 +5549,7 @@ class RoomEditor:
         screen.draw_rect(self.colors['accent'], list_rect, 2, border_radius=5)
 
         current = getattr(self.editing_room, 'ambient_weather', 'none')
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._logical_mouse_pos
         self._weather_dropdown_rects = {}
         for i, weather_type in enumerate(self.WEATHER_TYPES):
             item_rect = pygame.Rect(list_rect.x, list_rect.y + i * item_h, list_rect.width, item_h)
@@ -5032,7 +5628,7 @@ class RoomEditor:
         screen.draw_rect(self.colors['accent'], list_rect, 2, border_radius=5)
 
         current = getattr(self.editing_room, 'music_track', '')
-        mouse_pos = pygame.mouse.get_pos()
+        mouse_pos = self._logical_mouse_pos
         self._music_dropdown_rects = {}
 
         if not options[1:]:
@@ -5061,6 +5657,95 @@ class RoomEditor:
         # Small scroll hint if the list is scrolled or scrollable
         if len(options) > self.MUSIC_DROPDOWN_VISIBLE_ROWS:
             hint = f"{self._music_dropdown_scroll + 1}-{self._music_dropdown_scroll + len(visible)} of {len(options)} (scroll)"
+            hint_surf = self.font_small.render(hint, True, self.colors['text_dim'])
+            screen.blit(hint_surf, (list_rect.x, list_rect.bottom + 4))
+
+    # Cap the visible height of the Room BGS dropdown, same reasoning as
+    # MUSIC_DROPDOWN_VISIBLE_ROWS above.
+    BGS_DROPDOWN_VISIBLE_ROWS = 8
+
+    def handle_bgs_dropdown_event(self, event) -> "str | None":
+        """Swallow all input while the Room BGS dropdown list is open —
+        mirrors handle_music_dropdown_event exactly, just against
+        self._bgs_files / self.editing_room.bgs_track."""
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            for track_name, rect in self._bgs_dropdown_rects.items():
+                if rect.collidepoint(event.pos):
+                    # Store the stem only (no extension) — sound_engine's
+                    # AudioAssetLoader registers BGS loops in ambient_sounds
+                    # keyed by os.path.splitext(filename)[0] (bare filename,
+                    # regardless of which subfolder under sfx/ambient/ they
+                    # came from), so play_bgs() needs the extensionless name
+                    # to find a match.
+                    self.editing_room.bgs_track = os.path.splitext(track_name)[0] if track_name else ''
+                    self._bgs_dropdown_open = False
+                    return None
+            self._bgs_dropdown_open = False
+            return None
+        if event.type == pygame.MOUSEWHEEL:
+            options = [''] + self._bgs_files
+            max_scroll = max(0, len(options) - self.BGS_DROPDOWN_VISIBLE_ROWS)
+            self._bgs_dropdown_scroll = max(0, min(max_scroll,
+                self._bgs_dropdown_scroll - event.y))
+            return None
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            self._bgs_dropdown_open = False
+            return None
+        return None
+
+    def _draw_bgs_dropdown(self, screen):
+        """Popup list of BGS ambient loops (plus a 'None' option), anchored
+        directly under the Room BGS field row. Mirrors _draw_music_dropdown."""
+        options = [''] + self._bgs_files  # '' = no ambient loop
+        anchor = self._bgs_field_rect
+        item_h = 30
+        visible = options[self._bgs_dropdown_scroll:
+                           self._bgs_dropdown_scroll + self.BGS_DROPDOWN_VISIBLE_ROWS]
+        list_h = item_h * max(1, len(visible))
+        list_rect = pygame.Rect(anchor.x, anchor.bottom + 4, anchor.width, list_h)
+
+        # Flip above the field if the list would run off the bottom of the screen
+        SH = screen.get_size()[1]
+        if list_rect.bottom > SH - 10:
+            list_rect.y = max(10, anchor.top - list_h - 4)
+
+        shadow = pygame.Surface((list_rect.width + 6, list_rect.height + 6), pygame.SRCALPHA)
+        shadow.fill((0, 0, 0, 90))
+        screen.blit(shadow, (list_rect.x - 3, list_rect.y - 3))
+
+        screen.draw_rect(self.colors['panel'], list_rect, border_radius=5)
+        screen.draw_rect(self.colors['accent'], list_rect, 2, border_radius=5)
+
+        current = getattr(self.editing_room, 'bgs_track', '')
+        mouse_pos = self._logical_mouse_pos
+        self._bgs_dropdown_rects = {}
+
+        if not options[1:]:
+            # No BGS files found at all — say so instead of showing an
+            # empty box, so this doesn't look broken.
+            empty_surf = self.font_small.render('No ambient sounds found', True, self.colors['text_dim'])
+            screen.blit(empty_surf, (list_rect.x + 8, list_rect.y + 6))
+            return
+
+        for i, track_name in enumerate(visible):
+            item_rect = pygame.Rect(list_rect.x, list_rect.y + i * item_h, list_rect.width, item_h)
+            self._bgs_dropdown_rects[track_name] = item_rect
+
+            # current is stored as a stem (see handle_bgs_dropdown_event);
+            # track_name here is the raw filename, so compare stem-to-stem.
+            is_current = (os.path.splitext(track_name)[0] == current) if track_name else (current == '')
+            if item_rect.collidepoint(mouse_pos):
+                screen.draw_rect(self.colors['panel_light'], item_rect)
+
+            text_color = self.colors['accent'] if is_current else self.colors['text']
+            display = os.path.splitext(track_name)[0] if track_name else 'None'
+            label = display + ('  \u2713' if is_current else '')
+            text_surf = self.font_small.render(label, True, text_color)
+            screen.blit(text_surf, (item_rect.x + 8, item_rect.y + 6))
+
+        # Small scroll hint if the list is scrolled or scrollable
+        if len(options) > self.BGS_DROPDOWN_VISIBLE_ROWS:
+            hint = f"{self._bgs_dropdown_scroll + 1}-{self._bgs_dropdown_scroll + len(visible)} of {len(options)} (scroll)"
             hint_surf = self.font_small.render(hint, True, self.colors['text_dim'])
             screen.blit(hint_surf, (list_rect.x, list_rect.bottom + 4))
 
@@ -5129,7 +5814,7 @@ class RoomEditor:
         # ── Clear button ─────────────────────────────────────────────────
         sy += 4
         clr_rect = pygame.Rect(PX + 12, sy, inner_w, 26)
-        mx, my   = pygame.mouse.get_pos()
+        mx, my   = self._logical_mouse_pos
         clr_hov  = clr_rect.collidepoint(mx, my)
         screen.draw_rect((130, 40, 40) if clr_hov else (70, 25, 25),
                          clr_rect, border_radius=4)
@@ -5231,7 +5916,7 @@ class RoomEditor:
         thumb_x = x + int(value * width)
         thumb_cy = track_y + self.SLIDER_TRACK // 2
         THUMB_R  = 7
-        mx, my   = pygame.mouse.get_pos()
+        mx, my   = self._logical_mouse_pos
         dragging = self._bg_drag_slider == key
         hovered  = (abs(mx - thumb_x) <= THUMB_R + 3
                     and abs(my - thumb_cy) <= THUMB_R + 3)
@@ -5270,6 +5955,29 @@ class RoomEditor:
             )
         except OSError:
             self._music_files = []
+
+    # BGS ambient loops live under sfx/ambient/ and can be nested in
+    # subfolders (e.g. sfx/ambient/weather/rain.wav) — mirrors
+    # sound_engine.AudioAssetLoader's os.walk of that folder, and (like
+    # runtime loading) keys everything by bare filename regardless of which
+    # subfolder it came from, so this scan does the same os.walk rather than
+    # a flat os.listdir like the music scan above.
+    BGS_EXTENSIONS = ('.wav', '.ogg')
+
+    def _ensure_bgs_scanned(self):
+        if self._bgs_scan_done:
+            return
+        self._bgs_scan_done = True
+        ambient_dir = os.path.join('assets', 'audio', 'sfx', 'ambient')
+        files = []
+        try:
+            for root, _dirs, filenames in os.walk(ambient_dir):
+                for filename in filenames:
+                    if filename.lower().endswith(self.BGS_EXTENSIONS):
+                        files.append(filename)
+        except OSError:
+            files = []
+        self._bgs_files = sorted(set(files))
 
     def _draw_edit_view(self, screen):
         """Show the edit room form"""
@@ -5325,16 +6033,19 @@ class RoomEditor:
         weather_val = getattr(self.editing_room, 'ambient_weather', 'none')
         music_val = getattr(self.editing_room, 'music_track', '')
         music_display = os.path.splitext(music_val)[0] if music_val else 'None'
+        bgs_val = getattr(self.editing_room, 'bgs_track', '')
+        bgs_display = os.path.splitext(bgs_val)[0] if bgs_val else 'None'
         can_attack_val = getattr(self.editing_room, 'can_attack', True)
         bg_val = self._room_bg_get('image', '')
         bg_display = os.path.splitext(bg_val)[0] if bg_val else 'None'
 
-        # Weather (index 4) and Room Music (index 5) — half-width cycle rows,
-        # side by side
-        row_w = (field_width - 12) // 2
+        # Weather (index 4), Room Music (index 5) and Room BGS (index 6) —
+        # third-width cycle rows, side by side
+        row_w = (field_width - 24) // 3
         for j, (field_id, label, value, hint) in enumerate([
             ('weather', 'Weather', weather_val.capitalize(), ' (CLICK to select)'),
             ('music', 'Set Room Music', music_display, ' (CLICK to select)'),
+            ('bgs', 'Set Room BGS', bgs_display, ' (CLICK to select)'),
         ]):
             idx = 4 + j
             is_selected = (idx == self.selected_index)
@@ -5354,6 +6065,8 @@ class RoomEditor:
                 self._weather_field_rect = row_rect
             elif field_id == 'music':
                 self._music_field_rect = row_rect
+            elif field_id == 'bgs':
+                self._bgs_field_rect = row_rect
 
             value_text = value + (hint if (is_selected or is_hovered) else "")
             value_surf = self.font_small.render(value_text, True, self.colors['text'])
@@ -5361,9 +6074,9 @@ class RoomEditor:
 
         y_pos += 66
 
-        # Can attack? (index 6) — checkbox row
-        is_selected = (6 == self.selected_index)
-        is_hovered = (6 == self.hover_index)
+        # Can attack? (index 7) — checkbox row
+        is_selected = (7 == self.selected_index)
+        is_hovered = (7 == self.hover_index)
         chk_label = self.font_small.render('Can attack?', True, self.colors['text_dim'])
         screen.blit(chk_label, (content_x, y_pos + 6))
 
@@ -5376,13 +6089,13 @@ class RoomEditor:
         if can_attack_val:
             check_surf = self.font_medium.render('X', True, self.colors['success'])
             screen.blit(check_surf, check_surf.get_rect(center=box_rect.center))
-        self.clickable_rects.append({'rect': box_rect, 'index': 6, 'type': 'item'})
+        self.clickable_rects.append({'rect': box_rect, 'index': 7, 'type': 'item'})
 
         y_pos += 44
 
-        # Background (index 7) — opens the sub-panel
-        is_selected = (7 == self.selected_index)
-        is_hovered = (7 == self.hover_index)
+        # Background (index 8) — opens the sub-panel
+        is_selected = (8 == self.selected_index)
+        is_hovered = (8 == self.hover_index)
         bg_label = self.font_small.render('Background', True, self.colors['text_dim'])
         screen.blit(bg_label, (content_x, y_pos))
         y_pos += 22
@@ -5392,7 +6105,7 @@ class RoomEditor:
         bg_border_color = self.colors['accent'] if (is_selected or is_hovered) else self.colors['grid']
         screen.draw_rect(bg_bg_color, bg_row_rect, border_radius=5)
         screen.draw_rect(bg_border_color, bg_row_rect, 2, border_radius=5)
-        self.clickable_rects.append({'rect': bg_row_rect, 'index': 7, 'type': 'item'})
+        self.clickable_rects.append({'rect': bg_row_rect, 'index': 8, 'type': 'item'})
 
         bg_hint = ' (CLICK to configure)' if (is_selected or is_hovered) else ''
         bg_value_surf = self.font_small.render(bg_display + bg_hint, True, self.colors['text'])
@@ -5402,9 +6115,9 @@ class RoomEditor:
 
         y_pos += 10
         buttons = [
-            (8, 'Save', self.colors['success']),
-            (9, 'Delete', self.colors['danger']),
-            (10, 'Cancel', self.colors['text_dim'])
+            (9, 'Save', self.colors['success']),
+            (10, 'Delete', self.colors['danger']),
+            (11, 'Cancel', self.colors['text_dim'])
         ]
 
         for j, (btn_index, btn_label, btn_color) in enumerate(buttons):
@@ -5436,6 +6149,8 @@ class RoomEditor:
             self._draw_weather_dropdown(screen)
         if self._music_dropdown_open:
             self._draw_music_dropdown(screen)
+        if self._bgs_dropdown_open:
+            self._draw_bgs_dropdown(screen)
         if self._bg_panel_open:
             self._draw_bg_panel(screen)
 
