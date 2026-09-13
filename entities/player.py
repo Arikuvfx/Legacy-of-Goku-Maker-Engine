@@ -3491,13 +3491,21 @@ class Player:
             print(f'[fishing_jump] could not load {path}: {e}')
         return frames
 
-    def start_fishing_jump(self, on_complete=None):
+    def start_fishing_jump(self, on_complete=None, direction=None):
         """Begin the fishing jump sequence's ENTER half.
 
         Called by game.py once the player selects "Yes" on a fishing-area
         prompt. The player hops straight up along a parabolic arc and back
         down to their starting spot (no horizontal/world movement), then is
         hidden — on_complete fires at exactly that point, same as before.
+
+        direction: optional 'up'/'down'/'left'/'right' override for which
+        way the player faces/hops — e.g. FishingArea.direction, a fixed
+        direction a designer set per-area in the room editor, so the jump
+        always goes the way the area was designed for regardless of which
+        side the player walked up from. Omitted (or anything else) falls
+        back to the old behavior of using whichever way the player already
+        happens to be facing (self.direction) when they press E.
 
         From here the rest of the round trip (hidden wait, then the exit
         jump facing the opposite direction, complete with its own splash)
@@ -3506,12 +3514,17 @@ class Player:
         if self.is_fishing_jumping:
             return
 
+        if direction in ('up', 'down', 'left', 'right'):
+            self.direction = direction
+
         # Snap to standing idle right as the interaction kicks off — belt
         # and suspenders alongside FishingPrompt.open()'s player.enter_idle()
         # call (see objects/fishing_area.py), in case this ever gets invoked
         # without going through that prompt. enter_idle() also resets the
         # idle-wait timer, which just setting current_animation_state below
-        # doesn't do on its own.
+        # doesn't do on its own. Runs AFTER the direction override above so
+        # the idle pose itself also turns to face the fixed direction,
+        # rather than idling facing one way and then hopping another.
         self.enter_idle()
 
         # Cancel anything that could conflict mid-sequence, same idea as

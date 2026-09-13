@@ -272,7 +272,7 @@ class _WeatherEffect:
 
     # ── Draw ──────────────────────────────────────────────────────────────────
 
-    def draw(self, screen, screen_w: int, screen_h: int):
+    def draw(self, screen, screen_w: int, screen_h: int, camera_x: float = 0.0, camera_y: float = 0.0):
         if self._surf is None or self.opacity <= 0.001:
             return
         img_w = self._surf.get_width()
@@ -280,9 +280,18 @@ class _WeatherEffect:
         if img_w <= 0 or img_h <= 0:
             return
 
+        # Anchor the tile grid to world space (camera_x/camera_y are the
+        # camera's world offset in the same RENDER_SCALE'd pixel space this
+        # surface is already scaled to — see _scale()), then layer the
+        # weather's own scroll (fall/drift) on top. Without subtracting the
+        # camera offset here, the pattern was pinned to the screen instead
+        # of the room, so it looked like it was following the player around
+        # rather than sitting in the world for them to walk through.
         # Start one full tile above/left so seams stay off-screen on both axes.
-        start_y     = int(self.scroll_y) - img_h
-        start_x     = int(self.scroll_x) - img_w
+        start_y     = (self.scroll_y - camera_y) % img_h - img_h
+        start_x     = (self.scroll_x - camera_x) % img_w - img_w
+        start_y     = int(start_y)
+        start_x     = int(start_x)
         is_additive = self.weather_type in self._ADDITIVE_TYPES
         blit_flags  = pygame.BLEND_ADD if is_additive else 0
 
@@ -612,11 +621,16 @@ class CutsceneRuntime:
         for effect in self._attack_effects:
             effect.draw(screen, camera, colors)
 
-    def draw_weather(self, screen, screen_width, screen_height, only_types=None, skip_types=None):
+    def draw_weather(self, screen, screen_width, screen_height, camera_x=0.0, camera_y=0.0,
+                      only_types=None, skip_types=None):
         """Draw the weather layer.
 
         Call before the dialogue box so weather scrolls behind it, and before
         draw_overlay() so fades and invert sit on top of everything.
+
+        camera_x / camera_y: the camera's current world offset (same units as
+        Camera.x/.y), so the tiled pattern stays anchored to the room instead
+        of the screen — see _WeatherEffect.draw().
 
         only_types / skip_types: optional iterables of weather_type strings
         used to split a single active weather effect across two draw calls —
@@ -633,7 +647,7 @@ class CutsceneRuntime:
             return
         if only_types is None and skip_types is not None and wt in skip_types:
             return
-        self._weather.draw(screen, screen_width, screen_height)
+        self._weather.draw(screen, screen_width, screen_height, camera_x, camera_y)
 
     def draw_overlay(self, screen, screen_width, screen_height):
         """Draw the invert effect and colour-fade overlay above the scene.

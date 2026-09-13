@@ -22,8 +22,25 @@ class TileDef:
         self.solid = solid
 
 
-def detect_tile_size(image: pygame.Surface) -> int:
-    """Infer tile size from image dimensions — tries 16px first, then 8px."""
+def detect_tile_size(image: pygame.Surface, image_path: str = None) -> int:
+    """Infer tile size for a tileset sheet.
+
+    Dimension-only guessing is ambiguous once tiles get bigger than 16px:
+    any 64px-tile sheet's width/height is also a clean multiple of 16, so
+    a plain "does it divide evenly" check can't tell a 64x64 tileset from
+    a 16x16 one. To resolve that, a filename ending in "_<size>" (e.g.
+    "dirt_64.png", "water_32.png") is checked first and wins outright.
+    With no such suffix, we fall back to the old 16-then-8 guess, which
+    keeps every existing tileset loading exactly as before.
+    """
+    if image_path:
+        stem = os.path.splitext(os.path.basename(image_path))[0]
+        tail = stem.rsplit('_', 1)[-1]
+        if tail.isdigit():
+            hinted = int(tail)
+            if hinted > 0:
+                return hinted
+
     w, h = image.get_size()
     for size in (16, 8):
         if w % size == 0 and h % size == 0:
@@ -122,11 +139,35 @@ class Tileset:
         # full-tile CollisionObject generated for it -- see
         # RoomEditor._sync_tile_collision. Purely tileset-graphic-level data;
         # has no notion of which rooms use it.
+        #
+        # Used when collision_granularity == 16 (the default, and the only
+        # option for an 8px tileset — there's nothing finer to subdivide
+        # into). For collision_granularity == 8 on a 16px tileset, per-tile
+        # solidity lives in solid_subtiles instead, at quarter-tile
+        # precision — see that attribute and is_tile_solid()/
+        # set_tile_solid() below for how the two stay in sync.
         self.solid_tiles = set()
+
+        # Collision editing granularity for this tileset, in pixels: either
+        # 16 (one solid flag per whole tile — the original/default
+        # behavior) or 8 (one solid flag per 8x8 quadrant of each tile,
+        # letting a single 16x16 tile carry partial collision, e.g. just
+        # its bottom-right corner for a rounded ledge). Only meaningful
+        # when tile_width == 16; toggled via the tileset editor's 'H' key
+        # (see TilesetEditor._toggle_collision_granularity).
+        self.collision_granularity = 16
+
+        # Set of (tile_x, tile_y, sub_x, sub_y) tileset+quadrant coordinates
+        # marked solid when collision_granularity == 8. sub_x/sub_y are each
+        # 0 or 1, selecting which 8x8 quadrant of the 16x16 tile (tile_x,
+        # tile_y) — (0,0) top-left, (1,0) top-right, (0,1) bottom-left,
+        # (1,1) bottom-right. Empty (and unused) while
+        # collision_granularity == 16.
+        self.solid_subtiles = set()
 
         try:
             self.image = pygame.image.load(image_path).convert_alpha()
-            self.tile_width = detect_tile_size(self.image)
+            self.tile_width = detect_tile_size(self.image, image_path)
             self.tile_height = self.tile_width
             w, h = self.image.get_size()
             self.cols = w // self.tile_width
@@ -172,10 +213,19 @@ class Tileset:
         """Load which tiles are marked solid from a sidecar JSON file.
 
         Looked up next to the tileset image as '<name>.collision.json'. Format:
-            { "solid": [[3, 1], [3, 2], [4, 1]] }
-        Each entry is a (tile_x, tile_y) tileset coordinate. Missing/malformed
-        files are silently ignored so a tileset with no collision data
-        defined behaves exactly as before (nothing is solid).
+            {
+              "granularity": 8,
+              "solid": [[3, 1], [3, 2], [4, 1]],
+              "solid_subtiles": [[5, 0, 1, 0], [5, 0, 1, 1]]
+            }
+        "granularity" defaults to 16 (whole-tile) when absent, so existing
+        collision.json files written before 8x8 collision existed keep
+        loading exactly as before. "solid" is whole-tile entries (used at
+        granularity 16); "solid_subtiles" is (tile_x, tile_y, sub_x, sub_y)
+        quadrant entries (used at granularity 8) — see solid_subtiles'
+        docstring above for what sub_x/sub_y mean. Missing/malformed files
+        are silently ignored so a tileset with no collision data defined
+        behaves exactly as before (nothing is solid).
         """
         collision_path = os.path.splitext(image_path)[0] + '.collision.json'
         if not os.path.exists(collision_path):
@@ -185,24 +235,141 @@ class Tileset:
             with open(collision_path, 'r') as f:
                 data = json.load(f)
             self.solid_tiles = {tuple(coord) for coord in data.get('solid', [])}
+            granularity = data.get('granularity', 16)
+            self.collision_granularity = 8 if granularity == 8 and self.tile_width == 16 else 16
+            self.solid_subtiles = {tuple(coord) for coord in data.get('solid_subtiles', [])}
         except (json.JSONDecodeError, OSError, KeyError, TypeError, ValueError) as e:
             print(f"Error loading tile collision for {self.name}: {e}")
 
     def is_tile_solid(self, tile_x, tile_y):
-        """True if (tile_x, tile_y) is marked as blocking movement."""
+        """True if (tile_x, tile_y) blocks movement.
+
+        At collision_granularity 16 this is just membership in
+        solid_tiles. At granularity 8 there's no single flag for the whole
+        tile — this reports True only when every one of its four 8x8
+        quadrants is solid, so a caller that only understands whole-tile
+        collision (a simple "is this tile solid" check) still gets a sane
+        answer for a fully-solid tile, and doesn't overclaim solidity for
+        one that's only partially solid. Callers that need the actual
+        partial shape should use is_subtile_solid()/get_solid_rects_px()
+        instead.
+        """
+        if self.collision_granularity == 8:
+            return all(self.is_subtile_solid(tile_x, tile_y, sx, sy)
+                       for sx in (0, 1) for sy in (0, 1))
+        return (tile_x, tile_y) in self.solid_tiles
+
+    def is_subtile_solid(self, tile_x, tile_y, sub_x, sub_y):
+        """True if the (sub_x, sub_y) 8x8 quadrant of tile (tile_x, tile_y)
+        blocks movement. At collision_granularity 16 (or for an 8px
+        tileset, where there's only one quadrant) this just defers to
+        is_tile_solid() — the whole tile is the only unit that exists.
+        """
+        if self.collision_granularity == 8:
+            return (tile_x, tile_y, sub_x, sub_y) in self.solid_subtiles
         return (tile_x, tile_y) in self.solid_tiles
 
     def set_tile_solid(self, tile_x, tile_y, solid):
-        """Set (or clear) the solid flag for one tile and persist immediately."""
-        key = (tile_x, tile_y)
-        if solid:
-            self.solid_tiles.add(key)
+        """Set (or clear) the solid flag for one tile and persist immediately.
+
+        At collision_granularity 8, this sets all four quadrants together —
+        i.e. "mark this whole tile solid/non-solid" still works exactly as
+        a single action even in 8x8 mode; use set_subtile_solid() to target
+        just one quadrant.
+        """
+        if self.collision_granularity == 8:
+            for sx in (0, 1):
+                for sy in (0, 1):
+                    self._set_subtile_solid_no_save(tile_x, tile_y, sx, sy, solid)
         else:
-            self.solid_tiles.discard(key)
+            key = (tile_x, tile_y)
+            if solid:
+                self.solid_tiles.add(key)
+            else:
+                self.solid_tiles.discard(key)
+        self.save_tile_collision()
+
+    def _set_subtile_solid_no_save(self, tile_x, tile_y, sub_x, sub_y, solid):
+        """set_subtile_solid()'s actual mutation, without the save — shared
+        by set_subtile_solid() and set_tile_solid()'s all-four-quadrants
+        case above so toggling a whole tile doesn't write the sidecar file
+        four times in a row."""
+        key = (tile_x, tile_y, sub_x, sub_y)
+        if solid:
+            self.solid_subtiles.add(key)
+        else:
+            self.solid_subtiles.discard(key)
+
+    def set_subtile_solid(self, tile_x, tile_y, sub_x, sub_y, solid):
+        """Set (or clear) the solid flag for a single 8x8 quadrant and
+        persist immediately. Only meaningful at collision_granularity 8 —
+        see set_collision_granularity() to switch a 16px tileset into that
+        mode first."""
+        self._set_subtile_solid_no_save(tile_x, tile_y, sub_x, sub_y, solid)
+        self.save_tile_collision()
+
+    def get_solid_rects_px(self, tile_x, tile_y):
+        """Return this tile's solid area(s) as a list of tile-local pixel
+        rects [(px, py, w, h), ...], (0, 0) being the tile's top-left
+        corner. Empty list means the tile has no collision at all.
+
+        This is what a consumer that needs the *actual shape* (e.g.
+        RoomEditor._sync_tile_collision building CollisionObjects for a
+        placed tile) should use instead of is_tile_solid() — at
+        collision_granularity 8 a tile can be solid in just one or two of
+        its four quadrants, and is_tile_solid() alone can't express that.
+        """
+        if self.collision_granularity == 8:
+            return [
+                (sx * 8, sy * 8, 8, 8)
+                for sx in (0, 1) for sy in (0, 1)
+                if self.is_subtile_solid(tile_x, tile_y, sx, sy)
+            ]
+        return [(0, 0, self.tile_width, self.tile_height)] if self.is_tile_solid(tile_x, tile_y) else []
+
+    def set_collision_granularity(self, size):
+        """Switch this tileset's collision editing granularity between 16
+        (whole-tile) and 8 (quarter-tile), converting existing data so
+        nothing is silently lost or overclaimed:
+
+          16 -> 8: every currently-solid whole tile becomes solid in all
+                   four of its quadrants — identical collision footprint,
+                   just re-expressed at the finer granularity.
+          8 -> 16: a tile becomes solid only if ALL FOUR of its quadrants
+                   already were — a tile that was only partially solid
+                   (e.g. just one corner) loses that partial collision
+                   rather than have it silently promoted to full-tile
+                   solid, which would make the room's collision more
+                   restrictive than what was actually authored.
+
+        No-op on an 8px tileset (tile_width != 16) — there's nothing finer
+        than the whole tile to subdivide into, so size 8 there would be
+        indistinguishable from size 16 anyway.
+        """
+        size = 8 if size == 8 else 16
+        if self.tile_width != 16 or size == self.collision_granularity:
+            return
+
+        if size == 8:
+            for (tx, ty) in self.solid_tiles:
+                for sx in (0, 1):
+                    for sy in (0, 1):
+                        self.solid_subtiles.add((tx, ty, sx, sy))
+            self.solid_tiles = set()
+        else:
+            tiles_covered = {(tx, ty) for (tx, ty, sx, sy) in self.solid_subtiles}
+            self.solid_tiles = {
+                (tx, ty) for (tx, ty) in tiles_covered
+                if all((tx, ty, sx, sy) in self.solid_subtiles for sx in (0, 1) for sy in (0, 1))
+            }
+            self.solid_subtiles = set()
+
+        self.collision_granularity = size
         self.save_tile_collision()
 
     def save_tile_collision(self):
-        """Write self.solid_tiles back out to the '<name>.collision.json' sidecar.
+        """Write self.solid_tiles/solid_subtiles back out to the
+        '<name>.collision.json' sidecar.
 
         Overwrites the whole file with the current in-memory state, same
         convention as save_tile_animations -- the palette UI is the single
@@ -211,7 +378,11 @@ class Tileset:
         if not self.image_path:
             return
         collision_path = os.path.splitext(self.image_path)[0] + '.collision.json'
-        data = {'solid': [list(coord) for coord in sorted(self.solid_tiles)]}
+        data = {
+            'granularity': self.collision_granularity,
+            'solid': [list(coord) for coord in sorted(self.solid_tiles)],
+            'solid_subtiles': [list(coord) for coord in sorted(self.solid_subtiles)],
+        }
         try:
             with open(collision_path, 'w') as f:
                 json.dump(data, f, indent=2)
@@ -763,6 +934,16 @@ class TilesetEditor:
         A mixed selection (some solid, some not) is set fully solid on the
         first press; a further press clears all of them — same one-key
         toggle feel as animation's 'N'.
+
+        Single-tile selection on a tileset currently in 8x8 collision mode
+        (see _toggle_collision_granularity) is a special case: instead of
+        toggling the whole tile, this targets just the 8x8 quadrant the
+        mouse is hovering over, so a 16x16 tile can carry partial collision
+        (e.g. only its bottom-right corner). Point at the quadrant you want
+        and press C — no separate paint mode needed. A multi-tile selection
+        always toggles whole tiles (all four quadrants together), since a
+        single keypress can't sensibly express an arbitrary per-quadrant
+        pattern across several tiles at once.
         """
         tileset = self.get_current_tileset()
         if not tileset:
@@ -778,6 +959,21 @@ class TilesetEditor:
         if not cells:
             return
 
+        if len(cells) == 1 and tileset.collision_granularity == 8:
+            tx, ty = cells[0]
+            sub = self._hovered_subtile(tx, ty)
+            if sub is not None:
+                sub_x, sub_y = sub
+                make_solid = not tileset.is_subtile_solid(tx, ty, sub_x, sub_y)
+                tileset.set_subtile_solid(tx, ty, sub_x, sub_y, make_solid)
+                verb = "Marked solid" if make_solid else "Marked non-solid"
+                self._set_anim_feedback(f"{verb}: quadrant ({sub_x},{sub_y}) of tile ({tx},{ty})")
+                self.notify_tile_changed(None)
+                return
+            # Mouse isn't over the selected tile (e.g. selection was moved
+            # with arrow keys, not the mouse) — fall through to the normal
+            # whole-tile toggle below rather than silently doing nothing.
+
         make_solid = not all(tileset.is_tile_solid(tx, ty) for tx, ty in cells)
         for tx, ty in cells:
             tileset.set_tile_solid(tx, ty, make_solid)
@@ -789,6 +985,70 @@ class TilesetEditor:
         # there's no single room_name to pass — the room editor's listener
         # resyncs whichever room is currently open.
         self.notify_tile_changed(None)
+
+    def _toggle_collision_granularity(self):
+        """'H' in the palette: switch the current tileset's collision
+        editing granularity between 16 (whole-tile) and 8 (quarter-tile).
+        No-op with a feedback message on an 8px tileset — there's nothing
+        finer than the whole tile to subdivide into there. See
+        Tileset.set_collision_granularity for the data-conversion rules
+        applied when switching.
+        """
+        tileset = self.get_current_tileset()
+        if not tileset:
+            return
+
+        if tileset.tile_width != 16:
+            self._set_anim_feedback("8x8 collision only applies to 16x16 tilesets")
+            return
+
+        new_size = 8 if tileset.collision_granularity == 16 else 16
+        tileset.set_collision_granularity(new_size)
+        self._set_anim_feedback(f"Collision grid: {new_size}x{new_size}")
+        self.notify_tile_changed(None)
+
+    def _palette_to_subtile_coords(self, mouse_x: int, mouse_y: int):
+        """Like _palette_to_tile_coords, but also resolves which 8x8
+        quadrant (sub_x, sub_y, each 0 or 1) of a 16x16 tile the position
+        falls in — used for 8x8-granularity collision painting.
+
+        Returns (tile_x, tile_y, sub_x, sub_y), or None if outside the
+        tileset area. sub_x/sub_y are always (0, 0) for an 8px tileset —
+        there's only one quadrant, the whole tile. The math works at any
+        palette zoom level (self.grid_cell_size) because the quadrant
+        boundary is always exactly the midpoint of the cell on screen,
+        regardless of how many actual pixels that maps to.
+        """
+        tileset_x = self.palette_x + 20
+        tileset_y = self.palette_y + self.tileset_area_y_offset
+        rel_x = mouse_x - tileset_x + self.palette_scroll_x
+        rel_y = mouse_y - tileset_y + self.palette_scroll_y
+
+        if rel_x < 0 or rel_y < 0:
+            return None
+
+        tile_x = int(rel_x // self.grid_cell_size)
+        tile_y = int(rel_y // self.grid_cell_size)
+        half = self.grid_cell_size / 2
+        sub_x = 1 if (rel_x % self.grid_cell_size) >= half else 0
+        sub_y = 1 if (rel_y % self.grid_cell_size) >= half else 0
+        return tile_x, tile_y, sub_x, sub_y
+
+    def _hovered_subtile(self, tile_x, tile_y):
+        """Return (sub_x, sub_y) for whichever 8x8 quadrant of tile
+        (tile_x, tile_y) the mouse currently sits over in the palette, or
+        None if the mouse isn't over that tile at all (outside the palette
+        entirely, or hovering a different tile)."""
+        mouse_x, mouse_y = getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos())
+        if not self._is_in_palette(mouse_x, mouse_y):
+            return None
+        coords = self._palette_to_subtile_coords(mouse_x, mouse_y)
+        if coords is None:
+            return None
+        tx, ty, sub_x, sub_y = coords
+        if (tx, ty) != (tile_x, tile_y):
+            return None
+        return sub_x, sub_y
 
     def _is_in_palette(self, mouse_x: int, mouse_y: int) -> bool:
         """Returns True when the mouse is over the palette panel."""
@@ -939,6 +1199,9 @@ class TilesetEditor:
 
             elif event.key == pygame.K_c and not ctrl_pressed:
                 self._toggle_solid_selection()
+
+            elif event.key == pygame.K_h and not ctrl_pressed:
+                self._toggle_collision_granularity()
 
             elif event.key == pygame.K_k and not ctrl_pressed:
                 self.native_shadow_enabled = not self.native_shadow_enabled
@@ -1829,18 +2092,51 @@ class TilesetEditor:
             # footprint is visible at a glance — echoes the red hatched look
             # collision walls get drawn with in the room editor itself, so
             # "red = blocks movement" reads consistently in both places.
-            for (solid_tx, solid_ty) in tileset.solid_tiles:
-                if not (0 <= solid_tx < tileset.cols and 0 <= solid_ty < tileset.rows):
-                    continue
-                cell_x = draw_x + solid_tx * self.grid_cell_size
-                cell_y = draw_y + solid_ty * self.grid_cell_size
-                size = self.grid_cell_size
-                hatch = pygame.Surface((size, size), pygame.SRCALPHA)
-                hatch.fill((255, 0, 0, 60))
-                for i in range(-size, size * 2, 6):
-                    pygame.draw.line(hatch, (255, 0, 0, 130), (i, 0), (i + size, size), 1)
-                screen.blit(hatch, (cell_x, cell_y))
-                screen.draw_rect((255, 0, 0), (cell_x, cell_y, size, size), 1)
+            #
+            # At collision_granularity 16 this hatches whole tiles from
+            # solid_tiles, same as always. At granularity 8 it instead
+            # hatches individual 8x8 quadrants from solid_subtiles, so a
+            # tile that's only partially solid shows exactly which corner.
+            if tileset.collision_granularity == 8:
+                half = self.grid_cell_size // 2
+                for (solid_tx, solid_ty, sub_x, sub_y) in tileset.solid_subtiles:
+                    if not (0 <= solid_tx < tileset.cols and 0 <= solid_ty < tileset.rows):
+                        continue
+                    cell_x = draw_x + solid_tx * self.grid_cell_size + sub_x * half
+                    cell_y = draw_y + solid_ty * self.grid_cell_size + sub_y * half
+                    hatch = pygame.Surface((half, half), pygame.SRCALPHA)
+                    hatch.fill((255, 0, 0, 60))
+                    for i in range(-half, half * 2, 6):
+                        pygame.draw.line(hatch, (255, 0, 0, 130), (i, 0), (i + half, half), 1)
+                    screen.blit(hatch, (cell_x, cell_y))
+                    screen.draw_rect((255, 0, 0), (cell_x, cell_y, half, half), 1)
+                # Faint quadrant divider on every 16x16 tile (not just solid
+                # ones) so it's clear at a glance the palette is in 8x8
+                # collision mode and where each tile's quarter boundaries
+                # fall, before anything's even been painted solid yet.
+                for row in range(tileset.rows):
+                    for col in range(tileset.cols):
+                        mid_x = draw_x + col * self.grid_cell_size + half
+                        mid_y = draw_y + row * self.grid_cell_size + half
+                        screen.draw_line((150, 150, 170),
+                                         (mid_x, draw_y + row * self.grid_cell_size),
+                                         (mid_x, draw_y + row * self.grid_cell_size + self.grid_cell_size), 1)
+                        screen.draw_line((150, 150, 170),
+                                         (draw_x + col * self.grid_cell_size, mid_y),
+                                         (draw_x + col * self.grid_cell_size + self.grid_cell_size, mid_y), 1)
+            else:
+                for (solid_tx, solid_ty) in tileset.solid_tiles:
+                    if not (0 <= solid_tx < tileset.cols and 0 <= solid_ty < tileset.rows):
+                        continue
+                    cell_x = draw_x + solid_tx * self.grid_cell_size
+                    cell_y = draw_y + solid_ty * self.grid_cell_size
+                    size = self.grid_cell_size
+                    hatch = pygame.Surface((size, size), pygame.SRCALPHA)
+                    hatch.fill((255, 0, 0, 60))
+                    for i in range(-size, size * 2, 6):
+                        pygame.draw.line(hatch, (255, 0, 0, 130), (i, 0), (i + size, size), 1)
+                    screen.blit(hatch, (cell_x, cell_y))
+                    screen.draw_rect((255, 0, 0), (cell_x, cell_y, size, size), 1)
 
             # Draw selection rectangle
             min_x, max_x, min_y, max_y = self._get_selection_bounds()
@@ -1886,6 +2182,10 @@ class TilesetEditor:
         # hint above, which only makes sense for a multi-tile run). Reflects
         # whether every non-empty tile in the selection is already solid,
         # so it's accurate even right after a mixed selection gets toggled.
+        #
+        # At collision_granularity 8 with exactly one tile selected, this
+        # instead reports the hovered quadrant's own state — matching what
+        # 'C' will actually do in that case (see _toggle_solid_selection).
         solid_cells = [
             (tx, ty)
             for ty in range(min_y, max_y + 1)
@@ -1893,13 +2193,39 @@ class TilesetEditor:
             if not tileset.is_tile_empty(tx, ty)
         ]
         if solid_cells:
-            all_solid = all(tileset.is_tile_solid(tx, ty) for tx, ty in solid_cells)
-            if all_solid:
-                collision_hint_text, collision_hint_color = "Solid \u2014 press C to clear", (255, 100, 100)
+            quadrant_hint = None
+            if len(solid_cells) == 1 and tileset.collision_granularity == 8:
+                tx, ty = solid_cells[0]
+                sub = self._hovered_subtile(tx, ty)
+                if sub is not None:
+                    sub_x, sub_y = sub
+                    if tileset.is_subtile_solid(tx, ty, sub_x, sub_y):
+                        quadrant_hint = (f"Quadrant ({sub_x},{sub_y}) solid \u2014 press C to clear",
+                                         (255, 100, 100))
+                    else:
+                        quadrant_hint = (f"Press C to mark quadrant ({sub_x},{sub_y}) solid",
+                                         self.colors['text_dim'])
+
+            if quadrant_hint is not None:
+                collision_hint_text, collision_hint_color = quadrant_hint
             else:
-                collision_hint_text, collision_hint_color = "Press C to mark solid (blocks movement)", self.colors['text_dim']
+                all_solid = all(tileset.is_tile_solid(tx, ty) for tx, ty in solid_cells)
+                if all_solid:
+                    collision_hint_text, collision_hint_color = "Solid \u2014 press C to clear", (255, 100, 100)
+                else:
+                    collision_hint_text, collision_hint_color = "Press C to mark solid (blocks movement)", self.colors['text_dim']
             collision_hint_surf = self.font_small.render(collision_hint_text, True, collision_hint_color)
             screen.blit(collision_hint_surf, (self.palette_x + 20, sel_y + 18))
+
+        # Collision granularity indicator — only meaningful for a 16x16
+        # tileset (an 8px tileset has nothing finer to switch to), shown
+        # on its own row below the collision hint / animation prompt /
+        # feedback banner (all of which share sel_y + 36) so it never
+        # overlaps whichever of those happens to be showing.
+        if tileset.tile_width == 16:
+            granularity_text = f"Collision grid: {tileset.collision_granularity}x{tileset.collision_granularity} \u2014 press H to switch"
+            granularity_surf = self.font_small.render(granularity_text, True, self.colors['text_dim'])
+            screen.blit(granularity_surf, (self.palette_x + 20, sel_y + 54))
 
         # Inline FPS prompt while confirming a new animation
         if self.fps_input_active:

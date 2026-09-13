@@ -126,7 +126,7 @@ def _find_decoration_image(folder, decoration_type, metadata):
         if os.path.isabs(configured):
             candidates = [configured]
         else:
-            candidates = [os.path.join(folder, configured), configured]
+            candidates = [os.path.join(folder, configured), _resolve_asset_path(configured)]
         for candidate in candidates:
             if os.path.isfile(candidate):
                 return candidate

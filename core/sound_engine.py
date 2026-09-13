@@ -9,10 +9,27 @@ class SoundEngine:
         # Initialize pygame mixer
         pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
 
+        # Widen the channel pool (SDL_mixer defaults to 8) so one-shot sfx,
+        # looping sfx, and positional BGS instances aren't fighting over a
+        # handful of slots — and reserve channel 0 exclusively for the room
+        # BGS slot below. Reserved channels are excluded from SDL_mixer's
+        # automatic "steal the oldest channel" behavior that Sound.play()
+        # falls back to when the pool is full, so the room BGS can no
+        # longer be silently stolen by an unrelated sfx/positional-bgs play.
+        pygame.mixer.set_num_channels(32)
+        pygame.mixer.set_reserved(1)
+        self.BGS_CHANNEL_ID = 0
+
         # Music settings
         self.current_music = None
         self.music_volume = 0.7
         self.is_music_playing = False
+        # Per-room multiplier (0.0-1.0) layered on top of music_volume above,
+        # set by whoever calls play_music(..., volume_scale=...) — typically
+        # a room's own music_volume setting. Kept around (rather than only
+        # used at play time) so set_music_volume() can recompute the
+        # effective volume for whatever's already playing.
+        self._music_volume_scale = 1.0
 
         # Sound effects
         self.sfx_volume = 0.1
@@ -36,11 +53,21 @@ class SoundEngine:
         # cleanly stop whatever ambient loop was previously playing without
         # the caller needing to know its name.
         self.bgs_volume = 0.4
+        # Per-room multiplier (0.0-1.0) layered on top of bgs_volume above,
+        # set by whoever calls play_bgs(..., volume_scale=...) — typically a
+        # room's own bgs_volume setting. Applied to bgs_channel directly
+        # (see play_bgs/set_bgs_volume) rather than to the Sound object,
+        # since a Sound's own volume is shared with any positional BGS
+        # instance playing the same ambient loop.
+        self._bgs_volume_scale = 1.0
         self.ambient_sounds = {}
         # Mirrors ambient_sounds' keys — see sound_effect_paths above.
         self.ambient_sound_paths = {}
         self.current_bgs = None
-        self.bgs_channel = None
+        # A fixed, reserved Channel object (not one returned by Sound.play(),
+        # which would be a fresh — and stealable — channel each time). We
+        # play *onto* this channel from now on, so it's never reassigned.
+        self.bgs_channel = pygame.mixer.Channel(self.BGS_CHANNEL_ID)
 
         # Positional BGS — independent ambient loops for world-placed
         # "Ambient Sound" objects (e.g. a waterfall, a beehive, a torch).
@@ -131,7 +158,7 @@ class SoundEngine:
                 pygame.mixer.music.load(filepath)
                 if was_playing:
                     pygame.mixer.music.play(-1)
-                    pygame.mixer.music.set_volume(self.music_volume)
+                    pygame.mixer.music.set_volume(self.music_volume * self._music_volume_scale)
                 print(f"🔄 Reloaded music (live): {name}")
             except Exception as e:
                 print(f"Warning: could not hot-reload playing music '{name}': {e}")
@@ -166,7 +193,9 @@ class SoundEngine:
             self.ambient_sounds[name] = sound
             self.ambient_sound_paths[name] = filepath
             if self.current_bgs == name:
-                self.play_bgs(name, fade_in=False)
+                # Preserve whatever per-room volume_scale is already in
+                # effect instead of resetting it to the play_bgs default.
+                self.play_bgs(name, fade_in=False, volume_scale=self._bgs_volume_scale)
             print(f"🔄 Reloaded BGS: {name}")
             return True
         except Exception as e:
@@ -188,11 +217,16 @@ class SoundEngine:
         if self.current_bgs == name:
             self.stop_bgs(fade_out=False)
 
-    def play_music(self, name, loops=-1, fade_in=True):
+    def play_music(self, name, loops=-1, fade_in=True, volume_scale=1.0):
         """
         Play a music track
         loops: -1 for infinite loop, 0 for play once, n for play n+1 times
         fade_in: whether to fade in the music
+        volume_scale: 0.0-1.0 multiplier applied on top of music_volume,
+            typically a room's own music_volume setting so a room can be
+            mixed quieter/louder without touching the player's own volume
+            preference. Stored on self._music_volume_scale so a later
+            set_music_volume() call recomputes against it correctly.
         """
         if not self.music_enabled:
             return
@@ -201,13 +235,18 @@ class SoundEngine:
             print(f"Warning: Music track '{name}' not loaded")
             return
 
-        # Don't restart if already playing
+        self._music_volume_scale = max(0.0, min(1.0, volume_scale))
+
+        # Don't restart if already playing — but a changed volume_scale
+        # (e.g. re-entering the same room after its slider moved) should
+        # still take effect without a restart.
         if self.current_music == name and self.is_music_playing:
+            pygame.mixer.music.set_volume(self.music_volume * self._music_volume_scale)
             return
 
         try:
             pygame.mixer.music.load(self.music_tracks[name])
-            pygame.mixer.music.set_volume(self.music_volume)
+            pygame.mixer.music.set_volume(self.music_volume * self._music_volume_scale)
 
             if fade_in:
                 pygame.mixer.music.play(loops, fade_ms=self.fade_duration)
@@ -228,6 +267,7 @@ class SoundEngine:
 
         self.is_music_playing = False
         self.current_music = None
+        self._music_volume_scale = 1.0
 
     def pause_music(self):
         """Pause the current music"""
@@ -274,14 +314,21 @@ class SoundEngine:
             channel.stop()
             self.looping_channels[name] = None
 
-    def play_bgs(self, name, fade_in=True):
+    def play_bgs(self, name, fade_in=True, volume_scale=1.0):
         """Start (or switch to) a BGS ambient loop, e.g. 'rain'.
 
         Unlike play_looping_sound(), this tracks a single "current bgs"
         slot: calling play_bgs() with a different name stops whatever
         ambient loop was previously playing first, the same way
         play_music() replaces the current music track. Calling it again
-        with the same name that's already looping is a cheap no-op.
+        with the same name that's already looping is a cheap no-op (aside
+        from re-applying volume_scale, see below).
+
+        volume_scale: 0.0-1.0 multiplier applied on top of bgs_volume,
+            typically a room's own bgs_volume setting. Applied directly to
+            bgs_channel (not the Sound object) so it doesn't bleed into
+            positional BGS instances that happen to share the same ambient
+            loop — see set_positional_bgs_volume for that separate path.
         """
         if not self.bgs_enabled:
             return
@@ -290,11 +337,16 @@ class SoundEngine:
             print(f"Warning: BGS '{name}' not loaded")
             return
 
-        if self.current_bgs == name and self.bgs_channel is not None and self.bgs_channel.get_busy():
-            return  # Already playing this ambient loop — don't restart it.
+        self._bgs_volume_scale = max(0.0, min(1.0, volume_scale))
+
+        if self.current_bgs == name and self.bgs_channel.get_busy():
+            # Already playing this ambient loop — don't restart it, but a
+            # changed volume_scale should still take effect immediately.
+            self.bgs_channel.set_volume(self.bgs_volume * self._bgs_volume_scale)
+            return
 
         # Stop whatever ambient loop was playing before switching.
-        if self.bgs_channel is not None:
+        if self.bgs_channel.get_busy():
             if fade_in:
                 self.bgs_channel.fadeout(self.fade_duration)
             else:
@@ -302,21 +354,28 @@ class SoundEngine:
 
         try:
             fade_ms = self.fade_duration if fade_in else 0
-            self.bgs_channel = self.ambient_sounds[name].play(loops=-1, fade_ms=fade_ms)
+            # Set the channel's target volume *before* play() so a fade-in
+            # ramps up to the right level instead of jumping to it partway
+            # through the fade.
+            self.bgs_channel.set_volume(self.bgs_volume * self._bgs_volume_scale)
+            # Play onto the reserved bgs_channel itself (Channel.play), not
+            # Sound.play() — Sound.play() would hand back an arbitrary
+            # channel from the general pool, which is exactly the channel
+            # that positional BGS / one-shot sfx could later steal.
+            self.bgs_channel.play(self.ambient_sounds[name], loops=-1, fade_ms=fade_ms)
             self.current_bgs = name
         except Exception as e:
             print(f"Error: Could not play BGS '{name}': {e}")
 
     def stop_bgs(self, fade_out=True):
         """Stop the currently playing BGS ambient loop, if any."""
-        if self.bgs_channel is not None:
-            if fade_out:
-                self.bgs_channel.fadeout(self.fade_duration)
-            else:
-                self.bgs_channel.stop()
+        if fade_out:
+            self.bgs_channel.fadeout(self.fade_duration)
+        else:
+            self.bgs_channel.stop()
 
         self.current_bgs = None
-        self.bgs_channel = None
+        self._bgs_volume_scale = 1.0
 
     def play_positional_bgs(self, name):
         """Start a standalone ambient loop for a single placed 'Ambient Sound'
@@ -385,6 +444,13 @@ class SoundEngine:
         for sound in self.ambient_sounds.values():
             sound.set_volume(self.bgs_volume)
 
+        # Re-apply to the room BGS channel too, factoring in whatever
+        # per-room volume_scale play_bgs() was last called with — the loop
+        # above only touches each Sound's own default volume, which
+        # bgs_channel.play() doesn't read from once it's already playing.
+        if self.current_bgs is not None:
+            self.bgs_channel.set_volume(self.bgs_volume * self._bgs_volume_scale)
+
         # NOTE: this does not retroactively rescale already-playing
         # positional ambient channels (see play_positional_bgs) — those are
         # driven every frame by their owning AmbientSoundObject via
@@ -403,7 +469,7 @@ class SoundEngine:
     def set_music_volume(self, volume):
         """Set music volume (0.0 to 1.0)"""
         self.music_volume = max(0.0, min(1.0, volume))
-        pygame.mixer.music.set_volume(self.music_volume)
+        pygame.mixer.music.set_volume(self.music_volume * self._music_volume_scale)
 
     def set_sfx_volume(self, volume):
         """Set sound effects volume (0.0 to 1.0)"""
@@ -530,14 +596,41 @@ class SoundManager:
             # Return to exploration music
             self.set_context('exploration')
 
+    def sync_battle_state(self, has_enemies):
+        """Seed in_battle/battle_music_timer to match a room that was just
+        entered or loaded, WITHOUT going through set_context()/stop_music().
+
+        update_battle_state() treats any has_enemies flip relative to
+        self.in_battle as a fight starting or ending, and reacts by
+        fading out whatever's playing and switching to the battle/
+        exploration context track a couple of seconds later. That's the
+        right behavior mid-play, but it's wrong on a fresh room entry
+        (a normal room transition, or restoring a save): a room simply
+        *containing* enemies already isn't the same as a fight that just
+        started, and _apply_room_music/_apply_room_bgs have already put
+        that room's own persisted track on right before this runs. Call
+        this once, right after spawning the room's entities, so the very
+        next update_battle_state() tick sees no change and leaves that
+        track alone — instead of counting down battle_music_delay and
+        yanking it out from under the room's own music a couple of
+        seconds after loading in.
+        """
+        self.in_battle = has_enemies
+        self.battle_music_timer = 0
+
     def play_sfx(self, sfx_name):
         """Play a sound effect. Returns the Channel it's playing on (or None),
         so callers can poll get_busy() to know when it has finished."""
         return self.sound_engine.play_sound(sfx_name)
 
-    def play_music(self, track_name, loops=-1, fade_in=True):
+    def play_music(self, track_name, loops=-1, fade_in=True, volume_scale=1.0):
         """Directly play a track by name, bypassing the exploration/battle/
         boss context map entirely. Intended for room-level Music objects.
+
+        volume_scale: 0.0-1.0 multiplier on top of the player's music volume
+            setting — pass a room's own music_volume here to mix that
+            room's BGM quieter/louder without touching the player's own
+            volume preference.
 
         NOTE: because this bypasses set_context(), it does NOT update
         self.current_context. That means update_battle_state() will still
@@ -553,7 +646,8 @@ class SoundManager:
         this method deliberately doesn't make on its own.
         """
         print(f"🎵 Playing music (direct): {track_name}")
-        self.sound_engine.play_music(track_name, loops=loops, fade_in=fade_in)
+        self.sound_engine.play_music(track_name, loops=loops, fade_in=fade_in,
+                                      volume_scale=volume_scale)
 
     def stop_music(self, fade_out=True):
         """Stop whatever music is currently playing, regardless of how it was
@@ -572,12 +666,18 @@ class SoundManager:
         """Stop a looping sound effect started with play_looping_sfx."""
         self.sound_engine.stop_looping_sound(sfx_name)
 
-    def play_bgs(self, bgs_name, fade_in=True):
+    def play_bgs(self, bgs_name, fade_in=True, volume_scale=1.0):
         """Start (or switch to) a BGS ambient loop (e.g. 'rain'). Intended
         for room-level ambient sound, the same way play_music() is used for
         room-level music tracks. Switching to a different name automatically
-        stops whatever ambient loop was playing before."""
-        self.sound_engine.play_bgs(bgs_name, fade_in=fade_in)
+        stops whatever ambient loop was playing before.
+
+        volume_scale: 0.0-1.0 multiplier on top of the player's BGS volume
+            setting — pass a room's own bgs_volume here to mix that room's
+            ambient loop quieter/louder without touching the player's own
+            volume preference.
+        """
+        self.sound_engine.play_bgs(bgs_name, fade_in=fade_in, volume_scale=volume_scale)
 
     def stop_bgs(self, fade_out=True):
         """Stop whatever BGS ambient loop is currently playing, if any."""

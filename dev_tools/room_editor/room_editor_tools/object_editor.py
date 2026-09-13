@@ -1259,6 +1259,7 @@ class ObjectEditor:
         """Open or close the object editor"""
         self.active = not self.active
         if self.active:
+            self.refresh_decoration_catalog()
             self.selected_object = None
             self.selected_variant = None
             self.showing_variants_for = None
@@ -3704,6 +3705,16 @@ class ObjectEditor:
                 self._toggle_grid_snap()
             elif event.key == pygame.K_h:
                 self.show_grid = not self.show_grid
+            elif (event.key == pygame.K_r and self.hovered_object_type == 'fishing_area'
+                  and self.hovered_object is not None):
+                # Rotate the hovered fishing area's jump direction. Mutates
+                # the live FishingArea in place -- it's already the exact
+                # instance saved with the room (same treatment chest loot
+                # assignment gets, see on_chest_loot_changed above), so no
+                # separate placement/undo step is needed for this to stick.
+                self.hovered_object.cycle_direction(
+                    -1 if (pygame.key.get_mods() & pygame.KMOD_SHIFT) else 1
+                )
             elif event.key == pygame.K_ESCAPE or event.key == pygame.K_F3:
                 if self.placing_collision:
                     self.placing_collision = False
@@ -5058,7 +5069,43 @@ class ObjectEditor:
                 continue
             if not self._center_obj_in_view(area, camera_x, camera_y):
                 continue
-            area.draw(screen, temp_camera, colors)
+            area.draw(screen, temp_camera, colors, dev_mode=True)
+            self._draw_fishing_area_direction_arrow(screen, area, camera_x, camera_y)
+
+    def _draw_fishing_area_direction_arrow(self, screen, area, camera_x, camera_y):
+        """Editor-only arrow showing which way this area's jump direction is
+        currently set -- deliberately NOT part of FishingArea.draw() itself,
+        since that method also runs during real gameplay and this is purely
+        a room-editor authoring aid (see area.direction / cycle_direction,
+        set via hover + R)."""
+        sx = (area.x * RENDER_SCALE) - camera_x
+        sy = (area.y * RENDER_SCALE) - camera_y
+        reach = max(10, int(area.width * RENDER_SCALE * 0.35))
+
+        dx, dy = area.get_direction_vector()
+        tip = (sx + dx * reach, sy + dy * reach)
+        # perpendicular unit vector, for the arrowhead's two back corners
+        px, py = -dy, dx
+        back = (sx + dx * reach * 0.45, sy + dy * reach * 0.45)
+        spread = reach * 0.35
+        left = (back[0] + px * spread, back[1] + py * spread)
+        right = (back[0] - px * spread, back[1] - py * spread)
+
+        color = (255, 230, 60)
+        screen.draw_line(color, (int(sx), int(sy)), (int(back[0]), int(back[1])), 3)
+        screen.draw_polygon(color, [
+            (int(tip[0]), int(tip[1])),
+            (int(left[0]), int(left[1])),
+            (int(right[0]), int(right[1])),
+        ], 0)
+
+        # "Facing: down (R to rotate)" hint only while this exact area is
+        # hovered -- otherwise every fishing area in a busy room would be
+        # captioned at once.
+        if self.hovered_object is area and self.hovered_object_type == 'fishing_area':
+            label = self.font_small.render(
+                f"Facing: {area.direction}  (R to rotate, Shift+R back)", True, color)
+            screen.blit(label, (int(sx - label.get_width() / 2), int(sy + reach + 6)))
 
     def draw_ambient_sounds(self, screen, camera_x, camera_y):
         """Draw editor-only positional sound markers and audible radii."""

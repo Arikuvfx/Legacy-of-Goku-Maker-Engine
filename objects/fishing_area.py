@@ -22,41 +22,52 @@ from core.draw_layers import DrawLayer
 class FishingArea:
     """A rectangular area the player can stand in and interact with (E) to fish."""
 
-    def __init__(self, x, y, width=48, height=48):
+    # Cardinal facing → (dx, dy) unit vector, screen/world axes (+y is down).
+    # This is the per-instance jump direction set in the room editor (hover
+    # the fishing area + press R to cycle) -- see ObjectEditor's direction
+    # arrow indicator and game.py's _start_fishing_jump, which passes
+    # area.direction straight through to player.start_fishing_jump().
+    DIRECTION_VECTORS = {
+        'up':    (0, -1),
+        'down':  (0, 1),
+        'left':  (-1, 0),
+        'right': (1, 0),
+    }
+
+    def __init__(self, x, y, width=48, height=48, direction='down'):
         self.x = float(x)
         self.y = float(y)
         self.width = width
         self.height = height
         self.active = True
+        self.direction = direction if direction in self.DIRECTION_VECTORS else 'down'
 
         # Ground-level, not y-sorted — same treatment as the flat 'world_map'
         # ground sprite variant, since this is a floor marker, not a body.
         self.draw_layer = DrawLayer.GROUND
         self.y_sort = False
 
-        self.sprite = None
-        self._load_sprite()
-
-        # Cached RENDER_SCALE-sized copy of self.sprite (and, when the
-        # sprite is missing, a cached translucent placeholder surface) —
-        # built lazily and only rebuilt if the target size changes. GPUScreen
-        # (see gpu_renderer.py) caches uploaded textures by the Python id()
-        # of the Surface object passed to blit(), so re-creating a brand
-        # new Surface every frame (the old behavior here) would silently
-        # leak a fresh texture into that cache every single frame instead
-        # of reusing one — same fix as WorldMapObject._get_scaled_sprite.
-        self._scaled_sprite = None
-        self._scaled_sprite_size = None
+        # Cached translucent placeholder surface, built lazily and only
+        # rebuilt if the target size changes. GPUScreen (see gpu_renderer.py)
+        # caches uploaded textures by the Python id() of the Surface object
+        # passed to blit(), so re-creating a brand new Surface every frame
+        # would silently leak a fresh texture into that cache every single
+        # frame instead of reusing one — same fix as
+        # WorldMapObject._get_scaled_sprite.
         self._placeholder_surface = None
         self._placeholder_size = None
 
-    def _load_sprite(self):
-        try:
-            self.sprite = pygame.image.load(
-                'assets/objects/fishing_area/fishing_area.png'
-            ).convert_alpha()
-        except Exception:
-            self.sprite = None  # falls back to a translucent placeholder rect
+    def get_direction_vector(self):
+        """(dx, dy) unit vector for self.direction — see DIRECTION_VECTORS."""
+        return self.DIRECTION_VECTORS.get(self.direction, (0, 1))
+
+    def cycle_direction(self, step=1):
+        """Advance (step=1) or retreat (step=-1) to the next cardinal
+        direction, in cycle order. Bound to the room editor's 'R' key
+        (Shift+R to go backward) while hovering a fishing area."""
+        order = ['down', 'left', 'up', 'right']
+        idx = order.index(self.direction) if self.direction in order else 0
+        self.direction = order[(idx + step) % len(order)]
 
     def get_sort_key(self):
         y = self.y if self.y_sort else 0
@@ -85,17 +96,11 @@ class FishingArea:
     def update(self, dt, player=None):
         pass
 
-    def _get_scaled_sprite(self, w, h):
-        if self._scaled_sprite_size != (w, h):
-            self._scaled_sprite = pygame.transform.scale(self.sprite, (w, h))
-            self._scaled_sprite_size = (w, h)
-        return self._scaled_sprite
-
     def _get_placeholder_surface(self, w, h):
-        """Translucent blue water-ish placeholder so this reads as an area,
-        not a solid object, until a real sprite is added. Cached per size
-        (see the __init__ note) so draw() reuses the same Surface object
-        every frame instead of allocating a new one."""
+        """Translucent blue water-ish box representing this area in the
+        room editor. Cached per size (see the __init__ note) so draw()
+        reuses the same Surface object every frame instead of allocating
+        a new one."""
         if self._placeholder_size != (w, h):
             overlay = pygame.Surface((w, h), pygame.SRCALPHA)
             overlay.fill((60, 140, 220, 90))
@@ -104,24 +109,32 @@ class FishingArea:
             self._placeholder_size = (w, h)
         return self._placeholder_surface
 
-    def draw(self, screen, camera, colors=None):
+    def draw(self, screen, camera, colors=None, dev_mode=False):
+        """dev_mode=True (room editor only -- see ObjectEditor.draw_fishing_areas)
+        draws a translucent box so the area is visible/selectable while
+        authoring a room; ObjectEditor draws the facing-direction arrow on
+        top of it separately.
+
+        In real gameplay (dev_mode=False, the default -- includes F2 test
+        mode, which reuses this exact same draw path) the area is
+        completely invisible: it's a trigger zone the player walks through,
+        not something meant to ever appear on screen during play.
+        """
+        if not dev_mode:
+            return
         sx = int(self.x * RENDER_SCALE - camera.x)
         sy = int(self.y * RENDER_SCALE - camera.y)
         w = int(self.width * RENDER_SCALE)
         h = int(self.height * RENDER_SCALE)
-
-        if self.sprite:
-            scaled = self._get_scaled_sprite(w, h)
-            screen.blit(scaled, scaled.get_rect(center=(sx, sy)))
-        else:
-            placeholder = self._get_placeholder_surface(w, h)
-            screen.blit(placeholder, placeholder.get_rect(center=(sx, sy)))
+        placeholder = self._get_placeholder_surface(w, h)
+        screen.blit(placeholder, placeholder.get_rect(center=(sx, sy)))
 
     def to_dict(self):
         return {
             'type': 'fishing_area',
             'x': self.x, 'y': self.y,
             'width': self.width, 'height': self.height,
+            'direction': self.direction,
         }
 
     @staticmethod
@@ -129,6 +142,7 @@ class FishingArea:
         return FishingArea(
             data.get('x', 0), data.get('y', 0),
             data.get('width', 48), data.get('height', 48),
+            data.get('direction', 'down'),
         )
 
 

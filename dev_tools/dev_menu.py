@@ -258,27 +258,41 @@ class DevMenu:
     # =========================================================================
 
     def toggle(self):
-        """
-        Show or hide the menu.
-        On open: resets state and switches to menu music.
-        On close: restores the previous music context.
-        """
-        self.active = not self.active
-
+        """Show or hide the menu (bound to F1). Thin wrapper around
+        open()/close() so external callers (game.py) keep a single
+        entry point regardless of current state."""
         if self.active:
-            self.current_menu = 'main'
-            self.selected_index = -1
-            self.hover_index = -1
-            self.editing_text = False
-            self.icon_bob_offset = [0.0] * self._max_menu_slots
-
-            if self.sound_manager:
-                self.previous_context = self.sound_manager.get_current_context()
-                self.sound_manager.set_context_immediate('menu')
+            self.close()
         else:
-            if self.sound_manager:
-                ctx = self.previous_context or 'exploration'
-                self.sound_manager.set_context(ctx, force=True)
+            self.open()
+
+    def open(self):
+        """Show the menu: resets state and switches to menu music."""
+        self.active = True
+        self.current_menu = 'main'
+        self.selected_index = -1
+        self.hover_index = -1
+        self.editing_text = False
+        self.icon_bob_offset = [0.0] * self._max_menu_slots
+
+        if self.sound_manager:
+            self.previous_context = self.sound_manager.get_current_context()
+            self.sound_manager.set_context_immediate('menu')
+
+    def close(self):
+        """Hide the menu and restore whatever music context was playing
+        before it opened. This is the ONLY place that should flip
+        self.active from True to False for a plain close (ESC / "CLOSE
+        MENU") — routing every close path through here (rather than some
+        callers setting self.active = False directly) is what guarantees
+        the music-context restore always runs. Selecting one of the
+        "open_<editor>" options is a different case, handled by game.py
+        itself, since it's replacing the dev menu with another overlay
+        rather than returning to plain gameplay."""
+        self.active = False
+        if self.sound_manager:
+            ctx = self.previous_context or 'exploration'
+            self.sound_manager.set_context(ctx, force=True)
 
     def handle_input(self, event):
         """
@@ -322,7 +336,8 @@ class DevMenu:
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_ESCAPE:
                 if self.current_menu == 'main':
-                    self.active = False
+                    self.close()
+                    return 'close'
                 else:
                     self._go_back()
                 return None
@@ -621,7 +636,8 @@ class DevMenu:
             elif option_id == 'config':
                 self._enter_menu('config')
             elif option_id == 'close':
-                self.active = False
+                self.close()
+                return 'close'
 
         elif self.current_menu == 'config':
             if option_id == 'back':

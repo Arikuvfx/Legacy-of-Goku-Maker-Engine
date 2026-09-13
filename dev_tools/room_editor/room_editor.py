@@ -454,6 +454,17 @@ class RoomEditor:
         self._bgs_dropdown_rects: dict = {}
         self._bgs_dropdown_scroll  = 0
 
+        # Room Music (BGM) / Room BGS volume sliders — live inline in the
+        # Edit Room view (unlike the dropdowns above, they're not a modal
+        # popup), so they only need drag state + hit-rects, drawn via
+        # _draw_room_volume_slider and dragged via
+        # _apply_room_volume_slider_drag. Values are stored on the room
+        # itself as editing_room.music_volume / editing_room.bgs_volume,
+        # each a 0.0-1.0 float defaulting to 1.0 (100%) when absent so
+        # older saved rooms keep playing at full volume.
+        self._room_volume_drag_slider          = None
+        self._room_volume_slider_rects: dict   = {}
+
         # Background sub-panel state (ported from EditorToolbar — see that
         # file's history for the original implementation)
         self._bg_panel_open   = False
@@ -748,6 +759,26 @@ class RoomEditor:
         # Room BGS dropdown (Room Settings) is open — same convention.
         if self.current_view == 'edit' and self._bgs_dropdown_open:
             return self.handle_bgs_dropdown_event(event)
+
+        # Room Music/BGS volume sliders (Room Settings) — these live inline
+        # in the edit view rather than behind a modal swallow-all flag like
+        # the dropdowns above, so only the drag itself is intercepted here;
+        # everything else keeps falling through to normal edit-view routing.
+        if self.current_view == 'edit':
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                for key, track in self._room_volume_slider_rects.items():
+                    if track.collidepoint(event.pos):
+                        self._room_volume_drag_slider = key
+                        self._apply_room_volume_slider_drag(key, event.pos[0], track)
+                        return None
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                self._room_volume_drag_slider = None
+            elif event.type == pygame.MOUSEMOTION and self._room_volume_drag_slider is not None:
+                track = self._room_volume_slider_rects.get(self._room_volume_drag_slider)
+                if track:
+                    self._apply_room_volume_slider_drag(
+                        self._room_volume_drag_slider, event.pos[0], track)
+                return None
 
         # Room viewing mode gets special treatment (includes mouse)
         if self.current_view == 'view_room':
@@ -2359,10 +2390,28 @@ class RoomEditor:
         # Drop this room's previously auto-generated boxes; anything the
         # user placed by hand (auto_tile is False/absent) is left exactly
         # where it is.
-        room.collision_objects = [
+        hand_placed = [
             obj for obj in room.collision_objects if not getattr(obj, 'auto_tile', False)
         ]
+        room.collision_objects = list(hand_placed)
+
+        # Skip any solid-tile footprint that a hand-placed box already
+        # covers. Without this, a diagonal (or any other hand-drawn) wall
+        # sitting on a tile the tileset also marks solid gets a duplicate
+        # auto_tile square stacked on top of it every time the room is
+        # (re)opened -- harmless for a plain rectangular wall, but for a
+        # diagonal run the new squares have no diagonal_group_id, so they
+        # draw individually *after* the merged diagonal quad (see
+        # ObjectEditor.draw_collision_objects) and visually paper over it,
+        # turning the smooth diagonal back into a staircase of plain
+        # squares. Rect-overlap (not just exact match) so this still
+        # catches a hand-placed box that's a different size than the tile
+        # (e.g. an 8px diagonal segment sitting on a 16px solid tile).
+        hand_placed_rects = [pygame.Rect(o.x, o.y, o.width, o.height) for o in hand_placed]
         for (x, y, w, h) in desired_rects:
+            tile_rect = pygame.Rect(x, y, w, h)
+            if any(tile_rect.colliderect(r) for r in hand_placed_rects):
+                continue
             room.collision_objects.append(CollisionObject(x, y, w, h, room_name, auto_tile=True))
 
         # collision_manager's dict entry is meant to be the same list object
@@ -5441,6 +5490,19 @@ class RoomEditor:
             self._bg_thumbs[fname] = None
         return self._bg_thumbs[fname]
 
+    def _apply_room_volume_slider_drag(self, key, mouse_x, track):
+        """Update editing_room.music_volume / bgs_volume from a slider drag.
+
+        Mirrors _apply_bg_slider_drag below, but writes straight onto the
+        room instead of into the scrolling_bg dict since volume isn't part
+        of that sub-panel's data.
+        """
+        t = round(max(0.0, min(1.0, (mouse_x - track.x) / max(1, track.width))), 2)
+        if key == 'music_volume':
+            self.editing_room.music_volume = t
+        elif key == 'bgs_volume':
+            self.editing_room.bgs_volume = t
+
     def _apply_bg_slider_drag(self, key, mouse_x, track):
         t = max(0.0, min(1.0, (mouse_x - track.x) / max(1, track.width)))
         if key == 'scroll_x':
@@ -5931,6 +5993,40 @@ class RoomEditor:
 
         self._bg_slider_rects[key] = track
 
+    def _draw_room_volume_slider(self, screen, x, y, width, key, label, value, display):
+        """Horizontal 0-1 volume slider for Room Music/BGS, drawn directly in
+        the Edit Room view. Same look and feel as _draw_bg_slider above, but
+        reads/writes self._room_volume_drag_slider / _room_volume_slider_rects
+        instead of the background sub-panel's slider state."""
+        lbl_s = self.font_small.render(label, True, self.colors['text_dim'])
+        screen.blit(lbl_s, (x, y))
+
+        val_s = self.font_small.render(display, True, self.colors['text'])
+        screen.blit(val_s, (x + width - val_s.get_width(), y))
+
+        track_y = y + self.SLIDER_H + 2
+        track = pygame.Rect(x, track_y, width, self.SLIDER_TRACK)
+        screen.draw_rect(self.colors['slider_track'], track, border_radius=3)
+
+        fill_w = max(0, int(value * width))
+        if fill_w:
+            screen.draw_rect(self.colors['slider_fill'],
+                             pygame.Rect(x, track_y, fill_w, self.SLIDER_TRACK),
+                             border_radius=3)
+
+        thumb_x = x + int(value * width)
+        thumb_cy = track_y + self.SLIDER_TRACK // 2
+        THUMB_R = 7
+        mx, my = self._logical_mouse_pos
+        dragging = self._room_volume_drag_slider == key
+        hovered = (abs(mx - thumb_x) <= THUMB_R + 3
+                   and abs(my - thumb_cy) <= THUMB_R + 3)
+        tcol = self.colors['accent'] if (dragging or hovered) else self.colors['text']
+        screen.filled_circle(thumb_x, thumb_cy, THUMB_R, tcol)
+        screen.aacircle(thumb_x, thumb_cy, THUMB_R, self.colors['panel_border'])
+
+        self._room_volume_slider_rects[key] = track
+
     # =========================================================================
     # Room Settings — Room Music scan
     # =========================================================================
@@ -6073,6 +6169,25 @@ class RoomEditor:
             screen.blit(value_surf, (row_rect.x + 8, row_rect.y + 8))
 
         y_pos += 66
+
+        # Room Music (BGM) / Room BGS volume — click-drag sliders, not part
+        # of the keyboard tab order (same convention as the sliders in the
+        # Background sub-panel below), so they don't need an edit_fields
+        # index of their own.
+        self._room_volume_slider_rects = {}
+        music_volume = getattr(self.editing_room, 'music_volume', 1.0)
+        bgs_volume = getattr(self.editing_room, 'bgs_volume', 1.0)
+
+        vol_row_w = (field_width - 24) // 2
+        self._draw_room_volume_slider(
+            screen, content_x, y_pos, vol_row_w,
+            'music_volume', 'Music Volume', music_volume,
+            f'{int(round(music_volume * 100))}%')
+        self._draw_room_volume_slider(
+            screen, content_x + vol_row_w + 24, y_pos, vol_row_w,
+            'bgs_volume', 'BGS Volume', bgs_volume,
+            f'{int(round(bgs_volume * 100))}%')
+        y_pos += self.SLIDER_H + 34
 
         # Can attack? (index 7) — checkbox row
         is_selected = (7 == self.selected_index)

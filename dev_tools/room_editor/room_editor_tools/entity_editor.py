@@ -156,6 +156,76 @@ def _build_npc_catalogue():
     return {'NPCs': npcs}
 
 
+_CRITTER_VARIANT_COLOR = (120, 190, 90)
+# Legacy per-species accents for the three built-in critters, kept purely
+# for continuity with how they used to look before this catalogue was
+# data-driven. Any critter_type not in here (including new custom
+# critters made in entity_creator) just gets the generic accent above.
+_CRITTER_TYPE_COLORS = {
+    'squirrel':  (150, 100, 60),
+    'bird':      (100, 150, 220),
+    'butterfly': (230, 150, 200),
+}
+
+
+def _build_critter_catalogue():
+    """Standalone builder for the 'Critters' portion of the entity catalogue,
+    factored out the same way _build_enemy_catalogue() / _build_npc_catalogue()
+    are, so the roster can be read without instantiating a full EntityEditor.
+
+    Sourced live from entity_creator: discover_all_ids() unions every
+    sprite-folder id under assets/sprites/critters/ with every id that has a
+    saved assets/critters/{id}.json — so a critter created (and saved) in
+    entity_creator shows up here automatically instead of only the three
+    hardcoded squirrel/bird/butterfly entries. Falls back to those three ids
+    if nothing is discovered at all, so the palette is never empty."""
+    critter_ids = entity_creator.discover_all_ids(entity_creator.KIND_CRITTER)
+    if not critter_ids:
+        critter_ids = ['squirrel', 'bird', 'butterfly']
+
+    critters = []
+    for critter_id in critter_ids:
+        cfg = entity_creator.load_config(entity_creator.KIND_CRITTER, critter_id)
+
+        variant_ids = entity_creator.scan_variants(entity_creator.KIND_CRITTER, critter_id)
+        color = _CRITTER_TYPE_COLORS.get(cfg.get('critter_type', ''), _CRITTER_VARIANT_COLOR)
+        variants = [
+            {
+                'type': v,
+                'name': 'Default' if v == 'default' else v.replace('_', ' ').title(),
+                'color': color,
+            }
+            for v in variant_ids
+        ]
+
+        display_name = cfg.get('display_name') or critter_id.replace('_', ' ').title()
+
+        critters.append({
+            'id': critter_id,
+            'name': display_name,
+            'sprite': None,
+            'width': cfg.get('width', 16), 'height': cfg.get('height', 16),
+            'entity_type': 'critter',
+            'has_variants': True,
+            'variants': variants,
+            'default_variant': 'default',
+        })
+
+    critters.sort(key=lambda e: e['name'])
+    return {'Critters': critters}
+
+
+def discover_critter_ids():
+    """All placeable critter ids, sourced from the same catalogue
+    EntityEditor's palette uses (_build_critter_catalogue() above), so this
+    list never drifts out of sync with what actually exists. Mirrors
+    discover_npc_ids()/discover_enemy_ids() for other dev tools that want
+    the critter roster without pulling in a full EntityEditor instance."""
+    catalogue = _build_critter_catalogue()
+    ids = {entity.get('id', '') for entity in catalogue.get('Critters', []) if entity.get('id')}
+    return sorted(ids)
+
+
 def discover_npc_ids():
     """All placeable NPC ids, sourced from the same catalogue EntityEditor's
     palette uses (_build_npc_catalogue() above), so this list never drifts
@@ -390,60 +460,11 @@ class EntityEditor:
         self.categories['Enemy Bosses'] = enemy_catalogue['Enemy Bosses']
 
         # ── Critters (ambient wildlife — no hitbox, no AI, no dialogue) ────────
-        squirrel_cfg = entity_creator.load_config(entity_creator.KIND_CRITTER, 'squirrel')
-        bird_cfg = entity_creator.load_config(entity_creator.KIND_CRITTER, 'bird')
-        butterfly_cfg = entity_creator.load_config(entity_creator.KIND_CRITTER, 'butterfly')
-
-        def _critter_size(entity_id, cfg, default=(16, 16)):
-            cfg_path = CRITTER_CONFIG_PATH = os.path.join(
-                "assets", "critters", f"{entity_id}.json"
-            )
-            if os.path.isfile(cfg_path):
-                return cfg.get("width", default[0]), cfg.get("height", default[1])
-            return self._resolve_critter_frame_size(entity_id, "default", *default)
-
-        squirrel_w, squirrel_h = _critter_size('squirrel', squirrel_cfg)
-        bird_w, bird_h = _critter_size('bird', bird_cfg)
-        butterfly_w, butterfly_h = _critter_size('butterfly', butterfly_cfg)
-
-        self.categories['Critters'] = [
-            {
-                'id': 'squirrel',
-                'name': 'Squirrel',
-                'sprite': None,
-                'width': squirrel_w, 'height': squirrel_h,
-                'entity_type': 'critter',
-                'has_variants': True,
-                'variants': [
-                    {'type': 'default', 'name': 'Default', 'color': (150, 100, 60)},
-                ],
-                'default_variant': 'default',
-            },
-            {
-                'id': 'bird',
-                'name': 'Bird',
-                'sprite': None,
-                'width': bird_w, 'height': bird_h,
-                'entity_type': 'critter',
-                'has_variants': True,
-                'variants': [
-                    {'type': 'default', 'name': 'Default', 'color': (100, 150, 220)},
-                ],
-                'default_variant': 'default',
-            },
-            {
-                'id': 'butterfly',
-                'name': 'Butterfly',
-                'sprite': None,
-                'width': butterfly_w, 'height': butterfly_h,
-                'entity_type': 'critter',
-                'has_variants': True,
-                'variants': [
-                    {'type': 'default', 'name': 'Default', 'color': (230, 150, 200)},
-                ],
-                'default_variant': 'default',
-            },
-        ]
+        # Sourced from the module-level _build_critter_catalogue() so this
+        # roster and discover_critter_ids() can never drift apart, and so
+        # critters created in entity_creator (beyond the original built-in
+        # squirrel/bird/butterfly) actually show up here.
+        self.categories['Critters'] = _build_critter_catalogue()['Critters']
 
         # generate placeholder sprites after catalogue is built
         self._generate_sprites()

@@ -37,6 +37,9 @@ class RoomPersistence:
                 'fishing_areas':         self._serialize_fishing_areas(room),
                 'ambient_sounds':        self._serialize_ambient_sounds(room),
                 'music_track':           getattr(room, 'music_track', ''),
+                'bgs_track':             getattr(room, 'bgs_track', ''),
+                'music_volume':          getattr(room, 'music_volume', 1.0),
+                'bgs_volume':            getattr(room, 'bgs_volume', 1.0),
                 'ambient_weather':       getattr(room, 'ambient_weather', 'none'),
                 'can_attack':            getattr(room, 'can_attack', True),
                 'animated_regions':      self._serialize_animated_regions(room),
@@ -593,6 +596,9 @@ class RoomManagerWithPersistence:
         room.fishing_areas       = self.persistence.deserialize_fishing_areas(data['fishing_areas'])   if data.get('fishing_areas')       else []
         room.ambient_sounds      = self.persistence.deserialize_ambient_sounds(data.get('ambient_sounds', []))
         room.music_track         = data.get('music_track', '')
+        room.bgs_track           = data.get('bgs_track', '')
+        room.music_volume        = data.get('music_volume', 1.0)
+        room.bgs_volume          = data.get('bgs_volume', 1.0)
         room.ambient_weather     = data.get('ambient_weather', 'none')
         room.can_attack          = data.get('can_attack', True)
         room.animated_regions    = self.persistence.deserialize_animated_regions(data['animated_regions'], room_name) if data.get('animated_regions') else []

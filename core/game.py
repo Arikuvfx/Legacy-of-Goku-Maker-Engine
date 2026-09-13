@@ -932,6 +932,15 @@ class Game:
         # Prevents save operations while a room is being previewed live.
         self.is_test_mode           = False
         self.test_room_backup       = None
+        # Set whenever F1 opens the dev menu while is_test_mode is True, so
+        # that plainly closing the dev menu again (ESC / "CLOSE MENU") drops
+        # back into the room editor instead of silently resuming the test
+        # session — see the 'close' handling in handle_events and the F1
+        # case in _handle_game_keydown. Otherwise nothing re-applies the
+        # test room's music/BGS context on the way back in, so it just
+        # stays silent even though the test session is technically still
+        # running underneath.
+        self._dev_menu_opened_while_testing = False
         self._test_mission_snapshot = None
         self._test_flag_snapshot    = None
         self._test_wm_hidden_snapshot = None  # pre-test copy of self._wm_hidden_locations,
@@ -952,6 +961,7 @@ class Game:
         oe.on_collision_deleted        = self._on_collision_deleted
         oe.on_stone_deleted            = self._on_stone_deleted
         oe.on_decoration_deleted       = self._on_decoration_deleted
+        oe.on_decoration_placed        = self._on_decoration_placed
         oe.on_gate_deleted             = self._on_gate_deleted
         oe.on_transition_placed        = self._on_transition_placed
         oe.on_transition_deleted       = self._on_transition_deleted
@@ -1961,7 +1971,19 @@ class Game:
                     self.decoration_creator.toggle()
                     continue
                 result = self.dev_menu.handle_input(event)
-                if result == 'open_room_editor':
+                if result == 'close':
+                    # Plain close (ESC at the main menu, or "CLOSE MENU") —
+                    # if this dev-menu session started mid test-session,
+                    # don't just fall back into the test room: exit test
+                    # mode and drop into the room editor instead, same as
+                    # F2. Resuming the test silently would leave its
+                    # music/BGS stopped forever, since nothing else
+                    # re-applies a room's audio context on the way back in.
+                    if self._dev_menu_opened_while_testing:
+                        self._exit_test_mode()
+                        self.room_editor.active       = True
+                        self.room_editor.current_view = 'view_room'
+                elif result == 'open_room_editor':
                     self.dev_menu.active = False
                     if self.is_test_mode:
                         self._exit_test_mode()
@@ -2159,6 +2181,13 @@ class Game:
             return
 
         if event.key == pygame.K_F1:
+            # This branch only runs when the dev menu is currently closed
+            # (see the dev_menu.active check earlier in handle_events, which
+            # intercepts F1/every other key once it's open) — so reaching
+            # here always means we're about to open it. Remember whether
+            # we're doing so mid test-session; see the 'close' handling in
+            # handle_events for why.
+            self._dev_menu_opened_while_testing = self.is_test_mode
             self.dev_menu.toggle()
 
         elif event.key == pygame.K_F3:
@@ -2739,7 +2768,16 @@ class Game:
             self._fishing_catch_result = self._roll_fishing_catch()
             self._fishing_awaiting_reveal = True
 
-        self.player.start_fishing_jump(on_complete=_on_landed)
+        # area.direction is the per-instance jump direction set in the room
+        # editor (hover the fishing area + press R) -- pass it through so
+        # the jump always goes the way the designer picked, rather than
+        # whichever way the player happened to be facing when they
+        # pressed E. NOTE: this requires player.start_fishing_jump() to
+        # accept a `direction` kwarg (a 'up'/'down'/'left'/'right' string,
+        # or use area.get_direction_vector() for a raw (dx, dy)) -- that
+        # method lives in player.py, which wasn't available to update
+        # here, so this line assumes that parameter exists/gets added.
+        self.player.start_fishing_jump(on_complete=_on_landed, direction=area.direction)
 
     def _roll_fishing_catch(self):
         """Rolls what the player finds. Returns None for "nothing", else
@@ -3523,6 +3561,15 @@ class Game:
         self.critters = []  # ambient wildlife: squirrels, birds, butterflies
         self._spawn_room_entities(room)
 
+        # Seed battle-music tracking to this room's actual enemy count —
+        # see sync_battle_state's docstring for why this has to happen
+        # here rather than letting the next update_battle_state() tick
+        # discover it on its own (that path fades out the room music we
+        # just started a couple of lines above and swaps in the battle
+        # theme, mistaking "this room has enemies in it" for "a fight
+        # just started").
+        self.sound_manager.sync_battle_state(len(self.enemies) > 0)
+
         # Clear all in-flight projectiles and attacks.
         self._clear_projectiles()
 
@@ -3727,6 +3774,13 @@ class Game:
         self.npcs    = []
         self.critters = []  # ambient wildlife: squirrels, birds, butterflies
         self._spawn_room_entities(room)
+
+        # Same reasoning as _load_room_objects_as_copies above — seed
+        # battle-music tracking to this room's actual enemy count so the
+        # music we just applied via _apply_room_music/_apply_room_bgs
+        # above doesn't get mistaken for "a fight just started" and faded
+        # out a couple of seconds later.
+        self.sound_manager.sync_battle_state(len(self.enemies) > 0)
 
         # Clear in-flight projectiles left over from the previous room.
         self._clear_projectiles()
@@ -4212,6 +4266,14 @@ class Game:
         if self.current_room and self.current_room.name == room_name:
             if decoration in self.decorations:
                 self.decorations.remove(decoration)
+
+    def _on_decoration_placed(self, decoration, room_name):
+        """Sync game list when a decoration (tree, etc.) is placed in the editor."""
+        if self.is_test_mode:
+            return
+        if self.current_room and self.current_room.name == room_name:
+            if decoration not in self.decorations:
+                self.decorations.append(decoration)
 
     def _on_gate_deleted(self, gate, room_name):
         """Sync game list when a level gate is removed in the editor."""
@@ -5296,11 +5358,18 @@ class Game:
         if track.lower().endswith(self._MUSIC_EXTENSIONS):
             track = os.path.splitext(track)[0]
 
-        if track == self.sound_engine.current_music:
-            return  # Already playing this track — avoid restarting it on every room entry
+        volume_scale = getattr(room, 'music_volume', 1.0)
 
-        print(f"[room_music] switching to '{track}' for room '{getattr(room, 'name', '?')}'")
-        self.sound_manager.play_music(track)
+        if track != self.sound_engine.current_music:
+            print(f"[room_music] switching to '{track}' for room '{getattr(room, 'name', '?')}'")
+
+        # Always go through play_music() rather than early-returning on
+        # "already the current track" — play_music() itself no-ops the
+        # restart in that case, but still re-applies volume_scale, which
+        # matters when two rooms share the same track but set different
+        # music_volume sliders (otherwise the second room's slider would
+        # silently have no effect since nothing here would ever call in).
+        self.sound_manager.play_music(track, volume_scale=volume_scale)
 
     # Extensions the room editor's BGS scan (and AudioAssetLoader) know
     # about — mirrors _MUSIC_EXTENSIONS. AudioAssetLoader currently only
@@ -5334,11 +5403,16 @@ class Game:
         if track.lower().endswith(self._BGS_EXTENSIONS):
             track = os.path.splitext(track)[0]
 
-        if track == self.sound_engine.current_bgs:
-            return  # Already playing this ambient loop — avoid restarting it on every room entry
+        volume_scale = getattr(room, 'bgs_volume', 1.0)
 
-        print(f"[room_bgs] switching to '{track}' for room '{getattr(room, 'name', '?')}'")
-        self.sound_manager.play_bgs(track)
+        if track != self.sound_engine.current_bgs:
+            print(f"[room_bgs] switching to '{track}' for room '{getattr(room, 'name', '?')}'")
+
+        # Always go through play_bgs() rather than early-returning on
+        # "already the current loop" — play_bgs() itself no-ops the restart
+        # in that case, but still re-applies volume_scale, same reasoning
+        # as _apply_room_music above.
+        self.sound_manager.play_bgs(track, volume_scale=volume_scale)
 
     def _apply_room_weather(self, room):
         """Apply the given room's persisted ambient weather (set via the
@@ -11372,12 +11446,13 @@ class Game:
         _fog_drawn = False
         if self.active_cutscene_runtime and not self.pause_menu.active:
             _fog_w, _fog_h = self.logical_surface.get_size()
-            self.active_cutscene_runtime.draw_weather(self.logical_surface, _fog_w, _fog_h, only_types={'fog'})
+            self.active_cutscene_runtime.draw_weather(self.logical_surface, _fog_w, _fog_h,
+                                                       self.camera.x, self.camera.y, only_types={'fog'})
             _fog_drawn = True
         elif (self.room_weather is not None and not self.pause_menu.active
               and self.room_weather.weather_type == 'fog'):
             _fog_w, _fog_h = self.logical_surface.get_size()
-            self.room_weather.draw(self.logical_surface, _fog_w, _fog_h)
+            self.room_weather.draw(self.logical_surface, _fog_w, _fog_h, self.camera.x, self.camera.y)
             _fog_drawn = True
 
         if _fog_drawn:
@@ -11586,11 +11661,12 @@ class Game:
         # flying-pad path previews).
         if self.active_cutscene_runtime and not self.pause_menu.active:
             w, h = self.logical_surface.get_size()
-            self.active_cutscene_runtime.draw_weather(self.logical_surface, w, h, skip_types={'fog'})
+            self.active_cutscene_runtime.draw_weather(self.logical_surface, w, h,
+                                                       self.camera.x, self.camera.y, skip_types={'fog'})
         elif (self.room_weather is not None and not self.pause_menu.active
               and self.room_weather.weather_type != 'fog'):
             w, h = self.logical_surface.get_size()
-            self.room_weather.draw(self.logical_surface, w, h)
+            self.room_weather.draw(self.logical_surface, w, h, self.camera.x, self.camera.y)
 
         # Cutscene colour/invert overlay (screen fades, flash, invert) is drawn
         # BEFORE the UI layer (dialogue box, HUD, menus) so a fade_in/fade_out/
@@ -13899,6 +13975,12 @@ class Game:
 
             if not hasattr(room, 'bgs_track'):
                 room.bgs_track = ''
+
+            if not hasattr(room, 'music_volume'):
+                room.music_volume = 1.0
+
+            if not hasattr(room, 'bgs_volume'):
+                room.bgs_volume = 1.0
 
     # ── Player death sequence ────────────────────────────────────────────────
 
