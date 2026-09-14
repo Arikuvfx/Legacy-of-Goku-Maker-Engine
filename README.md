@@ -1,6 +1,21 @@
 # Legacy-of-Goku-Maker-Engine
 This is a WIP LOG Series Maker Engine with the goal to have an easy engine to use to make fan games of the Legacy of Goku Series, developed by Ariku but being an open source project.
 
+Version 0.3.0 - Hotfix
+```
+Changes/Additions:
+- 64x64 tilesets when attaching "_64" to tileset now possible
+- slider for room BGM/BGS volume added
+- changed fog weather behaviour
+Major Bugfixes:
+- fixed new deco not appearing in object editor
+- fixed new critters not appearing in entity editor
+- fixed audio bugs
+- fixed audio bugs regarding save loading
+- fixed visual bug with 8x8 diagonal collision boxes
+- other stuff I forgot.
+```
+
 Version 0.3.0
 ```
 Changes/Additions:
