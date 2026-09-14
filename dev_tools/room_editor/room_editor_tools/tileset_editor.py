@@ -22,25 +22,8 @@ class TileDef:
         self.solid = solid
 
 
-def detect_tile_size(image: pygame.Surface, image_path: str = None) -> int:
-    """Infer tile size for a tileset sheet.
-
-    Dimension-only guessing is ambiguous once tiles get bigger than 16px:
-    any 64px-tile sheet's width/height is also a clean multiple of 16, so
-    a plain "does it divide evenly" check can't tell a 64x64 tileset from
-    a 16x16 one. To resolve that, a filename ending in "_<size>" (e.g.
-    "dirt_64.png", "water_32.png") is checked first and wins outright.
-    With no such suffix, we fall back to the old 16-then-8 guess, which
-    keeps every existing tileset loading exactly as before.
-    """
-    if image_path:
-        stem = os.path.splitext(os.path.basename(image_path))[0]
-        tail = stem.rsplit('_', 1)[-1]
-        if tail.isdigit():
-            hinted = int(tail)
-            if hinted > 0:
-                return hinted
-
+def detect_tile_size(image: pygame.Surface) -> int:
+    """Infer tile size from image dimensions — tries 16px first, then 8px."""
     w, h = image.get_size()
     for size in (16, 8):
         if w % size == 0 and h % size == 0:
@@ -167,7 +150,7 @@ class Tileset:
 
         try:
             self.image = pygame.image.load(image_path).convert_alpha()
-            self.tile_width = detect_tile_size(self.image, image_path)
+            self.tile_width = detect_tile_size(self.image)
             self.tile_height = self.tile_width
             w, h = self.image.get_size()
             self.cols = w // self.tile_width
