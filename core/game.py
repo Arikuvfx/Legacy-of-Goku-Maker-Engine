@@ -6,7 +6,7 @@ cutscenes, save/load, and the full dev-tooling layer. Cross-system calls route
 through Game rather than between subsystems directly.
 
 Boot sequence:  pygame.init → build all subsystems → create default room → run()
-Main loop:      handle_events → update → draw → clock.tick(FPS).
+Main loop:      handle_events → update → draw → clock.tick(FPS)
 """
 
 import sys
