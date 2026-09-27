@@ -139,31 +139,68 @@ class DialogueBox:
         self._chars_per_tick_min = 2
         self._chars_per_tick_max = 5
 
+        # Content cache for draw() — see draw()'s "Cached content" comment.
+        # Avoids re-running pygame.transform.scale on the box art/portrait
+        # and reallocating+re-blitting the composed `temp` surface on every
+        # single frame of the opening/closing animation, when none of that
+        # content actually changes frame-to-frame (only the final
+        # presentation size does, which is now handled by GPUScreen's
+        # blit_scaled — GPU-side, no CPU scale, no extra cache needed for
+        # that part). Keyed on whatever inputs actually affect the pixels,
+        # so a real change (box resized, portrait swapped, typewriter
+        # revealing more text) still invalidates correctly.
+        self._content_cache_key  = None
+        self._content_cache_surf = None
+
         self._load_sheet()
 
         # Same integer scale factor the textbox art itself is drawn at (see
-        # _box_layout()/draw()'s identical `sf` calc) — previously this was
-        # a hardcoded 4, completely disconnected from how big the box art
-        # actually ends up on screen, so the two only matched by
-        # coincidence. Baking the glyphs at this scale instead keeps text
-        # size locked to the box's actual size, at any screen resolution or
-        # textbox.png source size.
-        font_scale = self._compute_box_scale()
-        self._font_upper   = _BitmapFont('assets/ui/fonts/uppercase', scale=font_scale)
-        self._font_lower   = _BitmapFont('assets/ui/fonts/lowercase', scale=font_scale)
-        self._font_numbers = _BitmapFont('assets/ui/fonts/numbers',   scale=font_scale)
+        # _box_layout()/draw()'s identical `sf` calc) — keeps text size
+        # locked to the box's actual on-screen size, at any screen
+        # resolution or textbox.png source size. _compute_box_scale() below
+        # recomputes this live from self.screen_height on every call (draw()
+        # and _box_layout() both call it fresh), so the fonts are re-baked
+        # lazily via _ensure_fonts() whenever that live value actually
+        # changes — e.g. when the cutscene editor temporarily narrows
+        # screen_width/screen_height to draw the box at its own viewport
+        # size instead of full game resolution. Baking once here and never
+        # again is what let the box art and the text drift out of sync.
+        self._font_scale   = None
+        self._font_upper   = None
+        self._font_lower   = None
+        self._font_numbers = None
+        self._compute_box_scale()   # bakes the fonts as a side effect
         self._fallback     = pygame.font.Font(None, max(14, int(20 / _S)))
+
+    def _ensure_fonts(self, scale):
+        """(Re)bake the bitmap fonts at *scale* if they aren't already built
+        for it. A no-op (cheap self.-attribute comparison) whenever the
+        scale hasn't changed since last time, which is every frame during
+        normal gameplay — the rebake only actually runs at the moment the
+        live scale changes, e.g. once when the cutscene editor's preview
+        opens/closes."""
+        if scale == self._font_scale:
+            return
+        self._font_scale   = scale
+        self._font_upper   = _BitmapFont('assets/ui/fonts/uppercase', scale=scale)
+        self._font_lower   = _BitmapFont('assets/ui/fonts/lowercase', scale=scale)
+        self._font_numbers = _BitmapFont('assets/ui/fonts/numbers',   scale=scale)
 
     def _compute_box_scale(self):
         """Integer scale factor the textbox art is drawn at — box art is
         scaled up to fill target_h (30% of the screen height) using the
         largest whole multiple of the sheet's native frame height that
-        fits. Shared by __init__ (to scale the bitmap font to match),
-        _box_layout(), and draw(), so all three always agree."""
+        fits. Shared by _box_layout() and draw(), so both always agree.
+        Also keeps the bitmap fonts baked at this same scale (see
+        _ensure_fonts) so text size never drifts out of sync with the box
+        art, however self.screen_height is currently set."""
         target_h = max(1, int(self.screen_height * 0.3))
         if self._frame_h > 0:
-            return max(1, round(target_h / self._frame_h))
-        return 4  # no textbox.png loaded — arbitrary fallback, nothing to match
+            scale = max(1, round(target_h / self._frame_h))
+        else:
+            scale = 4  # no textbox.png loaded — arbitrary fallback, nothing to match
+        self._ensure_fonts(scale)
+        return scale
 
     def _load_sheet(self):
         path = 'assets/ui/textbox/textbox.png'
@@ -402,7 +439,14 @@ class DialogueBox:
                     len(self.current_text)
                 )
 
-    def draw(self, screen, colors):
+    def draw(self, screen, colors, offset=(0, 0)):
+        """`offset` shifts only the final on-screen blit position (not the
+        internal box_w/box_h/centering math, which stays relative to
+        self.screen_width/self.screen_height). Lets a caller — e.g. the
+        cutscene editor's preview viewport — draw straight onto its real
+        target surface at the viewport's screen position, instead of
+        allocating and GPU-uploading a full extra viewport-sized surface
+        every frame just to relocate the box."""
         if self._state == 'hidden' or not self.active:
             return
 
@@ -422,10 +466,8 @@ class DialogueBox:
             sf    = self._compute_box_scale()
             box_w = self._frame_w * sf
             box_h = self._frame_h * sf
-            scaled_box = pygame.transform.scale(frame, (box_w, box_h))
         else:
             box_w, box_h = int(self.screen_width * 0.6), target_h
-            scaled_box = None
 
         # True narrator lines float in the vertical middle of the screen
         # instead of the usual bottom-anchored speaker position. Portrait
@@ -442,113 +484,145 @@ class DialogueBox:
         # "some columns thinner than others" look from non-integer scale).
         portrait_surf = None
         portrait_w    = 0
-        portrait_draw = None
+        portrait_h    = 0
         if self._portrait_key:
             portrait_surf = self._load_portrait(self._portrait_key)
         if portrait_surf and portrait_surf.get_height() > 0:
             ps = max(1, round(box_h / portrait_surf.get_height()))
             portrait_w = portrait_surf.get_width() * ps
             portrait_h = portrait_surf.get_height() * ps
-            portrait_draw = pygame.transform.scale(
-                portrait_surf, (portrait_w, portrait_h))
 
         total_w    = portrait_w + box_w
         start_x    = (self.screen_width - total_w) // 2
 
-        temp = pygame.Surface((total_w, box_h), pygame.SRCALPHA)
-
-        if portrait_draw is not None:
-            # Centre vertically if integer scale didn't land exactly on box_h.
-            py = (box_h - portrait_draw.get_height()) // 2
-            temp.blit(portrait_draw, (0, py))
-
-        if scaled_box:
-            temp.blit(scaled_box, (portrait_w, 0))
+        # Cached content ------------------------------------------------
+        # The composed box+portrait+text surface (`temp`) is expensive to
+        # build: two pygame.transform.scale calls, a fresh SRCALPHA
+        # surface alloc, and several blits/text draws. During the
+        # opening/closing animation none of that content actually
+        # changes frame to frame — only the *presentation* size below
+        # does — so with the typewriter effect also idle (text is only
+        # drawn once fully 'open'), every frame of a transition was
+        # rebuilding a pixel-identical surface from scratch. Rebuild only
+        # when something that actually affects the pixels changes.
+        is_open = self._state == 'open'
+        content_key = (
+            box_w, box_h, self._portrait_key,
+            is_open, self._chars_shown if is_open else None,
+            self.current_text if is_open else None,
+        )
+        if content_key == self._content_cache_key and self._content_cache_surf is not None:
+            temp = self._content_cache_surf
         else:
-            pygame.draw.rect(temp, colors['DARK_GRAY'], pygame.Rect(portrait_w, 0, box_w, box_h))
-            pygame.draw.rect(temp, colors['CYAN'],      pygame.Rect(portrait_w, 0, box_w, box_h), 3)
+            temp = pygame.Surface((total_w, box_h), pygame.SRCALPHA)
 
-        # Text — only render when fully open (skip during transition)
-        if self._state == 'open':
-            pad      = max(6, int(box_w * 0.04))
-            lh       = self._line_height()
-            # Horizontal gap between glyphs (also used by wrap_text).
-            spacing  = 4
-            # Extra pixels between successive lines. Raise this if rows feel
-            # cramped; lower it if they feel too far apart.
-            line_gap = 20
-            # Vertical offset applied to the whole text block after it's
-            # positioned (negative pulls it up toward the top border).
-            # Always applied — for portrait boxes it offsets the fixed
-            # top-anchored start; for centered no-portrait boxes it offsets
-            # the computed center point. All rows share the same baseline
-            # math, so this only shifts the whole block — not row 2
-            # relative to row 1.
-            top_nudge = -5
-            max_w    = box_w - (8 + pad) * 2
-            visible  = self.current_text[:self._chars_shown]
+            if portrait_surf is not None and portrait_h > 0:
+                portrait_draw = pygame.transform.scale(portrait_surf, (portrait_w, portrait_h))
+                # Centre vertically if integer scale didn't land exactly on box_h.
+                py = (box_h - portrait_draw.get_height()) // 2
+                temp.blit(portrait_draw, (0, py))
 
-            lines = self.wrap_text(visible, max_w, spacing)[:self.MAX_LINES]
+            if frame:
+                scaled_box = pygame.transform.scale(frame, (box_w, box_h))
+                temp.blit(scaled_box, (portrait_w, 0))
+            else:
+                pygame.draw.rect(temp, colors['DARK_GRAY'], pygame.Rect(portrait_w, 0, box_w, box_h))
+                pygame.draw.rect(temp, colors['CYAN'],      pygame.Rect(portrait_w, 0, box_w, box_h), 3)
 
-            # Boxes with no portrait (narrator lines and portrait-less info
-            # lines like level-up notices) get a full-width box, so instead
-            # of the speaker layout — left-aligned text hugging the top,
-            # next to/after the portrait — the block is centred as a whole:
-            # horizontally per-line within the box, and vertically as a
-            # block within the box height. This is purely a text-layout
-            # concern and is independent of `is_narrator` (which only
-            # controls whether the box itself floats mid-screen or sits
-            # bottom-anchored).
-            no_portrait = not self._portrait_key
+            # Text — only render when fully open (skip during transition)
+            if is_open:
+                pad      = max(6, int(box_w * 0.04))
+                lh       = self._line_height()
+                # Horizontal gap between glyphs (also used by wrap_text).
+                spacing  = 4
+                # Extra pixels between successive lines. Raise this if rows
+                # feel cramped; lower it if they feel too far apart.
+                line_gap = 20
+                # Vertical offset applied to the whole text block after
+                # it's positioned (negative pulls it up toward the top
+                # border). Always applied — for portrait boxes it offsets
+                # the fixed top-anchored start; for centered no-portrait
+                # boxes it offsets the computed center point. All rows
+                # share the same baseline math, so this only shifts the
+                # whole block — not row 2 relative to row 1.
+                top_nudge = -5
+                max_w    = box_w - (8 + pad) * 2
+                visible  = self.current_text[:self._chars_shown]
 
-            # Same left edge for every row — never per-line adjusted.
-            text_left = portrait_w + 8 + pad
-            ty = pad + top_nudge
+                lines = self.wrap_text(visible, max_w, spacing)[:self.MAX_LINES]
 
-            if no_portrait and lines:
-                block_h = len(lines) * lh + max(0, len(lines) - 1) * line_gap
-                ty = (box_h - block_h) // 2 + top_nudge
+                # Boxes with no portrait (narrator lines and portrait-less
+                # info lines like level-up notices) get a full-width box,
+                # so instead of the speaker layout — left-aligned text
+                # hugging the top, next to/after the portrait — the block
+                # is centred as a whole: horizontally per-line within the
+                # box, and vertically as a block within the box height.
+                # This is purely a text-layout concern and is independent
+                # of `is_narrator` (which only controls whether the box
+                # itself floats mid-screen or sits bottom-anchored).
+                no_portrait = not self._portrait_key
 
-            for line in lines:
-                # Guard against any residual leading whitespace so row 2
-                # can't drift left/right relative to row 1.
-                line = line.lstrip()
-                if no_portrait:
-                    line_w = (self._text_width(line, spacing) if self._has_bitmap_font()
-                              else self._fallback.size(line)[0])
-                    line_x = portrait_w + max(0, (box_w - line_w) // 2)
-                else:
-                    line_x = text_left
-                if self._has_bitmap_font():
-                    self._render_text_line(temp, line, line_x, ty, spacing=spacing)
-                else:
-                    temp.blit(self._fallback.render(line, True, colors['WHITE']),
-                              (line_x, ty))
-                ty += lh + line_gap
+                # Same left edge for every row — never per-line adjusted.
+                text_left = portrait_w + 8 + pad
+                ty = pad + top_nudge
+
+                if no_portrait and lines:
+                    block_h = len(lines) * lh + max(0, len(lines) - 1) * line_gap
+                    ty = (box_h - block_h) // 2 + top_nudge
+
+                for line in lines:
+                    # Guard against any residual leading whitespace so row
+                    # 2 can't drift left/right relative to row 1.
+                    line = line.lstrip()
+                    if no_portrait:
+                        line_w = (self._text_width(line, spacing) if self._has_bitmap_font()
+                                  else self._fallback.size(line)[0])
+                        line_x = portrait_w + max(0, (box_w - line_w) // 2)
+                    else:
+                        line_x = text_left
+                    if self._has_bitmap_font():
+                        self._render_text_line(temp, line, line_x, ty, spacing=spacing)
+                    else:
+                        temp.blit(self._fallback.render(line, True, colors['WHITE']),
+                                  (line_x, ty))
+                    ty += lh + line_gap
+
+            self._content_cache_key  = content_key
+            self._content_cache_surf = temp
 
         # Open/close presentation.
         #
-        # Fully open/closed progress → blit 1:1. The old path always ran
-        # temp through a double pygame.transform.scale (down to lo_w then
-        # back up to draw_w). At progress≈1, integer truncation made
-        # lo_w = total_w - 1 (or similar), so every open frame was a
-        # non-integer upscale — classic "some pixel rows/cols thinner
-        # than others" artifact on the box art and portrait.
+        # Fully open/closed progress → blit 1:1, native size, no scaling.
         #
-        # During the transition, only discrete step sizes are used and
-        # the surface is scaled once to that exact size (no second stretch
-        # to a mismatched continuous size), so pixels stay uniform.
+        # During the transition: previously this ran `temp` through
+        # pygame.transform.scale() every step — real (albeit cached-when-
+        # possible) CPU work. GPUScreen.blit_scaled() (see gpu_renderer.py)
+        # exists precisely to replace that pattern: pass the *destination
+        # rect* and let SDL stretch the texture on the GPU, the same fix
+        # already applied to the room editor's zoom. Since `temp` itself is
+        # unchanged for the whole transition (see the content cache above),
+        # this also means a single GPU texture upload of `temp` gets reused
+        # across every step and every frame of the animation — no new
+        # Surface objects, no new uploads, at any step size.
+        #
+        # The discrete PIXEL_STEPS sizing is kept anyway (not for
+        # performance now, but for the pixel-uniformity reasoning in the
+        # comment this replaced — landing on a small set of deliberate
+        # sizes rather than every continuous progress value).
+        ox, oy = offset
         if progress >= 0.999:
-            screen.blit(temp, (start_x, box_y))
+            screen.blit(temp, (start_x + ox, box_y + oy))
         else:
             PIXEL_STEPS = 6
             step = max(1, min(PIXEL_STEPS, int(round(progress * PIXEL_STEPS))))
             draw_w = max(1, (total_w * step) // PIXEL_STEPS)
             draw_h = max(1, (box_h  * step) // PIXEL_STEPS)
-            final = pygame.transform.scale(temp, (draw_w, draw_h))
-            screen.blit(final,
-                        (start_x + (total_w - draw_w) // 2,
-                         box_y   + (box_h   - draw_h) // 2))
+            dst = pygame.Rect(
+                start_x + (total_w - draw_w) // 2 + ox,
+                box_y   + (box_h   - draw_h) // 2 + oy,
+                draw_w, draw_h,
+            )
+            screen.blit_scaled(temp, dst)
 
 
 class DialogueChoiceMenu:
@@ -955,8 +1029,9 @@ class DialogueChoiceMenu:
 
         if current_width > 0 and current_height > 0:
             if self.menu_sprite:
-                scaled_sprite = pygame.transform.scale(self.menu_sprite, (current_width, current_height))
-                screen.blit(scaled_sprite, (menu_x, menu_y))
+                # GPU-scaled — see DialogueBox.draw()'s blit_scaled fix for
+                # the same CPU pygame.transform.scale pattern.
+                screen.blit_scaled(self.menu_sprite, pygame.Rect(menu_x, menu_y, current_width, current_height))
             else:
                 pygame.draw.rect(screen, (20, 20, 20), (menu_x, menu_y, current_width, current_height),
                                   border_radius=6)
@@ -999,14 +1074,15 @@ class DialogueChoiceMenu:
                 lh = self._line_height() if self._has_bitmap_font() else self._fallback.get_linesize()
                 if self.arrow_sprite:
                     arrow_scale = lh / self.arrow_sprite.get_height()
-                    scaled_arrow = pygame.transform.scale(
-                        self.arrow_sprite,
-                        (int(self.arrow_sprite.get_width() * arrow_scale),
-                         int(self.arrow_sprite.get_height() * arrow_scale))
-                    )
-                    arrow_x = text_x - scaled_arrow.get_width() - arrow_spacing
-                    arrow_y = option_y + (lh - scaled_arrow.get_height()) // 2 + self.arrow_y_offset
-                    screen.blit(scaled_arrow, (arrow_x, arrow_y))
+                    arrow_w = int(self.arrow_sprite.get_width()  * arrow_scale)
+                    arrow_h = int(self.arrow_sprite.get_height() * arrow_scale)
+                    arrow_x = text_x - arrow_w - arrow_spacing
+                    arrow_y = option_y + (lh - arrow_h) // 2 + self.arrow_y_offset
+                    # GPU-scaled (see menu_sprite above) — this ran a fresh
+                    # CPU pygame.transform.scale every frame the menu was
+                    # simply sitting open with a selection made, not just
+                    # while animating in.
+                    screen.blit_scaled(self.arrow_sprite, pygame.Rect(arrow_x, arrow_y, arrow_w, arrow_h))
                 else:
                     star_x = text_x - arrow_spacing
                     star_y = option_y + row_h // 2 + self.arrow_y_offset

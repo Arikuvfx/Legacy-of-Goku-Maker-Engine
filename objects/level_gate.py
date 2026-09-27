@@ -397,11 +397,11 @@ class LevelGate:
         bh = max(2, int(6 / RENDER_SCALE))
         bx = int(sx - sw // 2)
         by = int(sy - (self.height * RENDER_SCALE // 2) - int(15 / RENDER_SCALE))
-        pygame.draw.rect(screen, (50, 50, 50),    (bx, by, sw, bh))
+        screen.draw_rect((50, 50, 50),    (bx, by, sw, bh))
         fill_w = int(sw * (self.health / self.max_health))
         color  = (100, 255, 100) if self.health > self.max_health * 0.5 else (255, 100, 100)
-        pygame.draw.rect(screen, color,           (bx, by, fill_w, bh))
-        pygame.draw.rect(screen, (255, 255, 255), (bx, by, sw, bh), 1)
+        screen.draw_rect(color,           (bx, by, fill_w, bh))
+        screen.draw_rect((255, 255, 255), (bx, by, sw, bh), 1)
 
     def get_sort_key(self):
         return (self.draw_layer, self.y if self.y_sort else 0)

@@ -7,6 +7,7 @@ import numpy as np
 import pygame
 import pygame.gfxdraw
 
+import dev_tools.ui_kit as uk
 from config.settings import RENDER_SCALE, TILE_SIZE, WORLD_WIDTH, WORLD_HEIGHT
 from objects.spawn_object import SpawnObject, SpawnObjectManager
 from objects.collision_object import (CollisionObject, CollisionObjectManager,
@@ -29,6 +30,43 @@ from objects.trigger_box import (OverlapTriggerBox, KeyTriggerBox, TriggerBoxMan
 from dev_tools.room_editor.room_editor_tools.flying_pad_path_editor import FlyingPadPathEditor
 from dev_tools.room_editor.room_editor_tools.nimbus_cloud_path_editor import NimbusCloudPathEditor
 from core.event_editor import EventEditorWindow
+
+
+# =============================================================================
+# Small vector chevron for the panel show/hide tab — same primitive
+# (draw_line_on), and the same look, as TilesetEditor's own tab chevron,
+# rather than the filled-triangle polygon this file used to draw.
+# =============================================================================
+
+def _draw_chevron_icon(surface, rect, color, left=True, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.28
+    if left:
+        uk.draw_line_on(surface, color, (cx + s * 0.5, cy - s), (cx - s * 0.5, cy), width)
+        uk.draw_line_on(surface, color, (cx - s * 0.5, cy), (cx + s * 0.5, cy + s), width)
+    else:
+        uk.draw_line_on(surface, color, (cx - s * 0.5, cy - s), (cx + s * 0.5, cy), width)
+        uk.draw_line_on(surface, color, (cx + s * 0.5, cy), (cx - s * 0.5, cy + s), width)
+
+
+class _BitmapFontView:
+    """Adapts a shared uk.BitmapFont to the plain pygame.font.Font call shape
+    -- render(text, antialias, color) -- at one fixed pixel height, so every
+    draw call below that used to say `self.font_small.render(text, True,
+    color)` against an old pygame.font.Font keeps working unchanged against
+    the new bitmap font. Same trick dev_menu.py's DevMenu uses for its
+    ModalTextInput fonts."""
+
+    def __init__(self, bitmap_font, height):
+        self._font = bitmap_font
+        self._height = height
+
+    def render(self, text, antialias=True, color=(255, 255, 255)):
+        return self._font.render(text, color=color, height=self._height)
+
+    def size(self, text):
+        return self._font.size(text, height=self._height)
+
 
 class ObjectEditor:
     """Editor for placing game objects like spawn points, collision walls, and decorations"""
@@ -62,31 +100,46 @@ class ObjectEditor:
         self.active = False
         self.room_manager = room_manager
 
-        self.font_small = pygame.font.Font(None, 16)
-        self.font_medium = pygame.font.Font(None, 20)
-        self.font_large = pygame.font.Font(None, 24)
+        # ── Shared "modern DBZ" dev-tool visual language ────────────────────
+        # Same bitmap font family + Theme palette as DevMenu/EditorToolbar/
+        # RoomEditor's own chrome: deep navy panels, gold/ki-blue accents,
+        # hairline borders that light up on hover, vector line-icons instead
+        # of loaded PNGs. self.font_small/medium/large below are thin
+        # _BitmapFontView adapters over the one shared bitmap font so every
+        # existing `self.font_X.render(text, True, color)` call across this
+        # file keeps working unchanged against the new font.
+        self.font = uk.BitmapFont('assets\\ui\\fonts', letter_spacing=1)
+        self.font_small = _BitmapFontView(self.font, 11)
+        self.font_medium = _BitmapFontView(self.font, 13)
+        self.font_large = _BitmapFontView(self.font, 18)
+        self.font_hint = _BitmapFontView(self.font, 10)
 
+        # self.colors is kept only as a thin compatibility alias for any
+        # in-world (non-chrome) draw call in this file that still reads a
+        # named color out of it (e.g. the placement snap-guide) -- every
+        # palette/panel/variant-selector visual below reads uk.Theme
+        # directly instead of this dict.
         self.colors = {
-            'bg': (20, 20, 30),
-            'bg_transparent': (20, 20, 30, 230),
-            'panel': (35, 35, 55),
-            'panel_light': (45, 45, 65),
-            'accent': (255, 215, 0),
-            'accent_dim': (200, 170, 0),
-            'text': (255, 255, 255),
-            'text_dim': (180, 180, 200),
-            'text_dark': (120, 120, 140),
-            'grid': (60, 60, 80),
-            'success': (100, 255, 100),
+            'bg': (14, 17, 25),
+            'bg_transparent': (14, 17, 25, 235),
+            'panel': uk.Theme.CARD_BG[:3],
+            'panel_light': uk.Theme.CARD_BG_HOVER[:3],
+            'accent': uk.Theme.GOLD,
+            'accent_dim': (196, 152, 61),
+            'text': uk.Theme.TEXT_PRIMARY,
+            'text_dim': uk.Theme.TEXT_MUTED,
+            'text_dark': uk.Theme.TEXT_DIM,
+            'grid': uk.Theme.CARD_BORDER,
+            'success': uk.Theme.KI_BLUE,
             'preview': (255, 255, 255, 100),
-            'snap_guide': (255, 215, 0, 150),
-            'disabled': (100, 100, 100),
-            'delete': (255, 50, 50),
-            'delete_hover': (255, 100, 100),
-            'input_bg': (60, 60, 75),
-            'input_active': (80, 80, 100),
-            'variant_bg': (25, 25, 40),
-            'variant_selected': (50, 150, 255)
+            'snap_guide': (*uk.Theme.GOLD, 150),
+            'disabled': (90, 94, 106),
+            'delete': uk.Theme.DANGER_BRIGHT,
+            'delete_hover': uk.Theme.DANGER,
+            'input_bg': (32, 36, 50, 255),
+            'input_active': (42, 47, 66, 255),
+            'variant_bg': uk.Theme.PANEL_BG,
+            'variant_selected': uk.Theme.KI_BLUE,
         }
 
         # ── Palette geometry ─────────────────────────────────────────────────
@@ -106,6 +159,15 @@ class ObjectEditor:
         item_gap = 10
         usable_width = self.palette_width - self.palette_padding * 2
         self.items_per_row = max(1, (usable_width + item_gap) // (self.item_size + item_gap))
+        # Column pitch (left-right) stays at the original gap so the grid's
+        # width/columns-per-row math above doesn't change. Row pitch
+        # (top-bottom) gets extra headroom so the name label drawn below
+        # each card has room to breathe before the next row of cards starts
+        # — previously it used the same 10px gap as columns, which wasn't
+        # enough for a line of text and made row N's labels overlap row
+        # N+1's cards.
+        self._item_col_gap = item_gap
+        self._item_row_gap = item_gap + 16
         self.scroll_offset = 0
         self.max_scroll = 0
 
@@ -650,11 +712,44 @@ class ObjectEditor:
         # UI click detection
         self.ui_rects = {}
 
+        # I-beam-on-hover for real text-entry fields (gate level, trigger box
+        # id, region seed/channel/hex) — rebuilt each draw_palette() call, same
+        # convention as RoomEditor.text_field_rects/_owns_text_cursor.
+        self.text_field_rects = []
+        self._owns_text_cursor = False
+
         # Panel show/hide toggle (same pattern as EditorToolbar)
         self.palette_visible = True
         self._panel_tab_w = 18
         self._panel_tab_h = 72
         self._hover_panel_toggle = False
+
+        # Slide animation for the panel opening/closing — chased toward
+        # 1.0 (fully open) or 0.0 (fully closed) each frame, same pattern
+        # as TilesetEditor's palette panel. Advanced from inside
+        # draw_palette() (timed off real elapsed ms) since this widget has
+        # no separate per-frame update(dt) hook of its own.
+        self._panel_slide_anim    = 1.0 if self.palette_visible else 0.0
+        self._panel_slide_last_ms = None
+        self._PANEL_SLIDE_RATE    = 9.0
+
+        # Keybinds reference popup — toggled by the '?' info button next to
+        # the palette title (same pattern as TilesetEditor). Replaces the
+        # old always-on instructions footer.
+        self.show_keybinds_popup = False
+
+        # Optional custom icon for the info ('?') badge — same PNG-override
+        # convention as EditorToolbar/TilesetEditor (assets/ui/toolbar/<id>.png):
+        # drop a PNG there and it replaces the procedural circle+'?' mark.
+        self._info_icon = None
+        try:
+            _info_img = pygame.image.load('assets/ui/toolbar/info.png').convert_alpha()
+            _iw, _ih = _info_img.get_size()
+            _scale = min(18 / _iw, 18 / _ih)
+            self._info_icon = pygame.transform.scale(
+                _info_img, (max(1, int(_iw * _scale)), max(1, int(_ih * _scale))))
+        except Exception:
+            pass
 
         # Set via set_toolbar() below; read (via getattr-guarded access) to
         # find out whether an item is armed in the Items panel for the
@@ -896,27 +991,37 @@ class ObjectEditor:
     # -------------------------------------------------------------------------
 
     def _panel_toggle_rect(self):
-        """Return the rect for the ◀/▶ tab that straddles the panel's left edge."""
+        """Return the rect for the ◀/▶ tab that straddles the panel's left
+        edge. Tracks the animated slide (_panel_slide_anim), not just the
+        instant palette_visible flag, so the tab visually stays glued to
+        the panel's edge as it slides in/out instead of snapping straight
+        to its new spot — same as TilesetEditor's tab. This also doubles
+        as the click/hover hit-rect, which is what we want: the tab should
+        be clickable where it's actually drawn. self.palette_x here is
+        always the panel's settled resting position (draw_palette restores
+        it after each shifted draw), so this is stable to call from
+        anywhere, animating or not."""
         gap = 6
-        tx = (self.palette_x - self._panel_tab_w - gap) if self.palette_visible else (
-                    self.screen_width - self._panel_tab_w)
+        tx_shown  = self.palette_x - self._panel_tab_w - gap
+        tx_hidden = self.screen_width - self._panel_tab_w
+        tx = round(uk.lerp(tx_hidden, tx_shown, self._panel_slide_anim))
         ty = self.palette_y + (self.palette_height - self._panel_tab_h) // 2
         return pygame.Rect(tx, ty, self._panel_tab_w, self._panel_tab_h)
 
     def _draw_panel_toggle_tab(self, screen):
-        """Render the small ◀/▶ tab — always visible so the panel can be recalled."""
+        """Render the small collapse/expand tab — always visible so the
+        panel can be recalled. Same pill-with-line-chevron look as
+        TilesetEditor's own show/hide tab (_draw_chevron_icon above),
+        rather than the filled-triangle glyph this used to draw."""
         rect = self._panel_toggle_rect()
-        bg = self.colors['panel_light'] if self._hover_panel_toggle else self.colors['panel']
-        border = self.colors['accent'] if self._hover_panel_toggle else self.colors['grid']
-        screen.draw_rect( bg, rect, border_radius=6)
-        screen.draw_rect( border, rect, 1, border_radius=6)
-        arrow = '◀' if self.palette_visible else '▶'
-        font = self.font_small
-        label = font.render(
-            arrow, True,
-            self.colors['accent'] if self._hover_panel_toggle else self.colors['text_dim']
-        )
-        screen.blit(label, label.get_rect(center=rect.center))
+        t = 1.0 if self._hover_panel_toggle else 0.0
+        base = uk.lerp_color((22, 25, 35), (30, 34, 46), t)
+        border = uk.lerp_color(uk.Theme.CARD_BORDER, uk.Theme.GOLD, t)
+        uk.draw_panel(screen, rect, bg=(*base, 235), border=border,
+                      border_width=1, radius=6, shadow=False)
+
+        chevron_color = uk.lerp_color(uk.Theme.TEXT_MUTED, uk.Theme.GOLD_BRIGHT, t)
+        _draw_chevron_icon(screen, rect, chevron_color, left=self.palette_visible, width=2)
 
     # Fixed corner-sample size used by _region_icon_crop_size for every
     # tile-mode frame, regardless of that frame's own pixel size — see
@@ -1859,20 +1964,18 @@ class ObjectEditor:
         return bool(self.toolbar and getattr(self.toolbar, 'selected_item_id', ''))
 
     def _is_level_input_clicked(self, mouse_pos):
-        """Check if the level input box was clicked"""
+        """Check if the level input box was clicked. Reads the rect the
+        settings panel actually drew this frame (self.ui_rects), same
+        pattern every other panel control already uses, rather than
+        re-deriving the row's position independently."""
         if not self.selected_object or not isinstance(self.selected_object, dict):
             return False
 
         if self.selected_object.get('object_type') != 'level_gate':
             return False
 
-        input_x = self.palette_x + self.palette_padding + 135
-        input_y = self.palette_y + self.palette_height - 105
-        input_width = 60
-        input_height = 25
-
-        input_rect = pygame.Rect(input_x, input_y, input_width, input_height)
-        return input_rect.collidepoint(mouse_pos)
+        input_rect = self.ui_rects.get('gate_level_input_rect')
+        return bool(input_rect and input_rect.collidepoint(mouse_pos))
 
     # ── Gate character lock helpers ─────────────────────────────────────────
 
@@ -1976,8 +2079,8 @@ class ObjectEditor:
             row = i // self.items_per_row
             col = i % self.items_per_row
 
-            item_x = self.palette_x + self.palette_padding + col * (self.item_size + 10)
-            item_y = objects_start_y + row * (self.item_size + 10)
+            item_x = self.palette_x + self.palette_padding + col * (self.item_size + self._item_col_gap)
+            item_y = objects_start_y + row * (self.item_size + self._item_row_gap)
 
             item_rect = pygame.Rect(item_x, item_y, self.item_size, self.item_size)
             if item_rect.collidepoint(mouse_pos):
@@ -2452,14 +2555,15 @@ class ObjectEditor:
         scaled_width = int(chest.width * RENDER_SCALE)
 
         pulse = int(20 + 10 * abs(pygame.time.get_ticks() % 1000 - 500) / 500)
-        screen.draw_circle( self.colors['success'],
+        uk.draw_circle_on(screen, uk.Theme.KI_BLUE,
                            (int(screen_x), int(screen_y)),
                            scaled_width // 2 + pulse, 3)
 
     def _draw_delete_highlight(self, screen, camera_x, camera_y):
-        """Draw red outline around object that's about to be deleted"""
+        """Draw a danger-accent outline around the object about to be deleted."""
         obj = self.hovered_object
         obj_type = self.hovered_object_type
+        delete_color = uk.Theme.DANGER_BRIGHT
 
         if obj_type == 'spawn':
             screen_x = (obj.x * RENDER_SCALE) - camera_x
@@ -2467,7 +2571,7 @@ class ObjectEditor:
             scaled_width = int(obj.width * RENDER_SCALE)
 
             pulse = int(20 + 10 * abs(pygame.time.get_ticks() % 1000 - 500) / 500)
-            screen.draw_circle( self.colors['delete'],
+            uk.draw_circle_on(screen, delete_color,
                                (int(screen_x), int(screen_y)),
                                scaled_width // 2 + pulse, 3)
 
@@ -2478,7 +2582,7 @@ class ObjectEditor:
             scaled_height = int(obj.height * RENDER_SCALE)
 
             pulse = int(3 + 2 * abs(pygame.time.get_ticks() % 1000 - 500) / 500)
-            screen.draw_rect( self.colors['delete'],
+            uk.draw_rect_on(screen, delete_color,
                              (int(screen_x), int(screen_y), int(scaled_width), int(scaled_height)),
                              pulse)
 
@@ -2488,7 +2592,7 @@ class ObjectEditor:
             scaled_width = int(obj.width * RENDER_SCALE)
 
             pulse = int(20 + 10 * abs(pygame.time.get_ticks() % 1000 - 500) / 500)
-            screen.draw_circle( self.colors['delete'],
+            uk.draw_circle_on(screen, delete_color,
                                (int(screen_x), int(screen_y)),
                                scaled_width // 2 + pulse, 3)
 
@@ -2502,15 +2606,15 @@ class ObjectEditor:
             scaled_width = int(obj.width * RENDER_SCALE)
 
             pulse = int(20 + 10 * abs(pygame.time.get_ticks() % 1000 - 500) / 500)
-            screen.draw_circle( self.colors['delete'],
+            uk.draw_circle_on(screen, delete_color,
                                (int(screen_x), int(screen_y)),
                                scaled_width // 2 + pulse, 3)
 
         mouse_pos = getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos())
-        screen.draw_line( self.colors['delete'],
+        uk.draw_line_on(screen, delete_color,
                          (mouse_pos[0] - 10, mouse_pos[1] - 10),
                          (mouse_pos[0] + 10, mouse_pos[1] + 10), 3)
-        screen.draw_line( self.colors['delete'],
+        uk.draw_line_on(screen, delete_color,
                          (mouse_pos[0] + 10, mouse_pos[1] - 10),
                          (mouse_pos[0] - 10, mouse_pos[1] + 10), 3)
 
@@ -3214,16 +3318,20 @@ class ObjectEditor:
 
         # Scroll through palette
         if event.type == pygame.MOUSEWHEEL:
-            # If the cursor is over the variant selector row, scroll through
-            # variants horizontally instead of scrolling the palette beneath it.
+            # If the cursor is over the variant selector, scroll through its
+            # rows instead of scrolling the palette grid beneath it.
             variant_selector_rect = self.ui_rects.get('variant_selector_rect')
             if (variant_selector_rect and variant_selector_rect.collidepoint(mouse_pos)
                     and isinstance(self.selected_object, dict)
                     and self.selected_object.get('has_variants', False)):
                 variants = self.selected_object.get('variants', [])
                 if variants:
+                    cols = self._variant_items_per_row()
+                    total_rows = (len(variants) + cols - 1) // cols
+                    visible_rows = min(total_rows, 3)
+                    max_row_scroll = max(0, total_rows - visible_rows)
                     self.variant_scroll -= event.y
-                    self.variant_scroll = max(0, min(self.variant_scroll, max(0, len(variants) - 1)))
+                    self.variant_scroll = max(0, min(self.variant_scroll, max_row_scroll))
                 return
 
             if self._is_in_palette(mouse_pos[0], mouse_pos[1]):
@@ -3235,6 +3343,18 @@ class ObjectEditor:
             # Panel show/hide toggle — checked first so it always fires
             if event.button == 1 and self._panel_toggle_rect().collidepoint(mouse_pos):
                 self.palette_visible = not self.palette_visible
+                return
+
+            info_rect = self.ui_rects.get('info_button')
+            if event.button == 1 and info_rect and info_rect.collidepoint(mouse_pos):
+                self.show_keybinds_popup = not self.show_keybinds_popup
+                return
+
+            # While the keybinds popup is open, any other click just closes
+            # it — nothing underneath (palette or world) should react to a
+            # click that was really the person dismissing the popup.
+            if self.show_keybinds_popup:
+                self.show_keybinds_popup = False
                 return
 
             if event.button == 3:
@@ -3467,16 +3587,6 @@ class ObjectEditor:
                             if hex_rect and hex_rect.collidepoint(mouse_pos):
                                 self.region_hex_input_active = True
                                 return
-
-                    # Variant scroll-arrow clicks (only present when the row overflows)
-                    left_arrow = self.ui_rects.get('variant_scroll_left')
-                    if left_arrow and left_arrow.collidepoint(mouse_pos):
-                        self.variant_scroll -= 1
-                        return
-                    right_arrow = self.ui_rects.get('variant_scroll_right')
-                    if right_arrow and right_arrow.collidepoint(mouse_pos):
-                        self.variant_scroll += 1
-                        return
 
                     # Check if clicking on variant selector
                     if self._is_variant_selector_clicked(mouse_pos):
@@ -3763,6 +3873,9 @@ class ObjectEditor:
         RoomEditor._screen_to_world().
         """
         if not self.active:
+            if self._owns_text_cursor:
+                uk.set_text_cursor(False)
+                self._owns_text_cursor = False
             return
 
         self.anim_timer += dt
@@ -4007,8 +4120,8 @@ class ObjectEditor:
                 row = i // self.items_per_row
                 col = i % self.items_per_row
 
-                item_x = self.palette_x + self.palette_padding + col * (self.item_size + 10)
-                item_y = objects_start_y + row * (self.item_size + 10)
+                item_x = self.palette_x + self.palette_padding + col * (self.item_size + self._item_col_gap)
+                item_y = objects_start_y + row * (self.item_size + self._item_row_gap)
 
                 item_rect = pygame.Rect(item_x, item_y, self.item_size, self.item_size)
                 if item_rect.collidepoint(mouse_pos):
@@ -4023,9 +4136,14 @@ class ObjectEditor:
 
         objects = self.categories[self.current_category]
         rows = (len(objects) + self.items_per_row - 1) // self.items_per_row
-        total_height = rows * (self.item_size + 10)
+        total_height = rows * (self.item_size + self._item_row_gap)
         category_section_height = len(self.categories) * 40 + 20
-        available_height = self.palette_height - (45 + category_section_height + 200)  # Increased for variant selector
+        # Mirrors draw_palette's dynamic bottom reservation (settings panel +
+        # variant selector, each 0 when there's nothing to show) so how far
+        # the grid can scroll always matches how much of it is actually
+        # visible on screen.
+        reserved_bottom = self._settings_panel_content_height() + self._variant_selector_content_height()
+        available_height = max(100, self.palette_height - (45 + category_section_height + reserved_bottom))
         self.max_scroll = max(0, total_height - available_height)
 
     def draw_preview(self, screen, camera_x, camera_y):
@@ -4082,13 +4200,13 @@ class ObjectEditor:
             screen_width = spawn_width * RENDER_SCALE
             screen_height = spawn_height * RENDER_SCALE
 
-            font = pygame.font.Font(None, 32)
-            text = font.render("Click to place transition spawn area", True, (255, 255, 0))
+            text = self.font.render("Click to place transition spawn area",
+                                     color=uk.Theme.GOLD_BRIGHT, height=18)
             text_bg = pygame.Surface((text.get_width() + 20, text.get_height() + 10), pygame.SRCALPHA)
             text_bg.fill((0, 0, 0, 180))
-            bg_x = (screen.get_width() - text.get_width()) // 2 - 10
+            bg_x = (self.screen_width - text.get_width()) // 2 - 10
             screen.blit(text_bg, (bg_x, 10))
-            screen.blit(text, ((screen.get_width() - text.get_width()) // 2, 15))
+            screen.blit(text, ((self.screen_width - text.get_width()) // 2, 15))
 
             # Draw the rectangular transition spawn area
             rect = pygame.Rect(int(screen_x), int(screen_y),
@@ -4127,9 +4245,8 @@ class ObjectEditor:
 
             # Draw dimensions text
             if screen_width > 50 and screen_height > 30:
-                dims_font = pygame.font.Font(None, 18)
                 dims_text = f"{spawn_width} x {spawn_height}"
-                dims_surface = dims_font.render(dims_text, True, (255, 255, 255))
+                dims_surface = self.font.render(dims_text, color=uk.Theme.TEXT_PRIMARY, height=12)
                 dims_rect = dims_surface.get_rect(center=(center_x, center_y))
 
                 # Text background
@@ -4664,6 +4781,11 @@ class ObjectEditor:
         if not self.active:
             return
 
+        # Rebuilt below by every real text-entry field this frame (gate
+        # level, trigger box id, region seed/channel/hex) — see
+        # _resolve_field_cursor and _draw_field_box's text-entry call sites.
+        self.text_field_rects = []
+
         # Don't show palette when path editor is active
         if self.flying_pad_path_editor.active:
             return
@@ -4673,6 +4795,21 @@ class ObjectEditor:
         # Update hover state and always draw the toggle tab
         mx, my = getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos())
         self._hover_panel_toggle = self._panel_toggle_rect().collidepoint(mx, my)
+        uk.register_hoverable(self._panel_toggle_rect())
+
+        # Advance the panel's open/close slide toward its target (chased,
+        # not a fixed-duration tween — same style as TilesetEditor's panel
+        # and EditorToolbar's bar).
+        now_ms = pygame.time.get_ticks()
+        dt = 0.0
+        if self._panel_slide_last_ms is not None:
+            dt = min(0.05, max(0.0, (now_ms - self._panel_slide_last_ms) / 1000.0))
+        self._panel_slide_last_ms = now_ms
+        target_slide = 1.0 if self.palette_visible else 0.0
+        self._panel_slide_anim += (target_slide - self._panel_slide_anim) * min(1.0, dt * self._PANEL_SLIDE_RATE)
+        if abs(target_slide - self._panel_slide_anim) < 0.001:
+            self._panel_slide_anim = target_slide
+
         self._draw_panel_toggle_tab(screen)
 
         # Always draw the transition config dialog — it must be visible even
@@ -4683,24 +4820,52 @@ class ObjectEditor:
         # method (after the settings panel etc.), not here — otherwise the
         # rest of the palette paints right over it every frame.
 
-        if not self.palette_visible:
+        # Keep drawing the panel for as long as it's still sliding, even
+        # after palette_visible has already flipped to False — otherwise
+        # it would vanish instantly the moment the tab is clicked, before
+        # the slide even starts. palette_visible itself still flips
+        # immediately (unchanged), so anything that reads it for hit-
+        # testing is unaffected — only the drawn frame lags behind.
+        if self._panel_slide_anim <= 0.001:
+            self._resolve_field_cursor((mx, my))
+            uk.update_hover_cursor((mx, my))
             return
 
+        # Slide offset: 0 fully open, palette_width fully closed (panel
+        # pushed entirely past the right edge). Every position below is
+        # already computed from self.palette_x, so temporarily shifting it
+        # moves the whole panel as one unit. Drawn directly to `screen` in
+        # a single pass — no intermediate offscreen surface (that caused
+        # visible seams and a glow halo on the toolbar bar).
+        dx = round(self.palette_width * (1.0 - self._panel_slide_anim))
+        self.palette_x += dx
+
         palette_rect = pygame.Rect(self.palette_x, self.palette_y, self.palette_width, self.palette_height)
-        palette_bg = pygame.Surface((self.palette_width, self.palette_height), pygame.SRCALPHA)
-        palette_bg.fill(self.colors['bg_transparent'])
-        screen.blit(palette_bg, (self.palette_x, self.palette_y))
-        screen.draw_rect( self.colors['accent'], palette_rect, 2)
+        uk.draw_panel(screen, palette_rect, bg=(*uk.Theme.PANEL_BG[:3], 235),
+                      border=uk.Theme.GOLD, border_width=2,
+                      radius=uk.Theme.RADIUS_PANEL, shadow=True)
 
         y_pos = self.palette_y + 10
 
-        title = self.font_medium.render("Object Palette", True, self.colors['text'])
+        title = self.font.render("Objects", color=uk.Theme.GOLD, height=16)
         screen.blit(title, (self.palette_x + 20, y_pos))
+
+        # Info button — small '?' badge right after the title that opens the
+        # full keybinds reference (see _draw_keybinds_popup).
+        info_d = 18
+        info_x = self.palette_x + 20 + title.get_width() + 14
+        info_y = y_pos + (title.get_height() - info_d) // 2
+        info_rect = pygame.Rect(info_x, info_y, info_d, info_d)
+        self.ui_rects['info_button'] = info_rect
+        uk.register_hoverable(info_rect)
+        self._draw_info_button(screen, info_rect)
+
         y_pos += 35
 
         for i, category in enumerate(self.categories.keys()):
             is_selected = category == self.current_category
             hover = self.category_hover[category]
+            t = round(max(hover, 1.0 if is_selected else 0.0) * 20) / 20.0
 
             category_rect = pygame.Rect(
                 self.palette_x + self.palette_padding,
@@ -4708,33 +4873,52 @@ class ObjectEditor:
                 self.palette_width - self.palette_padding * 2,
                 30
             )
+            uk.register_hoverable(category_rect)
 
-            bg_color = self.colors['panel_light'] if is_selected else self.colors['panel']
-            if hover > 0:
-                glow_surf = pygame.Surface((category_rect.width + 4, category_rect.height + 4), pygame.SRCALPHA)
-                glow_alpha = int(hover * 100)
-                pygame.draw.rect(glow_surf, (*self.colors['accent'], glow_alpha),
-                                 (0, 0, category_rect.width + 4, category_rect.height + 4), border_radius=5)
-                screen.blit(glow_surf, (category_rect.x - 2, category_rect.y - 2))
+            if t > 0.01:
+                uk.draw_soft_glow(screen, category_rect.center,
+                                  max(category_rect.w, category_rect.h) // 2,
+                                  uk.Theme.GOLD, max_alpha=int(26 * t))
 
-            screen.draw_rect( bg_color, category_rect, border_radius=5)
-            border_color = self.colors['accent'] if is_selected else self.colors['grid']
-            screen.draw_rect( border_color, category_rect, 2, border_radius=5)
+            bg_color = uk.lerp_color(uk.Theme.CARD_BG[:3], uk.Theme.CARD_BG_SELECTED[:3], t)
+            border_color = uk.lerp_color(uk.Theme.CARD_BORDER, uk.Theme.GOLD, t)
+            uk.draw_rect_on(screen, (*bg_color, 255), category_rect, 0, 6)
+            uk.draw_rect_on(screen, border_color, category_rect, 2 if is_selected else 1, 6)
 
-            text_color = self.colors['text'] if is_selected else self.colors['text_dim']
+            # Thin lit accent bar along the left edge of the active tab —
+            # same "which one is current" language the settings panel's
+            # selected pill controls use, just oriented for a vertical list.
+            if t > 0.01:
+                accent_bar = pygame.Rect(category_rect.x + 3, category_rect.y + 5,
+                                          3, category_rect.h - 10)
+                uk.draw_rect_on(screen, uk.lerp_color(uk.Theme.CARD_BORDER, uk.Theme.GOLD_BRIGHT, t),
+                                accent_bar, 0, 2)
+
+            text_color = uk.lerp_color(uk.Theme.TEXT_MUTED, uk.Theme.TEXT_PRIMARY, t)
             cat_text = self.font_medium.render(category, True, text_color)
             text_rect = cat_text.get_rect(center=category_rect.center)
             screen.blit(cat_text, text_rect)
 
             y_pos += 40
 
-        screen.draw_line( self.colors['accent'],
-                         (self.palette_x + self.palette_padding, y_pos),
-                         (self.palette_x + self.palette_width - self.palette_padding, y_pos), 1)
+        uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER,
+                        pygame.Rect(self.palette_x + self.palette_padding, y_pos,
+                                    self.palette_width - self.palette_padding * 2, 1), 0, 0)
         y_pos += 10
 
         objects_start_y = y_pos
-        objects_content_height = self.palette_height - (y_pos - self.palette_y) - 200
+
+        # Reserve only as much bottom space as the variant selector and
+        # settings panel actually need this frame (both can be 0 when the
+        # selected object has neither), so the grid gets to use whatever
+        # space they aren't using instead of a fixed chunk always being
+        # carved out — this is what used to leave an empty rectangle at the
+        # bottom of the palette when nothing needed it.
+        settings_height = self._settings_panel_content_height()
+        variant_height = self._variant_selector_content_height()
+        reserved_bottom = settings_height + variant_height
+        objects_content_height = max(
+            100, self.palette_height - (y_pos - self.palette_y) - reserved_bottom)
 
         clip_rect = pygame.Rect(self.palette_x, objects_start_y, self.palette_width, objects_content_height)
         screen.set_clip(clip_rect)
@@ -4746,8 +4930,8 @@ class ObjectEditor:
             row = i // self.items_per_row
             col = i % self.items_per_row
 
-            item_x = self.palette_x + self.palette_padding + col * (self.item_size + 10)
-            item_y = current_y + row * (self.item_size + 10)
+            item_x = self.palette_x + self.palette_padding + col * (self.item_size + self._item_col_gap)
+            item_y = current_y + row * (self.item_size + self._item_row_gap)
 
             if item_y + self.item_size < objects_start_y or item_y > objects_start_y + objects_content_height:
                 continue
@@ -4756,36 +4940,96 @@ class ObjectEditor:
 
         screen.set_clip(None)
 
-        self._draw_variant_selector(screen)
-        self._draw_settings_panel(screen)
+        # Lay the variant selector and settings panel out bottom-up, each
+        # sized to exactly what it needs (0 means "don't draw it at all").
+        settings_y = self.palette_y + self.palette_height - settings_height
+        variant_y = settings_y - variant_height
+        self._draw_variant_selector(screen, variant_y, variant_height)
+        self._draw_settings_panel(screen, settings_y, settings_height)
 
         # Drawn last so its dark overlay + window actually cover the whole
         # palette/settings panel instead of being painted over by them.
         if self.event_editor is not None:
             self.event_editor.draw(screen)
 
+        self.palette_x -= dx  # restore — the shift above was only for this draw pass
+
+        # Resolve the frame's cursor last, now that every clickable rect
+        # drawn above (category tabs, info button, object cards, toggle
+        # tab, variant slots, checkboxes/switches, text-entry fields) has
+        # had a chance to register itself via register_hoverable, and every
+        # text-entry field via text_field_rects. I-beam takes priority over
+        # the generic hand cursor — see _resolve_field_cursor.
+        self._resolve_field_cursor((mx, my))
+        uk.update_hover_cursor((mx, my))
+
+    def _fit_label_text(self, text, font_view, max_width):
+        """Shorten text with a trailing '...' so it renders within max_width.
+        The bitmap font has no ellipsis glyph, so three periods stand in for
+        one. Returns the text unchanged if it already fits. Results are
+        cached since this runs every frame for every visible palette card."""
+        if not hasattr(self, '_label_fit_cache'):
+            self._label_fit_cache = {}
+        cache_key = (text, max_width)
+        cached = self._label_fit_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        if font_view.size(text)[0] <= max_width:
+            self._label_fit_cache[cache_key] = text
+            return text
+
+        suffix = "..."
+        suffix_w = font_view.size(suffix)[0]
+        if suffix_w >= max_width:
+            self._label_fit_cache[cache_key] = suffix
+            return suffix
+
+        # Binary search for the longest prefix that still fits alongside
+        # the "..." suffix.
+        lo, hi, best = 0, len(text), ""
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            candidate = text[:mid].rstrip()
+            if font_view.size(candidate)[0] + suffix_w <= max_width:
+                best = candidate
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        result = (best + suffix) if best else suffix
+        self._label_fit_cache[cache_key] = result
+        return result
+
     def _draw_object_item(self, screen, obj, x, y):
-        """Draw a single object in the palette"""
+        """Draw a single object card in the palette — same card language
+        (hover lift via glow, gold border/selection, hairline rest state)
+        as EditorToolbar's Items panel thumbnails."""
         item_rect = pygame.Rect(x, y, self.item_size, self.item_size)
 
         is_selected = self.selected_object == obj
         is_hover = self.hover_object == obj
         is_disabled = self._is_object_disabled(obj)
 
-        if is_selected or is_hover:
-            if not is_disabled:
-                glow_surf = pygame.Surface((self.item_size + 4, self.item_size + 4), pygame.SRCALPHA)
-                glow_alpha = 150 if is_selected else 80
-                pygame.draw.rect(glow_surf, (*self.colors['accent'], glow_alpha),
-                                 (0, 0, self.item_size + 4, self.item_size + 4), border_radius=5)
-                screen.blit(glow_surf, (x - 2, y - 2))
+        if not is_disabled:
+            uk.register_hoverable(item_rect)
 
-        bg_color = self.colors['panel_light'] if (is_selected and not is_disabled) else self.colors['panel']
-        screen.draw_rect( bg_color, item_rect, border_radius=5)
+        t = 0.0 if is_disabled else (1.0 if is_selected else (0.6 if is_hover else 0.0))
 
-        border_color = self.colors['accent'] if (is_selected and not is_disabled) else self.colors['grid']
-        border_width = 2 if is_selected else 1
-        screen.draw_rect( border_color, item_rect, border_width, border_radius=5)
+        if t > 0.01:
+            uk.draw_soft_glow(screen, item_rect.center, self.item_size // 2 + 6,
+                              uk.Theme.GOLD, max_alpha=int(55 * t))
+
+        if is_disabled:
+            bg_color, border_color, border_width = uk.Theme.CARD_BG[:3], uk.Theme.CARD_BORDER, 1
+        elif is_selected:
+            bg_color, border_color, border_width = uk.Theme.CARD_BG_SELECTED[:3], uk.Theme.GOLD_BRIGHT, 2
+        elif is_hover:
+            bg_color, border_color, border_width = uk.Theme.CARD_BG_HOVER[:3], uk.Theme.GOLD, 1
+        else:
+            bg_color, border_color, border_width = uk.Theme.CARD_BG[:3], uk.Theme.CARD_BORDER, 1
+
+        uk.draw_rect_on(screen, (*bg_color, 255), item_rect, 0, uk.Theme.RADIUS_CARD)
+        uk.draw_rect_on(screen, border_color, item_rect, border_width, uk.Theme.RADIUS_CARD)
 
         if obj['sprite']:
             src = obj['sprite']
@@ -4815,119 +5059,131 @@ class ObjectEditor:
         # re-rasterized every frame for every visible palette item.
         if not hasattr(self, '_palette_label_cache'):
             self._palette_label_cache = {}
-        name_color = self.colors['disabled'] if is_disabled else self.colors['text_dim']
-        label_key = (obj['name'], name_color)
+        name_color = uk.Theme.TEXT_DIM if is_disabled else uk.Theme.TEXT_MUTED
+        # Cap the label to (roughly) its own card's width before rendering,
+        # so a long object name can no longer spill sideways past the card
+        # and into the neighboring column's label — that horizontal overlap
+        # was the main "names run into each other" issue. A couple of extra
+        # px into the column gap is allowed since that space is otherwise
+        # empty.
+        label_max_w = self.item_size + self._item_col_gap - 4
+        label_text = self._fit_label_text(obj['name'], self.font_small, label_max_w)
+        label_key = (label_text, name_color)
         name_text = self._palette_label_cache.get(label_key)
         if name_text is None:
-            name_text = self.font_small.render(obj['name'], True, name_color)
+            name_text = self.font_small.render(label_text, True, name_color)
             self._palette_label_cache[label_key] = name_text
         name_rect = name_text.get_rect(centerx=item_rect.centerx, top=item_rect.bottom + 2)
         screen.blit(name_text, name_rect)
 
         if is_disabled and obj.get('is_spawn', False):
-            placed_text = self.font_small.render("PLACED", True, self.colors['disabled'])
+            placed_text = self.font_small.render("PLACED", True, uk.Theme.TEXT_DIM)
             placed_rect = placed_text.get_rect(centerx=item_rect.centerx, centery=item_rect.centery)
-
-            bg_surf = pygame.Surface((placed_rect.width + 8, placed_rect.height + 4), pygame.SRCALPHA)
-            bg_surf.fill((0, 0, 0, 180))
-            screen.blit(bg_surf, (placed_rect.x - 4, placed_rect.y - 2))
-
+            badge_rect = placed_rect.inflate(10, 6)
+            uk.draw_rect_on(screen, (16, 18, 26, 210), badge_rect, 0, 5)
+            uk.draw_rect_on(screen, uk.Theme.CARD_BORDER, badge_rect, 1, 5)
             screen.blit(placed_text, placed_rect)
 
-        # Show variant indicator
-        if obj.get('has_variants', False) and is_hover:
-            variant_text = self.font_small.render("Click to select variant", True, self.colors['accent'])
-            variant_rect = variant_text.get_rect(centerx=item_rect.centerx, top=item_rect.bottom + 18)
+    def _variant_items_per_row(self):
+        """How many variant slots fit across one row of the selector, given
+        the current palette width — same derivation as items_per_row for the
+        main object grid."""
+        usable_width = self.palette_width - self.palette_padding * 2
+        slot = 50 + 10  # variant_size + col_gap
+        return max(1, usable_width // slot)
 
-            bg_surf = pygame.Surface((variant_rect.width + 6, variant_rect.height + 2), pygame.SRCALPHA)
-            bg_surf.fill((0, 0, 0, 180))
-            screen.blit(bg_surf, (variant_rect.x - 3, variant_rect.y - 1))
-
-            screen.blit(variant_text, variant_rect)
-
-    def _draw_variant_selector(self, screen):
-        """Draw variant selection row when an object with variants is selected"""
+    def _variant_selector_content_height(self):
+        """How tall the variant selector needs to be to show up to 3 rows of
+        variants at once (further rows scroll with the mouse wheel). Returns
+        0 when there's nothing to show, so draw_palette can skip reserving
+        any space for it at all."""
         if not self.selected_object or not isinstance(self.selected_object, dict):
-            self.ui_rects['variant_selector_rect'] = None
-            return
-
+            return 0
         if not self.selected_object.get('has_variants', False):
+            return 0
+        variants = self.selected_object.get('variants', [])
+        if not variants:
+            return 0
+
+        cols = self._variant_items_per_row()
+        total_rows = (len(variants) + cols - 1) // cols
+        visible_rows = min(total_rows, 3)
+        header_h = 25
+        row_pitch = 50 + 26  # variant_size + row_gap, matches the object grid's row spacing
+        return header_h + visible_rows * row_pitch + 10
+
+    def _draw_variant_selector(self, screen, selector_y, selector_height):
+        """Draw the variant picker as a wrapping grid (rows of slots) above
+        the settings panel, when the selected object has variants. Rows
+        beyond what fits scroll with the mouse wheel instead of everything
+        being squeezed into one horizontally-scrolling row."""
+        if selector_height <= 0:
             self.ui_rects['variant_selector_rect'] = None
+            self.ui_rects['variant_rects'] = []
             return
 
         variants = self.selected_object.get('variants', [])
-        if not variants:
-            self.ui_rects['variant_selector_rect'] = None
-            return
-
-        # Position above settings panel
-        selector_height = 100
-        selector_y = self.palette_y + self.palette_height - 250
         selector_x = self.palette_x
 
-        # Background
         selector_rect = pygame.Rect(selector_x, selector_y, self.palette_width, selector_height)
-        screen.draw_rect( self.colors['variant_bg'], selector_rect)
-        screen.draw_line( self.colors['accent'],
-                         (selector_x, selector_y),
-                         (selector_x + self.palette_width, selector_y), 2)
+        uk.draw_rect_on(screen, uk.Theme.PANEL_BG, selector_rect, 0, 0)
+        uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER,
+                        pygame.Rect(selector_x, selector_y, self.palette_width, 1), 0, 0)
         self.ui_rects['variant_selector_rect'] = selector_rect
 
-        # Title
-        title_text = self.font_small.render("Select Variant:", True, self.colors['text_dim'])
+        title_text = self.font_small.render("SELECT VARIANT", True, uk.Theme.TEXT_MUTED)
         screen.blit(title_text, (selector_x + self.palette_padding, selector_y + 5))
 
-        # Draw variant options
         variant_size = 50
-        variant_spacing = 10
-        arrow_width = 20  # reserved on each side when the list needs scrolling
-        start_y = selector_y + 25
+        col_gap = 10
+        row_gap = 26  # matches the object grid's row-gap fix — room for the label line
+        cols = self._variant_items_per_row()
+        total_rows = (len(variants) + cols - 1) // cols
+        visible_rows = min(total_rows, 3)
+        max_row_scroll = max(0, total_rows - visible_rows)
+        self.variant_scroll = max(0, min(self.variant_scroll, max_row_scroll))
+
+        grid_top = selector_y + 25
+        start_x = selector_x + self.palette_padding
+        label_max_w = variant_size + col_gap - 4
 
         current_variant = self.selected_variant or self._get_current_variant(self.selected_object)
 
-        # How many variants fit at once — recomputed every frame since the
-        # palette can be resized. Reserve room for scroll arrows only once
-        # we actually know the full row won't fit.
-        usable_width = self.palette_width - self.palette_padding * 2
-        slot_width = variant_size + variant_spacing
-        visible_count = max(1, usable_width // slot_width)
-        needs_scroll = len(variants) > visible_count
-        if needs_scroll:
-            # Re-derive visible_count with arrow space carved out on both sides.
-            usable_width -= arrow_width * 2
-            visible_count = max(1, usable_width // slot_width)
-
-        max_variant_scroll = max(0, len(variants) - visible_count)
-        self.variant_scroll = max(0, min(self.variant_scroll, max_variant_scroll))
-
-        start_x = selector_x + self.palette_padding + (arrow_width if needs_scroll else 0)
-        visible_variants = variants[self.variant_scroll:self.variant_scroll + visible_count]
+        first_index = self.variant_scroll * cols
+        last_index = min(len(variants), first_index + visible_rows * cols)
+        visible_variants = variants[first_index:last_index]
 
         self.ui_rects['variant_rects'] = []
-        self.ui_rects['variant_scroll_left'] = None
-        self.ui_rects['variant_scroll_right'] = None
 
-        for i, variant in enumerate(visible_variants):
-            variant_x = start_x + i * slot_width
-            variant_rect = pygame.Rect(variant_x, start_y, variant_size, variant_size)
+        clip_rect = pygame.Rect(selector_x, grid_top, self.palette_width,
+                                 visible_rows * (variant_size + row_gap))
+        screen.set_clip(clip_rect)
+
+        for list_idx, variant in enumerate(visible_variants):
+            row = list_idx // cols
+            col = list_idx % cols
+
+            variant_x = start_x + col * (variant_size + col_gap)
+            variant_y = grid_top + row * (variant_size + row_gap)
+            variant_rect = pygame.Rect(variant_x, variant_y, variant_size, variant_size)
 
             is_selected = (current_variant == variant)
-            is_hover = (self.hover_variant_index == i)
+            is_hover = (self.hover_variant_index == list_idx)
 
-            # Background
             if is_selected:
-                bg_color = self.colors['variant_selected']
+                bg_color, border_color, border_width = uk.Theme.CARD_BG_SELECTED[:3], uk.Theme.KI_BLUE, 2
             elif is_hover:
-                bg_color = self.colors['panel_light']
+                bg_color, border_color, border_width = uk.Theme.CARD_BG_HOVER[:3], uk.Theme.GOLD, 1
             else:
-                bg_color = self.colors['panel']
+                bg_color, border_color, border_width = uk.Theme.CARD_BG[:3], uk.Theme.CARD_BORDER, 1
 
-            screen.draw_rect( bg_color, variant_rect, border_radius=3)
+            if is_selected:
+                uk.draw_soft_glow(screen, variant_rect.center, variant_size // 2 + 4,
+                                  uk.Theme.KI_BLUE, max_alpha=60)
 
-            # Border
-            border_color = self.colors['accent'] if is_selected else self.colors['grid']
-            border_width = 2 if is_selected else 1
-            screen.draw_rect( border_color, variant_rect, border_width, border_radius=3)
+            uk.draw_rect_on(screen, (*bg_color, 255), variant_rect, 0, 8)
+            uk.draw_rect_on(screen, border_color, variant_rect, border_width, 8)
+            uk.register_hoverable(variant_rect)
 
             # Sprite — scaled to fit the slot (mirrors _draw_object_item's
             # scale-to-fit, needed now that variant sprites aren't all
@@ -4943,8 +5199,12 @@ class ObjectEditor:
                 sprite_rect = scaled_sprite.get_rect(center=variant_rect.center)
                 screen.blit(scaled_sprite, sprite_rect)
 
-            # Label
-            label_text = self.font_small.render(variant['name'], True, self.colors['text_dim'])
+            # Label — truncated to the slot's own width so a long variant
+            # name can't spill sideways into the next slot's label, same
+            # fix as the main object grid's cards.
+            label_color = uk.Theme.GOLD_BRIGHT if is_selected else uk.Theme.TEXT_MUTED
+            label_str = self._fit_label_text(variant['name'], self.font_small, label_max_w)
+            label_text = self.font_small.render(label_str, True, label_color)
             label_rect = label_text.get_rect(centerx=variant_rect.centerx, top=variant_rect.bottom + 2)
             screen.blit(label_text, label_rect)
 
@@ -4954,45 +5214,18 @@ class ObjectEditor:
                 'variant': variant
             })
 
-        if needs_scroll:
-            arrow_y = start_y + variant_size // 2
-            left_rect = pygame.Rect(selector_x + self.palette_padding, start_y, arrow_width, variant_size)
-            right_rect = pygame.Rect(
-                selector_x + self.palette_width - self.palette_padding - arrow_width,
-                start_y, arrow_width, variant_size,
+        screen.set_clip(None)
+
+        if max_row_scroll > 0:
+            hint_text = self.font_hint.render(
+                f"Row {self.variant_scroll + 1}/{total_rows} \u2014 scroll for more",
+                True, uk.Theme.TEXT_DIM,
             )
-
-            left_active = self.variant_scroll > 0
-            right_active = self.variant_scroll < max_variant_scroll
-            left_color = self.colors['text'] if left_active else self.colors['text_dim']
-            right_color = self.colors['text'] if right_active else self.colors['text_dim']
-
-            screen.draw_polygon( left_color, [
-                (left_rect.right - 4, arrow_y - 8),
-                (left_rect.left + 4, arrow_y),
-                (left_rect.right - 4, arrow_y + 8),
-            ])
-            screen.draw_polygon( right_color, [
-                (right_rect.left + 4, arrow_y - 8),
-                (right_rect.right - 4, arrow_y),
-                (right_rect.left + 4, arrow_y + 8),
-            ])
-
-            if left_active:
-                self.ui_rects['variant_scroll_left'] = left_rect
-            if right_active:
-                self.ui_rects['variant_scroll_right'] = right_rect
-
-            # Position indicator, e.g. "3-8 / 14"
-            count_text = self.font_small.render(
-                f"{self.variant_scroll + 1}-{min(self.variant_scroll + visible_count, len(variants))} / {len(variants)}",
-                True, self.colors['text_dim'],
-            )
-            count_rect = count_text.get_rect(
+            hint_rect = hint_text.get_rect(
                 right=selector_x + self.palette_width - self.palette_padding,
                 top=selector_y + 5,
             )
-            screen.blit(count_text, count_rect)
+            screen.blit(hint_text, hint_rect)
 
     def draw_flying_pads(self, screen, camera_x, camera_y, colors):
         """Draw flying pads in the current room"""
@@ -5133,44 +5366,48 @@ class ObjectEditor:
             )
 
     def _settings_panel_content_height(self):
-        """Compute how tall _draw_settings_panel's content actually is, so the
-        panel (and therefore the clickable area for its controls) can grow to
-        fit instead of clipping/pushing rows below the palette bounds."""
-        height = 10  # top padding (y_pos = panel_y + 10)
-        height += 25  # Grid Snap row
-        height += 25  # Show Grid row
+        """Compute how tall _draw_settings_panel's content actually is, so
+        the panel only appears (and only takes up space) when the selected
+        object actually has settings to show — otherwise this returns 0 and
+        draw_palette skips the panel entirely, letting the object grid (or
+        the variant selector) use that space instead."""
+        inner = 0
 
         obj = self.selected_object
         if obj and isinstance(obj, dict):
             if obj.get('object_type') == 'level_gate':
-                height += 30  # Gate Level Req row
-                height += 30  # Gate Character row
+                inner += 30  # Gate Level Req row
+                inner += 30  # Gate Character row
 
             if obj.get('object_type') == 'door':
-                height += 30
+                inner += 30  # Permanent checkbox row
+                inner += 30  # Sound picker + preview row
 
             if obj.get('object_type') == 'ambient_sound':
-                height += 60  # sound picker + max-distance row
+                inner += 60  # sound picker + max-distance row
 
             if obj.get('is_trigger_box', False):
-                height += 30  # Box ID row
-                height += 30  # Once toggle row
-                height += 30  # Requires Key toggle row
+                inner += 30  # Box ID row
+                inner += 30  # Once toggle row
+                inner += 30  # Requires Key toggle row
+                if self.trigger_box_always_run:
+                    inner += 18  # "Fires passively..." hint line
+                inner += 30  # Always Run toggle row
 
             if obj.get('object_type') == 'world_map_object':
                 current_variant = self._get_current_variant(obj)
                 if current_variant and current_variant.get('type') in ('world_map', 'world_map_sign'):
-                    height += 30
+                    inner += 30
 
             if obj.get('is_animated_region', False):
-                height += 20 + 14 + 16  # Opacity label + slider + gap
+                inner += 20 + 14 + 16  # Opacity label + slider + gap
                 region_type = obj.get('region_type')
                 if region_type in ('water',):
-                    height += 20 + 14 + 16  # Wave Amount label + slider + gap
-                    height += 30  # Seed input + reroll row
+                    inner += 20 + 14 + 16  # Wave Amount label + slider + gap
+                    inner += 30  # Seed input + reroll row
                 if REGION_STYLES.get(region_type, {}).get('mode', 'patch') == 'patch':
-                    height += 26  # Color label + swatch + reset row
-                    height += 90 + 10  # SV square / hue strip + trailing gap
+                    inner += 26  # Color label + swatch + reset row
+                    inner += 90 + 10  # SV square / hue strip + trailing gap
                 region_style = REGION_STYLES.get(region_type, {})
                 if region_style.get('mode', 'patch') == 'tile':
                     # A single-frame tile sheet (grid_rows omitted or 1 —
@@ -5187,75 +5424,153 @@ class ObjectEditor:
                         btn_gap = 6
                         slot_w = (self.palette_width - self.palette_padding * 2
                                   - btn_gap * (num_variants - 1)) // num_variants
-                        height += 20 + slot_w + 16  # Variant label + thumbnail row + gap
+                        inner += 20 + slot_w + 16  # Variant label + thumbnail row + gap
 
-        height += 10  # bottom padding
-        return height
+        if inner <= 0:
+            return 0
+        return inner + 24  # top (14) + bottom (10) padding, only when there's content
 
-    def _draw_settings_panel(self, screen):
-        """Draw controls and settings at the bottom of the palette"""
-        panel_height = max(160, self._settings_panel_content_height())
-        panel_y = self.palette_y + self.palette_height - panel_height
+    # ── Small reusable inspector-row primitives ─────────────────────────────
+    # The settings panel below is a long, sequential list of rows for very
+    # different controls (per selected object type), so rather than inline
+    # the same "pill toggle" / "dark input box" shape a dozen times, factor
+    # the couple of shapes that repeat into small helpers using the same
+    # card language (hairline border, gold accent when active/lit) as the
+    # rest of the dev-tool chrome.
+
+    def _resolve_field_cursor(self, mouse_pos):
+        """Switch the OS cursor to an I-beam while hovering any real
+        text-entry field registered this frame via self.text_field_rects
+        (gate level, trigger box id, region seed/channel/hex), same
+        no-op-guarded ownership pattern as RoomEditor's hovering_text_field
+        check. Call this right before update_hover_cursor so the I-beam
+        wins out over the generic hand cursor those same rects also get
+        from _draw_field_box's register_hoverable call."""
+        hovering_text_field = any(r.collidepoint(mouse_pos) for r in self.text_field_rects)
+        if hovering_text_field:
+            uk.set_text_cursor(True)
+            self._owns_text_cursor = True
+        elif self._owns_text_cursor:
+            uk.set_text_cursor(False)
+            self._owns_text_cursor = False
+
+    def _draw_field_box(self, screen, rect, active=False, radius=6):
+        """Dark inset box used for every text-entry field (gate level, seed,
+        hex, box id, dropdown buttons) -- lights up gold-bordered while
+        actively being typed into, same convention as ModalTextInput."""
+        bg = uk.Theme.CARD_BG_HOVER if active else (28, 31, 42, 255)
+        border = uk.Theme.GOLD if active else uk.Theme.CARD_BORDER
+        uk.draw_rect_on(screen, bg, rect, 0, radius)
+        uk.draw_rect_on(screen, border, rect, 2 if active else 1, radius)
+        # Hand cursor by default; text-entry call sites additionally append
+        # `rect` to self.text_field_rects, which wins out with the I-beam —
+        # see draw_palette's set_text_cursor call, resolved before this
+        # frame's update_hover_cursor.
+        uk.register_hoverable(rect)
+
+    def _draw_onoff_pill(self, screen, rect, is_on, on_color=None):
+        """Small ON/OFF toggle pill (Once / Requires Key / Always Run, etc.)."""
+        on_color = on_color or uk.Theme.KI_BLUE
+        bg = (*on_color, 60) if is_on else uk.Theme.CARD_BG
+        border = on_color if is_on else uk.Theme.CARD_BORDER
+        uk.draw_rect_on(screen, bg, rect, 0, rect.h // 2)
+        uk.draw_rect_on(screen, border, rect, 2, rect.h // 2)
+        text_color = uk.Theme.TEXT_PRIMARY if is_on else uk.Theme.TEXT_DIM
+        label = self.font_small.render('ON' if is_on else 'OFF', True, text_color)
+        screen.blit(label, label.get_rect(center=rect.center))
+        uk.register_hoverable(rect)
+
+    def _draw_mini_button(self, screen, rect, hover=False, selected=False, radius=6):
+        """Small pill/rect button (Reroll, Preview, Reset, sound picker
+        buttons, +/- steppers, world-map dropdown, etc.)."""
+        if selected:
+            bg, border, bw = (*uk.Theme.KI_BLUE, 55), uk.Theme.KI_BLUE, 2
+        elif hover:
+            bg, border, bw = uk.Theme.CARD_BG_HOVER, uk.Theme.GOLD, 1
+        else:
+            bg, border, bw = uk.Theme.CARD_BG, uk.Theme.CARD_BORDER, 1
+        uk.draw_rect_on(screen, bg, rect, 0, radius)
+        uk.draw_rect_on(screen, border, rect, bw, radius)
+        uk.register_hoverable(rect)
+
+    def _draw_slider_row(self, screen, track_rect, fraction, ui_key):
+        """Horizontal fill-track slider (Opacity, Wave Amount) with a lit
+        gold handle -- registers `ui_key` in self.ui_rects the same as the
+        old track rect did, for handle_input's existing drag hit-test."""
+        uk.draw_rect_on(screen, uk.Theme.CARD_BG, track_rect, 0, track_rect.h // 2)
+        fill_w = int(track_rect.w * max(0.0, min(1.0, fraction)))
+        if fill_w > 0:
+            fill_rect = pygame.Rect(track_rect.x, track_rect.y, fill_w, track_rect.h)
+            uk.draw_rect_on(screen, uk.Theme.GOLD, fill_rect, 0, track_rect.h // 2)
+        uk.draw_rect_on(screen, uk.Theme.CARD_BORDER, track_rect, 1, track_rect.h // 2)
+
+        handle_x = track_rect.x + fill_w
+        handle_center = (handle_x, track_rect.centery)
+        uk.draw_soft_glow(screen, handle_center, 10, uk.Theme.GOLD, max_alpha=90)
+        uk.draw_circle_on(screen, uk.Theme.GOLD_BRIGHT, handle_center, track_rect.h // 2 + 2)
+        uk.draw_circle_on(screen, (16, 18, 26), handle_center, track_rect.h // 2 + 2, 1)
+
+        self.ui_rects[ui_key] = track_rect
+
+    def _settings_section_label(self, screen, text, y_pos):
+        """Small caps-style muted label for a settings row (kept as plain
+        text, not a full section header, to match the panel's compact row
+        rhythm)."""
+        surf = self.font_medium.render(text, True, uk.Theme.TEXT_SECONDARY)
+        screen.blit(surf, (self.palette_x + self.palette_padding, y_pos))
+        return surf
+
+    def _draw_settings_panel(self, screen, panel_y, panel_height):
+        """Draw controls and settings at the bottom of the palette. Caller
+        (draw_palette) already knows panel_height is > 0 — it comes from
+        _settings_panel_content_height, which returns 0 (and no panel is
+        drawn at all) when the selected object has no per-object settings."""
+        if panel_height <= 0:
+            return
 
         panel_rect = pygame.Rect(self.palette_x, panel_y, self.palette_width, panel_height)
-        screen.draw_rect( self.colors['bg'], panel_rect)
-        screen.draw_line( self.colors['accent'],
-                         (self.palette_x, panel_y),
-                         (self.palette_x + self.palette_width, panel_y), 2)
+        uk.draw_rect_on(screen, uk.Theme.PANEL_BG, panel_rect, 0, 0)
+        uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER,
+                        pygame.Rect(self.palette_x, panel_y, self.palette_width, 1), 0, 0)
 
-        y_pos = panel_y + 10
-
-        snap_text = f"Grid Snap: {self.grid_snap_size}px" if self.grid_snap else "Grid Snap: OFF"
-        snap_color = self.colors['success'] if self.grid_snap else self.colors['text_dim']
-        snap_surf = self.font_medium.render(snap_text, True, snap_color)
-        screen.blit(snap_surf, (self.palette_x + self.palette_padding, y_pos))
-
-        hint = self.font_small.render("(Press G)", True, self.colors['text_dim'])
-        screen.blit(hint, (self.palette_x + self.palette_padding + 120, y_pos + 3))
-        y_pos += 25
-
-        grid_text = f"Show Grid: {'ON' if self.show_grid else 'OFF'}"
-        grid_color = self.colors['success'] if self.show_grid else self.colors['text_dim']
-        grid_surf = self.font_medium.render(grid_text, True, grid_color)
-        screen.blit(grid_surf, (self.palette_x + self.palette_padding, y_pos))
-
-        hint = self.font_small.render("(Press H)", True, self.colors['text_dim'])
-        screen.blit(hint, (self.palette_x + self.palette_padding + 120, y_pos + 3))
-        y_pos += 25
+        y_pos = panel_y + 14
 
         if (self.selected_object and isinstance(self.selected_object, dict)
                 and self.selected_object.get('object_type') == 'ambient_sound'):
-            label = self.font_medium.render('Sound:', True, self.colors['text'])
-            screen.blit(label, (self.palette_x + self.palette_padding, y_pos))
+            self._settings_section_label(screen, 'Sound:', y_pos)
             left = pygame.Rect(self.palette_x + 90, y_pos - 3, 24, 22)
             right = pygame.Rect(self.palette_x + self.palette_width - self.palette_padding - 24, y_pos - 3, 24, 22)
-            screen.draw_rect(self.colors['panel_light'], left, border_radius=3)
-            screen.draw_rect(self.colors['panel_light'], right, border_radius=3)
-            screen.blit(self.font_medium.render('<', True, self.colors['text']), (left.x + 7, left.y + 1))
-            screen.blit(self.font_medium.render('>', True, self.colors['text']), (right.x + 7, right.y + 1))
+            self._draw_mini_button(screen, left, radius=5)
+            self._draw_mini_button(screen, right, radius=5)
+            screen.draw_polygon(uk.Theme.TEXT_PRIMARY, [
+                (left.centerx + 3, left.centery - 5), (left.centerx - 4, left.centery), (left.centerx + 3, left.centery + 5)
+            ])
+            screen.draw_polygon(uk.Theme.TEXT_PRIMARY, [
+                (right.centerx - 3, right.centery - 5), (right.centerx + 4, right.centery), (right.centerx - 3, right.centery + 5)
+            ])
             sound_text = self.ambient_sound_name or '<no ambient files>'
-            sound_surf = self.font_small.render(sound_text, True, self.colors['text_dim'])
+            sound_surf = self.font_small.render(sound_text, True, uk.Theme.TEXT_MUTED)
             screen.blit(sound_surf, (left.right + 8, y_pos + 2))
             self.ui_rects['ambient_sound_left'] = left
             self.ui_rects['ambient_sound_right'] = right
             y_pos += 30
 
-            dlabel = self.font_medium.render(f'Radius: {self.ambient_sound_max_distance}px', True, self.colors['text'])
-            screen.blit(dlabel, (self.palette_x + self.palette_padding, y_pos))
+            self._settings_section_label(screen, f'Radius: {self.ambient_sound_max_distance}px', y_pos)
             minus = pygame.Rect(self.palette_x + 180, y_pos - 3, 24, 22)
             plus = pygame.Rect(self.palette_x + 210, y_pos - 3, 24, 22)
-            screen.draw_rect(self.colors['panel_light'], minus, border_radius=3)
-            screen.draw_rect(self.colors['panel_light'], plus, border_radius=3)
-            screen.blit(self.font_medium.render('-', True, self.colors['text']), (minus.x + 8, minus.y + 1))
-            screen.blit(self.font_medium.render('+', True, self.colors['text']), (plus.x + 7, plus.y + 1))
+            self._draw_mini_button(screen, minus, radius=5)
+            self._draw_mini_button(screen, plus, radius=5)
+            minus_txt = self.font_medium.render('-', True, uk.Theme.TEXT_PRIMARY)
+            plus_txt = self.font_medium.render('+', True, uk.Theme.TEXT_PRIMARY)
+            screen.blit(minus_txt, minus_txt.get_rect(center=minus.center))
+            screen.blit(plus_txt, plus_txt.get_rect(center=plus.center))
             self.ui_rects['ambient_distance_minus'] = minus
             self.ui_rects['ambient_distance_plus'] = plus
             y_pos += 30
 
         if self.selected_object and isinstance(self.selected_object, dict) and self.selected_object.get(
                 'object_type') == 'level_gate':
-            level_label = self.font_medium.render("Gate Level Req:", True, self.colors['text'])
-            screen.blit(level_label, (self.palette_x + self.palette_padding, y_pos))
+            self._settings_section_label(screen, "Gate Level Req:", y_pos)
 
             input_x = self.palette_x + self.palette_padding + 135
             input_y = y_pos - 3
@@ -5263,13 +5578,12 @@ class ObjectEditor:
             input_height = 25
 
             input_rect = pygame.Rect(input_x, input_y, input_width, input_height)
-            input_bg_color = self.colors['input_active'] if self.gate_level_input_active else self.colors['input_bg']
-            screen.draw_rect( input_bg_color, input_rect)
-            screen.draw_rect( self.colors['accent'] if self.gate_level_input_active else self.colors['grid'],
-                             input_rect, 2)
+            self._draw_field_box(screen, input_rect, active=self.gate_level_input_active)
+            self.text_field_rects.append(input_rect)
+            self.ui_rects['gate_level_input_rect'] = input_rect
 
             display_text = self.gate_level_text if self.gate_level_input_active else str(self.gate_required_level)
-            text_surf = self.font_medium.render(display_text, True, self.colors['text'])
+            text_surf = self.font_medium.render(display_text, True, uk.Theme.TEXT_PRIMARY)
             text_rect = text_surf.get_rect(center=input_rect.center)
             screen.blit(text_surf, text_rect)
 
@@ -5277,7 +5591,7 @@ class ObjectEditor:
                 if int(pygame.time.get_ticks() / 500) % 2 == 0:
                     cursor_x = text_rect.right + 3
                     cursor_y = input_rect.centery
-                    screen.draw_line( self.colors['text'],
+                    uk.draw_line_on(screen, uk.Theme.TEXT_PRIMARY,
                                      (cursor_x, cursor_y - 10),
                                      (cursor_x, cursor_y + 10), 2)
 
@@ -5287,8 +5601,7 @@ class ObjectEditor:
             # Cycle arrows through [Any, *characters]; the swatch previews
             # exactly the color the placed gate's number will use (see
             # _gate_character_color / LevelGate._load_gate_color).
-            char_label = self.font_medium.render("Gate Character:", True, self.colors['text'])
-            screen.blit(char_label, (self.palette_x + self.palette_padding, y_pos))
+            self._settings_section_label(screen, "Gate Character:", y_pos)
 
             arrow_size = 22
             name_x = self.palette_x + self.palette_padding + 135
@@ -5297,26 +5610,26 @@ class ObjectEditor:
                 self.palette_x + self.palette_width - self.palette_padding - arrow_size,
                 y_pos - 3, arrow_size, arrow_size,
             )
+            self._draw_mini_button(screen, left_rect, radius=6)
+            self._draw_mini_button(screen, right_rect, radius=6)
 
             ay = left_rect.centery
-            screen.draw_polygon( self.colors['text'], [
+            screen.draw_polygon(uk.Theme.TEXT_PRIMARY, [
                 (left_rect.right - 6, ay - 7),
                 (left_rect.left + 5, ay),
                 (left_rect.right - 6, ay + 7),
             ])
-            screen.draw_polygon( self.colors['text'], [
+            screen.draw_polygon(uk.Theme.TEXT_PRIMARY, [
                 (right_rect.left + 6, ay - 7),
                 (right_rect.right - 5, ay),
                 (right_rect.left + 6, ay + 7),
             ])
-            screen.draw_rect( self.colors['grid'], left_rect, 1, border_radius=4)
-            screen.draw_rect( self.colors['grid'], right_rect, 1, border_radius=4)
 
             self.ui_rects['gate_char_arrow_left'] = left_rect
             self.ui_rects['gate_char_arrow_right'] = right_rect
 
             name_txt = self._gate_character_display_name(self.gate_required_character)
-            name_surf = self.font_medium.render(name_txt, True, self.colors['text'])
+            name_surf = self.font_medium.render(name_txt, True, uk.Theme.TEXT_PRIMARY)
             name_area = pygame.Rect(left_rect.right + 6, y_pos - 3,
                                      right_rect.left - left_rect.right - 12 - 20, arrow_size)
             name_clip = name_surf.get_rect()
@@ -5324,16 +5637,14 @@ class ObjectEditor:
             screen.blit(name_surf, name_area.topleft, name_clip)
 
             swatch_rect = pygame.Rect(right_rect.left - 18, y_pos, 14, 14)
-            screen.draw_rect( self._gate_character_color(self.gate_required_character),
-                             swatch_rect, border_radius=3)
-            screen.draw_rect( self.colors['grid'], swatch_rect, 1, border_radius=3)
+            uk.draw_rect_on(screen, self._gate_character_color(self.gate_required_character), swatch_rect, 0, 4)
+            uk.draw_rect_on(screen, uk.Theme.CARD_BORDER, swatch_rect, 1, 4)
 
             y_pos += 30
 
         if self.selected_object and isinstance(self.selected_object, dict) and self.selected_object.get(
                 'object_type') == 'door':
-            label = self.font_medium.render("Permanent:", True, self.colors['text'])
-            screen.blit(label, (self.palette_x + self.palette_padding, y_pos))
+            self._settings_section_label(screen, "Permanent:", y_pos)
 
             box_size = 20
             box_x = self.palette_x + self.palette_padding + 100
@@ -5341,25 +5652,20 @@ class ObjectEditor:
             box_rect = pygame.Rect(box_x, box_y, box_size, box_size)
             self.ui_rects['door_permanent_checkbox'] = box_rect
 
-            box_bg = self.colors['success'] if self.door_permanent else self.colors['input_bg']
-            screen.draw_rect( box_bg, box_rect)
-            screen.draw_rect( self.colors['accent'] if self.door_permanent else self.colors['grid'],
-                             box_rect, 2)
-
+            self._draw_field_box(screen, box_rect, active=self.door_permanent, radius=5)
             if self.door_permanent:
-                screen.draw_line( (255, 255, 255),
+                uk.draw_line_on(screen, uk.Theme.GOLD_BRIGHT,
                                  (box_x + 4, box_y + 10), (box_x + 8, box_y + 15), 2)
-                screen.draw_line( (255, 255, 255),
+                uk.draw_line_on(screen, uk.Theme.GOLD_BRIGHT,
                                  (box_x + 8, box_y + 15), (box_x + 16, box_y + 5), 2)
 
-            hint = self.font_small.render("(stays open once opened)", True, self.colors['text_dim'])
+            hint = self.font_small.render("(stays open once opened)", True, uk.Theme.TEXT_MUTED)
             screen.blit(hint, (box_x + box_size + 8, y_pos + 3))
 
             y_pos += 30
 
             # ── Door sound picker ───────────────────────────────────────────
-            sound_label = self.font_medium.render("Sound:", True, self.colors['text'])
-            screen.blit(sound_label, (self.palette_x + self.palette_padding, y_pos))
+            self._settings_section_label(screen, "Sound:", y_pos)
 
             btn_h = 22
             btn_gap = 4
@@ -5371,15 +5677,12 @@ class ObjectEditor:
                 # Short label — e.g. 'door1' -> '1' — so a row of these reads
                 # like numbered tabs rather than repeating "door" each time.
                 short_label = name[4:] if name.lower().startswith('door') else name
-                label_surf = self.font_small.render(short_label, True, self.colors['text'])
+                label_surf = self.font_small.render(short_label, True, uk.Theme.TEXT_PRIMARY)
                 btn_w = max(24, label_surf.get_width() + 12)
                 btn_rect = pygame.Rect(btn_x, btn_y, btn_w, btn_h)
 
                 is_selected = (name == self.door_sound_text)
-                bg = self.colors['variant_selected'] if is_selected else self.colors['input_bg']
-                screen.draw_rect( bg, btn_rect)
-                screen.draw_rect( self.colors['accent'] if is_selected else self.colors['grid'],
-                                 btn_rect, 2)
+                self._draw_mini_button(screen, btn_rect, selected=is_selected, radius=5)
                 screen.blit(label_surf, label_surf.get_rect(center=btn_rect.center))
 
                 door_sound_buttons.append((btn_rect, name))
@@ -5389,19 +5692,17 @@ class ObjectEditor:
 
             # Preview button — plays whatever's currently selected. Drawn as a
             # small play triangle + label rather than a unicode ▶ glyph, since
-            # the default pygame font doesn't reliably have that character.
+            # the bitmap font has no such glyph either.
             preview_rect = pygame.Rect(btn_x + 6, btn_y, 78, btn_h)
             preview_hover = preview_rect.collidepoint(getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos()))
-            preview_bg = self.colors['input_active'] if preview_hover else self.colors['input_bg']
-            screen.draw_rect( preview_bg, preview_rect)
-            screen.draw_rect( self.colors['accent'], preview_rect, 2)
+            self._draw_mini_button(screen, preview_rect, hover=preview_hover, radius=5)
 
             tri_x = preview_rect.x + 8
             tri_y = preview_rect.centery
-            screen.draw_polygon( self.colors['accent'], [
+            screen.draw_polygon(uk.Theme.GOLD, [
                 (tri_x, tri_y - 5), (tri_x, tri_y + 5), (tri_x + 8, tri_y)
             ])
-            preview_label = self.font_small.render("Preview", True, self.colors['text'])
+            preview_label = self.font_small.render("Preview", True, uk.Theme.TEXT_PRIMARY)
             screen.blit(preview_label, (tri_x + 14, preview_rect.centery - preview_label.get_height() // 2))
             self.ui_rects['door_sound_preview_btn'] = preview_rect
 
@@ -5409,19 +5710,15 @@ class ObjectEditor:
 
         if self.selected_object and isinstance(self.selected_object, dict) and self.selected_object.get(
                 'is_trigger_box', False):
-            id_label = self.font_medium.render("Box ID:", True, self.colors['text'])
-            screen.blit(id_label, (self.palette_x + self.palette_padding, y_pos))
+            self._settings_section_label(screen, "Box ID:", y_pos)
 
             btn_x = self.palette_x + self.palette_padding + 120
             id_rect = pygame.Rect(btn_x, y_pos - 3, 200, 25)
-            id_bg = self.colors['input_active'] if self.trigger_box_id_input_active else self.colors['input_bg']
-            screen.draw_rect( id_bg, id_rect)
-            screen.draw_rect(
-                             self.colors['accent'] if self.trigger_box_id_input_active else self.colors['grid'],
-                             id_rect, 2)
+            self._draw_field_box(screen, id_rect, active=self.trigger_box_id_input_active)
+            self.text_field_rects.append(id_rect)
 
             display_label = self.trigger_box_id_text if self.trigger_box_id_text else '<box id>'
-            id_text_surf = self.font_small.render(display_label, True, self.colors['text'])
+            id_text_surf = self.font_small.render(display_label, True, uk.Theme.TEXT_PRIMARY)
             id_clip = pygame.Rect(id_rect.x + 4, id_rect.y, id_rect.w - 8, id_rect.h)
             screen.set_clip(id_clip)
             screen.blit(id_text_surf, (id_rect.x + 4, id_rect.y + 6))
@@ -5431,49 +5728,29 @@ class ObjectEditor:
 
             y_pos += 30
 
-            once_label = self.font_medium.render("Once:", True, self.colors['text'])
-            screen.blit(once_label, (self.palette_x + self.palette_padding, y_pos))
-
+            self._settings_section_label(screen, "Once:", y_pos)
             once_rect = pygame.Rect(btn_x, y_pos - 3, 60, 22)
-            once_color = self.colors['success'] if self.trigger_box_once else self.colors['panel']
-            screen.draw_rect( once_color, once_rect, border_radius=4)
-            screen.draw_rect( self.colors['accent'], once_rect, 2, border_radius=4)
-            once_text = self.font_small.render('ON' if self.trigger_box_once else 'OFF', True, self.colors['text'])
-            screen.blit(once_text, once_text.get_rect(center=once_rect.center))
+            self._draw_onoff_pill(screen, once_rect, self.trigger_box_once)
             self.ui_rects['trigger_box_once_rect'] = once_rect
 
             y_pos += 30
 
-            key_label = self.font_medium.render("Requires Key:", True, self.colors['text'])
-            screen.blit(key_label, (self.palette_x + self.palette_padding, y_pos))
-
+            self._settings_section_label(screen, "Requires Key:", y_pos)
             key_rect = pygame.Rect(btn_x, y_pos - 3, 60, 22)
-            key_color = self.colors['success'] if self.trigger_box_requires_key else self.colors['panel']
-            screen.draw_rect( key_color, key_rect, border_radius=4)
-            screen.draw_rect( self.colors['accent'], key_rect, 2, border_radius=4)
-            key_text = self.font_small.render('ON' if self.trigger_box_requires_key else 'OFF', True,
-                                              self.colors['text'])
-            screen.blit(key_text, key_text.get_rect(center=key_rect.center))
+            self._draw_onoff_pill(screen, key_rect, self.trigger_box_requires_key)
             self.ui_rects['trigger_box_requires_key_rect'] = key_rect
 
             y_pos += 30
 
-            always_run_label = self.font_medium.render("Always Run:", True, self.colors['text'])
-            screen.blit(always_run_label, (self.palette_x + self.palette_padding, y_pos))
-
+            self._settings_section_label(screen, "Always Run:", y_pos)
             always_run_rect = pygame.Rect(btn_x, y_pos - 3, 60, 22)
-            always_run_color = self.colors['success'] if self.trigger_box_always_run else self.colors['panel']
-            screen.draw_rect( always_run_color, always_run_rect, border_radius=4)
-            screen.draw_rect( self.colors['accent'], always_run_rect, 2, border_radius=4)
-            always_run_text = self.font_small.render('ON' if self.trigger_box_always_run else 'OFF', True,
-                                                      self.colors['text'])
-            screen.blit(always_run_text, always_run_text.get_rect(center=always_run_rect.center))
+            self._draw_onoff_pill(screen, always_run_rect, self.trigger_box_always_run)
             self.ui_rects['trigger_box_always_run_rect'] = always_run_rect
 
             if self.trigger_box_always_run:
                 hint_surf = self.font_small.render(
                     "Fires passively — position/size ignored, single-click to place",
-                    True, self.colors['text_dark'])
+                    True, uk.Theme.TEXT_DIM)
                 screen.blit(hint_surf, (self.palette_x + self.palette_padding, y_pos + 24))
                 y_pos += 18
 
@@ -5483,20 +5760,15 @@ class ObjectEditor:
                 and self.selected_object.get('object_type') == 'world_map_object'):
             current_variant = self._get_current_variant(self.selected_object)
             if current_variant and current_variant.get('type') in ('world_map', 'world_map_sign'):
-                map_label = self.font_medium.render("Map:", True, self.colors['text'])
-                screen.blit(map_label, (self.palette_x + self.palette_padding, y_pos))
+                self._settings_section_label(screen, "Map:", y_pos)
 
                 # ── Dropdown button ───────────────────────────────────────────
                 btn_x = self.palette_x + self.palette_padding + 120
                 btn_rect = pygame.Rect(btn_x, y_pos - 3, 200, 25)
-                btn_bg = self.colors['input_active'] if self.world_map_dropdown_open else self.colors['input_bg']
-                screen.draw_rect( btn_bg, btn_rect)
-                screen.draw_rect(
-                                 self.colors['accent'] if self.world_map_dropdown_open else self.colors['grid'],
-                                 btn_rect, 2)
+                self._draw_field_box(screen, btn_rect, active=self.world_map_dropdown_open)
 
                 display_label = self.world_map_name_text if self.world_map_name_text else '<select map>'
-                label_surf = self.font_small.render(display_label, True, self.colors['text'])
+                label_surf = self.font_small.render(display_label, True, uk.Theme.TEXT_PRIMARY)
                 label_clip = pygame.Rect(btn_rect.x + 4, btn_rect.y, btn_rect.w - 20, btn_rect.h)
                 screen.set_clip(label_clip)
                 screen.blit(label_surf, (btn_rect.x + 4, btn_rect.y + 6))
@@ -5505,7 +5777,7 @@ class ObjectEditor:
                 arrow_x = btn_rect.right - 14
                 arrow_y = btn_rect.centery
                 arrow_pts = [(arrow_x, arrow_y - 4), (arrow_x + 8, arrow_y - 4), (arrow_x + 4, arrow_y + 4)]
-                screen.draw_polygon( self.colors['text_dim'], arrow_pts)
+                screen.draw_polygon(uk.Theme.TEXT_MUTED, arrow_pts)
 
                 self.ui_rects['world_map_dropdown_btn'] = btn_rect
 
@@ -5516,24 +5788,21 @@ class ObjectEditor:
                     list_h = max(item_h, len(names) * item_h)
                     list_rect = pygame.Rect(btn_rect.x, btn_rect.bottom, btn_rect.w, list_h)
 
-                    list_bg = pygame.Surface((list_rect.w, list_rect.h), pygame.SRCALPHA)
-                    list_bg.fill((30, 30, 45, 240))
-                    screen.blit(list_bg, list_rect.topleft)
-                    screen.draw_rect( self.colors['accent'], list_rect, 1)
+                    uk.draw_panel(screen, list_rect, bg=(*uk.Theme.PANEL_BG[:3], 245),
+                                  border=uk.Theme.GOLD, border_width=1, radius=6, shadow=True)
 
                     self.ui_rects['world_map_dropdown_items'] = []
                     if not names:
-                        empty_surf = self.font_small.render('<no maps found>', True, self.colors['text_dark'])
+                        empty_surf = self.font_small.render('<no maps found>', True, uk.Theme.TEXT_DIM)
                         screen.blit(empty_surf, (list_rect.x + 4, list_rect.y + 4))
                     else:
                         for i, name in enumerate(names):
                             item_rect = pygame.Rect(list_rect.x, list_rect.y + i * item_h, list_rect.w, item_h)
                             is_sel = name == self.world_map_name_text
                             if is_sel:
-                                screen.draw_rect( self.colors['variant_selected'], item_rect)
-                            item_surf = self.font_small.render(name, True,
-                                                               self.colors['text'] if is_sel else self.colors[
-                                                                   'text_dim'])
+                                uk.draw_rect_on(screen, (*uk.Theme.KI_BLUE, 60), item_rect, 0, 0)
+                            item_surf = self.font_small.render(
+                                name, True, uk.Theme.TEXT_PRIMARY if is_sel else uk.Theme.TEXT_MUTED)
                             screen.blit(item_surf, (item_rect.x + 6, item_rect.y + 4))
                             self.ui_rects['world_map_dropdown_items'].append((item_rect, name))
 
@@ -5541,94 +5810,49 @@ class ObjectEditor:
 
         if self.selected_object and isinstance(self.selected_object, dict) and self.selected_object.get(
                 'is_animated_region', False):
-            label = self.font_medium.render(f"Opacity: {self.region_opacity}%", True, self.colors['text'])
-            screen.blit(label, (self.palette_x + self.palette_padding, y_pos))
+            self._settings_section_label(screen, f"Opacity: {self.region_opacity}%", y_pos)
             y_pos += 20
 
-            track_x = self.palette_x + self.palette_padding
-            track_y = y_pos
-            track_w = self.palette_width - self.palette_padding * 2
-            track_h = 14
-            track_rect = pygame.Rect(track_x, track_y, track_w, track_h)
+            track_rect = pygame.Rect(self.palette_x + self.palette_padding, y_pos,
+                                      self.palette_width - self.palette_padding * 2, 14)
+            self._draw_slider_row(screen, track_rect, self.region_opacity / 100, 'region_opacity_slider')
 
-            screen.draw_rect( self.colors['input_bg'], track_rect, border_radius=4)
-
-            fill_w = int(track_w * (self.region_opacity / 100))
-            if fill_w > 0:
-                fill_rect = pygame.Rect(track_x, track_y, fill_w, track_h)
-                screen.draw_rect( self.colors['accent'], fill_rect, border_radius=4)
-
-            screen.draw_rect( self.colors['grid'], track_rect, 2, border_radius=4)
-
-            handle_x = track_x + fill_w
-            handle_rect = pygame.Rect(0, 0, 10, track_h + 8)
-            handle_rect.center = (handle_x, track_y + track_h // 2)
-            screen.draw_rect( self.colors['text'], handle_rect, border_radius=3)
-
-            self.ui_rects['region_opacity_slider'] = track_rect
-
-            y_pos += track_h + 16
+            y_pos += track_rect.h + 16
 
             current_region_type = self.selected_object.get('region_type')
             if current_region_type in ('water',):
                 # Wave/Flicker Amount slider — fraction of 8x8 chunks showing
                 # the animated patch vs. the plain (no-line) patch.
-                amount_label_text = "Wave Amount"
-                wave_label = self.font_medium.render(
-                    f"{amount_label_text}: {self.region_wave_amount}%", True, self.colors['text'])
-                screen.blit(wave_label, (self.palette_x + self.palette_padding, y_pos))
+                self._settings_section_label(
+                    screen, f"Wave Amount: {self.region_wave_amount}%", y_pos)
                 y_pos += 20
 
-                wtrack_x = self.palette_x + self.palette_padding
-                wtrack_y = y_pos
-                wtrack_w = self.palette_width - self.palette_padding * 2
-                wtrack_h = 14
-                wtrack_rect = pygame.Rect(wtrack_x, wtrack_y, wtrack_w, wtrack_h)
+                wtrack_rect = pygame.Rect(self.palette_x + self.palette_padding, y_pos,
+                                           self.palette_width - self.palette_padding * 2, 14)
+                self._draw_slider_row(screen, wtrack_rect, self.region_wave_amount / 100, 'region_wave_slider')
 
-                screen.draw_rect( self.colors['input_bg'], wtrack_rect, border_radius=4)
-
-                wfill_w = int(wtrack_w * (self.region_wave_amount / 100))
-                if wfill_w > 0:
-                    wfill_rect = pygame.Rect(wtrack_x, wtrack_y, wfill_w, wtrack_h)
-                    screen.draw_rect( self.colors['accent'], wfill_rect, border_radius=4)
-
-                screen.draw_rect( self.colors['grid'], wtrack_rect, 2, border_radius=4)
-
-                whandle_x = wtrack_x + wfill_w
-                whandle_rect = pygame.Rect(0, 0, 10, wtrack_h + 8)
-                whandle_rect.center = (whandle_x, wtrack_y + wtrack_h // 2)
-                screen.draw_rect( self.colors['text'], whandle_rect, border_radius=3)
-
-                self.ui_rects['region_wave_slider'] = wtrack_rect
-
-                y_pos += wtrack_h + 16
+                y_pos += wtrack_rect.h + 16
 
                 # Seed — determines which chunks lose their waves at a given
                 # Wave Amount; reroll to reshuffle the layout.
-                seed_label = self.font_medium.render("Seed:", True, self.colors['text'])
-                screen.blit(seed_label, (self.palette_x + self.palette_padding, y_pos))
+                self._settings_section_label(screen, "Seed:", y_pos)
 
                 seed_input_x = self.palette_x + self.palette_padding + 60
                 seed_input_y = y_pos - 3
                 seed_input_rect = pygame.Rect(seed_input_x, seed_input_y, 80, 25)
-                seed_bg_color = self.colors['input_active'] if self.region_seed_input_active else self.colors[
-                    'input_bg']
-                screen.draw_rect( seed_bg_color, seed_input_rect)
-                screen.draw_rect(
-                                 self.colors['accent'] if self.region_seed_input_active else self.colors['grid'],
-                                 seed_input_rect, 2)
+                self._draw_field_box(screen, seed_input_rect, active=self.region_seed_input_active)
+                self.text_field_rects.append(seed_input_rect)
 
                 seed_display = self.region_seed_text if self.region_seed_input_active else str(self.region_seed)
-                seed_text_surf = self.font_medium.render(seed_display, True, self.colors['text'])
+                seed_text_surf = self.font_medium.render(seed_display, True, uk.Theme.TEXT_PRIMARY)
                 seed_text_rect = seed_text_surf.get_rect(center=seed_input_rect.center)
                 screen.blit(seed_text_surf, seed_text_rect)
 
                 self.ui_rects['region_seed_input'] = seed_input_rect
 
                 reroll_rect = pygame.Rect(seed_input_rect.right + 8, seed_input_y, 60, 25)
-                screen.draw_rect( self.colors['panel_light'], reroll_rect, border_radius=4)
-                screen.draw_rect( self.colors['accent'], reroll_rect, 2, border_radius=4)
-                reroll_text = self.font_small.render("Reroll", True, self.colors['text'])
+                self._draw_mini_button(screen, reroll_rect, radius=6)
+                reroll_text = self.font_small.render("Reroll", True, uk.Theme.TEXT_PRIMARY)
                 screen.blit(reroll_text, reroll_text.get_rect(center=reroll_rect.center))
                 self.ui_rects['region_seed_reroll'] = reroll_rect
 
@@ -5647,8 +5871,7 @@ class ObjectEditor:
                 # single-frame tile sheet (grid_rows omitted or 1 — e.g. a
                 # one-off, non-square sprite with nothing to choose
                 # between) skips this picker entirely.
-                variant_label = self.font_medium.render("Variant:", True, self.colors['text'])
-                screen.blit(variant_label, (self.palette_x + self.palette_padding, y_pos))
+                self._settings_section_label(screen, "Variant:", y_pos)
                 y_pos += 20
 
                 variant_sprites = self._load_region_variant_sprites(current_region_type)
@@ -5667,10 +5890,7 @@ class ObjectEditor:
                     btn_x = self.palette_x + self.palette_padding + i * (btn_w + btn_gap)
                     btn_rect = pygame.Rect(btn_x, y_pos, btn_w, btn_h)
                     selected = (self.region_variant == i)
-                    bg_color = self.colors['variant_selected'] if selected else self.colors['panel_light']
-                    screen.draw_rect( bg_color, btn_rect, border_radius=4)
-                    screen.draw_rect( self.colors['accent'], btn_rect,
-                                     3 if selected else 2, border_radius=4)
+                    self._draw_mini_button(screen, btn_rect, selected=selected, radius=6)
 
                     sprite = variant_sprites[i] if i < len(variant_sprites) else None
                     if sprite:
@@ -5685,7 +5905,7 @@ class ObjectEditor:
                     else:
                         # Asset not loaded yet — fall back to a number so the
                         # slot is still identifiable and clickable.
-                        num_text = self.font_small.render(str(i + 1), True, self.colors['text'])
+                        num_text = self.font_small.render(str(i + 1), True, uk.Theme.TEXT_PRIMARY)
                         screen.blit(num_text, num_text.get_rect(center=btn_rect.center))
 
                     variant_rects.append(btn_rect)
@@ -5708,17 +5928,15 @@ class ObjectEditor:
                 # for free without needing their own dict entry.
                 color_label_text = type_label.replace('Region', '').strip() + " Color:" \
                     if 'Region' in type_label else f"{type_label} Color:"
-                color_label = self.font_medium.render(color_label_text, True, self.colors['text'])
-                screen.blit(color_label, (self.palette_x + self.palette_padding, y_pos))
+                self._settings_section_label(screen, color_label_text, y_pos)
 
                 swatch_rect = pygame.Rect(self.palette_x + self.palette_padding + 120, y_pos - 2, 30, 18)
-                screen.draw_rect( self.region_color, swatch_rect)
-                screen.draw_rect( self.colors['grid'], swatch_rect, 2)
+                uk.draw_rect_on(screen, self.region_color, swatch_rect, 0, 4)
+                uk.draw_rect_on(screen, uk.Theme.CARD_BORDER, swatch_rect, 1, 4)
 
                 reset_rect = pygame.Rect(swatch_rect.right + 8, y_pos - 2, 60, 18)
-                screen.draw_rect( self.colors['panel_light'], reset_rect, border_radius=4)
-                screen.draw_rect( self.colors['accent'], reset_rect, 2, border_radius=4)
-                reset_text = self.font_small.render("Reset", True, self.colors['text'])
+                self._draw_mini_button(screen, reset_rect, radius=6)
+                reset_text = self.font_small.render("Reset", True, uk.Theme.TEXT_PRIMARY)
                 screen.blit(reset_text, reset_text.get_rect(center=reset_rect.center))
                 self.ui_rects['region_color_reset'] = reset_rect
 
@@ -5742,50 +5960,49 @@ class ObjectEditor:
                     bar_rect = pygame.Rect(bar_x, y_pos, bar_w, row_h)
                     grad_surf = self._get_channel_gradient_surface(idx, bar_w, row_h)
                     screen.blit(grad_surf, bar_rect.topleft)
-                    screen.draw_rect( self.colors['grid'], bar_rect, 1)
+                    uk.draw_rect_on(screen, uk.Theme.CARD_BORDER, bar_rect, 1, 3)
 
-                    label_surf = self.font_small.render(label_text + ":", True, self.colors['text'])
+                    label_surf = self.font_small.render(label_text + ":", True, uk.Theme.TEXT_PRIMARY)
                     screen.blit(label_surf, (bar_rect.left - label_w,
                                               bar_rect.centery - label_surf.get_height() // 2))
 
                     val = self.region_color[idx]
                     marker_x = bar_rect.left + int((val / 255) * bar_rect.width)
                     marker_rect = pygame.Rect(marker_x - 2, bar_rect.top - 2, 4, bar_rect.height + 4)
-                    screen.draw_rect( (255, 255, 255), marker_rect, 1)
-                    screen.draw_rect( (0, 0, 0), marker_rect, 1)
+                    uk.draw_rect_on(screen, (255, 255, 255), marker_rect, 1)
+                    uk.draw_rect_on(screen, (0, 0, 0), marker_rect, 1)
                     self.ui_rects[f'region_{key}_bar'] = bar_rect
 
                     spin_rect = pygame.Rect(bar_rect.right + bar_gap, y_pos, spin_text_w, row_h)
-                    screen.draw_rect( self.colors['panel_light'], spin_rect)
-                    border_col = self.colors['accent'] if self.region_channel_input_active == key else self.colors['grid']
-                    screen.draw_rect( border_col, spin_rect, 1)
+                    self._draw_field_box(screen, spin_rect,
+                                         active=(self.region_channel_input_active == key), radius=4)
+                    self.text_field_rects.append(spin_rect)
                     val_text = self.region_channel_text if self.region_channel_input_active == key else str(val)
-                    val_surf = self.font_small.render(val_text, True, self.colors['text'])
+                    val_surf = self.font_small.render(val_text, True, uk.Theme.TEXT_PRIMARY)
                     screen.blit(val_surf, val_surf.get_rect(center=spin_rect.center))
                     self.ui_rects[f'region_{key}_spin_text'] = spin_rect
 
                     arrow_up_rect = pygame.Rect(spin_rect.right, y_pos, spin_arrow_w, row_h // 2)
                     arrow_down_rect = pygame.Rect(spin_rect.right, y_pos + row_h // 2,
                                                    spin_arrow_w, row_h - row_h // 2)
-                    screen.draw_rect( self.colors['panel_light'], arrow_up_rect)
-                    screen.draw_rect( self.colors['panel_light'], arrow_down_rect)
-                    screen.draw_rect( self.colors['grid'], arrow_up_rect, 1)
-                    screen.draw_rect( self.colors['grid'], arrow_down_rect, 1)
+                    uk.draw_rect_on(screen, uk.Theme.CARD_BG, arrow_up_rect, 0, 0)
+                    uk.draw_rect_on(screen, uk.Theme.CARD_BG, arrow_down_rect, 0, 0)
+                    uk.draw_rect_on(screen, uk.Theme.CARD_BORDER, arrow_up_rect, 1, 0)
+                    uk.draw_rect_on(screen, uk.Theme.CARD_BORDER, arrow_down_rect, 1, 0)
                     up_pts = [(arrow_up_rect.centerx, arrow_up_rect.top + 3),
                               (arrow_up_rect.left + 3, arrow_up_rect.bottom - 2),
                               (arrow_up_rect.right - 3, arrow_up_rect.bottom - 2)]
                     down_pts = [(arrow_down_rect.centerx, arrow_down_rect.bottom - 3),
                                 (arrow_down_rect.left + 3, arrow_down_rect.top + 2),
                                 (arrow_down_rect.right - 3, arrow_down_rect.top + 2)]
-                    screen.draw_polygon( self.colors['text'], up_pts)
-                    screen.draw_polygon( self.colors['text'], down_pts)
+                    screen.draw_polygon(uk.Theme.TEXT_MUTED, up_pts)
+                    screen.draw_polygon(uk.Theme.TEXT_MUTED, down_pts)
                     self.ui_rects[f'region_{key}_spin_up'] = arrow_up_rect
                     self.ui_rects[f'region_{key}_spin_down'] = arrow_down_rect
 
                     y_pos += row_h + row_gap
 
-                hex_label_text = "Hex:"
-                hex_label_surf = self.font_small.render(hex_label_text, True, self.colors['text'])
+                hex_label_surf = self.font_small.render("Hex:", True, uk.Theme.TEXT_PRIMARY)
                 hex_label_x = self.palette_x + self.palette_padding
                 screen.blit(hex_label_surf, (hex_label_x, y_pos + row_h // 2 - hex_label_surf.get_height() // 2))
 
@@ -5793,24 +6010,135 @@ class ObjectEditor:
                 hex_rect = pygame.Rect(hex_field_x, y_pos,
                                         self.palette_x + self.palette_width - self.palette_padding - hex_field_x,
                                         row_h)
-                screen.draw_rect( self.colors['panel_light'], hex_rect)
-                hex_border_col = self.colors['accent'] if self.region_hex_input_active else self.colors['grid']
-                screen.draw_rect( hex_border_col, hex_rect, 2 if self.region_hex_input_active else 1)
-                hex_surf = self.font_small.render("#" + self.region_hex_text, True, self.colors['text'])
+                self._draw_field_box(screen, hex_rect, active=self.region_hex_input_active, radius=4)
+                self.text_field_rects.append(hex_rect)
+                hex_surf = self.font_small.render("#" + self.region_hex_text, True, uk.Theme.TEXT_PRIMARY)
                 screen.blit(hex_surf, (hex_rect.left + 6, hex_rect.centery - hex_surf.get_height() // 2))
                 self.ui_rects['region_hex_input'] = hex_rect
 
                 y_pos += row_h + 10
 
-        instructions = [
-            "Click: Select Object",
-            "Click World: Place",
-            "Right-Click: Delete",
-            "Item armed + Click Chest: Add Loot",
-            "ESC/F3: Close"
+        # Keybinds popup — replaces the old always-on instructions footer
+        # that used to sit here. Drawn last so it sits on top of everything
+        # else the panel just painted.
+        self._draw_keybinds_popup(screen)
+
+    def _draw_info_button(self, screen: pygame.Surface, rect: pygame.Rect):
+        """Small circular badge that toggles the keybinds popup. Uses a
+        custom icon from assets/ui/toolbar/info.png when present, falling
+        back to the procedural '?' mark otherwise."""
+        mouse_pos = getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos())
+        hovered = rect.collidepoint(mouse_pos)
+        center = rect.center
+        radius = rect.width // 2
+
+        if self.show_keybinds_popup:
+            fill = uk.Theme.GOLD
+            mark_color = (14, 17, 25)
+        else:
+            fill = (40, 44, 58) if hovered else (28, 31, 42)
+            mark_color = uk.Theme.GOLD_BRIGHT if hovered else uk.Theme.TEXT_MUTED
+
+        uk.draw_circle_on(screen, fill, center, radius)
+        uk.draw_circle_on(screen, uk.Theme.GOLD, center, radius, 1)
+
+        if self._info_icon:
+            uk.blit_surface(screen, self._info_icon,
+                            self._info_icon.get_rect(center=center), transient=True)
+        else:
+            mark_s = self.font.render("?", color=mark_color, height=11)
+            uk.blit_surface(screen, mark_s,
+                            (center[0] - mark_s.get_width() // 2, center[1] - mark_s.get_height() // 2),
+                            transient=True)
+
+    def _draw_keybinds_popup(self, screen: pygame.Surface):
+        """Full keybind reference, opened from the '?' info button. Drawn last,
+        over a dimmed backdrop, so it reads as a modal overlay above the whole
+        panel (and the world beneath it). Any click while it's open closes it
+        (handled in the event loop) — this method only ever draws."""
+        if not self.show_keybinds_popup:
+            return
+
+        overlay = pygame.Surface((self.screen_width, self.screen_height), pygame.SRCALPHA)
+        overlay.fill((8, 9, 13, 170))
+        screen.blit(overlay, (0, 0))
+
+        sections = [
+            ("Object editor", [
+                ("Click Palette", "Select object"),
+                ("Click World", "Place object"),
+                ("Right Click", "Delete object"),
+                ("Item armed + Click Chest", "Add loot"),
+            ]),
+            ("Other", [
+                ("G", "Toggle grid snap"),
+                ("H", "Toggle grid"),
+                ("R (on fishing area)", "Cycle jump direction"),
+                ("Shift + R", "Cycle direction (reverse)"),
+                ("ESC / F3", "Close editor"),
+            ]),
         ]
 
-        for inst in instructions:
-            inst_surf = self.font_small.render(inst, True, self.colors['text_dim'])
-            screen.blit(inst_surf, (self.palette_x + self.palette_padding, y_pos))
-            y_pos += 18
+        row_h = 20
+        section_gap = 14
+        header_h = 50
+        margin_x = 20
+        key_indent = 10       # key label offset from the left margin
+        col_gap = 18          # gap between the key column and the desc column
+        right_pad = 20
+
+        # Cache rendered surfaces so widths are measured once and reused for
+        # both sizing the panel and drawing it (avoids re-deriving layout
+        # constants from guessed pixel widths, which caused overflow/overlap
+        # in the old fixed-width layout).
+        key_surfaces = []
+        desc_surfaces = []
+        for _, rows in sections:
+            for key_label, desc in rows:
+                key_surfaces.append(self.font.render(key_label, color=uk.Theme.GOLD, height=11))
+                desc_surfaces.append(self.font.render(desc, color=uk.Theme.TEXT_PRIMARY, height=11))
+
+        key_col_w = max(s.get_width() for s in key_surfaces) + col_gap
+        max_desc_w = max(s.get_width() for s in desc_surfaces)
+
+        title_s = self.font.render("Keybinds", color=uk.Theme.GOLD, height=16)
+        close_s = self.font.render("Click anywhere to close", color=uk.Theme.TEXT_DIM, height=10)
+
+        content_w = key_indent + key_col_w + max_desc_w + right_pad
+        header_w = title_s.get_width() + 24 + close_s.get_width()
+        panel_w = max(360, margin_x * 2 + max(content_w, header_w))
+
+        # Every section header line also consumes a row, so count one extra
+        # row per section on top of its keybind rows.
+        content_rows = sum(1 + len(rows) for _, rows in sections)
+        panel_h = header_h + content_rows * row_h + len(sections) * section_gap + 16
+
+        panel_x = (self.screen_width - panel_w) // 2
+        panel_y = max(30, (self.screen_height - panel_h) // 2)
+        panel_rect = pygame.Rect(panel_x, panel_y, panel_w, panel_h)
+
+        uk.draw_panel(screen, panel_rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD,
+                      border_width=2, radius=uk.Theme.RADIUS_PANEL, shadow=True)
+
+        uk.blit_surface(screen, title_s, (panel_x + margin_x, panel_y + 14), transient=True)
+        uk.blit_surface(screen, close_s,
+                        (panel_x + panel_w - close_s.get_width() - margin_x, panel_y + 20), transient=True)
+
+        uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER,
+                        (panel_x + 16, panel_y + header_h - 10, panel_w - 32, 1), 0, 0)
+
+        y = panel_y + header_h
+        i = 0
+        for section_name, rows in sections:
+            section_s = self.font.render(section_name, color=uk.Theme.TEXT_MUTED, height=11)
+            uk.blit_surface(screen, section_s, (panel_x + margin_x, y), transient=True)
+            y += row_h
+            for _ in rows:
+                key_s = key_surfaces[i]
+                desc_s = desc_surfaces[i]
+                i += 1
+                uk.blit_surface(screen, key_s, (panel_x + margin_x + key_indent, y), transient=True)
+                uk.blit_surface(screen, desc_s,
+                                (panel_x + margin_x + key_indent + key_col_w, y), transient=True)
+                y += row_h
+            y += section_gap

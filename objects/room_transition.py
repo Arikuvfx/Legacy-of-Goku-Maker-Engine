@@ -1,6 +1,8 @@
 import pygame
 from typing import Optional, Tuple, List
 
+import dev_tools.ui_kit as uk
+
 # Dev-mode overlay fonts for RoomTransition.draw() — cached by size so a
 # room full of transitions doesn't re-parse the font file every frame for
 # every transition (same fix as flying_pad.py/nimbus_cloud.py).
@@ -320,8 +322,61 @@ class RoomTransitionManager:
             transition.start_cooldown()
 
 
+class _MenuFont:
+    """Adapts ui_kit.BitmapFont to the plain pygame.font.Font call shape —
+    render(text, antialias, color) / size(text) — at one fixed pixel
+    height. Same adapter room_editor.py / dev_menu.py use, so this dialog's
+    text renders with the exact same bitmap glyphs as every other dev-tool
+    overlay instead of a plain TTF font."""
+
+    def __init__(self, bitmap_font, height):
+        self._font = bitmap_font
+        self._height = height
+
+    def render(self, text, antialias=True, color=(255, 255, 255)):
+        return self._font.render(text, color=color, height=self._height)
+
+    def size(self, text):
+        return self._font.size(text, height=self._height)
+
+
+# ---------------------------------------------------------------------------
+# Small vector glyphs, drawn with the same line primitives as every other
+# ui_kit icon so they read as part of the same family instead of a
+# mismatched one-off (the old dialog used pygame.draw.polygon triangles).
+# ---------------------------------------------------------------------------
+
+def _draw_chevron_up(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.32
+    uk.draw_line_on(surface, color, (cx - s, cy + s * 0.5), (cx, cy - s * 0.6), width)
+    uk.draw_line_on(surface, color, (cx, cy - s * 0.6), (cx + s, cy + s * 0.5), width)
+
+
+def _draw_chevron_down(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.32
+    uk.draw_line_on(surface, color, (cx - s, cy - s * 0.5), (cx, cy + s * 0.6), width)
+    uk.draw_line_on(surface, color, (cx, cy + s * 0.6), (cx + s, cy - s * 0.5), width)
+
+
+def _draw_check_icon(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.32
+    uk.draw_line_on(surface, color, (cx - s, cy), (cx - s * 0.15, cy + s * 0.8), width)
+    uk.draw_line_on(surface, color, (cx - s * 0.15, cy + s * 0.8), (cx + s, cy - s * 0.7), width)
+
+
 class TransitionConfigDialog:
-    """Dialog for configuring room transition properties with dropdown menus"""
+    """Dialog for configuring room transition properties with dropdown menus.
+
+    Same open/close/handle_input contract and the same three dropdown
+    fields (target room, exit direction, entry direction) plus Save/Cancel
+    as before — only the drawing changed, over to the shared ui_kit
+    "modern DBZ" look (deep navy panel, gold accent, rounded hairline-
+    bordered cards) used by every other dev-tool overlay, instead of the
+    old flat colored-rectangle dialog.
+    """
 
     def __init__(self, screen_width, screen_height, y_offset=0):
         self.active = False
@@ -342,27 +397,15 @@ class TransitionConfigDialog:
         }
         self.directions = ['up', 'down', 'left', 'right']
 
-        # Fonts
-        self.font_large = pygame.font.Font(None, 32)
-        self.font_medium = pygame.font.Font(None, 24)
-        self.font_small = pygame.font.Font(None, 18)
-
-        # Colors
-        self.colors = {
-            'bg': (20, 20, 30, 240),
-            'panel': (35, 35, 55),
-            'panel_hover': (45, 45, 65),
-            'accent': (0, 150, 255),
-            'accent_hover': (50, 180, 255),
-            'text': (255, 255, 255),
-            'text_dim': (180, 180, 200),
-            'dropdown_bg': (30, 30, 40),
-            'dropdown_hover': (50, 50, 70)
-        }
+        # Fonts — bitmap menu font, same family as every other dev-tool
+        # overlay, instead of a plain system TTF font.
+        self._bitmap_font = uk.BitmapFont('assets\\ui\\fonts', letter_spacing=1)
+        self.font_large = _MenuFont(self._bitmap_font, 22)
+        self.font_medium = _MenuFont(self._bitmap_font, 16)
+        self.font_small = _MenuFont(self._bitmap_font, 13)
 
         # UI rects for click detection
         self.ui_rects = {}
-
 
     def open(self, transition: RoomTransition, available_rooms: list, current_room_name: str = ""):
         """Open dialog to configure a transition"""
@@ -388,6 +431,41 @@ class TransitionConfigDialog:
 
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             mouse_pos = event.pos
+
+            # Dropdown popups are a higher z-order than Save/Cancel. Handle
+            # their controls first so an option click can never also activate
+            # a button underneath the popup.
+            for dropdown_name in ['target_room', 'exit_direction', 'entry_direction']:
+                if self.dropdowns[dropdown_name]:
+                    items = self._get_dropdown_items(dropdown_name)
+                    max_visible = 5
+
+                    # Scroll arrow clicks
+                    up_key = f'{dropdown_name}_scroll_up'
+                    down_key = f'{dropdown_name}_scroll_down'
+                    if up_key in self.ui_rects and self.ui_rects[up_key].collidepoint(mouse_pos):
+                        self.dropdown_scroll[dropdown_name] = max(
+                            0, self.dropdown_scroll[dropdown_name] - 1
+                        )
+                        return None
+
+                    if down_key in self.ui_rects and self.ui_rects[down_key].collidepoint(mouse_pos):
+                        max_scroll = max(0, len(items) - max_visible)
+                        self.dropdown_scroll[dropdown_name] = min(
+                            max_scroll,
+                            self.dropdown_scroll[dropdown_name] + 1
+                        )
+                        return None
+
+                    # Item clicks are checked before Save/Cancel because the
+                    # popup is visually above those buttons.
+                    for actual_index, item in enumerate(items):
+                        rect_name = f'{dropdown_name}_item_{actual_index}'
+                        if rect_name in self.ui_rects:
+                            if self.ui_rects[rect_name].collidepoint(mouse_pos):
+                                self._set_dropdown_value(dropdown_name, item)
+                                self.dropdowns[dropdown_name] = False
+                                return None
 
             # Check if clicking save button
             if 'save_button' in self.ui_rects:
@@ -416,33 +494,6 @@ class TransitionConfigDialog:
                         if opening:
                             self.dropdown_scroll[dropdown_name] = 0
                         return None
-
-            # Check dropdown item clicks
-            for dropdown_name in ['target_room', 'exit_direction', 'entry_direction']:
-                if self.dropdowns[dropdown_name]:
-                    items = self._get_dropdown_items(dropdown_name)
-                    max_visible = 5
-
-                    # Scroll arrow clicks
-                    up_key = f'{dropdown_name}_scroll_up'
-                    down_key = f'{dropdown_name}_scroll_down'
-                    if up_key in self.ui_rects and self.ui_rects[up_key].collidepoint(mouse_pos):
-                        self.dropdown_scroll[dropdown_name] = max(0, self.dropdown_scroll[dropdown_name] - 1)
-                        return None
-                    if down_key in self.ui_rects and self.ui_rects[down_key].collidepoint(mouse_pos):
-                        max_scroll = max(0, len(items) - max_visible)
-                        self.dropdown_scroll[dropdown_name] = min(max_scroll,
-                                                                  self.dropdown_scroll[dropdown_name] + 1)
-                        return None
-
-                    # Item clicks (keyed by actual index)
-                    for actual_index, item in enumerate(items):
-                        rect_name = f'{dropdown_name}_item_{actual_index}'
-                        if rect_name in self.ui_rects:
-                            if self.ui_rects[rect_name].collidepoint(mouse_pos):
-                                self._set_dropdown_value(dropdown_name, item)
-                                self.dropdowns[dropdown_name] = False
-                                return None
 
             # Close dropdowns if clicking outside
             clicked_on_dropdown = False
@@ -512,7 +563,7 @@ class TransitionConfigDialog:
             self.transition.entry_direction = value
 
     def _get_dropdown_value(self, dropdown_name: str) -> str:
-        """Get current value for a dropdown"""
+        """Get current display value for a dropdown"""
         if dropdown_name == 'target_room':
             return self.transition.target_room or 'Select Room'
         elif dropdown_name == 'exit_direction':
@@ -521,201 +572,289 @@ class TransitionConfigDialog:
             return self.transition.entry_direction
         return ''
 
+    def _get_raw_value(self, dropdown_name: str):
+        """Get the actual stored value for a dropdown (no placeholder text),
+        used to mark the currently-selected row in the open dropdown list."""
+        if dropdown_name == 'target_room':
+            return self.transition.target_room
+        elif dropdown_name == 'exit_direction':
+            return self.transition.exit_direction
+        elif dropdown_name == 'entry_direction':
+            return self.transition.entry_direction
+        return None
+
+    # =========================================================================
+    # Drawing — ui_kit styled
+    # =========================================================================
+
+    def _draw_dropdown_toggle(self, screen, rect, value_text, is_open, is_hover):
+        accent = uk.Theme.GOLD
+
+        if is_open:
+            border, border_width, bg = accent, 2, (32, 36, 58, 255)
+        elif is_hover:
+            border, border_width, bg = uk.lerp_color(uk.Theme.CARD_BORDER, accent, 0.5), 1, uk.Theme.CARD_BG_HOVER
+        else:
+            border, border_width, bg = uk.Theme.CARD_BORDER, 1, uk.Theme.CARD_BG
+
+        uk.draw_panel(screen, rect, bg=bg, border=border, border_width=border_width, radius=8, shadow=False)
+
+        color = uk.Theme.GOLD_BRIGHT if is_open else (uk.Theme.TEXT_PRIMARY if is_hover else uk.Theme.TEXT_SECONDARY)
+        val_surf = self.font_medium.render(str(value_text), True, color)
+        uk.blit_surface(screen, val_surf, (rect.x + 14, rect.centery - val_surf.get_height() // 2),
+                        transient=True)
+
+        chevron_rect = pygame.Rect(0, 0, 16, 16)
+        chevron_rect.midright = (rect.right - 16, rect.centery)
+        chev_color = accent if (is_open or is_hover) else uk.Theme.TEXT_DIM
+        if is_open:
+            _draw_chevron_up(screen, chevron_rect, chev_color)
+        else:
+            _draw_chevron_down(screen, chevron_rect, chev_color)
+
+        uk.register_hoverable(rect)
+
+    def _draw_dropdown_menu(self, screen, anchor_rect, field_id, max_bottom=None):
+        """Popup option list anchored under `anchor_rect`'s toggle. Returns
+        the dropdown's rect; also fills in this field's *_dropdown,
+        *_scroll_up, *_scroll_down and *_item_N entries in self.ui_rects.
+
+        `max_bottom`, if given, is the lowest y the list is allowed to
+        reach (e.g. the top of the Save/Cancel row) — if opening downward
+        would run past it, the list opens upward from the toggle instead,
+        same convention RoomEditor's dropdowns use to stay clear of the
+        edge of their own dialog."""
+        items = self._get_dropdown_items(field_id)
+        max_visible = 5
+        scroll_offset = self.dropdown_scroll[field_id]
+        visible_items = items[scroll_offset: scroll_offset + max_visible]
+
+        can_scroll_up = scroll_offset > 0
+        can_scroll_down = scroll_offset + max_visible < len(items)
+
+        arrow_h = 20
+        item_h = 34
+        top_arrow_h = arrow_h if can_scroll_up else 0
+        bot_arrow_h = arrow_h if can_scroll_down else 0
+        dropdown_height = top_arrow_h + len(visible_items) * item_h + bot_arrow_h + 10
+        dropdown_rect = pygame.Rect(
+            anchor_rect.x,
+            anchor_rect.bottom + 6,
+            anchor_rect.width,
+            dropdown_height
+        )
+
+        # Entry Direction always opens downward. When necessary the popup can
+        # extend into the Save/Cancel row; it is drawn afterward so it remains
+        # visually above those buttons, and its click handling runs first.
+        force_downward = field_id == 'entry_direction'
+
+        if (
+            not force_downward
+            and max_bottom is not None
+            and dropdown_rect.bottom > max_bottom
+        ):
+            dropdown_rect.y = anchor_rect.top - dropdown_height - 6
+
+        uk.draw_panel(screen, dropdown_rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD,
+                      border_width=1, radius=8)
+        self.ui_rects[f'{field_id}_dropdown'] = dropdown_rect
+
+        mouse_pos = pygame.mouse.get_pos()
+        current_value = self._get_raw_value(field_id)
+        inner_y = dropdown_rect.y + 5
+
+        if can_scroll_up:
+            arrow_rect = pygame.Rect(dropdown_rect.x + 6, inner_y, dropdown_rect.width - 12, arrow_h - 2)
+            if arrow_rect.collidepoint(mouse_pos):
+                uk.draw_rect_on(screen, uk.Theme.CARD_BG_HOVER[:3], arrow_rect, 0, 6)
+            chev_rect = pygame.Rect(0, 0, 14, 14)
+            chev_rect.center = arrow_rect.center
+            _draw_chevron_up(screen, chev_rect, uk.Theme.TEXT_SECONDARY)
+            self.ui_rects[f'{field_id}_scroll_up'] = arrow_rect
+            uk.register_hoverable(arrow_rect)
+            inner_y += arrow_h
+
+        for i, item in enumerate(visible_items):
+            actual_index = scroll_offset + i
+            item_rect = pygame.Rect(dropdown_rect.x + 4, inner_y, dropdown_rect.width - 8, item_h - 2)
+
+            is_current = (item == current_value)
+            hovered = item_rect.collidepoint(mouse_pos)
+            if is_current or hovered:
+                row_bg = uk.Theme.CARD_BG_SELECTED[:3] if is_current else uk.Theme.CARD_BG_HOVER[:3]
+                uk.draw_rect_on(screen, row_bg, item_rect.inflate(-4, -2), 0, 6)
+
+            text_color = uk.Theme.GOLD_BRIGHT if is_current else uk.Theme.TEXT_SECONDARY
+            item_surf = self.font_small.render(str(item), True, text_color)
+            uk.blit_surface(screen, item_surf,
+                            (item_rect.x + 10, item_rect.centery - item_surf.get_height() // 2),
+                            transient=True)
+
+            if is_current:
+                chk_rect = pygame.Rect(0, 0, 14, 14)
+                chk_rect.midright = (item_rect.right - 10, item_rect.centery)
+                _draw_check_icon(screen, chk_rect, uk.Theme.GOLD_BRIGHT)
+
+            self.ui_rects[f'{field_id}_item_{actual_index}'] = item_rect
+            uk.register_hoverable(item_rect)
+            inner_y += item_h
+
+        if can_scroll_down:
+            arrow_rect = pygame.Rect(dropdown_rect.x + 6, inner_y, dropdown_rect.width - 12, arrow_h - 2)
+            if arrow_rect.collidepoint(mouse_pos):
+                uk.draw_rect_on(screen, uk.Theme.CARD_BG_HOVER[:3], arrow_rect, 0, 6)
+            chev_rect = pygame.Rect(0, 0, 14, 14)
+            chev_rect.center = arrow_rect.center
+            _draw_chevron_down(screen, chev_rect, uk.Theme.TEXT_SECONDARY)
+            self.ui_rects[f'{field_id}_scroll_down'] = arrow_rect
+            uk.register_hoverable(arrow_rect)
+
+        return dropdown_rect
+
+    def _draw_pill_button(self, screen, rect, label, highlighted, danger=False, icon_fn=None):
+        accent = uk.Theme.DANGER_BRIGHT if danger else uk.Theme.GOLD
+        dim_bg = (32, 22, 22, 255) if danger else (28, 33, 44, 255)
+
+        bg = dim_bg if highlighted else (22, 26, 35, 255)
+        border = accent if highlighted else uk.Theme.CARD_BORDER
+        border_width = 2 if highlighted else 1
+
+        uk.draw_panel(screen, rect, bg=bg, border=border, border_width=border_width, radius=10, shadow=False)
+        if highlighted:
+            uk.draw_soft_glow(screen, rect.center, max(rect.w, rect.h) // 2, accent, max_alpha=28)
+
+        label_color = accent if highlighted else uk.Theme.TEXT_SECONDARY
+
+        if icon_fn is not None:
+            icon_rect = pygame.Rect(0, 0, 16, 16)
+            icon_rect.midleft = (rect.x + 18, rect.centery)
+            icon_fn(screen, icon_rect, label_color)
+            label_surf = self.font_medium.render(label, True, label_color)
+            uk.blit_surface(screen, label_surf,
+                            (icon_rect.right + 8, rect.centery - label_surf.get_height() // 2),
+                            transient=True)
+        else:
+            label_surf = self.font_medium.render(label, True, label_color)
+            uk.blit_surface(screen, label_surf, label_surf.get_rect(center=rect.center), transient=True)
+
+        uk.register_hoverable(rect)
+
     def draw(self, screen: pygame.Surface):
         """Draw the configuration dialog"""
         if not self.active or not self.transition:
             return
 
         self.ui_rects = {}
-
-        # Semi-transparent overlay
         screen_width, screen_height = screen.get_size()
-        overlay = pygame.Surface((screen_width, screen_height), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 150))
-        screen.blit(overlay, (0, 0))
+        mouse_pos = pygame.mouse.get_pos()
 
-        # Dialog box
-        dialog_width = 600
-        dialog_height = 500
+        # Dim the game behind the dialog
+        overlay_rect = pygame.Rect(0, 0, screen_width, screen_height)
+        uk.draw_rect_on(screen, (*uk.Theme.BG_BOTTOM, 190), overlay_rect, 0, 0)
+
+        # Dialog panel
+        dialog_width = 560
+        dialog_height = 460
         dialog_x = (screen_width - dialog_width) // 2
         dialog_y = (screen_height - dialog_height) // 2
+        dialog_rect = pygame.Rect(dialog_x, dialog_y, dialog_width, dialog_height)
 
-        dialog_surface = pygame.Surface((dialog_width, dialog_height), pygame.SRCALPHA)
-        dialog_surface.fill(self.colors['bg'])
-        pygame.draw.rect(dialog_surface, self.colors['accent'], (0, 0, dialog_width, dialog_height), 3)
+        uk.draw_panel(screen, dialog_rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD,
+                      border_width=2, radius=uk.Theme.RADIUS_PANEL)
 
         # Title
-        title = self.font_large.render("Configure Room Transition", True, self.colors['accent'])
-        dialog_surface.blit(title, (20, 20))
+        title_surf = self.font_large.render("CONFIGURE ROOM TRANSITION", True, uk.Theme.GOLD_BRIGHT)
+        title_top = dialog_rect.y + 20
+        title_rect = title_surf.get_rect(centerx=dialog_rect.centerx, y=title_top)
+        uk.blit_surface(screen, title_surf, title_rect, transient=True)
 
-        y_pos = 80
-        mouse_pos = pygame.mouse.get_pos()
-        adjusted_mouse = (mouse_pos[0] - dialog_x, mouse_pos[1] - dialog_y)
+        divider_y = dialog_rect.y + 58
+        uk.draw_line_on(screen, uk.Theme.PANEL_BORDER,
+                        (dialog_rect.x + 24, divider_y), (dialog_rect.right - 24, divider_y), 1)
 
-        # Draw each dropdown field
+        # Save / Cancel row geometry is computed up front (even though it's
+        # drawn after the fields below) so an open dropdown knows where the
+        # button row starts and can flip itself upward instead of being
+        # hidden underneath it.
+        button_y = dialog_rect.bottom - 74
+        button_h = 50
+
+        # Fields
+        x = dialog_rect.x + 24
+        width = dialog_rect.width - 48
+        y = dialog_rect.y + 72
+
         fields = [
             ('target_room', 'Target Room'),
             ('exit_direction', 'Exit Direction'),
             ('entry_direction', 'Entry Direction')
         ]
 
-        # Find if any dropdown is open and which one
+        # Find if any dropdown is open and which one — fields after it are
+        # skipped so its popup list never gets drawn over by a later field
+        # (same convention the old dialog used).
         open_dropdown_index = -1
         for idx, (field_id, _) in enumerate(fields):
             if self.dropdowns[field_id]:
                 open_dropdown_index = idx
                 break
 
+        open_dropdown_to_draw = None
+
         for idx, (field_id, label) in enumerate(fields):
-            # Skip drawing fields below an open dropdown
             if open_dropdown_index >= 0 and idx > open_dropdown_index:
                 continue
 
-            # Label
-            label_surf = self.font_medium.render(label + ":", True, self.colors['text_dim'])
-            dialog_surface.blit(label_surf, (20, y_pos))
+            label_surf = self.font_small.render(label.upper(), True, uk.Theme.TEXT_MUTED)
+            uk.blit_surface(screen, label_surf, (x, y), transient=True)
+            y += label_surf.get_height() + 6
 
-            # Dropdown toggle button
-            toggle_rect = pygame.Rect(20, y_pos + 30, dialog_width - 40, 40)
-            is_hover = toggle_rect.collidepoint(adjusted_mouse)
-            bg_color = self.colors['panel_hover'] if is_hover else self.colors['panel']
+            toggle_rect = pygame.Rect(x, y, width, 44)
+            is_open = self.dropdowns[field_id]
+            is_hover = toggle_rect.collidepoint(mouse_pos)
+            self._draw_dropdown_toggle(screen, toggle_rect, self._get_dropdown_value(field_id),
+                                       is_open, is_hover)
+            self.ui_rects[f'{field_id}_toggle'] = toggle_rect
 
-            pygame.draw.rect(dialog_surface, bg_color, toggle_rect, border_radius=5)
-            pygame.draw.rect(dialog_surface, self.colors['accent'], toggle_rect, 2, border_radius=5)
+            if is_open:
+                # Defer the popup until after Save/Cancel so the popup has the
+                # correct visual z-order.
+                open_dropdown_to_draw = (toggle_rect, field_id)
 
-            # Display current value
-            value_text = self._get_dropdown_value(field_id)
-            value_surf = self.font_medium.render(str(value_text), True, self.colors['text'])
-            dialog_surface.blit(value_surf, (toggle_rect.x + 10, toggle_rect.y + 8))
+            y += 44 + 22
 
-            # Dropdown arrow
-            arrow_x = toggle_rect.right - 30
-            arrow_y = toggle_rect.centery
-            arrow_points = [
-                (arrow_x, arrow_y - 5),
-                (arrow_x + 10, arrow_y - 5),
-                (arrow_x + 5, arrow_y + 5)
-            ]
-            pygame.draw.polygon(dialog_surface, self.colors['text_dim'], arrow_points)
+        # Save / Cancel buttons, pinned to the bottom of the dialog
+        btn_gap = 16
+        button_width = (width - btn_gap) // 2
 
-            # Store rect for click detection
-            global_toggle_rect = toggle_rect.move(dialog_x, dialog_y)
-            self.ui_rects[f'{field_id}_toggle'] = global_toggle_rect
+        save_rect = pygame.Rect(x, button_y, button_width, button_h)
+        cancel_rect = pygame.Rect(x + button_width + btn_gap, button_y, button_width, button_h)
 
-            y_pos += 80
+        self._draw_pill_button(screen, save_rect, "SAVE", save_rect.collidepoint(mouse_pos),
+                               danger=False)
+        self._draw_pill_button(screen, cancel_rect, "CANCEL", cancel_rect.collidepoint(mouse_pos),
+                               danger=True)
 
-            # Draw dropdown menu if open
-            if self.dropdowns[field_id]:
-                items = self._get_dropdown_items(field_id)
-                max_visible = 5
-                scroll_offset = self.dropdown_scroll[field_id]
-                visible_items = items[scroll_offset: scroll_offset + max_visible]
+        self.ui_rects['save_button'] = save_rect
+        self.ui_rects['cancel_button'] = cancel_rect
 
-                can_scroll_up = scroll_offset > 0
-                can_scroll_down = scroll_offset + max_visible < len(items)
+        # Draw the open dropdown last so it appears above Save/Cancel when
+        # its downward popup reaches into their visual area.
+        if open_dropdown_to_draw is not None:
+            popup_anchor, popup_field_id = open_dropdown_to_draw
+            self._draw_dropdown_menu(
+                screen,
+                popup_anchor,
+                popup_field_id,
+                max_bottom=button_y - 8
+            )
 
-                # Reserve space for scroll arrows (20px each) when needed
-                arrow_h = 20
-                top_arrow_h = arrow_h if can_scroll_up else 0
-                bot_arrow_h = arrow_h if can_scroll_down else 0
-                dropdown_height = top_arrow_h + len(visible_items) * 35 + bot_arrow_h + 10
-                dropdown_rect = pygame.Rect(20, toggle_rect.bottom + 5, dialog_width - 40, dropdown_height)
-
-                # Dropdown background
-                dropdown_surface = pygame.Surface((dropdown_rect.width, dropdown_rect.height), pygame.SRCALPHA)
-                dropdown_surface.fill(self.colors['dropdown_bg'])
-                pygame.draw.rect(dropdown_surface, self.colors['accent'],
-                                 (0, 0, dropdown_rect.width, dropdown_rect.height), 2)
-
-                # Store dropdown rect for scroll hit-testing
-                self.ui_rects[f'{field_id}_dropdown'] = dropdown_rect.move(dialog_x, dialog_y)
-
-                # Top scroll arrow
-                if can_scroll_up:
-                    arrow_rect = pygame.Rect(5, 2, dropdown_rect.width - 10, arrow_h - 2)
-                    adj = (adjusted_mouse[0] - dropdown_rect.x, adjusted_mouse[1] - dropdown_rect.y)
-                    if arrow_rect.collidepoint(adj):
-                        pygame.draw.rect(dropdown_surface, self.colors['dropdown_hover'], arrow_rect, border_radius=3)
-                    cx = dropdown_rect.width // 2
-                    pygame.draw.polygon(dropdown_surface, self.colors['text'],
-                                        [(cx, 5), (cx - 8, 16), (cx + 8, 16)])
-                    self.ui_rects[f'{field_id}_scroll_up'] = arrow_rect.move(dialog_x + dropdown_rect.x,
-                                                                              dialog_y + dropdown_rect.y)
-
-                # Draw items
-                item_y = top_arrow_h + 5
-                for i, item in enumerate(visible_items):
-                    actual_index = scroll_offset + i
-                    item_rect = pygame.Rect(5, item_y, dropdown_rect.width - 10, 30)
-                    item_global_rect = item_rect.move(dialog_x + dropdown_rect.x, dialog_y + dropdown_rect.y)
-
-                    is_item_hover = item_rect.collidepoint(
-                        adjusted_mouse[0] - dropdown_rect.x,
-                        adjusted_mouse[1] - dropdown_rect.y
-                    )
-
-                    if is_item_hover:
-                        pygame.draw.rect(dropdown_surface, self.colors['dropdown_hover'], item_rect, border_radius=3)
-
-                    item_text = self.font_small.render(item, True, self.colors['text'])
-                    dropdown_surface.blit(item_text, (item_rect.x + 10, item_rect.y + 7))
-
-                    self.ui_rects[f'{field_id}_item_{actual_index}'] = item_global_rect
-                    item_y += 35
-
-                # Bottom scroll arrow
-                if can_scroll_down:
-                    arrow_rect = pygame.Rect(5, item_y + 2, dropdown_rect.width - 10, arrow_h - 2)
-                    adj = (adjusted_mouse[0] - dropdown_rect.x, adjusted_mouse[1] - dropdown_rect.y)
-                    if arrow_rect.collidepoint(adj):
-                        pygame.draw.rect(dropdown_surface, self.colors['dropdown_hover'], arrow_rect, border_radius=3)
-                    cx = dropdown_rect.width // 2
-                    base_y = item_y + arrow_h - 4
-                    pygame.draw.polygon(dropdown_surface, self.colors['text'],
-                                        [(cx, base_y), (cx - 8, base_y - 11), (cx + 8, base_y - 11)])
-                    self.ui_rects[f'{field_id}_scroll_down'] = arrow_rect.move(dialog_x + dropdown_rect.x,
-                                                                                dialog_y + dropdown_rect.y)
-
-                dialog_surface.blit(dropdown_surface, dropdown_rect.topleft)
-
-        # Buttons at bottom
-        button_y = dialog_height - 80
-        button_width = 200
-
-        # Save button
-        save_x = 50
-        save_rect = pygame.Rect(save_x, button_y, button_width, 50)
-        save_is_hover = save_rect.collidepoint(adjusted_mouse)
-        save_color = self.colors['accent_hover'] if save_is_hover else (100, 255, 100)
-
-        pygame.draw.rect(dialog_surface, save_color, save_rect, border_radius=5)
-        pygame.draw.rect(dialog_surface, self.colors['accent'], save_rect, 2, border_radius=5)
-
-        save_text = self.font_large.render("Save", True, (0, 0, 0) if save_is_hover else (255, 255, 255))
-        save_text_rect = save_text.get_rect(center=save_rect.center)
-        dialog_surface.blit(save_text, save_text_rect)
-
-        self.ui_rects['save_button'] = save_rect.move(dialog_x, dialog_y)
-
-        # Cancel button
-        cancel_x = dialog_width - button_width - 50
-        cancel_rect = pygame.Rect(cancel_x, button_y, button_width, 50)
-        cancel_is_hover = cancel_rect.collidepoint(adjusted_mouse)
-        cancel_color = (230, 100, 100) if cancel_is_hover else (200, 80, 80)
-
-        pygame.draw.rect(dialog_surface, cancel_color, cancel_rect, border_radius=5)
-        pygame.draw.rect(dialog_surface, self.colors['accent'], cancel_rect, 2, border_radius=5)
-
-        cancel_text = self.font_large.render("Cancel", True, (255, 255, 255))
-        cancel_text_rect = cancel_text.get_rect(center=cancel_rect.center)
-        dialog_surface.blit(cancel_text, cancel_text_rect)
-
-        self.ui_rects['cancel_button'] = cancel_rect.move(dialog_x, dialog_y)
-
-        # The dialog has been composed entirely on the off-screen
-        # dialog_surface above (title, dropdowns, Save/Cancel buttons).
-        # This final blit is what was missing — without it none of that
-        # ever reached the visible screen, only the dim overlay did.
-        # screen.blit() works whether `screen` is a real pygame.Surface
-        # or a GPUScreen (see gpu_renderer.py) since both implement blit().
-        screen.blit(dialog_surface, (dialog_x, dialog_y))
+        # Every clickable widget above (dropdown toggles, list items, scroll
+        # arrows, Save/Cancel) has registered itself via uk.register_hoverable
+        # so it shows the hand cursor on hover. Deliberately NOT calling
+        # uk.update_hover_cursor() here: ObjectEditor.draw() always calls
+        # this dialog's draw() first and then resolves the frame's cursor
+        # itself right after, once every other palette/panel widget has also
+        # had a chance to register — calling it again here would clear the
+        # shared hover list before that later call sees it.

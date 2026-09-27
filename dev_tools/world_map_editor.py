@@ -36,6 +36,8 @@ from typing import Optional
 
 import pygame
 
+import dev_tools.ui_kit as uk
+
 # ─────────────────────────────── constants ────────────────────────────────────
 
 SAVE_DIR    = os.path.join("assets", "world_maps")
@@ -47,13 +49,33 @@ NATIVE_TILE  = 8      # source tile size in pixels
 CHUNK_TILES  = 16     # tiles per side of a pre-composited chunk (see
                        # WorldMapEditor._get_chunk_surface) — the viewport
                        # draw loop blits whole chunks, not individual tiles.
+CHUNK_BUILD_BUDGET_PER_FRAME = 24
+                       # Max never-before-seen chunks composited in one
+                       # draw() call. Normal panning only ever reveals a
+                       # chunk or two at a time, but dragging the panel
+                       # splitter can instantly expose a whole swath of
+                       # map that's never been on screen this session —
+                       # without a cap, that swath gets composited
+                       # synchronously in a single frame (each chunk is up
+                       # to CHUNK_TILES² individual blits), which is the
+                       # stall you feel. Chunks that don't fit in this
+                       # frame's budget are simply skipped (left blank)
+                       # and picked up on a later frame once still
+                       # uncached — see _get_chunk_surface / _draw_viewport.
 
 ZOOM_LEVELS  = [1, 2, 3, 4, 6, 8]
 ZOOM_DEFAULT = 2      # index into ZOOM_LEVELS
 
-PANEL_W      = 320    # right-panel width in pixels
+PANEL_W      = 320    # right-panel default/initial width in pixels
+PANEL_MIN_W  = 220    # narrowest the user can drag the panel to
+PANEL_MAX_W  = 640    # widest the user can drag the panel to
+SPLITTER_HIT_W = 6    # width (px) of the invisible drag zone straddling the
+                       # viewport/panel boundary, centered on the border line
+PANEL_LAYOUT_SNAP = 8  # quantization grid (px) for panel *content* width —
+                       # see panel_layout_w below
 TOP_BAR_H    = 44     # top bar height in pixels
 PALETTE_CELL = 24     # how large each tile appears in the palette grid
+PALETTE_BOTTOM_MARGIN = 16  # padding kept below the palette panel, screen bottom
 
 PIN_RADIUS   = 7      # location-pin draw radius
 
@@ -468,6 +490,145 @@ def _vehicle_dir_row(dx: float, dy: float, num_dirs: int) -> int:
 
 # ──────────────────────────────── main editor ─────────────────────────────────
 
+# ──────────────────────── chrome: fonts, icons ─────────────────────────────
+
+class _BitmapFontView:
+    """Adapts a BitmapFont to the plain pygame.font.Font call shape —
+    render(text, antialias, color) / size(text) — at one fixed pixel height.
+
+    Same adapter dev_menu.py / room_editor.py use for their own bitmap
+    fonts: BitmapFont.render() takes a `height` keyword rather than
+    pygame.font.Font's fixed per-instance size, so this pins one height per
+    "font" (title/large/medium/small) and otherwise stays a drop-in swap —
+    every `self.font_x.render(text, True, color)` call site below keeps
+    working unchanged whether font_x is bitmap- or system-font-backed."""
+
+    def __init__(self, bitmap_font, height):
+        self._font = bitmap_font
+        self._height = height
+
+    def render(self, text, antialias=True, color=(255, 255, 255)):
+        return self._font.render(text, color=color, height=self._height)
+
+    def size(self, text):
+        return self._font.size(text, height=self._height)
+
+
+# Vector line-glyph icon set for the World Map Editor's own chrome (top-bar
+# mode/action buttons, panel headers, list-row actions). Drawn with the same
+# primitives — uk.draw_line_on / uk.draw_rect_on / uk.draw_circle_on — as
+# ui_kit's own DEV_MENU_ICON_DRAWERS and room_editor.py's toolbar icons, so
+# these read as part of the same family instead of a mismatched one-off.
+
+def _draw_plus_icon(surface, rect, color, width=3):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.34
+    uk.draw_line_on(surface, color, (cx - s, cy), (cx + s, cy), width)
+    uk.draw_line_on(surface, color, (cx, cy - s), (cx, cy + s), width)
+
+
+def _draw_check_icon(surface, rect, color, width=3):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.32
+    uk.draw_line_on(surface, color, (cx - s, cy), (cx - s * 0.15, cy + s * 0.8), width)
+    uk.draw_line_on(surface, color, (cx - s * 0.15, cy + s * 0.8), (cx + s, cy - s * 0.7), width)
+
+
+def _draw_brush_icon(surface, rect, color, width=2):
+    """Paint-brush glyph — Paint mode."""
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    # Handle
+    uk.draw_line_on(surface, color, (cx - s * 0.26, cy - s * 0.30),
+                    (cx + s * 0.10, cy + s * 0.06), max(2, width + 1))
+    # Ferrule
+    uk.draw_line_on(surface, color, (cx + s * 0.02, cy - s * 0.02),
+                    (cx + s * 0.20, cy + s * 0.16), width)
+    # Bristle splash
+    tip = (cx + s * 0.24, cy + s * 0.22)
+    for dx, dy in ((-0.05, 0.14), (0.06, 0.18), (0.16, 0.12)):
+        uk.draw_line_on(surface, color, tip,
+                        (cx + s * dx, cy + s * dy), max(1, width - 1))
+
+
+def _draw_pin_icon(surface, rect, color, width=2):
+    """Teardrop map-pin glyph — Location mode."""
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    r = s * 0.22
+    head = (cx, cy - s * 0.08)
+    uk.draw_circle_on(surface, color, head, r, width)
+    uk.draw_line_on(surface, color, (cx - r * 0.55, head[1] + r * 0.75),
+                    (cx, cy + s * 0.34), width)
+    uk.draw_line_on(surface, color, (cx + r * 0.55, head[1] + r * 0.75),
+                    (cx, cy + s * 0.34), width)
+    uk.draw_circle_on(surface, color, head, max(1, int(r * 0.32)))
+
+
+def _draw_scouter_icon(surface, rect, color, width=2):
+    """Radar-sweep glyph — Scouter (silhouette) mode."""
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    r = s * 0.30
+    uk.draw_circle_on(surface, color, (cx, cy), r, width)
+    uk.draw_circle_on(surface, color, (cx, cy), max(1, int(r * 0.28)))
+    uk.draw_line_on(surface, color, (cx, cy),
+                    (cx + r * 0.9, cy - r * 0.75), max(1, width - 1))
+
+
+def _draw_zoom_icon(surface, rect, color, plus=True, width=2):
+    """Magnifying-glass glyph with a +/- mark inside — zoom buttons."""
+    cx, cy = rect.centerx - 1, rect.centery - 1
+    s = min(rect.w, rect.h)
+    r = s * 0.26
+    uk.draw_circle_on(surface, color, (cx, cy), r, width)
+    hx, hy = cx + r * 0.75, cy + r * 0.75
+    uk.draw_line_on(surface, color, (hx, hy), (hx + s * 0.16, hy + s * 0.16), width + 1)
+    m = r * 0.45
+    uk.draw_line_on(surface, color, (cx - m, cy), (cx + m, cy), width)
+    if plus:
+        uk.draw_line_on(surface, color, (cx, cy - m), (cx, cy + m), width)
+
+
+def _draw_chevron_icon(surface, rect, color, direction=-1, width=2):
+    """Simple '‹' / '›' chevron — tab and frame scroll arrows."""
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.22
+    dx = -1 if direction < 0 else 1
+    uk.draw_line_on(surface, color, (cx + s * dx, cy - s * 1.3), (cx - s * dx, cy), width)
+    uk.draw_line_on(surface, color, (cx - s * dx, cy), (cx + s * dx, cy + s * 1.3), width)
+
+
+def _draw_music_icon(surface, rect, color, width=2):
+    """Eighth-note glyph — the map-music dropdown."""
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    stem_x = cx + s * 0.12
+    top_y = cy - s * 0.30
+    bot_y = cy + s * 0.22
+    uk.draw_line_on(surface, color, (stem_x, top_y), (stem_x, bot_y), width)
+    uk.draw_line_on(surface, color, (stem_x, top_y), (stem_x + s * 0.20, top_y + s * 0.10), width)
+    uk.draw_circle_on(surface, color, (stem_x - s * 0.10, bot_y), max(2, int(s * 0.13)))
+
+
+def _draw_vehicle_icon(surface, rect, color, width=2):
+    """Simple car-body glyph — Entity mode / vehicle picker fallback."""
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    body = pygame.Rect(0, 0, s * 0.62, s * 0.26)
+    body.center = (cx, cy - s * 0.02)
+    uk.draw_rect_on(surface, color, body, width, 4)
+    cabin = pygame.Rect(0, 0, s * 0.32, s * 0.20)
+    cabin.midbottom = (cx, body.top + 2)
+    uk.draw_rect_on(surface, color, cabin, width, 3)
+    for wx in (body.x + body.w * 0.22, body.x + body.w * 0.78):
+        uk.draw_circle_on(surface, color, (wx, body.bottom), max(2, int(s * 0.08)), width)
+_CHUNK_PENDING = object()  # sentinel: chunk isn't cached yet and this
+                           # frame's CHUNK_BUILD_BUDGET_PER_FRAME is used
+                           # up — try again next frame instead of building
+                           # it synchronously right now.
+
+
 class WorldMapEditor:
     """Full-screen world-map tile editor."""
 
@@ -479,8 +640,30 @@ class WorldMapEditor:
         # Viewport geometry (recomputed if panel is hidden, but kept simple here)
         self.vp_x = 0
         self.vp_y = TOP_BAR_H
-        self.vp_w = screen_width - PANEL_W
+        self.panel_w = PANEL_W   # user-draggable; see _splitter_rect / MOUSEMOTION handling
+        # Right panel shown/collapsed — pressing the active mode's top-bar
+        # button toggles it (see _on_mode_button). panel_w keeps the user's
+        # dragged width while collapsed, so re-opening restores it.
+        self.panel_open = True
+        # Quantized copy of panel_w for sizing rounded/shadowed panel-content
+        # boxes (buttons, rows, cards) — NOT for the panel background/
+        # splitter line/viewport, which stay pixel-exact so the panel visibly
+        # tracks the cursor 1:1 while dragging. Those rounded-rect and
+        # drop-shadow surfaces in ui_kit.py are cached by their *exact*
+        # pixel size, so feeding them a width that changes every single
+        # pixel of mouse movement means a full cache miss (rebuild +
+        # supersample/blur + fresh GPU texture upload) on every one of
+        # those boxes, every frame, for the whole drag — see
+        # _set_panel_w/_recompute_viewport for where this gets refreshed.
+        self.panel_layout_w = self.panel_w
+        self.vp_w = screen_width - self.panel_w
         self.vp_h = screen_height - TOP_BAR_H
+
+        # ── Panel splitter drag (resize the right panel like a Windows
+        # split-pane border) ────────────────────────────────────────────────
+        self._panel_resize_active     = False
+        self._panel_resize_start_mx   = 0
+        self._panel_resize_start_w    = 0
 
         # ── Maps ──────────────────────────────────────────────────────────────
         self.maps: list[WorldMap]    = []
@@ -569,6 +752,7 @@ class WorldMapEditor:
         self._sel_surf_size:  tuple[int, int]          = (0, 0)
         self._vp_grid_surf:   Optional[pygame.Surface] = None
         self._vp_grid_ds:     int                      = 0
+        self._vp_grid_size:   tuple[int, int]          = (0, 0)
 
         # ── Entity height slider state ─────────────────────────────────────────
         self._entity_height_slider_drag    = False
@@ -608,6 +792,28 @@ class WorldMapEditor:
         self.new_map_name    = ''
         self._map_tab_scroll = 0   # index of the first visible map tab
 
+        # ── Text-field editing (New Map name / Location name) ─────────────────
+        # Same state RoomEditor keeps for its inline text fields. The text
+        # itself stays in new_map_name / loc_dialog_name (see the text_input
+        # property near _handle_new_map_dialog_event).
+        self.cursor_pos       = 0
+        self.selection_anchor = None   # None = no selection; else other end of it
+        self._text_drag       = False
+        # Rect + text-start-x + font of the name field, captured by
+        # _draw_input_field each frame so click/drag handling can hit-test
+        # and turn a mouse x into a character index without knowing which
+        # dialog is up.
+        self._active_edit_rect   = None
+        self._active_edit_text_x = None
+        self._active_edit_font   = None
+
+        # ── Dialog dragging (New Map / Location dialogs — only one is ever
+        # open at a time, see draw(), so one shared offset is enough) ─────────
+        self._dialog_pos_offset: list      = [0, 0]  # [dx, dy] from centered
+        self._dialog_drag_active           = False
+        self._dialog_drag_start_mouse: tuple[int, int] = (0, 0)
+        self._dialog_drag_start_offset: tuple[int, int] = (0, 0)
+
         # ── Double-click detection ─────────────────────────────────────────────
         self._dbl_click_time: float                     = 0.0
         self._dbl_click_pos:  Optional[tuple[int, int]] = None
@@ -619,37 +825,87 @@ class WorldMapEditor:
         # ── Animation ────────────────────────────────────────────────────────
         self.cursor_blink = 0.0
 
-        # ── Fonts & colors ────────────────────────────────────────────────────
-        self.font_large  = pygame.font.Font(None, 28)
-        self.font_medium = pygame.font.Font(None, 22)
-        self.font_small  = pygame.font.Font(None, 18)
+        # Which of move/resize/text cursor kind (if any) update() currently
+        # has "claimed" from the shared ui_kit cursor state -- see update()'s
+        # cursor block for why this has to be ownership-guarded rather than
+        # calling a setter unconditionally every frame.
+        self._owned_cursor_kind: Optional[str] = None
 
-        self.C = {
-            'bg':           (15,  15,  25),
-            'panel':        (22,  22,  38),
-            'panel_border': (55,  55,  85),
-            'topbar':       (18,  18,  32),
-            'accent':       (255, 215, 0),
-            'text':         (240, 240, 240),
-            'dim':          (150, 150, 180),
-            'grid':         (38,  38,  58),
-            'map_border':   (255, 215, 0),
-            'pin':          (255, 75,  75),
-            'pin_sel':      (255, 210, 60),
-            'btn':          (48,  48,  72),
-            'btn_hover':    (72,  72,  105),
-            'btn_active':   (90,  65,  0),
-            'success':      (70,  210, 70),
-            'danger':       (210, 70,  70),
-            'input_bg':     (35,  35,  55),
-            'input_border': (80,  80,  120),
-            'entity_path':  (80,  200, 255),
-            'entity_node':  (255, 160, 40),
-            'entity_sel':   (255, 220, 80),
+        # ── Fonts (bitmap, matching DevMenu / Room Editor) ─────────────────────
+        self._bitmap_font  = uk.BitmapFont('assets\\ui\\fonts', letter_spacing=1)
+        self._title_bitmap_font = uk.BitmapFont('assets\\ui\\fonts', letter_spacing=1)
+        self._title_bitmap_font.uppercase_dir = os.path.join('assets', 'ui', 'fonts', 'uppercase')
+        self._title_bitmap_font.lowercase_dir = os.path.join('assets', 'ui', 'fonts', 'lowercase')
+
+        self.font_title  = _BitmapFontView(self._title_bitmap_font, 22)
+        self.font_large  = _BitmapFontView(self._bitmap_font, 16)
+        self.font_medium = _BitmapFontView(self._bitmap_font, 13)
+        self.font_small  = _BitmapFontView(self._bitmap_font, 11)
+
+        # Mode → (label, icon drawer, accent color) — single source of truth
+        # for the top-bar mode buttons and the panel headers that match them.
+        self.MODE_INFO = {
+            'paint':    ('Paint',    _draw_brush_icon,   uk.Theme.GOLD),
+            'location': ('Location', _draw_pin_icon,     uk.Theme.GOLD),
+            'entity':   ('Entity',   uk.draw_entity_icon, uk.Theme.KI_BLUE),
+            'scouter':  ('Scouter',  _draw_scouter_icon, (120, 220, 140)),
         }
 
-        # Cached UI rects for hit-testing
+        # Back-arrow icon, top bar (left of "New") — the exact same shared
+        # PNG asset (assets/ui/dev_menu/icons/back.png) that DevMenu's own
+        # header back button and Room Editor's back button use, loaded with
+        # the same crop + point-sample scaling so it's pixel-identical
+        # across every menu rather than a separate vector look-alike.
+        self._back_icon = self._load_dev_menu_icon('back', 22)
+
+        # Plus icon (+Frame button) — same convention as _back_icon above:
+        # drop assets/ui/dev_menu/icons/plus.png in to replace the vector
+        # plus glyph that button used before. Degrades to a blank
+        # transparent surface if the file isn't there yet.
+        self._plus_icon = self._load_dev_menu_icon('plus', 18)
+
+        # Zoom in/out icons — same convention: drop
+        # assets/ui/dev_menu/icons/zoom_in.png and zoom_out.png in to
+        # replace the vector magnifying-glass glyphs those buttons used
+        # before. Degrades to a blank transparent surface if the files
+        # aren't there yet.
+        self._zoom_in_icon  = self._load_dev_menu_icon('zoom_in', 18)
+        self._zoom_out_icon = self._load_dev_menu_icon('zoom_out', 18)
+
+        # Close/delete "X" icon — replaces uk.draw_close_icon everywhere
+        # it was used in this file (list-row delete buttons, Cancel,
+        # Clear/Clear Path/Clear all, the frame-delete button). Same
+        # convention: drop assets/ui/dev_menu/icons/close.png in.
+        # Degrades to a blank transparent surface if the file isn't
+        # there yet.
+        self._close_icon = self._load_dev_menu_icon('close', 18)
+
+        # Cached UI rects for hit-testing — populated fresh by the draw
+        # methods every frame (see _draw_top_bar / _draw_panel / dialogs) and
+        # consumed by handle_input's click handlers. Keys are unchanged from
+        # the previous UI pass so all existing input-handling logic below
+        # keeps working: only how each rect gets drawn has changed.
         self.ui: dict[str, pygame.Rect] = {}
+
+        # Map-content palette — used only by the viewport/entity-path/height-
+        # preview renderers below (tiles, grid, pins, paths), which draw the
+        # actual map data rather than editor chrome. Kept as a small color
+        # table, same keys as before, so that content-drawing code needs no
+        # changes beyond picking new theme-matching values here; every panel,
+        # button, dialog and list elsewhere is built fresh from uk.Theme.
+        self.C = {
+            'bg':           (10,  12,  18),
+            'grid':         (34,  39,  50),
+            'map_border':   uk.Theme.GOLD,
+            'text':         uk.Theme.TEXT_PRIMARY,
+            'dim':          uk.Theme.TEXT_MUTED,
+            'accent':       uk.Theme.GOLD,
+            'pin':          (232, 92,  92),
+            'pin_sel':      uk.Theme.GOLD_BRIGHT,
+            'entity_path':  uk.Theme.KI_BLUE,
+            'entity_node':  (244, 170, 90),
+            'entity_sel':   uk.Theme.GOLD_BRIGHT,
+        }
 
     # ─────────────────────── public API ──────────────────────────────────────
 
@@ -658,9 +914,83 @@ class WorldMapEditor:
 
     def update(self, dt: float):
         if not self.active:
+            self._release_owned_cursor()
             return
         self.cursor_blink    = (self.cursor_blink    + dt) % 1.0
         self._entity_anim_t += dt
+
+        # I-beam over the new-map-name / location-name text fields — built
+        # from last frame's draw() (see _draw_new_map_dialog /
+        # _draw_loc_dialog), same lag the existing rect hit-testing here
+        # already lives with.
+        text_rect = None
+        if self.new_map_dialog:
+            text_rect = self.loc_dialog_rects.get('field')
+        elif self.loc_dialog:
+            text_rect = self.loc_dialog_rects.get('field_name')
+        mouse_pos = pygame.mouse.get_pos()
+
+        text_hover = text_rect is not None and text_rect.collidepoint(mouse_pos)
+        if self.new_map_dialog or self.loc_dialog:
+            # A dialog is up — it intercepts all input (see handle_input's
+            # "Dialog intercepts" block), so the background splitter isn't
+            # actually draggable right now; only the dialog's own title bar
+            # (move) and text field (I-beam) hover states apply.
+            dragbar = self.loc_dialog_rects.get('_dragbar')
+            move_hover = self._dialog_drag_active or (
+                dragbar is not None and dragbar.collidepoint(mouse_pos))
+            resize_hover = False
+        else:
+            # Resize cursor takes priority over the text I-beam — while
+            # actively dragging the splitter, or just hovering it, show
+            # the left-right arrow; only fall back to the I-beam check
+            # otherwise.
+            move_hover = False
+            resize_hover = self._panel_resize_active or self._over_splitter(*mouse_pos)
+
+        # Decide which hover state (if any) wins, then touch the shared OS
+        # cursor ONLY when that decision actually changed since last frame.
+        #
+        # This used to call set_move_cursor/set_resize_cursor/set_text_cursor
+        # unconditionally every frame — harmless when claiming a kind, but
+        # when none of the three applied it still called
+        # set_text_cursor(False), which forces the arrow right here, in
+        # update(). The hand cursor for every clickable widget elsewhere
+        # (toolbar buttons, panel rows, dropdowns, ...) isn't decided until
+        # draw() runs update_hover_cursor() much later in the same frame, so
+        # forcing the arrow here and letting draw() correct it back to hand
+        # a full frame's worth of drawing later meant the OS genuinely
+        # rendered the arrow for a moment before flipping back — every
+        # single frame, seen as the cursor flickering. (Same bug, same fix,
+        # as RoomEditor.update()'s _owns_text_cursor guard.)
+        #
+        # Fix: only ever touch the cursor here when we're actually claiming
+        # one of these three kinds, or releasing the one we previously
+        # claimed. Otherwise leave the shared cursor alone entirely, so
+        # whatever draw()'s update_hover_cursor() already decided (or is
+        # about to decide) is never disturbed by a speculative reset here.
+        desired_kind = 'move' if move_hover else 'resize' if resize_hover else 'text' if text_hover else None
+        if desired_kind != self._owned_cursor_kind:
+            self._release_owned_cursor()
+            if desired_kind == 'move':
+                uk.set_move_cursor(True)
+            elif desired_kind == 'resize':
+                uk.set_resize_cursor(True)
+            elif desired_kind == 'text':
+                uk.set_text_cursor(True)
+            self._owned_cursor_kind = desired_kind
+
+    def _release_owned_cursor(self):
+        """Release whichever of move/resize/text cursor update() currently
+        holds (no-op if it isn't holding any), without touching the shared
+        cursor at all otherwise. See update()'s cursor block."""
+        if self._owned_cursor_kind == 'move':
+            uk.set_move_cursor(False)
+        elif self._owned_cursor_kind == 'resize':
+            uk.set_resize_cursor(False)
+        elif self._owned_cursor_kind == 'text':
+            uk.set_text_cursor(False)
+        self._owned_cursor_kind = None
 
     # ─────────────────────── properties ──────────────────────────────────────
 
@@ -705,12 +1035,93 @@ class WorldMapEditor:
         self.cam_x = max(0.0, min(self.cam_x, max_x))
         self.cam_y = max(0.0, min(self.cam_y, max_y))
 
+    def _palette_visible_height(self, default: int = 400) -> int:
+        """Visible height of the tileset palette scroll area in Paint
+        mode. Derived from _palette_grid_origin (set by _draw_paint_panel
+        each frame) so the scroll-wheel/middle-drag clamps below always
+        match whatever the panel is actually sized to on screen — same
+        one-frame lag as the other last-frame-rect lookups in this file.
+        Falls back to `default` before the first paint-panel draw."""
+        if self._palette_grid_origin is None:
+            return default
+        _, grid_y = self._palette_grid_origin
+        return max(1, self.screen_height - grid_y - PALETTE_BOTTOM_MARGIN)
+
     def _in_viewport(self, mx: int, my: int) -> bool:
         return (self.vp_x <= mx < self.vp_x + self.vp_w
                 and self.vp_y <= my < self.vp_y + self.vp_h)
 
     def _in_panel(self, mx: int, my: int) -> bool:
         return mx >= self.vp_x + self.vp_w
+
+    # ─────────────────────── panel splitter (resize) ──────────────────────────
+
+    def _recompute_viewport(self):
+        """Re-derive vp_w from panel_w and re-clamp the camera so the newly
+        exposed/covered viewport edge doesn't leave it looking at empty
+        space or off the map. Call this any time panel_w or panel_open
+        changes. A collapsed panel takes no width, so the map view gets
+        the whole screen."""
+        self.vp_w = self.screen_width - (self.panel_w if self.panel_open else 0)
+        # Floor to the snap grid (never up) so panel_layout_w-sized content
+        # never overflows the actual (equal-or-wider) panel background.
+        self.panel_layout_w = (self.panel_w // PANEL_LAYOUT_SNAP) * PANEL_LAYOUT_SNAP
+        self._clamp_camera()
+
+    def _splitter_rect(self) -> pygame.Rect:
+        """Hit-region for the drag handle between viewport and panel,
+        straddling the border line so it's easy to grab (matches the
+        'drag the border between two panes' feel of Windows split views)."""
+        border_x = self.vp_x + self.vp_w
+        return pygame.Rect(border_x - SPLITTER_HIT_W // 2, self.vp_y,
+                            SPLITTER_HIT_W, self.vp_h)
+
+    def _over_splitter(self, mx: int, my: int) -> bool:
+        # No panel, no splitter — otherwise its hit-strip would still sit
+        # straddling the screen's right edge.
+        return self.panel_open and self._splitter_rect().collidepoint(mx, my)
+
+    def _max_panel_w(self) -> int:
+        # Leave a minimum usable viewport width so the panel can never be
+        # dragged wide enough to swallow the whole map view.
+        return min(PANEL_MAX_W, self.screen_width - 480)
+
+    def _set_panel_w(self, new_w: int):
+        new_w = max(PANEL_MIN_W, min(self._max_panel_w(), new_w))
+        if new_w != self.panel_w:
+            self.panel_w = new_w
+            self._recompute_viewport()
+
+    def _set_panel_open(self, open_: bool):
+        """Show or collapse the right panel; the map view grows/shrinks to
+        fill whatever is free."""
+        if open_ == self.panel_open:
+            return
+        self.panel_open = open_
+        if not open_:
+            # Drop transient state that lives inside the panel, so nothing
+            # invisible keeps grabbing input and popups don't reappear
+            # stale when the panel comes back.
+            self.music_dropdown_open       = False
+            self.entity_room_dropdown_open = False
+            self._pal_drag_active          = False
+            self._ts_panning               = False
+            self._entity_height_slider_drag = False
+            self._panel_resize_active      = False
+        self._recompute_viewport()
+
+    def _on_mode_button(self, mode: str):
+        """Top-bar mode button. Pressing the already-active mode toggles the
+        right panel; pressing a different mode switches to it and makes sure
+        its panel is showing."""
+        if mode == self.mode:
+            self._set_panel_open(not self.panel_open)
+            return
+        self.mode = mode
+        if mode != 'entity':
+            self._entity_stop_placing()
+            self.entity_room_dropdown_open = False
+        self._set_panel_open(True)
 
     # ─────────────────────── disk I/O ────────────────────────────────────────
 
@@ -923,6 +1334,7 @@ class WorldMapEditor:
         self.loc_dialog_is_new  = is_new
         self.loc_dialog_new_pos = pos
         self.loc_dialog_field   = 'name'
+        self._dialog_pos_offset = [0, 0]
         self.room_dropdown_open  = False
         self.room_dropdown_scroll = 0
         self.room_dropdown_hover  = -1
@@ -940,6 +1352,7 @@ class WorldMapEditor:
             self.loc_dialog_icon = (existing if existing in self.icon_names
                                     else default_icon)
         self.cursor_blink = 0.0
+        self._begin_text_edit()
 
     def _commit_loc_dialog(self):
         wm = self.current_map
@@ -1003,6 +1416,13 @@ class WorldMapEditor:
         self.room_dropdown_open  = False
         self.room_dropdown_scroll = 0
         self.room_dropdown_hover  = -1
+        # If the dialog is closing (Enter/Escape/OK/Cancel) while its
+        # title bar is still mid-drag, no MOUSEBUTTONUP ever reaches
+        # _handle_dialog_drag_event to clear this — leaving it stuck True
+        # and, the next time any dialog opens, forcing update()'s
+        # move_hover on unconditionally regardless of actual mouse
+        # position (see update()'s move_hover line). Clear it here too.
+        self._dialog_drag_active = False
 
     def _push_undo(self):
         """Snapshot the current map state onto the undo stack."""
@@ -1144,7 +1564,12 @@ class WorldMapEditor:
         if event.type == pygame.KEYDOWN:
             if event.key in (pygame.K_F2, pygame.K_ESCAPE):
                 self.active = False
-                return None
+                # Mirrors RoomEditor's 'back_to_dev_menu' convention: the Dev
+                # Menu closed itself when it launched this editor (see
+                # DevMenu._activate_selected), so game.py's event loop needs
+                # this explicit signal to reopen it — otherwise closing the
+                # editor drops all the way back into gameplay instead.
+                return 'back_to_dev_menu'
             if ctrl and event.key == pygame.K_s:
                 self._save_current_map()
                 return None
@@ -1206,7 +1631,13 @@ class WorldMapEditor:
 
             # ── Top-bar buttons ───────────────────────────────────────────────
             if my < TOP_BAR_H:
-                self._handle_topbar_click(mx, my, event.button)
+                return self._handle_topbar_click(mx, my, event.button)
+
+            # ── Panel splitter drag (resize panel like a Windows split view) ───
+            if event.button == 1 and self._over_splitter(mx, my):
+                self._panel_resize_active   = True
+                self._panel_resize_start_mx = mx
+                self._panel_resize_start_w  = self.panel_w
                 return None
 
             # ── Middle-click pan ──────────────────────────────────────────────
@@ -1288,6 +1719,7 @@ class WorldMapEditor:
                 self._pal_drag_active         = False
                 self._last_paint_cell         = None
                 self._entity_height_slider_drag = False
+                self._panel_resize_active     = False
             elif event.button == 2:
                 self.is_panning  = False
                 self._ts_panning = False
@@ -1298,7 +1730,13 @@ class WorldMapEditor:
         elif event.type == pygame.MOUSEMOTION:
             mx, my = event.pos
 
-            if self.is_panning and self._pan_start_mouse and self._pan_start_cam:
+            if self._panel_resize_active:
+                # Dragging left grows the panel (border moves left), dragging
+                # right shrinks it — same feel as a Windows split-pane border.
+                delta = self._panel_resize_start_mx - mx
+                self._set_panel_w(self._panel_resize_start_w + delta)
+
+            elif self.is_panning and self._pan_start_mouse and self._pan_start_cam:
                 dx = self._pan_start_mouse[0] - mx
                 dy = self._pan_start_mouse[1] - my
                 self.cam_x = self._pan_start_cam[0] + dx
@@ -1309,8 +1747,8 @@ class WorldMapEditor:
                 dx = self._ts_pan_start_mouse[0] - mx
                 dy = self._ts_pan_start_mouse[1] - my
                 ts = self.current_tileset
-                max_scroll_y = max(0, ts.rows * PALETTE_CELL - 400) if ts else 0
-                max_scroll_x = max(0, ts.cols * PALETTE_CELL - PANEL_W) if ts else 0
+                max_scroll_y = max(0, ts.rows * PALETTE_CELL - self._palette_visible_height()) if ts else 0
+                max_scroll_x = max(0, ts.cols * PALETTE_CELL - self.panel_w) if ts else 0
                 self.palette_scroll_y = max(0, min(max_scroll_y, self._ts_pan_start_scroll[1] + dy))
                 self.palette_scroll_x = max(0, min(max_scroll_x, self._ts_pan_start_scroll[0] + dx))
 
@@ -1373,7 +1811,7 @@ class WorldMapEditor:
             # Scroll palette
             ts = self.current_tileset
             if ts:
-                max_scroll = max(0, ts.rows * PALETTE_CELL - 400)
+                max_scroll = max(0, ts.rows * PALETTE_CELL - self._palette_visible_height())
                 self.palette_scroll_y = max(
                     0, min(max_scroll, self.palette_scroll_y - direction * PALETTE_CELL))
         else:
@@ -1391,35 +1829,30 @@ class WorldMapEditor:
                 self.cam_y = rel_y * factor - (my - self.vp_y)
                 self._clamp_camera()
 
-    def _handle_topbar_click(self, mx: int, my: int, button: int):
+    def _handle_topbar_click(self, mx: int, my: int, button: int) -> Optional[str]:
         # Priority pass: delete-tab buttons sit inside tab rects, so check them first.
         for key, rect in self.ui.items():
             if key.startswith('map_del_') and rect.collidepoint(mx, my):
                 idx = int(key.split('_')[-1])
                 self._delete_map(idx)
-                return
+                return None
         for key, rect in self.ui.items():
             if not rect.collidepoint(mx, my):
                 continue
-            if key == 'btn_new':
-                self.new_map_dialog = True
-                self.new_map_name   = ''
+            if key == 'btn_back':
+                self.active = False
+                # Same 'back_to_dev_menu' convention RoomEditor uses — see
+                # the matching comment on the F2/Escape handler above.
+                return 'back_to_dev_menu'
+            elif key == 'btn_new':
+                self.new_map_dialog     = True
+                self.new_map_name       = ''
+                self._dialog_pos_offset = [0, 0]
+                self._begin_text_edit()
             elif key == 'btn_save':
                 self._save_current_map()
-            elif key == 'btn_mode_paint':
-                self.mode = 'paint'
-                self._entity_stop_placing()
-                self.entity_room_dropdown_open = False
-            elif key == 'btn_mode_location':
-                self.mode = 'location'
-                self._entity_stop_placing()
-                self.entity_room_dropdown_open = False
-            elif key == 'btn_mode_entity':
-                self.mode = 'entity'
-            elif key == 'btn_mode_scouter':
-                self.mode = 'scouter'
-                self._entity_stop_placing()
-                self.entity_room_dropdown_open = False
+            elif key.startswith('btn_mode_'):
+                self._on_mode_button(key[len('btn_mode_'):])
             elif key == 'btn_zoom_in':
                 mx2, my2 = self.vp_x + self.vp_w // 2, self.vp_y + self.vp_h // 2
                 self._scroll_event(mx2, my2, +1)
@@ -1452,6 +1885,7 @@ class WorldMapEditor:
                 wm = self.current_map
                 if wm and wm.frame_count > 1:
                     wm.frame_idx = wm.remove_frame(wm.frame_idx)
+        return None
 
     def _handle_panel_click(self, mx: int, my: int, button: int, is_double: bool = False):
         wm = self.current_map
@@ -1559,28 +1993,257 @@ class WorldMapEditor:
             self.sel_end_tx = coords[0]
             self.sel_end_ty = coords[1]
 
+    def _handle_dialog_drag_event(self, event: pygame.event.Event) -> bool:
+        """Shared drag-the-dialog-by-its-title-bar handling for both the
+        New Map and Location dialogs (only one is ever open at a time —
+        see draw() / self._dialog_pos_offset, so one shared offset covers
+        both). Returns True if this event was consumed by the drag and
+        the caller should stop processing it further."""
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            dragbar = self.loc_dialog_rects.get('_dragbar')
+            if dragbar and dragbar.collidepoint(event.pos):
+                self._dialog_drag_active       = True
+                self._dialog_drag_start_mouse  = event.pos
+                self._dialog_drag_start_offset = tuple(self._dialog_pos_offset)
+                return True
+        elif event.type == pygame.MOUSEMOTION:
+            if self._dialog_drag_active:
+                dx = event.pos[0] - self._dialog_drag_start_mouse[0]
+                dy = event.pos[1] - self._dialog_drag_start_mouse[1]
+                self._dialog_pos_offset[0] = self._dialog_drag_start_offset[0] + dx
+                self._dialog_pos_offset[1] = self._dialog_drag_start_offset[1] + dy
+                return True
+        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            if self._dialog_drag_active:
+                self._dialog_drag_active = False
+                return True
+        return False
+
+    # ── Text-field editing (New Map name / Location name) ─────────────────────
+    #
+    # Ported from RoomEditor's inline text input: real caret position,
+    # selection range, shift/drag selection, click-to-place-caret, and the OS
+    # clipboard (uk.clipboard_get_text / uk.clipboard_set_text). RoomEditor
+    # edits one live buffer, self.text_input. Here the two editable strings
+    # already live in new_map_name / loc_dialog_name and are read directly by
+    # _create_map / _commit_loc_dialog, so text_input is a property aliasing
+    # whichever one the open dialog is editing — that keeps every helper
+    # below identical to RoomEditor's.
+
+    @property
+    def text_input(self) -> str:
+        return self.new_map_name if self.new_map_dialog else self.loc_dialog_name
+
+    @text_input.setter
+    def text_input(self, value: str):
+        if self.new_map_dialog:
+            self.new_map_name = value
+        else:
+            self.loc_dialog_name = value
+
+    @property
+    def _text_max_len(self) -> int:
+        # The same caps the old `len(...) < N` checks used.
+        return 32 if self.new_map_dialog else 40
+
+    def _reset_text_edit_state(self):
+        """Caret at the end of the field, no selection — used whenever the
+        name field (re)gains focus, so cursor state can't be left stale."""
+        self.cursor_pos = len(self.text_input)
+        self.selection_anchor = None
+        self._text_drag = False
+        self.cursor_blink = 0.0
+
+    def _begin_text_edit(self):
+        """A dialog just opened: reset the caret and drop the field geometry
+        captured for whichever dialog was drawn last."""
+        self._active_edit_rect = None
+        self._active_edit_text_x = None
+        self._active_edit_font = None
+        self._reset_text_edit_state()
+
+    def _has_text_selection(self):
+        return self.selection_anchor is not None and self.selection_anchor != self.cursor_pos
+
+    def _text_selection_range(self):
+        a, b = self.selection_anchor, self.cursor_pos
+        return (a, b) if a <= b else (b, a)
+
+    def _delete_text_selection(self):
+        """Removes the selected text (if any), leaving the cursor at the
+        start of where it was. Returns True if anything was deleted."""
+        if not self._has_text_selection():
+            return False
+        s, e = self._text_selection_range()
+        self.text_input = self.text_input[:s] + self.text_input[e:]
+        self.cursor_pos = s
+        self.selection_anchor = None
+        return True
+
+    def _insert_into_text_input(self, s):
+        """Types `s` in at the cursor, replacing the selection if any and
+        respecting the field's max length. Used for both single keystrokes
+        and pasted text. Filters/length-checks happen before touching the
+        selection, so an empty or all-non-printable `s` (e.g. a stray
+        modifier-key keystroke, or pasting an empty clipboard) leaves any
+        existing selection untouched instead of silently deleting it."""
+        s = "".join(ch for ch in s if ch.isprintable())
+        if not s:
+            return
+        if self._has_text_selection():
+            self._delete_text_selection()
+        space = self._text_max_len - len(self.text_input)
+        if space <= 0:
+            return
+        s = s[:space]
+        self.text_input = self.text_input[:self.cursor_pos] + s + self.text_input[self.cursor_pos:]
+        self.cursor_pos += len(s)
+
+    def _text_index_from_x(self, x):
+        """Map an absolute mouse x-coordinate to the character index in
+        self.text_input whose caret sits closest to it, using the field/font
+        captured by the last draw (see _active_edit_text_x / _active_edit_font)."""
+        if self._active_edit_font is None or self._active_edit_text_x is None or not self.text_input:
+            return 0
+        font = self._active_edit_font
+        widths = [0]
+        for i in range(1, len(self.text_input) + 1):
+            widths.append(font.size(self.text_input[:i])[0])
+        rel_x = x - self._active_edit_text_x
+        best_i, best_d = 0, abs(widths[0] - rel_x)
+        for i, w in enumerate(widths):
+            d = abs(w - rel_x)
+            if d < best_d:
+                best_i, best_d = i, d
+        return best_i
+
+    def _handle_text_edit_key(self, event):
+        """Editing keys for the focused name field — the same branches as
+        RoomEditor's text-field KEYDOWN handling. Enter / Escape / Tab are
+        left to the caller since what they do differs per dialog."""
+        mods = pygame.key.get_mods()
+        ctrl = bool(mods & (pygame.KMOD_CTRL | pygame.KMOD_META))
+        shift = bool(mods & pygame.KMOD_SHIFT)
+
+        if ctrl and event.key == pygame.K_a:
+            self.selection_anchor = 0
+            self.cursor_pos = len(self.text_input)
+        elif ctrl and event.key in (pygame.K_c, pygame.K_x):
+            if self._has_text_selection():
+                s, e = self._text_selection_range()
+                uk.clipboard_set_text(self.text_input[s:e])
+                if event.key == pygame.K_x:
+                    self._delete_text_selection()
+        elif ctrl and event.key == pygame.K_v:
+            self._insert_into_text_input(uk.clipboard_get_text())
+        elif event.key == pygame.K_LEFT:
+            if shift:
+                if self.selection_anchor is None:
+                    self.selection_anchor = self.cursor_pos
+                self.cursor_pos = max(0, self.cursor_pos - 1)
+            elif self._has_text_selection():
+                self.cursor_pos = self._text_selection_range()[0]
+                self.selection_anchor = None
+            else:
+                self.cursor_pos = max(0, self.cursor_pos - 1)
+        elif event.key == pygame.K_RIGHT:
+            if shift:
+                if self.selection_anchor is None:
+                    self.selection_anchor = self.cursor_pos
+                self.cursor_pos = min(len(self.text_input), self.cursor_pos + 1)
+            elif self._has_text_selection():
+                self.cursor_pos = self._text_selection_range()[1]
+                self.selection_anchor = None
+            else:
+                self.cursor_pos = min(len(self.text_input), self.cursor_pos + 1)
+        elif event.key == pygame.K_HOME:
+            if shift and self.selection_anchor is None:
+                self.selection_anchor = self.cursor_pos
+            elif not shift:
+                self.selection_anchor = None
+            self.cursor_pos = 0
+        elif event.key == pygame.K_END:
+            if shift and self.selection_anchor is None:
+                self.selection_anchor = self.cursor_pos
+            elif not shift:
+                self.selection_anchor = None
+            self.cursor_pos = len(self.text_input)
+        elif event.key == pygame.K_BACKSPACE:
+            if not self._delete_text_selection() and self.cursor_pos > 0:
+                self.text_input = self.text_input[:self.cursor_pos - 1] + self.text_input[self.cursor_pos:]
+                self.cursor_pos -= 1
+        elif event.key == pygame.K_DELETE:
+            if not self._delete_text_selection() and self.cursor_pos < len(self.text_input):
+                self.text_input = self.text_input[:self.cursor_pos] + self.text_input[self.cursor_pos + 1:]
+        else:
+            # Reject non-printable codes (e.g. arrow keys); length cap and
+            # selection-replace are handled in the helper.
+            if event.unicode and event.unicode.isprintable():
+                self._insert_into_text_input(event.unicode)
+        self.cursor_blink = 0.0
+
+    def _handle_text_edit_mouse(self, event) -> bool:
+        """Click / drag / release on the name field — same behaviour as
+        RoomEditor: click places the caret, shift+click extends the
+        selection, dragging selects (clamped to the box edges). Returns True
+        if the event was consumed."""
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self._active_edit_rect is not None and self._active_edit_rect.collidepoint(event.pos):
+                idx = self._text_index_from_x(event.pos[0])
+                if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                    if self.selection_anchor is None:
+                        self.selection_anchor = self.cursor_pos
+                else:
+                    self.selection_anchor = idx
+                self.cursor_pos = idx
+                self._text_drag = True
+                self.cursor_blink = 0.0
+                return True
+        elif event.type == pygame.MOUSEMOTION:
+            if self._text_drag and self._active_edit_rect is not None:
+                # Clamp to the box so dragging past an edge still selects to
+                # that edge, same as a normal textbox.
+                x = max(self._active_edit_rect.left, min(event.pos[0], self._active_edit_rect.right))
+                self.cursor_pos = self._text_index_from_x(x)
+                self.cursor_blink = 0.0
+                return True
+        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            if self._text_drag:
+                self._text_drag = False
+                return True
+        return False
+
     def _handle_new_map_dialog_event(self, event: pygame.event.Event):
+        if self._handle_dialog_drag_event(event):
+            return
         if event.type == pygame.KEYDOWN:
             if event.key == pygame.K_RETURN and self.new_map_name.strip():
                 self._create_map(self.new_map_name)
                 self.new_map_dialog = False
+                self._dialog_drag_active = False  # see _cancel_loc_dialog
             elif event.key == pygame.K_ESCAPE:
                 self.new_map_dialog = False
-            elif event.key == pygame.K_BACKSPACE:
-                self.new_map_name = self.new_map_name[:-1]
+                self._dialog_drag_active = False  # see _cancel_loc_dialog
             else:
-                if len(self.new_map_name) < 32 and event.unicode.isprintable():
-                    self.new_map_name += event.unicode
+                self._handle_text_edit_key(event)
         elif event.type == pygame.MOUSEBUTTONDOWN:
+            if self._handle_text_edit_mouse(event):
+                return
             for key, rect in self.loc_dialog_rects.items():
                 if key == 'cancel' and rect.collidepoint(event.pos):
                     self.new_map_dialog = False
+                    self._dialog_drag_active = False  # see _cancel_loc_dialog
                 elif key == 'ok' and rect.collidepoint(event.pos):
                     if self.new_map_name.strip():
                         self._create_map(self.new_map_name)
                         self.new_map_dialog = False
+                        self._dialog_drag_active = False  # see _cancel_loc_dialog
+        elif event.type in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONUP):
+            self._handle_text_edit_mouse(event)
 
     def _handle_loc_dialog_event(self, event: pygame.event.Event):
+        if self._handle_dialog_drag_event(event):
+            return
         if event.type == pygame.KEYDOWN:
             # If the dropdown is open, arrow keys scroll it; Enter selects; Escape closes
             if self.room_dropdown_open:
@@ -1620,18 +2283,13 @@ class WorldMapEditor:
             elif event.key == pygame.K_TAB:
                 self.loc_dialog_field = ('room' if self.loc_dialog_field == 'name'
                                          else 'name')
+                if self.loc_dialog_field == 'name':
+                    self._reset_text_edit_state()
             elif event.key == pygame.K_ESCAPE:
                 self._cancel_loc_dialog()
-            elif event.key == pygame.K_BACKSPACE:
-                if self.loc_dialog_field == 'name':
-                    self.loc_dialog_name = self.loc_dialog_name[:-1]
-                # Room field is dropdown-only — no typing
-            else:
-                ch = event.unicode
-                if ch.isprintable():
-                    if self.loc_dialog_field == 'name' and len(self.loc_dialog_name) < 40:
-                        self.loc_dialog_name += ch
-                    # Room field is dropdown-only — no typing
+            elif self.loc_dialog_field == 'name':
+                self._handle_text_edit_key(event)
+            # Room field is dropdown-only — no typing
 
         elif event.type == pygame.MOUSEBUTTONDOWN:
             # Scroll the dropdown with the mouse wheel
@@ -1654,13 +2312,22 @@ class WorldMapEditor:
                     self._height_slider_update(event.pos[0])
                     return
 
+            # Name field: focus it (if it wasn't already) and put the caret /
+            # start a drag-selection wherever the click landed.
+            if event.button == 1:
+                name_rect = self.loc_dialog_rects.get('field_name')
+                if name_rect is not None and name_rect.collidepoint(event.pos):
+                    if self.loc_dialog_field != 'name':
+                        self.loc_dialog_field = 'name'
+                        self._reset_text_edit_state()
+                    self.room_dropdown_open = False
+                    self._handle_text_edit_mouse(event)
+                    return
+
             for key, rect in self.loc_dialog_rects.items():
                 if not rect.collidepoint(event.pos):
                     continue
-                if key == 'field_name':
-                    self.loc_dialog_field = 'name'
-                    self.room_dropdown_open = False
-                elif key == 'field_room':
+                if key == 'field_room':
                     # Toggle the dropdown
                     self.loc_dialog_field = 'room'
                     self.room_dropdown_open = not self.room_dropdown_open
@@ -1688,11 +2355,14 @@ class WorldMapEditor:
                     self._cancel_loc_dialog()
 
         elif event.type == pygame.MOUSEMOTION:
+            if self._handle_text_edit_mouse(event):
+                return
             if self._height_slider_drag:
                 self._height_slider_update(event.pos[0])
 
         elif event.type == pygame.MOUSEBUTTONUP:
             if event.button == 1:
+                self._handle_text_edit_mouse(event)
                 self._height_slider_drag = False
 
     def _height_slider_update(self, mouse_x: int):
@@ -1703,8 +2373,101 @@ class WorldMapEditor:
         t  = max(0.0, min(1.0, (mouse_x - tx) / tw))
         self.loc_dialog_height = round(HEIGHT_MIN + t * (HEIGHT_MAX - HEIGHT_MIN))
 
-    # ─────────────────────── drawing ─────────────────────────────────────────
+    def _handle_entity_panel_click(self, mx: int, my: int, button: int):
+        wm = self.current_map
+        if not wm:
+            return
 
+        # Height slider — higher priority than named button rects
+        if button == 1:
+            hit = self.ui.get('entity_height_slider')
+            if hit and hit.collidepoint(mx, my):
+                self._entity_height_slider_drag = True
+                self._entity_height_slider_update(mx)
+                return
+
+        # Room dropdown item clicks (popup floats above everything else)
+        if button == 1 and self.entity_room_dropdown_open:
+            eidx = self.entity_selected_idx
+            room_names = self._get_room_names()
+            for key, rect in self.ui.items():
+                if key.startswith('entity_room_dd_') and rect.collidepoint(mx, my):
+                    idx = int(key.split('_')[-1])
+                    if eidx is not None and 0 <= eidx < len(wm.entities) \
+                            and 0 <= idx < len(room_names):
+                        wm.entities[eidx].room = room_names[idx]
+                    self.entity_room_dropdown_open = False
+                    return
+            # Click outside popup → close it
+            self.entity_room_dropdown_open = False
+
+        for key, rect in self.ui.items():
+            if not rect.collidepoint(mx, my):
+                continue
+            if key == 'btn_entity_add':
+                self._push_undo()
+                e = WMEntity(name=f'entity_{len(wm.entities)+1}',
+                             sprite=self.vehicle_names[0] if self.vehicle_names else '')
+                wm.entities.append(e)
+                self.entity_selected_idx = len(wm.entities) - 1
+                self.entity_placing = True
+                self._entity_rubber = None
+            elif key == 'btn_entity_place':
+                # Toggle placement mode for selected entity
+                self.entity_placing = not self.entity_placing
+                self._entity_rubber = None
+            elif key == 'btn_entity_clear':
+                idx = self.entity_selected_idx
+                if idx is not None and 0 <= idx < len(wm.entities):
+                    self._push_undo()
+                    wm.entities[idx].path = []
+                self._entity_stop_placing()
+            elif key == 'btn_entity_closed':
+                idx = self.entity_selected_idx
+                if idx is not None and 0 <= idx < len(wm.entities):
+                    wm.entities[idx].closed = not wm.entities[idx].closed
+            elif key == 'btn_entity_done':
+                self._entity_stop_placing()
+            elif key.startswith('entity_del_'):
+                idx = int(key.split('_')[-1])
+                if 0 <= idx < len(wm.entities):
+                    self._push_undo()
+                    wm.entities.pop(idx)
+                    if self.entity_selected_idx == idx:
+                        self.entity_selected_idx = None
+                        self._entity_stop_placing()
+                    elif (self.entity_selected_idx or 0) > idx:
+                        self.entity_selected_idx = (self.entity_selected_idx or 1) - 1
+            elif key.startswith('entity_row_'):
+                idx = int(key.split('_')[-1])
+                if 0 <= idx < len(wm.entities):
+                    self.entity_selected_idx = idx
+                    self._entity_stop_placing()
+                    self.entity_room_dropdown_open = False
+            elif key.startswith('vehicle_pick_'):
+                vidx = int(key.split('_')[-1])
+                eidx = self.entity_selected_idx
+                if (eidx is not None and 0 <= eidx < len(wm.entities)
+                        and 0 <= vidx < len(self.vehicle_names)):
+                    wm.entities[eidx].sprite = self.vehicle_names[vidx]
+            elif key == 'entity_room_btn':
+                eidx = self.entity_selected_idx
+                if eidx is not None and 0 <= eidx < len(wm.entities):
+                    self.entity_room_dropdown_open = not self.entity_room_dropdown_open
+                    self.entity_room_dropdown_scroll = 0
+                    # Scroll so the current selection is visible
+                    room_names = self._get_room_names()
+                    cur_room = wm.entities[eidx].room
+                    if cur_room in room_names:
+                        idx2 = room_names.index(cur_room)
+                        self.entity_room_dropdown_scroll = max(0, idx2 - 4)
+            elif key == 'entity_room_clear':
+                eidx = self.entity_selected_idx
+                if eidx is not None and 0 <= eidx < len(wm.entities):
+                    wm.entities[eidx].room = ''
+                self.entity_room_dropdown_open = False
+
+    # ─────────────────────── drawing ─────────────────────────────────────────
     def draw(self, screen: pygame.Surface):
         if not self.active:
             return
@@ -1721,6 +2484,16 @@ class WorldMapEditor:
         # Height preview: show while dragging either height slider
         if self._height_slider_drag or self._entity_height_slider_drag:
             self._draw_height_preview(screen)
+
+        # Resolve the frame's cursor last, now that every clickable widget
+        # drawn above (toolbar buttons, mode buttons, map tabs, panel rows,
+        # sliders, dropdown fields/items, dialog buttons, icon/vehicle
+        # pickers) has had a chance to register itself via
+        # register_hoverable. Yields to whichever of move/resize/I-beam
+        # update() claimed this frame — see update_hover_cursor's docstring
+        # and update()'s _owned_cursor_kind guard (same convention as
+        # RoomEditor.draw()'s own uk.update_hover_cursor call).
+        uk.update_hover_cursor(pygame.mouse.get_pos())
 
     def _draw_height_preview(self, screen: pygame.Surface):
         """Draw a small Mode7-style preview in the bottom-left corner showing
@@ -1866,7 +2639,8 @@ class WorldMapEditor:
 
     # ── viewport ──────────────────────────────────────────────────────────────
 
-    def _get_chunk_surface(self, wm: WorldMap, cx: int, cy: int) -> Optional[pygame.Surface]:
+    def _get_chunk_surface(self, wm: WorldMap, cx: int, cy: int,
+                           allow_build: bool = True) -> Optional[pygame.Surface]:
         """Composed CHUNK_TILES×CHUNK_TILES native-resolution Surface for
         chunk (cx, cy) in wm's current frame, cached on the WorldMap
         itself (see WorldMap._chunk_cache). This is the fix for the
@@ -1880,11 +2654,17 @@ class WorldMapEditor:
         turns "one draw call per visible tile" into "one draw call per
         visible chunk" — a ~CHUNK_TILES² reduction — and the composed
         chunk is cached and reused every frame until a tile inside it
-        changes (see invalidate_chunk_at)."""
+        changes (see invalidate_chunk_at).
+
+        If the chunk isn't cached yet and `allow_build` is False (the
+        caller's per-frame build budget is spent), returns _CHUNK_PENDING
+        instead of building it here — see CHUNK_BUILD_BUDGET_PER_FRAME."""
         key = (wm.frame_idx, cx, cy)
         cache = wm._chunk_cache
         if key in cache:
             return cache[key]
+        if not allow_build:
+            return _CHUNK_PENDING
 
         base_tx = cx * CHUNK_TILES
         base_ty = cy * CHUNK_TILES
@@ -1948,10 +2728,18 @@ class WorldMapEditor:
             scy0 = sty // CHUNK_TILES
             scx1 = (etx - 1) // CHUNK_TILES
             scy1 = (ety - 1) // CHUNK_TILES
+            build_budget = CHUNK_BUILD_BUDGET_PER_FRAME
             for cy in range(scy0, scy1 + 1):
                 chunk_sy = cy * CHUNK_TILES * ds - cam_yi + self.vp_y
                 for cx in range(scx0, scx1 + 1):
-                    chunk = self._get_chunk_surface(wm, cx, cy)
+                    key = (wm.frame_idx, cx, cy)
+                    was_cached = key in wm._chunk_cache
+                    chunk = self._get_chunk_surface(
+                        wm, cx, cy, allow_build=(was_cached or build_budget > 0))
+                    if chunk is _CHUNK_PENDING:
+                        continue  # not built yet, budget spent — try again next frame
+                    if not was_cached:
+                        build_budget -= 1
                     if chunk is None:
                         continue
                     chunk_sx = cx * CHUNK_TILES * ds - cam_xi + self.vp_x
@@ -1960,8 +2748,12 @@ class WorldMapEditor:
 
         # Grid (only when tiles are large enough to make it readable)
         if self.show_grid and ds >= 8:
-            # Rebuild the grid surface only when zoom level changes
-            if self._vp_grid_ds != ds:
+            # Rebuild the grid surface when zoom level OR viewport size
+            # changes — it used to key off zoom alone, so resizing the
+            # panel (which changes vp_w every frame while dragging) kept
+            # blitting a grid surface sized for the *old* viewport, leaving
+            # it too narrow/short for the new one.
+            if self._vp_grid_ds != ds or self._vp_grid_size != (self.vp_w, self.vp_h):
                 gs = pygame.Surface((self.vp_w + ds, self.vp_h + ds),
                                     pygame.SRCALPHA)
                 gc = self.C['grid']
@@ -1973,6 +2765,7 @@ class WorldMapEditor:
                     pygame.draw.line(gs, gc, (c * ds, 0), (c * ds, self.vp_h + ds))
                 self._vp_grid_surf = gs
                 self._vp_grid_ds   = ds
+                self._vp_grid_size = (self.vp_w, self.vp_h)
             # Blit with sub-tile offset so lines stay locked to world coords
             off_x = cam_xi % ds
             off_y = cam_yi % ds
@@ -2173,202 +2966,496 @@ class WorldMapEditor:
                 screen.blit(lbl, (pts_screen[0][0] + NODE_R + 2,
                                   pts_screen[0][1] - 8))
 
+    # ── shared chrome primitives ────────────────────────────────────────────
+
+    def _hover(self, rect: pygame.Rect) -> bool:
+        mx, my = pygame.mouse.get_pos()
+        return rect.collidepoint(mx, my)
+
+    @staticmethod
+    def _load_dev_menu_icon(icon_key, box_size):
+        """Load one of the shared dev-menu PNG icons (assets/ui/dev_menu/icons/)
+        using the exact same crop + scaling as DevMenu._load_icon and Room
+        Editor's copy of it, so an icon like 'back' comes out pixel-identical
+        whether it's drawn on DevMenu's own header, Room Editor, or here.
+        Kept in sync with those on purpose — if their scaling logic changes,
+        mirror it here too."""
+        path = os.path.join('assets', 'ui', 'dev_menu', 'icons', f'{icon_key}.png')
+        try:
+            raw = pygame.image.load(path).convert_alpha()
+        except (FileNotFoundError, pygame.error):
+            return pygame.Surface((box_size, box_size), pygame.SRCALPHA)
+
+        content_rect = raw.get_bounding_rect(min_alpha=1)
+        if content_rect.width <= 0 or content_rect.height <= 0:
+            content_rect = raw.get_rect()
+        raw = raw.subsurface(content_rect).copy()
+
+        iw, ih = raw.get_size()
+        scale = min(box_size / max(1, iw), box_size / max(1, ih))
+
+        nw = max(1, round(iw * scale))
+        nh = max(1, round(ih * scale))
+        if scale >= 1.0:
+            # Enlarging: blow up to a whole-number multiple first with
+            # fast point-sampling (crisp, blocky, no filtering yet), THEN
+            # do the final resize down to the exact target size with
+            # smoothscale (area-averaging) instead of another
+            # point-sample. A second point-sample step here was the
+            # uneven-thickness bug: nw/nh is essentially never an exact
+            # divisor of the blown-up size, so nearest-neighbor rounds
+            # each destination pixel to its nearest source pixel
+            # independently — a 2px-wide stroke can land as 2px in one
+            # spot and 1px a few pixels over. smoothscale instead blends
+            # each destination pixel from the source pixels it actually
+            # covers, so stroke width comes out even. Doing the crisp
+            # blow-up first (rather than smoothscaling straight from the
+            # tiny source) keeps this from reading as blurry.
+            prescale = max(1, math.ceil(scale) * 2)
+            big = pygame.transform.scale(raw, (iw * prescale, ih * prescale))
+            scaled = pygame.transform.smoothscale(big, (nw, nh))
+        else:
+            # Shrinking: discarding detail rather than fabricating it, so
+            # smoothscale's area-averaging is the right tool here too —
+            # and, same as above, avoids the uneven-thickness point-sample
+            # bug.
+            scaled = pygame.transform.smoothscale(raw, (nw, nh))
+
+        canvas = pygame.Surface((box_size, box_size), pygame.SRCALPHA)
+        canvas.blit(scaled, ((box_size - nw) // 2, (box_size - nh) // 2))
+        return canvas
+
+    def _toolbar_button(self, screen, x: int, label: str, key: str,
+                         icon_fn=None, icon_surface=None, active: bool = False,
+                         w: int = 0, accent=None, danger: bool = False) -> int:
+        """Draw one top-bar pill button, register its hit rect under `key`
+        in self.ui, and return the x position for whatever comes next.
+        `icon_surface` (a pre-rendered PNG, e.g. the shared back-arrow icon)
+        takes priority over `icon_fn` (a vector line-glyph) when given, and
+        is simply centered in the button rather than recolored per state."""
+        accent = accent or uk.Theme.GOLD
+        col = uk.Theme.DANGER_BRIGHT if danger else accent
+        pad = 34 if (icon_fn is not None or icon_surface is not None) else 18
+        tw = self.font_small.size(label)[0]
+        bw = w or (tw + pad)
+        rect = pygame.Rect(x, 7, bw, TOP_BAR_H - 14)
+        hovered = self._hover(rect)
+
+        if active:
+            base = uk.lerp_color((22, 26, 35), col, 0.22)
+            border = col
+            border_w = 2
+        else:
+            base = uk.lerp_color((22, 26, 35), (34, 24, 24) if danger else (32, 37, 48),
+                                 1.0 if hovered else 0.0)
+            border = uk.lerp_color(uk.Theme.CARD_BORDER, col, 1.0 if hovered else 0.0)
+            border_w = 1
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border,
+                      border_width=border_w, radius=6, shadow=False)
+
+        label_color = uk.Theme.TEXT_PRIMARY if (active or hovered) else uk.Theme.TEXT_SECONDARY
+        if icon_surface is not None:
+            if label:
+                icon_rect = icon_surface.get_rect()
+                icon_rect.midleft = (rect.x + 8, rect.centery)
+                uk.blit_surface(screen, icon_surface, icon_rect, transient=False)
+                surf = self.font_small.render(label, True, label_color)
+                screen.blit(surf, (icon_rect.right + 5, rect.centery - surf.get_height() // 2))
+            else:
+                uk.blit_surface(screen, icon_surface, icon_surface.get_rect(center=rect.center),
+                                transient=False)
+        elif icon_fn is not None:
+            icon_rect = pygame.Rect(0, 0, 15, 15)
+            icon_rect.midleft = (rect.x + 8, rect.centery)
+            icon_fn(screen, icon_rect, label_color)
+            surf = self.font_small.render(label, True, label_color)
+            screen.blit(surf, (icon_rect.right + 5, rect.centery - surf.get_height() // 2))
+        else:
+            surf = self.font_small.render(label, True, label_color)
+            screen.blit(surf, surf.get_rect(center=rect.center))
+
+        self.ui[key] = rect
+        uk.register_hoverable(rect)
+        return rect.right + 5
+
+    def _icon_button(self, screen, rect: pygame.Rect, icon_fn=None, icon_surface=None,
+                     accent=None, danger: bool = False) -> bool:
+        """Small square icon button (list-row delete ×, tab ×, etc). Returns
+        whether it's currently hovered, so callers can pick their own hover
+        color for adjoining text if needed. `icon_surface` (a pre-rendered
+        PNG) takes priority over `icon_fn` (a vector line-glyph) when both
+        are given, same convention as _toolbar_button — and, like there,
+        it's centered as-is rather than recolored per hover/danger state,
+        since it's a fixed-color image rather than a drawn glyph."""
+        accent = accent or uk.Theme.GOLD
+        col = uk.Theme.DANGER_BRIGHT if danger else accent
+        hovered = self._hover(rect)
+        base = uk.lerp_color((26, 22, 22) if danger else (22, 26, 35),
+                             (52, 26, 26) if danger else (34, 39, 50),
+                             1.0 if hovered else 0.0)
+        border = uk.lerp_color(uk.Theme.CARD_BORDER, col, 1.0 if hovered else 0.0)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border,
+                      border_width=1, radius=5, shadow=False)
+        if icon_surface is not None:
+            uk.blit_surface(screen, icon_surface, icon_surface.get_rect(center=rect.center),
+                            transient=False)
+        elif icon_fn is not None:
+            icon_color = col if hovered else uk.Theme.TEXT_MUTED
+            icon_fn(screen, rect.inflate(-int(rect.w * 0.32), -int(rect.h * 0.32)), icon_color)
+        uk.register_hoverable(rect)
+        return hovered
+
+    def _pill_button(self, screen, rect: pygame.Rect, label: str,
+                     icon_fn=None, icon_surface=None, accent=None, danger: bool = False,
+                     active: bool = False) -> bool:
+        """Medium action button used inside the right panel (Add Entity,
+        Edit Path, Clear, OK/CANCEL, ...). Returns whether hovered.
+        `icon_surface` (a pre-rendered PNG) takes priority over `icon_fn`
+        (a vector line-glyph) when both are given, same convention as
+        _toolbar_button."""
+        accent = accent or uk.Theme.GOLD
+        col = uk.Theme.DANGER_BRIGHT if danger else accent
+        hovered = self._hover(rect)
+        t = 1.0 if (hovered or active) else 0.0
+        base = uk.lerp_color((22, 26, 35), (34, 24, 24) if danger else (30, 35, 46),
+                             1.0 if active else (0.6 if hovered else 0.0))
+        border = col if active else uk.lerp_color(uk.Theme.CARD_BORDER, col, t)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border,
+                      border_width=(2 if active else 1), radius=8, shadow=False)
+        if t > 0.01:
+            uk.draw_soft_glow(screen, rect.center, max(rect.w, rect.h) // 2, col,
+                              max_alpha=int(28 * t))
+        label_color = uk.Theme.TEXT_PRIMARY if (hovered or active) else uk.Theme.TEXT_SECONDARY
+        if icon_surface is not None:
+            icon_rect = icon_surface.get_rect()
+            icon_rect.midleft = (rect.x + 12, rect.centery)
+            uk.blit_surface(screen, icon_surface, icon_rect, transient=False)
+            surf = self.font_medium.render(label, True, label_color)
+            screen.blit(surf, (icon_rect.right + 6, rect.centery - surf.get_height() // 2))
+        elif icon_fn is not None:
+            icon_rect = pygame.Rect(0, 0, 16, 16)
+            icon_rect.midleft = (rect.x + 12, rect.centery)
+            icon_fn(screen, icon_rect, label_color)
+            surf = self.font_medium.render(label, True, label_color)
+            screen.blit(surf, (icon_rect.right + 6, rect.centery - surf.get_height() // 2))
+        else:
+            surf = self.font_medium.render(label, True, label_color)
+            screen.blit(surf, surf.get_rect(center=rect.center))
+        uk.register_hoverable(rect)
+        return hovered
+
+    def _draw_field_row(self, screen, rect: pygame.Rect, label: str, has_value: bool,
+                        placeholder: str, focused: bool = False,
+                        accent=None) -> None:
+        """Dropdown-shaped field row — the music picker, room pickers, etc.
+        `label` is the current value (or placeholder text when has_value
+        is False)."""
+        accent = accent or uk.Theme.GOLD
+        hovered = self._hover(rect)
+        border = accent if focused else uk.lerp_color(
+            uk.Theme.CARD_BORDER, accent, 0.6 if hovered else 0.0)
+        base = uk.lerp_color((20, 23, 32), (27, 31, 42), 1.0 if (focused or hovered) else 0.0)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border,
+                      border_width=(2 if focused else 1), radius=6, shadow=False)
+        shown = label if has_value else placeholder
+        col = uk.Theme.TEXT_PRIMARY if has_value else uk.Theme.TEXT_MUTED
+        val_surf = self.font_medium.render(shown, True, col)
+        clip = pygame.Rect(rect.x + 8, rect.y, rect.w - 30, rect.h)
+        screen.set_clip(clip)
+        screen.blit(val_surf, (rect.x + 8, rect.y + (rect.h - val_surf.get_height()) // 2))
+        screen.set_clip(None)
+        # Chevron: points down normally, up while the popup is open.
+        arrow_rect = pygame.Rect(0, 0, 10, 10)
+        arrow_rect.midright = (rect.right - 8, rect.centery)
+        _draw_chevron_icon(screen, arrow_rect, uk.Theme.TEXT_MUTED,
+                           direction=(-1 if focused else 1))
+        uk.register_hoverable(rect)
+
+    def _draw_text_caret(self, screen, x, y, height, color=None):
+        if int(self.cursor_blink * 2) % 2 != 0:
+            return
+        color = color or uk.Theme.TEXT_PRIMARY
+        uk.draw_rect_on(screen, color, pygame.Rect(int(x), int(y), 2, int(height)), 0, 0)
+
+    def _draw_live_text_field(self, screen, font, text_rect, click_rect, live=True):
+        """Shared tail for the field being typed into: records the field's
+        font / text-start-x / hit-rect so click and drag handling can turn a
+        mouse x into a caret index (see _text_index_from_x), then — when
+        `live` — draws the selection highlight behind the text and the caret
+        at self.cursor_pos. `text_rect` is where the text was just blitted;
+        `click_rect` is what counts as "inside this field" for the mouse.
+
+        `live=False` only records the geometry: the Location dialog's name
+        field still needs it while the Room field has focus, so the click
+        that moves focus back can already land the caret in the right spot."""
+        self._active_edit_rect = click_rect
+        self._active_edit_text_x = text_rect.x
+        self._active_edit_font = font
+        if not live:
+            return
+
+        if self._has_text_selection():
+            s, e = self._text_selection_range()
+            sx = text_rect.x + (font.size(self.text_input[:s])[0] if s else 0)
+            ex = text_rect.x + (font.size(self.text_input[:e])[0] if e else 0)
+            sel_rect = pygame.Rect(sx, text_rect.y, max(1, ex - sx), text_rect.height)
+            uk.draw_rect_on(screen, (*uk.Theme.KI_BLUE, 90), sel_rect, 0, 0)
+
+        caret_w = font.size(self.text_input[:self.cursor_pos])[0] if self.cursor_pos else 0
+        self._draw_text_caret(screen, text_rect.x + caret_w, text_rect.y, text_rect.height)
+
+    def _draw_range_slider(self, screen, x, y, w, value, vmin, vmax, dragging: bool,
+                           accent=None, label: str = None) -> tuple[pygame.Rect, int, int]:
+        """Horizontal slider used for the height controls (location dialog
+        and entity panel). Returns (hit_rect, track_x, track_w) so callers
+        can stash them for their own drag-update math."""
+        accent = accent or uk.Theme.GOLD
+        track_h = 8
+        track_rect = pygame.Rect(x, y, w, track_h)
+        uk.draw_rect_on(screen, uk.Theme.CARD_BG[:3], track_rect, 0, 4)
+        t = 0.0 if vmax == vmin else max(0.0, min(1.0, (value - vmin) / (vmax - vmin)))
+        thumb_x = int(x + t * w)
+        if thumb_x > x:
+            uk.draw_rect_on(screen, accent, pygame.Rect(x, y, thumb_x - x, track_h), 0, 4)
+        uk.draw_rect_on(screen, uk.Theme.CARD_BORDER, track_rect, 1, 4)
+        uk.draw_line_on(screen, uk.Theme.TEXT_DIM, (x, y - 3), (x, y + track_h + 3), 1)
+
+        thumb_r = 8
+        mx, my = pygame.mouse.get_pos()
+        hovered = abs(mx - thumb_x) <= thumb_r + 4 and abs(my - (y + track_h // 2)) <= thumb_r + 6
+        thumb_col = accent if (dragging or hovered) else uk.Theme.TEXT_PRIMARY
+        uk.draw_circle_on(screen, thumb_col, (thumb_x, y + track_h // 2), thumb_r)
+        uk.draw_circle_on(screen, uk.Theme.BG_BOTTOM, (thumb_x, y + track_h // 2), thumb_r - 3)
+
+        val_surf = self.font_small.render(str(int(value)), True, uk.Theme.TEXT_PRIMARY)
+        screen.blit(val_surf, val_surf.get_rect(centerx=thumb_x, bottom=y - 6))
+        min_s = self.font_small.render(str(vmin), True, uk.Theme.TEXT_DIM)
+        max_s = self.font_small.render(str(vmax), True, uk.Theme.TEXT_DIM)
+        screen.blit(min_s, (x, y + track_h + 6))
+        screen.blit(max_s, (x + w - max_s.get_width(), y + track_h + 6))
+
+        hit = pygame.Rect(x, y - thumb_r, w, track_h + thumb_r * 2)
+        uk.register_hoverable(hit)
+        return hit, x, w
+
+    def _draw_option_popup(self, screen, anchor: pygame.Rect, names: list,
+                           current_name, scroll: int, max_visible: int,
+                           rects_dict: dict, key_prefix: str, accent=None,
+                           empty_text: str = '(none found)') -> pygame.Rect:
+        """Floating option list anchored under a field row — shared by the
+        map-music, entity-room and location-room dropdowns. Populates
+        `rects_dict[f'{key_prefix}{absolute_index}']` for every visible row
+        so the existing click/scroll handlers (which already look up rects
+        by exactly those keys) keep working unchanged."""
+        accent = accent or uk.Theme.GOLD
+        mx, my = pygame.mouse.get_pos()
+        item_h = 26
+        visible = names[scroll:scroll + max_visible]
+        list_h = (max(1, len(visible)) * item_h) + 4
+        list_rect = pygame.Rect(anchor.x, anchor.bottom + 4, anchor.w, list_h)
+        if list_rect.bottom > self.screen_height - 8:
+            list_rect.y = max(TOP_BAR_H + 4, anchor.top - list_h - 4)
+
+        uk.draw_panel(screen, list_rect, bg=uk.Theme.PANEL_BG, border=accent,
+                      border_width=1, radius=8)
+
+        if not names:
+            s = self.font_small.render(empty_text, True, uk.Theme.TEXT_MUTED)
+            screen.blit(s, (list_rect.x + 8, list_rect.y + 6))
+            return list_rect
+
+        for i, name in enumerate(visible):
+            idx = scroll + i
+            item_rect = pygame.Rect(list_rect.x + 2, list_rect.y + 2 + i * item_h,
+                                    list_rect.w - 4, item_h)
+            is_cur = (name == current_name)
+            hovered = item_rect.collidepoint(mx, my)
+            if is_cur:
+                uk.draw_rect_on(screen, accent, item_rect, 0, 5)
+            elif hovered:
+                uk.draw_rect_on(screen, uk.Theme.CARD_BG_HOVER[:3], item_rect, 0, 5)
+            col = (uk.Theme.BG_BOTTOM if is_cur else
+                   uk.Theme.TEXT_PRIMARY if hovered else uk.Theme.TEXT_SECONDARY)
+            s = self.font_small.render(name, True, col)
+            screen.blit(s, (item_rect.x + 8, item_rect.y + (item_h - s.get_height()) // 2))
+            rects_dict[f'{key_prefix}{idx}'] = item_rect
+            uk.register_hoverable(item_rect)
+
+        if len(names) > max_visible:
+            end = min(scroll + max_visible, len(names))
+            hint = self.font_small.render(
+                f'\u2191\u2193 scroll  ({scroll + 1}\u2013{end} of {len(names)})',
+                True, uk.Theme.TEXT_DIM)
+            screen.blit(hint, (list_rect.x + 4, list_rect.bottom + 2))
+        return list_rect
+
     # ── top bar ───────────────────────────────────────────────────────────────
 
     def _draw_top_bar(self, screen: pygame.Surface):
         self.ui.clear()
         bar = pygame.Rect(0, 0, self.screen_width, TOP_BAR_H)
-        screen.draw_rect(self.C['topbar'], bar)
-        screen.draw_line(self.C['panel_border'],
-                         (0, TOP_BAR_H - 1), (self.screen_width, TOP_BAR_H - 1))
+        uk.draw_rect_on(screen, (12, 15, 23), bar, 0, 0)
+        uk.draw_rect_on(screen, (43, 49, 63), pygame.Rect(0, TOP_BAR_H - 1, self.screen_width, 1), 0, 0)
 
-        x = 6
-
-        def _btn(label: str, key: str, active: bool = False, w: int = 0) -> int:
-            tw = self.font_medium.size(label)[0]
-            bw = w or tw + 18
-            rect = pygame.Rect(x, 6, bw, TOP_BAR_H - 12)
-            mx, my = pygame.mouse.get_pos()
-            hover  = rect.collidepoint(mx, my) and my < TOP_BAR_H
-            bg = (self.C['btn_active'] if active
-                  else self.C['btn_hover'] if hover
-                  else self.C['btn'])
-            screen.draw_rect(bg, rect, border_radius=4)
-            screen.draw_rect(self.C['accent'] if active else self.C['panel_border'],
-                             rect, 1, border_radius=4)
-            surf = self.font_medium.render(label, True, self.C['text'])
-            screen.blit(surf, surf.get_rect(center=rect.center))
-            self.ui[key] = rect
-            return rect.right + 4
-
-        x = _btn('+ NEW',  'btn_new',  w=64)
-        x = _btn('💾 SAVE', 'btn_save', w=72)
+        x = 8
+        x = self._toolbar_button(screen, x, '', 'btn_back', icon_surface=self._back_icon, w=30)
         x += 6
+        uk.draw_rect_on(screen, (43, 49, 63), pygame.Rect(x, 8, 1, TOP_BAR_H - 16), 0, 0)
+        x += 8
+        x = self._toolbar_button(screen, x, 'New', 'btn_new', w=68)
+        x = self._toolbar_button(screen, x, 'Save', 'btn_save', w=76)
+        x += 8
+        uk.draw_rect_on(screen, (43, 49, 63), pygame.Rect(x, 8, 1, TOP_BAR_H - 16), 0, 0)
+        x += 8
 
-        # ── Map tabs (scrollable) ─────────────────────────────────────────────
-        # Reserve space on the right for frame controls (~180 px) and the mode/
-        # zoom buttons (~160 px) so tabs never collide with them.
-        TAB_AREA_RIGHT = self.vp_w - 434
-        # Each tab = name label + 18 px padding + 18 px × delete button.
-        TAB_DELETE_W = 18
-        ARROW_W      = 20
-        mx2, my2     = pygame.mouse.get_pos()
+        # ── Right-anchored: zoom + mode buttons ──────────────────────────────
+        # Pinned to the screen's own right edge — NOT to vp_w/self.panel_w —
+        # so this block sits in a fixed spot at the top-right of the whole
+        # editor and doesn't slide around as the panel splitter is dragged.
+        # Drawn before the map tabs below so its leftmost extent (right_x,
+        # once this loop is done) is known and the tabs can be kept clear
+        # of it.
+        right_x = self.screen_width - 8
 
-        # Clamp scroll so it never goes past the last tab.
+        zoom_label = self.font_small.render(f'{self.zoom}\u00d7', True, uk.Theme.TEXT_MUTED)
+        right_x -= zoom_label.get_width()
+        screen.blit(zoom_label, (right_x, (TOP_BAR_H - zoom_label.get_height()) // 2))
+        right_x -= 8
+
+        zi_w = 30
+        right_x -= zi_w
+        self._toolbar_button(screen, right_x, '', 'btn_zoom_in',
+                              icon_surface=self._zoom_in_icon, w=zi_w)
+        right_x -= 4
+        zo_w = 30
+        right_x -= zo_w
+        self._toolbar_button(screen, right_x, '', 'btn_zoom_out',
+                              icon_surface=self._zoom_out_icon, w=zo_w)
+        right_x -= 14
+        uk.draw_rect_on(screen, (43, 49, 63), pygame.Rect(right_x, 8, 1, TOP_BAR_H - 16), 0, 0)
+        right_x -= 10
+
+        # Mode buttons, right-to-left: Location, Entity, Paint, Scouter.
+        # Text-only — no icon_fn passed, so these stay flush left/right
+        # padded like any label-only toolbar pill (see the `pad` line in
+        # _toolbar_button: 18px for text-only vs 34px when an icon is drawn).
+        for mode_key, ui_key in (('location', 'btn_mode_location'),
+                                  ('entity',   'btn_mode_entity'),
+                                  ('paint',    'btn_mode_paint'),
+                                  ('scouter',  'btn_mode_scouter')):
+            label, _icon_fn, accent = self.MODE_INFO[mode_key]
+            bw = self.font_small.size(label)[0] + 18
+            right_x -= bw
+            self._toolbar_button(screen, right_x, label, ui_key,
+                                  active=(self.mode == mode_key), w=bw, accent=accent)
+            right_x -= 6
+
+        # ── Map tabs (scrollable) ───────────────────────────────────────────
+        TAB_AREA_RIGHT = right_x - 12   # keep tabs clear of the fixed right block above
+        TAB_DELETE_W = 20
+        ARROW_W = 22
         max_scroll = max(0, len(self.maps) - 1)
         self._map_tab_scroll = max(0, min(self._map_tab_scroll, max_scroll))
 
-        # Measure how many tabs fit from _map_tab_scroll onward.
-        tab_x     = x
+        tab_x = x
         need_left = self._map_tab_scroll > 0
         if need_left:
-            tab_x += ARROW_W + 2
+            tab_x += ARROW_W + 4
 
-        # First pass: figure out how many tabs fit so we know if we need › arrow.
         tabs_visible = []
         scan_x = tab_x
         for i in range(self._map_tab_scroll, len(self.maps)):
-            wm     = self.maps[i]
-            label  = wm.name[:14]
-            tab_w  = min(130, self.font_medium.size(label)[0] + 18 + TAB_DELETE_W)
+            wm = self.maps[i]
+            label = wm.name[:14]
+            tab_w = min(140, self.font_small.size(label)[0] + 20 + TAB_DELETE_W)
             if scan_x + tab_w + ARROW_W + 4 > TAB_AREA_RIGHT:
                 break
             tabs_visible.append((i, label, tab_w))
-            scan_x += tab_w + 4
+            scan_x += tab_w + 6
         need_right = (self._map_tab_scroll + len(tabs_visible)) < len(self.maps)
 
-        # Draw ‹ arrow if scrolled right.
         if need_left:
-            lx = _btn('‹', 'btn_tab_scroll_left', w=ARROW_W)
-        # Draw visible tabs.
-        tab_x = lx if need_left else x  # noqa: F821 — lx is always set when need_left
-        if not need_left:
-            tab_x = x
+            x = self._toolbar_button(screen, x, '', 'btn_tab_scroll_left',
+                                      icon_fn=lambda s, r, c: _draw_chevron_icon(s, r, c, -1), w=ARROW_W)
+
         for i, label, tab_w in tabs_visible:
             is_active = (i == self.current_map_idx)
-            bg        = self.C['accent'] if is_active else self.C['btn']
-            rect      = pygame.Rect(tab_x, 6, tab_w, TOP_BAR_H - 12)
-            hover_bg  = self.C['btn_hover'] if not is_active else self.C['accent']
-            draw_bg   = hover_bg if rect.collidepoint(mx2, my2) and my2 < TOP_BAR_H and not is_active else bg
-            screen.draw_rect(draw_bg, rect, border_radius=4)
-            screen.draw_rect(self.C['accent'] if is_active else self.C['panel_border'],
-                             rect, 1, border_radius=4)
-            # Name label (leave room for × button on the right)
-            name_surf = self.font_medium.render(label, True, self.C['text'])
-            name_rect = name_surf.get_rect(
-                midleft=(rect.x + 6, rect.centery))
-            screen.blit(name_surf, name_rect)
-            # × delete button inside the tab
-            del_r = pygame.Rect(rect.right - TAB_DELETE_W - 1, rect.y + 1,
-                                TAB_DELETE_W, rect.height - 2)
-            del_hover = del_r.collidepoint(mx2, my2) and my2 < TOP_BAR_H
-            del_bg    = self.C['danger'] if del_hover else (
-                (80, 30, 30) if is_active else (50, 30, 30))
-            screen.draw_rect(del_bg, del_r, border_radius=3)
-            x_surf = self.font_medium.render('×', True, self.C['text'])
-            screen.blit(x_surf, x_surf.get_rect(center=del_r.center))
-            self.ui[f'map_tab_{i}']    = rect
-            self.ui[f'map_del_{i}']    = del_r
-            tab_x = rect.right + 4
-        x = tab_x
-        # Draw › arrow if more tabs overflow to the right.
-        if need_right:
-            x = _btn('›', 'btn_tab_scroll_right', w=ARROW_W)
+            rect = pygame.Rect(x, 7, tab_w, TOP_BAR_H - 14)
+            hovered = self._hover(rect) and not is_active
+            accent = uk.Theme.GOLD
+            if is_active:
+                base = uk.lerp_color((22, 26, 35), accent, 0.22)
+                border = accent
+                border_w = 2
+            else:
+                base = uk.lerp_color((22, 26, 35), (30, 35, 46), 1.0 if hovered else 0.0)
+                border = uk.lerp_color(uk.Theme.CARD_BORDER, accent, 1.0 if hovered else 0.0)
+                border_w = 1
+            uk.draw_panel(screen, rect, bg=(*base, 255), border=border,
+                          border_width=border_w, radius=6, shadow=False)
 
-        # Frame controls — shown when a map exists
+            del_r = pygame.Rect(rect.right - TAB_DELETE_W - 3, rect.y + 3, TAB_DELETE_W, rect.h - 6)
+            self._icon_button(screen, del_r, icon_surface=self._close_icon, danger=True)
+
+            name_color = uk.Theme.TEXT_PRIMARY if (is_active or hovered) else uk.Theme.TEXT_SECONDARY
+            name_surf = self.font_small.render(label, True, name_color)
+            screen.set_clip(pygame.Rect(rect.x + 6, rect.y, rect.w - TAB_DELETE_W - 12, rect.h))
+            screen.blit(name_surf, (rect.x + 6, rect.centery - name_surf.get_height() // 2))
+            screen.set_clip(None)
+
+            self.ui[f'map_tab_{i}'] = rect
+            self.ui[f'map_del_{i}'] = del_r
+            uk.register_hoverable(rect)
+            x = rect.right + 6
+
+        if need_right:
+            x = self._toolbar_button(screen, x, '', 'btn_tab_scroll_right',
+                                      icon_fn=lambda s, r, c: _draw_chevron_icon(s, r, c, 1), w=ARROW_W)
+
+        # ── Frame controls ───────────────────────────────────────────────────
         wm_cur = self.current_map
         if wm_cur is not None:
-            x += 8
-            x = _btn('\u2039', 'btn_frame_prev', w=24)
+            x += 10
+            uk.draw_rect_on(screen, (43, 49, 63), pygame.Rect(x, 8, 1, TOP_BAR_H - 16), 0, 0)
+            x += 10
+            x = self._toolbar_button(screen, x, '', 'btn_frame_prev',
+                                      icon_fn=lambda s, r, c: _draw_chevron_icon(s, r, c, -1), w=24)
             fc_label = f'Frame {wm_cur.frame_idx + 1}/{wm_cur.frame_count}'
-            fc_w = self.font_medium.size(fc_label)[0] + 12
-            fc_rect = pygame.Rect(x, 6, fc_w, TOP_BAR_H - 12)
-            screen.draw_rect(self.C['panel'], fc_rect, border_radius=4)
-            screen.draw_rect(self.C['panel_border'], fc_rect, 1, border_radius=4)
-            fc_surf = self.font_medium.render(fc_label, True, self.C['text'])
+            fc_w = self.font_small.size(fc_label)[0] + 16
+            fc_rect = pygame.Rect(x, 7, fc_w, TOP_BAR_H - 14)
+            uk.draw_panel(screen, fc_rect, bg=(*uk.Theme.CARD_BG[:3], 255),
+                          border=uk.Theme.CARD_BORDER, border_width=1, radius=6, shadow=False)
+            fc_surf = self.font_small.render(fc_label, True, uk.Theme.TEXT_SECONDARY)
             screen.blit(fc_surf, fc_surf.get_rect(center=fc_rect.center))
             self.ui['frame_label'] = fc_rect
-            x = fc_rect.right + 4
-            x = _btn('\u203a', 'btn_frame_next', w=24)
-            x = _btn('+F', 'btn_frame_add', w=32)
+            x = fc_rect.right + 5
+            x = self._toolbar_button(screen, x, '', 'btn_frame_next',
+                                      icon_fn=lambda s, r, c: _draw_chevron_icon(s, r, c, 1), w=24)
+            x = self._toolbar_button(screen, x, '', 'btn_frame_add', icon_surface=self._plus_icon, w=30)
             if wm_cur.frame_count > 1:
-                x = _btn('-F', 'btn_frame_del', w=32)
-
-        # Right-side buttons
-        right_x = self.vp_w - 4
-        # Zoom
-        zoom_label = self.font_medium.render(f'{self.zoom}×', True, self.C['dim'])
-        right_x -= zoom_label.get_width() + 4
-        screen.blit(zoom_label, (right_x, (TOP_BAR_H - zoom_label.get_height()) // 2))
-        right_x -= 30
-        zi_rect = pygame.Rect(right_x, 6, 28, TOP_BAR_H - 12)
-        mx2, my2 = pygame.mouse.get_pos()
-        screen.draw_rect((self.C['btn_hover'] if zi_rect.collidepoint(mx2, my2) and my2 < TOP_BAR_H else self.C['btn']), zi_rect, border_radius=4)
-        screen.blit(self.font_medium.render('+', True, self.C['text']), self.font_medium.render('+', True, self.C['text']).get_rect(center=zi_rect.center))
-        self.ui['btn_zoom_in'] = zi_rect
-        right_x -= 32
-        zo_rect = pygame.Rect(right_x, 6, 28, TOP_BAR_H - 12)
-        screen.draw_rect((self.C['btn_hover'] if zo_rect.collidepoint(mx2, my2) and my2 < TOP_BAR_H else self.C['btn']), zo_rect, border_radius=4)
-        screen.blit(self.font_medium.render('−', True, self.C['text']), self.font_medium.render('−', True, self.C['text']).get_rect(center=zo_rect.center))
-        self.ui['btn_zoom_out'] = zo_rect
-        right_x -= 6
-
-        # Mode buttons (anchored to right)
-        right_x -= 94
-        loc_rect = pygame.Rect(right_x, 6, 90, TOP_BAR_H - 12)
-        bg_loc = (self.C['btn_active'] if self.mode == 'location'
-                  else self.C['btn_hover'] if loc_rect.collidepoint(mx2, my2) and my2 < TOP_BAR_H
-                  else self.C['btn'])
-        screen.draw_rect(bg_loc, loc_rect, border_radius=4)
-        screen.draw_rect(self.C['panel_border'], loc_rect, 1, border_radius=4)
-        screen.blit(self.font_medium.render('Location', True, self.C['text']),
-                    self.font_medium.render('Location', True, self.C['text']).get_rect(center=loc_rect.center))
-        self.ui['btn_mode_location'] = loc_rect
-
-        right_x -= 68
-        ent_rect = pygame.Rect(right_x, 6, 64, TOP_BAR_H - 12)
-        bg_ent = (self.C['btn_active'] if self.mode == 'entity'
-                  else self.C['btn_hover'] if ent_rect.collidepoint(mx2, my2) and my2 < TOP_BAR_H
-                  else self.C['btn'])
-        screen.draw_rect(bg_ent, ent_rect, border_radius=4)
-        screen.draw_rect(self.C['panel_border'], ent_rect, 1, border_radius=4)
-        screen.blit(self.font_medium.render('Entity', True, self.C['text']),
-                    self.font_medium.render('Entity', True, self.C['text']).get_rect(center=ent_rect.center))
-        self.ui['btn_mode_entity'] = ent_rect
-
-        right_x -= 66
-        pnt_rect = pygame.Rect(right_x, 6, 62, TOP_BAR_H - 12)
-        bg_pnt = (self.C['btn_active'] if self.mode == 'paint'
-                  else self.C['btn_hover'] if pnt_rect.collidepoint(mx2, my2) and my2 < TOP_BAR_H
-                  else self.C['btn'])
-        screen.draw_rect(bg_pnt, pnt_rect, border_radius=4)
-        screen.draw_rect(self.C['panel_border'], pnt_rect, 1, border_radius=4)
-        screen.blit(self.font_medium.render('Paint', True, self.C['text']),
-                    self.font_medium.render('Paint', True, self.C['text']).get_rect(center=pnt_rect.center))
-        self.ui['btn_mode_paint'] = pnt_rect
-
-        right_x -= 78
-        sct_rect = pygame.Rect(right_x, 6, 74, TOP_BAR_H - 12)
-        bg_sct = (self.C['btn_active'] if self.mode == 'scouter'
-                  else self.C['btn_hover'] if sct_rect.collidepoint(mx2, my2) and my2 < TOP_BAR_H
-                  else self.C['btn'])
-        screen.draw_rect(bg_sct, sct_rect, border_radius=4)
-        screen.draw_rect(self.C['panel_border'], sct_rect, 1, border_radius=4)
-        screen.blit(self.font_medium.render('Scouter', True, self.C['text']),
-                    self.font_medium.render('Scouter', True, self.C['text']).get_rect(center=sct_rect.center))
-        self.ui['btn_mode_scouter'] = sct_rect
+                x = self._toolbar_button(screen, x, '', 'btn_frame_del',
+                                          icon_surface=self._close_icon, w=30, danger=True)
 
     # ── right panel ───────────────────────────────────────────────────────────
 
     def _draw_panel(self, screen: pygame.Surface):
+        if not self.panel_open:
+            return
         panel_rect = pygame.Rect(self.vp_x + self.vp_w, TOP_BAR_H,
-                                 PANEL_W, self.screen_height - TOP_BAR_H)
-        screen.draw_rect(self.C['panel'], panel_rect)
-        screen.draw_line(self.C['panel_border'],
-                         panel_rect.topleft, panel_rect.bottomleft, 2)
+                                 self.panel_w, self.screen_height - TOP_BAR_H)
+        uk.draw_rect_on(screen, uk.Theme.PANEL_BG[:3], panel_rect, 0, 0)
 
-        px = panel_rect.x + 10
-        py = panel_rect.y + 10
+        # Splitter border — thickens/brightens on hover or while actively
+        # dragging, as a visual affordance that it can be grabbed.
+        mx, my = pygame.mouse.get_pos()
+        splitter_live = self._panel_resize_active or self._over_splitter(mx, my)
+        border_w = 4 if splitter_live else 2
+        border_col = uk.Theme.GOLD_BRIGHT if splitter_live else uk.Theme.GOLD
+        uk.draw_rect_on(screen, border_col,
+                        pygame.Rect(panel_rect.x - (border_w - 2), panel_rect.y, border_w, panel_rect.h), 0, 0)
+
+        px = panel_rect.x + 14
+        py = panel_rect.y + 12
 
         py = self._draw_map_music_row(screen, px, py)
 
@@ -2381,562 +3468,277 @@ class WorldMapEditor:
         else:
             self._draw_location_panel(screen, px, py)
 
-        # Drawn last so the open dropdown list floats above mode-panel content.
         if self.music_dropdown_open:
             self._draw_music_dropdown_popup(screen, px)
 
     def _draw_map_music_row(self, screen: pygame.Surface, px: int, py: int) -> int:
-        """Draw the world map's music-track picker. Shown above the mode-specific
-        panel content since it applies to the whole map, not any one mode.
-
-        Returns the y position for whatever gets drawn below it.
-        """
         wm = self.current_map
         mx2, my2 = pygame.mouse.get_pos()
+        row_w = self.panel_layout_w - 30
 
-        lbl = self.font_small.render('Mode7 Music:', True, self.C['dim'])
+        lbl = self.font_small.render('MODE7 MUSIC', True, uk.Theme.TEXT_DIM)
         screen.blit(lbl, (px, py))
         py += 18
 
-        btn_rect = pygame.Rect(px, py, PANEL_W - 40, 28)
-        focused  = self.music_dropdown_open
-        border_col = self.C['accent'] if focused else self.C['input_border']
-        bg_col     = self.C['btn_hover'] if focused else self.C['input_bg']
-        screen.draw_rect(bg_col, btn_rect, border_radius=4)
-        screen.draw_rect(border_col, btn_rect, 1, border_radius=4)
-
+        btn_rect = pygame.Rect(px, py, row_w, 28)
         track = wm.music if wm else ''
-        label = track if track else '<no music>'
-        lbl_col = self.C['text'] if track else self.C['dim']
-        lbl_surf = self.font_medium.render(label, True, lbl_col)
-        screen.set_clip(pygame.Rect(btn_rect.x + 6, btn_rect.y, btn_rect.w - 26, btn_rect.h))
-        screen.blit(lbl_surf, (btn_rect.x + 6, btn_rect.y + 5))
-        screen.set_clip(None)
-        arrow = '▲' if self.music_dropdown_open else '▼'
-        arr_s = self.font_medium.render(arrow, True, self.C['dim'])
-        screen.blit(arr_s, (btn_rect.right - arr_s.get_width() - 8, btn_rect.y + 5))
+        self._draw_field_row(screen, btn_rect, track, bool(track), '<no music>',
+                             focused=self.music_dropdown_open)
         self.ui['music_dropdown_btn'] = btn_rect
         py += 34
 
-        # Clear button — separate row so it doesn't crowd the dropdown button.
         if wm and wm.music:
-            clr_rect = pygame.Rect(px, py, PANEL_W - 40, 20)
-            hover = clr_rect.collidepoint(mx2, my2)
-            clr_lbl = self.font_small.render('× clear music', True,
-                                             self.C['danger'] if hover else self.C['dim'])
+            clr_rect = pygame.Rect(px, py, row_w, 18)
+            hovered = clr_rect.collidepoint(mx2, my2)
+            clr_lbl = self.font_small.render(
+                '\u00d7 clear music', True,
+                uk.Theme.DANGER_BRIGHT if hovered else uk.Theme.TEXT_MUTED)
             screen.blit(clr_lbl, (px, py))
             self.ui['music_clear'] = clr_rect
+            uk.register_hoverable(clr_rect)
             py += 22
         else:
             self.ui.pop('music_clear', None)
 
         py += 6
-        screen.draw_line(self.C['panel_border'], (px, py), (px + PANEL_W - 40, py), 1)
-        py += 10
+        uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER, pygame.Rect(px, py, row_w, 1), 0, 0)
+        py += 12
         return py
 
     def _draw_music_dropdown_popup(self, screen: pygame.Surface, px: int):
-        """Floating track list, drawn above everything else in the panel."""
         btn_rect = self.ui.get('music_dropdown_btn')
         if not btn_rect:
             return
-        mx2, my2 = pygame.mouse.get_pos()
         names = self.music_dropdown_names
-        item_h = 22
-
+        item_h = 26
         max_rows_on_screen = max(1, (self.screen_height - btn_rect.bottom - 10) // item_h)
         visible_rows = max(1, min(max_rows_on_screen, 8, len(names) or 1))
         self._music_dropdown_visible_rows = visible_rows
 
         max_scroll = max(0, len(names) - visible_rows)
         self.music_dropdown_scroll = max(0, min(self.music_dropdown_scroll, max_scroll))
-        scroll = self.music_dropdown_scroll
 
-        list_h = max(item_h, min(len(names), visible_rows) * item_h)
-        list_rect = pygame.Rect(btn_rect.x, btn_rect.bottom, btn_rect.w, list_h)
-
-        list_bg = pygame.Surface((list_rect.w, list_rect.h), pygame.SRCALPHA)
-        list_bg.fill((30, 30, 45, 240))
-        screen.blit(list_bg, list_rect.topleft)
-        screen.draw_rect(self.C['accent'], list_rect, 1)
-
-        self.ui['music_dropdown_list_rect'] = list_rect
         for key in [k for k in self.ui if k.startswith('music_dd_')]:
             del self.ui[key]
 
         wm = self.current_map
         cur_track = wm.music if wm else ''
+        list_rect = self._draw_option_popup(
+            screen, btn_rect, names, cur_track, self.music_dropdown_scroll,
+            visible_rows, self.ui, 'music_dd_', empty_text='<no tracks found>')
+        self.ui['music_dropdown_list_rect'] = list_rect
 
-        if not names:
-            empty_surf = self.font_small.render('<no tracks found>', True, self.C['dim'])
-            screen.blit(empty_surf, (list_rect.x + 4, list_rect.y + 4))
-        else:
-            visible_names = names[scroll:scroll + visible_rows]
-            for i, name in enumerate(visible_names):
-                item_rect = pygame.Rect(list_rect.x, list_rect.y + i * item_h, list_rect.w, item_h)
-                is_sel = name == cur_track
-                hovered = item_rect.collidepoint(mx2, my2)
-                if is_sel:
-                    screen.draw_rect(self.C['accent'], item_rect)
-                elif hovered:
-                    screen.draw_rect(self.C['btn_hover'], item_rect)
-                col = self.C['text'] if (is_sel or hovered) else self.C['dim']
-                item_surf = self.font_small.render(name, True, col)
-                screen.blit(item_surf, (item_rect.x + 6, item_rect.y + 4))
-                self.ui[f'music_dd_{scroll + i}'] = item_rect
-
-            if len(names) > visible_rows:
-                sh_lbl = self.font_small.render(
-                    f'↑↓ scroll  ({scroll+1}–{min(scroll+visible_rows, len(names))} of {len(names)})',
-                    True, self.C['dim'])
-                screen.blit(sh_lbl, (list_rect.x + 4, list_rect.bottom + 2))
-
-    def _handle_entity_panel_click(self, mx: int, my: int, button: int):
-        wm = self.current_map
-        if not wm:
-            return
-
-        # Height slider — higher priority than named button rects
-        if button == 1:
-            hit = self.ui.get('entity_height_slider')
-            if hit and hit.collidepoint(mx, my):
-                self._entity_height_slider_drag = True
-                self._entity_height_slider_update(mx)
-                return
-
-        # Room dropdown item clicks (popup floats above everything else)
-        if button == 1 and self.entity_room_dropdown_open:
-            eidx = self.entity_selected_idx
-            room_names = self._get_room_names()
-            for key, rect in self.ui.items():
-                if key.startswith('entity_room_dd_') and rect.collidepoint(mx, my):
-                    idx = int(key.split('_')[-1])
-                    if eidx is not None and 0 <= eidx < len(wm.entities) \
-                            and 0 <= idx < len(room_names):
-                        wm.entities[eidx].room = room_names[idx]
-                    self.entity_room_dropdown_open = False
-                    return
-            # Click outside popup → close it
-            self.entity_room_dropdown_open = False
-
-        for key, rect in self.ui.items():
-            if not rect.collidepoint(mx, my):
-                continue
-            if key == 'btn_entity_add':
-                self._push_undo()
-                e = WMEntity(name=f'entity_{len(wm.entities)+1}',
-                             sprite=self.vehicle_names[0] if self.vehicle_names else '')
-                wm.entities.append(e)
-                self.entity_selected_idx = len(wm.entities) - 1
-                self.entity_placing = True
-                self._entity_rubber = None
-            elif key == 'btn_entity_place':
-                # Toggle placement mode for selected entity
-                self.entity_placing = not self.entity_placing
-                self._entity_rubber = None
-            elif key == 'btn_entity_clear':
-                idx = self.entity_selected_idx
-                if idx is not None and 0 <= idx < len(wm.entities):
-                    self._push_undo()
-                    wm.entities[idx].path = []
-                self._entity_stop_placing()
-            elif key == 'btn_entity_closed':
-                idx = self.entity_selected_idx
-                if idx is not None and 0 <= idx < len(wm.entities):
-                    wm.entities[idx].closed = not wm.entities[idx].closed
-            elif key == 'btn_entity_done':
-                self._entity_stop_placing()
-            elif key.startswith('entity_del_'):
-                idx = int(key.split('_')[-1])
-                if 0 <= idx < len(wm.entities):
-                    self._push_undo()
-                    wm.entities.pop(idx)
-                    if self.entity_selected_idx == idx:
-                        self.entity_selected_idx = None
-                        self._entity_stop_placing()
-                    elif (self.entity_selected_idx or 0) > idx:
-                        self.entity_selected_idx = (self.entity_selected_idx or 1) - 1
-            elif key.startswith('entity_row_'):
-                idx = int(key.split('_')[-1])
-                if 0 <= idx < len(wm.entities):
-                    self.entity_selected_idx = idx
-                    self._entity_stop_placing()
-                    self.entity_room_dropdown_open = False
-            elif key.startswith('vehicle_pick_'):
-                vidx = int(key.split('_')[-1])
-                eidx = self.entity_selected_idx
-                if (eidx is not None and 0 <= eidx < len(wm.entities)
-                        and 0 <= vidx < len(self.vehicle_names)):
-                    wm.entities[eidx].sprite = self.vehicle_names[vidx]
-            elif key == 'entity_room_btn':
-                eidx = self.entity_selected_idx
-                if eidx is not None and 0 <= eidx < len(wm.entities):
-                    self.entity_room_dropdown_open = not self.entity_room_dropdown_open
-                    self.entity_room_dropdown_scroll = 0
-                    # Scroll so the current selection is visible
-                    room_names = self._get_room_names()
-                    cur_room = wm.entities[eidx].room
-                    if cur_room in room_names:
-                        idx2 = room_names.index(cur_room)
-                        self.entity_room_dropdown_scroll = max(0, idx2 - 4)
-            elif key == 'entity_room_clear':
-                eidx = self.entity_selected_idx
-                if eidx is not None and 0 <= eidx < len(wm.entities):
-                    wm.entities[eidx].room = ''
-                self.entity_room_dropdown_open = False
+    # ── entity panel ─────────────────────────────────────────────────────────
 
     def _draw_entity_panel(self, screen: pygame.Surface, px: int, py: int):
-        wm       = self.current_map
-        mx2, my2 = pygame.mouse.get_pos()
+        wm = self.current_map
+        row_w = self.panel_layout_w - 30
+        accent = uk.Theme.KI_BLUE
 
-        # ── Header ──────────────────────────────────────────────────────────
-        hdr = self.font_medium.render('ENTITIES', True, self.C['accent'])
-        screen.blit(hdr, (px, py));  py += 28
+        hdr = self.font_large.render('ENTITIES', True, accent)
+        screen.blit(hdr, (px, py));  py += 24
 
-        # Status hint
         if self.entity_placing:
             hint = self.font_small.render(
-                'Left-click map → add waypoint', True, self.C['entity_path'])
+                'Left-click map \u2192 add waypoint', True, accent)
             screen.blit(hint, (px, py));  py += 16
-            hint2 = self.font_small.render(
-                'Right-click → stop', True, self.C['dim'])
+            hint2 = self.font_small.render('Right-click \u2192 stop', True, uk.Theme.TEXT_DIM)
             screen.blit(hint2, (px, py));  py += 20
         else:
-            hint = self.font_small.render('Select entity then Edit Path', True, self.C['dim'])
+            hint = self.font_small.render('Select entity, then Edit Path', True, uk.Theme.TEXT_DIM)
             screen.blit(hint, (px, py));  py += 22
 
-        # ── Add Entity button ──────────────────────────────────────────────
-        add_rect = pygame.Rect(px, py, PANEL_W - 20, 26)
-        hover = add_rect.collidepoint(mx2, my2)
-        screen.draw_rect(self.C['btn_hover'] if hover else self.C['btn'],
-                         add_rect, border_radius=4)
-        screen.draw_rect(self.C['accent'], add_rect, 1, border_radius=4)
-        screen.blit(self.font_medium.render('+ Add Entity', True, self.C['text']),
-                    self.font_medium.render('+ Add Entity', True, self.C['text']).get_rect(
-                        center=add_rect.center))
+        add_rect = pygame.Rect(px, py, row_w, 30)
+        self._pill_button(screen, add_rect, 'Add Entity', icon_fn=_draw_plus_icon, accent=accent)
         self.ui['btn_entity_add'] = add_rect
-        py += 32
+        py += 36
 
-        # ── Entity list ───────────────────────────────────────────────────
         entities = wm.entities if wm else []
         panel_bottom = self.screen_height - TOP_BAR_H
-        list_clip = pygame.Rect(px - 4, py, PANEL_W - 12,
-                                min(panel_bottom - py - 10,
-                                    len(entities) * 38 + 10))
+        list_clip = pygame.Rect(px - 4, py, self.panel_layout_w - 12,
+                                max(0, min(panel_bottom - py - 10, len(entities) * 40 + 10)))
         screen.set_clip(list_clip)
+        mx2, my2 = pygame.mouse.get_pos()
         for i, e in enumerate(entities):
-            is_sel   = (i == self.entity_selected_idx)
-            row_rect = pygame.Rect(px - 4, py, PANEL_W - 30, 34)
-            bg = self.C['btn_active'] if is_sel else self.C['btn']
-            screen.draw_rect(bg, row_rect, border_radius=3)
+            is_sel = (i == self.entity_selected_idx)
+            row_rect = pygame.Rect(px - 4, py, self.panel_layout_w - 30, 36)
+            hovered = row_rect.collidepoint(mx2, my2)
+            base = uk.lerp_color((22, 26, 35), accent, 0.22 if is_sel else (0.5 if hovered else 0.0))
+            border = accent if is_sel else uk.lerp_color(uk.Theme.CARD_BORDER, accent, 1.0 if hovered else 0.0)
+            uk.draw_panel(screen, row_rect, bg=(*base, 255), border=border,
+                          border_width=(2 if is_sel else 1), radius=6, shadow=False)
 
-            # Sprite thumbnail
             vs = self._get_vehicle_sprite(e.sprite) if e.sprite else None
             thumb = vs.get_panel_thumb(28) if vs else None
+            thumb_rect = pygame.Rect(row_rect.x + 5, row_rect.y + 4, 28, 28)
             if thumb:
-                screen.blit(thumb, (px, py + 3))
+                screen.blit(thumb, thumb_rect)
             else:
-                screen.draw_rect(self.C['entity_node'],
-                                 (px, py + 5, 28, 24), border_radius=3)
+                uk.draw_panel(screen, thumb_rect, bg=(*uk.Theme.CARD_BG[:3], 255),
+                              border=uk.Theme.CARD_BORDER, border_width=1, radius=5, shadow=False)
+                _draw_vehicle_icon(screen, thumb_rect.inflate(-6, -6), uk.Theme.TEXT_MUTED)
 
-            # Name + info
-            name_s  = self.font_small.render(
-                e.name or f'entity_{i}', True,
-                self.C['accent'] if is_sel else self.C['text'])
-            pts_s   = self.font_small.render(
-                f'{len(e.path)} pts  {"⟳ loop" if e.closed else "↔ ping-pong"}',
-                True, self.C['dim'])
-            screen.blit(name_s, (px + 32, py + 3))
-            screen.blit(pts_s,  (px + 32, py + 18))
+            name_col = uk.Theme.GOLD_BRIGHT if is_sel else uk.Theme.TEXT_PRIMARY
+            name_s = self.font_small.render(e.name or f'entity_{i}', True, name_col)
+            pts_s = self.font_small.render(
+                f'{len(e.path)} pts  {"loop" if e.closed else "ping-pong"}',
+                True, uk.Theme.TEXT_MUTED)
+            screen.blit(name_s, (thumb_rect.right + 8, row_rect.y + 4))
+            screen.blit(pts_s,  (thumb_rect.right + 8, row_rect.y + 19))
 
-            # Room-linked indicator: small coloured dot when a room is assigned
             if e.room:
-                dot_x = row_rect.right - 38
-                dot_y = py + 7
-                screen.draw_circle(self.C['entity_path'], (dot_x, dot_y), 5)
-                screen.draw_circle(self.C['text'],        (dot_x, dot_y), 5, 1)
-                tip_s = self.font_small.render('⇒', True, self.C['entity_path'])
-                screen.blit(tip_s, (dot_x - tip_s.get_width() // 2, dot_y + 7))
+                dot_x = row_rect.right - 40
+                dot_y = row_rect.y + 10
+                uk.draw_circle_on(screen, accent, (dot_x, dot_y), 5)
+                uk.draw_circle_on(screen, uk.Theme.BG_BOTTOM, (dot_x, dot_y), 5, 1)
 
-            # Delete button
-            del_rect = pygame.Rect(px + PANEL_W - 34, py + 7, 20, 20)
-            del_bg   = self.C['danger'] if del_rect.collidepoint(mx2, my2) else (80, 40, 40)
-            screen.draw_rect(del_bg, del_rect, border_radius=3)
-            screen.blit(self.font_small.render('×', True, (255, 255, 255)),
-                        self.font_small.render('×', True, (255, 255, 255)).get_rect(
-                            center=del_rect.center))
+            del_rect = pygame.Rect(row_rect.right - 26, row_rect.y + 8, 20, 20)
+            self._icon_button(screen, del_rect, icon_surface=self._close_icon, danger=True)
 
             self.ui[f'entity_row_{i}'] = row_rect
             self.ui[f'entity_del_{i}'] = del_rect
-            py += 38
-
+            uk.register_hoverable(row_rect)
+            py += 40
         screen.set_clip(None)
         py += 8
 
-        # ── Selected entity controls ──────────────────────────────────────
         eidx = self.entity_selected_idx
         if eidx is not None and wm and 0 <= eidx < len(wm.entities):
             e = wm.entities[eidx]
-            # Divider
-            screen.draw_line(self.C['panel_border'],
-                             (px - 4, py), (px + PANEL_W - 20, py), 1)
-            py += 8
+            uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER, pygame.Rect(px - 4, py, row_w + 6, 1), 0, 0)
+            py += 10
 
-            sel_lbl = self.font_small.render(
-                f'Selected: {e.name}', True, self.C['entity_sel'])
-            screen.blit(sel_lbl, (px, py));  py += 20
+            sel_lbl = self.font_small.render(f'Selected: {e.name}', True, uk.Theme.GOLD_BRIGHT)
+            screen.blit(sel_lbl, (px, py));  py += 22
 
-            # Edit Path / Done buttons
+            half_w = (row_w - 8) // 2
             if self.entity_placing:
-                done_rect = pygame.Rect(px, py, (PANEL_W - 24) // 2 - 2, 26)
-                hover = done_rect.collidepoint(mx2, my2)
-                screen.draw_rect(self.C['success'] if hover else (40, 120, 40),
-                                 done_rect, border_radius=4)
-                screen.blit(self.font_medium.render('✓ Done', True, (255, 255, 255)),
-                            self.font_medium.render('✓ Done', True, (255, 255, 255)).get_rect(
-                                center=done_rect.center))
+                done_rect = pygame.Rect(px, py, half_w, 28)
+                self._pill_button(screen, done_rect, 'Done', icon_fn=_draw_check_icon,
+                                  accent=(90, 210, 110), active=True)
                 self.ui['btn_entity_done'] = done_rect
             else:
-                place_rect = pygame.Rect(px, py, (PANEL_W - 24) // 2 - 2, 26)
-                hover = place_rect.collidepoint(mx2, my2)
-                screen.draw_rect(self.C['btn_hover'] if hover else self.C['btn'],
-                                 place_rect, border_radius=4)
-                screen.draw_rect(self.C['entity_path'], place_rect, 1, border_radius=4)
-                screen.blit(self.font_medium.render('✎ Edit Path', True, self.C['text']),
-                            self.font_medium.render('✎ Edit Path', True, self.C['text']).get_rect(
-                                center=place_rect.center))
+                place_rect = pygame.Rect(px, py, half_w, 28)
+                self._pill_button(screen, place_rect, 'Edit Path', accent=accent)
                 self.ui['btn_entity_place'] = place_rect
 
-            clear_rect = pygame.Rect(
-                px + (PANEL_W - 24) // 2 + 2, py, (PANEL_W - 24) // 2 - 2, 26)
-            chover = clear_rect.collidepoint(mx2, my2)
-            screen.draw_rect((120, 40, 40) if chover else (80, 30, 30),
-                             clear_rect, border_radius=4)
-            screen.blit(self.font_medium.render('Clear Path', True, self.C['text']),
-                        self.font_medium.render('Clear Path', True, self.C['text']).get_rect(
-                            center=clear_rect.center))
+            clear_rect = pygame.Rect(px + half_w + 8, py, half_w, 28)
+            self._pill_button(screen, clear_rect, 'Clear Path', icon_surface=self._close_icon, danger=True)
             self.ui['btn_entity_clear'] = clear_rect
-            py += 32
-
-            # Closed/ping-pong toggle
-            closed_rect = pygame.Rect(px, py, PANEL_W - 20, 26)
-            closed_label = ('⟳ Closed Loop' if e.closed else '↔ Ping-Pong (open)')
-            is_closed_hover = closed_rect.collidepoint(mx2, my2)
-            bg_closed = (self.C['btn_active'] if e.closed
-                         else self.C['btn_hover'] if is_closed_hover
-                         else self.C['btn'])
-            screen.draw_rect(bg_closed, closed_rect, border_radius=4)
-            screen.draw_rect(self.C['panel_border'], closed_rect, 1, border_radius=4)
-            screen.blit(self.font_medium.render(closed_label, True, self.C['text']),
-                        self.font_medium.render(closed_label, True, self.C['text']).get_rect(
-                            center=closed_rect.center))
-            self.ui['btn_entity_closed'] = closed_rect
             py += 34
 
-            # ── Height slider ──────────────────────────────────────────────
+            closed_rect = pygame.Rect(px, py, row_w, 28)
+            closed_label = 'Closed Loop' if e.closed else 'Ping-Pong (open)'
+            self._pill_button(screen, closed_rect, closed_label, accent=accent, active=e.closed)
+            self.ui['btn_entity_closed'] = closed_rect
+            py += 36
+
             EHEIGHT_MIN, EHEIGHT_MAX = 0, 2000
-            h_lbl = self.font_small.render('Height (0 = ground):', True, self.C['dim'])
-            screen.blit(h_lbl, (px, py));  py += 18
-            track_x = px
-            track_y = py
-            track_w = PANEL_W - 20
-            track_h = 8
-            track_rect = pygame.Rect(track_x, track_y, track_w, track_h)
-            screen.draw_rect(self.C['btn'], track_rect, border_radius=4)
-            t_h = (e.height - EHEIGHT_MIN) / (EHEIGHT_MAX - EHEIGHT_MIN)
-            t_h = max(0.0, min(1.0, t_h))
-            thumb_x = int(track_x + t_h * track_w)
-            fill_rect = pygame.Rect(track_x, track_y, thumb_x - track_x, track_h)
-            screen.draw_rect(self.C['entity_path'], fill_rect, border_radius=4)
-            screen.draw_rect(self.C['panel_border'], track_rect, 1, border_radius=4)
-            screen.draw_line(self.C['dim'],
-                             (track_x, track_y - 3), (track_x, track_y + track_h + 3), 1)
-            THUMB_R = 8
-            thumb_hover = (abs(mx2 - thumb_x) <= THUMB_R + 4
-                           and abs(my2 - (track_y + track_h // 2)) <= THUMB_R + 4)
-            thumb_col = self.C['entity_path'] if (self._entity_height_slider_drag or thumb_hover) else self.C['text']
-            screen.draw_circle(thumb_col, (thumb_x, track_y + track_h // 2), THUMB_R)
-            screen.draw_circle(self.C['bg'], (thumb_x, track_y + track_h // 2), THUMB_R - 3)
-            val_s = self.font_medium.render(str(e.height), True, self.C['text'])
-            screen.blit(val_s, val_s.get_rect(center=(thumb_x, track_y - 14)))
-            min_s = self.font_small.render(str(EHEIGHT_MIN), True, self.C['dim'])
-            max_s = self.font_small.render(str(EHEIGHT_MAX), True, self.C['dim'])
-            screen.blit(min_s, (track_x, track_y + track_h + 5))
-            screen.blit(max_s, (track_x + track_w - max_s.get_width(), track_y + track_h + 5))
-            slider_hit = pygame.Rect(track_x, track_y - THUMB_R, track_w, track_h + THUMB_R * 2)
+            h_lbl = self.font_small.render('HEIGHT (0 = GROUND)', True, uk.Theme.TEXT_DIM)
+            screen.blit(h_lbl, (px, py));  py += 20
+            slider_hit, track_x, track_w = self._draw_range_slider(
+                screen, px, py, row_w, e.height, EHEIGHT_MIN, EHEIGHT_MAX,
+                self._entity_height_slider_drag, accent=accent)
             self.ui['entity_height_slider'] = slider_hit
-            self.ui['entity_height_track']  = track_rect
             self._entity_height_slider_track_x = track_x
             self._entity_height_slider_track_w = track_w
-            py += track_h + 28
+            py += 34
 
-            # ── Room link dropdown ─────────────────────────────────────────
-            room_lbl = self.font_small.render('Linked Room:', True, self.C['dim'])
+            room_lbl = self.font_small.render('LINKED ROOM', True, uk.Theme.TEXT_DIM)
             screen.blit(room_lbl, (px, py));  py += 18
-            btn_w    = PANEL_W - 20
+            btn_w = row_w - 26
             btn_rect = pygame.Rect(px, py, btn_w, 28)
-            ent_room_focused = self.entity_room_dropdown_open
-            border_col = self.C['entity_path'] if ent_room_focused else self.C['input_border']
-            bg_col     = self.C['btn_hover'] if ent_room_focused else self.C['input_bg']
-            screen.draw_rect(bg_col, btn_rect, border_radius=4)
-            screen.draw_rect(border_col, btn_rect, 1, border_radius=4)
-            room_label = e.room if e.room else '(no room — no collision)'
-            lbl_col    = self.C['text'] if e.room else self.C['dim']
-            lbl_surf   = self.font_medium.render(room_label, True, lbl_col)
-            # Clip label inside button
-            screen.set_clip(pygame.Rect(btn_rect.x + 4, btn_rect.y,
-                                        btn_rect.w - 24, btn_rect.h))
-            screen.blit(lbl_surf, (btn_rect.x + 6, btn_rect.y + 6))
-            screen.set_clip(None)
-            arrow_s = self.font_medium.render(
-                '▲' if self.entity_room_dropdown_open else '▼', True, self.C['dim'])
-            screen.blit(arrow_s, (btn_rect.right - arrow_s.get_width() - 6,
-                                  btn_rect.y + 6))
+            self._draw_field_row(screen, btn_rect, e.room, bool(e.room),
+                                 '(no room \u2014 no collision)',
+                                 focused=self.entity_room_dropdown_open, accent=accent)
             self.ui['entity_room_btn'] = btn_rect
-            # Clear button (×) to the right of the dropdown
-            clr_r = pygame.Rect(btn_rect.right + 4, py, 20, 28)
-            clr_bg = self.C['danger'] if clr_r.collidepoint(mx2, my2) else (80, 40, 40)
-            screen.draw_rect(clr_bg, clr_r, border_radius=3)
-            screen.blit(self.font_small.render('×', True, (255, 255, 255)),
-                        self.font_small.render('×', True, (255, 255, 255)).get_rect(
-                            center=clr_r.center))
+            clr_r = pygame.Rect(btn_rect.right + 6, py, 20, 28)
+            self._icon_button(screen, clr_r, icon_surface=self._close_icon, danger=True)
             self.ui['entity_room_clear'] = clr_r
             py += 34
 
-            # Hint: how to complete the in-room side of the link
             if e.room:
-                hint_lines = [
-                    'In the room editor, place a',
-                    'World Map Object (world_map)',
-                    f'and set entity_name = "{e.name}"',
-                    'to mark where the player spawns.',
-                ]
-                for _hl in hint_lines:
-                    hs = self.font_small.render(_hl, True, self.C['dim'])
+                for hl in ('In the room editor, place a',
+                           'World Map Object (world_map)',
+                           f'and set entity_name = "{e.name}"',
+                           'to mark where the player spawns.'):
+                    hs = self.font_small.render(hl, True, uk.Theme.TEXT_DIM)
                     screen.blit(hs, (px, py));  py += 14
                 py += 4
 
-            # ── Vehicle sprite picker ──────────────────────────────────────
             if self.vehicle_names:
-                picker_lbl = self.font_small.render('Sprite:', True, self.C['dim'])
+                picker_lbl = self.font_small.render('SPRITE', True, uk.Theme.TEXT_DIM)
                 screen.blit(picker_lbl, (px, py));  py += 18
                 VCELL = 40
-                VCOLS = max(1, (PANEL_W - 20) // (VCELL + 4))
-                picker_clip = pygame.Rect(px - 4, py, PANEL_W - 12,
-                                          self.screen_height - py - 10)
+                VCOLS = max(1, row_w // (VCELL + 6))
+                picker_clip = pygame.Rect(px - 4, py, self.panel_layout_w - 12, self.screen_height - py - 10)
                 screen.set_clip(picker_clip)
                 for vi, vname in enumerate(self.vehicle_names):
-                    vcol = vi % VCOLS
-                    vrow = vi // VCOLS
-                    cx   = px + vcol * (VCELL + 4)
-                    cy   = py + vrow * (VCELL + 4)
+                    vcol, vrow = vi % VCOLS, vi // VCOLS
+                    cx = px + vcol * (VCELL + 6)
+                    cy = py + vrow * (VCELL + 6)
                     if cy + VCELL > self.screen_height:
                         break
                     cell_rect = pygame.Rect(cx, cy, VCELL, VCELL)
-                    v_sel   = (vname == e.sprite)
-                    v_hover = cell_rect.collidepoint(mx2, my2)
-                    vbg = (self.C['accent'] if v_sel
-                           else self.C['btn_hover'] if v_hover
-                           else self.C['btn'])
-                    screen.draw_rect(vbg, cell_rect, border_radius=4)
-                    screen.draw_rect(self.C['accent'] if v_sel else self.C['panel_border'],
-                                     cell_rect, 1, border_radius=4)
+                    v_sel = (vname == e.sprite)
+                    v_hover = self._hover(cell_rect)
+                    base = uk.lerp_color((22, 26, 35), accent, 0.3 if v_sel else (0.5 if v_hover else 0.0))
+                    border = accent if v_sel else uk.lerp_color(uk.Theme.CARD_BORDER, accent, 1.0 if v_hover else 0.0)
+                    uk.draw_panel(screen, cell_rect, bg=(*base, 255), border=border,
+                                  border_width=(2 if v_sel else 1), radius=6, shadow=False)
                     vs = self._get_vehicle_sprite(vname)
-                    thumb = vs.get_panel_thumb(VCELL - 6) if vs else None
+                    thumb = vs.get_panel_thumb(VCELL - 8) if vs else None
                     if thumb:
                         screen.blit(thumb, thumb.get_rect(center=cell_rect.center))
                     else:
-                        fb = self.font_small.render(vname[:2].upper(), True, self.C['text'])
-                        screen.blit(fb, fb.get_rect(center=cell_rect.center))
+                        _draw_vehicle_icon(screen, cell_rect.inflate(-10, -10), uk.Theme.TEXT_MUTED)
                     if v_hover:
-                        tip = self.font_small.render(vname, True, self.C['dim'])
+                        tip = self.font_small.render(vname, True, uk.Theme.TEXT_DIM)
                         screen.blit(tip, (cx, cy + VCELL + 2))
                     self.ui[f'vehicle_pick_{vi}'] = cell_rect
+                    uk.register_hoverable(cell_rect)
                 screen.set_clip(None)
             else:
-                no_v = self.font_small.render(
-                    f'(no sprites in {VEHICLE_DIR})', True, self.C['dim'])
+                no_v = self.font_small.render(f'(no sprites in {VEHICLE_DIR})', True, uk.Theme.TEXT_DIM)
                 screen.blit(no_v, (px, py))
 
-        # ── Room dropdown popup (drawn last so it floats over sprite picker) ─
         if (self.entity_room_dropdown_open and eidx is not None
                 and wm and 0 <= eidx < len(wm.entities)):
             room_names = self._get_room_names()
-            MAX_VIS  = 8
-            ITEM_H   = 26
-            pop_w    = PANEL_W - 20
-            pop_h    = min(len(room_names), MAX_VIS) * ITEM_H + 4
-            if not room_names:
-                pop_h = ITEM_H + 4
-            btn_ref  = self.ui.get('entity_room_btn')
-            pop_x    = px
+            for key in [k for k in self.ui if k.startswith('entity_room_dd_')]:
+                del self.ui[key]
+            btn_ref = self.ui.get('entity_room_btn')
             if btn_ref:
-                btn_bottom = btn_ref.bottom
-                # Flip above if it would go off screen
-                if btn_bottom + pop_h > self.screen_height - 20:
-                    pop_y = btn_ref.top - pop_h
-                else:
-                    pop_y = btn_bottom
-            else:
-                pop_y = TOP_BAR_H + 60
-            popup_rect = pygame.Rect(pop_x, pop_y, pop_w, pop_h)
-            screen.draw_rect(self.C['panel'], popup_rect, border_radius=4)
-            screen.draw_rect(self.C['entity_path'], popup_rect, 1, border_radius=4)
-            if not room_names:
-                ns = self.font_small.render('(no rooms found)', True, self.C['dim'])
-                screen.blit(ns, (pop_x + 6, pop_y + 5))
-            else:
-                cur_ent_room = wm.entities[eidx].room
-                end = min(self.entity_room_dropdown_scroll + MAX_VIS, len(room_names))
-                for i, rname in enumerate(
-                        room_names[self.entity_room_dropdown_scroll:end]):
-                    abs_idx   = self.entity_room_dropdown_scroll + i
-                    item_rect = pygame.Rect(pop_x + 2, pop_y + 2 + i * ITEM_H,
-                                            pop_w - 4, ITEM_H)
-                    hovered   = item_rect.collidepoint(mx2, my2)
-                    selected  = (rname == cur_ent_room)
-                    if selected:
-                        screen.draw_rect(self.C['entity_path'],
-                                         item_rect, border_radius=3)
-                    elif hovered:
-                        screen.draw_rect(self.C['btn_hover'],
-                                         item_rect, border_radius=3)
-                    col = self.C['text'] if (selected or hovered) else self.C['dim']
-                    ns  = self.font_medium.render(rname, True, col)
-                    screen.blit(ns, (item_rect.x + 6, item_rect.y + 4))
-                    self.ui[f'entity_room_dd_{abs_idx}'] = item_rect
-                if len(room_names) > MAX_VIS:
-                    sh_lbl = self.font_small.render(
-                        f'↑↓ scroll  ({self.entity_room_dropdown_scroll+1}–{end}'
-                        f' of {len(room_names)})',
-                        True, self.C['dim'])
-                    screen.blit(sh_lbl, (pop_x + 4, pop_y + pop_h + 2))
+                self._draw_option_popup(
+                    screen, btn_ref, room_names, wm.entities[eidx].room,
+                    self.entity_room_dropdown_scroll, 8, self.ui,
+                    'entity_room_dd_', accent=accent, empty_text='(no rooms found)')
+
+    # ── paint panel ──────────────────────────────────────────────────────────
 
     def _draw_paint_panel(self, screen: pygame.Surface, px: int, py: int):
         ts = self.current_tileset
+        row_w = self.panel_layout_w - 30
         if not ts:
-            surf = self.font_medium.render('No tilesets found', True, self.C['dim'])
+            surf = self.font_medium.render('No tilesets found', True, uk.Theme.TEXT_MUTED)
             screen.blit(surf, (px, py))
             self._palette_grid_origin = None
             return
 
-        # Tileset name + TAB hint
         name_surf = self.font_medium.render(
-            f'{ts.name}  [{self.tileset_idx + 1}/{len(self.tilesets)}]',
-            True, self.C['text'])
+            f'{ts.name}   [{self.tileset_idx + 1}/{len(self.tilesets)}]', True, uk.Theme.TEXT_PRIMARY)
         screen.blit(name_surf, (px, py));  py += 22
-        hint = self.font_small.render('TAB to switch tileset', True, self.C['dim'])
-        screen.blit(hint, (px, py));  py += 20
+        hint = self.font_small.render('TAB to switch tileset', True, uk.Theme.TEXT_DIM)
+        screen.blit(hint, (px, py));  py += 18
 
-        # Palette grid (scrollable)
-        grid_x = px;  grid_y = py
-        # Record the real, unscrolled screen origin of the grid so click
-        # hit-testing (_palette_mouse_to_tile) matches whatever ends up drawn
-        # above this panel (e.g. the music row), instead of assuming a fixed
-        # layout offset that can silently drift out of sync.
+        grid_x, grid_y = px, py
         self._palette_grid_origin = (grid_x, grid_y)
-        palette_h = self.screen_height - TOP_BAR_H - 160
-        clip = pygame.Rect(grid_x - 4, grid_y, PANEL_W - 12, palette_h)
+        palette_h = self._palette_visible_height()
+        panel_rect = pygame.Rect(grid_x - 6, grid_y - 4, self.panel_layout_w - 20, palette_h + 8)
+        uk.draw_panel(screen, panel_rect, bg=(*uk.Theme.CARD_BG[:3], 255),
+                      border=uk.Theme.CARD_BORDER, border_width=1, radius=8, shadow=False)
+        uk.register_hoverable(panel_rect)
+        clip = pygame.Rect(grid_x - 2, grid_y, self.panel_layout_w - 24, palette_h)
         screen.set_clip(clip)
 
         min_tx = min(self.sel_tx, self.sel_end_tx)
@@ -2951,389 +3753,250 @@ class WorldMapEditor:
                 iy = grid_y - self.palette_scroll_y
                 screen.blit(pal_surf, (ix, iy))
 
-                # Selection highlight — only reallocate the surface when its
-                # pixel size changes (e.g. user drags to a different tile count)
                 sel_x = ix + min_tx * PALETTE_CELL
                 sel_y = iy + min_ty * PALETTE_CELL
                 sel_w = (max_tx - min_tx + 1) * PALETTE_CELL
                 sel_h = (max_ty - min_ty + 1) * PALETTE_CELL
                 if self._sel_surf_size != (sel_w, sel_h):
                     self._sel_surf = pygame.Surface((sel_w, sel_h), pygame.SRCALPHA)
-                    self._sel_surf.fill((255, 215, 0, 55))
+                    self._sel_surf.fill((*uk.Theme.GOLD, 60))
                     self._sel_surf_size = (sel_w, sel_h)
                 screen.blit(self._sel_surf, (sel_x, sel_y))
-                screen.draw_rect(self.C['accent'],
-                                 (sel_x, sel_y, sel_w, sel_h), 2)
+                screen.draw_rect(uk.Theme.GOLD, (sel_x, sel_y, sel_w, sel_h), 2)
 
         screen.set_clip(None)
 
-        # Instructions at bottom of panel
-        inst_y = self.screen_height - 150
-        instructions = [
-            'Left-drag: paint',
-            'Right-drag: erase',
-            'Mid-drag: pan',
-            'Scroll: zoom / palette',
-            'G: toggle grid',
-            'Ctrl+S: save',
-            'F2 / Esc: close',
-        ]
-        for line in instructions:
-            s = self.font_small.render(line, True, self.C['dim'])
-            screen.blit(s, (self.vp_x + self.vp_w + 10, inst_y))
-            inst_y += 18
+    # ── scouter panel ────────────────────────────────────────────────────────
 
     def _draw_scouter_panel(self, screen: pygame.Surface, px: int, py: int):
         wm = self.current_map
-        mx, my = pygame.mouse.get_pos()
+        row_w = self.panel_layout_w - 30
+        accent = self.MODE_INFO['scouter'][2]
 
-        title = self.font_medium.render('Scouter Paint', True, self.C['text'])
+        title = self.font_large.render('Scouter Paint', True, accent)
         screen.blit(title, (px, py));  py += 22
-        for line in ('Paints the silhouette shown on', "the Scouter's WORLD MAP screen —"):
-            s = self.font_small.render(line, True, self.C['dim'])
-            screen.blit(s, (px, py));  py += 16
+        for line in ('Paints the silhouette shown on', "the Scouter's WORLD MAP screen."):
+            s = self.font_small.render(line, True, uk.Theme.TEXT_DIM)
+            screen.blit(s, (px, py));  py += 15
         py += 8
 
-        label = self.font_small.render('Brush size', True, self.C['dim'])
+        label = self.font_small.render('BRUSH SIZE', True, uk.Theme.TEXT_DIM)
         screen.blit(label, (px, py));  py += 20
         bx = px
         for size in (1, 2, 4, 8):
-            w = 42
-            rect = pygame.Rect(bx, py, w, 26)
-            active = (self.scouter_brush == size)
-            hover  = rect.collidepoint(mx, my)
-            bg = (self.C['btn_active'] if active
-                  else self.C['btn_hover'] if hover
-                  else self.C['btn'])
-            screen.draw_rect(bg, rect, border_radius=4)
-            screen.draw_rect(self.C['accent'] if active else self.C['panel_border'],
-                             rect, 1, border_radius=4)
-            s = self.font_small.render(str(size), True, self.C['text'])
-            screen.blit(s, s.get_rect(center=rect.center))
+            w = 46
+            rect = pygame.Rect(bx, py, w, 28)
+            self._pill_button(screen, rect, str(size), accent=accent, active=(self.scouter_brush == size))
             self.ui[f'btn_scouter_brush_{size}'] = rect
             bx += w + 6
-        py += 34
+        py += 36
 
         count = len(wm.scouter_paint) if wm else 0
-        cnt_surf = self.font_small.render(f'{count} cells painted', True, self.C['dim'])
+        cnt_surf = self.font_small.render(f'{count} cells painted', True, uk.Theme.TEXT_DIM)
         screen.blit(cnt_surf, (px, py));  py += 24
 
-        clr_rect = pygame.Rect(px, py, 104, 26)
-        hover = clr_rect.collidepoint(mx, my)
-        screen.draw_rect(self.C['danger'] if hover else self.C['btn'],
-                         clr_rect, border_radius=4)
-        screen.draw_rect(self.C['panel_border'], clr_rect, 1, border_radius=4)
-        clr_surf = self.font_small.render('Clear all', True, self.C['text'])
-        screen.blit(clr_surf, clr_surf.get_rect(center=clr_rect.center))
+        clr_rect = pygame.Rect(px, py, 120, 28)
+        self._pill_button(screen, clr_rect, 'Clear all', icon_surface=self._close_icon, danger=True)
         self.ui['btn_scouter_clear'] = clr_rect
 
-        # Instructions at bottom of panel (matches _draw_paint_panel's layout)
-        inst_y = self.screen_height - 150
-        instructions = [
-            'Left-drag: paint',
-            'Right-drag: erase',
-            '[ / ]: brush size',
-            'Mid-drag: pan',
-            'Scroll: zoom',
-            'G: toggle grid',
-            'Ctrl+S: save',
-            'F2 / Esc: close',
-        ]
-        for line in instructions:
-            s = self.font_small.render(line, True, self.C['dim'])
-            screen.blit(s, (self.vp_x + self.vp_w + 10, inst_y))
-            inst_y += 18
+    # ── location panel ───────────────────────────────────────────────────────
 
     def _draw_location_panel(self, screen: pygame.Surface, px: int, py: int):
         wm = self.current_map
-        header = self.font_medium.render('LOCATIONS', True, self.C['accent'])
-        screen.blit(header, (px, py));  py += 28
+        accent = uk.Theme.GOLD
+        header = self.font_large.render('LOCATIONS', True, accent)
+        screen.blit(header, (px, py));  py += 24
 
-        hint = self.font_small.render('Click map to place pin', True, self.C['dim'])
+        hint = self.font_small.render('Click map to place a pin', True, uk.Theme.TEXT_DIM)
         screen.blit(hint, (px, py));  py += 22
 
         if not wm or not wm.locations:
-            none_s = self.font_small.render('(none yet)', True, self.C['dim'])
+            none_s = self.font_small.render('(none yet)', True, uk.Theme.TEXT_DIM)
             screen.blit(none_s, (px, py))
             return
 
-        clip_rect = pygame.Rect(px - 4, py, PANEL_W - 12,
-                                self.screen_height - py - 20)
+        clip_rect = pygame.Rect(px - 4, py, self.panel_layout_w - 12, self.screen_height - py - 20)
         screen.set_clip(clip_rect)
+        mx2, my2 = pygame.mouse.get_pos()
 
         for i, loc in enumerate(wm.locations):
             is_sel = (loc is self.selected_loc)
-            row_rect = pygame.Rect(px - 4, py, PANEL_W - 30, 36)
-            bg = self.C['btn_active'] if is_sel else self.C['btn']
-            screen.draw_rect(bg, row_rect, border_radius=3)
+            row_rect = pygame.Rect(px - 4, py, self.panel_layout_w - 30, 38)
+            hovered = row_rect.collidepoint(mx2, my2)
+            base = uk.lerp_color((22, 26, 35), accent, 0.22 if is_sel else (0.5 if hovered else 0.0))
+            border = accent if is_sel else uk.lerp_color(uk.Theme.CARD_BORDER, accent, 1.0 if hovered else 0.0)
+            uk.draw_panel(screen, row_rect, bg=(*base, 255), border=border,
+                          border_width=(2 if is_sel else 1), radius=6, shadow=False)
 
-            # Icon badge (sprite or coloured circle fallback)
-            badge_cx, badge_cy = px + 14, py + 18
-            screen.draw_circle(self.C['pin_sel'] if is_sel else self.C['pin'],
-                               (badge_cx, badge_cy), 12)
+            badge_cx, badge_cy = row_rect.x + 18, row_rect.centery
+            badge_col = uk.Theme.GOLD_BRIGHT if is_sel else (232, 92, 92)
+            uk.draw_circle_on(screen, badge_col, (badge_cx, badge_cy), 13)
+            uk.draw_circle_on(screen, uk.Theme.BG_BOTTOM, (badge_cx, badge_cy), 13, 1)
             icon_stem = getattr(loc, 'icon', '')
             if icon_stem:
                 icon_surf = self._get_icon(icon_stem, 20)
                 if icon_surf:
                     screen.blit(icon_surf, icon_surf.get_rect(center=(badge_cx, badge_cy)))
 
-            name_s = self.font_small.render(loc.name or '(unnamed)', True,
-                                            self.C['accent'] if is_sel else self.C['text'])
-            room_s = self.font_small.render(f'→ {loc.room or "(no room)"}', True, self.C['dim'])
-            screen.blit(name_s, (px + 30, py + 3))
-            screen.blit(room_s, (px + 30, py + 19))
+            name_col = uk.Theme.GOLD_BRIGHT if is_sel else uk.Theme.TEXT_PRIMARY
+            name_s = self.font_small.render(loc.name or '(unnamed)', True, name_col)
+            room_s = self.font_small.render(f'\u2192 {loc.room or "(no room)"}', True, uk.Theme.TEXT_DIM)
+            screen.blit(name_s, (row_rect.x + 34, row_rect.y + 5))
+            screen.blit(room_s, (row_rect.x + 34, row_rect.y + 20))
 
-            # Delete button (× only — edit via double-click)
-            mx2, my2 = pygame.mouse.get_pos()
-            del_rect = pygame.Rect(px + PANEL_W - 34, py + 8, 20, 20)
-            del_bg = self.C['danger'] if del_rect.collidepoint(mx2, my2) else (80, 40, 40)
-            screen.draw_rect(del_bg, del_rect, border_radius=3)
-            x_s = self.font_small.render('×', True, (255, 255, 255))
-            screen.blit(x_s, x_s.get_rect(center=del_rect.center))
+            del_rect = pygame.Rect(row_rect.right - 26, row_rect.y + 9, 20, 20)
+            self._icon_button(screen, del_rect, icon_surface=self._close_icon, danger=True)
 
             self.ui[f'loc_entry_{i}'] = row_rect
             self.ui[f'loc_del_{i}']   = del_rect
-            py += 42
+            uk.register_hoverable(row_rect)
+            py += 44
 
         screen.set_clip(None)
 
     # ── dialogs ───────────────────────────────────────────────────────────────
 
     def _draw_dialog_base(self, screen: pygame.Surface, title: str,
-                          w: int, h: int) -> tuple[int, int, int]:
-        """Draw dim overlay + centered dialog box. Returns (box_x, box_y, inner_x)."""
+                          w: int, h: int) -> tuple[int, int, int, pygame.Rect]:
         overlay = pygame.Surface((self.screen_width, self.screen_height), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 160))
+        overlay.fill((0, 0, 0, 165))
         screen.blit(overlay, (0, 0))
-        box_x = (self.screen_width - w) // 2
-        box_y = (self.screen_height - h) // 2
-        screen.draw_rect(self.C['panel'], (box_x, box_y, w, h),
-                         border_radius=8)
-        screen.draw_rect(self.C['accent'], (box_x, box_y, w, h),
-                         2, border_radius=8)
-        title_s = self.font_large.render(title, True, self.C['text'])
-        screen.blit(title_s, (box_x + (w - title_s.get_width()) // 2, box_y + 14))
-        return box_x, box_y, box_x + 20
+        ox, oy = self._dialog_pos_offset
+        box_x = (self.screen_width - w) // 2 + ox
+        box_y = (self.screen_height - h) // 2 + oy
+        box_rect = pygame.Rect(box_x, box_y, w, h)
+        uk.draw_panel(screen, box_rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD,
+                      border_width=2, radius=10)
+        title_s = self.font_title.render(title, True, uk.Theme.TEXT_PRIMARY)
+        screen.blit(title_s, (box_x + (w - title_s.get_width()) // 2, box_y + 16))
+        # Drag handle — the whole title strip is grabbable, like a window
+        # title bar. Callers must stash this in self.loc_dialog_rects
+        # under '_dragbar' themselves (AFTER their own rects-dict reset,
+        # since this runs before that reset — see _draw_new_map_dialog /
+        # _draw_loc_dialog) for _handle_dialog_drag_event to see it.
+        drag_rect = pygame.Rect(box_x, box_y, w, 44)
+        return box_x, box_y, box_x + 20, drag_rect
 
     def _draw_input_field(self, screen: pygame.Surface,
                           label: str, value: str, active: bool,
                           x: int, y: int, w: int) -> pygame.Rect:
-        lbl = self.font_small.render(label, True, self.C['dim'])
+        lbl = self.font_small.render(label.upper(), True, uk.Theme.TEXT_DIM)
         screen.blit(lbl, (x, y))
-        cursor = '|' if (active and int(self.cursor_blink * 2) % 2 == 0) else ''
-        field_rect = pygame.Rect(x, y + 18, w, 28)
-        border_col = self.C['accent'] if active else self.C['input_border']
-        screen.draw_rect(self.C['input_bg'], field_rect, border_radius=4)
-        screen.draw_rect(border_col, field_rect, 1, border_radius=4)
-        val_s = self.font_medium.render(value + cursor, True, self.C['text'])
-        screen.blit(val_s, (field_rect.x + 6, field_rect.y + 5))
+        field_rect = pygame.Rect(x, y + 18, w, 30)
+        border = uk.Theme.GOLD if active else uk.Theme.CARD_BORDER
+        uk.draw_panel(screen, field_rect, bg=(*uk.Theme.CARD_BG[:3], 255), border=border,
+                      border_width=(2 if active else 1), radius=6, shadow=False)
+        val_s = self.font_medium.render(value, True, uk.Theme.TEXT_PRIMARY)
+        # An empty string renders as a 1x1 surface, which would leave the
+        # caret 1px tall in an empty field — size the line from a reference
+        # glyph in that case.
+        line_h = val_s.get_height() if value else self.font_medium.size('A')[1]
+        val_rect = pygame.Rect(field_rect.x + 8, field_rect.centery - line_h // 2,
+                               val_s.get_width(), line_h)
+        screen.blit(val_s, val_rect.topleft)
+        self._draw_live_text_field(screen, self.font_medium, val_rect, field_rect, live=active)
+        uk.register_hoverable(field_rect)
         return field_rect
 
     def _draw_new_map_dialog(self, screen: pygame.Surface):
-        w, h = 420, 160
-        bx, by, ix = self._draw_dialog_base(screen, 'NEW WORLD MAP', w, h)
+        w, h = 420, 170
+        bx, by, ix, drag_rect = self._draw_dialog_base(screen, 'NEW WORLD MAP', w, h)
         self.loc_dialog_rects = {}
+        self.loc_dialog_rects['_dragbar'] = drag_rect
 
-        field = self._draw_input_field(
-            screen, 'Map name:', self.new_map_name, True, ix, by + 50, w - 40)
+        field = self._draw_input_field(screen, 'Map name', self.new_map_name, True, ix, by + 56, w - 40)
         self.loc_dialog_rects['field'] = field
 
-        ok_r  = pygame.Rect(bx + w // 2 - 110, by + h - 44, 100, 30)
-        can_r = pygame.Rect(bx + w // 2 + 10,  by + h - 44, 100, 30)
-        mx, my = pygame.mouse.get_pos()
-        for rect, key, label in ((ok_r, 'ok', 'CREATE'), (can_r, 'cancel', 'CANCEL')):
-            hover = rect.collidepoint(mx, my)
-            screen.draw_rect(self.C['btn_hover'] if hover else self.C['btn'],
-                             rect, border_radius=4)
-            screen.draw_rect(self.C['accent'], rect, 1, border_radius=4)
-            s = self.font_medium.render(label, True, self.C['text'])
-            screen.blit(s, s.get_rect(center=rect.center))
-            self.loc_dialog_rects[key] = rect
+        ok_r  = pygame.Rect(bx + w // 2 - 110, by + h - 50, 100, 32)
+        can_r = pygame.Rect(bx + w // 2 + 10,  by + h - 50, 100, 32)
+        self._pill_button(screen, ok_r, 'Create', icon_fn=_draw_check_icon, active=True)
+        self._pill_button(screen, can_r, 'Cancel', icon_surface=self._close_icon, danger=True)
+        self.loc_dialog_rects['ok'] = ok_r
+        self.loc_dialog_rects['cancel'] = can_r
 
-        hint = self.font_small.render('Enter to confirm · Esc to cancel',
-                                      True, self.C['dim'])
-        screen.blit(hint, (bx + (w - hint.get_width()) // 2, by + h - 14))
+        hint = self.font_small.render('Enter to confirm \u00b7 Esc to cancel', True, uk.Theme.TEXT_DIM)
+        screen.blit(hint, (bx + (w - hint.get_width()) // 2, by + h - 16))
 
     def _draw_loc_dialog(self, screen: pygame.Surface):
-        CELL      = 36   # icon cell size in picker
-        COLS      = 8    # icons per row
-        n_icons   = len(self.icon_names)
+        CELL, COLS = 38, 8
+        n_icons = len(self.icon_names)
         icon_rows = max(1, math.ceil(n_icons / COLS)) if n_icons else 1
-        w  = max(460, COLS * (CELL + 4) + 40)
-        h  = 50 + 100 + 30 + 44 + 30 + icon_rows * (CELL + 4) + 20 + 44 + 20
+        w = max(480, COLS * (CELL + 6) + 40)
+        h = 56 + 108 + 40 + 46 + 30 + icon_rows * (CELL + 6) + 24 + 48 + 20
         title = 'NEW LOCATION' if self.loc_dialog_is_new else 'EDIT LOCATION'
-        bx, by, ix = self._draw_dialog_base(screen, title, w, h)
+        bx, by, ix, drag_rect = self._draw_dialog_base(screen, title, w, h)
         self.loc_dialog_rects = {}
-        mx, my = pygame.mouse.get_pos()
+        self.loc_dialog_rects['_dragbar'] = drag_rect
+        accent = uk.Theme.GOLD
 
-        # Name field
         n_field = self._draw_input_field(
-            screen, 'Location name:',
-            self.loc_dialog_name, self.loc_dialog_field == 'name',
-            ix, by + 50, w - 40)
+            screen, 'Location name', self.loc_dialog_name,
+            self.loc_dialog_field == 'name', ix, by + 56, w - 40)
         self.loc_dialog_rects['field_name'] = n_field
 
-        # Room dropdown button (replaces the old text input)
-        room_lbl = self.font_small.render('Room ID:', True, self.C['dim'])
-        screen.blit(room_lbl, (ix, by + 120))
-        btn_rect = pygame.Rect(ix, by + 138, w - 40, 28)
-        focused  = (self.loc_dialog_field == 'room')
-        border_col = self.C['accent'] if focused else self.C['input_border']
-        bg_col     = self.C['btn_hover'] if (focused or self.room_dropdown_open) else self.C['input_bg']
-        screen.draw_rect(bg_col, btn_rect, border_radius=4)
-        screen.draw_rect(border_col, btn_rect, 1, border_radius=4)
-        # Label: current value or placeholder
-        room_label = self.loc_dialog_room if self.loc_dialog_room else '(select a room…)'
-        lbl_col    = self.C['text'] if self.loc_dialog_room else self.C['dim']
-        lbl_surf   = self.font_medium.render(room_label, True, lbl_col)
-        screen.blit(lbl_surf, (btn_rect.x + 6, btn_rect.y + 5))
-        # Chevron
-        arrow = '▲' if self.room_dropdown_open else '▼'
-        arr_s = self.font_medium.render(arrow, True, self.C['dim'])
-        screen.blit(arr_s, (btn_rect.right - arr_s.get_width() - 8, btn_rect.y + 5))
+        room_lbl = self.font_small.render('ROOM ID', True, uk.Theme.TEXT_DIM)
+        screen.blit(room_lbl, (ix, by + 126))
+        btn_rect = pygame.Rect(ix, by + 144, w - 40, 30)
+        self._draw_field_row(screen, btn_rect, self.loc_dialog_room, bool(self.loc_dialog_room),
+                             '(select a room\u2026)',
+                             focused=(self.loc_dialog_field == 'room' or self.room_dropdown_open))
         self.loc_dialog_rects['field_room'] = btn_rect
 
-        # ── Height slider ─────────────────────────────────────────────────────
-        # 0 = ground level (left edge); 2000 = maximum elevation (right edge).
         HEIGHT_MIN, HEIGHT_MAX = 0, 2000
-        slider_lbl = self.font_small.render('Height (0 = ground):', True, self.C['dim'])
-        screen.blit(slider_lbl, (ix, by + 196))
-        track_x = ix
-        track_y = by + 214
-        track_w = w - 40
-        track_h = 8
-        track_rect = pygame.Rect(track_x, track_y, track_w, track_h)
-        # Draw track
-        screen.draw_rect(self.C['btn'], track_rect, border_radius=4)
-        # Fill from left (0 / ground level) to thumb position
-        t = (self.loc_dialog_height - HEIGHT_MIN) / (HEIGHT_MAX - HEIGHT_MIN)
-        t = max(0.0, min(1.0, t))
-        thumb_x   = int(track_x + t * track_w)
-        fill_rect = pygame.Rect(track_x, track_y, thumb_x - track_x, track_h)
-        screen.draw_rect(self.C['accent'], fill_rect, border_radius=4)
-        screen.draw_rect(self.C['panel_border'], track_rect, 1, border_radius=4)
-        # Ground-level notch at the left edge
-        screen.draw_line(self.C['dim'],
-                         (track_x, track_y - 3), (track_x, track_y + track_h + 3), 1)
-        # Draw thumb
-        THUMB_R = 8
-        thumb_hover = (abs(mx - thumb_x) <= THUMB_R + 4
-                       and abs(my - (track_y + track_h // 2)) <= THUMB_R + 4)
-        thumb_col = self.C['accent'] if (self._height_slider_drag or thumb_hover) else self.C['text']
-        screen.draw_circle(thumb_col, (thumb_x, track_y + track_h // 2), THUMB_R)
-        screen.draw_circle(self.C['bg'], (thumb_x, track_y + track_h // 2), THUMB_R - 3)
-        # Value label + range hints
-        val_s = self.font_medium.render(str(self.loc_dialog_height), True, self.C['text'])
-        screen.blit(val_s, val_s.get_rect(center=(thumb_x, track_y - 14)))
-        min_s = self.font_small.render(str(HEIGHT_MIN), True, self.C['dim'])
-        max_s = self.font_small.render(str(HEIGHT_MAX), True, self.C['dim'])
-        screen.blit(min_s, (track_x, track_y + track_h + 5))
-        screen.blit(max_s, (track_x + track_w - max_s.get_width(), track_y + track_h + 5))
-        # Store rects for event handling: full slider area + track rect
-        slider_hit = pygame.Rect(track_x, track_y - THUMB_R,
-                                 track_w, track_h + THUMB_R * 2)
+        slider_lbl = self.font_small.render('HEIGHT (0 = GROUND)', True, uk.Theme.TEXT_DIM)
+        screen.blit(slider_lbl, (ix, by + 204))
+        slider_hit, track_x, track_w = self._draw_range_slider(
+            screen, ix, by + 224, w - 40, self.loc_dialog_height,
+            HEIGHT_MIN, HEIGHT_MAX, self._height_slider_drag, accent=accent)
         self.loc_dialog_rects['height_slider'] = slider_hit
-        self.loc_dialog_rects['height_track']  = track_rect
-        # Store geometry so mouse handlers can compute value without re-deriving
         self._height_slider_track_x = track_x
         self._height_slider_track_w = track_w
 
-        # Icon picker
-        icon_lbl_y = by + 256
-        icon_lbl = self.font_small.render('Icon:', True, self.C['dim'])
+        icon_lbl_y = by + 268
+        icon_lbl = self.font_small.render('ICON', True, uk.Theme.TEXT_DIM)
         screen.blit(icon_lbl, (ix, icon_lbl_y))
-
         picker_y = icon_lbl_y + 18
+
         if not self.icon_names:
-            no_s = self.font_small.render(
-                f'(no icons found in {ICON_DIR})', True, self.C['dim'])
+            no_s = self.font_small.render(f'(no icons found in {ICON_DIR})', True, uk.Theme.TEXT_DIM)
             screen.blit(no_s, (ix, picker_y))
         else:
+            mx, my = pygame.mouse.get_pos()
             for i, stem in enumerate(self.icon_names):
-                col = i % COLS
-                row = i // COLS
-                cx  = ix  + col * (CELL + 4)
-                cy  = picker_y + row * (CELL + 4)
+                col, row = i % COLS, i // COLS
+                cx = ix + col * (CELL + 6)
+                cy = picker_y + row * (CELL + 6)
                 cell_rect = pygame.Rect(cx, cy, CELL, CELL)
-                selected  = (stem == self.loc_dialog_icon)
-                hovered   = cell_rect.collidepoint(mx, my)
-                bg = (self.C['accent'] if selected
-                      else self.C['btn_hover'] if hovered
-                      else self.C['btn'])
-                screen.draw_rect(bg, cell_rect, border_radius=5)
-                screen.draw_rect(self.C['accent'] if selected else self.C['panel_border'],
-                                 cell_rect, 1, border_radius=5)
-                surf = self._get_icon(stem, CELL - 6)
+                selected = (stem == self.loc_dialog_icon)
+                hovered = cell_rect.collidepoint(mx, my)
+                base = uk.lerp_color((22, 26, 35), accent, 0.3 if selected else (0.5 if hovered else 0.0))
+                border = accent if selected else uk.lerp_color(uk.Theme.CARD_BORDER, accent, 1.0 if hovered else 0.0)
+                uk.draw_panel(screen, cell_rect, bg=(*base, 255), border=border,
+                              border_width=(2 if selected else 1), radius=6, shadow=False)
+                surf = self._get_icon(stem, CELL - 8)
                 if surf:
                     screen.blit(surf, surf.get_rect(center=cell_rect.center))
                 else:
-                    # Fallback: first letter of stem
-                    fb = self.font_small.render(stem[:1].upper(), True, self.C['text'])
+                    fb = self.font_small.render(stem[:1].upper(), True, uk.Theme.TEXT_PRIMARY)
                     screen.blit(fb, fb.get_rect(center=cell_rect.center))
-                # Tooltip on hover
                 if hovered:
-                    tip = self.font_small.render(stem, True, self.C['dim'])
+                    tip = self.font_small.render(stem, True, uk.Theme.TEXT_DIM)
                     screen.blit(tip, (cx, cy + CELL + 2))
                 self.loc_dialog_rects[f'icon_{i}'] = cell_rect
+                uk.register_hoverable(cell_rect)
 
-        # OK / Cancel
-        ok_r  = pygame.Rect(bx + w // 2 - 110, by + h - 44, 100, 30)
-        can_r = pygame.Rect(bx + w // 2 + 10,  by + h - 44, 100, 30)
-        for rect, key, label in ((ok_r, 'ok', 'OK'), (can_r, 'cancel', 'CANCEL')):
-            hover = rect.collidepoint(mx, my)
-            screen.draw_rect(self.C['btn_hover'] if hover else self.C['btn'],
-                             rect, border_radius=4)
-            screen.draw_rect(self.C['accent'], rect, 1, border_radius=4)
-            s = self.font_medium.render(label, True, self.C['text'])
-            screen.blit(s, s.get_rect(center=rect.center))
-            self.loc_dialog_rects[key] = rect
+        ok_r  = pygame.Rect(bx + w // 2 - 110, by + h - 46, 100, 32)
+        can_r = pygame.Rect(bx + w // 2 + 10,  by + h - 46, 100, 32)
+        self._pill_button(screen, ok_r, 'OK')
+        self._pill_button(screen, can_r, 'Cancel', danger=True)
+        self.loc_dialog_rects['ok'] = ok_r
+        self.loc_dialog_rects['cancel'] = can_r
 
-        hint = self.font_small.render('Tab to switch field · Enter/Esc to confirm/cancel',
-                                      True, self.C['dim'])
-        screen.blit(hint, (bx + (w - hint.get_width()) // 2, by + h - 14))
-
-        # ── Room dropdown popup (drawn last so it floats above icon picker) ───
         if self.room_dropdown_open:
             room_names = self._get_room_names()
-            MAX_VIS    = 8
-            ITEM_H     = 26
-            pop_w      = w - 40
-            pop_h      = min(len(room_names), MAX_VIS) * ITEM_H + 4
-            if not room_names:
-                pop_h = ITEM_H + 4
-            # Position below the button; flip above if it would go off-screen
-            btn_bottom = by + 138 + 28
-            if btn_bottom + pop_h > self.screen_height - 20:
-                pop_y = by + 138 - pop_h
-            else:
-                pop_y = btn_bottom
-            pop_x = ix
-            popup_rect = pygame.Rect(pop_x, pop_y, pop_w, pop_h)
-            screen.draw_rect(self.C['panel'], popup_rect, border_radius=4)
-            screen.draw_rect(self.C['accent'], popup_rect, 1, border_radius=4)
-            if not room_names:
-                ns = self.font_small.render('(no rooms found)', True, self.C['dim'])
-                screen.blit(ns, (pop_x + 6, pop_y + 5))
-            else:
-                mx2, my2 = pygame.mouse.get_pos()
-                end = min(self.room_dropdown_scroll + MAX_VIS, len(room_names))
-                for i, name in enumerate(room_names[self.room_dropdown_scroll:end]):
-                    abs_idx   = self.room_dropdown_scroll + i
-                    item_rect = pygame.Rect(pop_x + 2, pop_y + 2 + i * ITEM_H,
-                                            pop_w - 4, ITEM_H)
-                    hovered   = item_rect.collidepoint(mx2, my2)
-                    selected  = (name == self.loc_dialog_room)
-                    if selected:
-                        screen.draw_rect(self.C['accent'], item_rect, border_radius=3)
-                    elif hovered:
-                        screen.draw_rect(self.C['btn_hover'], item_rect, border_radius=3)
-                    col  = self.C['text'] if (selected or hovered) else self.C['dim']
-                    ns   = self.font_medium.render(name, True, col)
-                    screen.blit(ns, (item_rect.x + 6, item_rect.y + 4))
-                    self.loc_dialog_rects[f'dropdown_{abs_idx}'] = item_rect
-                # Scroll hint
-                if len(room_names) > MAX_VIS:
-                    sh = self.font_small.render(
-                        f'↑↓ scroll  ({self.room_dropdown_scroll+1}–{end} of {len(room_names)})',
-                        True, self.C['dim'])
-                    screen.blit(sh, (pop_x + 4, pop_y + pop_h + 2))
+            for key in [k for k in self.loc_dialog_rects if k.startswith('dropdown_')]:
+                del self.loc_dialog_rects[key]
+            self._draw_option_popup(
+                screen, btn_rect, room_names, self.loc_dialog_room,
+                self.room_dropdown_scroll, 8, self.loc_dialog_rects,
+                'dropdown_', accent=accent, empty_text='(no rooms found)')

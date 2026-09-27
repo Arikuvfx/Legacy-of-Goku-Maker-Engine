@@ -19,9 +19,18 @@ KamehamehaChargeEffect classes (via attacks/attack_config.py) with whatever
 values are currently in the form. What you see here is exactly what
 game.py will render if it loads the same config.
 
-Follows character_creator.py's conventions on purpose (same BASE_DIR
-anchoring, same dark dev-tool palette, same run(screen, clock) wire-up) so
-it feels like the same toolset, not a bolted-on one-off.
+VISUAL LANGUAGE — rebuilt from scratch on dev_tools/ui_kit.py, matching
+DevMenu's "modern DBZ" look (deep navy background, gold/ki-blue accents,
+dark hairline-bordered cards, header/footer chrome, inline field-row text
+editing with a live caret) the same way item_creator.py's own rebuild did.
+None of the old widget classes (Button/HoldButton/FieldEditor/ParamPanel/
+draw_rect-on-a-GPUScreen-wrapper colour constants) are used any more —
+every visual here is built directly on ui_kit primitives and this file's
+own drawing helpers. The underlying data model, archetype registry,
+save/load/duplicate/delete behaviour, the live fire/charge/decay state
+machine, the real LayerManager-driven stage preview, and the per-direction
+offset drag handle are all unchanged from the previous version of this
+file — only how they're drawn and clicked has changed.
 
 Wire-up (game.py) — same shape as character_creator.CharacterCreator:
 ------------------------------------------------------------------
@@ -32,6 +41,12 @@ Wire-up (game.py) — same shape as character_creator.CharacterCreator:
     # event loop
     if self.attack_creator.active:
         result = self.attack_creator.handle_input(event)
+        if result == 'back_to_dev_menu':
+            # Back-arrow / ESC — the Dev Menu closed itself when it
+            # launched this creator (see DevMenu._activate_selected), so
+            # reopen it here instead of dropping all the way back into
+            # gameplay. Mirrors CharacterCreator / RoomEditor's handling.
+            self.dev_menu.open()
         continue
     ...
     if self.dev_menu.active:
@@ -51,10 +66,10 @@ Wire-up (game.py) — same shape as character_creator.CharacterCreator:
 
 Controls
 --------
-    Left sidebar    — archetype picker (which kind [+ New] creates), then
+    Sidebar         — archetype picker (which kind [+ New] creates), then
                        saved attack configs across every archetype: click
                        to load (switches the archetype picker to match),
-                       [+ New], [Duplicate], [Delete].
+                       [+ New], [Duplicate], [Delete Selected].
     Top bar         — character picker, facing direction picker.
     Stage           — live preview. Press and HOLD the "Hold to Fire"
                        button (or hold SPACE, same effect): charges (if
@@ -65,15 +80,16 @@ Controls
     Right panel     — tabbed parameter form (tabs come from the current
                        archetype's config.PARAM_SETS, e.g. Beam/Charge or
                        Chain/Charge), auto-built from attacks/attack_config.py.
-                       Click a number/text field to edit it, Enter or click
-                       away to commit.
+                       Click a field to edit it, Enter or click away to
+                       commit.
     Drag handle     — Every tab whose param set has a per-direction spawn
                        offset shows a crosshair on the stage for it (Beam/
                        Chain/Projectile/Dragon Fist's own tab, plus every
                        archetype's Charge tab). Hit [Pause] first (freezes
                        whatever's currently on screen), then drag the
                        crosshair to reposition it.
-    [Save]          — writes the current config to assets/attack_configs/.
+    [Save]          — header icon button, writes the current config to
+                       assets/attack_configs/.
 
 Adding another archetype (projectile, melee, ...) means: give it a config
 class in attack_config.py with the same shape as BeamAttackConfig/
@@ -94,12 +110,15 @@ from __future__ import annotations
 
 import os
 import sys
+import math
 import copy
 import inspect
 from pathlib import Path
 from typing import Optional
 
 import pygame
+
+import dev_tools.ui_kit as uk
 
 # ── Paths — anchored to the running program's own folder, not CWD. Same
 # rationale as character_creator.py's BASE_DIR: a relative path only
@@ -117,7 +136,7 @@ CONFIGS_DIR = BASE_DIR / "assets/attack_configs"
 sys.path.insert(0, str(BASE_DIR))  # so `attacks.beam` / `config.settings` resolve when run standalone
 
 from attacks.attack_config import (
-    list_saved_configs, load_config, BEAM_DIRECTIONS as DIRECTIONS, FieldSpec,
+    list_saved_configs, load_config, BEAM_DIRECTIONS as DIRECTIONS,
 )
 from dev_tools import character_creator  # canonical roster — see _scan_characters()
 from core.draw_layers import DrawLayer, LayerManager  # stage layering — see _draw_stage()
@@ -143,18 +162,6 @@ ARCHETYPES = {
     "ultra_volleyball": ("Ultra Volleyball", _ATTACK_CONFIG_REGISTRY["ultra_volleyball"]),
 }
 
-# ── Palette (matches character_creator.py's dark dev-tool look) ─────────
-C_BG = (14, 14, 20)
-C_PANEL = (24, 24, 34)
-C_PANEL_DARK = (18, 18, 26)
-C_BORDER = (52, 52, 66)
-C_TEXT = (225, 225, 232)
-C_TEXT_DIM = (150, 150, 162)
-C_ACCENT = (90, 160, 255)
-C_ACCENT_DIM = (60, 100, 160)
-C_GOOD = (110, 200, 130)
-C_WARN = (230, 180, 90)
-C_BAD = (220, 90, 90)
 
 FALLBACK_COLORS = {
     "CYAN": (80, 220, 230), "YELLOW": (240, 220, 90), "WHITE": (240, 240, 240),
@@ -214,308 +221,122 @@ OFFSET_ATTR_FOR_TAB = {
 }
 
 
-# ─────────────────────────────────────────────────────────────────────────
-#  Small generic widgets
-# ─────────────────────────────────────────────────────────────────────────
+# =============================================================================
+# Bitmap-font adapter and small vector icon glyphs — same shapes
+# item_creator.py's own rebuild uses, so this tool reads as part of the
+# same icon/font family rather than a one-off.
+# =============================================================================
 
-class Button:
-    def __init__(self, rect: pygame.Rect, label: str, on_click, enabled=True, style="normal"):
-        self.rect = rect
-        self.label = label
-        self.on_click = on_click
-        self.enabled = enabled
-        self.style = style  # 'normal' | 'primary' | 'danger'
-        self.hovered = False
+class _BitmapFontView:
+    """Adapts a BitmapFont to the plain pygame.font.Font call shape —
+    render(text, antialias, color) / size(text) — at one fixed pixel
+    height, same adapter DevMenu.py / RoomEditor.py / item_creator.py use
+    for their own bitmap fonts."""
 
-    def handle_event(self, event) -> bool:
-        if not self.enabled:
-            return False
-        if event.type == pygame.MOUSEMOTION:
-            self.hovered = self.rect.collidepoint(event.pos)
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            if self.rect.collidepoint(event.pos):
-                self.on_click()
-                return True
-        return False
+    def __init__(self, bitmap_font, height):
+        self._font = bitmap_font
+        self._height = height
 
-    def draw(self, surf, font):
-        if not self.enabled:
-            bg = C_PANEL_DARK
-        elif self.style == "primary":
-            bg = C_ACCENT if self.hovered else C_ACCENT_DIM
-        elif self.style == "danger":
-            bg = (170, 60, 60) if self.hovered else (120, 45, 45)
-        else:
-            bg = (54, 54, 68) if self.hovered else C_PANEL
-        surf.draw_rect(bg, self.rect, border_radius=4)
-        surf.draw_rect(C_BORDER, self.rect, width=1, border_radius=4)
-        color = C_TEXT if self.enabled else C_TEXT_DIM
-        text = font.render(self.label, True, color)
-        surf.blit(text, text.get_rect(center=self.rect.center))
+    def render(self, text, antialias=True, color=(255, 255, 255)):
+        return self._font.render(text, color=color, height=self._height)
+
+    def size(self, text):
+        return self._font.size(text, height=self._height)
 
 
-class HoldButton(Button):
-    """Like Button, but reports press/release separately instead of a
-    single click — for the stage's 'hold to fire' control, which needs to
-    know exactly when the mouse goes down and up (mirrors holding Q in
-    the real game) rather than a completed click."""
-
-    def __init__(self, rect, label, on_press, on_release, enabled=True):
-        super().__init__(rect, label, on_click=lambda: None, enabled=enabled)
-        self.on_press = on_press
-        self.on_release = on_release
-        self.pressed = False
-
-    def handle_event(self, event) -> bool:
-        if event.type == pygame.MOUSEMOTION:
-            self.hovered = self.rect.collidepoint(event.pos)
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self.enabled:
-            if self.rect.collidepoint(event.pos):
-                self.pressed = True
-                self.on_press()
-                return True
-        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-            if self.pressed:
-                self.pressed = False
-                self.on_release()
-                return True
-        return False
-
-    def draw(self, surf, font):
-        bg = (200, 90, 60) if self.pressed else (C_ACCENT if self.hovered else C_ACCENT_DIM)
-        surf.draw_rect(bg, self.rect, border_radius=4)
-        surf.draw_rect(C_BORDER, self.rect, width=1, border_radius=4)
-        text = font.render(self.label, True, C_TEXT)
-        surf.blit(text, text.get_rect(center=self.rect.center))
+def _draw_chevron_left(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.22
+    uk.draw_line_on(surface, color, (cx + s * 0.4, cy - s), (cx - s * 0.6, cy), width)
+    uk.draw_line_on(surface, color, (cx - s * 0.6, cy), (cx + s * 0.4, cy + s), width)
 
 
-class FieldEditor:
-    """One editable row bound to `target[spec.key]`, its look and parsing
-    driven entirely by the FieldSpec (see attacks/attack_config.py). This is
-    what makes the panel generic: add a field to the schema and it shows
-    up here automatically, no bespoke widget needed."""
-
-    ROW_H = 26
-
-    def __init__(self, spec: FieldSpec, target: dict):
-        self.spec = spec
-        self.target = target
-        self.rect = pygame.Rect(0, 0, 0, 0)   # positioned by the panel each frame
-        self.editing = False
-        self.buffer = ""
-        self._select_all = False   # True right after clicking in: first keystroke replaces, not appends
-
-    def value(self):
-        return self.target.get(self.spec.key, self.spec.default)
-
-    def set_value(self, v):
-        self.target[self.spec.key] = v
-
-    def start_edit(self):
-        v = self.value()
-        self.buffer = "" if v is None else str(v)
-        self.editing = True
-        self._select_all = True
-
-    def commit(self):
-        raw = self.buffer.strip()
-        spec = self.spec
-        if raw == "" and spec.nullable:
-            self.set_value(None)
-        elif spec.kind == "int":
-            try:
-                v = int(float(raw))
-                if spec.min is not None: v = max(spec.min, v)
-                if spec.max is not None: v = min(spec.max, v)
-                self.set_value(v)
-            except ValueError:
-                pass
-        elif spec.kind == "float":
-            try:
-                v = float(raw)
-                if spec.min is not None: v = max(spec.min, v)
-                if spec.max is not None: v = min(spec.max, v)
-                self.set_value(v)
-            except ValueError:
-                pass
-        elif spec.kind == "str":
-            self.set_value(raw)
-        self.editing = False
-
-    def handle_event(self, event, panel_clip: pygame.Rect):
-        if not panel_clip.collidepoint(self.rect.center) and self.rect.height == 0:
-            return False
-        spec = self.spec
-        if spec.kind == "bool":
-            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self.rect.collidepoint(event.pos):
-                self.set_value(not bool(self.value()))
-                return True
-            return False
-        if spec.kind == "choice":
-            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self.rect.collidepoint(event.pos):
-                choices = list(spec.choices)
-                cur = self.value()
-                idx = (choices.index(cur) + 1) % len(choices) if cur in choices else 0
-                self.set_value(choices[idx])
-                return True
-            return False
-
-        # numeric / string text fields
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            if self.rect.collidepoint(event.pos):
-                if not self.editing:
-                    self.start_edit()
-                return True
-            elif self.editing:
-                self.commit()
-        if self.editing and event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_RETURN or event.key == pygame.K_KP_ENTER or event.key == pygame.K_TAB:
-                self.commit()
-            elif event.key == pygame.K_ESCAPE:
-                self.editing = False
-            elif event.key == pygame.K_BACKSPACE:
-                self.buffer = "" if self._select_all else self.buffer[:-1]
-                self._select_all = False
-            else:
-                ch = event.unicode
-                is_valid = (ch.isdigit() or ch in "-.") if spec.kind in ("int", "float") else (ch and ch.isprintable())
-                if is_valid:
-                    if self._select_all:
-                        self.buffer = ""
-                        self._select_all = False
-                    self.buffer += ch
-            return True
-        return False
-
-    def draw(self, surf, font, font_sm):
-        spec = self.spec
-        label_surf = font_sm.render(spec.label, True, C_TEXT_DIM)
-        surf.blit(label_surf, (self.rect.x, self.rect.y + (self.rect.height - label_surf.get_height()) // 2))
-
-        widget_w = 130
-        widget_rect = pygame.Rect(self.rect.right - widget_w, self.rect.y + 2, widget_w, self.rect.height - 4)
-
-        if spec.kind == "bool":
-            on = bool(self.value())
-            surf.draw_rect(C_GOOD if on else C_PANEL_DARK, widget_rect, border_radius=4)
-            surf.draw_rect(C_BORDER, widget_rect, width=1, border_radius=4)
-            txt = font_sm.render("ON" if on else "OFF", True, C_TEXT)
-            surf.blit(txt, txt.get_rect(center=widget_rect.center))
-        elif spec.kind == "choice":
-            surf.draw_rect(C_PANEL_DARK, widget_rect, border_radius=4)
-            surf.draw_rect(C_BORDER, widget_rect, width=1, border_radius=4)
-            txt = font_sm.render(str(self.value()), True, C_TEXT)
-            surf.blit(txt, txt.get_rect(center=widget_rect.center))
-        else:
-            bg = C_PANEL if self.editing else C_PANEL_DARK
-            surf.draw_rect(bg, widget_rect, border_radius=4)
-            surf.draw_rect(C_ACCENT if self.editing else C_BORDER, widget_rect, width=1, border_radius=4)
-            if self.editing:
-                shown = self.buffer + ("_" if (pygame.time.get_ticks() // 400) % 2 == 0 else "")
-            else:
-                v = self.value()
-                shown = "auto" if v is None else str(v)
-            color = C_TEXT_DIM if (not self.editing and self.value() is None) else C_TEXT
-            txt = font_sm.render(shown, True, color)
-            surf.blit(txt, (widget_rect.x + 6, widget_rect.y + (widget_rect.height - txt.get_height()) // 2))
-        self.rect.height = self.ROW_H  # keep hit-test valid between layout passes
+def _draw_chevron_right(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.22
+    uk.draw_line_on(surface, color, (cx - s * 0.4, cy - s), (cx + s * 0.6, cy), width)
+    uk.draw_line_on(surface, color, (cx + s * 0.6, cy), (cx - s * 0.4, cy + s), width)
 
 
-# ─────────────────────────────────────────────────────────────────────────
-#  Parameter panel — scrollable, section-grouped, built from a schema
-# ─────────────────────────────────────────────────────────────────────────
-
-class ParamPanel:
-    def __init__(self, rect: pygame.Rect):
-        self.rect = rect
-        self.scroll = 0
-        self.editors: list = []   # flat list of (kind, payload) — 'header' or FieldEditor
-
-    def load(self, groups, target: dict):
-        self.editors = []
-        for section_name, fields in groups:
-            self.editors.append(("header", section_name))
-            for spec in fields:
-                self.editors.append(("field", FieldEditor(spec, target)))
-        self.scroll = 0
-
-    def content_height(self):
-        h = 0
-        for kind, payload in self.editors:
-            h += 28 if kind == "header" else FieldEditor.ROW_H
-        return h
-
-    def is_editing(self):
-        """True while a text/numeric FieldEditor has an active edit buffer
-        open — used to keep the stage's spacebar hotkey from hijacking a
-        space the user is trying to type into a field."""
-        return any(kind == "field" and payload.editing for kind, payload in self.editors)
-
-    def handle_event(self, event):
-        if event.type == pygame.MOUSEWHEEL and self.rect.collidepoint(pygame.mouse.get_pos()):
-            self.scroll -= event.y * 30
-            max_scroll = max(0, self.content_height() - self.rect.height)
-            self.scroll = max(0, min(self.scroll, max_scroll))
-            return True
-        for kind, payload in self.editors:
-            if kind == "field":
-                if payload.rect.height and self.rect.collidepoint(payload.rect.center):
-                    if payload.handle_event(event, self.rect):
-                        return True
-                elif payload.editing and event.type == pygame.MOUSEBUTTONDOWN:
-                    payload.commit()
-        return False
-
-    def draw(self, surf, font, font_sm):
-        prev_clip = surf.get_clip()
-        surf.set_clip(self.rect)
-        surf.draw_rect(C_PANEL_DARK, self.rect)
-
-        y = self.rect.y - self.scroll
-        for kind, payload in self.editors:
-            if kind == "header":
-                row = pygame.Rect(self.rect.x, y, self.rect.width, 28)
-                if row.bottom > self.rect.y and row.top < self.rect.bottom:
-                    surf.draw_rect((34, 34, 46), row)
-                    txt = font.render(payload, True, C_ACCENT)
-                    surf.blit(txt, (row.x + 8, row.y + 5))
-                y += 28
-            else:
-                editor: FieldEditor = payload
-                editor.rect = pygame.Rect(self.rect.x + 12, y, self.rect.width - 24, FieldEditor.ROW_H)
-                if editor.rect.bottom > self.rect.y and editor.rect.top < self.rect.bottom:
-                    editor.draw(surf, font, font_sm)
-                    if editor.spec.help:
-                        pass  # tooltip could hook in here later (status bar shows it on hover)
-                y += FieldEditor.ROW_H
-
-        surf.set_clip(prev_clip)
-        surf.draw_rect(C_BORDER, self.rect, width=1)
-
-        # scrollbar
-        total = self.content_height()
-        if total > self.rect.height:
-            track = pygame.Rect(self.rect.right - 6, self.rect.y, 6, self.rect.height)
-            surf.draw_rect(C_PANEL, track)
-            thumb_h = max(20, int(self.rect.height * self.rect.height / total))
-            thumb_y = self.rect.y + int(self.scroll * (self.rect.height - thumb_h) / max(1, total - self.rect.height))
-            surf.draw_rect(C_ACCENT_DIM, (track.x, thumb_y, 6, thumb_h), border_radius=3)
-
-    def field_under_mouse(self, pos):
-        for kind, payload in self.editors:
-            if kind == "field" and payload.rect.height and payload.rect.collidepoint(pos):
-                return payload.spec
-        return None
+def _draw_plus_icon(surface, rect, color, width=3):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.34
+    uk.draw_line_on(surface, color, (cx - s, cy), (cx + s, cy), width)
+    uk.draw_line_on(surface, color, (cx, cy - s), (cx, cy + s), width)
 
 
-# ─────────────────────────────────────────────────────────────────────────
-#  Preview actor — a minimal stand-in for player.py's Player class.
-#  KamehamehaChargeEffect only ever reads .x / .y / .height / .direction
-#  off the object passed to it (see beam.py's KamehamehaChargeEffect.draw),
-#  so that's all this needs to provide to drive the REAL charge-effect
-#  class. It also knows how to draw a placeholder body so the stage reads
-#  as "a character standing here" even before wiring in real sprite frames.
-# ─────────────────────────────────────────────────────────────────────────
+def _draw_duplicate_icon(surface, rect, color, width=2):
+    """Fallback 'two overlapping sheets' copy/duplicate glyph, used only
+    if assets/ui/dev_menu/icons/duplicate.png isn't present."""
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.42
+    back = pygame.Rect(0, 0, s, s)
+    back.center = (cx - s * 0.18, cy - s * 0.18)
+    uk.draw_rect_on(surface, color, back, width, 2)
+    front = pygame.Rect(0, 0, s, s)
+    front.center = (cx + s * 0.18, cy + s * 0.18)
+    uk.draw_rect_on(surface, color, front, width, 2)
+
+
+def _draw_check_icon(surface, rect, color, width=3):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.32
+    uk.draw_line_on(surface, color, (cx - s, cy), (cx - s * 0.15, cy + s * 0.8), width)
+    uk.draw_line_on(surface, color, (cx - s * 0.15, cy + s * 0.8), (cx + s, cy - s * 0.7), width)
+
+
+def _draw_trash_icon(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    body = pygame.Rect(0, 0, s * 0.46, s * 0.48)
+    body.centerx = cx
+    body.top = int(cy - s * 0.08)
+    uk.draw_rect_on(surface, color, body, width, 2)
+    lid = pygame.Rect(0, 0, s * 0.62, s * 0.09)
+    lid.centerx = cx
+    lid.bottom = body.top + 1
+    uk.draw_rect_on(surface, color, lid, width, 1)
+    handle = pygame.Rect(0, 0, s * 0.22, s * 0.12)
+    handle.centerx = cx
+    handle.bottom = lid.top + 2
+    uk.draw_rect_on(surface, color, handle, width, 2)
+    for i in (-1, 0, 1):
+        x = cx + i * s * 0.13
+        uk.draw_line_on(surface, color, (x, body.top + 5), (x, body.bottom - 4), width)
+
+
+def _draw_play_icon(surface, rect, color):
+    """Filled right-pointing triangle — 'Hold to Fire' button glyph.
+    pygame.draw.polygon only accepts a real pygame.Surface, but `surface`
+    here can be the engine's GPUScreen wrapper (see ui_kit.py's own
+    'Supersampled shapes' note) — so this draws the triangle on a small
+    throwaway real Surface first, then blits that through
+    uk.blit_surface, which both backends support."""
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.32
+    w, h = int(s * 1.5) + 2, int(s * 2) + 2
+    tri = pygame.Surface((w, h), pygame.SRCALPHA)
+    pts = [(1, 1), (1, h - 1), (w - 1, h / 2)]
+    pygame.draw.polygon(tri, color, pts)
+    uk.blit_surface(surface, tri, tri.get_rect(center=(int(cx), int(cy))), transient=True)
+
+
+def _draw_pause_icon(surface, rect, color):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.30
+    for dx in (-s * 0.5, s * 0.15):
+        bar = pygame.Rect(0, 0, s * 0.32, s * 2)
+        bar.centerx = cx + dx
+        bar.centery = cy
+        uk.draw_rect_on(surface, color, bar, 0, 2)
+
+
+# =============================================================================
+# Preview actor — a minimal stand-in for player.py's Player class.
+# Unchanged from the previous version of this file: this is the simulation
+# side (it drives the REAL KamehamehaChargeEffect/etc. classes), not UI
+# chrome, so the visual rework above doesn't touch it.
+# =============================================================================
 
 class PreviewActor:
     # Player sprite sheets (see CharacterSpriteLoader.load_character in
@@ -901,19 +722,37 @@ class PreviewActor:
             body = pygame.Rect(0, 0, w, h)
             body.midbottom = (int(screen_x), int(screen_y))
             surf.draw_ellipse((90, 130, 170), body)
-            surf.draw_ellipse(C_BORDER, body, width=2)
-            label = pygame.font.Font(None, 16).render(self.char_id, True, C_TEXT_DIM)
+            surf.draw_ellipse(uk.Theme.CARD_BORDER, body, width=2)
+            label = pygame.font.Font(None, 16).render(self.char_id, True, uk.Theme.TEXT_DIM)
             surf.blit(label, label.get_rect(midtop=(body.centerx, body.bottom + 2)))
 
 
 class FakeCamera:
     x = 0.0
     y = 0.0
-
-
 # ─────────────────────────────────────────────────────────────────────────
-#  Main tool
+#  Layout constants
 # ─────────────────────────────────────────────────────────────────────────
+ROW_H = 32          # parameter field row height
+SECTION_H = 26       # parameter section header row height
+TAB_H = 34
+FIELD_VALUE_W = 128
+SIDEBAR_ROW_H = 34
+FIELD_MAX_LEN = 40
+
+# Per-archetype accent colour — same "colored dot = identity" idea
+# item_creator.py uses for its category dots, here identifying which
+# archetype a saved config (or the active tab row) belongs to.
+ARCHETYPE_ACCENT = {
+    "beam": uk.Theme.GOLD,
+    "chain": uk.Theme.KI_BLUE,
+    "projectile": (240, 146, 92),
+    "sword": (167, 139, 250),
+    "dragon_fist": (235, 110, 150),
+    "genkidama": (94, 210, 148),
+    "ultra_volleyball": (140, 200, 255),
+}
+
 
 class AttackCreator:
     STATE_IDLE, STATE_CHARGING, STATE_FIRING, STATE_DECAYING = "idle", "charging", "firing", "decaying"
@@ -922,16 +761,35 @@ class AttackCreator:
         self.screen_width = screen_width
         self.screen_height = screen_height
         self.active = False   # same contract as CharacterCreator: game.py gates
+        self._logical_mouse_pos = (screen_width // 2, screen_height // 2)
 
-        self.font = pygame.font.Font(None, 20)
-        self.font_sm = pygame.font.Font(None, 16)
-        self.font_lg = pygame.font.Font(None, 26)
+        # Same bitmap-font family / split as DevMenu / item_creator: title
+        # text uses the plain uppercase/lowercase glyph set, everything
+        # else uses the menu glyph set.
+        self._menu_font = uk.BitmapFont('assets\\ui\\fonts', letter_spacing=1)
+        self._title_bitmap_font = uk.BitmapFont('assets\\ui\\fonts', letter_spacing=1)
+        self._title_bitmap_font.uppercase_dir = os.path.join('assets', 'ui', 'fonts', 'uppercase')
+        self._title_bitmap_font.lowercase_dir = os.path.join('assets', 'ui', 'fonts', 'lowercase')
 
+        self.font_title = _BitmapFontView(self._title_bitmap_font, 28)
+        self.font_large = _BitmapFontView(self._menu_font, 17)
+        self.font_medium = _BitmapFontView(self._menu_font, 14)
+        self.font_small = _BitmapFontView(self._menu_font, 12)
+        self.font_tiny = _BitmapFontView(self._menu_font, 10)
+
+        self._back_icon = self._load_dev_menu_icon('back', 34)
+        self._save_icon = self._load_dev_menu_icon('save', 26)
+        self._trash_icon = self._load_dev_menu_icon('trash', 22)
+        self._plus_icon = self._load_dev_menu_icon('plus', 18)
+        self._dup_icon = self._load_dev_menu_icon('duplicate', 18)
+
+        # ── functional state (unchanged from the previous version) ──────
         self.active_archetype = "beam"
         self.config = self._make_config(self.active_archetype, {"id": "new_attack", "display_name": "New Attack"})
         self.active_tab = self._first_tab(self.config)   # e.g. 'beam' | 'charge', or 'chain' | 'charge'
         self.status_msg = ""
         self.status_ok = True
+        self.status_timer = 0.0
 
         self.characters = self._scan_characters()
         self.char_index = 0
@@ -941,21 +799,6 @@ class AttackCreator:
         self.charge_obj = None
         self.attack_obj = None
         self.charge_elapsed = 0.0
-        # Ultra-Volleyball-only: mirrors player.py's pending_ultra_volleyball
-        # gate. Set to True in _on_fire_press() instead of building
-        # attack_obj right away, then flips to 'ready' in update() once
-        # _pending_ultra_volleyball_elapsed reaches one frame's worth of
-        # wind-up — see update()'s STATE_FIRING/_pending_ultra_volleyball
-        # branch for why this is tracked as an independent wall-clock
-        # timer rather than read off self.actor's own frame index (that
-        # index isn't refreshed for the new "firing" state until
-        # self.actor.set_anim_state()/update() run at the *bottom* of this
-        # same update(), so checking it earlier in the method — before
-        # those calls — read whatever frame the *previous* animation
-        # happened to be sitting on, which was often already >= 1 and
-        # fired the attack on the very first tick after press regardless).
-        # Same "don't trust art/animation internals to gate real game
-        # logic" reasoning as self.charge_elapsed below.
         self._pending_ultra_volleyball = None
         self._pending_direction = None
         self._pending_ultra_volleyball_elapsed = 0.0
@@ -963,20 +806,108 @@ class AttackCreator:
         # Real LayerManager (core/draw_layers.py) — the same one game.py
         # uses — so the stage sorts actor/charge_obj/attack_obj by their
         # actual draw_layer/get_sort_key() instead of a fixed draw order.
-        # See _draw_stage().
         self.layer_manager = LayerManager()
 
-        # Pause + drag-to-reposition for whichever offset dict the active
-        # tab exposes (charge/beam/chain — see OFFSET_ATTR_FOR_TAB above).
         self.paused = False
         self.dragging_offset = False
-        self._drag_offset_attr: Optional[str] = None  # which attr is being dragged, set on press
+        self._drag_offset_attr: Optional[str] = None
+
+        # ── sidebar (saved-config list + archetype picker) ──────────────
+        self.sidebar_scroll = 0
+        self._sidebar_row_rects: list = []
+
+        # ── param panel (tabs + field list) ──────────────────────────────
+        self._param_rows: list = []            # [("header", label) | ("field", spec, target)]
+        self.panel_scroll = 0
+        self._field_row_rects: dict = {}        # (tab, key) -> rect, rebuilt each draw()
+        self.tab_rects: dict = {}
+        self._panel_scroll_dragging = False
+        self._panel_scrollbar_track: Optional[pygame.Rect] = None
+        self._panel_scrollbar_thumb: Optional[pygame.Rect] = None
+        self._panel_scrollbar_max_scroll = 0
+
+        # ── inline field-edit engine (single-line only — every field in
+        # this tool's param panel is a short int/float/str value) ───────
+        self.editing_field: Optional[tuple] = None   # (tab, key) or None
+        self._editing_spec = None
+        self._editing_target = None
+        self.text_input = ""
+        self.cursor_pos = 0
+        self.selection_anchor = None
+        self.cursor_blink = 0.0
+        self._text_drag = False
+        self._text_max_len = FIELD_MAX_LEN
+        self._active_edit_rect: Optional[pygame.Rect] = None
+        self._active_edit_text_x: Optional[int] = None
+        self._active_edit_font = None
+        self.text_field_rects: list = []
+
+        # ── hover/press anim buckets ──────────────────────────────────────
+        self._back_hovered = False
+        self._back_hover_anim = 0.0
+        self._save_hovered = False
+        self._save_hover_anim = 0.0
+        self._new_hovered = False
+        self._new_hover_anim = 0.0
+        self._dup_hovered = False
+        self._dup_hover_anim = 0.0
+        self._delete_hovered = False
+        self._delete_hover_anim = 0.0
+        self._pause_hovered = False
+        self._pause_hover_anim = 0.0
+        self._fire_hovered = False
+        self._fire_hover_anim = 0.0
+        self._arch_prev_hovered = False
+        self._arch_next_hovered = False
+        self._char_prev_hovered = False
+        self._char_next_hovered = False
+        self._dir_prev_hovered = False
+        self._dir_next_hovered = False
+        self.sidebar_hover_index = -1
+        self._sidebar_hover_anim: list = [0.0] * 64
+        self._enabled_chip_hovered = False
+        self._enabled_chip_hover_anim = 0.0
+
+        # Fire is a hold button — pressed state is tracked separately from
+        # hover so the stage knows to keep firing across MOUSEMOTION events.
+        self._fire_pressed = False
 
         self._build_layout()
         self._reload_panel()
         self._new_actor()
 
-    # ── setup ────────────────────────────────────────────────────────
+    # ------------------------------------------------------------------ setup
+    @staticmethod
+    def _load_dev_menu_icon(icon_key, box_size):
+        """Same shared dev-menu PNG icon loader (crop + point-sample scale)
+        DevMenu._load_icon / item_creator._load_dev_menu_icon use, so these
+        icons match theirs pixel-for-pixel."""
+        path = os.path.join('assets', 'ui', 'dev_menu', 'icons', f'{icon_key}.png')
+        try:
+            raw = pygame.image.load(path).convert_alpha()
+        except (FileNotFoundError, pygame.error):
+            return None
+
+        content_rect = raw.get_bounding_rect(min_alpha=1)
+        if content_rect.width <= 0 or content_rect.height <= 0:
+            content_rect = raw.get_rect()
+        raw = raw.subsurface(content_rect).copy()
+
+        iw, ih = raw.get_size()
+        scale = min(box_size / max(1, iw), box_size / max(1, ih))
+        nw = max(1, round(iw * scale))
+        nh = max(1, round(ih * scale))
+        if scale >= 1.0:
+            prescale = max(1, math.ceil(scale) * 2)
+            big = pygame.transform.scale(raw, (iw * prescale, ih * prescale))
+            scaled = pygame.transform.scale(big, (nw, nh))
+        else:
+            scaled = pygame.transform.scale(raw, (nw, nh))
+
+        canvas = pygame.Surface((box_size, box_size), pygame.SRCALPHA)
+        canvas.blit(scaled, ((box_size - nw) // 2, (box_size - nh) // 2))
+        return canvas
+
     @staticmethod
     def _make_config(archetype: str, data: dict):
         """Construct a fresh config of the given archetype — the one
@@ -992,97 +923,103 @@ class AttackCreator:
     @staticmethod
     def _scan_characters() -> list:
         """Delegate to character_creator.discover_characters() instead of
-        listing assets/sprites/player/ ourselves. That's the same roster
-        game.py plays from: it honors the saved menu order and — crucially —
-        excludes characters that were soft-deleted via the character
-        creator (their sprite folder stays on disk, but the ID is recorded
-        in character_menu.json's "removed" list). Scanning the raw folder
-        ourselves, as this used to do, meant deleted characters kept
-        showing up here even though they're gone everywhere else."""
+        listing assets/sprites/player/ ourselves — see the previous
+        version of this file's own comment: this is the same roster
+        game.py plays from, and excludes soft-deleted characters."""
         names = character_creator.discover_characters()
         if names:
             return names
         return ["default"]
 
     def _build_layout(self):
-        pad = 12
-        sidebar_w = 220
-        panel_w = 340
-        top_h = 46
+        sw, sh = self.screen_width, self.screen_height
+        # Same header/footer formula as DevMenu / item_creator.
+        self.header_h = max(86, round(sh * 0.12))
+        self.footer_h = max(42, round(sh * 0.065))
+        self.margin_x = max(24, round(sw * 0.03))
 
-        self.sidebar_rect = pygame.Rect(pad, pad, sidebar_w, self.screen_height - 2 * pad)
-        self.top_rect = pygame.Rect(self.sidebar_rect.right + pad, pad,
-                                     self.screen_width - sidebar_w - panel_w - 3 * pad, top_h)
-        self.stage_rect = pygame.Rect(self.top_rect.x, self.top_rect.bottom + pad,
-                                       self.top_rect.width, self.screen_height - top_h - 3 * pad)
-        self.panel_rect_outer = pygame.Rect(self.stage_rect.right + pad, pad,
-                                             panel_w, self.screen_height - 2 * pad)
+        back_size = max(40, round(self.header_h * 0.55))
+        self._back_rect = pygame.Rect(0, 0, back_size, back_size)
+        self._back_rect.left = self.margin_x
+        self._back_rect.centery = self.header_h // 2
 
-        # Tab row: fixed height regardless of archetype, but split into
-        # however many tabs config.PARAM_SETS has for the current
-        # archetype — see _build_tabs(), called at the end of this method
-        # and again any time self.config swaps to a different archetype
-        # (new/duplicate/load/archetype-cycle). Decoupled from that count
-        # here since every archetype's tab row is the same fixed height,
-        # only the per-tab widths vary.
-        tab_h = 30
+        self._title_surf = self.font_title.render("ATTACK CREATOR", True, uk.Theme.TEXT_PRIMARY)
+
+        self._save_rect = pygame.Rect(0, 0, back_size, back_size)
+        self._save_rect.right = sw - self.margin_x
+        self._save_rect.centery = self.header_h // 2
+
+        gap = 16
+        content_top = self.header_h + gap
+        content_bottom = sh - self.footer_h - gap
+        content_h = max(100, content_bottom - content_top)
+
+        sidebar_w = min(300, max(230, int(sw * 0.19)))
+        panel_w = min(400, max(300, int(sw * 0.26)))
         self.panel_w = panel_w
-        self.tab_h = tab_h
-        save_bar_h = 40
-        self.param_panel = ParamPanel(pygame.Rect(
-            self.panel_rect_outer.x, self.panel_rect_outer.y + tab_h + 4,
-            panel_w, self.panel_rect_outer.height - tab_h - save_bar_h - 8))
-        self.save_bar_rect = pygame.Rect(self.panel_rect_outer.x, self.panel_rect_outer.bottom - save_bar_h,
-                                          panel_w, save_bar_h)
 
-        # sidebar buttons — archetype picker (governs what [+ New] makes)
-        # sits above the new/duplicate row, pushing the saved-config list
-        # down accordingly.
-        arch_row_y = self.sidebar_rect.y + 40
-        self.btn_arch_prev = Button(pygame.Rect(self.sidebar_rect.x + 8, arch_row_y, 26, 26),
-                                     "<", lambda: self._cycle_archetype(-1))
-        self.btn_arch_next = Button(pygame.Rect(self.sidebar_rect.right - 8 - 26, arch_row_y, 26, 26),
-                                     ">", lambda: self._cycle_archetype(1))
+        self.sidebar_rect = pygame.Rect(self.margin_x, content_top, sidebar_w, content_h)
+        self.panel_rect_outer = pygame.Rect(sw - self.margin_x - panel_w, content_top, panel_w, content_h)
+        center_x = self.sidebar_rect.right + gap
+        center_w = self.panel_rect_outer.x - gap - center_x
 
-        new_dup_row_y = arch_row_y + 32
-        list_top = new_dup_row_y + 44
-        self.sidebar_list_rect = pygame.Rect(self.sidebar_rect.x + 8, list_top,
-                                              self.sidebar_rect.width - 16,
-                                              self.sidebar_rect.bottom - list_top - 90)
-        self.sidebar_scroll = 0
+        top_h = 60
+        self.top_rect = pygame.Rect(center_x, content_top, center_w, top_h)
+        self.stage_rect = pygame.Rect(center_x, self.top_rect.bottom + gap,
+                                       center_w, content_h - top_h - gap)
 
-        bw = (self.sidebar_rect.width - 24) // 2
-        self.btn_new = Button(pygame.Rect(self.sidebar_rect.x + 8, new_dup_row_y, bw, 28),
-                               "+ New", self._on_new)
-        self.btn_dup = Button(pygame.Rect(self.sidebar_rect.x + 16 + bw, new_dup_row_y, bw, 28),
-                               "Duplicate", self._on_duplicate)
-        self.btn_delete = Button(pygame.Rect(self.sidebar_rect.x + 8, self.sidebar_rect.bottom - 40,
-                                              self.sidebar_rect.width - 16, 28),
-                                  "Delete Selected", self._on_delete, style="danger")
+        # ── sidebar internals ──────────────────────────────────────────
+        pad = 14
+        x = self.sidebar_rect.x + pad
+        w = self.sidebar_rect.w - pad * 2
+        y = self.sidebar_rect.y + pad
 
-        self.btn_char_prev = Button(pygame.Rect(self.top_rect.x, self.top_rect.y, 28, self.top_rect.height),
-                                     "<", self._prev_char)
-        self.btn_char_next = Button(pygame.Rect(self.top_rect.x + 190, self.top_rect.y, 28, self.top_rect.height),
-                                     ">", self._next_char)
-        self.btn_dir_prev = Button(pygame.Rect(self.top_rect.x + 240, self.top_rect.y, 28, self.top_rect.height),
-                                    "<", self._prev_dir)
-        self.btn_dir_next = Button(pygame.Rect(self.top_rect.x + 380, self.top_rect.y, 28, self.top_rect.height),
-                                    ">", self._next_dir)
+        self._sidebar_title_pos = (x, y)
+        y += 30
 
-        fire_w, fire_h = 200, 44
-        self.btn_fire = HoldButton(
-            pygame.Rect(self.stage_rect.centerx - fire_w // 2, self.stage_rect.bottom - fire_h - 10,
-                        fire_w, fire_h),
-            "Hold to Fire", self._on_fire_press, self._on_fire_release)
+        arch_btn = 28
+        self._arch_prev_rect = pygame.Rect(x, y, arch_btn, arch_btn)
+        self._arch_next_rect = pygame.Rect(x + w - arch_btn, y, arch_btn, arch_btn)
+        self._arch_row_rect = pygame.Rect(x, y, w, arch_btn)
+        y += arch_btn + 10
 
-        pause_w = 90
-        self.btn_pause = Button(
-            pygame.Rect(self.btn_fire.rect.x - pause_w - 10, self.btn_fire.rect.y, pause_w, fire_h),
-            "Pause", self._toggle_pause)
+        bw = (w - 10) // 2
+        self._new_rect = pygame.Rect(x, y, bw, 30)
+        self._dup_rect = pygame.Rect(x + bw + 10, y, bw, 30)
+        y += 30 + 12
 
-        self.btn_save = Button(pygame.Rect(self.save_bar_rect.x + 6, self.save_bar_rect.y + 4,
-                                            self.save_bar_rect.width - 12, self.save_bar_rect.height - 8),
-                                "Save", self._on_save, style="primary")
+        list_bottom = self.sidebar_rect.bottom - pad - 34 - 10
+        self._sidebar_list_rect = pygame.Rect(x, y, w, max(40, list_bottom - y))
+
+        self._delete_rect = pygame.Rect(x, self.sidebar_rect.bottom - pad - 34, w, 34)
+
+        # ── top bar internals (character + direction pickers) ───────────
+        nav_btn = 30
+        tx = self.top_rect.x + 14
+        ty = self.top_rect.centery
+        self._char_prev_rect = pygame.Rect(tx, ty - nav_btn // 2, nav_btn, nav_btn)
+        self._char_label_rect = pygame.Rect(self._char_prev_rect.right + 6, self.top_rect.y, 130, self.top_rect.h)
+        self._char_next_rect = pygame.Rect(self._char_label_rect.right + 6, ty - nav_btn // 2, nav_btn, nav_btn)
+
+        dx = self._char_next_rect.right + 26
+        self._dir_prev_rect = pygame.Rect(dx, ty - nav_btn // 2, nav_btn, nav_btn)
+        self._dir_label_rect = pygame.Rect(self._dir_prev_rect.right + 6, self.top_rect.y, 110, self.top_rect.h)
+        self._dir_next_rect = pygame.Rect(self._dir_label_rect.right + 6, ty - nav_btn // 2, nav_btn, nav_btn)
+
+        # ── stage internals (hold-to-fire + pause) — bottom-right, clear
+        # of the offset-handle readout text at the bottom-left, and
+        # thinner than a standard pill so the row stays compact. Centered
+        # in the 40px band between the ground line and the stage's own
+        # bottom edge, rather than pinned to either. ─────────────────────
+        fire_w, fire_h = 168, 22
+        self._fire_rect = pygame.Rect(0, 0, fire_w, fire_h)
+        self._fire_rect.right = self.stage_rect.right - 12
+        self._fire_rect.centery = self.stage_rect.bottom - 20
+
+        pause_w = 88
+        self._pause_rect = pygame.Rect(0, 0, pause_w, fire_h)
+        self._pause_rect.right = self._fire_rect.left - 8
+        self._pause_rect.centery = self._fire_rect.centery
 
         self._build_tabs()
 
@@ -1090,22 +1027,88 @@ class AttackCreator:
         """(Re)build self.tab_rects — one Rect per entry in
         self.config.PARAM_SETS, evenly dividing the fixed-height tab row.
         Called from _build_layout() and again whenever self.config swaps
-        to a config of a different archetype (different PARAM_SETS), since
-        the tab count/labels can change even though the row's own
-        position/height doesn't."""
+        to a config of a different archetype (different PARAM_SETS)."""
         names = list(self.config.PARAM_SETS.keys())
         n = max(1, len(names))
         self.tab_rects = {}
         x = self.panel_rect_outer.x
         for i, name in enumerate(names):
             w = self.panel_w // n if i < n - 1 else self.panel_w - (self.panel_w // n) * (n - 1)
-            self.tab_rects[name] = pygame.Rect(x, self.panel_rect_outer.y, w, self.tab_h)
+            self.tab_rects[name] = pygame.Rect(x, self.panel_rect_outer.y, w, TAB_H)
             x += w
+
+        enable_h = 26
+        self._enabled_chip_rect = pygame.Rect(
+            self.panel_rect_outer.right - 14 - 84, self.panel_rect_outer.y + TAB_H + 8, 84, enable_h)
+
+        field_top = self.panel_rect_outer.y + TAB_H + (enable_h + 16 if self.active_tab in self.config.OPTIONAL_SETS else 8)
+        self._panel_list_rect = pygame.Rect(
+            self.panel_rect_outer.x, field_top,
+            self.panel_w, self.panel_rect_outer.bottom - field_top - 8)
 
     def _reload_panel(self):
         groups = self.config.GROUPS.get(self.active_tab) or [("Parameters", self.config.PARAM_SETS[self.active_tab])]
         target = self.config.params[self.active_tab]
-        self.param_panel.load(groups, target)
+        rows = []
+        for section_name, fields in groups:
+            rows.append(("header", section_name))
+            for spec in fields:
+                rows.append(("field", spec, target))
+        self._param_rows = rows
+        self.panel_scroll = 0
+
+    def _panel_content_height(self) -> int:
+        h = 0
+        for row in self._param_rows:
+            h += SECTION_H if row[0] == "header" else ROW_H
+        return h
+
+    def _panel_row_top_offsets(self):
+        """Cumulative top-y (in content space) of every row, plus a
+        trailing sentinel equal to the total content height."""
+        offsets = []
+        y = 0
+        for row in self._param_rows:
+            offsets.append(y)
+            y += SECTION_H if row[0] == "header" else ROW_H
+        offsets.append(y)
+        return offsets
+
+    def _snap_panel_scroll(self, raw: int) -> int:
+        """Snap a raw scroll offset down to the top of whichever row it
+        falls in. Rows have two different heights (section headers vs.
+        fields), so a free pixel scroll can leave a row's text starting
+        a few pixels above self._panel_list_rect.y — clipping is
+        supposed to hide that sliver, but on the real engine's GPUScreen
+        that clip didn't reliably hold, and a section header ('Identity',
+        'Asset Folder', ...) bled up over the tab row above it. Snapping
+        to row boundaries means a row is never drawn starting above the
+        list's top edge in the first place, so there's nothing for a
+        clip bug to fail to hide."""
+        offsets = self._panel_row_top_offsets()
+        total = offsets[-1]
+        max_scroll = max(0, total - self._panel_list_rect.h)
+        raw = max(0, min(max_scroll, raw))
+        best = 0
+        for off in offsets:
+            if off <= raw:
+                best = off
+            else:
+                break
+        return min(best, max_scroll)
+
+    def _scrub_panel_scroll(self, mouse_y: int) -> None:
+        """Map a mouse y position to a scroll offset, for click-to-jump
+        and drag-follow on the field-list scrollbar thumb."""
+        track = self._panel_scrollbar_track
+        thumb = self._panel_scrollbar_thumb
+        if track is None or thumb is None:
+            return
+        usable = max(1, track.height - thumb.height)
+        rel = mouse_y - track.y - thumb.height / 2
+        frac = max(0.0, min(1.0, rel / usable))
+        raw = int(round(frac * self._panel_scrollbar_max_scroll))
+        self.panel_scroll = self._snap_panel_scroll(raw)
 
     def _new_actor(self):
         cx = self.stage_rect.centerx
@@ -1113,27 +1116,15 @@ class AttackCreator:
         self.actor = PreviewActor(PREVIEW_WORLD_ANCHOR, PREVIEW_WORLD_ANCHOR, self.characters[self.char_index])
         self.actor.set_direction(DIRECTIONS[self.direction_index])  # keep facing on character switch
         self.camera = FakeCamera()
-        # Center world (PREVIEW_WORLD_ANCHOR, PREVIEW_WORLD_ANCHOR) — the
-        # actor's anchor, well clear of the corner-origin bounds check
-        # fired attacks run against (see PREVIEW_WORLD_ANCHOR's own
-        # comment) — at the desired screen point:
-        # screen = world*scale - camera, so camera = world*scale - screen.
         from config.settings import RENDER_SCALE
         self.camera.x = PREVIEW_WORLD_ANCHOR * RENDER_SCALE - cx
         self.camera.y = PREVIEW_WORLD_ANCHOR * RENDER_SCALE - cy
 
-    # ── sidebar actions ─────────────────────────────────────────────
+    # ── sidebar actions (unchanged) ─────────────────────────────────────
     def _saved_configs(self):
-        # Every archetype this tool supports shows in one flat list —
-        # _draw_sidebar tags each row with its archetype so a beam config
-        # and a chain config aren't visually confused with one another.
         return list_saved_configs(CONFIGS_DIR)
 
     def _cycle_archetype(self, step):
-        """Changes what [+ New] builds. Also immediately starts a fresh
-        untitled attack of the newly-selected archetype — the previously
-        in-progress (unsaved) edit would otherwise be showing a param
-        panel/tabs for a class that no longer matches self.active_archetype."""
         keys = list(ARCHETYPES.keys())
         idx = (keys.index(self.active_archetype) + step) % len(keys)
         self.active_archetype = keys[idx]
@@ -1188,7 +1179,7 @@ class AttackCreator:
         self._reload_panel()
         self._set_status(f"Loaded {self.config.id}", True)
 
-    # ── character / direction ──────────────────────────────────────
+    # ── character / direction (unchanged) ───────────────────────────────
     def _prev_char(self):
         self.char_index = (self.char_index - 1) % len(self.characters)
         self._new_actor()
@@ -1209,12 +1200,10 @@ class AttackCreator:
 
     # ── fire lifecycle — mirrors player.py's hold-to-charge/release-to-
     # fire/release-to-decay beam contract described in beam.py's own
-    # comments, just driven by a mouse button instead of a keybind. ──
+    # comments, just driven by a mouse button instead of a keybind.
+    # UNCHANGED from the previous version of this file. ──
     def _on_fire_press(self):
         if self.paused:
-            # Pause freezes the whole preview for dragging — a stray
-            # press while paused (e.g. clicking "Hold to Fire" again by
-            # habit) shouldn't restart anything out from under the drag.
             return
         self._stop_preview()
         direction = self.actor.direction
@@ -1223,19 +1212,6 @@ class AttackCreator:
             self.charge_elapsed = 0.0
             self.state = self.STATE_CHARGING
         elif self.active_archetype == "ultra_volleyball":
-            # Don't build the flying attack_obj yet — the actor is only
-            # just starting the shared kiblast wind-up (frame 0). Building
-            # it here made the volleyball launch on the same frame the
-            # wind-up pose first appears, a full throw-frame early compared
-            # to the real game, where shoot_ultra_volleyball() only arms
-            # pending_ultra_volleyball and the actual attack isn't spawned
-            # until the kiblast animation reaches frame index 1 (see
-            # player.py's update(), 'kiblast' branch). Enter STATE_FIRING
-            # now so the wind-up animation starts playing, and let
-            # update() build attack_obj once one frame's worth of wind-up
-            # has elapsed (see _pending_ultra_volleyball_elapsed's own
-            # comment for why that's a separate timer instead of reading
-            # the actor's frame index directly).
             self._pending_ultra_volleyball = True
             self._pending_direction = direction
             self._pending_ultra_volleyball_elapsed = 0.0
@@ -1246,24 +1222,8 @@ class AttackCreator:
 
     def _on_fire_release(self):
         if self.paused:
-            # Without this, letting go of SPACE/the mouse button after
-            # hitting Pause — the natural thing to do once the preview
-            # visibly stops moving — would still run the normal release
-            # logic below and cancel/decay whatever was just frozen for
-            # dragging (e.g. STATE_CHARGING would _stop_preview() and the
-            # charge effect would vanish out from under you). Pause means
-            # frozen until Resume, full stop; Resume picks the state
-            # machine back up exactly where update() left it.
             return
         if self.state == self.STATE_CHARGING:
-            # Genkidama-only (fires_on_release=True — see AttackConfigBase):
-            # unlike every other archetype, releasing MID-CHARGE is this
-            # attack's actual fire trigger, not a cancel — you throw
-            # whatever power state you're currently sitting in (see
-            # GenkidamaChargeEffect's own docstring). Every other
-            # archetype's build_attack(...) doesn't even declare a
-            # charge_obj parameter; this branch is the only caller that
-            # passes one, and only takes it when the active config opted in.
             if getattr(self.config, "fires_on_release", False) and self.charge_obj is not None:
                 self.attack_obj = self.config.build_attack(
                     self.actor.x, self.actor.y, self.actor.direction,
@@ -1273,44 +1233,7 @@ class AttackCreator:
             else:
                 self._stop_preview()
         elif self.state == self.STATE_FIRING:
-            # Archetype-generic: beam-family attacks have a lengthwise
-            # decay sweep (start_decay(), then let update() run it down to
-            # inactive — see the STATE_DECAYING branch in update()).
-            # Chain-family attacks (flame_kamehameha) have no such sweep —
-            # release just ends them outright via stop(). Prefer
-            # start_decay() when the built object has one; fall back to
-            # stop(); if it has neither, just drop the preview.
-            #
-            # Sword-family attacks (EnergySwordSpinEffect) are a third
-            # case: releasing early should do NOTHING — the spin is a
-            # fixed, free, autoplay beat once it starts (see that class's
-            # docstring) and ends itself via its own duration countdown
-            # (see the STATE_FIRING/STATE_DECAYING branch in update()).
-            # no_release_cancel is how it opts out of the decay/stop
-            # fallback below without a hardcoded archetype check here.
-            #
-            # Dragon-Fist-family attacks (DragonFistAttack) are a fourth
-            # case: release begins its own two-phase closing sequence
-            # (start_retract() — head_end art, then the shared destruction
-            # puff — see that class's start_retract() docstring), which
-            # plays out and ends the attack itself, the same
-            # "start*, then let update() run it down to inactive" shape
-            # start_decay() already has — so it's handled the same way,
-            # just via a different method name.
-            #
-            # Ultra-Volleyball-family attacks (UltraVolleyballAttack) are a
-            # fifth case, same shape as sword: release should do NOTHING —
-            # all three segments travel their fixed travel_distance and
-            # despawn on their own timer regardless of how long the button
-            # was held (see that class's docstring), so it opts out via
-            # no_release_cancel exactly like EnergySwordSpinEffect does.
             if self._pending_ultra_volleyball is not None:
-                # attack_obj hasn't spawned yet — still mid wind-up waiting
-                # on the frame-1 throw threshold (see the STATE_FIRING
-                # branch in update()). Same no_release_cancel contract as
-                # the spawned case below: release does nothing, the
-                # wind-up keeps playing and the volleyball still launches
-                # on schedule.
                 pass
             elif getattr(self.attack_obj, "no_release_cancel", False):
                 pass
@@ -1338,15 +1261,14 @@ class AttackCreator:
     def _toggle_pause(self):
         """Freeze the fire state machine and the actor's own animation so
         the currently-visible frame holds still — meant to be hit mid-
-        charge/fire/decay so the on-stage offset handle (charge/beam/
-        chain) can be dragged precisely without everything moving out
-        from under the mouse at the same time."""
+        charge/fire/decay so the on-stage offset handle can be dragged
+        precisely without everything moving out from under the mouse."""
         self.paused = not self.paused
-        self.btn_pause.label = "Resume" if self.paused else "Pause"
 
     def _set_status(self, msg, ok):
         self.status_msg = msg
         self.status_ok = ok
+        self.status_timer = 4.0
 
     # ── lifecycle (same contract as character_creator.CharacterCreator) ──
     def toggle(self):
@@ -1356,47 +1278,60 @@ class AttackCreator:
             self.paused = False
             self.dragging_offset = False
             self._drag_offset_attr = None
-            self.btn_pause.label = "Pause"
+            self._panel_scroll_dragging = False
+            self._cancel_field_edit()
 
     # ── frame update ─────────────────────────────────────────────────
     def update(self, dt):
         if not self.active:
+            uk.set_text_cursor(False)
+            uk.set_hand_cursor(False)
             return
+        dt_ui = min(dt, 1 / 20)
+        self.cursor_blink += dt_ui
+
+        # hover-anim lerps (UI only)
+        def _lerp(cur, target):
+            return cur + (target - cur) * min(1.0, dt_ui * 12.0)
+        self._back_hover_anim = _lerp(self._back_hover_anim, 1.0 if self._back_hovered else 0.0)
+        self._save_hover_anim = _lerp(self._save_hover_anim, 1.0 if self._save_hovered else 0.0)
+        self._new_hover_anim = _lerp(self._new_hover_anim, 1.0 if self._new_hovered else 0.0)
+        self._dup_hover_anim = _lerp(self._dup_hover_anim, 1.0 if self._dup_hovered else 0.0)
+        self._delete_hover_anim = _lerp(self._delete_hover_anim, 1.0 if self._delete_hovered else 0.0)
+        self._pause_hover_anim = _lerp(self._pause_hover_anim, 1.0 if self._pause_hovered else 0.0)
+        self._fire_hover_anim = _lerp(self._fire_hover_anim, 1.0 if self._fire_hovered else 0.0)
+        self._enabled_chip_hover_anim = _lerp(self._enabled_chip_hover_anim, 1.0 if self._enabled_chip_hovered else 0.0)
+        for i in range(min(len(self._saved_configs()), len(self._sidebar_hover_anim))):
+            target = 1.0 if i == self.sidebar_hover_index else 0.0
+            self._sidebar_hover_anim[i] = _lerp(self._sidebar_hover_anim[i], target)
+
+        if self.status_timer > 0:
+            self.status_timer -= dt_ui
+            if self.status_timer <= 0:
+                self.status_msg = ""
+
+        # OS cursor: I-beam over a text field, hand over anything clickable,
+        # else the plain arrow. Same once-per-frame convention/priority as
+        # CharacterCreator._resolve_cursor — resolved here against the rects
+        # the last draw() pass registered (text_field_rects/_field_row_rects
+        # etc. are rebuilt in _draw_panel), same lag the text-cursor check
+        # already lived with before this call existed.
+        self._resolve_cursor()
+
         if self.paused:
             # Deliberately don't touch state/charge_obj/attack_obj/actor at
             # all — whatever was on screen the moment Pause was hit just
-            # keeps being redrawn as-is by draw(), frozen, so the charge
-            # offset handle can be dragged against a stable target.
+            # keeps being redrawn as-is by draw(), frozen.
             return
         if self.state == self.STATE_CHARGING and self.charge_obj:
             self.charge_obj.update(dt)
-            # Tracked independently of charge_obj's own internal tick:
-            # KamehamehaChargeEffect.update() is a no-op whenever no charge
-            # spritesheet loaded (see beam.py — `if not self.frames_scaled:
-            # return`), so tick never advances without art in place. The
-            # real game can't be relying on that tick to know when to
-            # auto-fire either, or an attack with no charge art yet would
-            # simply charge forever — hence tracking wall-clock elapsed
-            # time here against get_total_duration() instead.
             self.charge_elapsed += dt
             if self.charge_elapsed >= self.charge_obj.get_total_duration():
-                # Charge animation has played through — auto-fire while
-                # still held, exactly like player.py's auto-fire-on-
-                # charge-complete beams.
                 self.attack_obj = self.config.build_attack(
                     self.actor.x, self.actor.y, self.actor.direction, player=self.actor)
                 self.charge_obj = None
                 self.state = self.STATE_FIRING
         elif self.state == self.STATE_FIRING and self._pending_ultra_volleyball is not None:
-            # Waiting out one frame's worth of the kiblast wind-up before
-            # spawning the attack — see _pending_ultra_volleyball_elapsed's
-            # comment in __init__ for why this is a standalone dt-driven
-            # timer (self.actor.FRAME_DURATION is the actor's own per-
-            # frame duration, so this waits exactly as long as the wind-up
-            # pose (frame 0) is actually on screen for) rather than reading
-            # self.actor's frame index, which isn't refreshed for this
-            # state until self.actor.set_anim_state()/update() run further
-            # down in this same method.
             if self._pending_ultra_volleyball is True:
                 self._pending_ultra_volleyball_elapsed += dt
                 if self._pending_ultra_volleyball_elapsed >= self.actor.FRAME_DURATION:
@@ -1408,28 +1343,6 @@ class AttackCreator:
                 self._pending_direction = None
                 self._pending_ultra_volleyball_elapsed = 0.0
         elif self.state in (self.STATE_FIRING, self.STATE_DECAYING) and self.attack_obj:
-            # Projectile-family attacks (BurningAttack, inherited from
-            # attacks.projectile.Projectile) take world_width/world_height
-            # so the projectile knows when it's traveled off the play area
-            # and should despawn — the same bounds player.py's real
-            # movement/collision code passes in. Beam/chain/sword attacks
-            # only take dt. Dragon Fist takes player_x/player_y instead —
-            # it needs the player's *live* position every tick (the leash
-            # box and anchor segment both track it — see
-            # DragonFistAttack.update()), not a one-time spawn point.
-            #
-            # Rather than hardcode any of this per-archetype (and have it
-            # silently go stale the next time a new attack shape is
-            # added), inspect the actual update() signature's PARAMETER
-            # NAMES — not just the count, which can't tell Dragon Fist's
-            # (dt, player_x, player_y) apart from a projectile's (dt,
-            # world_width, world_height); both are 3 params — and dispatch
-            # accordingly. A previewed projectile despawns at
-            # PREVIEW_WORLD_BOUND from the world-space corner-origin (see
-            # PREVIEW_WORLD_ANCHOR's own comment on why that's not the
-            # stage rect's pixel dimensions), not the whole window; a
-            # previewed Dragon Fist tracks self.actor's real position,
-            # same as it would track a real player's.
             try:
                 param_names = set(inspect.signature(self.attack_obj.update).parameters.keys())
             except (TypeError, ValueError):
@@ -1439,33 +1352,14 @@ class AttackCreator:
             elif len(param_names) >= 3:
                 # Matches Projectile.update(self, world_width, world_height,
                 # dt=0.016)'s real positional order (see attacks/projectile.py
-                # and attacks/genkidama.py's GenkidamaBlast, which shares it)
-                # — width/height first, dt last. Previously called as
-                # (dt, width, height), which silently fed dt in as
-                # world_width; since dt (~0.016) is smaller than almost any
-                # on-stage x/y, the projectile/genkidama preview would judge
-                # itself instantly out of bounds and despawn the frame after
-                # it fired. Fixed here rather than worked around per-
-                # archetype since every future attack sharing this same
-                # 3-param (width, height, dt) shape gets it for free too.
+                # and attacks/genkidama.py's GenkidamaBlast, which shares it).
                 self.attack_obj.update(PREVIEW_WORLD_BOUND, PREVIEW_WORLD_BOUND, dt)
             else:
                 self.attack_obj.update(dt)
             if not self.attack_obj.active:
                 self._stop_preview()
 
-        # Keep the preview sprite's pose/animation in sync with the fire
-        # state machine (idle/charging/firing/decaying) and let it advance
-        # its own frame cycle. Previously nothing drove either of these,
-        # so the actor stayed frozen on whatever single frame it loaded at
-        # construction regardless of state or direction changes.
         self.actor.set_anim_state(self.state, self._anim_archetype_key())
-        # Sword-spin-only: the player's own body sweeps through the same
-        # 8 octants the attack_obj (EnergySwordSpinEffect) is stepping
-        # through — see PreviewActor.set_octant()'s own comment. Cleared
-        # back to None (plain self.direction) the instant it's not the
-        # live spin driving the pose, so charging/idle/every other
-        # archetype are unaffected.
         if self.active_archetype == "sword" and self.state in (self.STATE_FIRING, self.STATE_DECAYING) \
                 and self.attack_obj is not None and hasattr(self.attack_obj, "current_octant"):
             self.actor.set_octant(self.attack_obj.current_octant())
@@ -1473,49 +1367,129 @@ class AttackCreator:
             self.actor.set_octant(None)
         self.actor.update(dt)
 
+    def _anim_archetype_key(self) -> str:
+        if self.active_archetype != "sword":
+            return self.active_archetype
+        clockwise = getattr(self.attack_obj, "clockwise", None)
+        if clockwise is None:
+            clockwise = bool(self.config.sword.get("clockwise", True))
+        return "sword_cw" if clockwise else "sword_ccw"
+
+    # ── offset drag handle (charge / beam / chain / projectile /
+    # dragon_fist / sword — archetype-generic). UNCHANGED. ──
+    def _active_offset_attr(self) -> Optional[str]:
+        attr_name = OFFSET_ATTR_FOR_TAB.get(self.active_tab)
+        if attr_name and hasattr(self.config, attr_name):
+            return attr_name
+        return None
+
+    def _offset_anchor_extra(self, attr_name: str):
+        if attr_name == "dragon_fist_offsets":
+            dxu, dyu = _DRAGON_FIST_DIRECTION_UNIT.get(self.actor.direction, (0, 0))
+            anchor_offset = self.config.dragon_fist.get("anchor_offset", 0)
+            return dxu * anchor_offset, dyu * anchor_offset
+        if attr_name == "direction_offsets" and self.active_archetype == "genkidama":
+            return 0, -getattr(self.actor, "height", 0) / 2
+        if attr_name == "genkidama_offsets":
+            dox, doy = self.config.direction_offsets.get(self.actor.direction, (0, 0))
+            return dox, doy - getattr(self.actor, "height", 0) / 2
+        return 0, 0
+
+    def _offset_screen_pos(self, attr_name: str):
+        from config.settings import RENDER_SCALE
+        offsets = getattr(self.config, attr_name)
+        ox, oy = offsets.get(self.actor.direction, (0, 0))
+        ex, ey = self._offset_anchor_extra(attr_name)
+        screen_x = (self.actor.x + ox + ex) * RENDER_SCALE - self.camera.x
+        screen_y = (self.actor.y + oy + ey) * RENDER_SCALE - self.camera.y
+        return int(screen_x), int(screen_y)
+
+    def _drag_offset_to(self, attr_name: str, mouse_pos):
+        from config.settings import RENDER_SCALE
+        direction = self.actor.direction
+        ex, ey = self._offset_anchor_extra(attr_name)
+        world_x = (mouse_pos[0] + self.camera.x) / RENDER_SCALE - self.actor.x - ex
+        world_y = (mouse_pos[1] + self.camera.y) / RENDER_SCALE - self.actor.y - ey
+        new_offset = (round(world_x), round(world_y))
+        offsets_dict = getattr(self.config, attr_name)
+        old_offset = offsets_dict.get(direction, (0, 0))
+        offsets_dict[direction] = new_offset
+
+        if attr_name == "direction_offsets" and self.charge_obj is not None \
+                and hasattr(self.charge_obj, "direction_offsets"):
+            try:
+                self.charge_obj.direction_offsets[direction] = new_offset
+            except Exception:
+                pass
+        elif attr_name == "sword_offsets" and self.attack_obj is not None \
+                and hasattr(self.attack_obj, "direction_offsets"):
+            try:
+                self.attack_obj.direction_offsets[direction] = new_offset
+            except Exception:
+                pass
+        elif attr_name == "dragon_fist_offsets" and self.attack_obj is not None \
+                and hasattr(self.attack_obj, "translate"):
+            dx, dy = new_offset[0] - old_offset[0], new_offset[1] - old_offset[1]
+            try:
+                self.attack_obj.translate(dx, dy)
+            except Exception:
+                pass
+        elif attr_name in ("beam_offsets", "chain_offsets", "projectile_offsets") and self.attack_obj is not None:
+            ox, oy = new_offset
+            try:
+                self.attack_obj.x = self.actor.x + ox
+                self.attack_obj.y = self.actor.y + oy
+            except Exception:
+                pass
+        elif attr_name == "genkidama_offsets" and self.attack_obj is not None:
+            ox, oy = new_offset
+            dox, doy = self.config.direction_offsets.get(direction, (0, 0))
+            height = getattr(self.actor, "height", 0)
+            try:
+                self.attack_obj.x = self.actor.x + dox + ox
+                self.attack_obj.y = self.actor.y - height / 2 + doy + oy
+            except Exception:
+                pass
     # ── events ───────────────────────────────────────────────────────
     def handle_input(self, event):
         """Returns 'close' when the overlay was just closed (mirrors
         CharacterCreator.handle_input's contract), else None."""
         if not self.active:
             return None
+        if hasattr(event, 'pos'):
+            self._logical_mouse_pos = tuple(event.pos)
+
+        # -- inline field editing (int/float/str param fields) --------------
+        if self.editing_field is not None:
+            consumed = self._handle_text_edit_event(event)
+            if consumed:
+                return None
+            # fall through — the click that just committed the field may
+            # also hit a button/row below
 
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
             self._stop_preview()
             self.paused = False
             self.dragging_offset = False
             self._drag_offset_attr = None
-            self.btn_pause.label = "Pause"
             self.active = False
-            return "close"
+            return "back_to_dev_menu"
 
-        for btn in (self.btn_arch_prev, self.btn_arch_next, self.btn_new, self.btn_dup, self.btn_delete,
-                    self.btn_char_prev, self.btn_char_next,
-                    self.btn_dir_prev, self.btn_dir_next, self.btn_save, self.btn_pause):
-            if btn.handle_event(event):
-                return None
-        if self.btn_fire.handle_event(event):
-            return None
-
-        # Spacebar mirrors the "Hold to Fire" button — press to start
-        # charging/firing, release to let go — same contract as clicking
-        # btn_fire, just keyboard-driven. Skipped while a param-panel text
-        # field has an active edit buffer so typing a space into a value
-        # doesn't also trigger the stage. Guarded on btn_fire.pressed so a
-        # spurious extra KEYDOWN (or the mouse already holding the button)
-        # can't double-fire or send a release with nothing pressed.
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE \
-                and self.btn_fire.enabled and not self.param_panel.is_editing():
-            if not self.btn_fire.pressed:
-                self.btn_fire.pressed = True
-                self.btn_fire.on_press()
+        # Spacebar mirrors the "Hold to Fire" button — skipped while a
+        # param field has an active edit buffer so typing a space into a
+        # value doesn't also trigger the stage.
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_SPACE and self.editing_field is None:
+            if not self._fire_pressed:
+                self._fire_pressed = True
+                self._on_fire_press()
             return None
         if event.type == pygame.KEYUP and event.key == pygame.K_SPACE:
-            if self.btn_fire.pressed:
-                self.btn_fire.pressed = False
-                self.btn_fire.on_release()
+            if self._fire_pressed:
+                self._fire_pressed = False
+                self._on_fire_release()
             return None
 
+        # offset drag handle: press near the crosshair while paused
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self.paused \
                 and self.stage_rect.collidepoint(event.pos):
             attr_name = self._active_offset_attr()
@@ -1535,291 +1509,626 @@ class AttackCreator:
             self._drag_offset_attr = None
             return None
 
+        # param-panel scrollbar thumb — click-to-jump, then drag
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self._panel_scrollbar_track is not None:
+            hit = self._panel_scrollbar_track.inflate(10, 0)
+            if hit.collidepoint(event.pos) or self._panel_scrollbar_thumb.collidepoint(event.pos):
+                self._panel_scroll_dragging = True
+                self._scrub_panel_scroll(event.pos[1])
+                return None
+
+        if event.type == pygame.MOUSEMOTION and self._panel_scroll_dragging:
+            self._scrub_panel_scroll(event.pos[1])
+            return None
+
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1 and self._panel_scroll_dragging:
+            self._panel_scroll_dragging = False
+            return None
+
+        # hold-to-fire button
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and self._fire_rect.collidepoint(event.pos):
+            self._fire_pressed = True
+            self._on_fire_press()
+            return None
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1 and self._fire_pressed:
+            self._fire_pressed = False
+            self._on_fire_release()
+            return None
+
+        if event.type == pygame.MOUSEMOTION:
+            self._update_hover(event.pos)
+            return None
+
+        if event.type == pygame.MOUSEWHEEL:
+            if self._sidebar_list_rect.collidepoint(self._logical_mouse_pos):
+                total = len(self._saved_configs()) * SIDEBAR_ROW_H
+                max_scroll = max(0, total - self._sidebar_list_rect.h)
+                self.sidebar_scroll = max(0, min(max_scroll, self.sidebar_scroll - event.y * SIDEBAR_ROW_H))
+                return None
+            if self._panel_list_rect.collidepoint(self._logical_mouse_pos):
+                max_scroll = max(0, self._panel_content_height() - self._panel_list_rect.h)
+                raw = max(0, min(max_scroll, self.panel_scroll - event.y * ROW_H))
+                self.panel_scroll = self._snap_panel_scroll(raw)
+                return None
+
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self._back_rect.collidepoint(event.pos):
+                self._stop_preview()
+                self.paused = False
+                self.dragging_offset = False
+                self._drag_offset_attr = None
+                self.active = False
+                return 'back_to_dev_menu'
+            if self._save_rect.collidepoint(event.pos):
+                self._on_save()
+                return None
+            if self._arch_prev_rect.collidepoint(event.pos):
+                self._cycle_archetype(-1)
+                return None
+            if self._arch_next_rect.collidepoint(event.pos):
+                self._cycle_archetype(1)
+                return None
+            if self._new_rect.collidepoint(event.pos):
+                self._on_new()
+                return None
+            if self._dup_rect.collidepoint(event.pos):
+                self._on_duplicate()
+                return None
+            if self._delete_rect.collidepoint(event.pos):
+                self._on_delete()
+                return None
+            if self._char_prev_rect.collidepoint(event.pos):
+                self._prev_char()
+                return None
+            if self._char_next_rect.collidepoint(event.pos):
+                self._next_char()
+                return None
+            if self._dir_prev_rect.collidepoint(event.pos):
+                self._prev_dir()
+                return None
+            if self._dir_next_rect.collidepoint(event.pos):
+                self._next_dir()
+                return None
+            if self._pause_rect.collidepoint(event.pos):
+                self._toggle_pause()
+                return None
+
+            if self._sidebar_list_rect.collidepoint(event.pos):
+                configs = self._saved_configs()
+                for i, row_rect in enumerate(self._sidebar_row_rects):
+                    if row_rect.collidepoint(event.pos) and i < len(configs):
+                        path, cid, name, arch = configs[i]
+                        self._load_config_from_path(path)
+                        return None
+
             for tab_name, rect in self.tab_rects.items():
                 if rect.collidepoint(event.pos) and self.active_tab != tab_name:
                     self.active_tab = tab_name
+                    self._build_tabs()
                     self._reload_panel()
-                    return
-            if self.active_tab in self.config.OPTIONAL_SETS:
-                cb_rect = self._charge_enabled_rect()
-                if cb_rect.collidepoint(event.pos):
-                    self.config.set_enabled[self.active_tab] = not self.config.set_enabled[self.active_tab]
-                    return
-            for i, (path, cid, name, _arch) in enumerate(self._saved_configs()):
-                row = self._sidebar_row_rect(i)
-                if row.collidepoint(event.pos):
-                    self._load_config_from_path(path)
-                    return
+                    return None
+            if self.active_tab in self.config.OPTIONAL_SETS and self._enabled_chip_rect.collidepoint(event.pos):
+                self.config.set_enabled[self.active_tab] = not self.config.set_enabled[self.active_tab]
+                return None
 
-        # Always forward to the panel rather than gating on the live OS
-        # cursor position: ParamPanel/FieldEditor already check the
-        # event's own coordinates internally, and gating here on
-        # pygame.mouse.get_pos() made clicks miss whenever an event's
-        # position didn't match wherever the OS cursor last physically
-        # was (e.g. any programmatic/injected event, or simply a click
-        # registered a frame after a fast mouse move).
-        self.param_panel.handle_event(event)
+            if self._panel_list_rect.collidepoint(event.pos):
+                for key, (rect, spec, target) in self._field_row_rects.items():
+                    if rect.collidepoint(event.pos):
+                        self._on_field_row_click(spec, target)
+                        return None
+
         return None
 
-    def _anim_archetype_key(self) -> str:
-        """Which key into PreviewActor.ANIM_FOR_STATE_BY_ARCHETYPE to drive
-        the preview sprite from this frame. Every other archetype maps
-        1:1 onto its own name; "sword" is the one exception — it needs to
-        additionally pick the cw/ccw spin variant (see PreviewActor's own
-        comment on why), which isn't something a static per-archetype
-        table can encode on its own since it depends on the built attack's
-        own .clockwise (or, while still only charging and nothing's been
-        built yet, the config's own Clockwise field as a preview of what
-        it WILL be)."""
-        if self.active_archetype != "sword":
-            return self.active_archetype
-        clockwise = getattr(self.attack_obj, "clockwise", None)
-        if clockwise is None:
-            clockwise = bool(self.config.sword.get("clockwise", True))
-        return "sword_cw" if clockwise else "sword_ccw"
+    def _update_hover(self, pos):
+        self._back_hovered = self._back_rect.collidepoint(pos)
+        self._save_hovered = self._save_rect.collidepoint(pos)
+        self._new_hovered = self._new_rect.collidepoint(pos)
+        self._dup_hovered = self._dup_rect.collidepoint(pos)
+        self._delete_hovered = self._delete_rect.collidepoint(pos)
+        self._pause_hovered = self._pause_rect.collidepoint(pos)
+        self._fire_hovered = self._fire_rect.collidepoint(pos)
+        self._arch_prev_hovered = self._arch_prev_rect.collidepoint(pos)
+        self._arch_next_hovered = self._arch_next_rect.collidepoint(pos)
+        self._char_prev_hovered = self._char_prev_rect.collidepoint(pos)
+        self._char_next_hovered = self._char_next_rect.collidepoint(pos)
+        self._dir_prev_hovered = self._dir_prev_rect.collidepoint(pos)
+        self._dir_next_hovered = self._dir_next_rect.collidepoint(pos)
+        self._enabled_chip_hovered = (
+            self.active_tab in self.config.OPTIONAL_SETS and self._enabled_chip_rect.collidepoint(pos))
+        self.sidebar_hover_index = -1
+        if self._sidebar_list_rect.collidepoint(pos):
+            for i, r in enumerate(self._sidebar_row_rects):
+                if r.collidepoint(pos):
+                    self.sidebar_hover_index = i
+                    break
 
-    def _sidebar_row_rect(self, index):
-        return pygame.Rect(self.sidebar_list_rect.x, self.sidebar_list_rect.y + index * 26 - self.sidebar_scroll,
-                            self.sidebar_list_rect.width, 24)
+    def _resolve_cursor(self):
+        """Switch the OS cursor to an I-beam over a text field, a hand over
+        anything clickable (buttons, tabs, sidebar rows, chips, field rows,
+        the panel scrollbar thumb...), or back to the plain arrow otherwise.
+        I-beam wins where a field and a button happen to overlap."""
+        pos = self._logical_mouse_pos
+        hovering_text_field = any(r.collidepoint(pos) for r in self.text_field_rects)
+        hovering_widget = False
+        if not hovering_text_field:
+            click_rects = (
+                self._back_rect, self._save_rect, self._new_rect, self._dup_rect,
+                self._delete_rect, self._pause_rect, self._fire_rect,
+                self._arch_prev_rect, self._arch_next_rect,
+                self._char_prev_rect, self._char_next_rect,
+                self._dir_prev_rect, self._dir_next_rect,
+            )
+            hovering_widget = any(r.collidepoint(pos) for r in click_rects)
+            if not hovering_widget and self._sidebar_list_rect.collidepoint(pos):
+                hovering_widget = any(r.collidepoint(pos) for r in self._sidebar_row_rects)
+            if not hovering_widget:
+                hovering_widget = any(r.collidepoint(pos) for r in self.tab_rects.values())
+            if not hovering_widget and self.active_tab in self.config.OPTIONAL_SETS:
+                hovering_widget = self._enabled_chip_rect.collidepoint(pos)
+            if not hovering_widget and self._panel_list_rect.collidepoint(pos):
+                hovering_widget = any(r.collidepoint(pos) for r, spec, target in self._field_row_rects.values())
+            if not hovering_widget and self._panel_scrollbar_thumb is not None:
+                hovering_widget = (self._panel_scrollbar_thumb.collidepoint(pos)
+                                    or self._panel_scrollbar_track.inflate(10, 0).collidepoint(pos))
+        uk.set_text_cursor(hovering_text_field)
+        uk.set_hand_cursor(hovering_widget)
 
-    def _charge_enabled_rect(self):
-        return pygame.Rect(self.panel_rect_outer.x + self.panel_rect_outer.width - 90,
-                            self.panel_rect_outer.y + self.tab_h + 6, 78, 22)
+    def _on_field_row_click(self, spec, target):
+        if spec.kind == "bool":
+            target[spec.key] = not bool(target.get(spec.key, spec.default))
+        elif spec.kind == "choice":
+            choices = list(spec.choices)
+            cur = target.get(spec.key, spec.default)
+            idx = (choices.index(cur) + 1) % len(choices) if cur in choices else 0
+            target[spec.key] = choices[idx]
+        else:
+            self._begin_field_edit(spec, target)
 
-    # ── offset drag handle (charge / beam / chain / projectile /
-    # dragon_fist / sword — archetype-generic) ──
-    # Each of these is a per-direction (x, y) pixel offset applied to
-    # whatever the tab builds, relative to the player — direction_offsets
-    # for the charge-up effect, beam_offsets/chain_offsets/
-    # projectile_offsets/dragon_fist_offsets/sword_offsets for the fired
-    # attack itself (see attacks/attack_config.py). None of them fit
-    # ParamPanel's flat FieldSpec model (a dict keyed by direction, not a
-    # scalar), so they get this dedicated crosshair instead of a number
-    # field. OFFSET_ATTR_FOR_TAB (top of file) is what makes this
-    # archetype/tab-generic: a tab shows a handle whenever the active
-    # config actually has the attribute that tab maps to.
-    def _active_offset_attr(self) -> Optional[str]:
-        attr_name = OFFSET_ATTR_FOR_TAB.get(self.active_tab)
-        if attr_name and hasattr(self.config, attr_name):
-            return attr_name
-        return None
+    # ------------------------------------------------------------------ inline field-edit engine
+    # Generalized version of item_creator.py's editing_field/text_input/
+    # cursor state machine — single-line only (every field this tool's
+    # param panel shows is a short int/float/str value), with per-
+    # keystroke numeric filtering for int/float fields carried over from
+    # the previous version's FieldEditor.handle_event.
+    def _begin_field_edit(self, spec, target) -> None:
+        value = target.get(spec.key, spec.default)
+        text = "" if value is None else str(value)
+        self.editing_field = (self.active_tab, spec.key)
+        self._editing_spec = spec
+        self._editing_target = target
+        self.text_input = text
+        self.cursor_pos = len(text)
+        self.selection_anchor = None
+        self.cursor_blink = 0.0
+        self._text_max_len = FIELD_MAX_LEN
 
-    def _offset_anchor_extra(self, attr_name: str):
-        """Extra world-space (x, y) between the player and the point the
-        crosshair should actually represent, beyond the raw offset dict
-        itself. Every archetype except Dragon Fist has none (0, 0) — the
-        crosshair sits at actor position + offset, full stop.
+    def _clear_field_edit(self) -> None:
+        self.editing_field = None
+        self._editing_spec = None
+        self._editing_target = None
+        self.text_input = ""
+        self.cursor_pos = 0
+        self.selection_anchor = None
 
-        Dragon Fist is the exception: DragonFistAttack shifts the anchor
-        segment anchor_offset further out along the throw direction on
-        top of whatever x/y it's given (see DragonFistAttack._update_anchor()
-        and its own anchor_offset field, editable as a plain number in the
-        "dragon_fist" tab). Without folding that in here, the crosshair
-        would sit anchor_offset away from the anchor piece that's actually
-        drawn on screen — this keeps the handle exactly on it, so dragging
-        it moves the visible anchor, not some invisible point beside it.
-        """
-        if attr_name == "dragon_fist_offsets":
-            dxu, dyu = _DRAGON_FIST_DIRECTION_UNIT.get(self.actor.direction, (0, 0))
-            anchor_offset = self.config.dragon_fist.get("anchor_offset", 0)
-            return dxu * anchor_offset, dyu * anchor_offset
-        if attr_name == "direction_offsets" and self.active_archetype == "genkidama":
-            # GenkidamaChargeEffect anchors its floating ball at
-            # player.x, player.y - player.height/2 (see its own
-            # _center_world_pos()) rather than the raw player position
-            # every other archetype's charge effect uses as its base
-            # point — fold that vertical shift in here so the crosshair
-            # sits exactly on the visible ball instead of hovering
-            # half the player's height below it.
-            return 0, -getattr(self.actor, "height", 0) / 2
-        if attr_name == "genkidama_offsets":
-            # genkidama_offsets is an ADDITIVE nudge on top of
-            # direction_offsets (see GenkidamaAttackConfig.build_attack) —
-            # fold direction_offsets' own current-direction value in here
-            # too, plus the same -height/2 shift as above, so this
-            # crosshair sits at the ball's TRUE spawn point (where it was
-            # floating, plus this tab's own release-time nudge) rather
-            # than double-counting or ignoring the charge tab's offset.
-            dox, doy = self.config.direction_offsets.get(self.actor.direction, (0, 0))
-            return dox, doy - getattr(self.actor, "height", 0) / 2
-        return 0, 0
-
-    def _offset_screen_pos(self, attr_name: str):
-        from config.settings import RENDER_SCALE
-        offsets = getattr(self.config, attr_name)
-        ox, oy = offsets.get(self.actor.direction, (0, 0))
-        ex, ey = self._offset_anchor_extra(attr_name)
-        # Same world->screen transform PreviewActor.draw() uses, applied
-        # to (actor position + offset + anchor extra) instead of just
-        # actor position.
-        screen_x = (self.actor.x + ox + ex) * RENDER_SCALE - self.camera.x
-        screen_y = (self.actor.y + oy + ey) * RENDER_SCALE - self.camera.y
-        return int(screen_x), int(screen_y)
-
-    def _drag_offset_to(self, attr_name: str, mouse_pos):
-        from config.settings import RENDER_SCALE
-        direction = self.actor.direction
-        ex, ey = self._offset_anchor_extra(attr_name)
-        world_x = (mouse_pos[0] + self.camera.x) / RENDER_SCALE - self.actor.x - ex
-        world_y = (mouse_pos[1] + self.camera.y) / RENDER_SCALE - self.actor.y - ey
-        new_offset = (round(world_x), round(world_y))
-        offsets_dict = getattr(self.config, attr_name)
-        old_offset = offsets_dict.get(direction, (0, 0))
-        offsets_dict[direction] = new_offset
-
-        # Best-effort: also nudge whatever's already built/on-screen so a
-        # drag mid-preview (while paused) moves it immediately instead of
-        # only taking effect on the *next* charge/fire. This tool doesn't
-        # own attacks/beam.py, attacks/flame_kamehameha.py, etc., so it
-        # can't be certain these objects expose position the same way —
-        # each branch below silently no-ops if the guess is wrong. The
-        # config value set above is always correct regardless, and will
-        # apply next time either way.
-        if attr_name == "direction_offsets" and self.charge_obj is not None \
-                and hasattr(self.charge_obj, "direction_offsets"):
+    def _commit_field_edit(self) -> None:
+        spec = self._editing_spec
+        target = self._editing_target
+        if spec is None or target is None:
+            self._clear_field_edit()
+            return
+        raw = self.text_input.strip()
+        if raw == "" and spec.nullable:
+            target[spec.key] = None
+        elif spec.kind == "int":
             try:
-                self.charge_obj.direction_offsets[direction] = new_offset
-            except Exception:
+                v = int(float(raw))
+                if spec.min is not None:
+                    v = max(spec.min, v)
+                if spec.max is not None:
+                    v = min(spec.max, v)
+                target[spec.key] = v
+            except ValueError:
                 pass
-        elif attr_name == "sword_offsets" and self.attack_obj is not None \
-                and hasattr(self.attack_obj, "direction_offsets"):
-            # EnergySwordSpinEffect re-reads its own direction_offsets
-            # every update() tick (see that class) rather than baking a
-            # position in once — same live-reread shape as
-            # direction_offsets/charge_obj above, just on the fired attack
-            # instead of the charge effect.
+        elif spec.kind == "float":
             try:
-                self.attack_obj.direction_offsets[direction] = new_offset
-            except Exception:
+                v = float(raw)
+                if spec.min is not None:
+                    v = max(spec.min, v)
+                if spec.max is not None:
+                    v = min(spec.max, v)
+                target[spec.key] = v
+            except ValueError:
                 pass
-        elif attr_name == "dragon_fist_offsets" and self.attack_obj is not None \
-                and hasattr(self.attack_obj, "translate"):
-            # DragonFistAttack has no single self.x/self.y to overwrite —
-            # it tracks head_x/head_y, origin_x/origin_y, and every body
-            # segment separately (see class docstring) — so there's
-            # nothing to set an absolute position on. translate(dx, dy) is
-            # its own purpose-built "shift everything already in flight"
-            # method (used for the opening lunge — see Player.
-            # _advance_dragon_fist_lunge), so nudge by the delta from the
-            # drag instead of trying to set an absolute position.
-            dx, dy = new_offset[0] - old_offset[0], new_offset[1] - old_offset[1]
-            try:
-                self.attack_obj.translate(dx, dy)
-            except Exception:
-                pass
-        elif attr_name in ("beam_offsets", "chain_offsets", "projectile_offsets") and self.attack_obj is not None:
-            # Unlike direction_offsets (which KamehamehaChargeEffect keeps
-            # re-reading every frame), build_attack() bakes actor position
-            # + offset into the object's origin once at construction —
-            # there's no live offset for an already-fired beam/chain/
-            # projectile to re-read. Move its origin directly by the same
-            # amount instead.
-            ox, oy = new_offset
-            try:
-                self.attack_obj.x = self.actor.x + ox
-                self.attack_obj.y = self.actor.y + oy
-            except Exception:
-                pass
-        elif attr_name == "genkidama_offsets" and self.attack_obj is not None:
-            # Same "bake once at construction, so nudge origin directly"
-            # story as beam/chain/projectile above, just against
-            # GenkidamaAttackConfig.build_attack()'s own spawn formula
-            # (actor position - half height + direction_offsets +
-            # genkidama_offsets) instead of a plain actor-position-plus-
-            # offset one.
-            ox, oy = new_offset
-            dox, doy = self.config.direction_offsets.get(direction, (0, 0))
-            height = getattr(self.actor, "height", 0)
-            try:
-                self.attack_obj.x = self.actor.x + dox + ox
-                self.attack_obj.y = self.actor.y - height / 2 + doy + oy
-            except Exception:
-                pass
+        elif spec.kind == "str":
+            target[spec.key] = raw
+        self._clear_field_edit()
 
-    # ── drawing ──────────────────────────────────────────────────────
+    def _cancel_field_edit(self) -> None:
+        self._clear_field_edit()
+
+    def _has_text_selection(self) -> bool:
+        return self.selection_anchor is not None and self.selection_anchor != self.cursor_pos
+
+    def _text_selection_range(self):
+        a, b = self.selection_anchor, self.cursor_pos
+        return (a, b) if a <= b else (b, a)
+
+    def _delete_text_selection(self) -> bool:
+        if not self._has_text_selection():
+            return False
+        s, e = self._text_selection_range()
+        self.text_input = self.text_input[:s] + self.text_input[e:]
+        self.cursor_pos = s
+        self.selection_anchor = None
+        return True
+
+    def _insert_into_text_input(self, s: str, numeric: bool) -> None:
+        if numeric:
+            s = "".join(ch for ch in s if ch.isdigit() or ch in "-.")
+        else:
+            s = "".join(ch for ch in s if ch.isprintable())
+        if not s:
+            return
+        if self._has_text_selection():
+            self._delete_text_selection()
+        space = self._text_max_len - len(self.text_input)
+        if space <= 0:
+            return
+        s = s[:space]
+        self.text_input = self.text_input[:self.cursor_pos] + s + self.text_input[self.cursor_pos:]
+        self.cursor_pos += len(s)
+
+    def _text_index_from_x(self, x: int) -> int:
+        if self._active_edit_font is None or self._active_edit_text_x is None or not self.text_input:
+            return 0
+        font = self._active_edit_font
+        widths = [0]
+        for i in range(1, len(self.text_input) + 1):
+            widths.append(font.size(self.text_input[:i])[0])
+        rel_x = x - self._active_edit_text_x
+        best_i, best_d = 0, abs(widths[0] - rel_x)
+        for i, w in enumerate(widths):
+            d = abs(w - rel_x)
+            if d < best_d:
+                best_i, best_d = i, d
+        return best_i
+
+    def _handle_text_edit_event(self, event) -> bool:
+        """Returns True if the event was consumed by the text-edit engine."""
+        if self.editing_field is None:
+            return False
+        spec = self._editing_spec
+        numeric = spec is not None and spec.kind in ("int", "float")
+
+        if event.type == pygame.KEYDOWN:
+            mods = pygame.key.get_mods()
+            ctrl = bool(mods & (pygame.KMOD_CTRL | pygame.KMOD_META))
+            shift = bool(mods & pygame.KMOD_SHIFT)
+
+            if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_TAB):
+                self._commit_field_edit()
+            elif event.key == pygame.K_ESCAPE:
+                self._cancel_field_edit()
+            elif ctrl and event.key == pygame.K_a:
+                self.selection_anchor = 0
+                self.cursor_pos = len(self.text_input)
+            elif ctrl and event.key in (pygame.K_c, pygame.K_x):
+                if self._has_text_selection():
+                    s, e = self._text_selection_range()
+                    uk.clipboard_set_text(self.text_input[s:e])
+                    if event.key == pygame.K_x:
+                        self._delete_text_selection()
+            elif ctrl and event.key == pygame.K_v:
+                self._insert_into_text_input(uk.clipboard_get_text(), numeric)
+            elif event.key == pygame.K_LEFT:
+                if shift:
+                    if self.selection_anchor is None:
+                        self.selection_anchor = self.cursor_pos
+                    self.cursor_pos = max(0, self.cursor_pos - 1)
+                elif self._has_text_selection():
+                    self.cursor_pos = self._text_selection_range()[0]
+                    self.selection_anchor = None
+                else:
+                    self.cursor_pos = max(0, self.cursor_pos - 1)
+            elif event.key == pygame.K_RIGHT:
+                if shift:
+                    if self.selection_anchor is None:
+                        self.selection_anchor = self.cursor_pos
+                    self.cursor_pos = min(len(self.text_input), self.cursor_pos + 1)
+                elif self._has_text_selection():
+                    self.cursor_pos = self._text_selection_range()[1]
+                    self.selection_anchor = None
+                else:
+                    self.cursor_pos = min(len(self.text_input), self.cursor_pos + 1)
+            elif event.key == pygame.K_HOME:
+                if shift and self.selection_anchor is None:
+                    self.selection_anchor = self.cursor_pos
+                elif not shift:
+                    self.selection_anchor = None
+                self.cursor_pos = 0
+            elif event.key == pygame.K_END:
+                if shift and self.selection_anchor is None:
+                    self.selection_anchor = self.cursor_pos
+                elif not shift:
+                    self.selection_anchor = None
+                self.cursor_pos = len(self.text_input)
+            elif event.key == pygame.K_BACKSPACE:
+                if not self._delete_text_selection() and self.cursor_pos > 0:
+                    self.text_input = self.text_input[:self.cursor_pos - 1] + self.text_input[self.cursor_pos:]
+                    self.cursor_pos -= 1
+            elif event.key == pygame.K_DELETE:
+                if not self._delete_text_selection() and self.cursor_pos < len(self.text_input):
+                    self.text_input = self.text_input[:self.cursor_pos] + self.text_input[self.cursor_pos + 1:]
+            else:
+                if event.unicode and event.unicode.isprintable():
+                    self._insert_into_text_input(event.unicode, numeric)
+            self.cursor_blink = 0.0
+            return True
+
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self._active_edit_rect is not None and self._active_edit_rect.collidepoint(event.pos):
+                idx = self._text_index_from_x(event.pos[0])
+                if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                    if self.selection_anchor is None:
+                        self.selection_anchor = self.cursor_pos
+                else:
+                    self.selection_anchor = idx
+                self.cursor_pos = idx
+                self._text_drag = True
+                self.cursor_blink = 0.0
+                return True
+            self._commit_field_edit()
+            return False  # let the click fall through to normal handling
+
+        if event.type == pygame.MOUSEMOTION:
+            if self._text_drag and self._active_edit_rect is not None:
+                x = max(self._active_edit_rect.left, min(event.pos[0], self._active_edit_rect.right))
+                idx = self._text_index_from_x(x)
+                self.cursor_pos = idx
+                self.cursor_blink = 0.0
+            return True
+
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self._text_drag = False
+            return True
+
+        return True
+
+    # ------------------------------------------------------------------ shared card/panel drawing primitives
+    # Same shapes as item_creator.py's own rebuild — kept local here too
+    # since neither file shares a base class.
+    def _draw_card_shell(self, screen, rect, t, accent=None):
+        accent = accent or uk.Theme.GOLD
+        t = round(max(0.0, min(1.0, t)) * 20) / 20.0
+        lift = int(round(2 * t))
+        draw_rect = rect.move(0, -lift)
+        base = uk.lerp_color((22, 26, 35), (28, 33, 44), t)
+        border = uk.lerp_color(uk.Theme.CARD_BORDER, accent, t * 0.78)
+        uk.draw_panel(screen, draw_rect, bg=(*base, 255), border=border, border_width=1, radius=10, shadow=False)
+        return draw_rect
+
+    def _draw_pill_button(self, screen, rect, t, label, accent, icon_fn=None, danger=False, enabled=True):
+        col = uk.Theme.DANGER_BRIGHT if danger else accent
+        dim_base = (32, 22, 22) if danger else (28, 33, 44)
+        t = t if enabled else 0.0
+        base = uk.lerp_color((22, 26, 35), dim_base, t)
+        border = uk.lerp_color(uk.Theme.CARD_BORDER, col, t)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border, border_width=1 + round(t), radius=10, shadow=False)
+        label_color = uk.lerp_color(uk.Theme.TEXT_SECONDARY, col, t) if enabled else uk.Theme.TEXT_DIM
+        if icon_fn is not None:
+            icon_rect = pygame.Rect(0, 0, 15, 15)
+            icon_rect.midleft = (rect.x + 12, rect.centery)
+            icon_fn(screen, icon_rect, label_color)
+            label_surf = self.font_small.render(label, True, label_color)
+            uk.blit_surface(screen, label_surf, (icon_rect.right + 7, rect.centery - label_surf.get_height() // 2),
+                             transient=True)
+        else:
+            label_surf = self.font_small.render(label, True, label_color)
+            uk.blit_surface(screen, label_surf, label_surf.get_rect(center=rect.center), transient=True)
+
+    def _draw_icon_square_btn(self, screen, rect, t, icon_fn, accent, danger=False):
+        t = round(max(0.0, min(1.0, t)) * 20) / 20.0
+        dim_base = (32, 22, 22) if danger else (28, 33, 44)
+        base = uk.lerp_color((22, 26, 35), dim_base, t)
+        border = uk.lerp_color(uk.Theme.CARD_BORDER, accent, t)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border, border_width=1 + round(t), radius=8, shadow=False)
+        if t > 0.01:
+            uk.draw_soft_glow(screen, rect.center, min(rect.w, rect.h) // 2 + 4, accent, max_alpha=int(28 * t))
+        icon_fn(screen, rect, accent if t > 0.01 else uk.Theme.TEXT_SECONDARY)
+
+    def _draw_nav_btn(self, screen, rect, hovered, icon_fn):
+        t = 1.0 if hovered else 0.0
+        base = uk.lerp_color((20, 23, 32), (28, 33, 44), t)
+        border = uk.lerp_color(uk.Theme.CARD_BORDER, uk.Theme.GOLD, t)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border, border_width=1, radius=6, shadow=False)
+        icon_fn(screen, rect, uk.Theme.GOLD if hovered else uk.Theme.TEXT_SECONDARY)
+
+    def _draw_text_caret(self, screen, x, y, height, color=None):
+        if int(self.cursor_blink * 2) % 2 != 0:
+            return
+        color = color or uk.Theme.TEXT_PRIMARY
+        uk.draw_rect_on(screen, color, pygame.Rect(int(x), int(y), 2, int(height)), 0, 0)
+
+    def _draw_live_text_field(self, screen, font, text_rect, click_rect):
+        self._active_edit_rect = click_rect
+        self._active_edit_text_x = text_rect.x
+        self._active_edit_font = font
+
+        if self._has_text_selection():
+            s, e = self._text_selection_range()
+            sx = text_rect.x + (font.size(self.text_input[:s])[0] if s else 0)
+            ex = text_rect.x + (font.size(self.text_input[:e])[0] if e else 0)
+            sel_rect = pygame.Rect(sx, text_rect.y, max(1, ex - sx), text_rect.height)
+            uk.draw_rect_on(screen, (*uk.Theme.KI_BLUE, 90), sel_rect, 0, 0)
+
+        caret_w = font.size(self.text_input[:self.cursor_pos])[0] if self.cursor_pos else 0
+        self._draw_text_caret(screen, text_rect.x + caret_w, text_rect.y, text_rect.height)
+    # ------------------------------------------------------------------ drawing
     def draw(self, screen, dt: float = 0.0):
         if not self.active:
             return
-        screen.fill(C_BG)
+        self._draw_background(screen)
         self._draw_sidebar(screen)
         self._draw_top_bar(screen)
         self._draw_stage(screen)
         self._draw_panel(screen)
-        if self.status_msg:
-            color = C_GOOD if self.status_ok else C_BAD
-            txt = self.font_sm.render(self.status_msg, True, color)
-            screen.blit(txt, (self.sidebar_rect.x, self.screen_height - 22))
+        self._draw_header(screen)   # drawn last so it sits above the columns
+        self._draw_footer(screen)
 
+    def _draw_background(self, screen):
+        w, h = self.screen_width, self.screen_height
+        uk.draw_rect_on(screen, (8, 11, 17), pygame.Rect(0, 0, w, h), 0, 0)
+        uk.draw_rect_on(screen, (10, 13, 20),
+                         pygame.Rect(0, self.header_h, w, h - self.header_h - self.footer_h), 0, 0)
+
+    def _draw_header(self, screen):
+        w = self.screen_width
+        uk.draw_rect_on(screen, (12, 15, 23), pygame.Rect(0, 0, w, self.header_h), 0, 0)
+        uk.draw_rect_on(screen, (43, 49, 63), pygame.Rect(0, self.header_h - 1, w, 1), 0, 0)
+
+        title_rect = self._title_surf.get_rect(centerx=w // 2, centery=self.header_h // 2)
+        uk.blit_surface(screen, self._title_surf, title_rect, transient=False)
+
+        self._draw_back_button(screen)
+
+        if self.status_msg:
+            status_col = uk.Theme.GOLD_BRIGHT if self.status_ok else uk.Theme.DANGER_BRIGHT
+            status_surf = self.font_small.render(self.status_msg, True, status_col)
+            status_rect = status_surf.get_rect(right=self._save_rect.left - 16, centery=self.header_h // 2)
+            uk.blit_surface(screen, status_surf, status_rect, transient=True)
+
+        self._draw_icon_square_btn(screen, self._save_rect, self._save_hover_anim,
+                                    self._icon_save_png, uk.Theme.GOLD)
+
+    def _draw_back_button(self, screen):
+        accent = uk.Theme.GOLD
+        t = round(self._back_hover_anim * 20) / 20.0
+        base = uk.lerp_color((22, 26, 35), (28, 33, 44), t)
+        border = uk.lerp_color(uk.Theme.CARD_BORDER, accent, t * 0.78)
+        uk.draw_panel(screen, self._back_rect, bg=(*base, 255), border=border,
+                      border_width=1, radius=8, shadow=False)
+        if t > 0.01:
+            uk.draw_soft_glow(screen, self._back_rect.center, 22, accent, max_alpha=int(25 * t))
+        if self._back_icon is not None:
+            uk.blit_surface(screen, self._back_icon, self._back_icon.get_rect(center=self._back_rect.center),
+                             transient=False)
+        else:
+            _draw_chevron_left(screen, self._back_rect, uk.Theme.TEXT_SECONDARY, width=3)
+
+    def _icon_save_png(self, screen, rect, color):
+        if self._save_icon is not None:
+            uk.blit_surface(screen, self._save_icon, self._save_icon.get_rect(center=rect.center))
+        else:
+            _draw_check_icon(screen, rect, color)
+
+    def _icon_trash_png(self, screen, rect, color):
+        if self._trash_icon is not None:
+            uk.blit_surface(screen, self._trash_icon, self._trash_icon.get_rect(center=rect.center))
+        else:
+            _draw_trash_icon(screen, rect, color)
+
+    def _icon_plus_png(self, screen, rect, color):
+        if self._plus_icon is not None:
+            uk.blit_surface(screen, self._plus_icon, self._plus_icon.get_rect(center=rect.center))
+        else:
+            _draw_plus_icon(screen, rect, color)
+
+    def _icon_duplicate_png(self, screen, rect, color):
+        if self._dup_icon is not None:
+            uk.blit_surface(screen, self._dup_icon, self._dup_icon.get_rect(center=rect.center))
+        else:
+            _draw_duplicate_icon(screen, rect, color)
+
+    def _draw_footer(self, screen):
+        w, h = self.screen_width, self.screen_height
+        y = h - self.footer_h
+        uk.draw_rect_on(screen, (12, 15, 23), pygame.Rect(0, y, w, self.footer_h), 0, 0)
+        uk.draw_rect_on(screen, (43, 49, 63), pygame.Rect(0, y, w, 1), 0, 0)
+
+    # ------------------------------------------------------------------ sidebar
     def _draw_sidebar(self, screen):
         r = self.sidebar_rect
-        screen.draw_rect(C_PANEL, r)
-        screen.draw_rect(C_BORDER, r, width=1)
-        title = self.font_lg.render("Attacks", True, C_TEXT)
-        screen.blit(title, (r.x + 8, r.y + 6))
+        uk.draw_panel(screen, r, bg=uk.Theme.PANEL_BG, border=uk.Theme.PANEL_BORDER, border_width=1,
+                      radius=uk.Theme.RADIUS_PANEL, shadow=False)
 
-        self.btn_arch_prev.draw(screen, self.font_sm)
-        self.btn_arch_next.draw(screen, self.font_sm)
+        title_surf = self.font_large.render("ATTACKS", True, uk.Theme.TEXT_PRIMARY)
+        uk.blit_surface(screen, title_surf, self._sidebar_title_pos, transient=True)
+
+        self._draw_nav_btn(screen, self._arch_prev_rect, self._arch_prev_hovered, _draw_chevron_left)
+        self._draw_nav_btn(screen, self._arch_next_rect, self._arch_next_hovered, _draw_chevron_right)
         arch_label, _cls = ARCHETYPES[self.active_archetype]
-        arch_txt = self.font_sm.render(f"New: {arch_label}", True, C_TEXT_DIM)
-        screen.blit(arch_txt, arch_txt.get_rect(center=(r.centerx, self.btn_arch_prev.rect.centery)))
+        arch_accent = ARCHETYPE_ACCENT.get(self.active_archetype, uk.Theme.GOLD)
+        arch_txt = self.font_small.render(f"New: {arch_label}", True, arch_accent)
+        uk.blit_surface(screen, arch_txt, arch_txt.get_rect(center=self._arch_row_rect.center), transient=True)
 
-        self.btn_new.draw(screen, self.font_sm)
-        self.btn_dup.draw(screen, self.font_sm)
+        self._draw_icon_square_btn(screen, self._new_rect, self._new_hover_anim, self._icon_plus_png, uk.Theme.GOLD)
+        self._draw_icon_square_btn(screen, self._dup_rect, self._dup_hover_anim, self._icon_duplicate_png, uk.Theme.KI_BLUE)
 
         prev_clip = screen.get_clip()
-        screen.set_clip(self.sidebar_list_rect)
-        for i, (path, cid, name, arch) in enumerate(self._saved_configs()):
-            row = self._sidebar_row_rect(i)
-            selected = cid == self.config.id and arch == self.config.archetype
-            if selected:
-                screen.draw_rect(C_ACCENT_DIM, row, border_radius=3)
-            arch_label = ARCHETYPES.get(arch, (arch,))[0]
-            txt = self.font_sm.render(f"[{arch_label}] {name}", True, C_TEXT if selected else C_TEXT_DIM)
-            screen.blit(txt, (row.x + 6, row.y + 4))
+        screen.set_clip(self._sidebar_list_rect)
+        configs = self._saved_configs()
+        self._sidebar_row_rects = []
+        y = self._sidebar_list_rect.y - self.sidebar_scroll
+        for i, (path, cid, name, arch) in enumerate(configs):
+            row = pygame.Rect(self._sidebar_list_rect.x, y, self._sidebar_list_rect.w, SIDEBAR_ROW_H - 4)
+            self._sidebar_row_rects.append(pygame.Rect(self._sidebar_list_rect.x, y,
+                                                         self._sidebar_list_rect.w, SIDEBAR_ROW_H))
+            if row.bottom > self._sidebar_list_rect.y and row.top < self._sidebar_list_rect.bottom:
+                selected = cid == self.config.id and arch == self.config.archetype
+                t = max(self._item_hover_anim(i), 1.0 if selected else 0.0)
+                accent = ARCHETYPE_ACCENT.get(arch, uk.Theme.GOLD)
+                base = uk.lerp_color((18, 21, 29), (26, 30, 40), t)
+                border = uk.lerp_color(uk.Theme.CARD_BORDER, accent, t * 0.8)
+                uk.draw_panel(screen, row, bg=(*base, 255), border=border, border_width=1, radius=7, shadow=False)
+                dot = pygame.Rect(0, 0, 8, 8)
+                dot.midleft = (row.x + 10, row.centery)
+                uk.draw_circle_on(screen, accent, dot.center, 4, width=0)
+                name_color = uk.lerp_color(uk.Theme.TEXT_SECONDARY, uk.Theme.TEXT_PRIMARY, t)
+                name_surf = self.font_small.render(name, True, name_color)
+                uk.blit_surface(screen, name_surf, (row.x + 24, row.y + (row.h - name_surf.get_height()) // 2),
+                                 transient=True)
+            y += SIDEBAR_ROW_H
+        if not configs:
+            empty = self.font_small.render("No saved attacks yet", True, uk.Theme.TEXT_DIM)
+            uk.blit_surface(screen, empty, (self._sidebar_list_rect.x, self._sidebar_list_rect.y), transient=True)
         screen.set_clip(prev_clip)
 
-        self.btn_delete.draw(screen, self.font_sm)
+        self._draw_pill_button(screen, self._delete_rect, self._delete_hover_anim, "Delete Selected",
+                                uk.Theme.DANGER_BRIGHT, danger=True)
 
+    def _item_hover_anim(self, index: int) -> float:
+        if 0 <= index < len(self._sidebar_hover_anim):
+            return self._sidebar_hover_anim[index]
+        return 1.0 if index == self.sidebar_hover_index else 0.0
+
+    # ------------------------------------------------------------------ top bar
     def _draw_top_bar(self, screen):
-        screen.draw_rect(C_PANEL, self.top_rect, border_radius=4)
-        screen.draw_rect(C_BORDER, self.top_rect, width=1, border_radius=4)
-        self.btn_char_prev.draw(screen, self.font)
-        self.btn_char_next.draw(screen, self.font)
+        self._draw_card_shell(screen, self.top_rect, 0.0)
+
+        self._draw_nav_btn(screen, self._char_prev_rect, self._char_prev_hovered, _draw_chevron_left)
+        self._draw_nav_btn(screen, self._char_next_rect, self._char_next_hovered, _draw_chevron_right)
         char_name = self.characters[self.char_index]
-        txt = self.font_sm.render(char_name, True, C_TEXT)
-        screen.blit(txt, txt.get_rect(center=(self.top_rect.x + 110, self.top_rect.centery)))
+        char_txt = self.font_small.render(char_name, True, uk.Theme.TEXT_PRIMARY)
+        uk.blit_surface(screen, char_txt, char_txt.get_rect(center=self._char_label_rect.center), transient=True)
 
-        self.btn_dir_prev.draw(screen, self.font)
-        self.btn_dir_next.draw(screen, self.font)
-        dtxt = self.font_sm.render(DIRECTIONS[self.direction_index], True, C_TEXT)
-        screen.blit(dtxt, dtxt.get_rect(center=(self.top_rect.x + 310, self.top_rect.centery)))
+        self._draw_nav_btn(screen, self._dir_prev_rect, self._dir_prev_hovered, _draw_chevron_left)
+        self._draw_nav_btn(screen, self._dir_next_rect, self._dir_next_hovered, _draw_chevron_right)
+        dir_txt = self.font_small.render(DIRECTIONS[self.direction_index].title(), True, uk.Theme.TEXT_PRIMARY)
+        uk.blit_surface(screen, dir_txt, dir_txt.get_rect(center=self._dir_label_rect.center), transient=True)
 
-        id_txt = self.font_sm.render(f"Editing: {self.config.display_name}  ({self.config.id})", True, C_TEXT_DIM)
-        screen.blit(id_txt, (self.top_rect.x + 440, self.top_rect.centery - 8))
-
+    # ------------------------------------------------------------------ stage
     def _draw_stage(self, screen):
         r = self.stage_rect
-        screen.draw_rect((10, 10, 15), r)
-        screen.draw_rect(C_BORDER, r, width=1)
+        uk.draw_panel(screen, r, bg=(10, 12, 18, 255), border=uk.Theme.PANEL_BORDER, border_width=1,
+                      radius=uk.Theme.RADIUS_PANEL, shadow=False)
         prev_clip = screen.get_clip()
         screen.set_clip(r)
 
-        # simple ground line so travel direction reads clearly
-        screen.draw_line((30, 30, 40), (r.x, r.bottom - 40), (r.right, r.bottom - 40), 1)
+        uk.draw_line_on(screen, (30, 33, 44), (r.x, r.bottom - 40), (r.right, r.bottom - 40), 1)
 
         from config.settings import RENDER_SCALE
         # Real LayerManager pass — same draw_layer/get_sort_key() sorting
-        # game.py itself uses (see core/draw_layers.py), rather than a
-        # fixed charge-then-actor-then-attack draw order. That fixed order
-        # happened to be right for down/left/right (both charge and beam
-        # use EFFECTS_FRONT there) but was silently wrong for 'up', where
-        # the real beam/charge draw BEHIND the player — see
-        # get_beam_layer()'s and KamehamehaChargeEffect.__init__'s own
-        # comments in beam.py/draw_layers.py. Routing through the actual
-        # LayerManager means this stage is correct for every direction
-        # automatically, and stays correct if an archetype's own layering
-        # logic changes later, with nothing to update here.
+        # game.py itself uses. Unchanged from the previous version.
         self.layer_manager.clear()
         self.layer_manager.add_object(self.actor)
         if self.charge_obj:
@@ -1840,57 +2149,155 @@ class AttackCreator:
         }[self.state]
         if self.paused:
             state_label += "  (paused)"
-        lbl = self.font_sm.render(f"state: {state_label}", True, C_WARN if self.paused else C_TEXT_DIM)
-        screen.blit(lbl, (r.x + 8, r.y + 6))
+        state_col = uk.Theme.GOLD_BRIGHT if self.paused else uk.Theme.TEXT_MUTED
+        lbl = self.font_small.render(f"state: {state_label}", True, state_col)
+        uk.blit_surface(screen, lbl, (r.x + 10, r.y + 8), transient=True)
 
-        self.btn_fire.draw(screen, self.font)
-        self.btn_pause.draw(screen, self.font)
+        fire_t = 1.0 if self._fire_pressed else self._fire_hover_anim
+        fire_accent = uk.Theme.DANGER_BRIGHT if self._fire_pressed else uk.Theme.GOLD
+        self._draw_pill_button(screen, self._fire_rect, max(fire_t, 0.15), "Hold to Fire", fire_accent,
+                                icon_fn=_draw_play_icon)
+        pause_accent = uk.Theme.KI_BLUE if self.paused else uk.Theme.TEXT_SECONDARY
+        self._draw_pill_button(screen, self._pause_rect, max(self._pause_hover_anim, 0.3 if self.paused else 0.0),
+                                "Resume" if self.paused else "Pause", pause_accent, icon_fn=_draw_pause_icon)
 
     def _draw_offset_handle(self, screen, attr_name: str):
         """Crosshair for the current direction's offset on whichever tab
-        is active (charge/beam/chain). Bright + draggable while paused;
-        dimmed with a hint otherwise, so it's clear dragging needs Pause
-        first rather than just not responding to clicks for no visible
-        reason."""
+        is active. Bright + draggable while paused; dimmed with a hint
+        otherwise. Unchanged behaviour from the previous version, restyled."""
         is_dragging = self.dragging_offset and self._drag_offset_attr == attr_name
         hx, hy = self._offset_screen_pos(attr_name)
-        color = C_ACCENT if self.paused else C_TEXT_DIM
+        color = uk.Theme.GOLD_BRIGHT if self.paused else uk.Theme.TEXT_DIM
         radius = 8 if is_dragging else 6
-        screen.draw_circle(color, (hx, hy), radius, width=0 if is_dragging else 2)
-        screen.draw_line(color, (hx - 10, hy), (hx + 10, hy), 1)
-        screen.draw_line(color, (hx, hy - 10), (hx, hy + 10), 1)
+        uk.draw_circle_on(screen, color, (hx, hy), radius, width=0 if is_dragging else 2)
+        uk.draw_line_on(screen, color, (hx - 10, hy), (hx + 10, hy), 1)
+        uk.draw_line_on(screen, color, (hx, hy - 10), (hx, hy + 10), 1)
 
         ox, oy = getattr(self.config, attr_name).get(self.actor.direction, (0, 0))
         label = self.active_tab.replace("_", " ").title()
         r = self.stage_rect
         if self.paused:
-            txt = self.font_sm.render(
-                f"{label} offset ({self.actor.direction}): ({ox}, {oy}) — drag the crosshair", True, C_TEXT)
+            txt = self.font_small.render(
+                f"{label} offset ({self.actor.direction}): ({ox}, {oy}) — drag the crosshair", True,
+                uk.Theme.TEXT_PRIMARY)
         else:
-            txt = self.font_sm.render(
-                f"{label} offset ({self.actor.direction}): ({ox}, {oy}) — Pause to drag", True, C_TEXT_DIM)
-        screen.blit(txt, (r.x + 8, r.bottom - 22))
+            txt = self.font_small.render(
+                f"{label} offset ({self.actor.direction}): ({ox}, {oy}) — Pause to drag", True, uk.Theme.TEXT_DIM)
+        uk.blit_surface(screen, txt, (r.x + 10, r.bottom - 24), transient=True)
 
+    # ------------------------------------------------------------------ param panel
     def _draw_panel(self, screen):
         for tab_name, rect in self.tab_rects.items():
             active = self.active_tab == tab_name
-            screen.draw_rect(C_ACCENT_DIM if active else C_PANEL, rect)
-            screen.draw_rect(C_BORDER, rect, width=1)
+            accent = uk.Theme.GOLD
+            base = (26, 30, 40) if active else (18, 21, 29)
+            border = accent if active else uk.Theme.CARD_BORDER
+            uk.draw_panel(screen, rect, bg=(*base, 255), border=border, border_width=2 if active else 1,
+                          radius=0, shadow=False)
             label = tab_name.replace("_", " ").title()
-            txt = self.font.render(label, True, C_TEXT)
-            screen.blit(txt, txt.get_rect(center=rect.center))
+            color = uk.Theme.GOLD_BRIGHT if active else uk.Theme.TEXT_MUTED
+            txt = self.font_small.render(label, True, color)
+            uk.blit_surface(screen, txt, txt.get_rect(center=rect.center), transient=True)
 
         if self.active_tab in self.config.OPTIONAL_SETS:
-            cb = self._charge_enabled_rect()
             on = self.config.set_enabled[self.active_tab]
+            cb = self._enabled_chip_rect
+            t = max(self._enabled_chip_hover_anim, 1.0 if on else 0.0)
+            base = uk.lerp_color((28, 33, 44), (24, 44, 32), t if on else 0.0)
+            border = uk.lerp_color(uk.Theme.CARD_BORDER, uk.Theme.GOLD if not on else (110, 210, 140), 0.6)
+            uk.draw_panel(screen, cb, bg=(*base, 255), border=border, border_width=1, radius=6, shadow=False)
             label = self.active_tab.replace("_", " ").title()
-            screen.draw_rect(C_GOOD if on else C_PANEL_DARK, cb, border_radius=4)
-            screen.draw_rect(C_BORDER, cb, width=1, border_radius=4)
-            txt = self.font_sm.render(f"{label}: ON" if on else f"{label}: OFF", True, C_TEXT)
-            screen.blit(txt, txt.get_rect(center=cb.center))
+            txt = self.font_tiny.render(f"{label}: {'ON' if on else 'OFF'}", True,
+                                         (150, 230, 170) if on else uk.Theme.TEXT_DIM)
+            uk.blit_surface(screen, txt, txt.get_rect(center=cb.center), transient=True)
 
-        self.param_panel.draw(screen, self.font, self.font_sm)
-        self.btn_save.draw(screen, self.font)
+        list_rect = self._panel_list_rect
+        prev_clip = screen.get_clip()
+        screen.set_clip(list_rect)
+        uk.draw_rect_on(screen, (14, 16, 23), list_rect, 0, 0)
+
+        self._field_row_rects = {}
+        self.text_field_rects = []
+        y = list_rect.y - self.panel_scroll
+        for row in self._param_rows:
+            if row[0] == "header":
+                section_name = row[1]
+                hrect = pygame.Rect(list_rect.x, y, list_rect.w, SECTION_H)
+                if hrect.bottom > list_rect.y and hrect.top < list_rect.bottom:
+                    uk.draw_rect_on(screen, (20, 23, 32), hrect, 0, 0)
+                    txt = self.font_small.render(section_name.upper(), True, uk.Theme.GOLD)
+                    uk.blit_surface(screen, txt, (hrect.x + 10, hrect.y + (SECTION_H - txt.get_height()) // 2),
+                                     transient=True)
+                y += SECTION_H
+            else:
+                _, spec, target = row
+                frect = pygame.Rect(list_rect.x + 4, y, list_rect.w - 8, ROW_H - 2)
+                if frect.bottom > list_rect.y and frect.top < list_rect.bottom:
+                    self._draw_param_field_row(screen, frect, spec, target)
+                self._field_row_rects[id(spec)] = (pygame.Rect(list_rect.x, y, list_rect.w, ROW_H), spec, target)
+                y += ROW_H
+
+        screen.set_clip(prev_clip)
+
+        total = self._panel_content_height()
+        if total > list_rect.height:
+            track = pygame.Rect(list_rect.right - 8, list_rect.y, 6, list_rect.height)
+            uk.draw_rect_on(screen, (24, 27, 36), track, 0, 3)
+            thumb_h = max(20, int(list_rect.height * list_rect.height / total))
+            max_scroll = max(1, total - list_rect.height)
+            thumb_y = list_rect.y + int(self.panel_scroll * (list_rect.height - thumb_h) / max_scroll)
+            thumb = pygame.Rect(track.x, thumb_y, 6, thumb_h)
+            thumb_color = uk.Theme.GOLD if self._panel_scroll_dragging else uk.Theme.CARD_BORDER
+            uk.draw_rect_on(screen, thumb_color, thumb, 0, 3)
+            self._panel_scrollbar_track = track
+            self._panel_scrollbar_thumb = thumb
+            self._panel_scrollbar_max_scroll = max_scroll
+        else:
+            self._panel_scrollbar_track = None
+            self._panel_scrollbar_thumb = None
+            self._panel_scrollbar_max_scroll = 0
+
+    def _draw_param_field_row(self, screen, rect, spec, target):
+        label_surf = self.font_small.render(spec.label, True, uk.Theme.TEXT_SECONDARY)
+        uk.blit_surface(screen, label_surf,
+                         (rect.x + 8, rect.y + (rect.height - label_surf.get_height()) // 2), transient=True)
+
+        widget_rect = pygame.Rect(rect.right - FIELD_VALUE_W - 6, rect.y + 2, FIELD_VALUE_W, rect.height - 4)
+        editing = self.editing_field == (self.active_tab, spec.key)
+
+        if spec.kind == "bool":
+            on = bool(target.get(spec.key, spec.default))
+            bg = (24, 44, 32) if on else (24, 24, 30)
+            border = (110, 210, 140) if on else uk.Theme.CARD_BORDER
+            uk.draw_panel(screen, widget_rect, bg=(*bg, 255), border=border, border_width=1, radius=6, shadow=False)
+            txt = self.font_tiny.render("ON" if on else "OFF", True,
+                                         (150, 230, 170) if on else uk.Theme.TEXT_MUTED)
+            uk.blit_surface(screen, txt, txt.get_rect(center=widget_rect.center), transient=True)
+        elif spec.kind == "choice":
+            uk.draw_panel(screen, widget_rect, bg=(24, 24, 30, 255), border=uk.Theme.CARD_BORDER,
+                          border_width=1, radius=6, shadow=False)
+            txt = self.font_tiny.render(str(target.get(spec.key, spec.default)), True, uk.Theme.TEXT_SECONDARY)
+            uk.blit_surface(screen, txt, txt.get_rect(center=widget_rect.center), transient=True)
+        else:
+            bg = (30, 34, 46) if editing else (22, 24, 32)
+            border = uk.Theme.GOLD if editing else uk.Theme.CARD_BORDER
+            uk.draw_panel(screen, widget_rect, bg=(*bg, 255), border=border,
+                          border_width=1 + (1 if editing else 0), radius=6, shadow=False)
+            self.text_field_rects.append(widget_rect)
+            if editing:
+                val_surf = self.font_tiny.render(self.text_input, True, uk.Theme.TEXT_PRIMARY)
+            else:
+                v = target.get(spec.key, spec.default)
+                shown = "auto" if v is None else str(v)
+                col = uk.Theme.TEXT_DIM if v is None else uk.Theme.TEXT_SECONDARY
+                val_surf = self.font_tiny.render(shown, True, col)
+            val_rect = val_surf.get_rect(midleft=(widget_rect.x + 8, widget_rect.centery))
+            uk.blit_surface(screen, val_surf, val_rect, transient=True)
+            if editing:
+                line_h = self.font_tiny.size("Ag")[1]
+                caret_rect = pygame.Rect(val_rect.x, 0, val_rect.w, line_h)
+                caret_rect.centery = widget_rect.centery
+                self._draw_live_text_field(screen, self.font_tiny, caret_rect, widget_rect)
 
 
 # ─────────────────────────────────────────────────────────────────────────

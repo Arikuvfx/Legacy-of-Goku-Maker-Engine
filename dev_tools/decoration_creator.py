@@ -1,28 +1,50 @@
 """
-decoration_creator.py — Dev-menu Decoration Creator
-=====================================================
+decoration_creator.py  -  Dev-menu Decoration Creator
+======================================================
 
 A dedicated editor for the scenery/decorations used by the Object Editor.
 
-It deliberately follows the same non-blocking overlay style as the Character
-Creator: the host game owns the event loop and simply calls
-``toggle()`` / ``handle_input()`` / ``update()`` / ``draw()`` every frame.
+Rebuilt on dev_tools/ui_kit.py (the gold / ki-blue "modern DBZ" dev-tool
+look) so it matches DevMenu, CharacterCreator and EntityCreator exactly. The
+old hand-rolled pygame.Surface UI (C_* palette, TextField, Slider,
+DecorationList, button()/panel()/text() helpers and every old draw / hit-test
+routine) is gone entirely - every widget here draws through ui_kit's
+GPUScreen-safe primitives plus this file's small immediate-mode widget layer
+(same hover/press easing, same hairline-card language, same scrolling panel
+pattern as the other creators). Only the *functionality* is carried over -
+the discovery scan, the ``decoration.json`` schema, load/save, the sequence
+tools and the collision maths are unchanged.
+
+The host game owns the event loop and simply calls ``toggle()`` /
+``handle_input()`` / ``update()`` / ``draw()`` every frame::
+
+    from dev_tools import decoration_creator
+    self.decoration_creator = decoration_creator.DecorationCreator(W, H)
+    self.decoration_creator.on_catalog_changed = self._refresh_decoration_catalog
+    # event loop:
+    if self.decoration_creator.active:
+        result = self.decoration_creator.handle_input(event)   # 'back_to_dev_menu'
+    # every frame:
+    self.decoration_creator.update(dt)
+    self.decoration_creator.draw(self.logical_surface, dt)
 
 Features
 --------
 * Discovers decoration assets under ``assets/objects/decorations/``.
-* Shows the complete decoration roster in a left-hand list.
-* Animated preview of the currently configured sequence.
-* Visual spritesheet/frame layout editor.
-* Visual animation-sequence builder: click frames in the order they should
-  play instead of typing a raw list.
-* Visual collision editor: drag the collision box and resize it with corner
-  handles directly over the sprite.
-* Auto-collision mode for decorations where a manual box is not necessary.
+* Shows the complete decoration roster in a left-hand list, with a live
+  animated preview underneath it.
+* Preview tab: large animated preview with playback control.
+* Animation tab: visual spritesheet/frame layout editor and a visual
+  animation-sequence builder - click frames in the order they should play
+  instead of typing a raw list.
+* Collision tab: drag the collision box and resize it with corner handles
+  directly over the sprite, or type exact numbers. Auto-collision mode for
+  decorations where a manual box is not necessary.
 * Saves each discovered decoration's settings to ``decoration.json`` beside
   its art.
-* The existing hardcoded ``tree`` is visible but explicitly locked so its
-  hand-authored animation cannot be accidentally overwritten.
+* Decorations flagged ``hardcoded`` keep their hand-authored animation
+  protected (collision stays editable as a sidecar override). No decoration
+  is currently flagged - Tree is editable like any other.
 
 Recommended asset layout
 ------------------------
@@ -58,13 +80,16 @@ from __future__ import annotations
 
 import copy
 import json
+import math
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
 import pygame
 
+import dev_tools.ui_kit as uk
 from objects.decoration_objects import (
     DECORATION_STYLES,
     discover_decoration_styles,
@@ -84,33 +109,6 @@ else:
 DECORATIONS_DIR = BASE_DIR / "assets" / "objects" / "decorations"
 IMAGE_EXTENSIONS = {".png", ".webp", ".jpg", ".jpeg"}
 
-
-# ---------------------------------------------------------------------------
-# Palette — deliberately close to character_creator.py's dark dev-tool UI.
-# ---------------------------------------------------------------------------
-C_BG = (14, 14, 20)
-C_PANEL = (24, 24, 34)
-C_PANEL_DARK = (18, 18, 26)
-C_BORDER = (50, 50, 72)
-C_ACCENT = (80, 160, 255)
-C_ACCENT2 = (255, 200, 55)
-C_TEXT = (215, 215, 228)
-C_TEXT_DIM = (110, 110, 138)
-C_RED = (220, 70, 70)
-C_GREEN = (70, 200, 100)
-C_HOVER = (40, 40, 62)
-C_SELECTED = (30, 75, 140)
-C_COLLISION = (255, 80, 80)
-C_COLLISION_FILL = (255, 60, 60, 55)
-C_GRID = (42, 42, 58)
-C_CANVAS = (12, 12, 18)
-
-HEADER_H = 44
-FOOTER_H = 52
-LIST_W = 215
-TAB_H = 36
-PAD = 10
-
 TAB_PREVIEW = 0
 TAB_ANIMATION = 1
 TAB_COLLISION = 2
@@ -118,60 +116,8 @@ TAB_NAMES = ("Preview", "Animation", "Collision")
 
 
 # ---------------------------------------------------------------------------
-# Tiny UI helpers
+# Small data helpers (unchanged)
 # ---------------------------------------------------------------------------
-def _font(size: int, bold: bool = False):
-    pygame.font.init()
-    try:
-        return pygame.font.SysFont("segoeui,dejavusans,arial", size, bold=bold)
-    except Exception:
-        return pygame.font.Font(None, size + 4)
-
-
-_FONT_CACHE: dict[tuple[int, bool], pygame.font.Font] = {}
-_TEXT_CACHE: dict[tuple[int, bool, str, tuple[int, int, int]], pygame.Surface] = {}
-
-
-def get_font(size: int, bold: bool = False) -> pygame.font.Font:
-    key = (size, bold)
-    if key not in _FONT_CACHE:
-        _FONT_CACHE[key] = _font(size, bold)
-    return _FONT_CACHE[key]
-
-
-def text(surf: pygame.Surface, value: str, pos, color=C_TEXT,
-         size: int = 14, bold: bool = False) -> pygame.Rect:
-    key = (size, bold, str(value), tuple(color))
-    img = _TEXT_CACHE.get(key)
-    if img is None:
-        img = get_font(size, bold).render(str(value), True, color)
-        _TEXT_CACHE[key] = img
-    surf.blit(img, pos)
-    return pygame.Rect(pos[0], pos[1], img.get_width(), img.get_height())
-
-
-def button(surf: pygame.Surface, rect: pygame.Rect, label: str,
-           hover=False, active=False, disabled=False, danger=False,
-           small=False) -> None:
-    base = C_RED if danger else C_ACCENT
-    if disabled:
-        base = C_BORDER
-    bg = C_PANEL_DARK if not (hover or active) else (C_HOVER if not active else C_SELECTED)
-    if disabled:
-        bg = C_PANEL_DARK
-    surf.draw_rect(bg, rect, border_radius=5)
-    surf.draw_rect(base, rect, 1, border_radius=5)
-    f = get_font(12 if small else 13, bold=False)
-    img = f.render(label, True, C_TEXT_DIM if disabled else (C_TEXT if hover or active else base))
-    surf.blit(img, img.get_rect(center=rect.center))
-
-
-def panel(surf: pygame.Surface, rect: pygame.Rect, fill=C_PANEL_DARK,
-          border=C_BORDER, radius=6, width=1) -> None:
-    surf.draw_rect(fill, rect, border_radius=radius)
-    surf.draw_rect(border, rect, width, border_radius=radius)
-
-
 def clamp_int(value, lo, hi, default):
     try:
         return max(lo, min(hi, int(value)))
@@ -207,129 +153,6 @@ def relative_asset_path(path: Path) -> str:
         return path.resolve().relative_to(BASE_DIR.resolve()).as_posix()
     except ValueError:
         return str(path).replace(os.sep, "/")
-
-
-# ---------------------------------------------------------------------------
-# Text field
-# ---------------------------------------------------------------------------
-class TextField:
-    H = 30
-
-    def __init__(self, rect: pygame.Rect, value: str = ""):
-        self.rect = rect.copy()
-        self.value = str(value)
-        self.active = False
-        self.cursor = len(self.value)
-
-    def set_value(self, value: str) -> None:
-        self.value = str(value)
-        self.cursor = min(self.cursor, len(self.value))
-
-    def handle_event(self, event: pygame.event.Event) -> bool:
-        changed = False
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            self.active = self.rect.collidepoint(event.pos)
-            if self.active:
-                self.cursor = len(self.value)
-            return False
-
-        if not self.active or event.type != pygame.KEYDOWN:
-            return False
-
-        if event.key == pygame.K_BACKSPACE:
-            if self.cursor > 0:
-                self.value = self.value[:self.cursor - 1] + self.value[self.cursor:]
-                self.cursor -= 1
-                changed = True
-        elif event.key == pygame.K_DELETE:
-            if self.cursor < len(self.value):
-                self.value = self.value[:self.cursor] + self.value[self.cursor + 1:]
-                changed = True
-        elif event.key == pygame.K_LEFT:
-            self.cursor = max(0, self.cursor - 1)
-        elif event.key == pygame.K_RIGHT:
-            self.cursor = min(len(self.value), self.cursor + 1)
-        elif event.key == pygame.K_HOME:
-            self.cursor = 0
-        elif event.key == pygame.K_END:
-            self.cursor = len(self.value)
-        elif event.key in (pygame.K_RETURN, pygame.K_TAB, pygame.K_ESCAPE):
-            self.active = False
-        elif event.unicode and event.unicode.isprintable():
-            self.value = self.value[:self.cursor] + event.unicode + self.value[self.cursor:]
-            self.cursor += 1
-            changed = True
-        return changed
-
-    def draw(self, surf: pygame.Surface, enabled=True) -> None:
-        border = C_ACCENT if self.active and enabled else C_BORDER
-        if not enabled:
-            border = C_BORDER
-        bg = C_PANEL_DARK if enabled else (15, 15, 22)
-        surf.draw_rect(bg, self.rect, border_radius=4)
-        surf.draw_rect(border, self.rect, 1, border_radius=4)
-        col = C_TEXT if enabled else C_TEXT_DIM
-        img = get_font(13).render(self.value, True, col)
-        clip = self.rect.inflate(-8, -2)
-        surf.set_clip(clip)
-        surf.blit(img, (clip.x, self.rect.y + (self.rect.h - img.get_height()) // 2))
-        surf.set_clip(None)
-        if self.active and enabled:
-            cursor_x = self.rect.x + 7 + get_font(13).size(self.value[:self.cursor])[0]
-            surf.draw_line(C_TEXT,
-                             (cursor_x, self.rect.y + 5),
-                             (cursor_x, self.rect.bottom - 5), 1)
-
-
-# ---------------------------------------------------------------------------
-# Simple slider — same visual language as the Character Creator.
-# ---------------------------------------------------------------------------
-class Slider:
-    H = 22
-
-    def __init__(self, rect: pygame.Rect, minimum: float, maximum: float,
-                 value: float, step: float = 1.0):
-        self.rect = rect.copy()
-        self.min = float(minimum)
-        self.max = float(maximum)
-        self.value = max(self.min, min(self.max, float(value)))
-        self.step = float(step)
-        self.dragging = False
-
-    def _from_x(self, x: int) -> float:
-        t = (x - self.rect.x) / max(1, self.rect.w)
-        raw = self.min + t * (self.max - self.min)
-        if self.step:
-            raw = round(raw / self.step) * self.step
-        return max(self.min, min(self.max, raw))
-
-    def handle_event(self, event: pygame.event.Event, enabled=True) -> bool:
-        if not enabled:
-            self.dragging = False
-            return False
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            if self.rect.collidepoint(event.pos):
-                self.dragging = True
-                self.value = self._from_x(event.pos[0])
-                return True
-        elif event.type == pygame.MOUSEMOTION and self.dragging:
-            self.value = self._from_x(event.pos[0])
-            return True
-        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-            self.dragging = False
-        return False
-
-    def draw(self, surf: pygame.Surface, enabled=True) -> None:
-        y = self.rect.centery
-        track = pygame.Rect(self.rect.x, y - 3, self.rect.w, 6)
-        surf.draw_rect(C_BORDER if enabled else (35, 35, 46), track, border_radius=3)
-        rng = max(1e-6, self.max - self.min)
-        t = (self.value - self.min) / rng
-        fill = pygame.Rect(track.x, track.y, int(track.w * t), track.h)
-        if fill.w:
-            surf.draw_rect(C_ACCENT if enabled else C_BORDER, fill, border_radius=3)
-        kx = self.rect.x + int(track.w * t)
-        surf.draw_circle(C_ACCENT if enabled else C_BORDER, (kx, y), 7)
 
 
 # ---------------------------------------------------------------------------
@@ -477,88 +300,414 @@ def _collision_from_style(style: dict, frame: Optional[pygame.Surface]) -> Optio
     return _infer_collision(frame)
 
 
-# ---------------------------------------------------------------------------
-# Left roster panel
-# ---------------------------------------------------------------------------
-class DecorationList:
-    ITEM_H = 46
+# ══════════════════════════════════════════════════════════════════════
+#  UI layer  -  built entirely on dev_tools/ui_kit.py, same visual
+#  language and widget-behaviour conventions as character_creator.py and
+#  entity_creator.py (immediate-mode: draw() computes hit-rects consumed by
+#  the next frame's events, hover/press values ease and quantise for
+#  cache-friendliness, a small _TextEdit engine backs every text field).
+#
+#  NOTE: the bitmap menu font only has letters, digits and  . , ! ? : - + /
+#  _ ( ) '  - any other character renders as '?', so every UI string below
+#  sticks to that set (e.g. "x" rather than a multiplication sign).
+# ══════════════════════════════════════════════════════════════════════
 
-    def __init__(self, rect: pygame.Rect):
-        self.rect = rect.copy()
-        self.items: list[dict] = []
-        self.selected = ""
-        self.scroll = 0
+_T = uk.Theme
 
-    def set_items(self, items: list[dict], selected: str = "") -> None:
-        self.items = items
-        self.selected = selected or (items[0]["id"] if items else "")
-        self.scroll = 0
+# Same flat two-tone backdrop / bar colours DevMenu and the other creators use.
+_BG        = (8, 11, 17)
+_BAND      = (10, 13, 20)
+_BAR       = (12, 15, 23)
+_HAIR      = (43, 49, 63)
+_CARD      = (22, 26, 35)
+_CARD_HI   = (28, 33, 44)
+_FIELD     = (20, 23, 32)
+_FIELD_HI  = (27, 31, 42)
+_INSET     = (11, 14, 21)
+_TRACK     = (34, 39, 53)
+_SEL       = (31, 36, 49)
+_GRID      = (72, 80, 102)          # spritesheet cell lines
+_GROUND    = (120, 96, 44)          # dim-gold ground / anchor line
 
-    def handle_event(self, event: pygame.event.Event) -> Optional[str]:
-        visible = self.rect.inflate(-4, -42)
-        if event.type == pygame.MOUSEWHEEL and visible.collidepoint(pygame.mouse.get_pos()):
-            max_scroll = max(0, len(self.items) - max(1, visible.h // self.ITEM_H))
-            self.scroll = max(0, min(max_scroll, self.scroll - event.y))
+SEQ_CELL = 44                       # sequence-strip cell size
+SEQ_GAP = 6
+SEQ_ARROW = 34
 
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            mx, my = event.pos
-            if not visible.collidepoint(mx, my):
-                return None
-            for i, item in enumerate(self.items):
-                row = visible.y + (i - self.scroll) * self.ITEM_H
-                rr = pygame.Rect(visible.x, row, visible.w, self.ITEM_H - 4)
-                if rr.collidepoint(mx, my):
-                    if self.selected != item["id"]:
-                        self.selected = item["id"]
-                        return item["id"]
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def _fit_scale(box_w, box_h, w, h, cap):
+    """Scale that fits (w, h) in the box. Prefers a whole-number up-scale
+    (crisp pixel art, one sprite pixel == a whole number of screen pixels),
+    but falls back to the exact fractional fit when rounding down would waste
+    a lot of space (e.g. 1.8x must not become 1x)."""
+    s = min(box_w / max(1, w), box_h / max(1, h))
+    if s >= 1.0:
+        s = min(s, float(cap))
+        k = float(int(s))
+        return k if k >= 0.7 * s else s
+    return max(0.05, s)
+
+
+def _digit_ok(ch: str) -> bool:
+    return ch in "0123456789"
+
+
+# ── Bitmap font wrapper (same shape as character_creator._Font) ────────
+
+class _Font:
+    """One BitmapFont pinned to one pixel height, plus the text metrics the
+    layout code needs. See character_creator.py's identical class for the
+    full rationale (glyph fallback to '?', baseline-based positioning,
+    arithmetic width instead of per-prefix rendering)."""
+
+    def __init__(self, bitmap, height):
+        self.bm = bitmap
+        self.height = int(height)
+        self._ok = {}
+        self._adv = {}
+        self._spacing = None
+        native = max(1, bitmap.size("A")[1])
+        self.scale = max(1, int(round(self.height / native)))
+        self.cap_h = max(1, bitmap.size("A", height=self.height)[1])
+        offs = getattr(bitmap, "glyph_y_offsets", None) or {}
+        self.desc_h = max(offs.values(), default=0) * self.scale
+        self.line_h = self.cap_h + self.desc_h
+
+    def _has(self, ch):
+        ok = self._ok.get(ch)
+        if ok is None:
+            try:
+                ok = ch == " " or self.bm._glyph(ch) is not None
+            except AttributeError:
+                ok = True
+            self._ok[ch] = ok
+        return ok
+
+    def disp(self, text):
+        for ch in text:
+            if not self._has(ch):
+                return "".join(c if self._has(c) else "?" for c in text)
+        return text
+
+    def _advance(self, ch):
+        a = self._adv.get(ch)
+        if a is None:
+            a = self.bm.size(ch, height=self.height)[0]
+            self._adv[ch] = a
+        return a
+
+    def _sp(self):
+        if self._spacing is None:
+            aa = self.bm.size("AA", height=self.height)[0]
+            self._spacing = max(0, aa - 2 * self._advance("A"))
+        return self._spacing
+
+    def width(self, text):
+        if not text:
+            return 0
+        d = self.disp(text)
+        return sum(self._advance(c) for c in d) + self._sp() * (len(d) - 1)
+
+    def render(self, text, color):
+        d = self.disp(text)
+        surf = self.bm.render(d, color=tuple(color), height=self.height)
+        offs = getattr(self.bm, "glyph_y_offsets", None) or {}
+        desc = 0
+        for c in set(d):
+            o = offs.get(c, 0)
+            if o > desc:
+                desc = o
+        return surf, desc * self.scale
+
+    def fit(self, text, max_w):
+        if self.width(text) <= max_w:
+            return text
+        ell = "..."
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self.width(text[:mid].rstrip() + ell) <= max_w:
+                lo = mid
+            else:
+                hi = mid - 1
+        return (text[:lo].rstrip() + ell) if lo else ell
+
+    def wrap(self, text, max_w):
+        lines = []
+        for para in text.split("\n"):
+            cur = ""
+            for word in para.split(" "):
+                trial = f"{cur} {word}" if cur else word
+                if cur and self.width(trial) > max_w:
+                    lines.append(cur)
+                    cur = word
+                else:
+                    cur = trial
+            lines.append(cur)
+        return lines
+
+
+# ── Text editing engine (no drawing) ────────────────────────────────────
+
+def _index_at_x(font, line_text, x):
+    if x <= 0 or not line_text:
+        return 0
+    shown = font.disp(line_text)
+    sp = font._sp()
+    best_i, best_d = 0, x
+    acc = 0
+    for i, ch in enumerate(shown, 1):
+        acc += font._advance(ch) + (sp if i > 1 else 0)
+        d = abs(acc - x)
+        if d < best_d:
+            best_i, best_d = i, d
+    return best_i
+
+
+class _TextEdit:
+    """Caret / selection / clipboard logic shared by every text field. Pure
+    state - the creator draws it and feeds it keys. key() returns None,
+    'changed', 'commit' or 'cancel'. Single-line only (no field in this
+    tool needs more)."""
+
+    def __init__(self, value="", max_len=600, allowed=None):
+        self.value = value
+        self.cursor = len(value)
+        self.anchor = None
+        self.max_len = max_len
+        self.allowed = allowed
+        self.blink = 0.0
+
+    def has_sel(self):
+        return self.anchor is not None and self.anchor != self.cursor
+
+    def sel_range(self):
+        a, b = self.anchor, self.cursor
+        return (a, b) if a <= b else (b, a)
+
+    def _del_sel(self):
+        if not self.has_sel():
+            return False
+        s, e = self.sel_range()
+        self.value = self.value[:s] + self.value[e:]
+        self.cursor = s
+        self.anchor = None
+        return True
+
+    def insert(self, text):
+        text = text.replace("\r", "").replace("\n", " ")
+        keep = [ch for ch in text
+                if ch.isprintable() and (self.allowed is None or self.allowed(ch))]
+        text = "".join(keep)
+        if not text:
+            return False
+        changed = self._del_sel()
+        room = self.max_len - len(self.value)
+        if room <= 0:
+            return changed
+        text = text[:room]
+        self.value = self.value[:self.cursor] + text + self.value[self.cursor:]
+        self.cursor += len(text)
+        return True
+
+    def _move(self, idx, shift):
+        idx = _clamp(idx, 0, len(self.value))
+        if shift:
+            if self.anchor is None:
+                self.anchor = self.cursor
+        else:
+            self.anchor = None
+        self.cursor = idx
+
+    def _word_left(self, i):
+        v = self.value
+        while i > 0 and v[i - 1] == " ":
+            i -= 1
+        while i > 0 and v[i - 1] != " ":
+            i -= 1
+        return i
+
+    def _word_right(self, i):
+        v, n = self.value, len(self.value)
+        while i < n and v[i] == " ":
+            i += 1
+        while i < n and v[i] != " ":
+            i += 1
+        return i
+
+    def key(self, event):
+        mods = getattr(event, "mod", 0) | pygame.key.get_mods()
+        ctrl = bool(mods & (pygame.KMOD_CTRL | pygame.KMOD_META))
+        shift = bool(mods & pygame.KMOD_SHIFT)
+        k = event.key
+        self.blink = 0.0
+
+        if k in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_TAB):
+            return "commit"
+        if k == pygame.K_ESCAPE:
+            return "cancel"
+        if ctrl and k == pygame.K_a:
+            self.anchor, self.cursor = 0, len(self.value)
+            return None
+        if ctrl and k in (pygame.K_c, pygame.K_x):
+            if self.has_sel():
+                s, e = self.sel_range()
+                uk.clipboard_set_text(self.value[s:e])
+                if k == pygame.K_x:
+                    self._del_sel()
+                    return "changed"
+            return None
+        if ctrl and k == pygame.K_v:
+            return "changed" if self.insert(uk.clipboard_get_text()) else None
+
+        if k == pygame.K_LEFT:
+            if not shift and self.has_sel():
+                self.cursor = self.sel_range()[0]
+                self.anchor = None
+            else:
+                self._move(self._word_left(self.cursor) if ctrl else self.cursor - 1, shift)
+        elif k == pygame.K_RIGHT:
+            if not shift and self.has_sel():
+                self.cursor = self.sel_range()[1]
+                self.anchor = None
+            else:
+                self._move(self._word_right(self.cursor) if ctrl else self.cursor + 1, shift)
+        elif k == pygame.K_HOME:
+            self._move(0, shift)
+        elif k == pygame.K_END:
+            self._move(len(self.value), shift)
+        elif k == pygame.K_BACKSPACE:
+            if self._del_sel():
+                return "changed"
+            if self.cursor > 0:
+                start = self._word_left(self.cursor) if ctrl else self.cursor - 1
+                self.value = self.value[:start] + self.value[self.cursor:]
+                self.cursor = start
+                return "changed"
+        elif k == pygame.K_DELETE:
+            if self._del_sel():
+                return "changed"
+            if self.cursor < len(self.value):
+                end = self._word_right(self.cursor) if ctrl else self.cursor + 1
+                self.value = self.value[:self.cursor] + self.value[end:]
+                return "changed"
+        elif event.unicode and not ctrl:
+            return "changed" if self.insert(event.unicode) else None
         return None
 
-    def draw(self, surf: pygame.Surface, mouse_pos) -> None:
-        panel(surf, self.rect)
-        text(surf, "DECORATIONS", (self.rect.x + 12, self.rect.y + 10), C_TEXT_DIM, 12, True)
-        visible = pygame.Rect(self.rect.x + 4, self.rect.y + 38,
-                              self.rect.w - 8, self.rect.h - 42)
-        old_clip = surf.get_clip()
-        surf.set_clip(visible)
-        for i, item in enumerate(self.items):
-            y = visible.y + (i - self.scroll) * self.ITEM_H
-            rr = pygame.Rect(visible.x, y, visible.w, self.ITEM_H - 4)
-            if rr.bottom < visible.top or rr.top > visible.bottom:
-                continue
-            selected = item["id"] == self.selected
-            hovered = rr.collidepoint(*mouse_pos)
-            bg = C_SELECTED if selected else (C_HOVER if hovered else C_PANEL_DARK)
-            surf.draw_rect(bg, rr, border_radius=5)
-            surf.draw_rect(C_ACCENT if selected else C_BORDER, rr,
-                             1, border_radius=5)
 
-            img = item.get("thumb")
-            if img is not None:
-                thumb = img.copy()
-                thumb_scale = min(30 / max(1, thumb.get_width()),
-                                  34 / max(1, thumb.get_height()))
-                tw = max(1, int(thumb.get_width() * thumb_scale))
-                th = max(1, int(thumb.get_height() * thumb_scale))
-                thumb = pygame.transform.scale(thumb, (tw, th))
-                surf.blit(thumb, (rr.x + 8 + (34 - tw) // 2,
-                                  rr.y + (rr.h - th) // 2))
-            else:
-                surf.draw_rect(C_GRID,
-                                 pygame.Rect(rr.x + 10, rr.y + 7, 30, rr.h - 14),
-                                 border_radius=3)
+# ── Small vector icons (same primitives + look as the other creators) ───
 
-            text(surf, item.get("label", item["id"]), (rr.x + 50, rr.y + 8),
-                 C_TEXT if selected else C_TEXT_DIM, 14)
-            badge = "BUILT-IN" if item.get("hardcoded") else ""
-            if badge:
-                text(surf, badge, (rr.x + 50, rr.bottom - 17), C_ACCENT2, 10, True)
-
-        surf.set_clip(old_clip)
+def _ic_check(surface, rect, color, width=3):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.32
+    uk.draw_line_on(surface, color, (cx - s, cy), (cx - s * 0.15, cy + s * 0.8), width)
+    uk.draw_line_on(surface, color, (cx - s * 0.15, cy + s * 0.8), (cx + s, cy - s * 0.7), width)
 
 
-# ---------------------------------------------------------------------------
-# Main editor
-# ---------------------------------------------------------------------------
+def _ic_plus(surface, rect, color, width=3):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.34
+    uk.draw_line_on(surface, color, (cx - s, cy), (cx + s, cy), width)
+    uk.draw_line_on(surface, color, (cx, cy - s), (cx, cy + s), width)
+
+
+def _ic_minus(surface, rect, color, width=3):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.34
+    uk.draw_line_on(surface, color, (cx - s, cy), (cx + s, cy), width)
+
+
+def _make_chevron(direction):
+    def draw(surface, rect, color, width=2):
+        cx, cy = rect.center
+        s = min(rect.w, rect.h) * 0.26
+        if direction == "up":
+            pts = [(cx - s, cy + s * 0.6), (cx, cy - s * 0.6), (cx + s, cy + s * 0.6)]
+        elif direction == "down":
+            pts = [(cx - s, cy - s * 0.6), (cx, cy + s * 0.6), (cx + s, cy - s * 0.6)]
+        elif direction == "left":
+            pts = [(cx + s * 0.6, cy - s), (cx - s * 0.6, cy), (cx + s * 0.6, cy + s)]
+        else:
+            pts = [(cx - s * 0.6, cy - s), (cx + s * 0.6, cy), (cx - s * 0.6, cy + s)]
+        uk.draw_line_on(surface, color, pts[0], pts[1], width)
+        uk.draw_line_on(surface, color, pts[1], pts[2], width)
+    return draw
+
+
+_ic_left = _make_chevron("left")
+_ic_right = _make_chevron("right")
+
+
+def _ic_refresh(surface, rect, color, width=3):
+    """Open circular arrow: an arc that leaves a gap at the top-right, with an
+    arrow head on the leading end."""
+    cx, cy = rect.center
+    r = min(rect.w, rect.h) * 0.30
+    a0, a1 = math.radians(-35), math.radians(-35 + 290)
+    steps = 16
+    pts = []
+    for i in range(steps + 1):
+        a = a0 + (a1 - a0) * i / steps
+        pts.append((cx + math.cos(a) * r, cy + math.sin(a) * r))
+    for p, q in zip(pts, pts[1:]):
+        uk.draw_line_on(surface, color, p, q, width)
+    ex, ey = pts[-1]
+    tang = a1 + math.pi / 2                       # travel direction at the end
+    hl = r * 0.62
+    for off in (math.radians(150), math.radians(-150)):
+        uk.draw_line_on(surface, color, (ex, ey),
+                        (ex + math.cos(tang + off) * hl, ey + math.sin(tang + off) * hl), width)
+
+
+_POLY_CACHE: dict = {}
+
+
+def _poly_icon(kind, size, color):
+    """Filled play / pause glyph, drawn supersampled once per (kind, size,
+    colour) and reused - same approach ui_kit takes for rounded shapes."""
+    color = tuple(color)
+    key = (kind, size, color)
+    surf = _POLY_CACHE.get(key)
+    if surf is not None:
+        return surf
+    ss = 6
+    hi = pygame.Surface((size * ss, size * ss), pygame.SRCALPHA)
+    c = (*color[:3], 255)
+    if kind == "play":
+        pts = [(size * 0.28, size * 0.16), (size * 0.28, size * 0.84), (size * 0.84, size * 0.5)]
+        pygame.draw.polygon(hi, c, [(x * ss, y * ss) for x, y in pts])
+    else:
+        for x0 in (0.24, 0.56):
+            pygame.draw.rect(hi, c, pygame.Rect(int(size * x0 * ss), int(size * 0.16 * ss),
+                                                int(size * 0.20 * ss), int(size * 0.68 * ss)),
+                             border_radius=int(size * 0.04 * ss))
+    surf = pygame.transform.smoothscale(hi, (size, size))
+    if len(_POLY_CACHE) > 200:
+        _POLY_CACHE.clear()
+    _POLY_CACHE[key] = surf
+    return surf
+
+
+def _make_poly_icon(kind):
+    def draw(surface, rect, color, width=3):
+        size = max(8, min(rect.w, rect.h))
+        surf = _poly_icon(kind, size, color)
+        uk.blit_surface(surface, surf, surf.get_rect(center=rect.center).topleft)
+    return draw
+
+
+_ic_play = _make_poly_icon("play")
+_ic_pause = _make_poly_icon("pause")
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  DecorationCreator overlay
+# ══════════════════════════════════════════════════════════════════════
+
 class DecorationCreator:
     """Non-blocking dev-menu overlay for decoration authoring."""
 
@@ -568,56 +717,21 @@ class DecorationCreator:
         self.active = False
         self.active_tab = TAB_PREVIEW
 
-        self.font = get_font(15)
-        self.font_sm = get_font(12)
-        self.font_hd = get_font(20, True)
+        pygame.font.init()
+        self._init_fonts()
 
-        self.list_rect = pygame.Rect(
-            PAD, HEADER_H + PAD, LIST_W,
-            self.screen_height - HEADER_H - FOOTER_H - PAD * 2,
-        )
-        self.editor_x = LIST_W + PAD * 2
-        self.editor_rect = pygame.Rect(
-            self.editor_x, HEADER_H + PAD + TAB_H,
-            self.screen_width - self.editor_x - PAD,
-            self.screen_height - HEADER_H - FOOTER_H - PAD * 2 - TAB_H,
-        )
-        self.preview_rect = pygame.Rect(
-            PAD, self.screen_height - FOOTER_H - 215 - PAD,
-            LIST_W, 205,
-        )
-
-        tab_w = max(1, self.editor_rect.w // len(TAB_NAMES))
-        self.tab_rects = [
-            pygame.Rect(self.editor_x + i * tab_w, HEADER_H + PAD,
-                        tab_w if i < len(TAB_NAMES) - 1 else self.editor_rect.right - (self.editor_x + i * tab_w),
-                        TAB_H)
-            for i in range(len(TAB_NAMES))
-        ]
-
-        self.btn_save = pygame.Rect(self.screen_width - 225,
-                                    self.screen_height - FOOTER_H + 10, 95, 32)
-        self.btn_refresh = pygame.Rect(self.screen_width - 120,
-                                       self.screen_height - FOOTER_H + 10, 105, 32)
-
-        self.roster = DecorationList(self.list_rect)
+        # ── model ──────────────────────────────────────────────────
         self.decorations: list[dict] = []
         self.selected_id: Optional[str] = None
         self.current_item: Optional[dict] = None
         self.style: dict = {}
         self.sheet: Optional[pygame.Surface] = None
         self.image_path: Optional[Path] = None
+        self._sheet_serial = 0
 
         # Config values being edited.
-        self.label_input = TextField(pygame.Rect(0, 0, 220, 30))
-        self.frame_w_input = TextField(pygame.Rect(0, 0, 72, 30))
-        self.frame_h_input = TextField(pygame.Rect(0, 0, 72, 30))
-        self.frame_count_input = TextField(pygame.Rect(0, 0, 72, 30))
-        self.rows_input = TextField(pygame.Rect(0, 0, 72, 30))
-        self.variant_names_input = TextField(pygame.Rect(0, 0, 300, 30))
-
-        self.fps_slider = Slider(pygame.Rect(0, 0, 240, 22), 0, 30, 6, 0.5)
-
+        self.label_text = ""
+        self.variant_names_text = ""
         self.frame_w = 1
         self.frame_h = 1
         self.frame_count = 1
@@ -636,45 +750,205 @@ class DecorationCreator:
         # sequence strip in the Animation tab, when it holds more steps
         # than fit on screen at once.
         self.sequence_scroll = 0
-        self._sequence_strip_rect = None
-        self._sequence_scroll_left_rect = None
-        self._sequence_scroll_right_rect = None
 
-        # Collision state — local to a sprite frame.
+        # Collision state - local to a sprite frame.
         self.collision_manual = False
         self.collision_rect: Optional[tuple[int, int, int, int]] = None
-        self.collision_rect_input = {
-            "x": TextField(pygame.Rect(0, 0, 58, 30)),
-            "y": TextField(pygame.Rect(0, 0, 58, 30)),
-            "w": TextField(pygame.Rect(0, 0, 58, 30)),
-            "h": TextField(pygame.Rect(0, 0, 58, 30)),
-        }
-        self.collision_drag = None  # {mode,start_mouse,start_rect}
         self.collision_auto_rect: Optional[tuple[int, int, int, int]] = None
+        self.collision_drag = None  # {mode, mouse, rect, scale, frame_rect}
 
         self.dirty = False
+
+        # ── status ─────────────────────────────────────────────────
         self.status_msg = ""
-        self.status_col = C_TEXT_DIM
+        self.status_ok = True
         self.status_timer = 0.0
 
         # Optional host callback, e.g. to refresh the Object Editor catalogue.
         self.on_catalog_changed = None
 
+        # ── frame / scaled-surface caches ──────────────────────────
+        self._frames_key = None
+        self._frames_cache: list[pygame.Surface] = []
+        self._scaled_cache: dict = {}
+
+        # ── per-frame UI plumbing (same shape as EntityCreator's) ───
+        self._mouse = (screen_width // 2, screen_height // 2)
+        self._hm = self._mouse
+        self._dt = 1 / 60
+        self._pulse = 0.0
+        self._updated = False
+        self._hits: list[dict] = []
+        self._vp: Optional[pygame.Rect] = None
+        self._drag: Optional[dict] = None
+        self._focus = None
+        self._repeat_on = False
+        self._hv: dict = {}
+        self._tscroll: dict = {}
+        self._text_rects: list[pygame.Rect] = []
+        self._text_rects_new: list[pygame.Rect] = []
+        self._tip: Optional[str] = None
+        self._scroll = 0.0
+        self._content_h = 0
+        self._content_avail = 0
+        self._roster_scroll = 0.0
+        self._close_requested = False
+        self._seq_strip_rect: Optional[pygame.Rect] = None
+        self._col_geom = None            # (frame_rect, scale) of the collision stage
+        self._cursor_hint: Optional[str] = None
+
+        self._layout()
         self._refresh_roster(keep_selection=False)
 
-    # ------------------------------------------------------------------
-    # Lifecycle
-    # ------------------------------------------------------------------
+    # ── setup ──────────────────────────────────────────────────────
+    @staticmethod
+    def _font_root() -> str:
+        anchored = BASE_DIR / "assets" / "ui" / "fonts"
+        return str(anchored) if anchored.exists() else os.path.join("assets", "ui", "fonts")
+
+    @staticmethod
+    def _icon_path(name: str) -> str:
+        path = os.path.join(str(BASE_DIR), "assets", "ui", "dev_menu", "icons", name)
+        if not os.path.exists(path):
+            path = os.path.join("assets", "ui", "dev_menu", "icons", name)
+        return path
+
+    def _init_fonts(self) -> None:
+        """Same bitmap family as DevMenu / the other creators: title text uses
+        the plain uppercase/lowercase glyph folders, everything else the
+        menu glyph set."""
+        root = self._font_root()
+        menu = uk.BitmapFont(root, letter_spacing=1)
+        title = uk.BitmapFont(root, letter_spacing=1)
+        title.uppercase_dir = os.path.join(root, "uppercase")
+        title.lowercase_dir = os.path.join(root, "lowercase")
+        self.f_title = _Font(title, 30)
+        self.f_lg = _Font(menu, 20)
+        self.f_md = _Font(menu, 16)
+        self.f_sm = _Font(menu, 12)
+
+        self._back_icon = self._load_png_icon(self._icon_path("back.png"), 34)
+        self._save_icon = self._load_png_icon(self._icon_path("save.png"), 26)
+
+    @staticmethod
+    def _load_png_icon(path: str, box: int) -> Optional[pygame.Surface]:
+        """Same crop + integer-blow-up + point-sample path DevMenu / the
+        other creators use for their header icons. Returns None when the
+        file is missing (caller falls back to a vector icon)."""
+        try:
+            raw = pygame.image.load(path).convert_alpha()
+        except (FileNotFoundError, pygame.error):
+            return None
+        rect = raw.get_bounding_rect(min_alpha=1)
+        if rect.w <= 0 or rect.h <= 0:
+            rect = raw.get_rect()
+        raw = raw.subsurface(rect).copy()
+        iw, ih = raw.get_size()
+        scale = min(box / max(1, iw), box / max(1, ih))
+        nw, nh = max(1, round(iw * scale)), max(1, round(ih * scale))
+        if scale >= 1.0:
+            pre = max(1, math.ceil(scale) * 2)
+            scaled = pygame.transform.scale(pygame.transform.scale(raw, (iw * pre, ih * pre)), (nw, nh))
+        else:
+            scaled = pygame.transform.scale(raw, (nw, nh))
+        canvas = pygame.Surface((box, box), pygame.SRCALPHA)
+        canvas.blit(scaled, ((box - nw) // 2, (box - nh) // 2))
+        return canvas
+
+    def _layout(self) -> None:
+        w, h = self.screen_width, self.screen_height
+        # Same proportions DevMenu / the other creators use for their bars.
+        self.header_h = max(86, round(h * 0.12))
+        self.footer_h = max(42, round(h * 0.065))
+        m = 32
+        top = self.header_h + 20
+        bottom = h - self.footer_h - 20
+        area_h = max(240, bottom - top)
+
+        sm, md = self.f_sm, self.f_md
+        self.m_field_h = max(40, md.line_h + 20)
+        self.m_slider_h = sm.cap_h + 8 + 16
+        self.m_btn_h = max(40, md.line_h + 16)
+        self.row_h = max(56, sm.cap_h + md.cap_h + 28)
+        self.row_gap = 6
+
+        back = max(40, round(self.header_h * 0.55))
+        self.back_rect = pygame.Rect(0, 0, back, back)
+        self.back_rect.left = m
+        self.back_rect.centery = self.header_h // 2
+        self.save_rect = pygame.Rect(0, 0, back, back)
+        self.save_rect.right = w - m
+        self.save_rect.centery = self.header_h // 2
+        self.refresh_rect = pygame.Rect(0, 0, back, back)
+        self.refresh_rect.right = self.save_rect.left - 12
+        self.refresh_rect.centery = self.header_h // 2
+
+        side_w = _clamp(round(w * 0.225), 250, 330)
+        prev_h = _clamp(round(area_h * 0.34), 170, 250)
+        self.list_rect = pygame.Rect(m, top, side_w, max(160, area_h - prev_h - 16))
+        self.prev_rect = pygame.Rect(m, self.list_rect.bottom + 16, side_w, prev_h)
+        self.roster_view = pygame.Rect(self.list_rect.x + 8, self.list_rect.y + 46,
+                                       side_w - 16, max(40, self.list_rect.h - 46 - 10))
+
+        main_x = m + side_w + 24
+        main_w = w - m - main_x
+        self.tab_h = 46
+        gap = 8
+        n = len(TAB_NAMES)
+        avail = main_w - gap * (n - 1)
+        widths = [avail // n] * n
+        widths[-1] += avail - sum(widths)
+        self.tab_rects = []
+        tx = main_x
+        for wd in widths:
+            self.tab_rects.append(pygame.Rect(tx, top, wd, self.tab_h))
+            tx += wd + gap
+        self.panel_rect = pygame.Rect(main_x, top + self.tab_h + 12, main_w, area_h - self.tab_h - 12)
+
+    def resize(self, width: int, height: int) -> None:
+        """Re-layout for a new draw-target size (e.g. native-resolution mode)."""
+        width, height = int(width), int(height)
+        if (width, height) != (self.screen_width, self.screen_height):
+            self.screen_width, self.screen_height = width, height
+            self._layout()
+
+    # ── lifecycle ──────────────────────────────────────────────────
     def toggle(self) -> None:
-        self.active = not self.active
         if self.active:
+            self._shutdown()
+        else:
+            self.active = True
+            self._mouse = tuple(pygame.mouse.get_pos())
+            self._drag = None
+            self._blur()
             self._refresh_roster(keep_selection=True)
 
-    def _set_status(self, msg: str, ok=True) -> None:
-        self.status_msg = msg
-        self.status_col = C_GREEN if ok else C_RED
-        self.status_timer = 2.5
+    def _shutdown(self) -> None:
+        self._blur()
+        self._drag = None
+        self.collision_drag = None
+        self.active = False
+        uk.set_text_cursor(False)
+        self._set_key_repeat(False)
 
+    def _close(self) -> str:
+        self._shutdown()
+        return "back_to_dev_menu"
+
+    def _set_key_repeat(self, on: bool) -> None:
+        if on and not self._repeat_on:
+            pygame.key.set_repeat(400, 50)
+            self._repeat_on = True
+        elif not on and self._repeat_on:
+            pygame.key.set_repeat(0, 0)
+            self._repeat_on = False
+
+    def _set_status(self, msg: str, ok: bool = True) -> None:
+        self.status_msg = msg
+        self.status_ok = ok
+        self.status_timer = 3.0
+
+    # ── roster ─────────────────────────────────────────────────────
     def _refresh_roster(self, keep_selection=True) -> None:
         previous = self.selected_id if keep_selection else None
         self.decorations = _root_items()
@@ -684,13 +958,34 @@ class DecorationCreator:
 
         ids = [item["id"] for item in self.decorations]
         selected = previous if previous in ids else (ids[0] if ids else None)
-        self.roster.set_items(self.decorations, selected or "")
 
         if selected:
             self._select(selected)
+            self._ensure_selected_visible()
         else:
             self.selected_id = None
             self.current_item = None
+            self.sheet = None
+            self._frames_key = None
+        self._roster_scroll = _clamp(self._roster_scroll, 0, self._roster_max_scroll())
+
+    def _roster_pitch(self) -> int:
+        return self.row_h + self.row_gap
+
+    def _roster_max_scroll(self) -> float:
+        return max(0, len(self.decorations) * self._roster_pitch() - self.roster_view.h)
+
+    def _ensure_selected_visible(self) -> None:
+        ids = [d["id"] for d in self.decorations]
+        if self.selected_id not in ids:
+            return
+        pitch = self._roster_pitch()
+        i = ids.index(self.selected_id)
+        top, bottom = i * pitch, i * pitch + self.row_h
+        if top < self._roster_scroll:
+            self._roster_scroll = top
+        elif bottom > self._roster_scroll + self.roster_view.h:
+            self._roster_scroll = bottom - self.roster_view.h
 
     def _make_thumbnail(self, item: dict):
         path = item.get("image")
@@ -701,17 +996,34 @@ class DecorationCreator:
             style = item.get("style", {})
             fw = clamp_int(style.get("frame_w", sheet.get_width()), 1, sheet.get_width(), sheet.get_width())
             fh = clamp_int(style.get("frame_h", sheet.get_height()), 1, sheet.get_height(), sheet.get_height())
-            row = 0
             frame = pygame.Surface((fw, fh), pygame.SRCALPHA)
-            frame.blit(sheet, (0, 0), pygame.Rect(0, row * fh, fw, fh))
-            return frame
+            frame.blit(sheet, (0, 0), pygame.Rect(0, 0, fw, fh))
+            return self._fit_thumb(frame, 40)
         except (pygame.error, OSError):
             return None
+
+    @staticmethod
+    def _fit_thumb(frame: pygame.Surface, box: int) -> pygame.Surface:
+        """Fit a frame into a (box, box) transparent canvas, centred, using
+        whole-number up-scaling so pixel art stays crisp."""
+        fw, fh = frame.get_size()
+        scale = _fit_scale(box, box, fw, fh, 8)
+        nw, nh = max(1, round(fw * scale)), max(1, round(fh * scale))
+        scaled = pygame.transform.scale(frame, (nw, nh))
+        canvas = pygame.Surface((box, box), pygame.SRCALPHA)
+        canvas.blit(scaled, ((box - nw) // 2, (box - nh) // 2))
+        return canvas
 
     def _select(self, deco_id: str) -> None:
         item = next((x for x in self.decorations if x["id"] == deco_id), None)
         if not item:
             return
+        changed = deco_id != self.selected_id
+        if changed:
+            self._blur()
+            self.selected_variant = 0
+            self.sequence_scroll = 0
+            self._scroll = 0.0
         self.selected_id = deco_id
         self.current_item = item
         self.style = copy.deepcopy(item.get("style", {}))
@@ -727,6 +1039,7 @@ class DecorationCreator:
                 self.sheet = pygame.image.load(str(self.image_path)).convert_alpha()
             except (pygame.error, OSError):
                 self.sheet = None
+        self._sheet_serial += 1
 
         if self.sheet is not None:
             sw, sh = self.sheet.get_size()
@@ -743,10 +1056,7 @@ class DecorationCreator:
 
         raw_seq = self.style.get("sequence", [1])
         if isinstance(raw_seq, list) and raw_seq:
-            self.sequence = [
-                clamp_int(v, 1, self.frame_count, 1)
-                for v in raw_seq
-            ]
+            self.sequence = [clamp_int(v, 1, self.frame_count, 1) for v in raw_seq]
         else:
             self.sequence = [1]
 
@@ -756,90 +1066,109 @@ class DecorationCreator:
         else:
             base = self.style.get("label", pretty_id(deco_id))
             self.variant_names = [base] + [f"{base} (Variant {i + 1})"
-                                            for i in range(1, self.grid_rows)]
+                                           for i in range(1, self.grid_rows)]
         while len(self.variant_names) < self.grid_rows:
             self.variant_names.append(f"Variant {len(self.variant_names) + 1}")
 
         self.selected_variant = min(self.selected_variant, self.grid_rows - 1)
-        self._sync_fields()
+        self.label_text = str(self.style.get("label", pretty_id(self.selected_id or "Decoration")))
+        self.variant_names_text = ", ".join(self.variant_names)
 
         saved_collision = rect_tuple(self.style.get("collision_rect"))
         self.collision_manual = saved_collision is not None
         self.collision_rect = saved_collision
+        self.collision_drag = None
         self._refresh_collision_defaults()
 
         self.preview_seq_index = 0
         self.anim_timer = 0.0
         self.dirty = False
 
-    def _sync_fields(self) -> None:
-        self.label_input.set_value(str(self.style.get("label", pretty_id(self.selected_id or "Decoration"))))
-        self.frame_w_input.set_value(str(self.frame_w))
-        self.frame_h_input.set_value(str(self.frame_h))
-        self.frame_count_input.set_value(str(self.frame_count))
-        self.rows_input.set_value(str(self.grid_rows))
-        self.variant_names_input.set_value(", ".join(self.variant_names))
-        self.fps_slider.value = self.fps
-        self._sync_collision_fields()
+    def _on_pick(self, deco_id: str) -> None:
+        if deco_id != self.selected_id:
+            self._select(deco_id)
 
-    def _sync_collision_fields(self) -> None:
-        r = self.collision_rect or self.collision_auto_rect or (0, 0, 8, 8)
-        for key, value in zip(("x", "y", "w", "h"), r):
-            self.collision_rect_input[key].set_value(str(int(value)))
+    def _refresh_clicked(self) -> None:
+        self._refresh_roster(keep_selection=True)
+        self._set_status("Decoration catalogue refreshed")
 
-    # ------------------------------------------------------------------
-    # Config / animation helpers
-    # ------------------------------------------------------------------
-    def _read_numeric_fields(self) -> None:
-        if not self.sheet:
+    def _set_tab(self, index: int) -> None:
+        if index == self.active_tab:
             return
-        sw, sh = self.sheet.get_size()
+        self._blur()
+        if index == TAB_ANIMATION:
+            self._apply_layout()
+        self.active_tab = index
+        self._scroll = 0.0
 
-        old = (self.frame_w, self.frame_h, self.frame_count, self.grid_rows)
-        self.frame_w = clamp_int(self.frame_w_input.value, 1, sw, self.frame_w)
-        self.frame_h = clamp_int(self.frame_h_input.value, 1, sh, self.frame_h)
-        self.frame_count = clamp_int(self.frame_count_input.value, 1,
-                                     max(1, sw // self.frame_w), self.frame_count)
-        self.grid_rows = clamp_int(self.rows_input.value, 1,
-                                   max(1, sh // self.frame_h), self.grid_rows)
-
-        changed_layout = old != (self.frame_w, self.frame_h, self.frame_count, self.grid_rows)
-        if changed_layout:
-            self.sequence = [clamp_int(n, 1, self.frame_count, 1) for n in self.sequence] or [1]
-            self.variant_names = self.variant_names[:self.grid_rows]
-            base = self.style.get("label", pretty_id(self.selected_id or "Decoration"))
-            while len(self.variant_names) < self.grid_rows:
-                self.variant_names.append(f"{base} (Variant {len(self.variant_names) + 1})")
-            self._refresh_collision_defaults()
-
-        self.fps = float(self.fps_slider.value)
-        self._set_style_dirty()
-
-    def _set_style_dirty(self) -> None:
+    # ── config / animation helpers ─────────────────────────────────
+    def _mark_dirty(self) -> None:
         # Built-ins keep their animation definition locked, but their collision
         # can still be edited and saved as a sidecar override.
         if self.current_item:
             self.dirty = True
 
+    def _editor_enabled(self) -> bool:
+        return bool(self.current_item and not self.current_item.get("hardcoded"))
+
     def _collision_enabled(self) -> bool:
         """Collision editing is available for every decoration, including Tree."""
         return self.current_item is not None
 
-    def _frames(self) -> list[pygame.Surface]:
-        if self.sheet is None:
-            return []
-        frames = []
+    def _apply_layout(self, **wanted) -> None:
+        """Clamp (and optionally change) frame_w / frame_h / frame_count /
+        grid_rows against the sheet, then fix up everything that depends on
+        them. Same clamping order as the original numeric-field reader."""
+        if not self.sheet:
+            return
         sw, sh = self.sheet.get_size()
-        # Current variant only. The runtime treats each row as a variant and
-        # each column as a frame.
-        row_y = self.selected_variant * self.frame_h
-        for col in range(self.frame_count):
-            x = col * self.frame_w
-            if x + self.frame_w > sw or row_y + self.frame_h > sh:
-                break
-            frames.append(self.sheet.subsurface(
-                pygame.Rect(x, row_y, self.frame_w, self.frame_h)
-            ).copy())
+
+        old = (self.frame_w, self.frame_h, self.frame_count, self.grid_rows)
+        self.frame_w = clamp_int(wanted.get("frame_w", self.frame_w), 1, sw, self.frame_w)
+        self.frame_h = clamp_int(wanted.get("frame_h", self.frame_h), 1, sh, self.frame_h)
+        self.frame_count = clamp_int(wanted.get("frame_count", self.frame_count), 1,
+                                     max(1, sw // self.frame_w), self.frame_count)
+        self.grid_rows = clamp_int(wanted.get("grid_rows", self.grid_rows), 1,
+                                   max(1, sh // self.frame_h), self.grid_rows)
+
+        if old != (self.frame_w, self.frame_h, self.frame_count, self.grid_rows):
+            self.sequence = [clamp_int(n, 1, self.frame_count, 1) for n in self.sequence] or [1]
+            self.preview_seq_index = min(self.preview_seq_index, len(self.sequence) - 1)
+            self.selected_variant = min(self.selected_variant, self.grid_rows - 1)
+            self._refresh_collision_defaults()
+            self._mark_dirty()
+
+    def _variant_labels(self) -> list[str]:
+        """Variant names as they will be saved: the comma-separated text,
+        trimmed / padded to one name per sheet row."""
+        raw = [x.strip() for x in self.variant_names_text.split(",")]
+        raw = [x for x in raw if x]
+        if not raw:
+            raw = [pretty_id(self.selected_id or "Decoration")]
+        return (raw[:self.grid_rows] +
+                [f"Variant {i + 1}" for i in range(len(raw), self.grid_rows)])[:self.grid_rows]
+
+    def _frames(self) -> list[pygame.Surface]:
+        """Frames of the current variant row (the runtime treats each row as
+        a variant and each column as a frame). Cached until the sheet, row or
+        grid changes."""
+        key = (self._sheet_serial, self.selected_variant, self.frame_w, self.frame_h, self.frame_count)
+        if key == self._frames_key:
+            return self._frames_cache
+        frames: list[pygame.Surface] = []
+        if self.sheet is not None:
+            sw, sh = self.sheet.get_size()
+            row_y = self.selected_variant * self.frame_h
+            for col in range(self.frame_count):
+                x = col * self.frame_w
+                if x + self.frame_w > sw or row_y + self.frame_h > sh:
+                    break
+                frames.append(self.sheet.subsurface(
+                    pygame.Rect(x, row_y, self.frame_w, self.frame_h)
+                ).copy())
+        self._frames_key = key
+        self._frames_cache = frames
+        self._scaled_cache = {}
         return frames
 
     def _current_frame(self) -> Optional[pygame.Surface]:
@@ -851,13 +1180,95 @@ class DecorationCreator:
         seq_n = self.sequence[self.preview_seq_index % len(self.sequence)]
         return frames[max(0, min(len(frames) - 1, seq_n - 1))]
 
+    def _scaled(self, surf: pygame.Surface, w: int, h: int) -> pygame.Surface:
+        """Nearest-neighbour scaled copy, cached (sprites are re-drawn every
+        frame; re-scaling them every frame would be wasted work)."""
+        if surf.get_size() == (w, h):
+            return surf
+        key = (id(surf), w, h)
+        out = self._scaled_cache.get(key)
+        if out is None:
+            if len(self._scaled_cache) > 96:
+                self._scaled_cache.clear()
+            out = pygame.transform.scale(surf, (w, h))
+            self._scaled_cache[key] = out
+        return out
+
+    def _toggle_play(self) -> None:
+        self.preview_running = not self.preview_running
+
+    def _set_variant(self, index: int) -> None:
+        index = _clamp(int(index), 0, max(0, self.grid_rows - 1))
+        if index != self.selected_variant:
+            self.selected_variant = index
+            self._refresh_collision_defaults()
+
+    # ── sequence editing ───────────────────────────────────────────
+    def _append_sequence_frame(self, frame_number: int) -> None:
+        if self.current_item and self.current_item.get("hardcoded"):
+            return
+        frame_number = max(1, min(self.frame_count, int(frame_number)))
+        self.sequence.append(frame_number)
+        self.preview_seq_index = max(0, len(self.sequence) - 1)
+        self._mark_dirty()
+
+    def _remove_sequence_step(self, index: int) -> None:
+        if not self._editor_enabled() or not (0 <= index < len(self.sequence)):
+            return
+        self.sequence.pop(index)
+        if not self.sequence:
+            self.sequence = [1]
+        self.preview_seq_index = min(self.preview_seq_index, len(self.sequence) - 1)
+        self._mark_dirty()
+
+    def _clear_sequence(self) -> None:
+        if self.current_item and self.current_item.get("hardcoded"):
+            return
+        self.sequence = [1]
+        self.preview_seq_index = 0
+        self._mark_dirty()
+
+    def _all_sequence(self) -> None:
+        if self.current_item and self.current_item.get("hardcoded"):
+            return
+        self.sequence = list(range(1, self.frame_count + 1)) or [1]
+        self.preview_seq_index = 0
+        self._mark_dirty()
+
+    def _ping_pong_sequence(self) -> None:
+        if self.current_item and self.current_item.get("hardcoded"):
+            return
+        n = max(1, self.frame_count)
+        if n == 1:
+            self.sequence = [1]
+        else:
+            self.sequence = list(range(1, n + 1)) + list(range(n - 1, 1, -1))
+        self.preview_seq_index = 0
+        self._mark_dirty()
+
+    def _reverse_sequence(self) -> None:
+        if not self._editor_enabled():
+            return
+        self.sequence.reverse()
+        self.preview_seq_index = 0
+        self._mark_dirty()
+
+    def _scroll_sequence(self, delta: int) -> None:
+        max_scroll = max(0, len(self.sequence) - 1)
+        self.sequence_scroll = max(0, min(max_scroll, self.sequence_scroll + delta))
+
+    # ── collision editing ──────────────────────────────────────────
     def _refresh_collision_defaults(self) -> None:
         frames = self._frames()
         frame = frames[0] if frames else None
         self.collision_auto_rect = _collision_from_style(self.style, frame)
         if not self.collision_manual:
             self.collision_rect = None
-        self._sync_collision_fields()
+
+    def _current_collision(self) -> Optional[tuple[int, int, int, int]]:
+        if self.collision_manual and self.collision_rect:
+            return self.collision_rect
+        return self.collision_auto_rect
 
     def _set_manual_collision(self, rect: tuple[int, int, int, int]) -> None:
         frame = self._current_frame()
@@ -871,8 +1282,7 @@ class DecorationCreator:
             rect = (x, y, w, h)
         self.collision_manual = True
         self.collision_rect = rect
-        self._sync_collision_fields()
-        self._set_style_dirty()
+        self._mark_dirty()
 
     def _use_auto_collision(self) -> None:
         if not self.current_item:
@@ -884,53 +1294,104 @@ class DecorationCreator:
         # Tree, that means its original hardcoded collision_size).
         self.style.pop("collision_rect", None)
         self._refresh_collision_defaults()
-        self._set_style_dirty()
+        self._mark_dirty()
 
-    def _append_sequence_frame(self, frame_number: int) -> None:
-        if self.current_item and self.current_item.get("hardcoded"):
-            return
-        frame_number = max(1, min(self.frame_count, int(frame_number)))
-        self.sequence.append(frame_number)
-        self.preview_seq_index = max(0, len(self.sequence) - 1)
-        self._set_style_dirty()
+    def _use_manual_collision(self) -> None:
+        current = self._current_collision()
+        if current:
+            self._set_manual_collision(tuple(current))
 
-    def _clear_sequence(self) -> None:
-        if self.current_item and self.current_item.get("hardcoded"):
-            return
-        self.sequence = [1]
-        self.preview_seq_index = 0
-        self._set_style_dirty()
+    def _set_collision_component(self, index: int, value) -> None:
+        """Stepper / typed-number edit of one of x, y, w, h."""
+        cur = list(self._current_collision() or (0, 0, 8, 8))
+        cur[index] = int(value)
+        if cur[2] > 0 and cur[3] > 0:
+            self._set_manual_collision(tuple(cur))
 
-    def _all_sequence(self) -> None:
-        if self.current_item and self.current_item.get("hardcoded"):
-            return
-        self.sequence = list(range(1, self.frame_count + 1)) or [1]
-        self.preview_seq_index = 0
-        self._set_style_dirty()
+    def _rect_to_screen(self, local, frame_rect: pygame.Rect, scale: float) -> pygame.Rect:
+        x, y, w, h = local
+        return pygame.Rect(
+            int(round(frame_rect.x + x * scale)),
+            int(round(frame_rect.y + y * scale)),
+            max(1, int(round(w * scale))),
+            max(1, int(round(h * scale))),
+        )
 
-    def _ping_pong_sequence(self) -> None:
-        if self.current_item and self.current_item.get("hardcoded"):
+    def _collision_down(self, pos) -> None:
+        if not self._collision_enabled() or self._col_geom is None:
             return
-        n = max(1, self.frame_count)
-        if n == 1:
-            self.sequence = [1]
+        frame_rect, scale = self._col_geom
+        current = self._current_collision()
+        if current is None:
+            return
+        screen_rect = self._rect_to_screen(current, frame_rect, scale)
+
+        handle = 16
+        corners = {
+            "tl": screen_rect.topleft, "tr": screen_rect.topright,
+            "bl": screen_rect.bottomleft, "br": screen_rect.bottomright,
+        }
+        mode = None
+        for name, (cx, cy) in corners.items():
+            if pygame.Rect(cx - handle // 2, cy - handle // 2, handle, handle).collidepoint(pos):
+                mode = name
+                break
+        if mode is None and screen_rect.collidepoint(pos):
+            mode = "move"
+        if mode is not None:
+            self.collision_drag = {
+                "mode": mode,
+                "mouse": tuple(pos),
+                "rect": tuple(current),
+                "scale": scale,
+                "frame_rect": frame_rect,
+            }
+            self._set_manual_collision(tuple(current))
+
+    def _collision_move(self, pos) -> None:
+        d = self.collision_drag
+        if not d or not self.collision_rect:
+            return
+        scale = d["scale"]
+        frame = self._current_frame()
+        fw, fh = frame.get_size() if frame else (1, 1)
+        dx = int(round((pos[0] - d["mouse"][0]) / max(scale, 1e-6)))
+        dy = int(round((pos[1] - d["mouse"][1]) / max(scale, 1e-6)))
+        x, y, w, h = d["rect"]
+        mode = d["mode"]
+
+        if mode == "move":
+            nx = max(0, min(fw - w, x + dx))
+            ny = max(0, min(fh - h, y + dy))
+            new = (nx, ny, w, h)
         else:
-            self.sequence = list(range(1, n + 1)) + list(range(n - 1, 1, -1))
-        self.preview_seq_index = 0
-        self._set_style_dirty()
+            left, top, right, bottom = x, y, x + w, y + h
+            if "l" in mode:
+                left = max(0, min(right - 1, x + dx))
+            if "r" in mode:
+                right = max(left + 1, min(fw, x + w + dx))
+            if "t" in mode:
+                top = max(0, min(bottom - 1, y + dy))
+            if "b" in mode:
+                bottom = max(top + 1, min(fh, y + h + dy))
+            new = (left, top, right - left, bottom - top)
 
-    # ------------------------------------------------------------------
-    # Save
-    # ------------------------------------------------------------------
+        self.collision_rect = tuple(map(int, new))
+        self._mark_dirty()
+
+    def _collision_up(self, pos) -> None:
+        self.collision_drag = None
+
+    # ── save ───────────────────────────────────────────────────────
     def save(self) -> bool:
         item = self.current_item
         if not item:
             self._set_status("No decoration selected", ok=False)
             return False
 
-        # Tree keeps its hand-authored spritesheet/animation completely
-        # protected. Collision is intentionally editable through a sidecar
-        # override so the visual collision workflow still works for Tree.
+        # Hardcoded decorations keep their hand-authored spritesheet/animation
+        # completely protected. Collision is intentionally editable through a
+        # sidecar override so the visual collision workflow still works.
         if item.get("hardcoded"):
             folder = item.get("folder")
             if not folder or not folder.is_dir():
@@ -944,7 +1405,7 @@ class DecorationCreator:
                     data.pop("collision_size", None)
                 else:
                     # Removing the override restores the original hardcoded
-                    # collision_size for Tree.
+                    # collision_size.
                     data.pop("collision_rect", None)
                     data.pop("collision_size", None)
 
@@ -966,7 +1427,7 @@ class DecorationCreator:
             current = self.selected_id
             self._refresh_roster(keep_selection=True)
             if current and current == self.selected_id:
-                self._set_status("Saved Tree collision")
+                self._set_status(f"Saved {item.get('label', current)} collision")
             if callable(self.on_catalog_changed):
                 try:
                     self.on_catalog_changed()
@@ -978,24 +1439,18 @@ class DecorationCreator:
             self._set_status("No decoration image found", ok=False)
             return False
 
-        self._read_numeric_fields()
-
-        raw_names = [x.strip() for x in self.variant_names_input.value.split(",")]
-        raw_names = [x for x in raw_names if x]
-        if not raw_names:
-            raw_names = [pretty_id(self.selected_id or "Decoration")]
-        self.variant_names = (raw_names[:self.grid_rows] +
-                              [f"Variant {i + 1}" for i in range(len(raw_names), self.grid_rows)])[:self.grid_rows]
+        self._apply_layout()
+        self.variant_names = self._variant_labels()
 
         self.style.update({
-            "label": self.label_input.value.strip() or pretty_id(self.selected_id or "Decoration"),
+            "label": self.label_text.strip() or pretty_id(self.selected_id or "Decoration"),
             "sheet_path": relative_asset_path(self.image_path),
             "frame_w": self.frame_w,
             "frame_h": self.frame_h,
             "grid_rows": self.grid_rows,
             "frame_count": self.frame_count,
             "sequence": [clamp_int(v, 1, self.frame_count, 1) for v in self.sequence] or [1],
-            "fps": round(float(self.fps_slider.value), 2),
+            "fps": round(float(self.fps), 2),
             "variants": self.variant_names,
         })
 
@@ -1040,7 +1495,7 @@ class DecorationCreator:
         # rebuild its Object Editor decoration palette immediately.
         current = self.selected_id
         self._refresh_roster(keep_selection=True)
-        if current and current == self.selected_id:
+        if current and current == self.selected_id and self.status_ok:
             self._set_status(f"Saved {manifest.name}")
         if callable(self.on_catalog_changed):
             try:
@@ -1049,777 +1504,1235 @@ class DecorationCreator:
                 pass
         return True
 
-    # ------------------------------------------------------------------
-    # Input helpers
-    # ------------------------------------------------------------------
-    def _editor_enabled(self) -> bool:
-        return bool(self.current_item and not self.current_item.get("hardcoded"))
+    # ── text focus ─────────────────────────────────────────────────
+    def _focus_text(self, key, get, set_, max_len=600, allowed=None):
+        edit = _TextEdit(get() or "", max_len=max_len, allowed=allowed)
+        self._focus = SimpleNamespace(key=key, edit=edit, set=set_)
+        self._set_key_repeat(True)
+        return edit
 
-    def _tab_changed(self, index: int) -> None:
-        if index == TAB_ANIMATION:
-            self._read_numeric_fields()
-        self.active_tab = index
+    def _blur(self) -> None:
+        self._focus = None
+        self._set_key_repeat(False)
 
-    def _animation_frame_hit(self, pos) -> Optional[int]:
-        """Hit-test the clickable frame boxes drawn in the animation tab."""
-        rect = self._animation_source_rect()
-        if not rect or not self.sheet:
-            return None
-
-        # Fit the complete sheet in rect while keeping integer-ish nearest
-        # scaling. The source image itself is never modified.
-        sw, sh = self.sheet.get_size()
-        scale = min(rect.w / max(1, sw), rect.h / max(1, sh))
-        draw_w = max(1, int(sw * scale))
-        draw_h = max(1, int(sh * scale))
-        ox = rect.x + (rect.w - draw_w) // 2
-        oy = rect.y + (rect.h - draw_h) // 2
-        px, py = pos
-        if not (ox <= px < ox + draw_w and oy <= py < oy + draw_h):
-            return None
-        sx = int((px - ox) / max(scale, 1e-6))
-        sy = int((py - oy) / max(scale, 1e-6))
-        col = sx // self.frame_w
-        row = sy // self.frame_h
-        if not (0 <= row < self.grid_rows and 0 <= col < self.frame_count):
-            return None
-        # Current runtime sequence numbering is frame number within the row.
-        return col + 1
-
-    # ------------------------------------------------------------------
-    # Collision drag logic
-    # ------------------------------------------------------------------
-    def _collision_canvas(self) -> tuple[Optional[pygame.Rect], float, Optional[pygame.Surface]]:
-        canvas = self._collision_source_rect()
-        frame = self._current_frame()
-        if canvas is None or frame is None:
-            return None, 1.0, frame
-        fw, fh = frame.get_size()
-        scale = min(canvas.w / max(1, fw), canvas.h / max(1, fh))
-        draw_w = max(1, int(fw * scale))
-        draw_h = max(1, int(fh * scale))
-        rect = pygame.Rect(canvas.x + (canvas.w - draw_w) // 2,
-                           canvas.y + (canvas.h - draw_h) // 2,
-                           draw_w, draw_h)
-        return rect, scale, frame
-
-    def _collision_rect_screen(self) -> Optional[pygame.Rect]:
-        frame_rect, scale, frame = self._collision_canvas()
-        if frame_rect is None or frame is None:
-            return None
-        local = self.collision_rect if self.collision_manual and self.collision_rect else self.collision_auto_rect
-        if local is None:
-            return None
-        x, y, w, h = local
-        return pygame.Rect(
-            int(frame_rect.x + x * scale),
-            int(frame_rect.y + y * scale),
-            max(1, int(w * scale)),
-            max(1, int(h * scale)),
-        )
-
-    def _begin_collision_drag(self, pos) -> None:
-        if not self._collision_enabled():
-            return
-        frame_rect, scale, frame = self._collision_canvas()
-        if frame_rect is None or frame is None:
-            return
-
-        current = self.collision_rect if self.collision_manual and self.collision_rect else self.collision_auto_rect
-        if current is None:
-            return
-
-        screen_rect = self._collision_rect_screen()
-        if screen_rect is None:
-            return
-
-        handle = 8
-        handles = {
-            "tl": pygame.Rect(screen_rect.left - handle // 2, screen_rect.top - handle // 2, handle, handle),
-            "tr": pygame.Rect(screen_rect.right - handle // 2, screen_rect.top - handle // 2, handle, handle),
-            "bl": pygame.Rect(screen_rect.left - handle // 2, screen_rect.bottom - handle // 2, handle, handle),
-            "br": pygame.Rect(screen_rect.right - handle // 2, screen_rect.bottom - handle // 2, handle, handle),
-        }
-        mode = next((name for name, rr in handles.items() if rr.collidepoint(pos)), None)
-        if mode is None and screen_rect.collidepoint(pos):
-            mode = "move"
-        if mode is not None:
-            self.collision_drag = {
-                "mode": mode,
-                "mouse": pos,
-                "rect": tuple(current),
-                "scale": scale,
-                "frame_rect": frame_rect,
-            }
-            self._set_manual_collision(tuple(current))
-
-    def _update_collision_drag(self, pos) -> None:
-        d = self.collision_drag
-        if not d or not self.collision_rect:
-            return
-        frame_rect = d["frame_rect"]
-        scale = d["scale"]
-        fw, fh = self._current_frame().get_size() if self._current_frame() else (1, 1)
-        dx = int(round((pos[0] - d["mouse"][0]) / max(scale, 1e-6)))
-        dy = int(round((pos[1] - d["mouse"][1]) / max(scale, 1e-6)))
-        x, y, w, h = d["rect"]
-        mode = d["mode"]
-
-        if mode == "move":
-            nx = max(0, min(fw - w, x + dx))
-            ny = max(0, min(fh - h, y + dy))
-            new = (nx, ny, w, h)
-        else:
-            left, top, right, bottom = x, y, x + w, y + h
-            if "l" in mode:
-                left = max(0, min(right - 1, x + dx))
-            if "r" in mode:
-                right = max(left + 1, min(fw, x + w + dx))
-            if "t" in mode:
-                top = max(0, min(bottom - 1, y + dy))
-            if "b" in mode:
-                bottom = max(top + 1, min(fh, y + h + dy))
-            new = (left, top, right - left, bottom - top)
-
-        self.collision_rect = tuple(map(int, new))
-        self._sync_collision_fields()
-        self._set_style_dirty()
-
-    # ------------------------------------------------------------------
-    # Input
-    # ------------------------------------------------------------------
+    # ── input ──────────────────────────────────────────────────────
     def handle_input(self, event: pygame.event.Event):
+        """Returns 'back_to_dev_menu' when the overlay was just closed (via
+        the header Back button or ESC), else None."""
         if not self.active:
             return None
+        et = event.type
+        if et in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP) and hasattr(event, "pos"):
+            self._mouse = tuple(event.pos)
 
-        enabled = self._editor_enabled()
-
-        # Text fields consume keyboard input first.
-        fields = [
-            self.label_input,
-            self.frame_w_input,
-            self.frame_h_input,
-            self.frame_count_input,
-            self.rows_input,
-            self.variant_names_input,
-            *self.collision_rect_input.values(),
-        ]
-        for field in fields:
-            if field.active:
-                changed = field.handle_event(event)
-                if changed:
-                    self.dirty = bool(self.current_item)
-                    if field in self.collision_rect_input.values():
-                        self._apply_collision_field_values()
-                    elif field in (self.frame_w_input, self.frame_h_input,
-                                   self.frame_count_input, self.rows_input):
-                        self._read_numeric_fields()
+        if et == pygame.KEYDOWN:
+            mods = getattr(event, "mod", 0) | pygame.key.get_mods()
+            if (mods & (pygame.KMOD_CTRL | pygame.KMOD_META)) and event.key == pygame.K_s:
+                self.save()
                 return None
-
-        if event.type == pygame.KEYDOWN:
+            if self._focus is not None:
+                res = self._focus.edit.key(event)
+                if res == "changed":
+                    self._focus.set(self._focus.edit.value)
+                elif res in ("commit", "cancel"):
+                    self._blur()
+                return None
             if event.key == pygame.K_ESCAPE:
-                if self.dirty:
-                    self._set_status("Unsaved changes discarded", ok=False)
-                self.active = False
-                return "close"
+                return self._close()
             if event.key == pygame.K_SPACE and self.active_tab == TAB_PREVIEW:
-                self.preview_running = not self.preview_running
-                return None
-            if event.key == pygame.K_s and (event.mod & pygame.KMOD_CTRL):
-                self.save()
-                return None
-
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            mx, my = event.pos
-
-            # Header tabs.
-            for i, rr in enumerate(self.tab_rects):
-                if rr.collidepoint(mx, my):
-                    self._tab_changed(i)
-                    return None
-
-            # Footer.
-            if self.btn_save.collidepoint(mx, my):
-                self.save()
-                return None
-            if self.btn_refresh.collidepoint(mx, my):
-                self._refresh_roster(keep_selection=True)
-                self._set_status("Decoration catalogue refreshed")
-                return None
-
-            # Left roster.
-            new_sel = self.roster.handle_event(event)
-            if new_sel:
-                self._select(new_sel)
-                return None
-
-        # Preview tab widgets.
-        if self.active_tab == TAB_PREVIEW:
-            if self._handle_preview_input(event):
-                return None
-
-        # Animation tab widgets.
-        if self.active_tab == TAB_ANIMATION:
-            if self._handle_animation_input(event, enabled):
-                return None
-
-        # Collision tab widgets.
-        if self.active_tab == TAB_COLLISION:
-            if self._handle_collision_input(event, enabled):
-                return None
-
-        # Global field / slider input on visible controls.
-        if self.active_tab == TAB_ANIMATION:
-            changed = False
-            for field in (self.label_input, self.frame_w_input, self.frame_h_input,
-                          self.frame_count_input, self.rows_input, self.variant_names_input):
-                changed |= field.handle_event(event)
-            changed |= self.fps_slider.handle_event(event, enabled)
-            if changed:
-                self._read_numeric_fields()
-        elif self.active_tab == TAB_COLLISION and self._collision_enabled():
-            changed = False
-            for field in self.collision_rect_input.values():
-                changed |= field.handle_event(event)
-            if changed:
-                self._apply_collision_field_values()
-
+                self._toggle_play()
+        elif et == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            self._mouse_down(event.pos)
+            if self._close_requested:
+                self._close_requested = False
+                return self._close()
+        elif et == pygame.MOUSEMOTION:
+            if self._drag is not None and self._drag.get("drag"):
+                self._drag["drag"](event.pos)
+        elif et == pygame.MOUSEBUTTONUP and event.button == 1:
+            d, self._drag = self._drag, None
+            if d is not None and d.get("up"):
+                d["up"](event.pos)
+        elif et == pygame.MOUSEWHEEL:
+            self._wheel(event.y)
         return None
 
-    def _apply_collision_field_values(self) -> None:
-        """Read x/y/w/h from the collision text fields and commit them."""
-        try:
-            r = tuple(int(self.collision_rect_input[k].value) for k in ("x", "y", "w", "h"))
-        except ValueError:
+    def _hit_at(self, pos):
+        for hit in reversed(self._hits):
+            if hit["rect"].collidepoint(pos):
+                return hit
+        return None
+
+    def _mouse_down(self, pos) -> None:
+        hit = self._hit_at(pos)
+        if self._focus is not None and (hit is None or hit["key"] != self._focus.key):
+            self._blur()
+        if hit is None:
             return
-        if r[2] > 0 and r[3] > 0:
-            self._set_manual_collision(r)
+        if hit["down"]:
+            hit["down"](pos)
+        if hit["drag"] or hit["up"]:
+            self._drag = hit
 
-    def _handle_preview_input(self, event) -> bool:
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            rect = getattr(self, "_preview_play_rect", None)
-            if rect is not None and rect.collidepoint(event.pos):
-                self.preview_running = not self.preview_running
-                return True
-        return False
+    def _max_scroll(self) -> float:
+        return max(0, self._content_h - self.panel_rect.h)
 
-    def _handle_animation_input(self, event, enabled) -> bool:
-        if event.type == pygame.MOUSEWHEEL:
-            strip = self._sequence_strip_rect
-            if strip is not None and strip.collidepoint(pygame.mouse.get_pos()):
-                self._scroll_sequence(-event.y)
-                return True
-            return False
+    def _wheel(self, dy: int) -> None:
+        pos = self._mouse
+        if self.roster_view.collidepoint(pos):
+            self._roster_scroll = _clamp(self._roster_scroll - dy * self._roster_pitch(),
+                                         0, self._roster_max_scroll())
+            return
+        strip = self._seq_strip_rect
+        if (strip is not None and self.active_tab == TAB_ANIMATION
+                and strip.collidepoint(pos) and self.panel_rect.collidepoint(pos)):
+            self._scroll_sequence(-dy)
+            return
+        if self.panel_rect.collidepoint(pos):
+            self._scroll = _clamp(self._scroll - dy * 64, 0, self._max_scroll())
 
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            mx, my = event.pos
-            if not self._editor_rect_contains(mx, my):
-                return False
-
-            # Sequence-strip scroll arrows.
-            if self._sequence_scroll_left_rect and self._sequence_scroll_left_rect.collidepoint(mx, my):
-                self._scroll_sequence(-1)
-                return True
-            if self._sequence_scroll_right_rect and self._sequence_scroll_right_rect.collidepoint(mx, my):
-                self._scroll_sequence(1)
-                return True
-
-            # Clickable frame boxes.
-            hit = self._animation_frame_hit((mx, my))
-            if hit is not None and enabled:
-                self._append_sequence_frame(hit)
-                return True
-
-            # Sequence buttons.
-            for rr, seq_idx in self._sequence_rects:
-                if rr.collidepoint(mx, my):
-                    if enabled and 0 <= seq_idx < len(self.sequence):
-                        self.sequence.pop(seq_idx)
-                        if not self.sequence:
-                            self.sequence = [1]
-                        self.preview_seq_index = min(self.preview_seq_index, len(self.sequence) - 1)
-                        self._set_style_dirty()
-                    return True
-
-            for name, rr in self._animation_button_rects.items():
-                if rr.collidepoint(mx, my):
-                    if name == "clear":
-                        self._clear_sequence()
-                    elif name == "all":
-                        self._all_sequence()
-                    elif name == "ping":
-                        self._ping_pong_sequence()
-                    elif name == "reverse" and enabled:
-                        self.sequence.reverse()
-                        self.preview_seq_index = 0
-                        self._set_style_dirty()
-                    elif name == "play":
-                        self.preview_running = not self.preview_running
-                    return True
-        return False
-
-    def _scroll_sequence(self, delta: int) -> None:
-        max_scroll = max(0, len(self.sequence) - 1)
-        self.sequence_scroll = max(0, min(max_scroll, self.sequence_scroll + delta))
-
-    def _handle_collision_input(self, event, enabled) -> bool:
-        enabled = self._collision_enabled()
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            mx, my = event.pos
-            if self._collision_auto_button.collidepoint(mx, my):
-                self._use_auto_collision()
-                return True
-            if self._collision_manual_button.collidepoint(mx, my):
-                current = self.collision_rect or self.collision_auto_rect
-                if current:
-                    self._set_manual_collision(tuple(current))
-                return True
-            if enabled and self._collision_canvas_rect.collidepoint(mx, my):
-                self._begin_collision_drag((mx, my))
-                return True
-
-        if event.type == pygame.MOUSEMOTION and self.collision_drag:
-            self._update_collision_drag(event.pos)
-            return True
-
-        if event.type == pygame.MOUSEBUTTONUP and event.button == 1 and self.collision_drag:
-            self.collision_drag = None
-            return True
-        return False
-
-    # ------------------------------------------------------------------
-    # Update
-    # ------------------------------------------------------------------
-    def update(self, dt: float) -> None:
+    # ── update ─────────────────────────────────────────────────────
+    def update(self, dt: float, mouse_pos=None) -> None:
         if not self.active:
+            uk.set_text_cursor(False)
+            uk.set_hand_cursor(False)
             return
-        self.status_timer = max(0.0, self.status_timer - float(dt))
+        if mouse_pos is not None:
+            self._mouse = tuple(mouse_pos)
+        raw_dt = float(dt)
+        dt = min(dt, 1 / 20)
+        self._dt = max(dt, 1 / 240)
+        self._updated = True
+        self._pulse += dt
+        if self.status_timer > 0:
+            self.status_timer -= dt
+        if self._focus is not None:
+            self._focus.edit.blink += dt
 
         if self.preview_running and self.sequence and self.fps > 0:
-            self.anim_timer += float(dt)
+            self.anim_timer += raw_dt
             step = 1.0 / max(0.01, self.fps)
             while self.anim_timer >= step:
                 self.anim_timer -= step
                 self.preview_seq_index = (self.preview_seq_index + 1) % len(self.sequence)
 
-    # ------------------------------------------------------------------
-    # Geometry used by draw + hit testing.
-    # ------------------------------------------------------------------
-    def _editor_rect_contains(self, x, y) -> bool:
-        return self.editor_rect.collidepoint(x, y)
+        self._update_cursor()
 
-    def _animation_source_rect(self) -> pygame.Rect:
-        return pygame.Rect(self.editor_rect.x + 16,
-                           self.editor_rect.y + 105,
-                           max(1, int(self.editor_rect.w * 0.57)),
-                           max(1, self.editor_rect.h - 265))
+    def _update_cursor(self) -> None:
+        """One OS cursor per frame: I-beam over text, move / resize over the
+        collision box, hand over anything else clickable, arrow otherwise
+        (ui_kit's last-call-wins helpers)."""
+        if any(r.collidepoint(self._mouse) for r in self._text_rects):
+            uk.set_text_cursor(True)
+            uk.set_hand_cursor(False)
+            return
+        uk.set_text_cursor(False)
+        d = self.collision_drag
+        kind = ("move" if d["mode"] == "move" else "resize") if d else self._cursor_hint
+        if kind == "move":
+            uk.set_move_cursor(True)
+            uk.set_hand_cursor(False)
+            return
+        if kind == "resize":
+            uk.set_resize_cursor(True)
+            uk.set_hand_cursor(False)
+            return
+        # Anything else registered as a hit this frame is a real button/tab/
+        # row/scrollbar etc — except "c:canvas", the whole-stage hit behind
+        # the collision box, which only responds under the handles/box
+        # already covered above; hovering the rest of that stage doesn't
+        # actually do anything, so it stays out of the hand-cursor check.
+        hovering_widget = any(
+            hit["rect"].collidepoint(self._mouse)
+            for hit in self._hits
+            if hit.get("key") != "c:canvas"
+        )
+        uk.set_hand_cursor(hovering_widget)
 
-    def _collision_source_rect(self) -> pygame.Rect:
-        return pygame.Rect(self.editor_rect.x + 16,
-                           self.editor_rect.y + 20,
-                           max(1, int(self.editor_rect.w * 0.62)),
-                           max(1, self.editor_rect.h - 42))
+    # ══════════════════════════════════════════════════════════════
+    #  Drawing: plumbing
+    # ══════════════════════════════════════════════════════════════
 
-    # ------------------------------------------------------------------
-    # Draw
-    # ------------------------------------------------------------------
-    def draw(self, screen: pygame.Surface, dt: float = 0.0) -> None:
+    def draw(self, screen, dt: float = 0.0) -> None:
+        """`screen` may be the engine's GPUScreen or a plain pygame.Surface.
+        `dt` is only used if the host never calls update() this frame."""
         if not self.active:
             return
+        if not self._updated and dt > 0:
+            self.update(dt)
+        self._updated = False
 
-        sw, sh = self.screen_width, self.screen_height
-        mouse = pygame.mouse.get_pos()
-        enabled = self._editor_enabled()
-        save_enabled = self.current_item is not None
+        self._hits = []
+        self._text_rects_new = []
+        self._tip = None
+        self._vp = None
+        self._seq_strip_rect = None
+        self._col_geom = None
+        self._cursor_hint = None
+        self._hm = self._mouse
 
-        screen.fill(C_BG)
+        w, h = self.screen_width, self.screen_height
+        uk.draw_rect_on(screen, _BG, pygame.Rect(0, 0, w, h), 0, 0)
+        uk.draw_rect_on(screen, _BAND, pygame.Rect(0, self.header_h, w, h - self.header_h - self.footer_h), 0, 0)
 
-        # Header.
-        header = pygame.Rect(0, 0, sw, HEADER_H)
-        screen.draw_rect(C_PANEL, header)
-        screen.draw_line(C_BORDER, (0, HEADER_H - 1), (sw, HEADER_H - 1))
-        text(screen, "DECORATION CREATOR", (16, 12), C_TEXT, 20, True)
-        hint = "ESC to close  •  Ctrl+S to save"
-        text(screen, hint, (sw - get_font(12).size(hint)[0] - 16, 14), C_TEXT_DIM, 12)
+        self._draw_sidebar(screen)
+        self._draw_tabs(screen)
+        self._draw_content(screen)
+        self._draw_header(screen)
+        self._draw_footer(screen)
 
-        # Footer.
-        footer = pygame.Rect(0, sh - FOOTER_H, sw, FOOTER_H)
-        screen.draw_rect(C_PANEL, footer)
-        screen.draw_line(C_BORDER, (0, sh - FOOTER_H), (sw, sh - FOOTER_H))
-        if self.status_timer > 0:
-            text(screen, self.status_msg, (LIST_W + PAD * 2, sh - FOOTER_H + 17),
-                 self.status_col, 12)
+        self._text_rects = self._text_rects_new
 
-        button(screen, self.btn_save, "Save  ✓",
-               hover=self.btn_save.collidepoint(*mouse),
-               disabled=not save_enabled)
-        button(screen, self.btn_refresh, "Refresh",
-               hover=self.btn_refresh.collidepoint(*mouse))
+    # -- hover / hit plumbing -----------------------------------------
+    def _anim(self, key, on: bool) -> float:
+        v = self._hv.get(key, 0.0)
+        target = 1.0 if on else 0.0
+        v += (target - v) * min(1.0, self._dt * 14.0)
+        if abs(target - v) < 0.01:
+            v = target
+        self._hv[key] = v
+        return round(v * 20) / 20
 
-        if self.dirty:
-            dot = "● unsaved"
-            text(screen, dot, (self.btn_save.x - 75, self.btn_save.y + 9), C_ACCENT2, 11)
+    def _hov(self, rect) -> bool:
+        if not pygame.Rect(rect).collidepoint(self._hm):
+            return False
+        return self._vp is None or self._vp.collidepoint(self._hm)
 
-        # Left list + mini preview.
-        self.roster.draw(screen, mouse)
-        self._draw_sidebar_preview(screen)
+    def _add_hit(self, rect, key=None, down=None, drag=None, up=None, tip=None):
+        r = pygame.Rect(rect)
+        if self._vp is not None:
+            r = r.clip(self._vp)
+        if r.w <= 0 or r.h <= 0:
+            return None
+        hit = {"rect": r, "key": key, "down": down, "drag": drag, "up": up, "tip": tip}
+        self._hits.append(hit)
+        if tip and r.collidepoint(self._hm):
+            self._tip = tip
+        return hit
 
-        # Main panel and tabs.
-        editor_outer = self.editor_rect.inflate(0, TAB_H)
-        panel(screen, editor_outer, C_PANEL)
-        for i, (name, rr) in enumerate(zip(TAB_NAMES, self.tab_rects)):
-            active = i == self.active_tab
-            bg = C_SELECTED if active else C_PANEL_DARK
-            border = C_ACCENT if active else C_BORDER
-            screen.draw_rect(bg, rr, border_radius=6 if i in (0, len(TAB_NAMES) - 1) else 0)
-            screen.draw_rect(border, rr, 1,
-                             border_radius=6 if i in (0, len(TAB_NAMES) - 1) else 0)
-            img = get_font(13, active).render(name, True, C_TEXT if active else C_TEXT_DIM)
-            screen.blit(img, img.get_rect(center=rr.center))
+    # -- clipping -----------------------------------------------------
+    @staticmethod
+    def _push_clip(screen, rect):
+        old = screen.get_clip()
+        r = pygame.Rect(rect)
+        if old is not None:
+            try:
+                r = r.clip(pygame.Rect(old))
+            except Exception:
+                pass
+        screen.set_clip(r)
+        return old
 
-        if self.active_tab == TAB_PREVIEW:
-            self._draw_preview_tab(screen, enabled)
-        elif self.active_tab == TAB_ANIMATION:
-            self._draw_animation_tab(screen, enabled)
-        elif self.active_tab == TAB_COLLISION:
-            self._draw_collision_tab(screen, self._collision_enabled())
+    @staticmethod
+    def _pop_clip(screen, old) -> None:
+        screen.set_clip(old)
 
-        if self.current_item and self.current_item.get("hardcoded"):
-            lock = pygame.Rect(self.editor_rect.right - 220,
-                               self.editor_rect.y + 50, 200, 30)
-            screen.draw_rect((38, 30, 18), lock, border_radius=5)
-            screen.draw_rect(C_ACCENT2, lock, 1, border_radius=5)
-            label = "BUILT-IN • ANIMATION PROTECTED"
-            img = get_font(11, True).render(label, True, C_ACCENT2)
-            screen.blit(img, img.get_rect(center=lock.center))
+    def _blit_clip(self, screen, surf, pos, transient=True) -> None:
+        """Blit a sprite, cropping the source to the scroll viewport
+        ourselves - transient blits don't reliably honour the clip rect (see
+        _put), and a sprite stage that straddles the viewport edge would
+        otherwise bleed onto the tab row."""
+        x, y = int(pos[0]), int(pos[1])
+        tw, th = surf.get_size()
+        if self._vp is not None:
+            row = pygame.Rect(x, y, tw, th)
+            vis = row.clip(self._vp)
+            if vis.w <= 0 or vis.h <= 0:
+                return
+            if vis != row:
+                area = pygame.Rect(vis.x - x, vis.y - y, vis.w, vis.h)
+                uk.blit_surface(screen, surf, vis.topleft, area=area, transient=transient)
+                return
+        uk.blit_surface(screen, surf, (x, y), transient=transient)
 
-    # ------------------------------------------------------------------
-    # Draw: sidebar preview
-    # ------------------------------------------------------------------
-    def _draw_sidebar_preview(self, screen: pygame.Surface) -> None:
-        panel(screen, self.preview_rect)
-        text(screen, "LIVE PREVIEW", (self.preview_rect.x + 12, self.preview_rect.y + 10),
-             C_TEXT_DIM, 12, True)
+    def _put(self, screen, font, text, color, x, base_y, anchor="l", dyn=False) -> int:
+        if not text:
+            return 0
+        surf, desc = font.render(text, color)
+        tw, th = surf.get_size()
+        if anchor == "c":
+            x -= tw // 2
+        elif anchor == "r":
+            x -= tw
+        x = int(x)
+        y = int(base_y - (th - desc))
+        # Text draws through the "transient" (uncached) blit path, which on
+        # some render backends doesn't honour the active clip rect the way
+        # panel/slider backgrounds do - crop the source surface ourselves to
+        # whatever part of the row actually falls inside the viewport.
+        if self._vp is not None:
+            row = pygame.Rect(x, y, tw, th)
+            visible = row.clip(self._vp)
+            if visible.w <= 0 or visible.h <= 0:
+                return tw
+            if visible != row:
+                area = pygame.Rect(visible.x - x, visible.y - y, visible.w, visible.h)
+                uk.blit_surface(screen, surf, visible.topleft, area=area, transient=dyn)
+                return tw
+        uk.blit_surface(screen, surf, (x, y), transient=dyn)
+        return tw
 
-        frame = self._current_frame()
-        if frame is None:
-            text(screen, "No image", (self.preview_rect.centerx - 30, self.preview_rect.centery),
-                 C_TEXT_DIM, 12)
-            return
+    def _text_top(self, screen, font, text, color, x, y, anchor="l", dyn=False) -> int:
+        return self._put(screen, font, text, color, x, y + font.cap_h, anchor, dyn)
 
-        box = self.preview_rect.inflate(-20, -45)
-        fw, fh = frame.get_size()
-        scale = min(box.w / max(1, fw), box.h / max(1, fh))
-        scale = max(1.0, min(scale, 5.0))
-        dw = max(1, int(fw * scale))
-        dh = max(1, int(fh * scale))
-        img = pygame.transform.scale(frame, (dw, dh))
-        screen.blit(img, img.get_rect(center=(box.centerx, box.centery + 8)))
-        screen.draw_line(C_ACCENT2,
-                         (box.centerx - 8, box.bottom - 2),
-                         (box.centerx + 8, box.bottom - 2), 1)
+    def _text_mid(self, screen, font, text, color, x, cy, anchor="l", dyn=False, max_w=None) -> int:
+        if max_w is not None:
+            text = font.fit(text, max_w)
+        return self._put(screen, font, text, color, x, cy + (font.cap_h + 1) // 2, anchor, dyn)
 
-    # ------------------------------------------------------------------
-    # Draw: preview tab
-    # ------------------------------------------------------------------
-    def _draw_preview_tab(self, screen: pygame.Surface, enabled: bool) -> None:
-        if not self.current_item:
-            text(screen, "No decorations found under assets/objects/decorations/.",
-                 (self.editor_rect.x + 20, self.editor_rect.y + 60), C_TEXT_DIM, 14)
-            return
+    # -- primitives ---------------------------------------------------
+    @staticmethod
+    def _panel(screen, rect, bg, border, bw=1, radius=10) -> None:
+        if len(bg) == 3:
+            bg = (*bg, 255)
+        uk.draw_panel(screen, rect, bg=bg, border=border, border_width=bw, radius=radius, shadow=False)
 
-        text(screen, self.label_input.value or pretty_id(self.selected_id or "Decoration"),
-             (self.editor_rect.x + 20, self.editor_rect.y + 18), C_TEXT, 18, True)
-        text(screen, self.selected_id or "", (self.editor_rect.x + 20, self.editor_rect.y + 44),
-             C_TEXT_DIM, 12)
+    def _stage(self, screen, rect) -> None:
+        """Inset canvas well used for every sprite / sheet view."""
+        uk.draw_rect_on(screen, _INSET, rect, 0, 10)
+        uk.draw_rect_on(screen, _T.CARD_BORDER, rect, 1, 10)
 
-        canvas = pygame.Rect(self.editor_rect.x + 16, self.editor_rect.y + 75,
-                             self.editor_rect.w - 32, self.editor_rect.h - 135)
-        panel(screen, canvas, C_CANVAS, C_BORDER, 6)
-
-        frame = self._current_frame()
-        if frame is None:
-            text(screen, "No image / sprite sheet", (canvas.centerx - 60, canvas.centery), C_TEXT_DIM, 13)
+    def _icon_btn(self, screen, key, rect, icon, on_click, danger=False, enabled=True, tip=None) -> None:
+        accent = _T.DANGER_BRIGHT if danger else _T.GOLD
+        hov = enabled and self._hov(rect)
+        t = self._anim(key, hov)
+        if enabled:
+            self._panel(screen, rect, uk.lerp_color(_CARD, _CARD_HI, t),
+                        uk.lerp_color(_T.CARD_BORDER, accent, 0.78 * t))
+            fg = uk.lerp_color(_T.TEXT_SECONDARY, accent, t)
         else:
-            fw, fh = frame.get_size()
-            scale = min((canvas.w - 40) / max(1, fw), (canvas.h - 40) / max(1, fh))
-            scale = max(1.0, min(scale, 8.0))
-            dw, dh = max(1, int(fw * scale)), max(1, int(fh * scale))
-            img = pygame.transform.scale(frame, (dw, dh))
-            rr = img.get_rect(center=canvas.center)
-            screen.blit(img, rr)
+            self._panel(screen, rect, _CARD, _T.CARD_BORDER)
+            fg = _T.TEXT_DIM
+        icon(screen, pygame.Rect(0, 0, 28, 28).move(rect.centerx - 14, rect.centery - 14), fg, 3)
+        if enabled and on_click:
+            self._add_hit(rect, key=key, down=lambda p, cb=on_click: cb(), tip=tip)
 
-            # Anchor marker / ground line.
-            screen.draw_line(C_ACCENT2,
-                             (rr.left, rr.bottom), (rr.right, rr.bottom), 1)
-            screen.draw_line(C_ACCENT2,
-                             (rr.centerx - 6, rr.bottom), (rr.centerx + 6, rr.bottom), 2)
-            screen.draw_line(C_ACCENT2,
-                             (rr.centerx, rr.bottom - 6), (rr.centerx, rr.bottom), 2)
+    def _icon_save_png(self, screen, rect, color, width=3) -> None:
+        if self._save_icon is not None:
+            uk.blit_surface(screen, self._save_icon, self._save_icon.get_rect(center=rect.center))
+        else:
+            _ic_check(screen, rect, color, width)
 
-        # Playback controls.
-        play_rect = pygame.Rect(self.editor_rect.x + 20, self.editor_rect.bottom - 48, 105, 30)
-        self._preview_play_rect = play_rect
-        button(screen, play_rect, "Pause" if self.preview_running else "Play",
-               hover=play_rect.collidepoint(*pygame.mouse.get_pos()))
-        text(screen, f"Sequence: {len(self.sequence)} steps",
-             (play_rect.right + 15, play_rect.y + 7), C_TEXT_DIM, 12)
-        text(screen, f"FPS: {self.fps:g}",
-             (play_rect.right + 120, play_rect.y + 7), C_TEXT_DIM, 12)
+    def _pill(self, screen, key, rect, label, accent, icon=None, danger=False, enabled=True,
+              on_click=None, tip=None) -> None:
+        if danger:
+            accent = _T.DANGER_BRIGHT
+        hov = enabled and self._hov(rect)
+        t = self._anim(key, hov)
+        if enabled:
+            self._panel(screen, rect, uk.lerp_color(_CARD, _CARD_HI, t),
+                        uk.lerp_color(_T.CARD_BORDER, accent, 0.5 + 0.5 * t))
+            fg = uk.lerp_color(_T.TEXT_SECONDARY, accent, 0.55 + 0.45 * t)
+            if t > 0:
+                uk.draw_soft_glow(screen, rect.center, int(rect.w * 0.55), accent, max_alpha=int(26 * t))
+        else:
+            self._panel(screen, rect, _CARD, _T.CARD_BORDER)
+            fg = _T.TEXT_DIM
+        font = self.f_md
+        ic = 20 if icon else 0
+        gap = 10 if icon and label else 0
+        if icon and label and font.width(label) + 24 + ic + gap > rect.w:
+            icon, ic, gap = None, 0, 0    # too narrow for icon + label: the label matters more
+        text = font.fit(label, rect.w - 24 - ic - gap) if label else ""
+        tw = font.width(text)
+        x = rect.centerx - (ic + gap + tw) // 2
+        if icon:
+            icon(screen, pygame.Rect(x, rect.centery - ic // 2, ic, ic), fg, 3)
+        if text:
+            self._text_mid(screen, font, text, fg, x + ic + gap, rect.centery)
+        if enabled and on_click:
+            self._add_hit(rect, key=key, down=lambda p, cb=on_click: cb(), tip=tip)
 
-    # ------------------------------------------------------------------
-    # Draw: animation tab
-    # ------------------------------------------------------------------
-    def _draw_animation_tab(self, screen: pygame.Surface, enabled: bool) -> None:
-        if not self.current_item:
-            return
+    def _field_label(self, screen, text, x, y) -> int:
+        self._text_top(screen, self.f_sm, text.upper(), _T.TEXT_MUTED, x, y)
+        return self.f_sm.cap_h + 8
 
-        text(screen, "Spritesheet & Animation", (self.editor_rect.x + 16, self.editor_rect.y + 14),
-             C_TEXT, 18, True)
-        text(screen, "Click frames below in the order they should play.",
-             (self.editor_rect.x + 16, self.editor_rect.y + 41), C_TEXT_DIM, 12)
+    def _caption(self, screen, text, x, y, w, right=None) -> int:
+        sm = self.f_sm
+        label = text.upper()
+        self._text_top(screen, sm, label, _T.TEXT_MUTED, x, y)
+        x0 = x + sm.width(label) + 14
+        x1 = x + w
+        if right:
+            rw = self._text_top(screen, sm, right, _T.TEXT_DIM, x + w, y, "r", dyn=True)
+            x1 -= rw + 14
+        if x1 > x0:
+            uk.draw_line_on(screen, _HAIR, (x0, y + sm.cap_h // 2), (x1, y + sm.cap_h // 2), 1)
+        return sm.cap_h + 18
 
-        # Source sheet canvas.
-        source = self._animation_source_rect()
-        self._draw_source_sheet(screen, source, enabled)
+    def _note(self, screen, x, y, w, text, color=None, font=None) -> int:
+        font = font or self.f_sm
+        color = color or _T.TEXT_DIM
+        lh = font.line_h + 4
+        lines = font.wrap(text, w)
+        for i, line in enumerate(lines):
+            self._text_top(screen, font, line, color, x, y + i * lh)
+        return len(lines) * lh
 
-        # Control column.
-        x = source.right + 18
-        y = self.editor_rect.y + 82
-        w = self.editor_rect.right - x - 16
-        text(screen, "CONFIGURATION", (x, y - 25), C_TEXT_DIM, 11, True)
+    def _stat(self, screen, x, cy, label, value) -> int:
+        """'LABEL  value' readout on one baseline; returns the width used."""
+        sm = self.f_sm
+        a = self._text_mid(screen, sm, label, _T.TEXT_MUTED, x, cy)
+        b = self._text_mid(screen, sm, value, _T.TEXT_SECONDARY, x + a + 10, cy, dyn=True)
+        return a + 10 + b
 
-        label_y = y
-        text(screen, "Display name", (x, label_y), C_TEXT_DIM, 11)
-        self.label_input.rect = pygame.Rect(x, label_y + 16, w, 30)
-        self.label_input.draw(screen, enabled)
-        y = self.label_input.rect.bottom + 12
+    # -- sliders / steppers / segmented -------------------------------
+    def _slider(self, screen, key, x, y, w, label, value, vmin, vmax, step, fmt, setter, enabled=True) -> int:
+        sm = self.f_sm
+        self._text_top(screen, sm, label.upper(), _T.TEXT_MUTED, x, y)
+        self._text_top(screen, sm, fmt.format(value), _T.TEXT_SECONDARY if enabled else _T.TEXT_DIM,
+                       x + w, y, "r", dyn=True)
+        cy = y + sm.cap_h + 16
+        track = pygame.Rect(x, cy - 3, w, 6)
+        dragging = enabled and self._drag is not None and self._drag.get("key") == key
+        hover_zone = pygame.Rect(x - 8, cy - 12, w + 16, 24)
+        t = self._anim(key, enabled and (self._hov(hover_zone) or dragging))
+        frac = _clamp((value - vmin) / (vmax - vmin), 0.0, 1.0) if vmax > vmin else 0.0
+        uk.draw_rect_on(screen, _TRACK, track, 0, 3)
+        fill = pygame.Rect(x, cy - 3, max(0, int(w * frac)), 6)
+        accent = _T.GOLD if enabled else _T.CHIP_BORDER
+        if fill.w > 0:
+            uk.draw_rect_on(screen, uk.lerp_color(accent, _T.GOLD_BRIGHT, t) if enabled else accent, fill, 0, 3)
+        tx = x + int(w * frac)
+        if t > 0:
+            uk.draw_soft_glow(screen, (tx, cy), 20, _T.GOLD, max_alpha=int(38 * t))
+        uk.draw_circle_on(screen, uk.lerp_color(_T.TEXT_SECONDARY, _T.TEXT_PRIMARY, t) if enabled else _T.TEXT_DIM,
+                          (tx, cy), 8)
+        uk.draw_circle_on(screen, uk.lerp_color(_T.CARD_BORDER, _T.GOLD, t) if enabled else _T.CARD_BORDER,
+                          (tx, cy), 8, 2)
 
-        # 2x2 numeric layout.
-        specs = [
-            ("Frame W", self.frame_w_input),
-            ("Frame H", self.frame_h_input),
-            ("Frame count", self.frame_count_input),
-            ("Variant rows", self.rows_input),
-        ]
-        for idx, (lbl, field) in enumerate(specs):
-            col = idx % 2
-            row = idx // 2
-            fx = x + col * (w // 2 + 6)
-            fy = y + row * 58
-            text(screen, lbl, (fx, fy), C_TEXT_DIM, 11)
-            field.rect = pygame.Rect(fx, fy + 16, max(60, w // 2 - 8), 30)
-            field.draw(screen, enabled)
-        y += 116
+        if enabled:
+            def apply(pos, x=x, w=w):
+                f = _clamp((pos[0] - x) / max(1, w), 0.0, 1.0)
+                raw = vmin + f * (vmax - vmin)
+                if step:
+                    raw = round(raw / step) * step
+                setter(_clamp(raw, vmin, vmax))
 
-        text(screen, "Variant names", (x, y), C_TEXT_DIM, 11)
-        self.variant_names_input.rect = pygame.Rect(x, y + 16, w, 30)
-        self.variant_names_input.draw(screen, enabled)
-        y = self.variant_names_input.rect.bottom + 18
+            self._add_hit(hover_zone, key=key, down=apply, drag=apply)
+        return self.m_slider_h
 
-        text(screen, "Animation speed", (x, y), C_TEXT_DIM, 11)
-        self.fps_slider.rect = pygame.Rect(x, y + 18, max(120, w - 55), 22)
-        self.fps_slider.draw(screen, enabled)
-        text(screen, f"{self.fps_slider.value:g} fps",
-             (self.fps_slider.rect.right + 8, self.fps_slider.rect.y + 2), C_TEXT, 12)
+    def _stepper(self, screen, key, x, y, w, label, get, set_, vmin, vmax, enabled=True) -> int:
+        """[ - ] [ typed number ] [ + ]   (Shift = step by 10)."""
+        y0 = y
+        y += self._field_label(screen, label, x, y)
+        fh = self.m_field_h
+        minus = pygame.Rect(x, y, fh, fh)
+        plus = pygame.Rect(x + w - fh, y, fh, fh)
+        field = pygame.Rect(minus.right + 6, y, max(20, w - 2 * fh - 12), fh)
 
-        # Sequence strip under source — scrollable when it holds more steps
-        # than fit in the available width, instead of truncating with a
-        # "+ N more" label (which used to collide with the action buttons).
-        seq_y = source.bottom + 16
-        text(screen, "PLAYBACK SEQUENCE", (source.x, seq_y), C_TEXT_DIM, 11, True)
-        seq_y += 19
-        self._sequence_rects = []
-        cell_w = 34
-        cell_h = 30
-        arrow_w = 20
-        strip_rect = pygame.Rect(source.x, seq_y, source.w, cell_h)
+        def bump(sign):
+            step = 10 if (pygame.key.get_mods() & pygame.KMOD_SHIFT) else 1
+            set_(_clamp(get() + sign * step, vmin, vmax))
 
-        max_cells = max(1, (strip_rect.w - 2 * (arrow_w + 4)) // (cell_w + 4))
-        overflow = len(self.sequence) > max_cells
-        self.sequence_scroll = max(0, min(self.sequence_scroll,
-                                          max(0, len(self.sequence) - max_cells)))
+        v = get()
+        self._icon_btn(screen, (key, "-"), minus, _ic_minus, lambda: bump(-1),
+                       enabled=enabled and v > vmin, tip=f"Decrease {label.lower()}  (Shift = 10)")
+        self._icon_btn(screen, (key, "+"), plus, _ic_plus, lambda: bump(1),
+                       enabled=enabled and v < vmax, tip=f"Increase {label.lower()}  (Shift = 10)")
 
-        inner_x = strip_rect.x
-        inner_w = strip_rect.w
-        if overflow:
-            inner_x += arrow_w + 4
-            inner_w -= 2 * (arrow_w + 4)
+        def typed(text):
+            # Typed values are only capped at the top; each setter applies its
+            # own lower-bound rule exactly as the original numeric fields did
+            # (layout fields clamp up to 1, a collision W/H of 0 is ignored).
+            s = text.strip()
+            if s.isdigit():
+                set_(min(int(s), vmax))
 
-        self._sequence_strip_rect = strip_rect
-        self._sequence_scroll_left_rect = None
-        self._sequence_scroll_right_rect = None
+        self._text_field(screen, key, field, lambda: str(get()), typed, "0", max_len=5,
+                         allowed=_digit_ok, enabled=enabled)
+        return fh + (y - y0)
 
-        if overflow:
-            left_rect = pygame.Rect(strip_rect.x, seq_y, arrow_w, cell_h)
-            right_rect = pygame.Rect(strip_rect.right - arrow_w, seq_y, arrow_w, cell_h)
-            self._sequence_scroll_left_rect = left_rect
-            self._sequence_scroll_right_rect = right_rect
-            button(screen, left_rect, "<", hover=left_rect.collidepoint(*pygame.mouse.get_pos()),
-                   disabled=(self.sequence_scroll <= 0), small=True)
-            button(screen, right_rect, ">", hover=right_rect.collidepoint(*pygame.mouse.get_pos()),
-                   disabled=(self.sequence_scroll >= len(self.sequence) - max_cells), small=True)
+    def _stepper_grid(self, screen, x, y, w, specs, enabled=True) -> int:
+        gap = 16
+        cols = 2 if w >= 300 else 1
+        cw = (w - gap * (cols - 1)) // cols
+        pitch = self.f_sm.cap_h + 8 + self.m_field_h + 8
+        for i, sp in enumerate(specs):
+            r, c = divmod(i, cols)
+            self._stepper(screen, sp["key"], x + c * (cw + gap), y + r * pitch, cw, sp["label"],
+                          sp["get"], sp["set"], sp["vmin"], sp["vmax"], enabled)
+        return ((len(specs) + cols - 1) // cols) * pitch
 
-        prev_clip = screen.get_clip()
-        screen.set_clip(pygame.Rect(inner_x, seq_y, inner_w, cell_h))
-        visible = self.sequence[self.sequence_scroll:self.sequence_scroll + max_cells]
-        for i, frame_no in enumerate(visible):
-            seq_idx = self.sequence_scroll + i
-            rr = pygame.Rect(inner_x + i * (cell_w + 4), seq_y, cell_w, cell_h)
-            active = seq_idx == self.preview_seq_index
-            screen.draw_rect(C_SELECTED if active else C_PANEL_DARK, rr, border_radius=4)
-            screen.draw_rect(C_ACCENT if active else C_BORDER, rr, 1, border_radius=4)
-            img = get_font(12, True).render(str(frame_no), True, C_TEXT)
-            screen.blit(img, img.get_rect(center=rr.center))
-            self._sequence_rects.append((rr, seq_idx))
-        screen.set_clip(prev_clip)
+    def _segmented(self, screen, key, x, y, w, options, current, on_select, enabled=True) -> int:
+        fh = self.m_field_h
+        rect = pygame.Rect(x, y, w, fh)
+        self._panel(screen, rect, _FIELD, _T.CARD_BORDER)
+        seg_w = w // len(options)
+        for i, (val, label) in enumerate(options):
+            r = pygame.Rect(x + i * seg_w, y, seg_w if i < len(options) - 1 else w - seg_w * i, fh)
+            inner = r.inflate(-8, -8)
+            active = val == current
+            t = self._anim((key, val), enabled and self._hov(r) and not active)
+            if active:
+                self._panel(screen, inner, (48, 39, 19) if enabled else _CARD_HI,
+                            _T.GOLD if enabled else _T.CHIP_BORDER, 1, 8)
+            elif t > 0:
+                uk.draw_rect_on(screen, uk.lerp_color(_FIELD, _CARD_HI, t), inner, 0, 8)
+            if not enabled:
+                fg = _T.TEXT_DIM
+            else:
+                fg = _T.GOLD_BRIGHT if active else uk.lerp_color(_T.TEXT_MUTED, _T.TEXT_PRIMARY, t)
+            self._text_mid(screen, self.f_md, label, fg, r.centerx, r.centery, "c", max_w=r.w - 12)
+            if enabled:
+                self._add_hit(r, key=(key, val), down=lambda p, v=val: on_select(v))
+        return fh
 
-        if overflow:
-            text(screen, f"{self.sequence_scroll + 1}-{self.sequence_scroll + len(visible)} of {len(self.sequence)}",
-                 (strip_rect.x, seq_y + cell_h + 4), C_TEXT_DIM, 10)
-
-        # Action buttons — own row, so they never compete with the strip
-        # above for width.
-        button_row_y = seq_y + cell_h + (18 if overflow else 4)
-        self._animation_button_rects = {}
-        bx = source.x
-        for name, label in (("all", "Use all"), ("ping", "Ping-pong"),
-                            ("reverse", "Reverse"), ("clear", "Clear"),
-                            ("play", "Play/Pause")):
-            rr = pygame.Rect(bx, button_row_y, 58 if name != "ping" else 74, 30)
-            self._animation_button_rects[name] = rr
-            button(screen, rr, label, hover=rr.collidepoint(*pygame.mouse.get_pos()),
-                   disabled=(not enabled and name != "play"), small=True)
-            bx += rr.w + 4
-
+    # -- text fields --------------------------------------------------
+    def _text_field(self, screen, key, rect, get, set_, placeholder="", max_len=600, allowed=None,
+                    enabled=True, tip=None) -> None:
+        md = self.f_md
+        pad = 14
         if not enabled:
-            text(screen, "Built-in animation is protected. Collision can still be edited.",
-                 (source.x, self.editor_rect.bottom - 18), C_ACCENT2, 10, True)
-
-    def _draw_source_sheet(self, screen: pygame.Surface, rect: pygame.Rect, enabled: bool) -> None:
-        panel(screen, rect, C_CANVAS, C_BORDER)
-        if self.sheet is None:
-            text(screen, "No sprite sheet loaded.", (rect.x + 15, rect.y + 15), C_TEXT_DIM, 13)
+            self._panel(screen, rect, _INSET, _T.CARD_BORDER)
+            self._text_mid(screen, md, get() or "", _T.TEXT_DIM, rect.x + pad, rect.centery,
+                           dyn=True, max_w=rect.w - 2 * pad)
             return
 
-        sw, sh = self.sheet.get_size()
-        scale = min(rect.w / max(1, sw), rect.h / max(1, sh))
-        scale = max(0.05, min(scale, 8.0))
-        dw, dh = max(1, int(sw * scale)), max(1, int(sh * scale))
-        img = pygame.transform.scale(self.sheet, (dw, dh))
-        ox = rect.x + (rect.w - dw) // 2
-        oy = rect.y + (rect.h - dh) // 2
-        screen.blit(img, (ox, oy))
+        focus = self._focus if (self._focus is not None and self._focus.key == key) else None
+        edit = focus.edit if focus else None
+        hov = self._hov(rect)
+        t = self._anim(key, hov and not focus)
+        bg = uk.lerp_color(_FIELD, _FIELD_HI, t if not focus else 1.0)
+        if focus:
+            self._panel(screen, rect, bg, _T.GOLD, 2)
+        else:
+            self._panel(screen, rect, bg, uk.lerp_color(_T.CARD_BORDER, _T.GOLD, 0.6 * t))
+        value = edit.value if edit else (get() or "")
+        blink_on = edit is not None and int(edit.blink * 2) % 2 == 0
+        fg = _T.TEXT_PRIMARY if (focus or hov) else _T.TEXT_SECONDARY
+        self._text_rects_new.append(rect.clip(self._vp) if self._vp is not None else pygame.Rect(rect))
 
-        # Grid + frame numbers.
+        inner = pygame.Rect(rect.x + pad, rect.y + 2, rect.w - 2 * pad, rect.h - 4)
+        cy = rect.centery
+        scroll = self._tscroll.get(key, 0)
+        if edit:
+            cw = md.width(value[:edit.cursor])
+            if md.width(value) <= inner.w - 2:
+                scroll = 0
+            else:
+                if cw - scroll > inner.w - 2:
+                    scroll = cw - inner.w + 2
+                if cw < scroll:
+                    scroll = cw
+                scroll = max(0, scroll)
+            self._tscroll[key] = scroll
+        old = self._push_clip(screen, inner)
+        if not value and not focus:
+            self._text_mid(screen, md, placeholder, _T.TEXT_DIM, inner.x, cy)
+        elif focus:
+            if edit.has_sel():
+                s, e = edit.sel_range()
+                sx = inner.x - scroll + md.width(value[:s])
+                ex = inner.x - scroll + md.width(value[:e])
+                uk.draw_rect_on(screen, (*_T.GOLD, 70),
+                                pygame.Rect(sx, cy - md.cap_h // 2 - 4, ex - sx, md.line_h + 8), 0, 3)
+            self._text_mid(screen, md, value, fg, inner.x - scroll, cy, dyn=True)
+            if blink_on:
+                cx = inner.x - scroll + md.width(value[:edit.cursor])
+                uk.draw_rect_on(screen, _T.GOLD_BRIGHT,
+                                pygame.Rect(cx, cy - md.cap_h // 2 - 4, 2, md.line_h + 8), 0, 0)
+        else:
+            self._text_mid(screen, md, md.fit(value, inner.w), fg, inner.x, cy, dyn=True)
+        self._pop_clip(screen, old)
+
+        def idx_at(pos, rect=rect, key=key, value=value):
+            sc = self._tscroll.get(key, 0)
+            cur = self._focus.edit.value if self._focus and self._focus.key == key else value
+            return _index_at_x(md, cur, pos[0] - (rect.x + pad) + sc)
+
+        def click(pos):
+            shift = bool(pygame.key.get_mods() & pygame.KMOD_SHIFT)
+            if self._focus is None or self._focus.key != key:
+                self._focus_text(key, get, set_, max_len, allowed)
+                shift = False
+            ed = self._focus.edit
+            idx = idx_at(pos)
+            if shift and ed.anchor is None:
+                ed.anchor = ed.cursor
+            elif not shift:
+                ed.anchor = idx
+            ed.cursor = idx
+            ed.blink = 0.0
+
+        def drag(pos):
+            if self._focus is not None and self._focus.key == key:
+                self._focus.edit.cursor = idx_at(pos)
+                self._focus.edit.blink = 0.0
+
+        self._add_hit(rect, key=key, down=click, drag=drag, tip=tip)
+
+    # ══════════════════════════════════════════════════════════════
+    #  Drawing: header / footer
+    # ══════════════════════════════════════════════════════════════
+
+    def _draw_header(self, screen) -> None:
+        w, hh = self.screen_width, self.header_h
+        uk.draw_rect_on(screen, _BAR, pygame.Rect(0, 0, w, hh), 0, 0)
+        uk.draw_line_on(screen, _HAIR, (0, hh - 1), (w, hh - 1), 1)
+
+        r = self.back_rect
+        t = self._anim("back", self._hov(r))
+        self._panel(screen, r, uk.lerp_color(_CARD, _CARD_HI, t), uk.lerp_color(_T.CARD_BORDER, _T.GOLD, 0.78 * t))
+        if t > 0:
+            uk.draw_soft_glow(screen, r.center, int(r.w * 0.8), _T.GOLD, max_alpha=int(28 * t))
+        if self._back_icon is not None:
+            uk.blit_surface(screen, self._back_icon, self._back_icon.get_rect(center=r.center))
+        else:
+            _ic_left(screen, r, uk.lerp_color(_T.TEXT_SECONDARY, _T.GOLD, t), 3)
+        self._add_hit(r, key="back", down=lambda p: setattr(self, "_close_requested", True),
+                      tip="Back to the Dev Menu")
+
+        self._text_mid(screen, self.f_title, "DECORATION CREATOR", _T.TEXT_PRIMARY, w // 2, hh // 2, "c")
+
+        has = self.current_item is not None
+        self._icon_btn(screen, "refresh", self.refresh_rect, _ic_refresh, self._refresh_clicked,
+                       tip="Rescan assets/objects/decorations/")
+        self._icon_btn(screen, "save", self.save_rect, self._icon_save_png, self.save,
+                       enabled=has, tip="Save this decoration  (Ctrl+S)")
+
+        if self.dirty and has:
+            label = "UNSAVED"
+            tw = self.f_sm.width(label)
+            chip = pygame.Rect(0, 0, tw + 42, 32)
+            chip.right = self.refresh_rect.left - 14
+            chip.centery = self.save_rect.centery
+            self._panel(screen, chip, (36, 30, 16), (110, 88, 40), 1, 16)
+            pulse = 0.5 + 0.5 * math.sin(self._pulse * 4.0)
+            dot = (chip.x + 17, chip.centery)
+            uk.draw_soft_glow(screen, dot, 12, _T.GOLD, max_alpha=int(30 + 50 * pulse))
+            uk.draw_circle_on(screen, _T.GOLD, dot, 4)
+            self._text_mid(screen, self.f_sm, label, _T.GOLD_BRIGHT, chip.x + 30, chip.centery)
+
+    def _draw_footer(self, screen) -> None:
+        w, h = self.screen_width, self.screen_height
+        fy = h - self.footer_h
+        uk.draw_rect_on(screen, _BAR, pygame.Rect(0, fy, w, self.footer_h), 0, 0)
+        uk.draw_line_on(screen, _HAIR, (0, fy), (w, fy), 1)
+        cy = fy + self.footer_h // 2
+        x = 32
+        if self.status_timer > 0 and self.status_msg:
+            col = _T.KI_BLUE if self.status_ok else _T.DANGER_BRIGHT
+            uk.draw_circle_on(screen, col, (x + 4, cy), 4)
+            self._text_mid(screen, self.f_sm, self.status_msg, col, x + 18, cy, dyn=True, max_w=w // 2)
+        elif self._tip:
+            self._text_mid(screen, self.f_sm, self._tip, _T.TEXT_MUTED, x, cy, dyn=True, max_w=w // 2)
+
+    # ══════════════════════════════════════════════════════════════
+    #  Drawing: sidebar (roster + live preview)
+    # ══════════════════════════════════════════════════════════════
+
+    def _draw_sidebar(self, screen) -> None:
+        lr = self.list_rect
+        self._panel(screen, lr, _T.PANEL_BG, _T.PANEL_BORDER, 1, 12)
+        self._text_top(screen, self.f_sm, "DECORATIONS", _T.TEXT_MUTED, lr.x + 18, lr.y + 18)
+        self._text_top(screen, self.f_sm, str(len(self.decorations)), _T.TEXT_DIM, lr.right - 18, lr.y + 18,
+                       "r", dyn=True)
+
+        rv = self.roster_view
+        pitch = self._roster_pitch()
+        total = len(self.decorations) * pitch
+        self._roster_scroll = _clamp(self._roster_scroll, 0, max(0, total - rv.h))
+        old_vp = self._vp
+        self._vp = rv
+        old = self._push_clip(screen, rv)
+        if not self.decorations:
+            self._note(screen, rv.x + 8, rv.y + 14, rv.w - 16,
+                       "No decorations found in assets/objects/decorations/")
+        for i, item in enumerate(self.decorations):
+            ry = rv.y + i * pitch - int(self._roster_scroll)
+            row = pygame.Rect(rv.x, ry, rv.w - (8 if total > rv.h else 0), self.row_h)
+            if row.bottom < rv.y or row.y > rv.bottom:
+                continue
+            deco_id = item["id"]
+            sel = deco_id == self.selected_id
+            t = self._anim(("deco", deco_id), self._hov(row) and not sel)
+            base = _SEL if sel else uk.lerp_color(_CARD, _CARD_HI, t)
+            border = _T.GOLD if sel else uk.lerp_color(_T.CARD_BORDER, _T.GOLD, 0.78 * t)
+            self._panel(screen, row, base, border, 1, 9)
+
+            box = pygame.Rect(row.x + 8, row.centery - 20, 40, 40)
+            uk.draw_rect_on(screen, _INSET, box, 0, 8)
+            thumb = item.get("thumb")
+            if thumb is not None:
+                self._blit_clip(screen, thumb, box.topleft)
+            else:
+                self._text_mid(screen, self.f_sm, "?", _T.TEXT_DIM, box.centerx, box.centery, "c")
+            uk.draw_rect_on(screen, uk.lerp_color(_T.CARD_BORDER, _T.GOLD, 0.5) if sel else _T.CARD_BORDER,
+                            box, 1, 8)
+
+            md, sm = self.f_md, self.f_sm
+            tx = box.right + 12
+            max_w = row.right - tx - 10
+            block = md.cap_h + 6 + sm.cap_h
+            ty = row.centery - block // 2
+            fg = _T.TEXT_PRIMARY if sel else uk.lerp_color(_T.TEXT_SECONDARY, _T.TEXT_PRIMARY, t)
+            label = str(item.get("label", deco_id))
+            self._text_top(screen, md, md.fit(label, max_w), fg, tx, ty)
+            if item.get("hardcoded"):
+                self._text_top(screen, sm, "BUILT-IN", _T.GOLD, tx, ty + md.cap_h + 6)
+            else:
+                self._text_top(screen, sm, sm.fit(deco_id, max_w), _T.TEXT_DIM, tx, ty + md.cap_h + 6)
+            self._add_hit(row, key=("deco", deco_id), down=lambda p, d=deco_id: self._on_pick(d))
+        self._pop_clip(screen, old)
+        self._vp = old_vp
+        if total > rv.h:
+            frac = self._roster_scroll / max(1, total - rv.h)
+            th = max(24, int(rv.h * rv.h / total))
+            ty = rv.y + int((rv.h - th) * frac)
+            uk.draw_rect_on(screen, _T.CHIP_BORDER, pygame.Rect(rv.right - 4, ty, 3, th), 0, 1)
+
+        self._draw_live_preview(screen)
+
+    def _draw_live_preview(self, screen) -> None:
+        pr = self.prev_rect
+        self._panel(screen, pr, _T.PANEL_BG, _T.PANEL_BORDER, 1, 12)
+        self._text_top(screen, self.f_sm, "LIVE PREVIEW", _T.TEXT_MUTED, pr.x + 18, pr.y + 18)
+        if self.current_item is not None:
+            state = f"{self.fps:g} FPS" if self.preview_running else "PAUSED"
+            self._text_top(screen, self.f_sm, state, _T.TEXT_DIM, pr.right - 18, pr.y + 18, "r", dyn=True)
+        stage = pygame.Rect(pr.x + 12, pr.y + 44, pr.w - 24, pr.h - 44 - 12)
+        self._stage(screen, stage)
+
+        frame = self._current_frame()
+        if frame is None:
+            msg = "NO DECORATION SELECTED" if self.current_item is None else "NO IMAGE"
+            self._text_mid(screen, self.f_sm, msg, _T.TEXT_DIM, stage.centerx, stage.centery, "c")
+            return
+        old = self._push_clip(screen, stage)
+        fw, fh = frame.get_size()
+        base_y = stage.bottom - 22
+        scale = _fit_scale(stage.w - 28, base_y - stage.y - 14, fw, fh, 6)
+        dw, dh = max(1, int(round(fw * scale))), max(1, int(round(fh * scale)))
+        dest = pygame.Rect(0, 0, dw, dh)
+        dest.midbottom = (stage.centerx, base_y)
+        uk.draw_line_on(screen, _GROUND, (stage.x + 14, base_y), (stage.right - 14, base_y), 1)
+        self._blit_clip(screen, self._scaled(frame, dw, dh), dest.topleft)
+        uk.draw_line_on(screen, _T.GOLD, (dest.centerx - 7, base_y), (dest.centerx + 7, base_y), 2)
+        self._pop_clip(screen, old)
+
+    # ══════════════════════════════════════════════════════════════
+    #  Drawing: tabs + scrolling content panel
+    # ══════════════════════════════════════════════════════════════
+
+    def _draw_tabs(self, screen) -> None:
+        for i, name in enumerate(TAB_NAMES):
+            r = self.tab_rects[i]
+            active = i == self.active_tab
+            t = self._anim(("tab", i), self._hov(r) and not active)
+            base = _SEL if active else uk.lerp_color(_CARD, _CARD_HI, t)
+            border = _T.GOLD if active else uk.lerp_color(_T.CARD_BORDER, _T.GOLD, 0.78 * t)
+            self._panel(screen, r, base, border, 1, 10)
+            if active:
+                uk.draw_rect_on(screen, _T.GOLD, pygame.Rect(r.x + 14, r.bottom - 4, r.w - 28, 3), 0, 1)
+            fg = _T.GOLD_BRIGHT if active else uk.lerp_color(_T.TEXT_SECONDARY, _T.TEXT_PRIMARY, t)
+            label = self.f_md.fit(name, r.w - 28)
+            x = r.centerx - self.f_md.width(label) // 2
+            self._text_mid(screen, self.f_md, label, fg, x, r.centery - 1)
+            self._add_hit(r, key=("tab", i), down=lambda p, k=i: self._set_tab(k))
+
+    def _draw_content(self, screen) -> None:
+        pr = self.panel_rect
+        self._panel(screen, pr, _T.PANEL_BG, _T.PANEL_BORDER, 1, 12)
+        if self.current_item is None:
+            self._text_mid(screen, self.f_lg, "No decoration selected", _T.TEXT_MUTED, pr.centerx, pr.centery - 14, "c")
+            self._text_mid(screen, self.f_md, "Add art under assets/objects/decorations/, then press Refresh.",
+                           _T.TEXT_DIM, pr.centerx, pr.centery + 22, "c", max_w=pr.w - 40)
+            return
+        pad = 24
+        vp = pygame.Rect(pr.x + 3, pr.y + 3, pr.w - 6, pr.h - 6)
+        self._content_avail = pr.h - pad * 2
+        self._scroll = _clamp(self._scroll, 0, self._max_scroll())
+        fn = {TAB_PREVIEW: self._tab_preview, TAB_ANIMATION: self._tab_animation,
+              TAB_COLLISION: self._tab_collision}[self.active_tab]
+        old_vp = self._vp
+        self._vp = vp
+        old = self._push_clip(screen, vp)
+        x = pr.x + pad
+        w = pr.w - pad * 2 - 10
+        y = pr.y + pad - int(self._scroll)
+        used = fn(screen, x, y, w)
+        self._pop_clip(screen, old)
+        self._vp = old_vp
+        self._content_h = used + pad * 2
+
+        max_scroll = self._max_scroll()
+        if max_scroll > 0:
+            track = pygame.Rect(pr.right - 12, pr.y + 14, 5, pr.h - 28)
+            th = max(30, int(track.h * pr.h / self._content_h))
+            frac = self._scroll / max_scroll
+            thumb = pygame.Rect(track.x, track.y + int((track.h - th) * frac), track.w, th)
+            grab = self._drag is not None and self._drag.get("key") == "scrollbar"
+            t = self._anim("scrollbar", self._hov(track.inflate(10, 0)) or grab)
+            uk.draw_rect_on(screen, (24, 28, 38), track, 0, 2)
+            uk.draw_rect_on(screen, uk.lerp_color(_T.CHIP_BORDER, _T.GOLD, t), thumb, 0, 2)
+
+            def scrub(pos, track=track, th=th, ms=max_scroll):
+                f = _clamp((pos[1] - track.y - th / 2) / max(1, track.h - th), 0.0, 1.0)
+                self._scroll = f * ms
+
+            self._add_hit(track.inflate(12, 0), key="scrollbar", down=scrub, drag=scrub)
+
+    # ══════════════════════════════════════════════════════════════
+    #  Tab: Preview
+    # ══════════════════════════════════════════════════════════════
+
+    def _tab_preview(self, screen, x, y, w) -> int:
+        y0 = y
+        lg, sm = self.f_lg, self.f_sm
+        avail = self._content_avail
+
+        label = self.label_text.strip() or pretty_id(self.selected_id or "Decoration")
+        chip_w = 0
+        if self.current_item and self.current_item.get("hardcoded"):
+            chip = pygame.Rect(0, 0, sm.width("BUILT-IN") + 28, 30)
+            chip.topright = (x + w, y - 2)
+            self._panel(screen, chip, (36, 30, 16), (110, 88, 40), 1, 15)
+            self._text_mid(screen, sm, "BUILT-IN", _T.GOLD_BRIGHT, chip.centerx, chip.centery, "c")
+            chip_w = chip.w + 12
+        self._text_top(screen, lg, lg.fit(label, w - chip_w), _T.TEXT_PRIMARY, x, y, dyn=True)
+        y += lg.cap_h + 10
+
+        sub = f"ID: {self.selected_id}"
+        if self.grid_rows > 1:
+            names = self._variant_labels()
+            sub += f"     VARIANT {self.selected_variant + 1}: {names[min(self.selected_variant, len(names) - 1)]}"
+        elif self.image_path:
+            sub += f"     {relative_asset_path(self.image_path)}"
+        self._text_top(screen, sm, sm.fit(sub, w), _T.TEXT_DIM, x, y, dyn=True)
+        y += sm.cap_h + 16
+
+        ctrl_h = max(self.m_btn_h, self.m_field_h)
+        stage_h = max(120, avail - (y - y0) - ctrl_h - 16)
+        stage = pygame.Rect(x, y, w, stage_h)
+        self._draw_big_preview(screen, stage)
+        y += stage_h + 16
+
+        # playback row
+        running = self.preview_running
+        play = pygame.Rect(x, y, 132, ctrl_h)
+        self._pill(screen, "pv_play", play, "Pause" if running else "Play", _T.GOLD,
+                   _ic_pause if running else _ic_play, on_click=self._toggle_play,
+                   tip="Play / pause the preview  (Space)")
+        cy = y + ctrl_h // 2
+        sx = play.right + 24
+        n_steps = len(self.sequence)
+        sx += self._stat(screen, sx, cy, "SEQUENCE", f"{n_steps} STEP" + ("" if n_steps == 1 else "S")) + 24
+        sx += self._stat(screen, sx, cy, "SPEED", f"{self.fps:g} FPS")
+
+        if self.grid_rows > 1:
+            rows = self.grid_rows
+            seg_w = min(52 * rows, max(0, x + w - sx - 24))
+            if seg_w >= 40 * rows:
+                seg = pygame.Rect(x + w - seg_w, y + (ctrl_h - self.m_field_h) // 2, seg_w, self.m_field_h)
+                self._segmented(screen, "pv_variant", seg.x, seg.y, seg.w,
+                                [(i, str(i + 1)) for i in range(rows)],
+                                self.selected_variant, self._set_variant)
+                lbl_w = sm.width("VARIANT")
+                if seg.x - lbl_w - 14 > sx:
+                    self._text_mid(screen, sm, "VARIANT", _T.TEXT_MUTED, seg.x - 14, cy, "r")
+        return y + ctrl_h - y0
+
+    def _draw_big_preview(self, screen, stage: pygame.Rect) -> None:
+        self._stage(screen, stage)
+        frame = self._current_frame()
+        if frame is None:
+            self._text_mid(screen, self.f_md, "No image / sprite sheet", _T.TEXT_DIM, stage.centerx, stage.centery, "c")
+            return
+        old = self._push_clip(screen, stage)
+        fw, fh = frame.get_size()
+        base_y = stage.bottom - 34
+        scale = _fit_scale(stage.w - 48, base_y - stage.y - 24, fw, fh, 12)
+        dw, dh = max(1, int(round(fw * scale))), max(1, int(round(fh * scale)))
+        dest = pygame.Rect(0, 0, dw, dh)
+        dest.midbottom = (stage.centerx, base_y)
+        # Ground line + anchor: the sprite's bottom-centre is its world anchor.
+        uk.draw_line_on(screen, _GROUND, (min(dest.left - 30, stage.centerx - 90), base_y),
+                        (max(dest.right + 30, stage.centerx + 90), base_y), 1)
+        self._blit_clip(screen, self._scaled(frame, dw, dh), dest.topleft)
+        uk.draw_line_on(screen, _T.GOLD, (dest.centerx - 8, base_y), (dest.centerx + 8, base_y), 2)
+        uk.draw_line_on(screen, _T.GOLD, (dest.centerx, base_y - 8), (dest.centerx, base_y), 2)
+        self._pop_clip(screen, old)
+
+    # ══════════════════════════════════════════════════════════════
+    #  Tab: Animation
+    # ══════════════════════════════════════════════════════════════
+
+    def _tab_animation(self, screen, x, y, w) -> int:
+        gap = 28
+        if w >= 560:
+            lw = int(w * 0.58)
+            rw = w - lw - gap
+            left = self._anim_left(screen, x, y, lw, self._content_avail)
+            right = self._anim_right(screen, x + lw + gap, y, rw)
+            return max(left, right)
+        left = self._anim_left(screen, x, y, w, self._content_avail)
+        right = self._anim_right(screen, x, y + left + 24, w)
+        return left + 24 + right
+
+    def _anim_left(self, screen, x, y, w, avail) -> int:
+        y0 = y
+        en = self._editor_enabled()
+        sm = self.f_sm
+        cap = sm.cap_h + 18
+        tool_h = self._seq_tools_height(w)
+
+        right_txt = ""
+        if self.sheet is not None:
+            sw, sh = self.sheet.get_size()
+            right_txt = f"{sw} x {sh} PX"
+        y += self._caption(screen, "Spritesheet", x, y, w, right=right_txt)
+        sheet_h = max(130, avail - cap - (14 + cap + SEQ_CELL + 14 + tool_h))
+        self._draw_sheet(screen, pygame.Rect(x, y, w, sheet_h), en)
+        y += sheet_h + 14
+
+        geom = self._strip_geom(w)
+        overflow, _off, _iw, max_cells = geom
+        total = len(self.sequence)
+        if overflow:
+            first = self.sequence_scroll + 1
+            info = f"{first}-{min(total, self.sequence_scroll + max_cells)} OF {total}"
+        else:
+            info = f"{total} STEP" + ("" if total == 1 else "S")
+        y += self._caption(screen, "Playback Sequence", x, y, w, right=info)
+        self._draw_sequence_strip(screen, x, y, w, en, geom)
+        y += SEQ_CELL + 14
+        y += self._draw_seq_tools(screen, x, y, w, en)
+        return y - y0
+
+    def _draw_sheet(self, screen, rect: pygame.Rect, enabled: bool) -> None:
+        self._stage(screen, rect)
+        if self.sheet is None:
+            self._text_mid(screen, self.f_sm, "NO SPRITE SHEET LOADED", _T.TEXT_DIM, rect.centerx, rect.centery, "c")
+            return
+        sm = self.f_sm
+        hint_h = sm.cap_h + 14
+        area = pygame.Rect(rect.x + 12, rect.y + 12, rect.w - 24, max(20, rect.h - 24 - hint_h))
+        sw, sh = self.sheet.get_size()
+        scale = _fit_scale(area.w, area.h, sw, sh, 8)
+        dw, dh = max(1, int(round(sw * scale))), max(1, int(round(sh * scale)))
+        ox = area.x + (area.w - dw) // 2
+        oy = area.y + (area.h - dh) // 2
+        old = self._push_clip(screen, rect.inflate(-2, -2))
+        self._blit_clip(screen, self._scaled(self.sheet, dw, dh), (ox, oy))
+
+        playing = None
+        if self.sequence:
+            playing = self.sequence[self.preview_seq_index % len(self.sequence)]
         for row in range(self.grid_rows):
             for col in range(self.frame_count):
-                fr = pygame.Rect(
-                    int(ox + col * self.frame_w * scale),
-                    int(oy + row * self.frame_h * scale),
-                    max(1, int(self.frame_w * scale)),
-                    max(1, int(self.frame_h * scale)),
-                )
-                border = C_ACCENT if row == self.selected_variant else C_BORDER
-                screen.draw_rect(border, fr, 1)
-                if fr.w >= 20 and fr.h >= 16:
-                    img_n = get_font(10, True).render(str(col + 1), True, border)
-                    screen.blit(img_n, (fr.x + 3, fr.y + 2))
+                x0 = ox + int(round(col * self.frame_w * scale))
+                x1 = ox + int(round((col + 1) * self.frame_w * scale))
+                y0 = oy + int(round(row * self.frame_h * scale))
+                y1 = oy + int(round((row + 1) * self.frame_h * scale))
+                fr = pygame.Rect(x0, y0, max(1, x1 - x0), max(1, y1 - y0))
+                on_row = row == self.selected_variant
+                t = self._anim(("cell", row, col), enabled and self._hov(fr))
+                if t > 0:
+                    uk.draw_rect_on(screen, (*_T.GOLD, int(46 * t)), fr, 0, 0)
+                is_playing = on_row and playing == col + 1
+                if is_playing:
+                    color, bw = _T.GOLD, 2
+                else:
+                    color = uk.lerp_color(_T.KI_BLUE if on_row else _GRID, _T.GOLD, t)
+                    bw = 1
+                uk.draw_rect_on(screen, color, fr, bw, 0)
+                label = str(col + 1)
+                if fr.w >= sm.width(label) + 12 and fr.h >= sm.cap_h + 12:
+                    self._text_top(screen, sm, label, color, fr.x + 5, fr.y + 5)
+                if enabled:
+                    self._add_hit(fr, key=("cell", row, col),
+                                  down=lambda p, n=col + 1: self._append_sequence_frame(n),
+                                  tip=f"Click to add frame {col + 1} to the sequence")
+        self._pop_clip(screen, old)
+        if enabled:
+            for hint in ("CLICK A FRAME TO ADD IT TO THE SEQUENCE", "CLICK A FRAME TO ADD IT", "CLICK A FRAME"):
+                if sm.width(hint) <= rect.w - 24:
+                    self._text_top(screen, sm, hint, _T.TEXT_DIM, rect.centerx, rect.bottom - hint_h + 4, "c")
+                    break
 
-        help_txt = "Click a frame → append it to the sequence"
-        text(screen, help_txt, (rect.x + 10, rect.bottom - 20), C_TEXT_DIM, 10)
+    def _strip_geom(self, w: int):
+        """(overflow, inner_offset, inner_width, cells_visible) for the
+        sequence strip, and clamp its scroll to match."""
+        total = len(self.sequence)
+        per = max(1, (w + SEQ_GAP) // (SEQ_CELL + SEQ_GAP))
+        if total <= per:
+            geom = (False, 0, w, per)
+        else:
+            off = SEQ_ARROW + SEQ_GAP
+            inner_w = w - 2 * off
+            geom = (True, off, inner_w, max(1, (inner_w + SEQ_GAP) // (SEQ_CELL + SEQ_GAP)))
+        self.sequence_scroll = _clamp(self.sequence_scroll, 0, max(0, total - geom[3]))
+        return geom
 
-    # ------------------------------------------------------------------
-    # Draw: collision tab
-    # ------------------------------------------------------------------
-    def _draw_collision_tab(self, screen: pygame.Surface, enabled: bool) -> None:
-        if not self.current_item:
+    def _draw_sequence_strip(self, screen, x, y, w, enabled, geom) -> None:
+        overflow, off, _iw, max_cells = geom
+        total = len(self.sequence)
+        self._seq_strip_rect = pygame.Rect(x, y, w, SEQ_CELL)
+        if overflow:
+            left = pygame.Rect(x, y, SEQ_ARROW, SEQ_CELL)
+            right = pygame.Rect(x + w - SEQ_ARROW, y, SEQ_ARROW, SEQ_CELL)
+            self._icon_btn(screen, "seq_l", left, _ic_left, lambda: self._scroll_sequence(-1),
+                           enabled=self.sequence_scroll > 0, tip="Scroll the sequence left")
+            self._icon_btn(screen, "seq_r", right, _ic_right, lambda: self._scroll_sequence(1),
+                           enabled=self.sequence_scroll < total - max_cells, tip="Scroll the sequence right")
+        visible = self.sequence[self.sequence_scroll:self.sequence_scroll + max_cells]
+        for i, frame_no in enumerate(visible):
+            idx = self.sequence_scroll + i
+            r = pygame.Rect(x + off + i * (SEQ_CELL + SEQ_GAP), y, SEQ_CELL, SEQ_CELL)
+            active = idx == self.preview_seq_index
+            t = self._anim(("seq", idx), enabled and self._hov(r))
+            base = _SEL if active else uk.lerp_color(_CARD, _CARD_HI, t)
+            if active:
+                border = _T.GOLD
+            else:
+                border = uk.lerp_color(_T.CARD_BORDER, _T.DANGER_BRIGHT, 0.7 * t)
+            self._panel(screen, r, base, border, 1, 9)
+            fg = _T.GOLD_BRIGHT if active else uk.lerp_color(_T.TEXT_SECONDARY, _T.TEXT_PRIMARY, t)
+            self._text_mid(screen, self.f_md, str(frame_no), fg, r.centerx, r.centery, "c", dyn=True)
+            if enabled:
+                self._add_hit(r, key=("seq", idx), down=lambda p, k=idx: self._remove_sequence_step(k),
+                              tip="Click to remove this step")
+
+    def _seq_tool_specs(self, enabled):
+        running = self.preview_running
+        return [
+            ("t_all", "Use All", None, False, enabled, self._all_sequence, "Play every frame in order"),
+            ("t_ping", "Ping-Pong", None, False, enabled, self._ping_pong_sequence, "Forward, then back again"),
+            ("t_rev", "Reverse", None, False, enabled, self._reverse_sequence, "Reverse the sequence order"),
+            ("t_clr", "Clear", None, True, enabled, self._clear_sequence, "Reset the sequence to frame 1"),
+            ("t_play", "Pause" if running else "Play", _ic_pause if running else _ic_play, False, True,
+             self._toggle_play, "Play / pause the preview"),
+        ]
+
+    def _seq_tool_rows(self, w, specs):
+        """Flow the tool pills into rows: each pill gets its label's natural
+        width, wraps when the row is full, then the leftover is shared out so
+        every row spans the column. Returns [[(spec_index, x_off, width)]]."""
+        gap = 8
+        naturals = [self.f_md.width(sp[1]) + 36 + (30 if sp[2] else 0) for sp in specs]
+        rows, cur, used = [], [], 0
+        for i, nw in enumerate(naturals):
+            need = nw + (gap if cur else 0)
+            if cur and used + need > w:
+                rows.append(cur)
+                cur, used, need = [], 0, nw
+            cur.append(i)
+            used += need
+        rows.append(cur)
+        out = []
+        for r_i, row in enumerate(rows):
+            stretch = len(rows) == 1 or r_i < len(rows) - 1
+            spare = w - (sum(naturals[i] for i in row) + gap * (len(row) - 1))
+            extra = max(0, spare // len(row)) if stretch else 0
+            x_off, items = 0, []
+            for n, i in enumerate(row):
+                pw = naturals[i] + extra
+                if stretch and n == len(row) - 1:
+                    pw = w - x_off
+                items.append((i, x_off, pw))
+                x_off += pw + gap
+            out.append(items)
+        return out
+
+    def _seq_tools_height(self, w) -> int:
+        rows = len(self._seq_tool_rows(w, self._seq_tool_specs(True)))
+        return rows * self.m_btn_h + (rows - 1) * 8
+
+    def _draw_seq_tools(self, screen, x, y, w, enabled) -> int:
+        specs = self._seq_tool_specs(enabled)
+        h = self.m_btn_h
+        rows = self._seq_tool_rows(w, specs)
+        for r_i, items in enumerate(rows):
+            ry = y + r_i * (h + 8)
+            for i, x_off, pw in items:
+                key, label, icon, danger, en, cb, tip = specs[i]
+                self._pill(screen, key, pygame.Rect(x + x_off, ry, pw, h), label, _T.GOLD, icon,
+                           danger=danger, enabled=en, on_click=cb, tip=tip)
+        return len(rows) * h + (len(rows) - 1) * 8
+
+    def _anim_right(self, screen, x, y, w) -> int:
+        y0 = y
+        en = self._editor_enabled()
+        has_sheet = self.sheet is not None
+        fh = self.m_field_h
+
+        if not en:
+            y += self._note(screen, x, y, w, "Built-in animation is protected. Collision can still be edited.",
+                            _T.GOLD_BRIGHT) + 12
+
+        y += self._caption(screen, "Identity", x, y, w)
+        y += self._field_label(screen, "Display Name", x, y)
+
+        def set_label(v):
+            if self.label_text != v:
+                self.label_text = v
+                self._mark_dirty()
+
+        self._text_field(screen, "a:label", pygame.Rect(x, y, w, fh), lambda: self.label_text, set_label,
+                         "e.g. Bush", max_len=48, enabled=en)
+        y += fh + 10
+
+        y += self._caption(screen, "Sheet Layout", x, y, w)
+        sw, sh = self.sheet.get_size() if has_sheet else (1, 1)
+        specs = [
+            dict(key="a:fw", label="Frame Width", get=lambda: self.frame_w,
+                 set=lambda v: self._apply_layout(frame_w=v), vmin=1, vmax=sw),
+            dict(key="a:fh", label="Frame Height", get=lambda: self.frame_h,
+                 set=lambda v: self._apply_layout(frame_h=v), vmin=1, vmax=sh),
+            dict(key="a:fc", label="Frame Count", get=lambda: self.frame_count,
+                 set=lambda v: self._apply_layout(frame_count=v), vmin=1, vmax=max(1, sw // self.frame_w)),
+            dict(key="a:rows", label="Variant Rows", get=lambda: self.grid_rows,
+                 set=lambda v: self._apply_layout(grid_rows=v), vmin=1, vmax=max(1, sh // self.frame_h)),
+        ]
+        y += self._stepper_grid(screen, x, y, w, specs, enabled=en and has_sheet)
+
+        y += self._field_label(screen, "Variant Names", x, y)
+
+        def set_names(v):
+            if self.variant_names_text != v:
+                self.variant_names_text = v
+                self._mark_dirty()
+
+        self._text_field(screen, "a:variants", pygame.Rect(x, y, w, fh), lambda: self.variant_names_text,
+                         set_names, "e.g. Green, Autumn", max_len=200, enabled=en,
+                         tip="Comma-separated, one name per sheet row")
+        y += fh + 12
+
+        y += self._caption(screen, "Timing", x, y, w)
+
+        def set_fps(v):
+            v = float(v)
+            if self.fps != v:
+                self.fps = v
+                self._mark_dirty()
+
+        y += self._slider(screen, "a:fps", x, y, w, "Animation Speed", self.fps, 0, 30, 0.5, "{:g} fps",
+                          set_fps, enabled=en)
+        return y - y0
+
+    # ══════════════════════════════════════════════════════════════
+    #  Tab: Collision
+    # ══════════════════════════════════════════════════════════════
+
+    def _tab_collision(self, screen, x, y, w) -> int:
+        gap = 28
+        stacked = w < 560
+        lw = w if stacked else int(w * 0.54)
+        rw = w if stacked else w - lw - gap
+        en = self._collision_enabled()
+
+        y0 = y
+        mode = "MANUAL" if self.collision_manual else "AUTO"
+        y += self._caption(screen, "Collision Box", x, y, lw, right=mode)
+        stage_h = max(160, self._content_avail - (y - y0))
+        self._draw_collision_stage(screen, pygame.Rect(x, y, lw, stage_h), en)
+        left_used = (y - y0) + stage_h
+
+        if stacked:
+            ry = y0 + left_used + 24
+            rx = x
+        else:
+            ry = y0
+            rx = x + lw + gap
+        r0 = ry
+
+        ry += self._caption(screen, "Mode", rx, ry, rw)
+        self._segmented(screen, "c:mode", rx, ry, rw,
+                        [("auto", "Automatic"), ("manual", "Manual")],
+                        "manual" if self.collision_manual else "auto",
+                        lambda v: self._use_auto_collision() if v == "auto" else self._use_manual_collision(),
+                        enabled=en)
+        ry += self.m_field_h + 18
+
+        ry += self._caption(screen, "Box  (frame pixels)", rx, ry, rw)
+        cur = self._current_collision()
+        frame = self._current_frame()
+        fw, fh = frame.get_size() if frame is not None else (1, 1)
+        cx, cy, cw, ch = cur if cur else (0, 0, 1, 1)
+        specs = [
+            dict(key="c:x", label="X", get=lambda: cx, set=lambda v: self._set_collision_component(0, v),
+                 vmin=0, vmax=max(0, fw - cw)),
+            dict(key="c:y", label="Y", get=lambda: cy, set=lambda v: self._set_collision_component(1, v),
+                 vmin=0, vmax=max(0, fh - ch)),
+            dict(key="c:w", label="Width", get=lambda: cw, set=lambda v: self._set_collision_component(2, v),
+                 vmin=1, vmax=max(1, fw)),
+            dict(key="c:h", label="Height", get=lambda: ch, set=lambda v: self._set_collision_component(3, v),
+                 vmin=1, vmax=max(1, fh)),
+        ]
+        ry += self._stepper_grid(screen, rx, ry, rw, specs, enabled=en and cur is not None)
+
+        if cur is None:
+            ry += self._note(screen, rx, ry, rw, "No collision box available for this decoration.") + 6
+        if self.collision_auto_rect:
+            a = self.collision_auto_rect
+            ry += self._note(screen, rx, ry, rw, f"Auto box: {a[0]}, {a[1]}, {a[2]} x {a[3]}",
+                             _T.TEXT_MUTED) + 6
+        ry += self._note(screen, rx, ry, rw, "Drag the box to move it, or a corner handle to resize it. "
+                         "Only this compact box blocks movement and beams.") + 6
+        return max(left_used, ry - r0) if not stacked else left_used + 24 + (ry - r0)
+
+    def _draw_collision_stage(self, screen, stage: pygame.Rect, enabled: bool) -> None:
+        self._stage(screen, stage)
+        frame = self._current_frame()
+        if frame is None:
+            self._text_mid(screen, self.f_md, "No image / sprite sheet", _T.TEXT_DIM, stage.centerx, stage.centery, "c")
             return
 
-        text(screen, "Collision Box", (self.editor_rect.x + 16, self.editor_rect.y + 14),
-             C_TEXT, 18, True)
-        text(screen,
-             "Drag the box to move it. Drag a corner handle to resize it.",
-             (self.editor_rect.x + 16, self.editor_rect.y + 41), C_TEXT_DIM, 12)
+        old = self._push_clip(screen, stage.inflate(-2, -2))
+        fw, fh = frame.get_size()
+        fit = stage.inflate(-64, -64)
+        scale = _fit_scale(fit.w, fit.h, fw, fh, 24)
+        dw, dh = max(1, int(round(fw * scale))), max(1, int(round(fh * scale)))
+        frame_rect = pygame.Rect(0, 0, dw, dh)
+        frame_rect.center = stage.center
+        self._blit_clip(screen, self._scaled(frame, dw, dh), frame_rect.topleft)
 
-        canvas = self._collision_source_rect()
-        self._collision_canvas_rect = canvas
-        panel(screen, canvas, C_CANVAS, C_BORDER)
+        # Sprite boundary, base line and anchor.
+        uk.draw_rect_on(screen, _GRID, frame_rect, 1, 0)
+        uk.draw_line_on(screen, _GROUND, (frame_rect.left - 14, frame_rect.bottom),
+                        (frame_rect.right + 14, frame_rect.bottom), 1)
+        uk.draw_circle_on(screen, _T.GOLD, (frame_rect.centerx, frame_rect.bottom), 4)
 
-        frame_rect, scale, frame = self._collision_canvas()
-        if frame_rect is not None and frame is not None:
-            # Pixel-art nearest-neighbour preview.
-            img = pygame.transform.scale(frame, frame_rect.size)
-            screen.blit(img, frame_rect)
+        self._col_geom = (frame_rect, scale)
+        cur = self._current_collision()
+        if cur is not None:
+            cr = self._rect_to_screen(cur, frame_rect, scale)
+            uk.draw_rect_on(screen, (*_T.DANGER, 62), cr, 0, 0)
+            uk.draw_rect_on(screen, _T.DANGER_BRIGHT, cr, 2, 0)
 
-            # Sprite boundary.
-            screen.draw_rect(C_BORDER, frame_rect, 1)
+            hover_corner = None
+            dragging = self.collision_drag is not None
+            corners = {"tl": cr.topleft, "tr": cr.topright, "bl": cr.bottomleft, "br": cr.bottomright}
+            if enabled and not dragging and self._hov(stage):
+                for name, (px, py) in corners.items():
+                    if pygame.Rect(px - 8, py - 8, 16, 16).collidepoint(self._hm):
+                        hover_corner = name
+                        break
+                if hover_corner:
+                    self._cursor_hint = "resize"
+                elif cr.collidepoint(self._hm):
+                    self._cursor_hint = "move"
+            for name, (px, py) in corners.items():
+                hot = name == hover_corner or (dragging and self.collision_drag["mode"] == name)
+                handle = pygame.Rect(0, 0, 12 if hot else 10, 12 if hot else 10)
+                handle.center = (px, py)
+                if hot:
+                    uk.draw_soft_glow(screen, (px, py), 18, _T.DANGER_BRIGHT, max_alpha=60)
+                uk.draw_rect_on(screen, _T.DANGER_BRIGHT if not hot else (255, 190, 190), handle, 0, 2)
+                uk.draw_rect_on(screen, _BG, handle, 1, 2)
 
-            # Base line + anchor.
-            screen.draw_line(C_ACCENT2,
-                             (frame_rect.left, frame_rect.bottom),
-                             (frame_rect.right, frame_rect.bottom), 1)
-            screen.draw_circle(C_ACCENT2,
-                               (frame_rect.centerx, frame_rect.bottom), 3)
+            tag = "MANUAL" if self.collision_manual else "AUTO"
+            sm = self.f_sm
+            tag_y = cr.top - sm.cap_h - 8
+            if tag_y < stage.y + 6:
+                tag_y = cr.top + 6
+            self._text_top(screen, sm, tag, _T.DANGER_BRIGHT, cr.x + 2, tag_y)
 
-            cr = self._collision_rect_screen()
-            if cr:
-                fill = pygame.Surface(cr.size, pygame.SRCALPHA)
-                fill.fill(C_COLLISION_FILL)
-                screen.blit(fill, cr.topleft)
-                screen.draw_rect(C_COLLISION, cr, 2)
-                for cx, cy in ((cr.left, cr.top), (cr.right, cr.top),
-                               (cr.left, cr.bottom), (cr.right, cr.bottom)):
-                    h = pygame.Rect(cx - 4, cy - 4, 8, 8)
-                    screen.draw_rect(C_COLLISION, h)
-                    screen.draw_rect(C_BG, h, 1)
-                mode_text = "MANUAL" if self.collision_manual else "AUTO"
-                text(screen, mode_text, (cr.x + 4, cr.y + 4), C_TEXT, 10, True)
-
-        # Right controls.
-        x = canvas.right + 18
-        y = self.editor_rect.y + 20
-        w = self.editor_rect.right - x - 16
-        text(screen, "COLLISION MODE", (x, y), C_TEXT_DIM, 11, True)
-        y += 18
-        self._collision_auto_button = pygame.Rect(x, y, w, 34)
-        self._collision_manual_button = pygame.Rect(x, y + 42, w, 34)
-        button(screen, self._collision_auto_button, "Use automatic collision",
-               hover=self._collision_auto_button.collidepoint(*pygame.mouse.get_pos()),
-               disabled=not enabled)
-        button(screen, self._collision_manual_button, "Edit collision manually",
-               hover=self._collision_manual_button.collidepoint(*pygame.mouse.get_pos()),
-               disabled=not enabled)
-        y += 92
-
-        r = self.collision_rect if self.collision_manual and self.collision_rect else self.collision_auto_rect
-        if r is None:
-            text(screen, "No collision", (x, y), C_TEXT_DIM, 12)
-        else:
-            labels = (("X", "x"), ("Y", "y"), ("W", "w"), ("H", "h"))
-            col_w = max(64, (w - 12) // 2)
-            for i, (lbl, key) in enumerate(labels):
-                col = i % 2
-                row = i // 2
-                fx = x + col * (col_w + 12)
-                fy = y + row * 60
-                text(screen, lbl, (fx, fy), C_TEXT_DIM, 11)
-                field = self.collision_rect_input[key]
-                field.rect = pygame.Rect(fx, fy + 16, col_w, 30)
-                field.draw(screen, enabled)
-
-        y += 140
-        if self.collision_auto_rect:
-            text(screen,
-                 f"Auto: {self.collision_auto_rect[0]}, {self.collision_auto_rect[1]}, "
-                 f"{self.collision_auto_rect[2]} × {self.collision_auto_rect[3]}",
-                 (x, y), C_TEXT_DIM, 11)
-        text(screen,
-             "Collision coordinates are local to the frame.",
-             (x, self.editor_rect.bottom - 48), C_TEXT_DIM, 10)
-        text(screen,
-             "Only the compact box blocks movement / beams.",
-             (x, self.editor_rect.bottom - 31), C_TEXT_DIM, 10)
+        if enabled:
+            self._add_hit(stage, key="c:canvas", down=self._collision_down,
+                          drag=self._collision_move, up=self._collision_up)
+        self._pop_clip(screen, old)
 
 
 # ---------------------------------------------------------------------------
@@ -1834,11 +2747,8 @@ def run(screen: pygame.Surface, clock: pygame.time.Clock) -> None:
         dt = clock.tick(60) / 1000.0
         for event in pygame.event.get():
             result = creator.handle_input(event)
-            if result == "close":
+            if result in ("close", "back_to_dev_menu"):
                 running = False
         creator.update(dt)
         creator.draw(screen, dt)
         pygame.display.flip()
-
-
-__all__ = ["DecorationCreator", "run"]

@@ -23,6 +23,7 @@ from dev_tools.room_editor.room_editor_tools.object_editor import ObjectEditor
 from objects.ambient_sound_object import AmbientSoundObject
 from dev_tools.room_editor.room_editor_tools.entity_editor import EntityEditor
 from dev_tools import entity_creator
+import dev_tools.ui_kit as uk
 
 
 # How many actions we keep in each undo/redo stack before the oldest entry
@@ -40,6 +41,74 @@ _RUBBER_BAND_CLICK_THRESHOLD = 4
 # current zoom level — the world-space threshold above shrinks or grows in
 # screen terms as you zoom, which made clicks vs. drags feel inconsistent.
 _RUBBER_BAND_CLICK_THRESHOLD_PX = 4
+
+
+class _BitmapFontView:
+    """Adapts a BitmapFont to the plain pygame.font.Font call shape —
+    render(text, antialias, color) / size(text) — at one fixed pixel height.
+
+    Same adapter dev_menu.py uses for its ModalTextInput: BitmapFont's own
+    render() takes a `height` keyword rather than pygame.font.Font's fixed
+    per-instance size, so this pins one height per "font" (title/large/
+    medium/small) and otherwise stays a drop-in swap — every existing
+    `self.font_x.render(text, True, color)` call site in this file keeps
+    working unchanged."""
+
+    def __init__(self, bitmap_font, height):
+        self._font = bitmap_font
+        self._height = height
+
+    def render(self, text, antialias=True, color=(255, 255, 255)):
+        return self._font.render(text, color=color, height=self._height)
+
+    def size(self, text):
+        return self._font.size(text, height=self._height)
+
+
+# ---------------------------------------------------------------------------
+# Vector icon glyphs for the Room Editor's menu chrome (group/room list
+# rows, form buttons, dropdown "current" marker). Drawn with the same
+# primitives, and the same fn(surface, rect, color) shape, as
+# dev_tools.ui_kit's own DEV_MENU_ICON_DRAWERS set, so these read as part of
+# the same family instead of a mismatched one-off — reuse uk.draw_gear_icon,
+# uk.draw_close_icon and uk.draw_back_icon directly wherever they already fit.
+# ---------------------------------------------------------------------------
+
+def _draw_plus_icon(surface, rect, color, width=3):
+    """Simple cross — "create new" actions (New Group / Create Room)."""
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.34
+    uk.draw_line_on(surface, color, (cx - s, cy), (cx + s, cy), width)
+    uk.draw_line_on(surface, color, (cx, cy - s), (cx, cy + s), width)
+
+
+def _draw_check_icon(surface, rect, color, width=3):
+    """Checkmark — Save button and dropdown "currently selected" marker."""
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.32
+    uk.draw_line_on(surface, color, (cx - s, cy), (cx - s * 0.15, cy + s * 0.8), width)
+    uk.draw_line_on(surface, color, (cx - s * 0.15, cy + s * 0.8), (cx + s, cy - s * 0.7), width)
+
+
+def _draw_trash_icon(surface, rect, color, width=2):
+    """Wastebasket glyph — Delete button."""
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    body = pygame.Rect(0, 0, s * 0.46, s * 0.48)
+    body.centerx = cx
+    body.top = int(cy - s * 0.08)
+    uk.draw_rect_on(surface, color, body, width, 2)
+    lid = pygame.Rect(0, 0, s * 0.62, s * 0.09)
+    lid.centerx = cx
+    lid.bottom = body.top + 1
+    uk.draw_rect_on(surface, color, lid, width, 1)
+    handle = pygame.Rect(0, 0, s * 0.22, s * 0.12)
+    handle.centerx = cx
+    handle.bottom = lid.top + 2
+    uk.draw_rect_on(surface, color, handle, width, 2)
+    for i in (-1, 0, 1):
+        x = cx + i * s * 0.13
+        uk.draw_line_on(surface, color, (x, body.top + 5), (x, body.bottom - 4), width)
 
 
 class _SurfaceDrawCompat:
@@ -354,14 +423,30 @@ class RoomEditor:
         # Always stored in renderer logical coordinates.
         self._logical_mouse_pos = (screen_width // 2, screen_height // 2)
 
-        self.font_title = pygame.font.Font(None, 48)
-        self.font_large = pygame.font.Font(None, 32)
-        self.font_medium = pygame.font.Font(None, 24)
-        self.font_small = pygame.font.Font(None, 18)
+        # Same bitmap font family as DevMenu, at the same two-glyph-set
+        # split: title text uses the plain uppercase/lowercase glyphs (like
+        # DevMenu's "DEV TOOLS"/"CONFIGURATION" headers), everything else
+        # uses the menu glyph set (like DevMenu's card labels). Wrapped in
+        # _BitmapFontView so every existing .render(text, True, color) call
+        # site below keeps working unchanged.
+        self._menu_font = uk.BitmapFont('assets\\ui\\fonts', letter_spacing=1)
+        self._title_bitmap_font = uk.BitmapFont('assets\\ui\\fonts', letter_spacing=1)
+        self._title_bitmap_font.uppercase_dir = os.path.join('assets', 'ui', 'fonts', 'uppercase')
+        self._title_bitmap_font.lowercase_dir = os.path.join('assets', 'ui', 'fonts', 'lowercase')
+
+        self.font_title = _BitmapFontView(self._title_bitmap_font, 32)
+        self.font_large = _BitmapFontView(self._menu_font, 20)
+        self.font_medium = _BitmapFontView(self._menu_font, 16)
+        self.font_small = _BitmapFontView(self._menu_font, 12)
 
         self.current_view = 'groups'
         self.selected_index = 0
         self.hover_index = -1
+        # Tracks whether the mouse or the keyboard drove the last input, so
+        # the selection glow only shows for the input method actually in
+        # use (mirrors DevMenu._last_input) — otherwise selected_index's
+        # default of 0 makes the first item look permanently hovered.
+        self._last_input = 'mouse'
         self.scroll_offset = 0
         self.selected_group = None
 
@@ -405,6 +490,38 @@ class RoomEditor:
         self.editing_field = None
         self.text_input = ""
         self.cursor_blink = 0
+        self.cursor_pos = 0
+        self.selection_anchor = None  # None = no selection; else other end of it
+
+        # Tracks whether the text-field I-beam check at the end of update()
+        # is the thing currently holding the shared OS cursor, so it only
+        # ever releases a cursor it actually claimed — see update()'s
+        # final block for the full story (same idea as EditorToolbar's own
+        # _owns_cursor).
+        self._owns_text_cursor = False
+        self._text_drag = False
+        self._text_max_len = 50
+        # Rect + text-start-x + font of whichever row is currently being
+        # edited, captured by the draw call each frame (see _draw_field_row
+        # / _draw_new_group_row / _draw_rename_group_row) so handle_input's
+        # click/drag handling can hit-test and measure caret positions
+        # without needing to know which of the three row styles is active.
+        self._active_edit_rect = None
+        self._active_edit_text_x = None
+        self._active_edit_font = None
+        self.text_field_rects = []  # rebuilt each draw() — see _draw_field_row
+        # Set alongside editing_field == 'rename_group' — the group's name
+        # before editing, so _finish_text_input knows which entry in
+        # room_manager.groups (and which rooms' .group) to update, and
+        # _draw_groups_view knows which row to swap for the inline editor.
+        self._renaming_group_original = None
+
+        # ── Right-click context menu (groups/rooms list rows) ──────────────
+        # None when closed. Opened by _open_row_context_menu on a right
+        # click over a group/room row; consumed each frame by
+        # _draw_context_menu (which also fills in 'rects' for hit-testing)
+        # and cleared by _run_context_menu_action or a dismiss-click/ESC.
+        self._context_menu = None
 
         # ── Create-room form ─────────────────────────────────────────────────
         self.create_form = {
@@ -585,12 +702,51 @@ class RoomEditor:
         }
 
         # ── Layout ───────────────────────────────────────────────────────────
-        self.sidebar_width = 280
-        self.header_height = 80
-        self.item_height = 60
-        self.padding = 20
+        # Full-width header/footer chrome (dev-menu style) instead of the old
+        # fixed left sidebar — content gets the full width of the screen.
+        self.margin_x = 56
+        # Same formula as DevMenu._layout() — a fraction of screen height
+        # with a floor, not flat constants, so these come out the same
+        # actual size as the dev menu's header/footer bars.
+        self.header_h = max(86, round(screen_height * 0.12))
+        self.footer_h = max(42, round(screen_height * 0.065))
+        self.card_h = 68
 
-        self._view_icon = self._load_icon('assets/ui/room_editor/view.png', 28, 28)
+        # Back button, top-left of the header bar — exits the whole Room
+        # Editor back to the Dev Menu. Same geometry/behaviour convention as
+        # DevMenu's own header back-arrow (shown there when leaving its
+        # CONFIGURATION screen); here it's shown on the top-level 'groups'
+        # view and replaces the old in-list "Back to Dev Menu" card.
+        back_size = max(40, round(self.header_h * 0.55))
+        self._back_rect = pygame.Rect(0, 0, back_size, back_size)
+        self._back_rect.left = self.margin_x
+        self._back_rect.centery = self.header_h // 2
+        self._back_hovered = False
+        self._back_hover_anim = 0.0
+
+        # Same PNG icon (and loading path) as DevMenu's own header back
+        # arrow — see DevMenu._load_icon('back', ...) — instead of the
+        # vector-drawn uk.draw_back_icon, so the two back buttons match.
+        self._back_icon = self._load_dev_menu_icon('back', 34)
+
+        # "New Group" / "New Room" add-button, bottom-left of the middle
+        # content box — built from the exact same box (size, panel style,
+        # hover glow) as the header back button above, just anchored to
+        # the opposite corner and using a plus icon instead of the back
+        # arrow. See _draw_add_button.
+        self._new_item_rect = pygame.Rect(0, 0, back_size, back_size)
+        self._new_item_rect.left = self.margin_x
+        self._new_item_rect.bottom = self.screen_height - self.footer_h - 24
+        self._new_item_icon = self._load_dev_menu_icon('plus', 34)
+
+        # Room row "View" / "Settings" icon-buttons. View is a
+        # user-provided asset (assets/ui/dev_menu/icons/view.png).
+        # Settings reuses the exact same PNG as DevMenu's own
+        # CONFIGURATION gear icon (assets/ui/dev_menu/icons/config.png)
+        # instead of the vector-drawn uk.draw_gear_icon, so the two gears
+        # match pixel-for-pixel.
+        self._view_icon = self._load_dev_menu_icon('view', 26)
+        self._settings_icon = self._load_dev_menu_icon('config', 26)
 
         # Wired by game.py to game.blit_room_tiles — lets the editor use the
         # same baked-surface path as gameplay instead of scaling every tile
@@ -620,6 +776,47 @@ class RoomEditor:
             return pygame.transform.smoothscale(img, (w, h))
         except Exception:
             return None
+
+    @staticmethod
+    def _load_dev_menu_icon(icon_key, box_size):
+        """Load one of the shared dev-menu PNG icons (assets/ui/dev_menu/icons/)
+        using the exact same crop + point-sample scaling as DevMenu._load_icon,
+        so an icon like 'back' comes out pixel-identical whether it's drawn
+        here or on DevMenu's own header. Kept in sync with DevMenu._load_icon
+        on purpose — if that method's scaling logic changes, mirror it here too."""
+        path = os.path.join('assets', 'ui', 'dev_menu', 'icons', f'{icon_key}.png')
+        try:
+            raw = pygame.image.load(path).convert_alpha()
+        except (FileNotFoundError, pygame.error):
+            return pygame.Surface((box_size, box_size), pygame.SRCALPHA)
+
+        content_rect = raw.get_bounding_rect(min_alpha=1)
+        if content_rect.width <= 0 or content_rect.height <= 0:
+            content_rect = raw.get_rect()
+        raw = raw.subsurface(content_rect).copy()
+
+        iw, ih = raw.get_size()
+        scale = min(box_size / max(1, iw), box_size / max(1, ih))
+
+        nw = max(1, round(iw * scale))
+        nh = max(1, round(ih * scale))
+        if scale >= 1.0:
+            # Enlarging: blow up to a whole-number multiple first (crisp,
+            # blocky), then point-sample down to the exact target size, so
+            # edges stay hard instead of anti-aliased.
+            prescale = max(1, math.ceil(scale) * 2)
+            big = pygame.transform.scale(raw, (iw * prescale, ih * prescale))
+            scaled = pygame.transform.scale(big, (nw, nh))
+        else:
+            # Shrinking: these are flat-color/line icons, not photos, so
+            # smoothscale's interpolation just reads as smeared/blurry
+            # (same reasoning DevMenu._load_icon gives for avoiding it on
+            # the enlarge path). Point-sample here too instead.
+            scaled = pygame.transform.scale(raw, (nw, nh))
+
+        canvas = pygame.Surface((box_size, box_size), pygame.SRCALPHA)
+        canvas.blit(scaled, ((box_size - nw) // 2, (box_size - nh) // 2))
+        return canvas
 
     def deactivate(self):
         """Close the room editor and always restore key-repeat to default.
@@ -654,6 +851,9 @@ class RoomEditor:
             self.selected_group = None
             self.last_click_index = -1
             self.last_click_time = 0
+            self._back_hovered = False
+            self._back_hover_anim = 0.0
+            self._context_menu = None
 
             # Lazy-init the object editor on first open — skip if already created
             if self.object_editor is None:
@@ -723,25 +923,118 @@ class RoomEditor:
         if hasattr(event, 'pos'):
             self._logical_mouse_pos = tuple(event.pos)
 
-        # Text-field modal is open — swallow all input until confirmed/cancelled
+        # A field is being typed into. Keystrokes are still fully captured
+        # here (KEYDOWN branch). A left-click inside the field being edited
+        # just moves the caret there (or extends a drag-selection); a
+        # left-click anywhere else commits the field (same as pressing
+        # Enter) and falls through to the normal click handling below, in
+        # the same pass — so clicking straight from one text box into
+        # another commits-and-switches in one click instead of requiring
+        # Enter first.
         if self.editing_field is not None:
             if event.type == pygame.KEYDOWN:
+                mods = pygame.key.get_mods()
+                ctrl = bool(mods & (pygame.KMOD_CTRL | pygame.KMOD_META))
+                shift = bool(mods & pygame.KMOD_SHIFT)
+
                 if event.key == pygame.K_RETURN:
                     self._finish_text_input()
                 elif event.key == pygame.K_ESCAPE:
                     self.editing_field = None
                     self.text_input = ""
-                elif event.key == pygame.K_BACKSPACE:
-                    self.text_input = self.text_input[:-1]
+                    self.cursor_pos = 0
+                    self.selection_anchor = None
+                    self._renaming_group_original = None
                 elif event.key == pygame.K_TAB:
                     # Tab commits the current field and advances to the next one
                     self._finish_text_input()
                     self._next_form_field()
+                elif ctrl and event.key == pygame.K_a:
+                    self.selection_anchor = 0
+                    self.cursor_pos = len(self.text_input)
+                elif ctrl and event.key in (pygame.K_c, pygame.K_x):
+                    if self._has_text_selection():
+                        s, e = self._text_selection_range()
+                        uk.clipboard_set_text(self.text_input[s:e])
+                        if event.key == pygame.K_x:
+                            self._delete_text_selection()
+                elif ctrl and event.key == pygame.K_v:
+                    self._insert_into_text_input(uk.clipboard_get_text())
+                elif event.key == pygame.K_LEFT:
+                    if shift:
+                        if self.selection_anchor is None:
+                            self.selection_anchor = self.cursor_pos
+                        self.cursor_pos = max(0, self.cursor_pos - 1)
+                    elif self._has_text_selection():
+                        self.cursor_pos = self._text_selection_range()[0]
+                        self.selection_anchor = None
+                    else:
+                        self.cursor_pos = max(0, self.cursor_pos - 1)
+                elif event.key == pygame.K_RIGHT:
+                    if shift:
+                        if self.selection_anchor is None:
+                            self.selection_anchor = self.cursor_pos
+                        self.cursor_pos = min(len(self.text_input), self.cursor_pos + 1)
+                    elif self._has_text_selection():
+                        self.cursor_pos = self._text_selection_range()[1]
+                        self.selection_anchor = None
+                    else:
+                        self.cursor_pos = min(len(self.text_input), self.cursor_pos + 1)
+                elif event.key == pygame.K_HOME:
+                    if shift and self.selection_anchor is None:
+                        self.selection_anchor = self.cursor_pos
+                    elif not shift:
+                        self.selection_anchor = None
+                    self.cursor_pos = 0
+                elif event.key == pygame.K_END:
+                    if shift and self.selection_anchor is None:
+                        self.selection_anchor = self.cursor_pos
+                    elif not shift:
+                        self.selection_anchor = None
+                    self.cursor_pos = len(self.text_input)
+                elif event.key == pygame.K_BACKSPACE:
+                    if not self._delete_text_selection() and self.cursor_pos > 0:
+                        self.text_input = self.text_input[:self.cursor_pos - 1] + self.text_input[self.cursor_pos:]
+                        self.cursor_pos -= 1
+                elif event.key == pygame.K_DELETE:
+                    if not self._delete_text_selection() and self.cursor_pos < len(self.text_input):
+                        self.text_input = self.text_input[:self.cursor_pos] + self.text_input[self.cursor_pos + 1:]
                 else:
-                    # Cap at 50 chars; reject non-printable codes (e.g. arrow keys)
-                    if len(self.text_input) < 50 and event.unicode.isprintable():
-                        self.text_input += event.unicode
-            return None
+                    # Reject non-printable codes (e.g. arrow keys); length
+                    # cap and selection-replace are handled in the helper.
+                    if event.unicode and event.unicode.isprintable():
+                        self._insert_into_text_input(event.unicode)
+                self.cursor_blink = 0
+                return None
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if self._active_edit_rect is not None and self._active_edit_rect.collidepoint(event.pos):
+                    idx = self._text_index_from_x(event.pos[0])
+                    if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                        if self.selection_anchor is None:
+                            self.selection_anchor = self.cursor_pos
+                    else:
+                        self.selection_anchor = idx
+                    self.cursor_pos = idx
+                    self._text_drag = True
+                    self.cursor_blink = 0
+                    return None
+                self._finish_text_input()
+                # No return — let this same click continue on into the
+                # normal handling below, which may open a different field
+                # for editing immediately (or hit a button, etc).
+            elif event.type == pygame.MOUSEMOTION:
+                if self._text_drag and self._active_edit_rect is not None:
+                    # Clamp to the box so dragging past an edge still
+                    # selects to that edge, same as a normal textbox.
+                    x = max(self._active_edit_rect.left, min(event.pos[0], self._active_edit_rect.right))
+                    self.cursor_pos = self._text_index_from_x(x)
+                    self.cursor_blink = 0
+                return None
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                self._text_drag = False
+                return None
+            else:
+                return None
 
         # Background sub-panel (Room Settings) is open — swallow all input
         # until it's closed, same convention as the text-field modal above.
@@ -759,6 +1052,12 @@ class RoomEditor:
         # Room BGS dropdown (Room Settings) is open — same convention.
         if self.current_view == 'edit' and self._bgs_dropdown_open:
             return self.handle_bgs_dropdown_event(event)
+
+        # Group/room right-click context menu is open — swallow everything
+        # else (option click, dismiss-click, ESC), same convention as the
+        # dropdowns above.
+        if self._context_menu is not None:
+            return self._handle_context_menu_event(event)
 
         # Room Music/BGS volume sliders (Room Settings) — these live inline
         # in the edit view rather than behind a modal swallow-all flag like
@@ -784,9 +1083,41 @@ class RoomEditor:
         if self.current_view == 'view_room':
             return self._handle_view_room_input(event)
 
+        # Right-click a group/room row to open its context menu (Rename —
+        # groups only — and Delete). Only meaningful in the groups/rooms
+        # list views; left-click handling for the same rows is below.
+        if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 3
+                and self.current_view in ('groups', 'rooms')):
+            self._open_row_context_menu(event.pos)
+            return None
+
         # Handle mouse clicks for menu navigation
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             mouse_pos = event.pos
+
+            # Header back arrow. On 'groups' this leaves the whole Room
+            # Editor back to the Dev Menu; on 'rooms' it just steps back up
+            # to 'groups' — same behaviour as ESC in each case (see the
+            # K_ESCAPE handling below).
+            #
+            # NOTE: the 'groups' case must NOT return the same 'close'
+            # signal DevMenu's own ESC-at-main-screen handler returns (see
+            # dev_menu.py's K_ESCAPE case) - that string means "close the
+            # whole dev overlay back to gameplay". Returning it here was
+            # causing the caller to tear down the DevMenu too, since it
+            # can't tell the two cases apart. 'back_to_dev_menu' is the
+            # distinct signal the caller should use to reopen/reveal the
+            # Dev Tools menu instead of closing everything.
+            if self.current_view in ('groups', 'rooms') and self._back_rect.collidepoint(mouse_pos):
+                if self.current_view == 'groups':
+                    self.deactivate()
+                    return 'back_to_dev_menu'
+                else:
+                    self.current_view = 'groups'
+                    self.selected_index = 0
+                    self.hover_index = -1
+                    self.selected_group = None
+                    return None
 
             for clickable in self.clickable_rects:
                 if clickable['rect'].collidepoint(mouse_pos):
@@ -830,6 +1161,9 @@ class RoomEditor:
         # Handle mouse motion for hover effects
         if event.type == pygame.MOUSEMOTION:
             mouse_pos = event.pos
+            self._last_input = 'mouse'
+            self._back_hovered = (self.current_view in ('groups', 'rooms')
+                                   and self._back_rect.collidepoint(mouse_pos))
             self.hover_index = -1
             for clickable in self.clickable_rects:
                 if clickable['rect'].collidepoint(mouse_pos):
@@ -842,8 +1176,11 @@ class RoomEditor:
                 # ESC walks back up the view hierarchy:
                 # groups → close editor | rooms → groups | edit → wherever we came from
                 if self.current_view == 'groups':
+                    # Same "go back to the Dev Menu" signal as the header
+                    # back-arrow click above, not a full 'close' - see the
+                    # note on that branch.
                     self.deactivate()
-                    return 'close'
+                    return 'back_to_dev_menu'
                 elif self.current_view == 'rooms':
                     self.current_view = 'groups'
                     self.selected_index = 0
@@ -875,24 +1212,20 @@ class RoomEditor:
     def _handle_item_action(self):
         """Handle when user clicks or presses Enter on a menu item"""
         if self.current_view == 'groups':
-            total_items = len(self.room_manager.groups) + 2
+            total_items = len(self.room_manager.groups) + 1
             if self.selected_index < len(self.room_manager.groups):
                 self.selected_group = self.room_manager.groups[self.selected_index]
                 self.current_view = 'rooms'
                 self.selected_index = 0
                 self.hover_index = -1
             elif self.selected_index == len(self.room_manager.groups):
-                self.editing_field = 'new_group'
-                self.text_input = ""
-            elif self.selected_index == len(self.room_manager.groups) + 1:
-                self.deactivate()
-                return 'close'
+                self._begin_text_edit('new_group', "")
 
         elif self.current_view == 'rooms':
             if not self.selected_group:
                 return None
             rooms_in_group = self.room_manager.get_rooms_in_group(self.selected_group)
-            total_items = len(rooms_in_group) + 2
+            total_items = len(rooms_in_group) + 1
 
             if self.selected_index < len(rooms_in_group):
                 # Keyboard Enter on room - open edit view (double-click handled separately in mouse code)
@@ -911,11 +1244,6 @@ class RoomEditor:
                     'height': '1800',
                     'group': self.selected_group
                 }
-            elif self.selected_index == len(rooms_in_group) + 1:
-                self.current_view = 'groups'
-                self.selected_index = 0
-                self.hover_index = -1
-                self.selected_group = None
 
         elif self.current_view == 'create':
             field = self.create_form_fields[self.selected_index]
@@ -932,8 +1260,7 @@ class RoomEditor:
                 next_idx = (current_idx + 1) % len(groups)
                 self.create_form['group'] = groups[next_idx]
             else:
-                self.editing_field = field
-                self.text_input = self.create_form[field]
+                self._begin_text_edit(field, self.create_form[field])
 
         elif self.current_view == 'edit':
             edit_fields = ['name', 'width', 'height', 'group',
@@ -983,32 +1310,32 @@ class RoomEditor:
                 if self._bg_panel_open:
                     self._ensure_bg_scanned()
             else:
-                self.editing_field = field
                 if field == 'name':
-                    self.text_input = self.editing_room.name
+                    self._begin_text_edit(field, self.editing_room.name)
                 elif field == 'width':
-                    self.text_input = str(self.editing_room.width)
+                    self._begin_text_edit(field, str(self.editing_room.width))
                 elif field == 'height':
-                    self.text_input = str(self.editing_room.height)
+                    self._begin_text_edit(field, str(self.editing_room.height))
 
         return None
 
     def _handle_groups_input(self, event):
         """Navigate through groups"""
-        total_items = len(self.room_manager.groups) + 2
+        total_items = len(self.room_manager.groups) + 1
 
         if event.key in (pygame.K_UP, pygame.K_w):
+            self._last_input = 'keyboard'
             self.selected_index = (self.selected_index - 1) % total_items
         elif event.key in (pygame.K_DOWN, pygame.K_s):
+            self._last_input = 'keyboard'
             self.selected_index = (self.selected_index + 1) % total_items
         elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
             return self._handle_item_action()
         elif event.key == pygame.K_DELETE:
             if 0 <= self.selected_index < len(self.room_manager.groups):
                 group_name = self.room_manager.groups[self.selected_index]
-                if group_name != "Default":
-                    self.room_manager.delete_group(group_name)
-                    self.selected_index = min(self.selected_index, len(self.room_manager.groups))
+                self.room_manager.delete_group(group_name)
+                self.selected_index = min(self.selected_index, len(self.room_manager.groups))
 
         return None
 
@@ -1213,11 +1540,13 @@ class RoomEditor:
             return None
 
         rooms_in_group = self.room_manager.get_rooms_in_group(self.selected_group)
-        total_items = len(rooms_in_group) + 2
+        total_items = len(rooms_in_group) + 1
 
         if event.key in (pygame.K_UP, pygame.K_w):
+            self._last_input = 'keyboard'
             self.selected_index = (self.selected_index - 1) % total_items
         elif event.key in (pygame.K_DOWN, pygame.K_s):
+            self._last_input = 'keyboard'
             self.selected_index = (self.selected_index + 1) % total_items
         elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
             return self._handle_item_action()
@@ -1231,11 +1560,103 @@ class RoomEditor:
 
         return None
 
+    # ------------------------------------------------------------------ right-click context menu
+
+    def _open_row_context_menu(self, mouse_pos):
+        """Build and open the context menu for whichever group/room row (if
+        any) is under `mouse_pos`. No-ops when the click misses every row,
+        or lands on the "New Group"/"New Room" add-row instead of a real
+        item. Rename and Delete are both available on every group,
+        including 'Default' — if room_manager.py relies on 'Default'
+        existing as a fallback for ungrouped/orphaned rooms (plausible,
+        given it was the one name room_editor.py itself hardcoded — see
+        the create-room form's initial state above), renaming or deleting
+        it here is on the person doing it, not guarded against."""
+        target_index = None
+        for clickable in self.clickable_rects:
+            if clickable.get('type') == 'item' and clickable['rect'].collidepoint(mouse_pos):
+                target_index = clickable['index']
+                break
+        if target_index is None:
+            return
+
+        if self.current_view == 'groups':
+            groups = self.room_manager.groups
+            if not (0 <= target_index < len(groups)):
+                return
+            name = groups[target_index]
+            self._context_menu = {
+                'kind': 'group', 'name': name, 'index': target_index,
+                'pos': mouse_pos,
+                'options': [('rename_group', 'Rename'), ('delete_group', 'Delete')],
+                'rects': {},
+            }
+        elif self.current_view == 'rooms':
+            rooms_in_group = (self.room_manager.get_rooms_in_group(self.selected_group)
+                               if self.selected_group else [])
+            if not (0 <= target_index < len(rooms_in_group)):
+                return
+            room = rooms_in_group[target_index]
+            self._context_menu = {
+                'kind': 'room', 'name': room.name, 'index': target_index,
+                'pos': mouse_pos, 'options': [('delete_room', 'Delete')], 'rects': {},
+            }
+
+    def _handle_context_menu_event(self, event) -> "str | None":
+        """Swallow all input while the context menu is open — same
+        convention as the Weather/Music/BGS dropdowns. Clicking an option
+        runs it; clicking anywhere else (either button) or pressing ESC
+        just dismisses the menu without acting."""
+        menu = self._context_menu
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button in (1, 3):
+            for action_id, rect in menu['rects'].items():
+                if rect.collidepoint(event.pos):
+                    self._run_context_menu_action(action_id)
+                    return None
+            self._context_menu = None
+            return None
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            self._context_menu = None
+            return None
+        return None
+
+    def _run_context_menu_action(self, action_id):
+        """Carry out whichever context-menu option was clicked, then close
+        the menu. Rename doesn't apply immediately — it hands off to the
+        same inline text-editing flow the 'new group' row already uses
+        (see _finish_text_input), so it commits on Enter/click-away like
+        every other text field in this editor."""
+        menu = self._context_menu
+        self._context_menu = None
+        if menu is None:
+            return
+
+        if action_id == 'delete_group':
+            name = menu['name']
+            self.room_manager.delete_group(name)
+            if self.selected_group == name:
+                self.selected_group = None
+            self.selected_index = min(self.selected_index, len(self.room_manager.groups))
+
+        elif action_id == 'rename_group':
+            self._begin_text_edit('rename_group', menu['name'])
+            self._renaming_group_original = menu['name']
+            self.selected_index = menu['index']
+
+        elif action_id == 'delete_room':
+            rooms_in_group = (self.room_manager.get_rooms_in_group(self.selected_group)
+                               if self.selected_group else [])
+            if 0 <= menu['index'] < len(rooms_in_group):
+                self.room_manager.delete_room(rooms_in_group[menu['index']])
+                self.selected_index = min(self.selected_index, max(0, len(rooms_in_group) - 1))
+
     def _handle_create_input(self, event):
         """Handle form inputs for creating a room"""
         if event.key in (pygame.K_UP, pygame.K_w):
+            self._last_input = 'keyboard'
             self.selected_index = (self.selected_index - 1) % len(self.create_form_fields)
         elif event.key in (pygame.K_DOWN, pygame.K_s):
+            self._last_input = 'keyboard'
             self.selected_index = (self.selected_index + 1) % len(self.create_form_fields)
         elif event.key in (pygame.K_RETURN, pygame.K_SPACE):
             return self._handle_item_action()
@@ -1253,6 +1674,7 @@ class RoomEditor:
         LAST_FIELD            = 8           # 'background' — the row just above the buttons
 
         if event.key in (pygame.K_UP, pygame.K_w):
+            self._last_input = 'keyboard'
             if self.selected_index in BUTTON_INDICES:
                 # All three buttons are in the same row — UP goes to the field above
                 self.selected_index = LAST_FIELD
@@ -1263,6 +1685,7 @@ class RoomEditor:
             else:
                 self.selected_index = (self.selected_index - 1) % len(edit_fields)
         elif event.key in (pygame.K_DOWN, pygame.K_s):
+            self._last_input = 'keyboard'
             if self.selected_index == LAST_FIELD:
                 # Drop down from the last field onto the first button
                 self.selected_index = BUTTON_INDICES[0]
@@ -1273,6 +1696,7 @@ class RoomEditor:
             elif self.selected_index not in BUTTON_INDICES:
                 self.selected_index = (self.selected_index + 1) % len(edit_fields)
         elif event.key in (pygame.K_LEFT, pygame.K_a):
+            self._last_input = 'keyboard'
             if self.selected_index in BUTTON_INDICES:
                 idx = list(BUTTON_INDICES).index(self.selected_index)
                 self.selected_index = BUTTON_INDICES[(idx - 1) % len(BUTTON_INDICES)]
@@ -1280,6 +1704,7 @@ class RoomEditor:
                 idx = list(WEATHER_MUSIC_BGS_ROW).index(self.selected_index)
                 self.selected_index = WEATHER_MUSIC_BGS_ROW[(idx - 1) % len(WEATHER_MUSIC_BGS_ROW)]
         elif event.key in (pygame.K_RIGHT, pygame.K_d):
+            self._last_input = 'keyboard'
             if self.selected_index in BUTTON_INDICES:
                 idx = list(BUTTON_INDICES).index(self.selected_index)
                 self.selected_index = BUTTON_INDICES[(idx + 1) % len(BUTTON_INDICES)]
@@ -2047,6 +2472,73 @@ class RoomEditor:
                 nimbus_path_editor.room_width = target_room.width
                 nimbus_path_editor.room_height = target_room.height
 
+    def _begin_text_edit(self, field, text):
+        """Open `field` for typing with `text` as its starting value —
+        the shared setup every editing_field/text_input call site needs
+        (cursor at the end, no selection), so cursor state can't be
+        forgotten at some sites and not others."""
+        self.editing_field = field
+        self.text_input = text
+        self.cursor_pos = len(text)
+        self.selection_anchor = None
+        self.cursor_blink = 0
+
+    def _has_text_selection(self):
+        return self.selection_anchor is not None and self.selection_anchor != self.cursor_pos
+
+    def _text_selection_range(self):
+        a, b = self.selection_anchor, self.cursor_pos
+        return (a, b) if a <= b else (b, a)
+
+    def _delete_text_selection(self):
+        """Removes the selected text (if any), leaving the cursor at the
+        start of where it was. Returns True if anything was deleted."""
+        if not self._has_text_selection():
+            return False
+        s, e = self._text_selection_range()
+        self.text_input = self.text_input[:s] + self.text_input[e:]
+        self.cursor_pos = s
+        self.selection_anchor = None
+        return True
+
+    def _insert_into_text_input(self, s):
+        """Types `s` in at the cursor, replacing the selection if any and
+        respecting the field's max length. Used for both single keystrokes
+        and pasted text. Filters/length-checks happen before touching the
+        selection, so an empty or all-non-printable `s` (e.g. a stray
+        modifier-key keystroke, or pasting an empty clipboard) leaves any
+        existing selection untouched instead of silently deleting it."""
+        s = "".join(ch for ch in s if ch.isprintable())
+        if not s:
+            return
+        if self._has_text_selection():
+            self._delete_text_selection()
+        space = self._text_max_len - len(self.text_input)
+        if space <= 0:
+            return
+        s = s[:space]
+        self.text_input = self.text_input[:self.cursor_pos] + s + self.text_input[self.cursor_pos:]
+        self.cursor_pos += len(s)
+
+    def _text_index_from_x(self, x):
+        """Map an absolute mouse x-coordinate to the character index in
+        self.text_input whose caret sits closest to it, using whichever
+        row/font is currently being edited (set by the draw call — see
+        _active_edit_text_x / _active_edit_font)."""
+        if self._active_edit_font is None or self._active_edit_text_x is None or not self.text_input:
+            return 0
+        font = self._active_edit_font
+        widths = [0]
+        for i in range(1, len(self.text_input) + 1):
+            widths.append(font.size(self.text_input[:i])[0])
+        rel_x = x - self._active_edit_text_x
+        best_i, best_d = 0, abs(widths[0] - rel_x)
+        for i, w in enumerate(widths):
+            d = abs(w - rel_x)
+            if d < best_d:
+                best_i, best_d = i, d
+        return best_i
+
     def _finish_text_input(self):
         """Apply the text we just typed"""
         if self.editing_field is None:
@@ -2071,9 +2563,33 @@ class RoomEditor:
         elif self.current_view == 'groups':
             if self.editing_field == 'new_group' and self.text_input.strip():
                 self.room_manager.create_group(self.text_input.strip())
+            elif self.editing_field == 'rename_group':
+                new_name = self.text_input.strip()
+                old_name = self._renaming_group_original
+                if new_name and old_name and new_name != old_name:
+                    self._rename_group(old_name, new_name)
 
         self.editing_field = None
         self.text_input = ""
+        self.cursor_pos = 0
+        self.selection_anchor = None
+        self._renaming_group_original = None
+
+    def _rename_group(self, old_name, new_name):
+        """Rename a group in place: relabel its entry in
+        room_manager.groups and update every room currently in it, so
+        they stay grouped together under the new name instead of falling
+        out to Default. Bails out quietly on a collision with an existing
+        group name rather than silently merging the two groups."""
+        groups = self.room_manager.groups
+        if old_name not in groups or new_name in groups:
+            return
+        rooms = self.room_manager.get_rooms_in_group(old_name)
+        groups[groups.index(old_name)] = new_name
+        for room in rooms:
+            room.group = new_name
+        if self.selected_group == old_name:
+            self.selected_group = new_name
 
     def _next_form_field(self):
         """Jump to the next field in the form"""
@@ -2081,8 +2597,7 @@ class RoomEditor:
             self.selected_index = (self.selected_index + 1) % len(self.create_form_fields)
             field = self.create_form_fields[self.selected_index]
             if field not in ['create', 'cancel', 'group']:
-                self.editing_field = field
-                self.text_input = self.create_form[field]
+                self._begin_text_edit(field, self.create_form[field])
 
     def _create_room(self):
         """Actually create the new room"""
@@ -3154,6 +3669,9 @@ class RoomEditor:
         event_editor = getattr(self.object_editor, 'event_editor', None)
         if event_editor is not None and event_editor.active:
             return True
+        transition_config = getattr(self.object_editor, 'transition_config', None)
+        if transition_config is not None and transition_config.active:
+            return True
         if (self.entity_editor and self.entity_editor.active and
                 self.entity_editor._dialogue_popup is not None):
             return True
@@ -3178,6 +3696,17 @@ class RoomEditor:
         position is over that editor's own fixed-scale palette/panel (UI
         chrome is never zoomed, so it must keep receiving real coordinates).
         """
+        # The room-transition config dialog is a fixed modal drawn straight
+        # onto the real screen (see TransitionConfigDialog), never into the
+        # zoomed room-content surface -- so like palette UI it needs raw
+        # screen coordinates. Without this exemption its buttons are only
+        # clickable at native zoom, since both the fit-to-screen overview
+        # and continuous Ctrl+scroll zoom below would otherwise rescale the
+        # click position right off of them.
+        transition_config = getattr(self.object_editor, 'transition_config', None)
+        if transition_config is not None and transition_config.active:
+            return event
+
         if self.zoom_active:
             # Fit-to-screen overview: sub-editors were rendered with camera
             # (0, 0) into a surface scaled by _zoom_scale and blitted at
@@ -4134,6 +4663,11 @@ class RoomEditor:
     def update(self, dt, mouse_pos=None):
         """Update animations and camera"""
         if not self.active:
+            # Same one-shot-vs-debounce problem as below: keep asking every
+            # frame while inactive rather than gating on _owns_text_cursor,
+            # so the grace-period clear in ui_kit.py actually gets to commit.
+            uk.set_text_cursor(False)
+            self._owns_text_cursor = False
             return
 
         # Check if object editor wants to return to source room after spawn placement
@@ -4159,11 +4693,22 @@ class RoomEditor:
 
         # Smooth hover animations
         for i in range(len(self.hover_anim)):
-            # Highlight both selected AND hovered items
-            if i == self.selected_index or i == self.hover_index:
+            # Only glow for the input method actually driving selection right
+            # now — mouse hover glows hover_index, keyboard nav glows
+            # selected_index. Without this split, selected_index's default
+            # of 0 made the first item look hovered even with no input.
+            lit = (self._last_input == 'mouse' and i == self.hover_index) or \
+                  (self._last_input == 'keyboard' and i == self.selected_index)
+            if lit:
                 self.hover_anim[i] = min(1.0, self.hover_anim[i] + dt * 5)
             else:
                 self.hover_anim[i] = max(0.0, self.hover_anim[i] - dt * 5)
+
+        # Header back-arrow hover glow — same smoothing rate as DevMenu's
+        # header buttons (config/back), separate from the list hover_anim
+        # array above since it isn't tied to a clickable_rects index.
+        target_back_hover = 1.0 if self._back_hovered else 0.0
+        self._back_hover_anim += (target_back_hover - self._back_hover_anim) * min(1.0, dt * 12.0)
 
         # Update toolbar in room view
         if self.current_view == 'view_room':
@@ -4319,6 +4864,30 @@ class RoomEditor:
                     self.camera.y = max(0,
                                         min(self.camera.y, (self.viewing_room.height * RENDER_SCALE) - viewport_h))
 
+        # I-beam over any name/width/height/group-style text field — built
+        # from last frame's draw() (see _draw_field_row), same lag the
+        # existing clickable_rects hit-testing already lives with.
+        #
+        # This used to call set_text_cursor(hovering) unconditionally every
+        # frame, then got changed to only call it while hovering_text_field
+        # was True, releasing with a one-shot set_text_cursor(False) the
+        # instant hovering went False (guarded by _owns_text_cursor so that
+        # release only ever fired once). That one-shot release predates
+        # _apply_cursor_kind's clear-grace-period debounce in ui_kit.py: a
+        # request to drop back to the arrow only commits once it's been
+        # asked for continuously for _CURSOR_CLEAR_GRACE_MS. Asking once and
+        # then going quiet (as the old _owns_text_cursor-gated elif did)
+        # starts that countdown but never lets it finish, so the debounce
+        # never commits and the I-beam sticks forever after the first hover.
+        #
+        # The grace period itself is what now prevents the flicker the old
+        # one-shot guard was trying to avoid (a "more specific" cursor
+        # claimed later in draw() — hand/move/resize — still applies
+        # instantly and overrides a pending clear), so it's safe to just
+        # keep asking every frame like update_hover_cursor does.
+        hovering_text_field = any(r.collidepoint(self._logical_mouse_pos) for r in self.text_field_rects)
+        uk.set_text_cursor(hovering_text_field)
+        self._owns_text_cursor = hovering_text_field
 
     def draw(self, screen):
         """Draw the current view"""
@@ -4328,6 +4897,10 @@ class RoomEditor:
 
         # Clear clickable rects at start of each frame
         self.clickable_rects = []
+        self.text_field_rects = []
+        self._active_edit_rect = None
+        self._active_edit_text_x = None
+        self._active_edit_font = None
 
         # Room view gets special rendering
         if self.current_view == 'view_room':
@@ -4336,7 +4909,7 @@ class RoomEditor:
 
         # Draw menu interface
         self._draw_background(screen)
-        self._draw_sidebar(screen)
+        self._draw_header(screen)
 
         if self.current_view == 'groups':
             self._draw_groups_view(screen)
@@ -4347,8 +4920,25 @@ class RoomEditor:
         elif self.current_view == 'edit':
             self._draw_edit_view(screen)
 
-        if self.editing_field is not None:
-            self._draw_text_input_overlay(screen)
+        self._draw_footer(screen)
+
+        # Right-click context menu (groups/rooms list rows) draws last so
+        # it sits above the list itself.
+        if self._context_menu is not None:
+            self._draw_context_menu(screen)
+
+        # name/width/height (create + edit forms) and new_group (groups
+        # list) are the only fields that ever set self.editing_field, and
+        # all of them are now edited inline in their own row/card — see
+        # _draw_field_row and _draw_new_group_row — so there's no
+        # remaining case that needs a popup here.
+
+        # Resolve the frame's cursor last, now that every clickable widget
+        # drawn above (checkboxes, Weather/Room Music/Room BGS dropdown
+        # fields and their popup rows) has had a chance to register itself
+        # via register_hoverable. Yields to the I-beam set in update() —
+        # see update_hover_cursor's docstring.
+        uk.update_hover_cursor(self._logical_mouse_pos)
 
     def _draw_view_room(self, screen):
         """Render the room with all its layers and editors"""
@@ -5137,317 +5727,674 @@ class RoomEditor:
                                  (self.screen_width, py), 1)
 
     def _draw_background(self, screen):
-        """Draw the menu background with gradient and animated grid.
+        """Flat neutral backdrop for the room editor's menu screens — same
+        "functional editor first" two-tone treatment as DevMenu.draw()."""
+        w, h = self.screen_width, self.screen_height
+        uk.draw_rect_on(screen, (8, 11, 17), pygame.Rect(0, 0, w, h), 0, 0)
+        uk.draw_rect_on(screen, (10, 13, 20),
+                         pygame.Rect(0, self.header_h, w, h - self.header_h - self.footer_h), 0, 0)
 
-        The gradient is drawn one horizontal line at a time which is fine for
-        the menu screen — it only runs when we're NOT in view_room mode.
-        """
-        # Smooth gradient from top to bottom
-        for y in range(self.screen_height):
-            progress = y / self.screen_height
-            r = int(self.colors['bg'][0] + (self.colors['panel'][0] - self.colors['bg'][0]) * progress)
-            g = int(self.colors['bg'][1] + (self.colors['panel'][1] - self.colors['bg'][1]) * progress)
-            b = int(self.colors['bg'][2] + (self.colors['panel'][2] - self.colors['bg'][2]) * progress)
-            screen.draw_line((r, g, b), (0, y), (self.screen_width, y))
+    def _draw_header(self, screen):
+        """Full-width title bar, styled like DevMenu's header. Shows a
+        per-view title and a short breadcrumb-style subtitle."""
+        w = self.screen_width
+        uk.draw_rect_on(screen, (12, 15, 23), pygame.Rect(0, 0, w, self.header_h), 0, 0)
+        uk.draw_rect_on(screen, (43, 49, 63), pygame.Rect(0, self.header_h - 1, w, 1), 0, 0)
 
-        # Animated grid pattern
-        offset = int(self.anim_timer * 20) % (TILE_SIZE * 2)
-        for x in range(-offset, self.screen_width, TILE_SIZE * 2):
-            screen.draw_line(self.colors['grid'], (x, 0), (x, self.screen_height), 1)
-        for y in range(-offset, self.screen_height, TILE_SIZE * 2):
-            screen.draw_line(self.colors['grid'], (0, y), (self.screen_width, y), 1)
+        if self.current_view == 'rooms' and self.selected_group:
+            title_text, subtitle_text = self.selected_group.upper(), 'Rooms'
+        elif self.current_view == 'create':
+            title_text, subtitle_text = 'CREATE ROOM', f"New room in {self.create_form.get('group', '')}"
+        elif self.current_view == 'edit' and self.editing_room:
+            title_text, subtitle_text = f"EDIT: {self.editing_room.name}".upper(), 'Room settings'
+        else:
+            title_text, subtitle_text = 'ROOM EDITOR', 'Groups'
 
-    def _draw_sidebar(self, screen):
-        """Draw the info sidebar"""
-        sidebar_rect = pygame.Rect(0, 0, self.sidebar_width, self.screen_height)
-        screen.draw_rect(self.colors['panel'], sidebar_rect)
+        title_surf = self.font_title.render(title_text, True, uk.Theme.TEXT_PRIMARY)
+        title_rect = title_surf.get_rect(centerx=w // 2, centery=self.header_h // 2)
+        screen.blit(title_surf, title_rect)
 
-        # Nice glow on the right edge
-        for i in range(5):
-            alpha = 100 - i * 20
-            color = (*self.colors['accent'], alpha)
-            surf = pygame.Surface((2, self.screen_height), pygame.SRCALPHA)
-            surf.fill(color)
-            screen.blit(surf, (self.sidebar_width - i, 0))
+        sub_surf = self.font_small.render(subtitle_text, True, uk.Theme.TEXT_MUTED)
+        sub_rect = sub_surf.get_rect(centerx=w // 2,
+                                      centery=(title_rect.bottom + self.header_h) // 2)
+        screen.blit(sub_surf, sub_rect)
 
-        y_pos = self.padding
+        # Shown on 'groups' (leaves the whole Room Editor for the Dev Menu)
+        # and 'rooms' (steps back up to 'groups') — same spot/behaviour as
+        # DevMenu's own header back arrow either way; see handle_input's
+        # click handler and the K_ESCAPE case for what each view does.
+        if self.current_view in ('groups', 'rooms'):
+            self._draw_back_button(screen)
 
-        # Title
-        title = self.font_large.render("ROOM EDITOR", True, self.colors['accent'])
-        screen.blit(title, (self.padding, y_pos))
-        y_pos += 50
+    def _draw_back_button(self, screen):
+        """Header back arrow, top-left — mirrors DevMenu._draw_back_button's
+        construction (animated hover glow) rather than the flat on/off
+        _draw_icon_button used for the room-row View/Settings buttons."""
+        accent = uk.Theme.GOLD
+        t = round(self._back_hover_anim * 20) / 20.0
 
-        screen.draw_line(self.colors['accent'],
-                         (self.padding, y_pos),
-                         (self.sidebar_width - self.padding, y_pos), 2)
-        y_pos += 30
+        base = uk.lerp_color((22, 26, 35), (28, 33, 44), t)
+        border = uk.lerp_color(uk.Theme.CARD_BORDER, accent, t * 0.78)
+        uk.draw_panel(screen, self._back_rect, bg=(*base, 255), border=border,
+                      border_width=1, radius=8, shadow=False)
 
-        # Quick stats
-        stats = [
-            ("Total Rooms", len(self.room_manager.rooms)),
-            ("Groups", len(self.room_manager.groups)),
-            ("Current Room", self.room_manager.current_room.name if self.room_manager.current_room else "None")
-        ]
+        if t > 0.01:
+            uk.draw_soft_glow(screen, self._back_rect.center, 22, accent, max_alpha=int(25 * t))
 
-        for label, value in stats:
-            label_surf = self.font_small.render(label, True, self.colors['text_dim'])
-            screen.blit(label_surf, (self.padding, y_pos))
-            y_pos += 20
+        icon_rect = self._back_icon.get_rect(center=self._back_rect.center)
+        uk.blit_surface(screen, self._back_icon, icon_rect, transient=False)
+        uk.register_hoverable(self._back_rect)
 
-            value_surf = self.font_medium.render(str(value), True, self.colors['text'])
-            screen.blit(value_surf, (self.padding + 10, y_pos))
-            y_pos += 35
+    def _draw_footer(self, screen):
+        """Thin bar along the bottom — purely visual, matching DevMenu's
+        footer (no navigation or status text shown there)."""
+        w, h = self.screen_width, self.screen_height
+        y = h - self.footer_h
+        uk.draw_rect_on(screen, (12, 15, 23), pygame.Rect(0, y, w, self.footer_h), 0, 0)
+        uk.draw_rect_on(screen, (43, 49, 63), pygame.Rect(0, y, w, 1), 0, 0)
 
-        # What view are we in?
-        y_pos = self.screen_height - 100
-        screen.draw_line(self.colors['accent'],
-                         (self.padding, y_pos),
-                         (self.sidebar_width - self.padding, y_pos), 2)
-        y_pos += 20
+    # ------------------------------------------------------------------ shared card/panel primitives
 
-        view_text = {
-            'groups': 'Select Group',
-            'rooms': 'Group Rooms',
-            'create': 'Create Room',
-            'edit': 'Edit Room',
-            'view_room': 'Viewing Room'
-        }
+    def _item_anim(self, index):
+        """Smoothed 0..1 hover/focus value for list/form item `index`,
+        backed by the existing self.hover_anim array (already driven every
+        frame in update()). Falls back to a plain on/off value once the
+        fixed-size animation array runs out."""
+        if 0 <= index < len(self.hover_anim):
+            return self.hover_anim[index]
+        if self._last_input == 'mouse':
+            return 1.0 if index == self.hover_index else 0.0
+        return 1.0 if index == self.selected_index else 0.0
 
-        view_label = self.font_small.render("Current View:", True, self.colors['text_dim'])
-        screen.blit(view_label, (self.padding, y_pos))
-        y_pos += 20
+    def _draw_card_shell(self, screen, rect, t, accent=None):
+        """Dark card body with a hairline border that lights up toward
+        `accent` and lifts slightly on hover/focus — same construction as
+        DevMenu._draw_card."""
+        accent = accent or uk.Theme.GOLD
+        t = round(max(0.0, min(1.0, t)) * 20) / 20.0
+        lift = int(round(2 * t))
+        draw_rect = rect.move(0, -lift)
+        base = uk.lerp_color((22, 26, 35), (28, 33, 44), t)
+        border = uk.lerp_color(uk.Theme.CARD_BORDER, accent, t * 0.78)
+        uk.draw_panel(screen, draw_rect, bg=(*base, 255), border=border, border_width=1, radius=10, shadow=False)
+        return draw_rect
 
-        view_value = self.font_medium.render(view_text[self.current_view], True, self.colors['accent'])
-        screen.blit(view_value, (self.padding, y_pos))
+    def _draw_card_dot(self, screen, draw_rect, t, accent):
+        """Colored group-identity dot, left-aligned in a list card, with a
+        soft glow while hovered/focused."""
+        center = (draw_rect.x + 40, draw_rect.centery)
+        if t > 0.01:
+            uk.draw_soft_glow(screen, center, 28, accent, max_alpha=int(25 * t))
+        uk.draw_circle_on(screen, accent, center, 13)
+        uk.draw_circle_on(screen, (18, 20, 27), center, 13, 2)
+
+    def _draw_card_icon(self, screen, draw_rect, t, accent, icon_fn):
+        """Vector icon, left-aligned in a list card, with a soft glow while
+        hovered/focused — mirrors DevMenu._draw_card's icon treatment."""
+        center = (draw_rect.x + 40, draw_rect.centery)
+        if t > 0.01:
+            uk.draw_soft_glow(screen, center, 28, accent, max_alpha=int(25 * t))
+        icon_color = uk.lerp_color(uk.Theme.TEXT_MUTED, accent, t)
+        icon_rect = pygame.Rect(0, 0, 28, 28)
+        icon_rect.center = center
+        icon_fn(screen, icon_rect, icon_color)
+
+    def _draw_card_text(self, screen, draw_rect, t, title, subtitle=None, title_color=None):
+        tx = draw_rect.x + 74
+        color = title_color if title_color is not None else uk.lerp_color(uk.Theme.TEXT_SECONDARY, uk.Theme.TEXT_PRIMARY, t)
+        title_surf = self.font_large.render(title, True, color)
+        if subtitle:
+            title_rect = title_surf.get_rect(x=tx, y=draw_rect.y + 12)
+            screen.blit(title_surf, title_rect)
+            sub_surf = self.font_small.render(subtitle, True, uk.Theme.TEXT_MUTED)
+            screen.blit(sub_surf, (tx, title_rect.bottom + 4))
+        else:
+            title_rect = title_surf.get_rect(x=tx, centery=draw_rect.centery)
+            screen.blit(title_surf, title_rect)
+
+    def _draw_text_caret(self, screen, x, y, height, color=None):
+        """Blinking vertical caret bar for text-input widgets — the thin
+        vertical line every other platform draws next to the cursor,
+        rather than rendering a literal '|' character as part of the text
+        (which sits at whatever height/weight the font's pipe glyph
+        happens to have, not a clean full-height line). Shared by the
+        inline "new group" row and the remaining field-edit modal."""
+        if int(self.cursor_blink * 2) % 2 != 0:
+            return
+        color = color or uk.Theme.TEXT_PRIMARY
+        uk.draw_rect_on(screen, color, pygame.Rect(int(x), int(y), 2, int(height)), 0, 0)
+
+    def _draw_live_text_field(self, screen, font, text_rect, click_rect):
+        """Shared tail for every row currently being typed into: draws the
+        selection highlight (if any) behind the text, the caret at
+        self.cursor_pos, and records the row's font/hit-rect so
+        handle_input can turn a click or drag into a caret/selection
+        position (see _text_index_from_x). `text_rect` is the rect the
+        live self.text_input was just blitted at; `click_rect` is what
+        counts as "inside this field" for mouse hit-testing."""
+        self._active_edit_rect = click_rect
+        self._active_edit_text_x = text_rect.x
+        self._active_edit_font = font
+
+        if self._has_text_selection():
+            s, e = self._text_selection_range()
+            sx = text_rect.x + (font.size(self.text_input[:s])[0] if s else 0)
+            ex = text_rect.x + (font.size(self.text_input[:e])[0] if e else 0)
+            sel_rect = pygame.Rect(sx, text_rect.y, max(1, ex - sx), text_rect.height)
+            uk.draw_rect_on(screen, (*uk.Theme.KI_BLUE, 90), sel_rect, 0, 0)
+
+        caret_w = font.size(self.text_input[:self.cursor_pos])[0] if self.cursor_pos else 0
+        self._draw_text_caret(screen, text_rect.x + caret_w, text_rect.y, text_rect.height)
+
+    def _draw_new_group_row(self, screen, rect):
+        """Inline replacement for the old "Enter group name" popup —
+        dropped right into the groups list, in the same card shell a real
+        group uses, so the name is typed exactly where the group itself
+        will appear once created. Confirm/cancel is still the existing
+        text-field interception in handle_input (ENTER commits, ESC
+        cancels) — only the drawing moved, nothing about the input
+        handling changed."""
+        accent = uk.Theme.GOLD
+        draw_rect = self._draw_card_shell(screen, rect, 1.0, accent)
+        self._draw_card_icon(screen, draw_rect, 1.0, accent, _draw_plus_icon)
+
+        tx = draw_rect.x + 74
+        has_text = bool(self.text_input)
+        color = uk.Theme.TEXT_PRIMARY if has_text else uk.Theme.TEXT_MUTED
+        shown = self.text_input if has_text else "Group name"
+        text_surf = self.font_large.render(shown, True, color)
+        text_rect = text_surf.get_rect(x=tx, centery=draw_rect.centery)
+        screen.blit(text_surf, text_rect)
+
+        self._draw_live_text_field(screen, self.font_large, text_rect, draw_rect)
+
+    def _draw_rename_group_row(self, screen, rect, group_name):
+        """Inline text-entry row for renaming an existing group via the
+        right-click context menu — same treatment as _draw_new_group_row,
+        just keeping the group's own accent dot instead of the "new item"
+        plus icon, since this is editing something that already exists."""
+        accent = self._hue_to_rgb(hash(group_name) % 360)
+        draw_rect = self._draw_card_shell(screen, rect, 1.0, accent)
+        self._draw_card_dot(screen, draw_rect, 1.0, accent)
+
+        tx = draw_rect.x + 74
+        has_text = bool(self.text_input)
+        color = uk.Theme.TEXT_PRIMARY if has_text else uk.Theme.TEXT_MUTED
+        shown = self.text_input if has_text else "Group name"
+        text_surf = self.font_large.render(shown, True, color)
+        text_rect = text_surf.get_rect(x=tx, centery=draw_rect.centery)
+        screen.blit(text_surf, text_rect)
+
+        self._draw_live_text_field(screen, self.font_large, text_rect, draw_rect)
+
+    def _draw_add_button(self, screen, idx):
+        """"New Group" / "New Room" — bottom-left of the middle content
+        box, built with the exact same box construction as the header
+        back button (_draw_back_button): rounded panel, gold-tinted
+        border/glow on hover, single centered PNG icon (a user-provided
+        plus icon here instead of the back arrow). Kept as a small square
+        icon-button rather than a full-width list card so it doesn't
+        compete visually with the actual groups/rooms above it.
+
+        `idx` is len(list) — same convention the old in-list version
+        used — so selection, keyboard nav and _handle_item_action all
+        keep working unchanged; only the drawing/position changed."""
+        accent = uk.Theme.GOLD
+        t = self._item_anim(idx)
+        t = round(max(0.0, min(1.0, t)) * 20) / 20.0
+
+        base = uk.lerp_color((22, 26, 35), (28, 33, 44), t)
+        border = uk.lerp_color(uk.Theme.CARD_BORDER, accent, t * 0.78)
+        uk.draw_panel(screen, self._new_item_rect, bg=(*base, 255), border=border,
+                      border_width=1, radius=8, shadow=False)
+
+        if t > 0.01:
+            uk.draw_soft_glow(screen, self._new_item_rect.center, 22, accent, max_alpha=int(25 * t))
+
+        icon_rect = self._new_item_icon.get_rect(center=self._new_item_rect.center)
+        uk.blit_surface(screen, self._new_item_icon, icon_rect, transient=False)
+
+        self.clickable_rects.append({'rect': self._new_item_rect, 'index': idx, 'type': 'item'})
+        uk.register_hoverable(self._new_item_rect)
+
+    def _draw_icon_button(self, screen, rect, accent, icon, hovered=False):
+        """Small square icon button — room row View/Settings actions.
+        `icon` is either a vector icon_fn(surface, rect, color) — tinted by
+        hover state, like the old eye/gear glyphs — or a pre-loaded PNG
+        (pygame.Surface), blitted as-is the same way DevMenu blits its own
+        header/config icons (no recoloring)."""
+        t = 1.0 if hovered else 0.0
+        base = uk.lerp_color((22, 26, 35), (28, 33, 44), t)
+        border = uk.lerp_color(uk.Theme.CARD_BORDER, accent, t)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border, border_width=1 + round(t), radius=8, shadow=False)
+        if isinstance(icon, pygame.Surface):
+            icon_rect = icon.get_rect(center=rect.center)
+            uk.blit_surface(screen, icon, icon_rect, transient=False)
+        else:
+            icon_color = uk.lerp_color(uk.Theme.TEXT_MUTED, accent, t)
+            icon(screen, rect.inflate(-14, -14), icon_color)
+        uk.register_hoverable(rect)
+
+    def _draw_field_row(self, screen, rect, t, value_text, field_id=None):
+        """Text-field-shaped card row used across the Create/Edit forms.
+
+        When `field_id` matches self.editing_field, this row IS the text
+        box being typed into — it shows the live self.text_input with a
+        blinking caret and a brighter border, instead of the committed
+        `value_text`. This replaces the old full-screen "Enter value"
+        popup for name/width/height: those are the only fields that ever
+        set self.editing_field (see handle_input), so nothing else needs
+        to pass field_id at all — it defaults to None, which never
+        matches and keeps this row exactly as before (e.g. the
+        Background row, which opens a sub-panel rather than typing)."""
+        accent = uk.Theme.GOLD
+        editing = field_id is not None and self.editing_field == field_id
+        base = uk.lerp_color((20, 23, 32), (27, 31, 42), t)
+        border = accent if editing else uk.lerp_color(uk.Theme.CARD_BORDER, accent, t)
+        border_width = 2 if editing else 1 + round(t)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border, border_width=border_width, radius=8, shadow=False)
+
+        if field_id is not None:
+            self.text_field_rects.append(rect)
+
+        if editing:
+            shown, color = self.text_input, uk.Theme.TEXT_PRIMARY
+        else:
+            shown, color = value_text, uk.lerp_color(uk.Theme.TEXT_SECONDARY, uk.Theme.TEXT_PRIMARY, t)
+
+        val_surf = self.font_medium.render(shown, True, color)
+        val_rect = val_surf.get_rect(x=rect.x + 12, centery=rect.centery)
+        screen.blit(val_surf, val_rect)
+
+        if editing:
+            self._draw_live_text_field(screen, self.font_medium, val_rect, rect)
+
+    def _draw_pill_button(self, screen, rect, t, label, accent, icon_fn=None, danger=False):
+        col = uk.Theme.DANGER_BRIGHT if danger else accent
+        dim_base = (32, 22, 22) if danger else (28, 33, 44)
+        base = uk.lerp_color((22, 26, 35), dim_base, t)
+        border = uk.lerp_color(uk.Theme.CARD_BORDER, col, t)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border, border_width=1 + round(t), radius=10, shadow=False)
+        if t > 0.01:
+            uk.draw_soft_glow(screen, rect.center, max(rect.w, rect.h) // 2, col, max_alpha=int(30 * t))
+        label_color = uk.lerp_color(uk.Theme.TEXT_SECONDARY, col, t)
+        if icon_fn is not None:
+            icon_rect = pygame.Rect(0, 0, 18, 18)
+            icon_rect.midleft = (rect.x + 16, rect.centery)
+            icon_fn(screen, icon_rect, label_color)
+            label_surf = self.font_medium.render(label, True, label_color)
+            screen.blit(label_surf, (icon_rect.right + 8, rect.centery - label_surf.get_height() // 2))
+        else:
+            label_surf = self.font_medium.render(label, True, label_color)
+            screen.blit(label_surf, label_surf.get_rect(center=rect.center))
+        uk.register_hoverable(rect)
+
+    def _draw_checkbox(self, screen, rect, t, checked):
+        accent = uk.Theme.GOLD
+        base = uk.lerp_color((20, 23, 32), (27, 31, 42), t)
+        border = uk.lerp_color(uk.Theme.CARD_BORDER, accent, t)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border, border_width=1 + round(t), radius=6, shadow=False)
+        if checked:
+            _draw_check_icon(screen, rect.inflate(-8, -8), uk.Theme.GOLD_BRIGHT)
+        uk.register_hoverable(rect)
+
+    def _draw_slider(self, screen, x, y, width, key, label, value, display, rects_out, drag_key, center_mark=False):
+        """Horizontal 0..1 slider with label + value readout. Shared by the
+        Room Music/BGS volume sliders and the background sub-panel's
+        scroll/parallax sliders — `rects_out` is the caller's hit-rect dict
+        (self._room_volume_slider_rects / self._bg_slider_rects) and
+        `drag_key` is whichever key is currently being dragged, if any."""
+        label_surf = self.font_small.render(label.upper(), True, uk.Theme.TEXT_MUTED)
+        screen.blit(label_surf, (x, y))
+        val_surf = self.font_small.render(display, True, uk.Theme.TEXT_SECONDARY)
+        screen.blit(val_surf, (x + width - val_surf.get_width(), y))
+
+        track_y = y + label_surf.get_height() + 6
+        track = pygame.Rect(x, track_y, width, 6)
+        uk.draw_rect_on(screen, uk.Theme.CARD_BG[:3], track, 0, 3)
+
+        fill_w = max(0, min(width, int(value * width)))
+        if fill_w:
+            uk.draw_rect_on(screen, uk.Theme.GOLD, pygame.Rect(x, track_y, fill_w, 6), 0, 3)
+
+        thumb_x = x + int(max(0.0, min(1.0, value)) * width)
+        thumb_cy = track_y + 3
+        mx, my = self._logical_mouse_pos
+        dragging = drag_key == key
+        hovered = abs(mx - thumb_x) <= 10 and abs(my - thumb_cy) <= 10
+        thumb_color = uk.Theme.GOLD_BRIGHT if (dragging or hovered) else uk.Theme.TEXT_PRIMARY
+        uk.draw_circle_on(screen, thumb_color, (thumb_x, thumb_cy), 7)
+        uk.draw_circle_on(screen, uk.Theme.CARD_BORDER, (thumb_x, thumb_cy), 7, 1)
+
+        if center_mark:
+            mid_x = x + width // 2
+            uk.draw_line_on(screen, uk.Theme.CARD_BORDER, (mid_x, track_y - 3), (mid_x, track_y + 9), 1)
+
+        rects_out[key] = track
+
+    def _draw_dropdown_list(self, screen, anchor, items, is_current_fn, display_fn, empty_text=None):
+        """Popup option list anchored under a field row — shared by the
+        Weather / Room Music / Room BGS dropdowns. `items` is already
+        sliced to whatever's visible; returns (list_rect, {item: rect})."""
+        item_h = 30
+        list_h = item_h * max(1, len(items))
+        list_rect = pygame.Rect(anchor.x, anchor.bottom + 6, anchor.width, list_h)
+
+        if list_rect.bottom > self.screen_height - 10:
+            list_rect.y = max(10, anchor.top - list_h - 6)
+
+        uk.draw_panel(screen, list_rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD, border_width=1, radius=8)
+
+        rects = {}
+        if empty_text is not None:
+            empty_surf = self.font_small.render(empty_text, True, uk.Theme.TEXT_MUTED)
+            screen.blit(empty_surf, (list_rect.x + 10, list_rect.y + 8))
+            return list_rect, rects
+
+        mouse_pos = self._logical_mouse_pos
+        for i, opt in enumerate(items):
+            item_rect = pygame.Rect(list_rect.x, list_rect.y + i * item_h, list_rect.width, item_h)
+            rects[opt] = item_rect
+            uk.register_hoverable(item_rect)
+
+            is_current = is_current_fn(opt)
+            hovered = item_rect.collidepoint(mouse_pos)
+            if is_current or hovered:
+                row_bg = uk.Theme.CARD_BG_SELECTED[:3] if is_current else uk.Theme.CARD_BG_HOVER[:3]
+                uk.draw_rect_on(screen, row_bg, item_rect.inflate(-6, -2), 0, 6)
+
+            text_color = uk.Theme.GOLD_BRIGHT if is_current else uk.Theme.TEXT_SECONDARY
+            text_surf = self.font_small.render(display_fn(opt), True, text_color)
+            screen.blit(text_surf, (item_rect.x + 10, item_rect.y + (item_h - text_surf.get_height()) // 2))
+
+            if is_current:
+                chk_rect = pygame.Rect(0, 0, 14, 14)
+                chk_rect.midright = (item_rect.right - 10, item_rect.centery)
+                _draw_check_icon(screen, chk_rect, uk.Theme.GOLD_BRIGHT)
+
+        return list_rect, rects
+
+    def _draw_context_menu(self, screen):
+        """Small right-click popup for a group/room row — Rename (groups
+        only) and Delete, opened by _open_row_context_menu. Drawn last in
+        draw() so it sits on top of the list underneath it. Rebuilds
+        menu['rects'] every frame (same convention as the dropdown lists
+        above) so _handle_context_menu_event's hit-testing stays in sync
+        with whatever position/size was actually drawn this frame."""
+        menu = self._context_menu
+        if menu is None:
+            return
+
+        item_h = 34
+        width = 150
+        options = menu['options']
+        list_h = item_h * len(options)
+        rect = pygame.Rect(menu['pos'][0], menu['pos'][1], width, list_h)
+
+        # Keep the whole popup on-screen even when the click was near an edge.
+        if rect.right > self.screen_width - 8:
+            rect.x = self.screen_width - 8 - width
+        if rect.bottom > self.screen_height - 8:
+            rect.y = self.screen_height - 8 - list_h
+
+        uk.draw_panel(screen, rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD, border_width=1, radius=8)
+
+        mouse_pos = self._logical_mouse_pos
+        menu['rects'] = {}
+        for i, (action_id, label) in enumerate(options):
+            item_rect = pygame.Rect(rect.x, rect.y + i * item_h, rect.width, item_h)
+            menu['rects'][action_id] = item_rect
+
+            if item_rect.collidepoint(mouse_pos):
+                uk.draw_rect_on(screen, uk.Theme.CARD_BG_HOVER[:3], item_rect.inflate(-6, -2), 0, 6)
+
+            text_color = uk.Theme.DANGER_BRIGHT if action_id.startswith('delete') else uk.Theme.TEXT_SECONDARY
+            text_surf = self.font_small.render(label, True, text_color)
+            screen.blit(text_surf, (item_rect.x + 14, item_rect.y + (item_h - text_surf.get_height()) // 2))
+
+    # ------------------------------------------------------------------ groups / rooms lists
 
     def _draw_groups_view(self, screen):
-        """Show the list of groups"""
-        content_x = self.sidebar_width + self.padding
-        content_y = self.header_height
-        content_width = self.screen_width - self.sidebar_width - self.padding * 2
+        """Show the list of groups as a single-column card list."""
+        groups = self.room_manager.groups
+        x = self.margin_x
+        width = self.screen_width - self.margin_x * 2
+        y = self.header_h + 24
 
-        header = self.font_title.render("Select Group", True, self.colors['text'])
-        header_shadow = self.font_title.render("Select Group", True, (0, 0, 0))
-        screen.blit(header_shadow, (content_x + 2, self.padding + 2))
-        screen.blit(header, (content_x, self.padding))
+        for i, group_name in enumerate(groups):
+            rect = pygame.Rect(x, y, width, self.card_h)
 
-        y_pos = content_y
+            # Row is being renamed (via the right-click context menu) —
+            # swap in the same inline text-entry treatment _draw_new_group_row
+            # uses, instead of the normal card.
+            if self.editing_field == 'rename_group' and group_name == self._renaming_group_original:
+                self._draw_rename_group_row(screen, rect, group_name)
+                self.clickable_rects.append({'rect': rect, 'index': i, 'type': 'item'})
+                y += self.card_h + 12
+                continue
 
-        for i, group_name in enumerate(self.room_manager.groups):
-            is_selected = (i == self.selected_index)
-            is_hovered = (i == self.hover_index)
-            item_rect = self._draw_group_item(screen, group_name, content_x, y_pos, content_width,
-                                              is_selected or is_hovered, i)
-            self.clickable_rects.append({'rect': item_rect, 'index': i, 'type': 'item'})
-            y_pos += self.item_height + 10
+            t = self._item_anim(i)
+            accent = self._hue_to_rgb(hash(group_name) % 360)
+            draw_rect = self._draw_card_shell(screen, rect, t, accent)
+            self._draw_card_dot(screen, draw_rect, t, accent)
+            self._draw_card_text(screen, draw_rect, t, group_name)
+            self.clickable_rects.append({'rect': rect, 'index': i, 'type': 'item'})
+            y += self.card_h + 12
 
-        buttons = [
-            ("+ Create New Group", self.colors['success']),
-            ("< Back to Menu", self.colors['text_dim'])
-        ]
-
-        for j, (label, color) in enumerate(buttons):
-            i = len(self.room_manager.groups) + j
-            is_selected = (i == self.selected_index)
-            is_hovered = (i == self.hover_index)
-            btn_rect = self._draw_button(screen, label, content_x, y_pos, content_width, is_selected or is_hovered,
-                                         color, i)
-            self.clickable_rects.append({'rect': btn_rect, 'index': i, 'type': 'item'})
-            y_pos += self.item_height + 10
+        # "New Group" lives as a small icon-button, bottom-left of the
+        # middle content box, in the same box style as the header back
+        # button — see _draw_add_button. idx still equals len(groups),
+        # unchanged from the old card version, so selection/keyboard
+        # nav/_handle_item_action all keep working exactly as before.
+        # While actually naming the new group, that button is swapped for
+        # an inline text-entry row in the list itself (_draw_new_group_row)
+        # instead of the old floating "Enter group name" popup.
+        if self.editing_field == 'new_group':
+            rect = pygame.Rect(x, y, width, self.card_h)
+            self._draw_new_group_row(screen, rect)
+        else:
+            self._draw_add_button(screen, len(groups))
 
     def _draw_rooms_view(self, screen):
-        """Show the list of rooms in the selected group"""
+        """Show the list of rooms in the selected group, each with View and
+        Settings icon-buttons on the right."""
         if not self.selected_group:
             return
 
-        content_x = self.sidebar_width + self.padding
-        content_y = self.header_height
-        content_width = self.screen_width - self.sidebar_width - self.padding * 2
-
-        header = self.font_title.render(f"{self.selected_group} - Rooms", True, self.colors['text'])
-        header_shadow = self.font_title.render(f"{self.selected_group} - Rooms", True, (0, 0, 0))
-        screen.blit(header_shadow, (content_x + 2, self.padding + 2))
-        screen.blit(header, (content_x, self.padding))
-
         rooms_in_group = self.room_manager.get_rooms_in_group(self.selected_group)
-        y_pos = content_y
+        x = self.margin_x
+        width = self.screen_width - self.margin_x * 2
+        y = self.header_h + 24
+        btn_w, btn_h, btn_gap = 40, 34, 8
 
         for i, room in enumerate(rooms_in_group):
-            is_selected = (i == self.selected_index)
-            is_hovered = (i == self.hover_index)
-            item_rect = self._draw_room_item(screen, room, content_x, y_pos, content_width, is_selected or is_hovered,
-                                             i)
-            self.clickable_rects.append({'rect': item_rect, 'index': i, 'type': 'item'})
-            y_pos += self.item_height + 10
+            t = self._item_anim(i)
+            rect = pygame.Rect(x, y, width, self.card_h)
+            accent = self._hue_to_rgb(hash(room.group) % 360)
+            draw_rect = self._draw_card_shell(screen, rect, t, accent)
+            self._draw_card_dot(screen, draw_rect, t, accent)
 
-        buttons = [
-            ("+ Create New Room", self.colors['success']),
-            ("< Back to Groups", self.colors['text_dim'])
-        ]
+            self._draw_card_text(screen, draw_rect, t, room.name)
 
-        for j, (label, color) in enumerate(buttons):
-            i = len(rooms_in_group) + j
-            is_selected = (i == self.selected_index)
-            is_hovered = (i == self.hover_index)
-            btn_rect = self._draw_button(screen, label, content_x, y_pos, content_width, is_selected or is_hovered,
-                                         color, i)
-            self.clickable_rects.append({'rect': btn_rect, 'index': i, 'type': 'item'})
-            y_pos += self.item_height + 10
+            settings_rect = pygame.Rect(0, 0, btn_w, btn_h)
+            settings_rect.midright = (rect.right - 14, rect.centery)
+            view_rect = pygame.Rect(0, 0, btn_w, btn_h)
+            view_rect.midright = (settings_rect.left - btn_gap, rect.centery)
 
-    def _draw_room_item(self, screen, room, x, y, width, selected, index):
-        """Draw a single room in the list with View (👁) and Settings (⚙) buttons."""
-        # Reserve space on the right for the two buttons
-        btn_w = 44
-        btn_h = 36
-        btn_gap = 8
-        buttons_total = (btn_w + btn_gap) * 2
-        row_width = width - buttons_total - self.padding
+            mouse_pos = self._logical_mouse_pos
+            self._draw_icon_button(screen, view_rect, uk.Theme.KI_BLUE, self._view_icon,
+                                    hovered=view_rect.collidepoint(mouse_pos))
+            self._draw_icon_button(screen, settings_rect, uk.Theme.GOLD, self._settings_icon,
+                                    hovered=settings_rect.collidepoint(mouse_pos))
 
-        panel_rect = pygame.Rect(x, y, width, self.item_height)
+            # Registered before the row's own rect so the buttons win the
+            # first-match hit-test in handle_input (see RoomEditor.handle_input).
+            self.clickable_rects.append({'rect': view_rect, 'index': i, 'type': 'view_room'})
+            self.clickable_rects.append({'rect': settings_rect, 'index': i, 'type': 'edit_room'})
+            self.clickable_rects.append({'rect': rect, 'index': i, 'type': 'item'})
+            y += self.card_h + 12
 
-        if selected:
-            glow_alpha = int(50 + 30 * math.sin(self.anim_timer * 3))
-            glow_surf = pygame.Surface((width + 10, self.item_height + 10), pygame.SRCALPHA)
-            pygame.draw.rect(glow_surf, (*self.colors['accent'], glow_alpha),
-                             (0, 0, width + 10, self.item_height + 10), border_radius=8)
-            screen.blit(glow_surf, (x - 5, y - 5))
+        # "New Room" — same bottom-left add-button as "New Group" in
+        # _draw_groups_view, instead of a full-width card in this list.
+        self._draw_add_button(screen, len(rooms_in_group))
 
-        color = self.colors['panel_light'] if selected else self.colors['panel']
-        screen.draw_rect(color, panel_rect, border_radius=8)
-        screen.draw_rect(self.colors['accent'] if selected else self.colors['grid'],
-                         panel_rect, 2, border_radius=8)
-
-        # Group colour circle
-        icon_x = x + 20
-        icon_y = y + self.item_height // 2
-        icon_radius = 12
-        group_hash = hash(room.group) % 360
-        icon_color = self._hue_to_rgb(group_hash)
-        screen.filled_circle(icon_x, icon_y, icon_radius, icon_color)
-        screen.aacircle(icon_x, icon_y, icon_radius, self.colors['text'])
-
-        # Room name and dimensions
-        name_surf = self.font_large.render(room.name, True, self.colors['text'])
-        screen.blit(name_surf, (x + 50, y + 8))
-
-        details = f"{room.width}x{room.height}"
-        details_surf = self.font_small.render(details, True, self.colors['text_dim'])
-        screen.blit(details_surf, (x + 50, y + 35))
-
-        # "CURRENT" indicator
-        if self.room_manager.current_room == room:
-            indicator = self.font_small.render("* CURRENT", True, self.colors['success'])
-            screen.blit(indicator, (x + row_width - 90, y + 20))
-
-        # ── View button (👁) ────────────────────────────────────────────────
-        btn_right_edge = x + width - self.padding
-        settings_btn_rect = pygame.Rect(btn_right_edge - btn_w, y + (self.item_height - btn_h) // 2, btn_w, btn_h)
-        view_btn_rect     = pygame.Rect(settings_btn_rect.x - btn_gap - btn_w,
-                                        y + (self.item_height - btn_h) // 2, btn_w, btn_h)
-
-        _lm = self._logical_mouse_pos
-        view_hovered     = view_btn_rect.collidepoint(_lm)
-        settings_hovered = settings_btn_rect.collidepoint(_lm)
-
-        # View button
-        view_bg = (60, 120, 200) if view_hovered else (40, 80, 140)
-        screen.draw_rect(view_bg, view_btn_rect, border_radius=6)
-        screen.draw_rect((100, 160, 255) if view_hovered else (70, 120, 200),
-                         view_btn_rect, 2, border_radius=6)
-        if self._view_icon:
-            screen.blit(self._view_icon, self._view_icon.get_rect(center=view_btn_rect.center))
-        else:
-            eye_surf = self.font_large.render("V", True, self.colors['text'])
-            screen.blit(eye_surf, eye_surf.get_rect(center=view_btn_rect.center))
-
-        # Settings button
-        settings_bg = (80, 60, 160) if settings_hovered else (50, 40, 110)
-        screen.draw_rect(settings_bg, settings_btn_rect, border_radius=6)
-        screen.draw_rect((140, 100, 255) if settings_hovered else (100, 70, 200),
-                         settings_btn_rect, 2, border_radius=6)
-        gear_surf = self.font_large.render("S", True, self.colors['text'])
-        screen.blit(gear_surf, gear_surf.get_rect(center=settings_btn_rect.center))
-
-        # Register the two action buttons as separate clickable entries
-        self.clickable_rects.append({'rect': view_btn_rect,     'index': index, 'type': 'view_room'})
-        self.clickable_rects.append({'rect': settings_btn_rect, 'index': index, 'type': 'edit_room'})
-
-        return panel_rect
+    # ------------------------------------------------------------------ create / edit forms
 
     def _draw_create_view(self, screen):
-        """Show the create room form"""
-        content_x = self.sidebar_width + self.padding * 2
-        content_y = self.header_height
+        """Show the create room form."""
+        x = self.margin_x
+        width = min(560, self.screen_width - self.margin_x * 2)
+        y = self.header_h + 24
 
-        header = self.font_title.render("Create New Room", True, self.colors['text'])
-        screen.blit(header, (content_x, self.padding))
+        field_defs = [('name', 'Room Name'), ('width', 'Width'), ('height', 'Height'), ('group', 'Group')]
+        for i, (field_id, label) in enumerate(field_defs):
+            t = self._item_anim(i)
+            label_surf = self.font_small.render(label.upper(), True, uk.Theme.TEXT_MUTED)
+            screen.blit(label_surf, (x, y))
+            y += label_surf.get_height() + 6
 
-        y_pos = content_y
-        field_width = 500
+            rect = pygame.Rect(x, y, width, 44)
+            value = self.create_form.get(field_id, '')
+            self._draw_field_row(screen, rect, t, value, field_id=field_id)
+            self.clickable_rects.append({'rect': rect, 'index': i, 'type': 'item'})
+            y += 44 + 18
 
-        for i, field_name in enumerate(self.create_form_fields):
-            if field_name in ['create', 'cancel']:
-                continue
+        y += 8
+        btn_w, btn_h, gap = 220, 52, 16
+        for j, (field_id, label, accent, icon_fn, danger) in enumerate([
+            ('create', 'Create Room', uk.Theme.GOLD, _draw_plus_icon, False),
+            ('cancel', 'Cancel', None, uk.draw_close_icon, True),
+        ]):
+            idx = self.create_form_fields.index(field_id)
+            t = self._item_anim(idx)
+            rect = pygame.Rect(x + j * (btn_w + gap), y, btn_w, btn_h)
+            self._draw_pill_button(screen, rect, t, label, accent or uk.Theme.DANGER_BRIGHT, icon_fn, danger)
+            self.clickable_rects.append({'rect': rect, 'index': idx, 'type': 'item'})
 
-            is_selected = (i == self.selected_index)
-            is_hovered = (i == self.hover_index)
+    def _draw_edit_view(self, screen):
+        """Show the edit room form, including the Settings section (weather /
+        room music / room BGS / can-attack / background)."""
+        if not self.editing_room:
+            return
 
-            label = field_name.replace('_', ' ').title()
-            label_surf = self.font_medium.render(label, True, self.colors['text_dim'])
-            screen.blit(label_surf, (content_x, y_pos))
-            y_pos += 30
+        x = self.margin_x
+        width = min(620, self.screen_width - self.margin_x * 2)
+        y = self.header_h + 24
 
-            field_rect = pygame.Rect(content_x, y_pos, field_width, 40)
-            bg_color = self.colors['panel_light'] if (is_selected or is_hovered) else self.colors['panel']
-            border_color = self.colors['accent'] if (is_selected or is_hovered) else self.colors['grid']
-
-            screen.draw_rect(bg_color, field_rect, border_radius=5)
-            screen.draw_rect(border_color, field_rect, 2, border_radius=5)
-
-            self.clickable_rects.append({'rect': field_rect, 'index': i, 'type': 'item'})
-
-            if field_name == 'group':
-                value = self.create_form[field_name]
-                hint = " (CLICK to cycle)"
-            else:
-                value = self.create_form[field_name] if field_name in self.create_form else ""
-                hint = " (CLICK to edit)" if (is_selected or is_hovered) else ""
-
-            value_text = value + hint
-            value_surf = self.font_medium.render(value_text, True, self.colors['text'])
-            screen.blit(value_surf, (content_x + 10, y_pos + 8))
-
-            y_pos += 60
-
-        y_pos += 20
-        buttons = [
-            ('create', 'Create Room', self.colors['success']),
-            ('cancel', 'Cancel', self.colors['danger'])
+        fields = [
+            ('name', 'Room Name', str(self.editing_room.name)),
+            ('width', 'Width', str(self.editing_room.width)),
+            ('height', 'Height', str(self.editing_room.height)),
+            ('group', 'Group', str(self.editing_room.group)),
         ]
+        for i, (field_id, label, value) in enumerate(fields):
+            t = self._item_anim(i)
+            label_surf = self.font_small.render(label.upper(), True, uk.Theme.TEXT_MUTED)
+            screen.blit(label_surf, (x, y))
+            y += label_surf.get_height() + 6
 
-        for j, (btn_id, btn_label, btn_color) in enumerate(buttons):
-            btn_index = self.create_form_fields.index(btn_id)
-            is_selected = (self.selected_index == btn_index)
-            is_hovered = (self.hover_index == btn_index)
+            rect = pygame.Rect(x, y, width, 44)
+            self._draw_field_row(screen, rect, t, value, field_id=field_id)
+            self.clickable_rects.append({'rect': rect, 'index': i, 'type': 'item'})
+            y += 44 + 16
 
-            btn_rect = pygame.Rect(content_x + j * 260, y_pos, 250, 50)
-            bg_color = btn_color if (is_selected or is_hovered) else self.colors['panel']
+        y += 6
+        section_surf = self.font_small.render('SETTINGS', True, uk.Theme.TEXT_DIM)
+        screen.blit(section_surf, (x, y))
+        y += section_surf.get_height() + 8
 
-            if is_selected or is_hovered:
-                glow_alpha = int(50 + 30 * math.sin(self.anim_timer * 3))
-                glow_surf = pygame.Surface((260, 60), pygame.SRCALPHA)
-                pygame.draw.rect(glow_surf, (*btn_color, glow_alpha), (0, 0, 260, 60), border_radius=8)
-                screen.blit(glow_surf, (content_x + j * 260 - 5, y_pos - 5))
+        weather_val = getattr(self.editing_room, 'ambient_weather', 'none')
+        music_val = getattr(self.editing_room, 'music_track', '')
+        music_display = os.path.splitext(music_val)[0] if music_val else 'None'
+        bgs_val = getattr(self.editing_room, 'bgs_track', '')
+        bgs_display = os.path.splitext(bgs_val)[0] if bgs_val else 'None'
 
-            screen.draw_rect(bg_color, btn_rect, border_radius=8)
-            screen.draw_rect(btn_color, btn_rect, 2, border_radius=8)
+        row_w = (width - 24) // 3
+        row_label_h = 0
+        for j, (field_id, label, value) in enumerate([
+            ('weather', 'Weather', weather_val.capitalize()),
+            ('music', 'Room Music', music_display),
+            ('bgs', 'Room BGS', bgs_display),
+        ]):
+            idx = 4 + j
+            t = self._item_anim(idx)
+            col_x = x + j * (row_w + 12)
+            label_surf = self.font_small.render(label.upper(), True, uk.Theme.TEXT_MUTED)
+            screen.blit(label_surf, (col_x, y))
+            row_label_h = label_surf.get_height() + 6
 
-            self.clickable_rects.append({'rect': btn_rect, 'index': btn_index, 'type': 'item'})
+            row_rect = pygame.Rect(col_x, y + row_label_h, row_w, 38)
+            self._draw_field_row(screen, row_rect, t, value)
+            self.clickable_rects.append({'rect': row_rect, 'index': idx, 'type': 'item'})
 
-            text_color = self.colors['panel'] if (is_selected or is_hovered) else btn_color
-            btn_surf = self.font_large.render(btn_label, True, text_color)
-            btn_text_rect = btn_surf.get_rect(center=btn_rect.center)
-            screen.blit(btn_surf, btn_text_rect)
+            if field_id == 'weather':
+                self._weather_field_rect = row_rect
+            elif field_id == 'music':
+                self._music_field_rect = row_rect
+            elif field_id == 'bgs':
+                self._bgs_field_rect = row_rect
+            uk.register_hoverable(row_rect)
+        y += row_label_h + 38 + 20
+
+        # Room Music / Room BGS volume — click-drag sliders, not part of the
+        # keyboard tab order (same convention as the background sub-panel's
+        # sliders below).
+        self._room_volume_slider_rects = {}
+        music_volume = getattr(self.editing_room, 'music_volume', 1.0)
+        bgs_volume = getattr(self.editing_room, 'bgs_volume', 1.0)
+        vol_w = (width - 24) // 2
+        self._draw_slider(screen, x, y, vol_w, 'music_volume', 'Music Volume', music_volume,
+                           f'{int(round(music_volume * 100))}%',
+                           self._room_volume_slider_rects, self._room_volume_drag_slider)
+        self._draw_slider(screen, x + vol_w + 24, y, vol_w, 'bgs_volume', 'BGS Volume', bgs_volume,
+                           f'{int(round(bgs_volume * 100))}%',
+                           self._room_volume_slider_rects, self._room_volume_drag_slider)
+        y += 34
+
+        # Can attack? — checkbox row
+        idx = 7
+        t = self._item_anim(idx)
+        can_attack_val = getattr(self.editing_room, 'can_attack', True)
+        chk_label = self.font_small.render('CAN ATTACK HERE', True, uk.Theme.TEXT_MUTED)
+        screen.blit(chk_label, (x, y + 3))
+        box_rect = pygame.Rect(x + 190, y, 26, 26)
+        self._draw_checkbox(screen, box_rect, t, can_attack_val)
+        self.clickable_rects.append({'rect': box_rect, 'index': idx, 'type': 'item'})
+        y += 26 + 22
+
+        # Background — opens the sub-panel
+        idx = 8
+        t = self._item_anim(idx)
+        bg_val = self._room_bg_get('image', '')
+        bg_display = os.path.splitext(bg_val)[0] if bg_val else 'None'
+        bg_label_surf = self.font_small.render('BACKGROUND', True, uk.Theme.TEXT_MUTED)
+        screen.blit(bg_label_surf, (x, y))
+        bg_row_rect = pygame.Rect(x, y + bg_label_surf.get_height() + 6, width, 38)
+        self._draw_field_row(screen, bg_row_rect, t, bg_display)
+        self.clickable_rects.append({'rect': bg_row_rect, 'index': idx, 'type': 'item'})
+        y += bg_label_surf.get_height() + 6 + 38 + 24
+
+        btn_w, btn_h, gap = 170, 50, 14
+        for j, (idx, label, accent, icon_fn, danger) in enumerate([
+            (9, 'Save', uk.Theme.GOLD, None, False),
+            (10, 'Delete', None, None, True),
+            (11, 'Cancel', None, None, True),
+        ]):
+            t = self._item_anim(idx)
+            rect = pygame.Rect(x + j * (btn_w + gap), y, btn_w, btn_h)
+            self._draw_pill_button(screen, rect, t, label, accent or uk.Theme.DANGER_BRIGHT, icon_fn, danger)
+            self.clickable_rects.append({'rect': rect, 'index': idx, 'type': 'item'})
+
+        # Weather dropdown, Room Music/BGS dropdowns and the background
+        # sub-panel draw on top of everything else in this view.
+        if self._weather_dropdown_open:
+            self._draw_weather_dropdown(screen)
+        if self._music_dropdown_open:
+            self._draw_music_dropdown(screen)
+        if self._bgs_dropdown_open:
+            self._draw_bgs_dropdown(screen)
+        if self._bg_panel_open:
+            self._draw_bg_panel(screen)
 
     # =========================================================================
     # Room Settings — background sub-panel (ported from the old toolbar
@@ -5590,41 +6537,16 @@ class RoomEditor:
         return None
 
     def _draw_weather_dropdown(self, screen):
-        """Popup list of weather options, anchored directly under the
-        Weather field row (self._weather_field_rect, captured while drawing
-        the Settings section)."""
-        anchor = self._weather_field_rect
-        item_h = 30
-        list_h = item_h * len(self.WEATHER_TYPES)
-        list_rect = pygame.Rect(anchor.x, anchor.bottom + 4, anchor.width, list_h)
-
-        # Flip above the field if the list would run off the bottom of the screen
-        SH = screen.get_size()[1]
-        if list_rect.bottom > SH - 10:
-            list_rect.y = anchor.top - list_h - 4
-
-        shadow = pygame.Surface((list_rect.width + 6, list_rect.height + 6), pygame.SRCALPHA)
-        shadow.fill((0, 0, 0, 90))
-        screen.blit(shadow, (list_rect.x - 3, list_rect.y - 3))
-
-        screen.draw_rect(self.colors['panel'], list_rect, border_radius=5)
-        screen.draw_rect(self.colors['accent'], list_rect, 2, border_radius=5)
-
+        """Popup list of weather options, anchored under the Weather field
+        row (self._weather_field_rect, captured while drawing the Settings
+        section)."""
         current = getattr(self.editing_room, 'ambient_weather', 'none')
-        mouse_pos = self._logical_mouse_pos
-        self._weather_dropdown_rects = {}
-        for i, weather_type in enumerate(self.WEATHER_TYPES):
-            item_rect = pygame.Rect(list_rect.x, list_rect.y + i * item_h, list_rect.width, item_h)
-            self._weather_dropdown_rects[weather_type] = item_rect
-
-            is_current = (weather_type == current)
-            if item_rect.collidepoint(mouse_pos):
-                screen.draw_rect(self.colors['panel_light'], item_rect)
-
-            text_color = self.colors['accent'] if is_current else self.colors['text']
-            label = weather_type.capitalize() + ('  \u2713' if is_current else '')
-            text_surf = self.font_small.render(label, True, text_color)
-            screen.blit(text_surf, (item_rect.x + 8, item_rect.y + 6))
+        list_rect, rects = self._draw_dropdown_list(
+            screen, self._weather_field_rect, self.WEATHER_TYPES,
+            is_current_fn=lambda w: w == current,
+            display_fn=lambda w: w.capitalize(),
+        )
+        self._weather_dropdown_rects = rects
 
     # Cap the visible height of the Room Music dropdown so a big music
     # folder doesn't run the list off the screen — same idea as the
@@ -5670,56 +6592,31 @@ class RoomEditor:
         _draw_weather_dropdown but scrolls when there are more tracks than
         fit on screen."""
         options = [''] + self._music_files  # '' = no music
-        anchor = self._music_field_rect
-        item_h = 30
+        current = getattr(self.editing_room, 'music_track', '')
         visible = options[self._music_dropdown_scroll:
                            self._music_dropdown_scroll + self.MUSIC_DROPDOWN_VISIBLE_ROWS]
-        list_h = item_h * max(1, len(visible))
-        list_rect = pygame.Rect(anchor.x, anchor.bottom + 4, anchor.width, list_h)
 
-        # Flip above the field if the list would run off the bottom of the screen
-        SH = screen.get_size()[1]
-        if list_rect.bottom > SH - 10:
-            list_rect.y = max(10, anchor.top - list_h - 4)
+        def is_current(name):
+            return (os.path.splitext(name)[0] == current) if name else (current == '')
 
-        shadow = pygame.Surface((list_rect.width + 6, list_rect.height + 6), pygame.SRCALPHA)
-        shadow.fill((0, 0, 0, 90))
-        screen.blit(shadow, (list_rect.x - 3, list_rect.y - 3))
-
-        screen.draw_rect(self.colors['panel'], list_rect, border_radius=5)
-        screen.draw_rect(self.colors['accent'], list_rect, 2, border_radius=5)
-
-        current = getattr(self.editing_room, 'music_track', '')
-        mouse_pos = self._logical_mouse_pos
-        self._music_dropdown_rects = {}
+        def display(name):
+            return os.path.splitext(name)[0] if name else 'None'
 
         if not options[1:]:
             # No music files found at all — say so instead of showing an
             # empty box, so this doesn't look broken.
-            empty_surf = self.font_small.render('No music files found', True, self.colors['text_dim'])
-            screen.blit(empty_surf, (list_rect.x + 8, list_rect.y + 6))
+            self._draw_dropdown_list(screen, self._music_field_rect, [], is_current, display,
+                                      empty_text='No music files found')
+            self._music_dropdown_rects = {}
             return
 
-        for i, track_name in enumerate(visible):
-            item_rect = pygame.Rect(list_rect.x, list_rect.y + i * item_h, list_rect.width, item_h)
-            self._music_dropdown_rects[track_name] = item_rect
-
-            # current is stored as a stem (see handle_music_dropdown_event);
-            # track_name here is the raw filename, so compare stem-to-stem.
-            is_current = (os.path.splitext(track_name)[0] == current) if track_name else (current == '')
-            if item_rect.collidepoint(mouse_pos):
-                screen.draw_rect(self.colors['panel_light'], item_rect)
-
-            text_color = self.colors['accent'] if is_current else self.colors['text']
-            display = os.path.splitext(track_name)[0] if track_name else 'None'
-            label = display + ('  \u2713' if is_current else '')
-            text_surf = self.font_small.render(label, True, text_color)
-            screen.blit(text_surf, (item_rect.x + 8, item_rect.y + 6))
+        list_rect, rects = self._draw_dropdown_list(screen, self._music_field_rect, visible, is_current, display)
+        self._music_dropdown_rects = rects
 
         # Small scroll hint if the list is scrolled or scrollable
         if len(options) > self.MUSIC_DROPDOWN_VISIBLE_ROWS:
             hint = f"{self._music_dropdown_scroll + 1}-{self._music_dropdown_scroll + len(visible)} of {len(options)} (scroll)"
-            hint_surf = self.font_small.render(hint, True, self.colors['text_dim'])
+            hint_surf = self.font_small.render(hint, True, uk.Theme.TEXT_DIM)
             screen.blit(hint_surf, (list_rect.x, list_rect.bottom + 4))
 
     # Cap the visible height of the Room BGS dropdown, same reasoning as
@@ -5759,62 +6656,37 @@ class RoomEditor:
         """Popup list of BGS ambient loops (plus a 'None' option), anchored
         directly under the Room BGS field row. Mirrors _draw_music_dropdown."""
         options = [''] + self._bgs_files  # '' = no ambient loop
-        anchor = self._bgs_field_rect
-        item_h = 30
+        current = getattr(self.editing_room, 'bgs_track', '')
         visible = options[self._bgs_dropdown_scroll:
                            self._bgs_dropdown_scroll + self.BGS_DROPDOWN_VISIBLE_ROWS]
-        list_h = item_h * max(1, len(visible))
-        list_rect = pygame.Rect(anchor.x, anchor.bottom + 4, anchor.width, list_h)
 
-        # Flip above the field if the list would run off the bottom of the screen
-        SH = screen.get_size()[1]
-        if list_rect.bottom > SH - 10:
-            list_rect.y = max(10, anchor.top - list_h - 4)
+        def is_current(name):
+            return (os.path.splitext(name)[0] == current) if name else (current == '')
 
-        shadow = pygame.Surface((list_rect.width + 6, list_rect.height + 6), pygame.SRCALPHA)
-        shadow.fill((0, 0, 0, 90))
-        screen.blit(shadow, (list_rect.x - 3, list_rect.y - 3))
-
-        screen.draw_rect(self.colors['panel'], list_rect, border_radius=5)
-        screen.draw_rect(self.colors['accent'], list_rect, 2, border_radius=5)
-
-        current = getattr(self.editing_room, 'bgs_track', '')
-        mouse_pos = self._logical_mouse_pos
-        self._bgs_dropdown_rects = {}
+        def display(name):
+            return os.path.splitext(name)[0] if name else 'None'
 
         if not options[1:]:
             # No BGS files found at all — say so instead of showing an
             # empty box, so this doesn't look broken.
-            empty_surf = self.font_small.render('No ambient sounds found', True, self.colors['text_dim'])
-            screen.blit(empty_surf, (list_rect.x + 8, list_rect.y + 6))
+            self._draw_dropdown_list(screen, self._bgs_field_rect, [], is_current, display,
+                                      empty_text='No ambient sounds found')
+            self._bgs_dropdown_rects = {}
             return
 
-        for i, track_name in enumerate(visible):
-            item_rect = pygame.Rect(list_rect.x, list_rect.y + i * item_h, list_rect.width, item_h)
-            self._bgs_dropdown_rects[track_name] = item_rect
-
-            # current is stored as a stem (see handle_bgs_dropdown_event);
-            # track_name here is the raw filename, so compare stem-to-stem.
-            is_current = (os.path.splitext(track_name)[0] == current) if track_name else (current == '')
-            if item_rect.collidepoint(mouse_pos):
-                screen.draw_rect(self.colors['panel_light'], item_rect)
-
-            text_color = self.colors['accent'] if is_current else self.colors['text']
-            display = os.path.splitext(track_name)[0] if track_name else 'None'
-            label = display + ('  \u2713' if is_current else '')
-            text_surf = self.font_small.render(label, True, text_color)
-            screen.blit(text_surf, (item_rect.x + 8, item_rect.y + 6))
+        list_rect, rects = self._draw_dropdown_list(screen, self._bgs_field_rect, visible, is_current, display)
+        self._bgs_dropdown_rects = rects
 
         # Small scroll hint if the list is scrolled or scrollable
         if len(options) > self.BGS_DROPDOWN_VISIBLE_ROWS:
             hint = f"{self._bgs_dropdown_scroll + 1}-{self._bgs_dropdown_scroll + len(visible)} of {len(options)} (scroll)"
-            hint_surf = self.font_small.render(hint, True, self.colors['text_dim'])
+            hint_surf = self.font_small.render(hint, True, uk.Theme.TEXT_DIM)
             screen.blit(hint_surf, (list_rect.x, list_rect.bottom + 4))
 
     def _draw_bg_panel(self, screen):
-        SW, SH   = screen.get_size()
-        PANEL_TOP = self.header_height - 10
-        PANEL_H  = SH - PANEL_TOP - 20
+        SW, SH = screen.get_size()
+        PANEL_TOP = self.header_h - 10
+        PANEL_H = SH - PANEL_TOP - 20
         PX = (SW - self.PANEL_W) // 2
         PY = PANEL_TOP
 
@@ -5822,17 +6694,11 @@ class RoomEditor:
 
         # Dim the rest of the screen
         dim = pygame.Surface((SW, SH), pygame.SRCALPHA)
-        dim.fill((0, 0, 0, 140))
+        dim.fill((0, 0, 0, 150))
         screen.blit(dim, (0, 0))
 
-        # Drop shadow
-        shadow = pygame.Surface((self.PANEL_W + 8, PANEL_H + 8), pygame.SRCALPHA)
-        shadow.fill((0, 0, 0, 90))
-        screen.blit(shadow, (PX - 4, PY - 4))
-
-        # Panel body
-        screen.draw_rect(self.colors['panel'], self._bg_panel_rect, border_radius=8)
-        screen.draw_rect(self.colors['accent'], self._bg_panel_rect, 2, border_radius=8)
+        uk.draw_panel(screen, self._bg_panel_rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD,
+                       border_width=1, radius=10)
 
         bg_selected = self._room_bg_get('image', '')
         bg_scroll_x = float(self._room_bg_get('scroll_x', 0.0))
@@ -5840,56 +6706,52 @@ class RoomEditor:
         bg_parallax = float(self._room_bg_get('parallax', 0.5))
 
         # Title + current selection
-        title_s = self.font_large.render('Scrolling Background', True, self.colors['accent'])
-        screen.blit(title_s, (PX + 12, PY + 10))
+        title_s = self.font_large.render('Scrolling Background', True, uk.Theme.GOLD)
+        screen.blit(title_s, (PX + 14, PY + 12))
 
         sel_name = os.path.splitext(bg_selected)[0] if bg_selected else 'None'
-        sel_col  = self.colors['text'] if bg_selected else self.colors['text_dim']
-        sel_s    = self.font_medium.render(f'Selected: {sel_name}', True, sel_col)
-        screen.blit(sel_s, (PX + 12, PY + 36))
+        sel_col = uk.Theme.TEXT_PRIMARY if bg_selected else uk.Theme.TEXT_MUTED
+        sel_s = self.font_medium.render(f'Selected: {sel_name}', True, sel_col)
+        screen.blit(sel_s, (PX + 14, PY + 38))
 
         # ── Sliders ──────────────────────────────────────────────────────
-        inner_w = self.PANEL_W - 24
-        sy = PY + 62
+        inner_w = self.PANEL_W - 28
+        sy = PY + 64
         self._bg_slider_rects = {}
 
         sx_t = (bg_scroll_x / self.SCROLL_MAX + 1) / 2
-        self._draw_bg_slider(screen, PX + 12, sy, inner_w,
-                             'scroll_x', 'Scroll X', sx_t, f'{bg_scroll_x:+.0f} px/s')
+        self._draw_slider(screen, PX + 14, sy, inner_w, 'scroll_x', 'Scroll X', sx_t,
+                           f'{bg_scroll_x:+.0f} px/s', self._bg_slider_rects, self._bg_drag_slider,
+                           center_mark=True)
         sy += self.SLIDER_H + 24
 
         sy_t = (bg_scroll_y / self.SCROLL_MAX + 1) / 2
-        self._draw_bg_slider(screen, PX + 12, sy, inner_w,
-                             'scroll_y', 'Scroll Y', sy_t, f'{bg_scroll_y:+.0f} px/s')
+        self._draw_slider(screen, PX + 14, sy, inner_w, 'scroll_y', 'Scroll Y', sy_t,
+                           f'{bg_scroll_y:+.0f} px/s', self._bg_slider_rects, self._bg_drag_slider,
+                           center_mark=True)
         sy += self.SLIDER_H + 24
 
-        self._draw_bg_slider(screen, PX + 12, sy, inner_w,
-                             'parallax', 'Parallax', bg_parallax, f'{bg_parallax:.2f}')
+        self._draw_slider(screen, PX + 14, sy, inner_w, 'parallax', 'Parallax', bg_parallax,
+                           f'{bg_parallax:.2f}', self._bg_slider_rects, self._bg_drag_slider)
         sy += self.SLIDER_H + 20
 
         hint = self.font_small.render(
-            '0 = fixed on screen  \u00b7  0.5 = half camera  \u00b7  1 = moves with camera',
-            True, self.colors['text_dim'])
-        screen.blit(hint, (PX + 12, sy))
+            '0 = fixed on screen   0.5 = half camera   1 = moves with camera',
+            True, uk.Theme.TEXT_DIM)
+        screen.blit(hint, (PX + 14, sy))
         sy += 20
 
         # ── Clear button ─────────────────────────────────────────────────
         sy += 4
-        clr_rect = pygame.Rect(PX + 12, sy, inner_w, 26)
-        mx, my   = self._logical_mouse_pos
-        clr_hov  = clr_rect.collidepoint(mx, my)
-        screen.draw_rect((130, 40, 40) if clr_hov else (70, 25, 25),
-                         clr_rect, border_radius=4)
-        screen.draw_rect(self.colors['danger'], clr_rect, 1, border_radius=4)
-        clr_s = self.font_medium.render('Clear Background', True, self.colors['danger'])
-        screen.blit(clr_s, clr_s.get_rect(center=clr_rect.center))
+        clr_rect = pygame.Rect(PX + 14, sy, inner_w, 28)
+        self._draw_pill_button(screen, clr_rect, 1.0 if clr_rect.collidepoint(self._logical_mouse_pos) else 0.0,
+                                'Clear Background', uk.Theme.DANGER_BRIGHT, _draw_trash_icon, danger=True)
         self._bg_clear_rect = clr_rect
-        sy += 34
+        sy += 36
 
         # ── Divider ──────────────────────────────────────────────────────
-        screen.draw_line(self.colors['panel_border'],
-                         (PX + 8, sy), (PX + self.PANEL_W - 8, sy))
-        sy += 8
+        uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER, pygame.Rect(PX + 10, sy, self.PANEL_W - 20, 1), 0, 0)
+        sy += 10
 
         # ── Thumbnail grid ───────────────────────────────────────────────
         grid_rect = pygame.Rect(PX, sy, self.PANEL_W, PY + PANEL_H - sy - 8)
@@ -5900,13 +6762,13 @@ class RoomEditor:
         self._bg_thumb_rects = {}
         col = row = 0
         total_rows = max(1, (len(self._bg_files) + self.THUMB_COLS - 1) // self.THUMB_COLS)
-        row_h      = self.THUMB_SIZE + self.THUMB_PAD
+        row_h = self.THUMB_SIZE + self.THUMB_PAD
         max_scroll = max(0, total_rows * row_h - grid_rect.height)
         self._bg_scroll = min(self._bg_scroll, max_scroll)
 
         if not self._bg_files:
-            no_s = self.font_medium.render('No images found in assets/bg', True, self.colors['text_dim'])
-            screen.blit(no_s, (PX + 12, sy + 12))
+            no_s = self.font_medium.render('No images found in assets/bg', True, uk.Theme.TEXT_MUTED)
+            screen.blit(no_s, (PX + 14, sy + 12))
         else:
             for fname in self._bg_files:
                 cx = PX + self.THUMB_PAD + col * row_h
@@ -5916,29 +6778,30 @@ class RoomEditor:
 
                 is_sel = fname == bg_selected
                 is_hov = fname == self._bg_hover
-                border = (self.colors['accent'] if is_sel else
-                          self.colors['text']   if is_hov else
-                          self.colors['panel_border'])
+                border = (uk.Theme.GOLD if is_sel else
+                          uk.Theme.TEXT_PRIMARY if is_hov else
+                          uk.Theme.PANEL_BORDER)
                 bw = 2 if (is_sel or is_hov) else 1
 
-                screen.draw_rect((18, 18, 32), cell, border_radius=4)
-                screen.draw_rect(border, cell, bw, border_radius=4)
+                uk.draw_rect_on(screen, (18, 18, 26), cell, 0, 6)
+                uk.draw_rect_on(screen, border, cell, bw, 6)
 
                 thumb = self._load_bg_thumb(fname)
                 if thumb:
                     screen.blit(thumb, thumb.get_rect(center=cell.center))
                 else:
-                    q = self.font_medium.render('?', True, self.colors['text_dim'])
+                    q = self.font_medium.render('?', True, uk.Theme.TEXT_MUTED)
                     screen.blit(q, q.get_rect(center=cell.center))
 
                 lbl = self.font_small.render(
                     os.path.splitext(fname)[0], True,
-                    self.colors['accent'] if is_sel else self.colors['text_dim'])
-                screen.blit(lbl, (cell.x + 2, cell.bottom - 14))
+                    uk.Theme.GOLD_BRIGHT if is_sel else uk.Theme.TEXT_MUTED)
+                screen.blit(lbl, (cell.x + 3, cell.bottom - 14))
 
                 if is_sel:
-                    chk = self.font_medium.render('\u2713', True, self.colors['accent'])
-                    screen.blit(chk, (cell.right - 18, cell.top + 2))
+                    chk_rect = pygame.Rect(0, 0, 14, 14)
+                    chk_rect.topright = (cell.right - 3, cell.top + 3)
+                    _draw_check_icon(screen, chk_rect, uk.Theme.GOLD_BRIGHT)
 
                 col += 1
                 if col >= self.THUMB_COLS:
@@ -5948,84 +6811,13 @@ class RoomEditor:
         screen.set_clip(old_clip)
 
         if max_scroll > 0:
-            n   = min(8, total_rows)
+            n = min(8, total_rows)
             dot_x = PX + self.PANEL_W - 6
             for d in range(n):
-                dot_y  = grid_rect.top + int(grid_rect.height * d / max(1, n - 1))
-                ratio  = self._bg_scroll / max(1, max_scroll)
+                dot_y = grid_rect.top + int(grid_rect.height * d / max(1, n - 1))
+                ratio = self._bg_scroll / max(1, max_scroll)
                 active = abs(d / max(1, n - 1) - ratio) < 0.15
-                screen.filled_circle(dot_x, dot_y, 3,
-                    self.colors['accent'] if active else self.colors['panel_border'])
-
-    def _draw_bg_slider(self, screen, x, y, width, key, label, value, display):
-        """Horizontal slider with label, value readout, and thumb."""
-        lbl_s = self.font_small.render(label, True, self.colors['text_dim'])
-        screen.blit(lbl_s, (x, y))
-
-        val_s = self.font_small.render(display, True, self.colors['text'])
-        screen.blit(val_s, (x + width - val_s.get_width(), y))
-
-        track_y = y + self.SLIDER_H + 2
-        track   = pygame.Rect(x, track_y, width, self.SLIDER_TRACK)
-        screen.draw_rect(self.colors['slider_track'], track, border_radius=3)
-
-        fill_w = max(0, int(value * width))
-        if fill_w:
-            screen.draw_rect(self.colors['slider_fill'],
-                             pygame.Rect(x, track_y, fill_w, self.SLIDER_TRACK),
-                             border_radius=3)
-
-        thumb_x = x + int(value * width)
-        thumb_cy = track_y + self.SLIDER_TRACK // 2
-        THUMB_R  = 7
-        mx, my   = self._logical_mouse_pos
-        dragging = self._bg_drag_slider == key
-        hovered  = (abs(mx - thumb_x) <= THUMB_R + 3
-                    and abs(my - thumb_cy) <= THUMB_R + 3)
-        tcol = self.colors['accent'] if (dragging or hovered) else self.colors['text']
-        screen.filled_circle(thumb_x, thumb_cy, THUMB_R, tcol)
-        screen.aacircle(thumb_x, thumb_cy, THUMB_R, self.colors['panel_border'])
-
-        if key in ('scroll_x', 'scroll_y'):
-            mid_x = x + width // 2
-            screen.draw_line(self.colors['panel_border'],
-                             (mid_x, track_y - 3), (mid_x, track_y + self.SLIDER_TRACK + 3), 1)
-
-        self._bg_slider_rects[key] = track
-
-    def _draw_room_volume_slider(self, screen, x, y, width, key, label, value, display):
-        """Horizontal 0-1 volume slider for Room Music/BGS, drawn directly in
-        the Edit Room view. Same look and feel as _draw_bg_slider above, but
-        reads/writes self._room_volume_drag_slider / _room_volume_slider_rects
-        instead of the background sub-panel's slider state."""
-        lbl_s = self.font_small.render(label, True, self.colors['text_dim'])
-        screen.blit(lbl_s, (x, y))
-
-        val_s = self.font_small.render(display, True, self.colors['text'])
-        screen.blit(val_s, (x + width - val_s.get_width(), y))
-
-        track_y = y + self.SLIDER_H + 2
-        track = pygame.Rect(x, track_y, width, self.SLIDER_TRACK)
-        screen.draw_rect(self.colors['slider_track'], track, border_radius=3)
-
-        fill_w = max(0, int(value * width))
-        if fill_w:
-            screen.draw_rect(self.colors['slider_fill'],
-                             pygame.Rect(x, track_y, fill_w, self.SLIDER_TRACK),
-                             border_radius=3)
-
-        thumb_x = x + int(value * width)
-        thumb_cy = track_y + self.SLIDER_TRACK // 2
-        THUMB_R = 7
-        mx, my = self._logical_mouse_pos
-        dragging = self._room_volume_drag_slider == key
-        hovered = (abs(mx - thumb_x) <= THUMB_R + 3
-                   and abs(my - thumb_cy) <= THUMB_R + 3)
-        tcol = self.colors['accent'] if (dragging or hovered) else self.colors['text']
-        screen.filled_circle(thumb_x, thumb_cy, THUMB_R, tcol)
-        screen.aacircle(thumb_x, thumb_cy, THUMB_R, self.colors['panel_border'])
-
-        self._room_volume_slider_rects[key] = track
+                uk.draw_circle_on(screen, uk.Theme.GOLD if active else uk.Theme.PANEL_BORDER, (dot_x, dot_y), 3)
 
     # =========================================================================
     # Room Settings — Room Music scan
@@ -6075,236 +6867,6 @@ class RoomEditor:
             files = []
         self._bgs_files = sorted(set(files))
 
-    def _draw_edit_view(self, screen):
-        """Show the edit room form"""
-        if not self.editing_room:
-            return
-
-        content_x = self.sidebar_width + self.padding * 2
-        content_y = self.header_height
-
-        header = self.font_title.render(f"Edit: {self.editing_room.name}", True, self.colors['text'])
-        screen.blit(header, (content_x, self.padding))
-
-        y_pos = content_y
-        field_width = 500
-
-        fields = [
-            ('name', 'Room Name', str(self.editing_room.name)),
-            ('width', 'Width', str(self.editing_room.width)),
-            ('height', 'Height', str(self.editing_room.height)),
-            ('group', 'Group', str(self.editing_room.group))
-        ]
-
-        for i, (field_id, label, value) in enumerate(fields):
-            is_selected = (i == self.selected_index)
-            is_hovered = (i == self.hover_index)
-
-            label_surf = self.font_medium.render(label, True, self.colors['text_dim'])
-            screen.blit(label_surf, (content_x, y_pos))
-            y_pos += 30
-
-            field_rect = pygame.Rect(content_x, y_pos, field_width, 40)
-            bg_color = self.colors['panel_light'] if (is_selected or is_hovered) else self.colors['panel']
-            border_color = self.colors['accent'] if (is_selected or is_hovered) else self.colors['grid']
-
-            screen.draw_rect(bg_color, field_rect, border_radius=5)
-            screen.draw_rect(border_color, field_rect, 2, border_radius=5)
-
-            self.clickable_rects.append({'rect': field_rect, 'index': i, 'type': 'item'})
-
-            hint = " (CLICK to cycle)" if field_id == 'group' else " (CLICK to edit)"
-            value_text = value + (hint if (is_selected or is_hovered) else "")
-            value_surf = self.font_medium.render(value_text, True, self.colors['text'])
-            screen.blit(value_surf, (content_x + 10, y_pos + 8))
-
-            y_pos += 60
-
-        # ── Settings section — weather / room music / can-attack / background ──
-        y_pos += 10
-        settings_label = self.font_medium.render('Settings', True, self.colors['text_dim'])
-        screen.blit(settings_label, (content_x, y_pos))
-        y_pos += 30
-
-        weather_val = getattr(self.editing_room, 'ambient_weather', 'none')
-        music_val = getattr(self.editing_room, 'music_track', '')
-        music_display = os.path.splitext(music_val)[0] if music_val else 'None'
-        bgs_val = getattr(self.editing_room, 'bgs_track', '')
-        bgs_display = os.path.splitext(bgs_val)[0] if bgs_val else 'None'
-        can_attack_val = getattr(self.editing_room, 'can_attack', True)
-        bg_val = self._room_bg_get('image', '')
-        bg_display = os.path.splitext(bg_val)[0] if bg_val else 'None'
-
-        # Weather (index 4), Room Music (index 5) and Room BGS (index 6) —
-        # third-width cycle rows, side by side
-        row_w = (field_width - 24) // 3
-        for j, (field_id, label, value, hint) in enumerate([
-            ('weather', 'Weather', weather_val.capitalize(), ' (CLICK to select)'),
-            ('music', 'Set Room Music', music_display, ' (CLICK to select)'),
-            ('bgs', 'Set Room BGS', bgs_display, ' (CLICK to select)'),
-        ]):
-            idx = 4 + j
-            is_selected = (idx == self.selected_index)
-            is_hovered = (idx == self.hover_index)
-
-            label_surf = self.font_small.render(label, True, self.colors['text_dim'])
-            screen.blit(label_surf, (content_x + j * (row_w + 12), y_pos))
-
-            row_rect = pygame.Rect(content_x + j * (row_w + 12), y_pos + 22, row_w, 34)
-            bg_color = self.colors['panel_light'] if (is_selected or is_hovered) else self.colors['panel']
-            border_color = self.colors['accent'] if (is_selected or is_hovered) else self.colors['grid']
-            screen.draw_rect(bg_color, row_rect, border_radius=5)
-            screen.draw_rect(border_color, row_rect, 2, border_radius=5)
-            self.clickable_rects.append({'rect': row_rect, 'index': idx, 'type': 'item'})
-
-            if field_id == 'weather':
-                self._weather_field_rect = row_rect
-            elif field_id == 'music':
-                self._music_field_rect = row_rect
-            elif field_id == 'bgs':
-                self._bgs_field_rect = row_rect
-
-            value_text = value + (hint if (is_selected or is_hovered) else "")
-            value_surf = self.font_small.render(value_text, True, self.colors['text'])
-            screen.blit(value_surf, (row_rect.x + 8, row_rect.y + 8))
-
-        y_pos += 66
-
-        # Room Music (BGM) / Room BGS volume — click-drag sliders, not part
-        # of the keyboard tab order (same convention as the sliders in the
-        # Background sub-panel below), so they don't need an edit_fields
-        # index of their own.
-        self._room_volume_slider_rects = {}
-        music_volume = getattr(self.editing_room, 'music_volume', 1.0)
-        bgs_volume = getattr(self.editing_room, 'bgs_volume', 1.0)
-
-        vol_row_w = (field_width - 24) // 2
-        self._draw_room_volume_slider(
-            screen, content_x, y_pos, vol_row_w,
-            'music_volume', 'Music Volume', music_volume,
-            f'{int(round(music_volume * 100))}%')
-        self._draw_room_volume_slider(
-            screen, content_x + vol_row_w + 24, y_pos, vol_row_w,
-            'bgs_volume', 'BGS Volume', bgs_volume,
-            f'{int(round(bgs_volume * 100))}%')
-        y_pos += self.SLIDER_H + 34
-
-        # Can attack? (index 7) — checkbox row
-        is_selected = (7 == self.selected_index)
-        is_hovered = (7 == self.hover_index)
-        chk_label = self.font_small.render('Can attack?', True, self.colors['text_dim'])
-        screen.blit(chk_label, (content_x, y_pos + 6))
-
-        box_size = 24
-        box_x = content_x + 130
-        box_rect = pygame.Rect(box_x, y_pos, box_size, box_size)
-        border_color = self.colors['accent'] if (is_selected or is_hovered) else self.colors['grid']
-        screen.draw_rect(self.colors['panel'], box_rect, border_radius=4)
-        screen.draw_rect(border_color, box_rect, 2, border_radius=4)
-        if can_attack_val:
-            check_surf = self.font_medium.render('X', True, self.colors['success'])
-            screen.blit(check_surf, check_surf.get_rect(center=box_rect.center))
-        self.clickable_rects.append({'rect': box_rect, 'index': 7, 'type': 'item'})
-
-        y_pos += 44
-
-        # Background (index 8) — opens the sub-panel
-        is_selected = (8 == self.selected_index)
-        is_hovered = (8 == self.hover_index)
-        bg_label = self.font_small.render('Background', True, self.colors['text_dim'])
-        screen.blit(bg_label, (content_x, y_pos))
-        y_pos += 22
-
-        bg_row_rect = pygame.Rect(content_x, y_pos, field_width, 34)
-        bg_bg_color = self.colors['panel_light'] if (is_selected or is_hovered) else self.colors['panel']
-        bg_border_color = self.colors['accent'] if (is_selected or is_hovered) else self.colors['grid']
-        screen.draw_rect(bg_bg_color, bg_row_rect, border_radius=5)
-        screen.draw_rect(bg_border_color, bg_row_rect, 2, border_radius=5)
-        self.clickable_rects.append({'rect': bg_row_rect, 'index': 8, 'type': 'item'})
-
-        bg_hint = ' (CLICK to configure)' if (is_selected or is_hovered) else ''
-        bg_value_surf = self.font_small.render(bg_display + bg_hint, True, self.colors['text'])
-        screen.blit(bg_value_surf, (bg_row_rect.x + 8, bg_row_rect.y + 8))
-
-        y_pos += 54
-
-        y_pos += 10
-        buttons = [
-            (9, 'Save', self.colors['success']),
-            (10, 'Delete', self.colors['danger']),
-            (11, 'Cancel', self.colors['text_dim'])
-        ]
-
-        for j, (btn_index, btn_label, btn_color) in enumerate(buttons):
-            is_selected = (self.selected_index == btn_index)
-            is_hovered = (self.hover_index == btn_index)
-
-            btn_rect = pygame.Rect(content_x + j * 180, y_pos, 170, 50)
-            bg_color = btn_color if (is_selected or is_hovered) else self.colors['panel']
-
-            if is_selected or is_hovered:
-                glow_alpha = int(50 + 30 * math.sin(self.anim_timer * 3))
-                glow_surf = pygame.Surface((180, 60), pygame.SRCALPHA)
-                pygame.draw.rect(glow_surf, (*btn_color, glow_alpha), (0, 0, 180, 60), border_radius=8)
-                screen.blit(glow_surf, (content_x + j * 180 - 5, y_pos - 5))
-
-            screen.draw_rect(bg_color, btn_rect, border_radius=8)
-            screen.draw_rect(btn_color, btn_rect, 2, border_radius=8)
-
-            self.clickable_rects.append({'rect': btn_rect, 'index': btn_index, 'type': 'item'})
-
-            text_color = self.colors['panel'] if (is_selected or is_hovered) else btn_color
-            btn_surf = self.font_large.render(btn_label, True, text_color)
-            btn_text_rect = btn_surf.get_rect(center=btn_rect.center)
-            screen.blit(btn_surf, btn_text_rect)
-
-        # Weather dropdown and background sub-panel draw on top of
-        # everything else in this view
-        if self._weather_dropdown_open:
-            self._draw_weather_dropdown(screen)
-        if self._music_dropdown_open:
-            self._draw_music_dropdown(screen)
-        if self._bgs_dropdown_open:
-            self._draw_bgs_dropdown(screen)
-        if self._bg_panel_open:
-            self._draw_bg_panel(screen)
-
-    def _draw_text_input_overlay(self, screen):
-        """Show the text input modal"""
-        overlay = pygame.Surface((self.screen_width, self.screen_height), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 150))
-        screen.blit(overlay, (0, 0))
-
-        box_width = 600
-        box_height = 120
-        box_x = (self.screen_width - box_width) // 2
-        box_y = (self.screen_height - box_height) // 2
-
-        screen.draw_rect(self.colors['panel'], (box_x, box_y, box_width, box_height), border_radius=10)
-        screen.draw_rect(self.colors['accent'], (box_x, box_y, box_width, box_height), 3, border_radius=10)
-
-        prompt_text = "Enter group name:" if self.editing_field == 'new_group' else "Enter value:"
-
-        prompt = self.font_medium.render(prompt_text, True, self.colors['text_dim'])
-        prompt_rect = prompt.get_rect()
-        prompt_x = box_x + (box_width - prompt_rect.width) // 2
-        screen.blit(prompt, (prompt_x, box_y + 20))
-
-        input_rect = pygame.Rect(box_x + 20, box_y + 50, box_width - 40, 40)
-        screen.draw_rect(self.colors['panel_light'], input_rect, border_radius=5)
-        screen.draw_rect(self.colors['accent'], input_rect, 2, border_radius=5)
-
-        cursor = "_" if int(self.cursor_blink * 2) % 2 == 0 else ""
-        input_text = self.font_medium.render(self.text_input + cursor, True, self.colors['text'])
-        input_text_rect = input_text.get_rect()
-        input_x = box_x + (box_width - input_text_rect.width) // 2
-        screen.blit(input_text, (input_x, box_y + 55))
-
-        inst = self.font_small.render("ENTER to confirm | ESC to cancel", True, self.colors['text_dark'])
-        inst_rect = inst.get_rect()
-        inst_x = box_x + (box_width - inst_rect.width) // 2
-        screen.blit(inst, (inst_x, box_y + box_height - 25))
-
     def _hue_to_rgb(self, hue):
         """Convert a hue angle (0–360) to an RGB tuple.
 
@@ -6332,72 +6894,3 @@ class RoomEditor:
             r, g, b = c, 0, x
 
         return (int((r + m) * 255), int((g + m) * 255), int((b + m) * 255))
-
-    def _draw_button(self, screen, label, x, y, width, selected, color, index):
-        """Draw a button in the menu - returns the clickable rect"""
-        panel_rect = pygame.Rect(x, y, width, self.item_height)
-
-        if selected:
-            glow_alpha = int(50 + 30 * math.sin(self.anim_timer * 3))
-            glow_surf = pygame.Surface((width + 10, self.item_height + 10), pygame.SRCALPHA)
-            pygame.draw.rect(glow_surf, (*color, glow_alpha),
-                             (0, 0, width + 10, self.item_height + 10), border_radius=8)
-            screen.blit(glow_surf, (x - 5, y - 5))
-
-        bg_color = self.colors['panel_light'] if selected else self.colors['panel']
-        screen.draw_rect(bg_color, panel_rect, border_radius=8)
-        screen.draw_rect(color, panel_rect, 2, border_radius=8)
-
-        text_color = color if selected else self.colors['text_dim']
-        label_surf = self.font_large.render(label, True, text_color)
-        label_rect = label_surf.get_rect(center=(x + width // 2, y + self.item_height // 2))
-        screen.blit(label_surf, label_rect)
-
-        return panel_rect
-
-    def _draw_group_item(self, screen, group_name, x, y, width, selected, index):
-        """Draw a single group in the list - returns the clickable rect"""
-        panel_rect = pygame.Rect(x, y, width, self.item_height)
-
-        if selected:
-            glow_alpha = int(50 + 30 * math.sin(self.anim_timer * 3))
-            glow_surf = pygame.Surface((width + 10, self.item_height + 10), pygame.SRCALPHA)
-            pygame.draw.rect(glow_surf, (*self.colors['accent'], glow_alpha),
-                             (0, 0, width + 10, self.item_height + 10), border_radius=8)
-            screen.blit(glow_surf, (x - 5, y - 5))
-
-        color = self.colors['panel_light'] if selected else self.colors['panel']
-        screen.draw_rect(color, panel_rect, border_radius=8)
-        screen.draw_rect(self.colors['accent'] if selected else self.colors['grid'],
-                         panel_rect, 2, border_radius=8)
-
-        # Colored icon
-        icon_x = x + 20
-        icon_y = y + self.item_height // 2
-        icon_radius = 12
-
-        group_hash = hash(group_name) % 360
-        icon_color = self._hue_to_rgb(group_hash)
-
-        screen.filled_circle(icon_x, icon_y, icon_radius, icon_color)
-        screen.aacircle(icon_x, icon_y, icon_radius, self.colors['text'])
-
-        # Group name
-        name_surf = self.font_large.render(group_name, True, self.colors['text'])
-        screen.blit(name_surf, (x + 50, y + 8))
-
-        # How many rooms in this group
-        room_count = len(self.room_manager.get_rooms_in_group(group_name))
-        count_text = f"{room_count} room{'s' if room_count != 1 else ''}"
-        count_surf = self.font_small.render(count_text, True, self.colors['text_dim'])
-        screen.blit(count_surf, (x + 50, y + 35))
-
-        # Controls hint
-        if group_name != "Default" and selected:
-            hint = self.font_small.render("DELETE to remove | Double-Click to open", True, self.colors['accent'])
-            screen.blit(hint, (x + width - 360, y + 20))
-        elif selected:
-            hint = self.font_small.render("Double-Click to open", True, self.colors['accent'])
-            screen.blit(hint, (x + width - 190, y + 20))
-
-        return panel_rect

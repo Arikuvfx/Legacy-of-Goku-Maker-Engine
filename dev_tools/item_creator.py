@@ -16,7 +16,12 @@ Wire-up (game.py), mirrors character_creator's / entity_creator's:
     self.item_creator = item_creator.ItemCreator(SCREEN_WIDTH, SCREEN_HEIGHT)
     # in the event loop, same pattern as self.entity_creator:
     if self.item_creator.active:
-        self.item_creator.handle_input(event)
+        result = self.item_creator.handle_input(event)
+        if result == 'back_to_dev_menu':
+            # Back-arrow / ESC — the Dev Menu closed itself when it
+            # launched this creator, so reopen it instead of dropping
+            # all the way back into gameplay.
+            self.dev_menu.open()
     ...
     self.item_creator.update(dt)
     self.item_creator.draw(self.logical_surface, dt)
@@ -30,15 +35,23 @@ entity_creator.py uses for enemy/NPC sprites. Dropping in a new icon PNG
 separately is still up to you; this tool is purely the data side
 (name/description/category/effect).
 
-Reuses widgets/palette from character_creator.py rather than duplicating
-them — TextInput, TextArea, Slider, draw_button, render_text_cached, and
-the C_* colour constants are the same ones used everywhere else in the dev
-tools, so this looks and behaves like the rest of the suite.
+VISUAL LANGUAGE — rebuilt from scratch on dev_tools/ui_kit.py, matching
+DevMenu and RoomEditor's "modern DBZ" look (deep navy background, gold/
+ki-blue accents, dark hairline-bordered cards, header/footer chrome, inline
+field-row text editing with a live caret). None of the old widget classes
+(TextInput/TextArea/Slider/draw_button/legacy_widgets colour constants) are
+used any more — every visual here is built directly on ui_kit primitives
+and this file's own drawing helpers, following the same construction
+RoomEditor.py uses for its own forms (card shells, pill buttons, field
+rows, sliders, dropdown lists). The underlying data model, save/load/
+delete/create behaviour, category and effect-type tables, and effect
+field logic are unchanged from the previous version of this file.
 """
 
 from __future__ import annotations
 
 import copy
+import math
 import os
 import sys
 from pathlib import Path
@@ -46,12 +59,7 @@ from typing import Optional
 
 import pygame
 
-from dev_tools.character_creator import (
-    TextInput, TextArea, Slider, draw_button, render_text_cached,
-    C_BG, C_PANEL, C_PANEL_DARK, C_BORDER, C_ACCENT, C_ACCENT2,
-    C_TEXT, C_TEXT_DIM, C_RED, C_GREEN, C_TAB_ACT, C_TAB_INACT,
-    C_HOVER, C_SELECTED, C_DIALOG_BG,
-)
+import dev_tools.ui_kit as uk
 
 from core.items import (
     ITEMS,
@@ -86,6 +94,19 @@ CATEGORIES = [
 ]
 CATEGORY_LABELS = {cat: label for cat, label, _ in CATEGORIES}
 CATEGORY_SLOT   = {cat: slot for cat, _, slot in CATEGORIES}
+
+# Per-category accent colour, used for the list's identity dot and the
+# category picker's selected-state glow — same "colored dot = identity"
+# idea RoomEditor uses (there, hashed per group; here, fixed per category
+# since there are only six and they're meaningful, not arbitrary).
+CATEGORY_ACCENT = {
+    CATEGORY_SUPPLIES:        uk.Theme.GOLD,
+    CATEGORY_STORY_ITEMS:     uk.Theme.KI_BLUE,
+    CATEGORY_EQUIP_BODY:      (167, 139, 250),
+    CATEGORY_EQUIP_HANDS:     (240, 146, 92),
+    CATEGORY_EQUIP_FEET:      (94, 210, 148),
+    CATEGORY_EQUIP_ACCESSORY: (235, 110, 150),
+}
 
 # ── Effect types (see systems/item_effects.py for how each is applied).
 # 'none' isn't a real effect type item_effects.py knows about — it's this
@@ -176,497 +197,416 @@ def discover_all_item_ids() -> list[str]:
 
 
 def _load_icon(item_id: str, size: int = 96) -> Optional[pygame.Surface]:
-    """Preview icon at item_icon_path(item_id), scaled to (size, size).
-    None if no art exists yet — the editor shows a placeholder box rather
-    than blocking on missing art, same as entity_creator's sprite preview."""
+    """Preview icon at item_icon_path(item_id), scaled to fit inside a
+    (size, size) box. None if no art exists yet — the editor shows a
+    placeholder box rather than blocking on missing art, same as
+    entity_creator's sprite preview.
+
+    Item art is small pixel-art sprites, so this follows the same
+    crop-to-content + aspect-preserving + nearest-neighbour-style scale
+    _load_dev_menu_icon() uses for the UI's own icons, instead of
+    smoothscale directly to (size, size): smoothscale's bilinear
+    filtering blurs pixel art on upscale, and stretching straight to a
+    square box distorts any icon that isn't already square."""
     path = BASE_DIR / item_icon_path(item_id)
     if not path.is_file():
         return None
     try:
         raw = pygame.image.load(str(path)).convert_alpha()
-        return pygame.transform.scale(raw, (size, size))
     except Exception as e:
         print(f"Error loading item icon ({path}): {e}")
         return None
 
+    content_rect = raw.get_bounding_rect(min_alpha=1)
+    if content_rect.width <= 0 or content_rect.height <= 0:
+        content_rect = raw.get_rect()
+    raw = raw.subsurface(content_rect).copy()
 
-def draw_label(surf, font, text, x, y, color=C_TEXT_DIM):
-    surf.blit(render_text_cached(font, text, color), (x, y))
+    iw, ih = raw.get_size()
+    scale = min(size / max(1, iw), size / max(1, ih))
+    nw = max(1, round(iw * scale))
+    nh = max(1, round(ih * scale))
+    if scale >= 1.0:
+        # Crisp integer-ish upscale: blow up with nearest-neighbour scale
+        # first, then settle to the exact target size, instead of a
+        # single smoothscale that would soften pixel-art edges.
+        prescale = max(1, math.ceil(scale) * 2)
+        big = pygame.transform.scale(raw, (iw * prescale, ih * prescale))
+        scaled = pygame.transform.scale(big, (nw, nh))
+    else:
+        scaled = pygame.transform.smoothscale(raw, (nw, nh))
 
-
-# ══════════════════════════════════════════════════════════════════════
-#  Item list panel (left column) — category tabs + scrollable id list.
-#  No manual reordering (unlike EntityList) — items are numerous enough
-#  (100+) that alphabetical-within-category is more useful than a
-#  hand-picked order, and nothing else in the game reads a saved item
-#  display order the way the pause menu reads character_menu.json.
-# ══════════════════════════════════════════════════════════════════════
-class ItemList:
-    ITEM_H = 30
-
-    def __init__(self, rect: pygame.Rect):
-        self.rect = rect
-        self.ids: list[str] = []
-        self.filtered: list[str] = []
-        self.custom: set[str] = set()
-        self.selected = ""
-        self.scroll = 0
-        self.category_filter = "all"  # "all" or one of the CATEGORY_* values
-
-    def set_ids(self, ids: list[str], custom: set[str], selected: str = "") -> None:
-        self.ids = ids
-        self.custom = custom
-        self._apply_filter()
-        self.selected = selected or (self.filtered[0] if self.filtered else "")
-        self.scroll = 0
-
-    def set_filter(self, category: str) -> None:
-        self.category_filter = category
-        self._apply_filter()
-        self.scroll = 0
-
-    def _apply_filter(self) -> None:
-        if self.category_filter == "all":
-            self.filtered = list(self.ids)
-        else:
-            self.filtered = [iid for iid in self.ids
-                              if ITEMS.get(iid, {}).get("category") == self.category_filter]
-
-    def handle_event(self, event: pygame.event.Event) -> Optional[str]:
-        if event.type == pygame.MOUSEWHEEL and self.rect.collidepoint(pygame.mouse.get_pos()):
-            self.scroll = max(0, min(len(self.filtered) - 1, self.scroll - event.y))
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            mx, my = event.pos
-            if not self.rect.collidepoint(mx, my):
-                return None
-            for i, iid in enumerate(self.filtered):
-                item_y = self.rect.y + (i - self.scroll) * self.ITEM_H
-                item_r = pygame.Rect(self.rect.x, item_y, self.rect.w, self.ITEM_H)
-                if item_r.collidepoint(mx, my) and self.rect.collidepoint(item_r.center):
-                    if self.selected != iid:
-                        self.selected = iid
-                        return iid
-        return None
-
-    def draw(self, surf, font_sm) -> None:
-        surf.draw_rect(C_PANEL_DARK, self.rect, border_radius=6)
-        surf.draw_rect(C_BORDER, self.rect, 1, border_radius=6)
-
-        old_clip = surf.get_clip()
-        surf.set_clip(self.rect)
-        visible = max(1, self.rect.h // self.ITEM_H)
-        mx, my = pygame.mouse.get_pos()
-        for i, iid in enumerate(self.filtered[self.scroll:self.scroll + visible + 1]):
-            item_y = self.rect.y + i * self.ITEM_H
-            item_r = pygame.Rect(self.rect.x, item_y, self.rect.w, self.ITEM_H)
-            hovered = item_r.collidepoint(mx, my)
-            is_sel = (iid == self.selected)
-            bg = C_SELECTED if is_sel else (C_HOVER if hovered else C_PANEL_DARK)
-            surf.draw_rect(bg, item_r)
-
-            is_custom = iid in self.custom
-            col = C_ACCENT2 if is_custom else (C_TEXT if is_sel else C_TEXT_DIM)
-            name = ITEMS.get(iid, {}).get("name", iid)
-            label = f"{name}{' *' if is_custom else ''}"
-            txt = render_text_cached(font_sm, label, col)
-            surf.blit(txt, (item_r.x + 10, item_r.y + (item_r.h - txt.get_height()) // 2))
-        surf.set_clip(old_clip)
-
-        if not self.filtered:
-            msg = render_text_cached(font_sm, "No items in this category", C_TEXT_DIM)
-            surf.blit(msg, msg.get_rect(center=self.rect.center))
-
-        if len(self.filtered) > visible:
-            more = render_text_cached(
-                font_sm, f"{len(self.filtered)} items", C_TEXT_DIM)
-            surf.blit(more, (self.rect.right - more.get_width() - 6, self.rect.y - more.get_height() - 2))
+    canvas = pygame.Surface((size, size), pygame.SRCALPHA)
+    canvas.blit(scaled, ((size - nw) // 2, (size - nh) // 2))
+    return canvas
 
 
-# ══════════════════════════════════════════════════════════════════════
-#  Editor panel — holds live widgets for whichever item is selected.
-#  Rebuilt (via load()) every time the selection OR the effect type
-#  changes, same lifecycle as EntityEditorPanel.
-# ══════════════════════════════════════════════════════════════════════
-ROW_H = 34
+# =============================================================================
+# Small vector icon glyphs — same fn(surface, rect, color) shape as
+# ui_kit's own DEV_MENU_ICON_DRAWERS / RoomEditor's _draw_plus_icon family,
+# so these read as part of the same icon set rather than a one-off.
+# =============================================================================
 
-# Grid layout for the Category / Effect Type button rows. GRID_ROW_H is the
-# vertical step between rows (button height + breathing room, was a cramped
-# 30/26 = 4px gap before); SECTION_GAP is the gap left between one stacked
-# section (label + its button rows) and the next.
-GRID_BTN_H  = 26
-GRID_ROW_H  = 38
-SECTION_GAP = 26
+def _draw_plus_icon(surface, rect, color, width=3):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.34
+    uk.draw_line_on(surface, color, (cx - s, cy), (cx + s, cy), width)
+    uk.draw_line_on(surface, color, (cx, cy - s), (cx, cy + s), width)
 
 
-class ItemEditorPanel:
-    def __init__(self, rect: pygame.Rect, item_id: str, data: dict):
-        self.rect = rect
-        self.item_id = item_id
-        self.data = data
-        self.dirty = False
-        self._icon = _load_icon(item_id)
-        self._build_widgets()
-
-    # -- shared section layout -----------------------------------------
-    def _section_top(self, name: str) -> int:
-        """Single source of truth for where each stacked section starts:
-        Category buttons -> Effect Type buttons -> effect-specific fields
-        (sliders). Previously the effect-field sliders used their own
-        hardcoded offset that didn't account for the Category buttons'
-        actual height, so they were drawn overlapping the Category row
-        instead of below the Effect Type row. Everything that positions
-        one of these sections now reads from here instead of recomputing
-        the offset by hand."""
-        category_y = self.rect.y + 16 + ROW_H * 2 + SECTION_GAP // 2
-        effect_type_y = category_y + GRID_ROW_H * 2 + SECTION_GAP
-        fx_y = effect_type_y + GRID_ROW_H * 2 + SECTION_GAP
-        return {"category": category_y, "effect_type": effect_type_y, "fx": fx_y}[name]
-
-    def _build_widgets(self) -> None:
-        lx = self.rect.x + 160
-        y0 = self.rect.y + 16
-        w = {}
-
-        w["name"] = TextInput(pygame.Rect(lx, y0, 260, TextInput.H), self.data["name"])
-        w["effect_text"] = TextInput(pygame.Rect(lx, y0 + ROW_H, 320, TextInput.H),
-                                      self.data.get("effect_text", ""))
-        # Description rect.y is repositioned every frame in draw() once the
-        # effect-specific field block above it knows its own height — same
-        # "fixed fields first, description flows below" approach
-        # EntityEditorPanel uses for its own Description field.
-        w["description"] = TextArea(pygame.Rect(lx, 0, 320, TextArea.H),
-                                     self.data.get("description", ""))
-
-        self._build_effect_widgets(w, lx)
-        self.widgets = w
-
-    def _build_effect_widgets(self, w: dict, lx: int) -> None:
-        """(Re)builds only the effect-specific sliders, keyed with an
-        'fx_' prefix so _build_widgets()'s fixed fields (name/effect_text/
-        description) never collide with them. Called both from
-        _build_widgets() and whenever the effect-type cycle button is
-        clicked (see _handle_buttons)."""
-        for key in list(w.keys()):
-            if key.startswith("fx_"):
-                del w[key]
-
-        effect = self.data["effect"]
-        etype = effect.get("type", "none")
-        y = self._section_top("fx")  # below the Category and Effect Type button grids
-
-        if etype in ("heal_hp", "heal_ep"):
-            w["fx_amount"] = Slider(pygame.Rect(lx, y, 220, Slider.H), 1, 3000,
-                                     effect.get("amount", 20), step=5)
-        elif etype == "revive":
-            w["fx_hp_ratio"] = Slider(pygame.Rect(lx, y, 220, Slider.H), 0.05, 1.0,
-                                       effect.get("hp_ratio", 0.5), step=0.05, fmt="{:.2f}")
-        elif etype == "buff":
-            w["fx_duration"] = Slider(pygame.Rect(lx, y, 220, Slider.H), 1, 120,
-                                       effect.get("duration", 30.0), step=1, fmt="{:.0f}s")
-            y += ROW_H
-            stats = effect.get("stats", {})
-            for sid in STAT_IDS:
-                w[f"fx_stat_{sid}"] = Slider(pygame.Rect(lx, y, 220, Slider.H), -50, 100,
-                                              stats.get(sid, 0), step=1)
-                y += ROW_H
-        elif etype == "equip_stat":
-            stats = effect.get("stats", {})
-            for sid in STAT_IDS:
-                w[f"fx_stat_{sid}"] = Slider(pygame.Rect(lx, y, 220, Slider.H), -50, 100,
-                                              stats.get(sid, 0), step=1)
-                y += ROW_H
-            w["fx_exp_bonus"] = Slider(pygame.Rect(lx, y, 220, Slider.H), 0.0, 1.0,
-                                        effect.get("exp_bonus", 0.0), step=0.05, fmt="{:.2f}")
-        # 'full_restore' and 'none' need no extra fields.
-
-    def _effect_widgets_bottom(self) -> int:
-        """y-coordinate just below the last effect-specific widget, so
-        the category/effect-type cycle rows and Description field below
-        can be positioned without overlapping — recomputed each frame
-        rather than cached since it depends on the widget dict, which
-        can change out from under this on an effect-type switch."""
-        fx_keys = [k for k in self.widgets if k.startswith("fx_")]
-        if not fx_keys:
-            return self._section_top("fx")
-        return max(self.widgets[k].rect.bottom for k in fx_keys) + 10
-
-    # -- events -----------------------------------------------------
-    def handle_event(self, event: pygame.event.Event) -> bool:
-        changed = False
-        for key, wgt in self.widgets.items():
-            if wgt.handle_event(event):
-                changed = True
-                self._apply_widget(key, wgt)
-
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            changed = self._handle_buttons(event.pos) or changed
-
-        if changed:
-            self.dirty = True
-        return changed
-
-    def _apply_widget(self, key: str, wgt) -> None:
-        if key == "name":
-            self.data["name"] = wgt.value
-        elif key == "effect_text":
-            self.data["effect_text"] = wgt.value
-        elif key == "description":
-            self.data["description"] = wgt.value
-        elif key == "fx_amount":
-            self.data["effect"]["amount"] = int(wgt.value)
-        elif key == "fx_hp_ratio":
-            self.data["effect"]["hp_ratio"] = round(wgt.value, 2)
-        elif key == "fx_duration":
-            self.data["effect"]["duration"] = round(wgt.value, 1)
-        elif key == "fx_exp_bonus":
-            self.data["effect"]["exp_bonus"] = round(wgt.value, 2)
-        elif key.startswith("fx_stat_"):
-            sid = key[len("fx_stat_"):]
-            self.data["effect"].setdefault("stats", {})[sid] = int(wgt.value)
-
-    def _handle_buttons(self, pos) -> bool:
-        changed = False
-        for rect, cat in self._category_rects():
-            if rect.collidepoint(pos) and self.data["category"] != cat:
-                self.data["category"] = cat
-                slot = CATEGORY_SLOT[cat]
-                if slot:
-                    self.data["slot"] = slot
-                else:
-                    self.data.pop("slot", None)
-                changed = True
-
-        for rect, etype in self._effect_type_rects():
-            if rect.collidepoint(pos) and self.data["effect"].get("type") != etype:
-                self.data["effect"] = _default_effect_for_type(etype, self.data["effect"])
-                self._build_effect_widgets(self.widgets, self.rect.x + 160)
-                changed = True
-
-        return changed
-
-    # -- cycle-button layouts ----------------------------------------
-    def _category_rects(self):
-        """3 per row, 2 rows — 6 categories total."""
-        lx = self.rect.x + 160
-        y = self._section_top("category")
-        out = []
-        for i, (cat, label, _slot) in enumerate(CATEGORIES):
-            col, row = i % 3, i // 3
-            r = pygame.Rect(lx + col * 132, y + row * GRID_ROW_H, 124, GRID_BTN_H)
-            out.append((r, cat))
-        return out
-
-    def _effect_type_rects(self):
-        """4 + 3 — 7 effect types total. Positioned below the category
-        buttons (2 rows) with a gap for their row label."""
-        lx = self.rect.x + 160
-        y = self._section_top("effect_type")
-        out = []
-        for i, etype in enumerate(EFFECT_TYPES):
-            col, row = (i % 4, 0) if i < 4 else (i - 4, 1)
-            r = pygame.Rect(lx + col * 126, y + row * GRID_ROW_H, 118, GRID_BTN_H)
-            out.append((r, etype))
-        return out
-
-    # -- draw ---------------------------------------------------------
-    def draw(self, surf, font, font_sm, dt) -> None:
-        lx = self.rect.x + 20
-        y0 = self.rect.y + 16
-
-        draw_label(surf, font_sm, "Name", lx, y0 + 6)
-        self.widgets["name"].draw(surf, font_sm, dt)
-
-        draw_label(surf, font_sm, "Effect Text", lx, y0 + ROW_H + 6)
-        self.widgets["effect_text"].draw(surf, font_sm, dt)
-
-        self._draw_preview(surf, font_sm)
-        self._draw_category_row(surf, font_sm)
-        self._draw_effect_section(surf, font, font_sm, dt)
-
-    def _draw_preview(self, surf, font_sm) -> None:
-        box_w = 140
-        px = self.rect.right - box_w - 20
-        py = self.rect.y + 12
-        draw_label(surf, font_sm, "Icon", px, py)
-        py += 20
-        rect = pygame.Rect(px, py, 96, 96)
-        if self._icon is not None:
-            surf.blit(self._icon, rect)
-            surf.draw_rect(C_BORDER, rect, 1)
-        else:
-            surf.draw_rect(C_PANEL_DARK, rect)
-            dash = 4
-            xx = rect.left
-            while xx < rect.right:
-                surf.draw_line(C_TEXT_DIM, (xx, rect.top), (min(xx + dash, rect.right), rect.top))
-                surf.draw_line(C_TEXT_DIM, (xx, rect.bottom - 1), (min(xx + dash, rect.right), rect.bottom - 1))
-                xx += dash * 2
-            label = render_text_cached(font_sm, "no icon", C_TEXT_DIM)
-            surf.blit(label, label.get_rect(center=rect.center))
-            path_txt = render_text_cached(font_sm, item_icon_path(self.item_id), C_TEXT_DIM)
-            surf.blit(path_txt, (px, py + 100))
-
-    def _draw_category_row(self, surf, font_sm) -> None:
-        lx = self.rect.x + 160
-        y = self._section_top("category")
-        draw_label(surf, font_sm, "Category", self.rect.x + 20, y + 5)
-        mx, my = pygame.mouse.get_pos()
-        for rect, cat in self._category_rects():
-            hovered = rect.collidepoint(mx, my)
-            is_current = (self.data["category"] == cat)
-            draw_button(surf, font_sm, rect, CATEGORY_LABELS[cat],
-                       color=C_ACCENT if is_current else C_TEXT_DIM, hover=hovered)
-
-    def _draw_effect_section(self, surf, font, font_sm, dt) -> None:
-        lx = self.rect.x + 160
-        y = self._section_top("effect_type")
-        draw_label(surf, font_sm, "Effect Type", self.rect.x + 20, y + 5)
-        mx, my = pygame.mouse.get_pos()
-        for rect, etype in self._effect_type_rects():
-            hovered = rect.collidepoint(mx, my)
-            is_current = (self.data["effect"].get("type") == etype)
-            draw_button(surf, font_sm, rect, EFFECT_LABELS[etype],
-                       color=C_ACCENT if is_current else C_TEXT_DIM, hover=hovered)
-
-        fx_y = self._section_top("fx")
-        etype = self.data["effect"].get("type", "none")
-        stat_row_labels = {
-            "fx_amount":     "Amount",
-            "fx_hp_ratio":   "HP Ratio",
-            "fx_duration":   "Duration",
-            "fx_exp_bonus":  "XP Bonus",
-        }
-        for key, wgt in self.widgets.items():
-            if not key.startswith("fx_"):
-                continue
-            if key.startswith("fx_stat_"):
-                sid = key[len("fx_stat_"):]
-                label = STAT_LABELS[sid]
-            else:
-                label = stat_row_labels.get(key, key)
-            draw_label(surf, font_sm, label, self.rect.x + 20, wgt.rect.y + 2)
-            wgt.draw(surf, font_sm)
-
-        if etype == "none":
-            hint = render_text_cached(font_sm,
-                "No mechanical effect — used for key/quest items tracked purely by inventory presence.",
-                C_TEXT_DIM)
-            surf.blit(hint, (lx, fx_y))
-        elif etype == "full_restore":
-            hint = render_text_cached(font_sm, "Fully restores HP and EP. No extra fields.", C_TEXT_DIM)
-            surf.blit(hint, (lx, fx_y))
-
-        # ── Description — flows below whatever the effect section ended up needing.
-        desc_y = self._effect_widgets_bottom()
-        if etype in ("none", "full_restore"):
-            desc_y = max(desc_y, fx_y + 26)
-        draw_label(surf, font_sm, "Description", self.rect.x + 20, desc_y + 6)
-        desc_h = max(TextArea.H, self.rect.bottom - (desc_y + 26) - 16)
-        self.widgets["description"].rect = pygame.Rect(lx, desc_y + 26, self.rect.w - 220, desc_h)
-        self.widgets["description"].draw(surf, font_sm, dt)
+def _draw_x_icon(surface, rect, color, width=3):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.28
+    uk.draw_line_on(surface, color, (cx - s, cy - s), (cx + s, cy + s), width)
+    uk.draw_line_on(surface, color, (cx - s, cy + s), (cx + s, cy - s), width)
 
 
-# ══════════════════════════════════════════════════════════════════════
-#  Top-level overlay — same lifecycle contract as CharacterCreator /
-#  EntityCreator: toggle() / handle_input(event) / update(dt) /
-#  draw(surface, dt), lives inside the host game's loop.
-# ══════════════════════════════════════════════════════════════════════
-HEADER_H = 44
-FOOTER_H = 52
-LIST_W   = 240
-PAD      = 8
+def _draw_check_icon(surface, rect, color, width=3):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.32
+    uk.draw_line_on(surface, color, (cx - s, cy), (cx - s * 0.15, cy + s * 0.8), width)
+    uk.draw_line_on(surface, color, (cx - s * 0.15, cy + s * 0.8), (cx + s, cy - s * 0.7), width)
+
+
+def _draw_trash_icon(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    body = pygame.Rect(0, 0, s * 0.46, s * 0.48)
+    body.centerx = cx
+    body.top = int(cy - s * 0.08)
+    uk.draw_rect_on(surface, color, body, width, 2)
+    lid = pygame.Rect(0, 0, s * 0.62, s * 0.09)
+    lid.centerx = cx
+    lid.bottom = body.top + 1
+    uk.draw_rect_on(surface, color, lid, width, 1)
+    handle = pygame.Rect(0, 0, s * 0.22, s * 0.12)
+    handle.centerx = cx
+    handle.bottom = lid.top + 2
+    uk.draw_rect_on(surface, color, handle, width, 2)
+    for i in (-1, 0, 1):
+        x = cx + i * s * 0.13
+        uk.draw_line_on(surface, color, (x, body.top + 5), (x, body.bottom - 4), width)
+
+
+def _draw_star_icon(surface, rect, color):
+    """Small filled 4-point sparkle — marks an item as a custom / user
+    override in the list (in place of the old trailing ' *' in the label)."""
+    cx, cy = rect.center
+    r = min(rect.w, rect.h) * 0.5
+    pts = [(cx, cy - r), (cx + r * 0.28, cy - r * 0.28), (cx + r, cy),
+           (cx + r * 0.28, cy + r * 0.28), (cx, cy + r), (cx - r * 0.28, cy + r * 0.28),
+           (cx - r, cy), (cx - r * 0.28, cy - r * 0.28)]
+    pygame.draw.polygon(surface, color, pts)
+
+
+def _draw_chevron_down(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.22
+    uk.draw_line_on(surface, color, (cx - s, cy - s * 0.4), (cx, cy + s * 0.6), width)
+    uk.draw_line_on(surface, color, (cx, cy + s * 0.6), (cx + s, cy - s * 0.4), width)
+
+
+class _BitmapFontView:
+    """Adapts a BitmapFont to the plain pygame.font.Font call shape —
+    render(text, antialias, color) / size(text) — at one fixed pixel
+    height. Same adapter DevMenu.py / RoomEditor.py use for their own
+    bitmap fonts, so every `self.font_x.render(text, True, color)` call
+    site below behaves like a normal pygame Font."""
+
+    def __init__(self, bitmap_font, height):
+        self._font = bitmap_font
+        self._height = height
+
+    def render(self, text, antialias=True, color=(255, 255, 255)):
+        return self._font.render(text, color=color, height=self._height)
+
+    def size(self, text):
+        return self._font.size(text, height=self._height)
+
+
+# =============================================================================
+# Layout constants
+# =============================================================================
+LIST_W = 320
+CARD_H = 60
+GRID_BTN_H = 30
+GRID_ROW_H = 40
+SLIDER_H = 40
+FIELD_H = 40
+SECTION_GAP = 22
+
+# Per-field max input length — description gets a lot more room than a
+# short name or one-line effect blurb.
+_FIELD_MAX_LEN = {
+    "name": 40,
+    "effect_text": 64,
+    "description": 600,
+    "new_item_id": 40,
+}
 
 
 class ItemCreator:
+    """In-game item browser/editor. Same toggle()/handle_input(event)/
+    update(dt)/draw(surface, dt) lifecycle as CharacterCreator/EntityCreator/
+    RoomEditor, so game.py's wiring doesn't change."""
+
     def __init__(self, screen_width: int, screen_height: int):
-        self.screen_width = screen_width
-        self.screen_height = screen_height
+        self.screen_width = int(screen_width)
+        self.screen_height = int(screen_height)
         self.active = False
+        self._logical_mouse_pos = (screen_width // 2, screen_height // 2)
 
-        pygame.font.init()
-        try:
-            self.font    = pygame.font.SysFont("segoeui,dejavusans,arial", 16)
-            self.font_sm = pygame.font.SysFont("segoeui,dejavusans,arial", 13)
-            self.font_hd = pygame.font.SysFont("segoeui,dejavusans,arial", 20, bold=True)
-        except Exception:
-            self.font = self.font_sm = self.font_hd = pygame.font.Font(None, 18)
+        # Same bitmap-font family / split as DevMenu and RoomEditor: title
+        # text uses the plain uppercase/lowercase glyph set, everything
+        # else uses the menu glyph set.
+        self._menu_font = uk.BitmapFont('assets\\ui\\fonts', letter_spacing=1)
+        self._title_bitmap_font = uk.BitmapFont('assets\\ui\\fonts', letter_spacing=1)
+        self._title_bitmap_font.uppercase_dir = os.path.join('assets', 'ui', 'fonts', 'uppercase')
+        self._title_bitmap_font.lowercase_dir = os.path.join('assets', 'ui', 'fonts', 'lowercase')
 
-        self._build_layout()
+        self.font_title = _BitmapFontView(self._title_bitmap_font, 30)
+        self.font_large = _BitmapFontView(self._menu_font, 18)
+        self.font_medium = _BitmapFontView(self._menu_font, 15)
+        self.font_small = _BitmapFontView(self._menu_font, 12)
+        self.font_tiny = _BitmapFontView(self._menu_font, 11)
 
+        self._back_icon = self._load_dev_menu_icon('back', 34)
+        self._save_icon = self._load_dev_menu_icon('save', 26)
+        self._trash_icon = self._load_dev_menu_icon('trash', 26)
+        self._plus_icon = self._load_dev_menu_icon('plus', 22)
+
+        # ── item data ──────────────────────────────────────────────────
         self.ids: list[str] = []
         self.custom: set[str] = set()
-        self.item_list = ItemList(self.list_rect)
+        self.category_filter = "all"  # "all" or one of the CATEGORY_* values
+        self.list_scroll = 0
+        self._list_scroll_dragging = False
+        self._list_scrollbar_track = None
+        self._list_scrollbar_thumb = None
+        self._list_scrollbar_max_scroll = 0
         self.selected_id = ""
-        self.data = _new_item_data("")
-        self.editor: Optional[ItemEditorPanel] = None
+        self.data: dict = _new_item_data("")
+        self.editor_dirty = False
+        self._icon: Optional[pygame.Surface] = None
 
+        # ── status line (bottom of action row) ───────────────────────────
         self.status_msg = ""
-        self.status_col = C_TEXT_DIM
+        self.status_col = uk.Theme.TEXT_MUTED
         self.status_timer = 0.0
 
-        self.dialog = None  # non-blocking modal, same shape as character_creator's / entity_creator's
+        # ── category filter dropdown (list panel) ─────────────────────────
+        self._filter_dropdown_open = False
+        self._filter_field_rect = pygame.Rect(0, 0, 0, 0)
+        self._filter_option_rects: dict = {}
 
-    # -- layout ---------------------------------------------------------
-    def _build_layout(self) -> None:
+        # ── inline text editing (name / effect_text / description) ───────
+        self.editing_field: Optional[str] = None
+        self.text_input = ""
+        self.cursor_pos = 0
+        self.selection_anchor = None
+        self.cursor_blink = 0.0
+        self._text_drag = False
+        self._text_max_len = 40
+        self._active_edit_rect: Optional[pygame.Rect] = None
+        self._active_edit_text_x: Optional[int] = None
+        self._active_edit_font = None
+        self.text_field_rects: list[pygame.Rect] = []
+
+        # description word-wrap state — rebuilt every draw(), read by
+        # both drawing and the text-edit engine (click mapping, scrolling)
+        self._desc_rect = pygame.Rect(0, 0, 0, 0)
+        self._desc_lines: list[tuple[str, int]] = [("", 0)]
+        self._desc_scroll = 0
+        self._desc_line_h = 18
+
+        # ── category / effect-type pickers (editor panel) ────────────────
+        self._category_rects: dict = {}
+        self._effect_type_rects: dict = {}
+
+        # ── effect sliders ────────────────────────────────────────────────
+        self._slider_rects: dict = {}
+        self._slider_drag_key: Optional[str] = None
+
+        # ── new-item dialog ────────────────────────────────────────────────
+        self._new_item_dialog_open = False
+        self._dialog_error = ""
+        self._dialog_field_rect = pygame.Rect(0, 0, 0, 0)
+
+        # ── clickable rects, rebuilt every draw() ─────────────────────────
+        self.clickable_rects: list[dict] = []
+
+        # ── hover/press anim buckets (index-based, mirrors RoomEditor) ────
+        self.hover_anim = [0.0] * 64
+        self.hover_index = -1
+        self._last_input = 'mouse'
+
+        # Field-row rects, populated by the editor panel's first draw() —
+        # defaulted here so handle_input never sees a missing attribute if
+        # a click somehow lands before the first frame is drawn.
+        self._name_field_rect = pygame.Rect(0, 0, 0, 0)
+        self._effect_text_field_rect = pygame.Rect(0, 0, 0, 0)
+
+        self._back_hovered = False
+        self._back_hover_anim = 0.0
+        self._new_btn_hovered = False
+        self._new_btn_hover_anim = 0.0
+        self._save_btn_hovered = False
+        self._save_btn_hover_anim = 0.0
+        self._delete_btn_hovered = False
+        self._delete_btn_hover_anim = 0.0
+
+        self._layout()
+
+    # ------------------------------------------------------------------ setup
+    @staticmethod
+    def _load_dev_menu_icon(icon_key, box_size):
+        """Same shared dev-menu PNG icon loader (crop + point-sample scale)
+        DevMenu._load_icon / RoomEditor._load_dev_menu_icon use, so the
+        back arrow here matches theirs pixel-for-pixel."""
+        path = os.path.join('assets', 'ui', 'dev_menu', 'icons', f'{icon_key}.png')
+        try:
+            raw = pygame.image.load(path).convert_alpha()
+        except (FileNotFoundError, pygame.error):
+            return pygame.Surface((box_size, box_size), pygame.SRCALPHA)
+
+        content_rect = raw.get_bounding_rect(min_alpha=1)
+        if content_rect.width <= 0 or content_rect.height <= 0:
+            content_rect = raw.get_rect()
+        raw = raw.subsurface(content_rect).copy()
+
+        iw, ih = raw.get_size()
+        scale = min(box_size / max(1, iw), box_size / max(1, ih))
+        nw = max(1, round(iw * scale))
+        nh = max(1, round(ih * scale))
+        if scale >= 1.0:
+            prescale = max(1, math.ceil(scale) * 2)
+            big = pygame.transform.scale(raw, (iw * prescale, ih * prescale))
+            scaled = pygame.transform.scale(big, (nw, nh))
+        else:
+            scaled = pygame.transform.scale(raw, (nw, nh))
+
+        canvas = pygame.Surface((box_size, box_size), pygame.SRCALPHA)
+        canvas.blit(scaled, ((box_size - nw) // 2, (box_size - nh) // 2))
+        return canvas
+
+    def _layout(self):
         sw, sh = self.screen_width, self.screen_height
-        tab_w = min(140, (sw - PAD * 2 - LIST_W - PAD) // (len(CATEGORIES) + 1))
-        self.filter_tab_rects = []
-        for i in range(len(CATEGORIES) + 1):  # +1 for "All"
-            self.filter_tab_rects.append(
-                pygame.Rect(PAD + i * (tab_w + 4), PAD, tab_w, HEADER_H - PAD * 2))
+        # Same header/footer formula as DevMenu/RoomEditor.
+        self.header_h = max(86, round(sh * 0.12))
+        self.footer_h = max(42, round(sh * 0.065))
+        self.margin_x = max(24, round(sw * 0.03))
 
-        self.list_rect = pygame.Rect(PAD, HEADER_H + PAD, LIST_W,
-                                     sh - HEADER_H - FOOTER_H - PAD * 2)
-        editor_x = LIST_W + PAD * 2
-        self.editor_rect = pygame.Rect(editor_x, HEADER_H + PAD,
-                                       sw - editor_x - PAD,
-                                       sh - HEADER_H - FOOTER_H - PAD * 2)
-        self.btn_save   = pygame.Rect(sw - 230, sh - FOOTER_H + 10, 100, 32)
-        self.btn_delete = pygame.Rect(sw - 120, sh - FOOTER_H + 10, 100, 32)
-        self.btn_new    = pygame.Rect(PAD + 4, sh - FOOTER_H + 10, LIST_W - 8, 32)
+        back_size = max(40, round(self.header_h * 0.55))
+        self._back_rect = pygame.Rect(0, 0, back_size, back_size)
+        self._back_rect.left = self.margin_x
+        self._back_rect.centery = self.header_h // 2
 
-    # -- lifecycle --------------------------------------------------------
+        self._title_surf = self.font_title.render("ITEM CREATOR", True, uk.Theme.TEXT_PRIMARY)
+
+        # Save / Delete icon buttons live in the header bar itself, right
+        # side, matching the back button's square size.
+        self._delete_btn_rect = pygame.Rect(0, 0, back_size, back_size)
+        self._delete_btn_rect.right = sw - self.margin_x
+        self._delete_btn_rect.centery = self.header_h // 2
+        self._save_btn_rect = pygame.Rect(0, 0, back_size, back_size)
+        self._save_btn_rect.right = self._delete_btn_rect.left - 12
+        self._save_btn_rect.centery = self.header_h // 2
+
+        gap = 20
+        content_top = self.header_h + gap
+        content_bottom = sh - self.footer_h - gap
+        content_h = max(100, content_bottom - content_top)
+
+        list_w = min(LIST_W, max(240, int(sw * 0.24)))
+        self.list_rect = pygame.Rect(self.margin_x, content_top, list_w, content_h)
+        editor_x = self.list_rect.right + gap
+        self.editor_rect = pygame.Rect(editor_x, content_top, sw - editor_x - self.margin_x, content_h)
+
+        # Category filter field row, top of the list panel.
+        self._filter_field_rect = pygame.Rect(self.list_rect.x, self.list_rect.y, self.list_rect.w, FIELD_H)
+
+        # "New Item": a square plus-icon button when collapsed; when
+        # expanded (adding an item) this same row becomes an inline text
+        # field with confirm/cancel icon buttons — see _draw_new_item_row.
+        self._new_item_row_rect = pygame.Rect(
+            self.list_rect.x, self._filter_field_rect.bottom + 10, self.list_rect.w, 40)
+        self._new_item_btn_rect = pygame.Rect(
+            self.list_rect.x, self._new_item_row_rect.y, self._new_item_row_rect.h, self._new_item_row_rect.h)
+
+        # Scrollable item card area fills the rest of the list panel.
+        self.item_list_rect = pygame.Rect(
+            self.list_rect.x, self._new_item_row_rect.bottom + 12,
+            self.list_rect.w, self.list_rect.bottom - (self._new_item_row_rect.bottom + 12))
+
+        self._icon_box = pygame.Rect(0, 0, 96, 96)
+
+    def _resize_to(self, w, h):
+        w, h = int(w), int(h)
+        if (w, h) == (self.screen_width, self.screen_height):
+            return
+        self.screen_width, self.screen_height = w, h
+        self._layout()
+
+    # ------------------------------------------------------------------ lifecycle
     def toggle(self) -> None:
         self.active = not self.active
         if self.active:
+            pygame.key.set_repeat(400, 50)
             self._refresh_list()
+            self._back_hovered = False
+            self._back_hover_anim = 0.0
+            self._filter_dropdown_open = False
+            self._new_item_dialog_open = False
+            self.editing_field = None
+        else:
+            pygame.key.set_repeat(0, 0)
 
     def _refresh_list(self) -> None:
         self.ids = discover_all_item_ids()
         self.custom = discover_custom_item_ids()
-        self.item_list.set_ids(self.ids, self.custom, self.selected_id)
-        self.selected_id = self.item_list.selected
+        if self.selected_id not in self.ids:
+            self.selected_id = self._filtered_ids()[0] if self._filtered_ids() else ""
         if self.selected_id:
             self._load_item(self.selected_id)
         else:
-            self.editor = None
+            self.data = _new_item_data("")
+            self._icon = None
+
+    def _filtered_ids(self) -> list[str]:
+        if self.category_filter == "all":
+            return list(self.ids)
+        return [iid for iid in self.ids if ITEMS.get(iid, {}).get("category") == self.category_filter]
 
     def _load_item(self, item_id: str) -> None:
         self.selected_id = item_id
         self.data = _load_item_data(item_id)
-        self.editor = ItemEditorPanel(self.editor_rect, item_id, self.data)
+        self._icon = _load_icon(item_id, self._icon_box.w)
+        self.editor_dirty = False
+        self.editing_field = None
+        self._desc_scroll = 0
 
     def _switch_item(self, item_id: str) -> None:
+        if item_id == self.selected_id:
+            return
         self._load_item(item_id)
 
     def _set_status(self, msg: str, ok: bool = True) -> None:
         self.status_msg = msg
-        self.status_col = C_GREEN if ok else C_RED
+        self.status_col = uk.Theme.GOLD_BRIGHT if ok else uk.Theme.DANGER_BRIGHT
         self.status_timer = 3.0
 
-    # -- save / delete / new ----------------------------------------------
+    # ------------------------------------------------------------------ save / delete / new
     def _do_save(self) -> None:
-        if not self.editor or not self.selected_id:
+        if not self.selected_id:
             return
-        data = copy.deepcopy(self.editor.data)
+        data = copy.deepcopy(self.data)
         if data["effect"].get("type") == "none":
             data["effect"] = {}  # 'none' isn't a real item_effects.py type — omit it entirely
         save_item_override(self.selected_id, data)
         self.custom.add(self.selected_id)
         if self.selected_id not in self.ids:
             self.ids = discover_all_item_ids()
-            self.item_list.set_ids(self.ids, self.custom, self.selected_id)
-        self.editor.dirty = False
+        self.editor_dirty = False
         self._set_status(f"Saved {data['name']}")
 
     def _do_delete(self) -> None:
@@ -681,172 +621,1223 @@ class ItemCreator:
             else f"Deleted {self.selected_id}",
             ok=still_exists,
         )
-        next_selected = self.selected_id if still_exists else (self.ids[0] if self.ids else "")
-        self.item_list.set_ids(self.ids, self.custom, next_selected)
-        if self.item_list.selected:
-            self._load_item(self.item_list.selected)
+        filtered = self._filtered_ids()
+        next_selected = self.selected_id if still_exists else (filtered[0] if filtered else "")
+        if next_selected:
+            self._load_item(next_selected)
         else:
-            self.editor = None
             self.selected_id = ""
+            self.data = _new_item_data("")
+            self._icon = None
 
-    def _open_new_dialog(self) -> None:
-        field = TextInput(pygame.Rect(0, 0, 320, 32), "")
-        field.active = True
-        self.dialog = {"field": field, "error": ""}
+    def _open_new_item_dialog(self) -> None:
+        self._new_item_dialog_open = True
+        self._dialog_error = ""
+        self._begin_text_edit("new_item_id", "")
 
-    def _do_create(self, new_id: str) -> None:
-        new_id = new_id.strip().lower().replace(" ", "_")
+    def _close_new_item_dialog(self) -> None:
+        self._new_item_dialog_open = False
+        self._dialog_error = ""
+        if self.editing_field == "new_item_id":
+            self.editing_field = None
+            self.text_input = ""
+            self.cursor_pos = 0
+            self.selection_anchor = None
+
+    def _do_create(self, raw_id: str) -> bool:
+        new_id = raw_id.strip().lower().replace(" ", "_")
         if not new_id:
-            return
+            self._dialog_error = "Enter an item id."
+            self._set_status(self._dialog_error, ok=False)
+            return False
         if new_id in ITEMS:
-            self.dialog["error"] = f"'{new_id}' already exists."
-            return
+            self._dialog_error = f"'{new_id}' already exists."
+            self._set_status(self._dialog_error, ok=False)
+            return False
         save_item_override(new_id, _new_item_data(new_id))
         self.custom.add(new_id)
         self.ids = discover_all_item_ids()
-        self.item_list.set_ids(self.ids, self.custom, new_id)
+        self.category_filter = "all"
         self._switch_item(new_id)
-        self.dialog = None
         self._set_status(f"Created {new_id} — set its category and effect, then Save")
+        return True
 
-    # -- input --------------------------------------------------------------
-    def handle_input(self, event: pygame.event.Event):
+    # ------------------------------------------------------------------ text-edit engine
+    # Generalized version of RoomEditor's editing_field/text_input/cursor
+    # state machine — same field/commit/cancel/selection/clipboard
+    # behaviour, extended here to also support one multi-line field
+    # (description) via _desc_lines word-wrap.
+    def _begin_text_edit(self, field: str, text: str) -> None:
+        self.editing_field = field
+        self.text_input = text
+        self.cursor_pos = len(text)
+        self.selection_anchor = None
+        self.cursor_blink = 0.0
+        self._text_max_len = _FIELD_MAX_LEN.get(field, 40)
+
+    def _has_text_selection(self) -> bool:
+        return self.selection_anchor is not None and self.selection_anchor != self.cursor_pos
+
+    def _text_selection_range(self):
+        a, b = self.selection_anchor, self.cursor_pos
+        return (a, b) if a <= b else (b, a)
+
+    def _delete_text_selection(self) -> bool:
+        if not self._has_text_selection():
+            return False
+        s, e = self._text_selection_range()
+        self.text_input = self.text_input[:s] + self.text_input[e:]
+        self.cursor_pos = s
+        self.selection_anchor = None
+        return True
+
+    def _insert_into_text_input(self, s: str) -> None:
+        allow_newline = self.editing_field == "description"
+        s = "".join(ch for ch in s if ch.isprintable() or (allow_newline and ch == "\n"))
+        if not s:
+            return
+        if self._has_text_selection():
+            self._delete_text_selection()
+        space = self._text_max_len - len(self.text_input)
+        if space <= 0:
+            return
+        s = s[:space]
+        self.text_input = self.text_input[:self.cursor_pos] + s + self.text_input[self.cursor_pos:]
+        self.cursor_pos += len(s)
+
+    def _text_index_from_x(self, x: int) -> int:
+        """Single-line variant — used for name/effect_text/new_item_id."""
+        if self._active_edit_font is None or self._active_edit_text_x is None or not self.text_input:
+            return 0
+        font = self._active_edit_font
+        widths = [0]
+        for i in range(1, len(self.text_input) + 1):
+            widths.append(font.size(self.text_input[:i])[0])
+        rel_x = x - self._active_edit_text_x
+        best_i, best_d = 0, abs(widths[0] - rel_x)
+        for i, w in enumerate(widths):
+            d = abs(w - rel_x)
+            if d < best_d:
+                best_i, best_d = i, d
+        return best_i
+
+    def _desc_wrap_width(self) -> int:
+        """Text-wrap width for the description box, net of its 10px left/
+        right padding — the single source of truth so drawing, click
+        mapping, and vertical-arrow navigation all wrap identically."""
+        return max(10, self._desc_rect.w - 20)
+
+    def _desc_index_from_pos(self, x: int, y: int) -> int:
+        """Multi-line variant for the description box: pick the visual
+        line under y (accounting for scroll), then the nearest character
+        boundary in that line under x."""
+        lines = self._desc_lines
+        if not lines:
+            return 0
+        rel_row = (y - self._desc_rect.y - 6) // max(1, self._desc_line_h) + self._desc_scroll
+        row = max(0, min(len(lines) - 1, int(rel_row)))
+        line_text, line_start = lines[row]
+        font = self.font_medium
+        widths = [0]
+        for i in range(1, len(line_text) + 1):
+            widths.append(font.size(line_text[:i])[0])
+        rel_x = x - (self._desc_rect.x + 10)
+        best_i, best_d = 0, abs(widths[0] - rel_x)
+        for i, w in enumerate(widths):
+            d = abs(w - rel_x)
+            if d < best_d:
+                best_i, best_d = i, d
+        return line_start + best_i
+
+    @staticmethod
+    def _wrap_lines(font, text: str, width: int) -> list[tuple[str, int]]:
+        """Word-wrap `text` (which may contain manual '\\n' breaks) to fit
+        `width`. Returns [(visual_line_text, raw_start_index), ...] so the
+        caret / click-to-index mapping can translate back to a position in
+        the original (unwrapped) string."""
+        lines: list[tuple[str, int]] = []
+        offset = 0
+        paragraphs = text.split("\n")
+        for para in paragraphs:
+            if para == "":
+                lines.append(("", offset))
+            else:
+                words = para.split(" ")
+                word_starts = []
+                pos = offset
+                for w in words:
+                    word_starts.append(pos)
+                    pos += len(w) + 1
+                cur_words: list[str] = []
+                cur_start = word_starts[0]
+                for wi, w in enumerate(words):
+                    trial = cur_words + [w]
+                    if cur_words and font.size(" ".join(trial))[0] > width:
+                        lines.append((" ".join(cur_words), cur_start))
+                        cur_words = [w]
+                        cur_start = word_starts[wi]
+                    else:
+                        cur_words = trial
+                lines.append((" ".join(cur_words), cur_start))
+            offset += len(para) + 1
+        return lines
+
+    def _finish_text_input(self) -> None:
+        field = self.editing_field
+        if field is None:
+            return
+        text = self.text_input
+
+        if field == "name":
+            self.data["name"] = text
+            self.editor_dirty = True
+        elif field == "effect_text":
+            self.data["effect_text"] = text
+            self.editor_dirty = True
+        elif field == "description":
+            self.data["description"] = text
+            self.editor_dirty = True
+        elif field == "new_item_id":
+            if self._do_create(text):
+                self._close_new_item_dialog()
+            return  # keep the dialog (and its field) open on failure
+
+        self.editing_field = None
+        self.text_input = ""
+        self.cursor_pos = 0
+        self.selection_anchor = None
+
+    def _cancel_text_input(self) -> None:
+        if self.editing_field == "new_item_id":
+            self._close_new_item_dialog()
+            return
+        self.editing_field = None
+        self.text_input = ""
+        self.cursor_pos = 0
+        self.selection_anchor = None
+
+    def _handle_text_edit_event(self, event) -> bool:
+        """Returns True if the event was consumed by the text-edit engine."""
+        if self.editing_field is None:
+            return False
+
+        if event.type == pygame.KEYDOWN:
+            mods = pygame.key.get_mods()
+            ctrl = bool(mods & (pygame.KMOD_CTRL | pygame.KMOD_META))
+            shift = bool(mods & pygame.KMOD_SHIFT)
+            multiline = self.editing_field == "description"
+
+            if event.key == pygame.K_RETURN:
+                if multiline:
+                    self._insert_into_text_input("\n")
+                else:
+                    self._finish_text_input()
+            elif event.key == pygame.K_ESCAPE:
+                self._cancel_text_input()
+            elif event.key == pygame.K_TAB:
+                self._finish_text_input()
+            elif ctrl and event.key == pygame.K_a:
+                self.selection_anchor = 0
+                self.cursor_pos = len(self.text_input)
+            elif ctrl and event.key in (pygame.K_c, pygame.K_x):
+                if self._has_text_selection():
+                    s, e = self._text_selection_range()
+                    uk.clipboard_set_text(self.text_input[s:e])
+                    if event.key == pygame.K_x:
+                        self._delete_text_selection()
+            elif ctrl and event.key == pygame.K_v:
+                self._insert_into_text_input(uk.clipboard_get_text())
+            elif event.key == pygame.K_LEFT:
+                if shift:
+                    if self.selection_anchor is None:
+                        self.selection_anchor = self.cursor_pos
+                    self.cursor_pos = max(0, self.cursor_pos - 1)
+                elif self._has_text_selection():
+                    self.cursor_pos = self._text_selection_range()[0]
+                    self.selection_anchor = None
+                else:
+                    self.cursor_pos = max(0, self.cursor_pos - 1)
+            elif event.key == pygame.K_RIGHT:
+                if shift:
+                    if self.selection_anchor is None:
+                        self.selection_anchor = self.cursor_pos
+                    self.cursor_pos = min(len(self.text_input), self.cursor_pos + 1)
+                elif self._has_text_selection():
+                    self.cursor_pos = self._text_selection_range()[1]
+                    self.selection_anchor = None
+                else:
+                    self.cursor_pos = min(len(self.text_input), self.cursor_pos + 1)
+            elif event.key in (pygame.K_UP, pygame.K_DOWN) and multiline:
+                self._move_desc_cursor_vertical(-1 if event.key == pygame.K_UP else 1, shift)
+            elif event.key == pygame.K_HOME:
+                if shift and self.selection_anchor is None:
+                    self.selection_anchor = self.cursor_pos
+                elif not shift:
+                    self.selection_anchor = None
+                self.cursor_pos = 0
+            elif event.key == pygame.K_END:
+                if shift and self.selection_anchor is None:
+                    self.selection_anchor = self.cursor_pos
+                elif not shift:
+                    self.selection_anchor = None
+                self.cursor_pos = len(self.text_input)
+            elif event.key == pygame.K_BACKSPACE:
+                if not self._delete_text_selection() and self.cursor_pos > 0:
+                    self.text_input = self.text_input[:self.cursor_pos - 1] + self.text_input[self.cursor_pos:]
+                    self.cursor_pos -= 1
+            elif event.key == pygame.K_DELETE:
+                if not self._delete_text_selection() and self.cursor_pos < len(self.text_input):
+                    self.text_input = self.text_input[:self.cursor_pos] + self.text_input[self.cursor_pos + 1:]
+            else:
+                if event.unicode and (event.unicode.isprintable() or (multiline and event.unicode == "\n")):
+                    self._insert_into_text_input(event.unicode)
+            self.cursor_blink = 0.0
+            return True
+
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if self._active_edit_rect is not None and self._active_edit_rect.collidepoint(event.pos):
+                idx = (self._desc_index_from_pos(*event.pos) if self.editing_field == "description"
+                       else self._text_index_from_x(event.pos[0]))
+                if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                    if self.selection_anchor is None:
+                        self.selection_anchor = self.cursor_pos
+                else:
+                    self.selection_anchor = idx
+                self.cursor_pos = idx
+                self._text_drag = True
+                self.cursor_blink = 0.0
+                return True
+            self._finish_text_input()
+            return False  # let the click fall through to normal handling
+
+        if event.type == pygame.MOUSEMOTION:
+            if self._text_drag and self._active_edit_rect is not None:
+                x = max(self._active_edit_rect.left, min(event.pos[0], self._active_edit_rect.right))
+                y = max(self._active_edit_rect.top, min(event.pos[1], self._active_edit_rect.bottom - 1))
+                idx = (self._desc_index_from_pos(x, y) if self.editing_field == "description"
+                       else self._text_index_from_x(x))
+                self.cursor_pos = idx
+                self.cursor_blink = 0.0
+            return True
+
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self._text_drag = False
+            return True
+
+        if event.type == pygame.MOUSEWHEEL and self.editing_field == "description":
+            self._desc_scroll = max(0, self._desc_scroll - event.y)
+            return True
+
+        return True
+
+    def _move_desc_cursor_vertical(self, direction: int, shift: bool) -> None:
+        lines = self._wrap_lines(self.font_medium, self.text_input, self._desc_wrap_width())
+        starts = [s for _, s in lines]
+        row = 0
+        for i, s in enumerate(starts):
+            if s <= self.cursor_pos:
+                row = i
+        col_x = self.font_medium.size(self.text_input[lines[row][1]:self.cursor_pos])[0]
+        new_row = max(0, min(len(lines) - 1, row + direction))
+        line_text, line_start = lines[new_row]
+        widths = [0]
+        for i in range(1, len(line_text) + 1):
+            widths.append(self.font_medium.size(line_text[:i])[0])
+        best_i, best_d = 0, abs(widths[0] - col_x)
+        for i, w in enumerate(widths):
+            d = abs(w - col_x)
+            if d < best_d:
+                best_i, best_d = i, d
+        new_pos = line_start + best_i
+        if shift:
+            if self.selection_anchor is None:
+                self.selection_anchor = self.cursor_pos
+        else:
+            self.selection_anchor = None
+        self.cursor_pos = new_pos
+
+    # ------------------------------------------------------------------ effect sliders
+    def _slider_specs(self) -> list[dict]:
+        """Effect-specific numeric fields for the currently selected effect
+        type — same set of fields _build_effect_widgets used to build,
+        just described declaratively instead of as widget objects."""
+        effect = self.data["effect"]
+        etype = effect.get("type", "none")
+        specs: list[dict] = []
+
+        def stat_specs():
+            stats = effect.setdefault("stats", {})
+            out = []
+            for sid in STAT_IDS:
+                out.append({
+                    "key": f"stat_{sid}", "label": STAT_LABELS[sid],
+                    "min": -50, "max": 100, "step": 1, "as_int": True,
+                    "get": lambda stats=stats, sid=sid: stats.get(sid, 0),
+                    "set": lambda v, stats=stats, sid=sid: stats.__setitem__(sid, int(v)),
+                })
+            return out
+
+        if etype in ("heal_hp", "heal_ep"):
+            specs.append({
+                "key": "amount", "label": "Amount", "min": 1, "max": 3000, "step": 5, "as_int": True,
+                "get": lambda: effect.get("amount", 20),
+                "set": lambda v: effect.__setitem__("amount", int(v)),
+            })
+        elif etype == "revive":
+            specs.append({
+                "key": "hp_ratio", "label": "HP Ratio", "min": 0.05, "max": 1.0, "step": 0.05,
+                "as_int": False, "fmt": "{:.2f}",
+                "get": lambda: effect.get("hp_ratio", 0.5),
+                "set": lambda v: effect.__setitem__("hp_ratio", round(v, 2)),
+            })
+        elif etype == "buff":
+            specs.append({
+                "key": "duration", "label": "Duration", "min": 1, "max": 120, "step": 1,
+                "as_int": True, "fmt": "{:.0f}s",
+                "get": lambda: effect.get("duration", 30.0),
+                "set": lambda v: effect.__setitem__("duration", round(v, 1)),
+            })
+            specs.extend(stat_specs())
+        elif etype == "equip_stat":
+            specs.extend(stat_specs())
+            specs.append({
+                "key": "exp_bonus", "label": "XP Bonus", "min": 0.0, "max": 1.0, "step": 0.05,
+                "as_int": False, "fmt": "{:.2f}",
+                "get": lambda: effect.get("exp_bonus", 0.0),
+                "set": lambda v: effect.__setitem__("exp_bonus", round(v, 2)),
+            })
+        return specs
+
+    def _apply_slider_drag(self, key: str, mouse_x: int) -> None:
+        rect = self._slider_rects.get(key)
+        if rect is None:
+            return
+        spec = next((s for s in self._slider_specs() if s["key"] == key), None)
+        if spec is None:
+            return
+        t = max(0.0, min(1.0, (mouse_x - rect.x) / max(1, rect.w)))
+        value = spec["min"] + t * (spec["max"] - spec["min"])
+        step = spec.get("step", 1)
+        if step:
+            value = round(value / step) * step
+        value = max(spec["min"], min(spec["max"], value))
+        spec["set"](value)
+        self.editor_dirty = True
+
+    # ------------------------------------------------------------------ input
+    def handle_input(self, event):
         if not self.active:
             return None
 
-        if self.dialog is not None:
-            self._handle_dialog_event(event)
+        if hasattr(event, 'pos'):
+            self._logical_mouse_pos = tuple(event.pos)
+
+        # -- New-item inline row: fully captures input while expanded -------
+        if self._new_item_dialog_open:
+            if self._handle_text_edit_event(event):
+                return None
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                if not self._dialog_field_rect.collidepoint(event.pos):
+                    # Clicking anywhere outside the field closes it, same
+                    # as any other inline field committing on outside click.
+                    self._close_new_item_dialog()
             return None
+
+        # -- Inline field editing (name / effect_text / description) --------
+        if self.editing_field is not None:
+            consumed = self._handle_text_edit_event(event)
+            if consumed:
+                return None
+            # fall through — the click that just committed the field may
+            # also hit a button/row below
+
+        # -- Category filter dropdown ----------------------------------------
+        if self._filter_dropdown_open:
+            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                for cat, rect in self._filter_option_rects.items():
+                    if rect.collidepoint(event.pos):
+                        self.category_filter = cat
+                        self._filter_dropdown_open = False
+                        filtered = self._filtered_ids()
+                        if filtered and self.selected_id not in filtered:
+                            self._switch_item(filtered[0])
+                        self.list_scroll = 0
+                        return None
+                self._filter_dropdown_open = False
+                return None
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                self._filter_dropdown_open = False
+                return None
 
         if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
             self.active = False
-            return None
+            return 'back_to_dev_menu'
 
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_s \
-                and (event.mod & pygame.KMOD_CTRL):
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_s and (event.mod & pygame.KMOD_CTRL):
             self._do_save()
             return None
 
-        for rect, cat in zip(self.filter_tab_rects, ["all"] + [c for c, _, _ in CATEGORIES]):
-            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and rect.collidepoint(event.pos):
-                self.item_list.set_filter(cat)
+        if event.type == pygame.MOUSEWHEEL:
+            if self.item_list_rect.collidepoint(self._logical_mouse_pos):
+                self.list_scroll = max(0, self.list_scroll - event.y)
                 return None
 
-        new_sel = self.item_list.handle_event(event)
-        if new_sel:
-            self._switch_item(new_sel)
+        if event.type == pygame.MOUSEMOTION:
+            self._last_input = 'mouse'
+            if self._list_scroll_dragging:
+                self._scrub_list_scroll(event.pos[1])
+                return None
+            self._back_hovered = self._back_rect.collidepoint(event.pos)
+            self._new_btn_hovered = self._new_item_btn_rect.collidepoint(event.pos)
+            self._save_btn_hovered = self._save_btn_rect.collidepoint(event.pos)
+            self._delete_btn_hovered = self._delete_btn_rect.collidepoint(event.pos)
+            self._set_hover_from_pos(event.pos)
             return None
 
-        if self.editor:
-            self.editor.handle_event(event)
-
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            if self.btn_save.collidepoint(event.pos):
+            if self._back_rect.collidepoint(event.pos):
+                self.active = False
+                return 'back_to_dev_menu'
+            if self._filter_field_rect.collidepoint(event.pos):
+                self._filter_dropdown_open = not self._filter_dropdown_open
+                return None
+            if self._new_item_btn_rect.collidepoint(event.pos):
+                self._open_new_item_dialog()
+                return None
+            if self._save_btn_rect.collidepoint(event.pos):
                 self._do_save()
-            elif self.btn_delete.collidepoint(event.pos):
+                return None
+            if self._delete_btn_rect.collidepoint(event.pos):
                 self._do_delete()
-            elif self.btn_new.collidepoint(event.pos):
-                self._open_new_dialog()
+                return None
+
+            # scrollbar thumb / track — click-to-jump, then drag
+            if self._list_scrollbar_track is not None:
+                hit = self._list_scrollbar_track.inflate(12, 0)
+                if hit.collidepoint(event.pos) or (
+                        self._list_scrollbar_thumb and self._list_scrollbar_thumb.collidepoint(event.pos)):
+                    self._list_scroll_dragging = True
+                    self._scrub_list_scroll(event.pos[1])
+                    return None
+
+            # item list rows
+            filtered = self._filtered_ids()
+            if self.item_list_rect.collidepoint(event.pos):
+                visible = max(1, self.item_list_rect.h // CARD_H)
+                for i, iid in enumerate(filtered[self.list_scroll:self.list_scroll + visible + 1]):
+                    row_y = self.item_list_rect.y + i * CARD_H
+                    row_rect = pygame.Rect(self.item_list_rect.x, row_y, self.item_list_rect.w, CARD_H - 8)
+                    if row_rect.collidepoint(event.pos):
+                        self._switch_item(iid)
+                        return None
+
+            # name / effect_text field rows
+            if self._name_field_rect.collidepoint(event.pos):
+                self._begin_text_edit("name", self.data.get("name", ""))
+                return None
+            if self._effect_text_field_rect.collidepoint(event.pos):
+                self._begin_text_edit("effect_text", self.data.get("effect_text", ""))
+                return None
+            if self._desc_rect.collidepoint(event.pos):
+                self._begin_text_edit("description", self.data.get("description", ""))
+                idx = self._desc_index_from_pos(*event.pos)
+                self.cursor_pos = idx
+                return None
+
+            # category picker
+            for cat, rect in self._category_rects.items():
+                if rect.collidepoint(event.pos) and self.data["category"] != cat:
+                    self.data["category"] = cat
+                    slot = CATEGORY_SLOT[cat]
+                    if slot:
+                        self.data["slot"] = slot
+                    else:
+                        self.data.pop("slot", None)
+                    self.editor_dirty = True
+                    return None
+
+            # effect type picker
+            for etype, rect in self._effect_type_rects.items():
+                if rect.collidepoint(event.pos) and self.data["effect"].get("type") != etype:
+                    self.data["effect"] = _default_effect_for_type(etype, self.data["effect"])
+                    self.editor_dirty = True
+                    return None
+
+            # sliders — click-to-set, then drag
+            for key, rect in self._slider_rects.items():
+                hit = rect.inflate(0, 16)
+                if hit.collidepoint(event.pos):
+                    self._slider_drag_key = key
+                    self._apply_slider_drag(key, event.pos[0])
+                    return None
+
+            return None
+
+        if event.type == pygame.MOUSEMOTION and self._slider_drag_key is not None:
+            self._apply_slider_drag(self._slider_drag_key, event.pos[0])
+            return None
+
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self._slider_drag_key = None
+            self._list_scroll_dragging = False
+            return None
+
         return None
 
-    def _handle_dialog_event(self, event) -> None:
-        d = self.dialog
-        d["field"].handle_event(event)
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_RETURN:
-            self._do_create(d["field"].value)
-        elif event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-            self.dialog = None
-        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            ok_r = d.get("ok_rect")
-            cancel_r = d.get("cancel_rect")
-            if ok_r and ok_r.collidepoint(event.pos):
-                self._do_create(d["field"].value)
-            elif cancel_r and cancel_r.collidepoint(event.pos):
-                self.dialog = None
+    def _set_hover_from_pos(self, pos):
+        self.hover_index = -1
+        filtered = self._filtered_ids()
+        if not self.item_list_rect.collidepoint(pos):
+            return
+        visible = max(1, self.item_list_rect.h // CARD_H)
+        for i, iid in enumerate(filtered[self.list_scroll:self.list_scroll + visible + 1]):
+            row_y = self.item_list_rect.y + i * CARD_H
+            row_rect = pygame.Rect(self.item_list_rect.x, row_y, self.item_list_rect.w, CARD_H - 8)
+            if row_rect.collidepoint(pos):
+                self.hover_index = self.list_scroll + i
+                return
 
-    # -- frame --------------------------------------------------------------
+    # ------------------------------------------------------------------ frame
     def update(self, dt: float) -> None:
         if not self.active:
+            uk.set_text_cursor(False)
+            uk.set_hand_cursor(False)
             return
+
+        dt = min(dt, 1 / 20)
+        self.cursor_blink += dt
+
+        target_back = 1.0 if self._back_hovered else 0.0
+        self._back_hover_anim += (target_back - self._back_hover_anim) * min(1.0, dt * 12.0)
+        target_new = 1.0 if self._new_btn_hovered else 0.0
+        self._new_btn_hover_anim += (target_new - self._new_btn_hover_anim) * min(1.0, dt * 12.0)
+        target_save = 1.0 if self._save_btn_hovered else 0.0
+        self._save_btn_hover_anim += (target_save - self._save_btn_hover_anim) * min(1.0, dt * 12.0)
+        target_delete = 1.0 if self._delete_btn_hovered else 0.0
+        self._delete_btn_hover_anim += (target_delete - self._delete_btn_hover_anim) * min(1.0, dt * 12.0)
+
+        filtered = self._filtered_ids()
+        for i in range(len(filtered)):
+            if i >= len(self.hover_anim):
+                break
+            target = 1.0 if i == self.hover_index else 0.0
+            self.hover_anim[i] += (target - self.hover_anim[i]) * min(1.0, dt * 12.0)
+
         if self.status_timer > 0:
             self.status_timer -= dt
             if self.status_timer <= 0:
                 self.status_msg = ""
 
-    def draw(self, screen: pygame.Surface, dt: float) -> None:
-        if not self.active:
-            return
-        sw, sh = self.screen_width, self.screen_height
-        overlay = pygame.Surface((sw, sh))
-        overlay.fill(C_BG)
-        screen.blit(overlay, (0, 0))
+        hovering_text_field = any(r.collidepoint(self._logical_mouse_pos) for r in self.text_field_rects)
+        uk.set_text_cursor(hovering_text_field)
+        hovering_widget = (not hovering_text_field
+                            and any(c["rect"].collidepoint(self._logical_mouse_pos) for c in self.clickable_rects))
+        uk.set_hand_cursor(hovering_widget)
 
-        labels = ["All"] + [label for _, label, _ in CATEGORIES]
-        cats = ["all"] + [c for c, _, _ in CATEGORIES]
-        for rect, label, cat in zip(self.filter_tab_rects, labels, cats):
-            active = (self.item_list.category_filter == cat)
-            bg = C_TAB_ACT if active else C_TAB_INACT
-            screen.draw_rect(bg, rect, border_radius=6)
-            screen.draw_rect(C_ACCENT if active else C_BORDER, rect, 1, border_radius=6)
-            txt = render_text_cached(self.font_sm, label, C_TEXT if active else C_TEXT_DIM)
-            # Shrink-to-fit so longer labels ("Equip: Accessory") don't
-            # spill past narrow tabs on smaller screen widths.
-            if txt.get_width() > rect.w - 8:
-                scale = (rect.w - 8) / txt.get_width()
-                txt = pygame.transform.scale(
-                    txt, (max(1, int(txt.get_width() * scale)), max(1, int(txt.get_height() * scale))))
-            screen.blit(txt, txt.get_rect(center=rect.center))
+    # ------------------------------------------------------------------ drawing helpers (shared card/panel primitives)
+    def _item_anim(self, index: int) -> float:
+        if 0 <= index < len(self.hover_anim):
+            return self.hover_anim[index]
+        return 1.0 if index == self.hover_index else 0.0
 
-        self.item_list.draw(screen, self.font_sm)
+    def _draw_background(self, screen):
+        w, h = self.screen_width, self.screen_height
+        uk.draw_rect_on(screen, (8, 11, 17), pygame.Rect(0, 0, w, h), 0, 0)
+        uk.draw_rect_on(screen, (10, 13, 20),
+                         pygame.Rect(0, self.header_h, w, h - self.header_h - self.footer_h), 0, 0)
 
-        screen.draw_rect(C_PANEL, self.editor_rect, border_radius=6)
-        screen.draw_rect(C_BORDER, self.editor_rect, 1, border_radius=6)
-        if self.editor:
-            old_clip = screen.get_clip()
-            screen.set_clip(self.editor_rect)
-            self.editor.draw(screen, self.font, self.font_sm, dt)
-            screen.set_clip(old_clip)
-        elif not self.ids:
-            msg = render_text_cached(self.font_sm, "No items found in core/items.py's ITEMS table", C_TEXT_DIM)
-            screen.blit(msg, msg.get_rect(center=self.editor_rect.center))
+    def _draw_header(self, screen):
+        w = self.screen_width
+        uk.draw_rect_on(screen, (12, 15, 23), pygame.Rect(0, 0, w, self.header_h), 0, 0)
+        uk.draw_rect_on(screen, (43, 49, 63), pygame.Rect(0, self.header_h - 1, w, 1), 0, 0)
 
-        draw_button(screen, self.font_sm, self.btn_save, "Save",
-                   color=C_ACCENT2 if (self.editor and self.editor.dirty) else C_ACCENT)
-        draw_button(screen, self.font_sm, self.btn_delete, "Delete", color=C_RED)
-        draw_button(screen, self.font_sm, self.btn_new, "+ New Item")
+        title_rect = self._title_surf.get_rect(centerx=w // 2, centery=self.header_h // 2)
+        uk.blit_surface(screen, self._title_surf, title_rect, transient=False)
+
+        self._draw_back_button(screen)
+
+        save_accent = uk.Theme.GOLD_BRIGHT if self.editor_dirty else uk.Theme.GOLD
+        t_save = max(self._save_btn_hover_anim, 0.35 if self.editor_dirty else 0.0)
+        self._draw_icon_square_btn(screen, self._save_btn_rect, t_save, self._icon_save_png, save_accent)
+        self.clickable_rects.append({"rect": self._save_btn_rect})
+
+        t_del = self._delete_btn_hover_anim
+        self._draw_icon_square_btn(screen, self._delete_btn_rect, t_del, self._icon_trash_png,
+                                    uk.Theme.DANGER_BRIGHT, danger=True)
+        self.clickable_rects.append({"rect": self._delete_btn_rect})
 
         if self.status_msg:
-            txt = render_text_cached(self.font_sm, self.status_msg, self.status_col)
-            screen.blit(txt, (self.editor_rect.x, self.screen_height - FOOTER_H + 18))
+            status_surf = self.font_small.render(self.status_msg, True, self.status_col)
+            status_rect = status_surf.get_rect(right=self._save_btn_rect.left - 16, centery=self.header_h // 2)
+            uk.blit_surface(screen, status_surf, status_rect, transient=True)
 
-        if self.dialog is not None:
-            self._draw_dialog(screen, dt)
+    def _draw_back_button(self, screen):
+        accent = uk.Theme.GOLD
+        t = round(self._back_hover_anim * 20) / 20.0
+        base = uk.lerp_color((22, 26, 35), (28, 33, 44), t)
+        border = uk.lerp_color(uk.Theme.CARD_BORDER, accent, t * 0.78)
+        uk.draw_panel(screen, self._back_rect, bg=(*base, 255), border=border,
+                      border_width=1, radius=8, shadow=False)
+        if t > 0.01:
+            uk.draw_soft_glow(screen, self._back_rect.center, 22, accent, max_alpha=int(25 * t))
+        icon_rect = self._back_icon.get_rect(center=self._back_rect.center)
+        uk.blit_surface(screen, self._back_icon, icon_rect, transient=False)
+        self.clickable_rects.append({"rect": self._back_rect})
 
-    def _draw_dialog(self, screen, dt) -> None:
-        sw, sh = self.screen_width, self.screen_height
-        dim = pygame.Surface((sw, sh), pygame.SRCALPHA)
-        dim.fill((0, 0, 0, 160))
-        screen.blit(dim, (0, 0))
+    def _icon_save_png(self, screen, rect, color):
+        if self._save_icon is not None:
+            uk.blit_surface(screen, self._save_icon, self._save_icon.get_rect(center=rect.center))
+        else:
+            _draw_check_icon(screen, rect, color)
 
-        box = pygame.Rect(sw // 2 - 220, sh // 2 - 70, 440, 140)
-        screen.draw_rect(C_DIALOG_BG, box, border_radius=8)
-        screen.draw_rect(C_ACCENT, box, 1, border_radius=8)
+    def _icon_trash_png(self, screen, rect, color):
+        if self._trash_icon is not None:
+            uk.blit_surface(screen, self._trash_icon, self._trash_icon.get_rect(center=rect.center))
+        else:
+            _draw_trash_icon(screen, rect, color)
 
-        prompt = "New item id (e.g. 'power_pole')"
-        txt = render_text_cached(self.font_sm, prompt, C_TEXT)
-        screen.blit(txt, (box.x + 20, box.y + 16))
+    def _icon_plus_png(self, screen, rect, color):
+        if self._plus_icon is not None:
+            uk.blit_surface(screen, self._plus_icon, self._plus_icon.get_rect(center=rect.center))
+        else:
+            _draw_plus_icon(screen, rect, color)
 
-        field = self.dialog["field"]
-        field.rect = pygame.Rect(box.x + 20, box.y + 46, box.w - 40, 32)
-        field.draw(screen, self.font_sm, dt)
+    def _draw_icon_square_btn(self, screen, rect, t, icon_fn, accent, danger=False):
+        """Square, icon-only button (no label) — same shape as the back
+        button, used for Save / Delete in the header bar."""
+        t = round(max(0.0, min(1.0, t)) * 20) / 20.0
+        dim_base = (32, 22, 22) if danger else (28, 33, 44)
+        base = uk.lerp_color((22, 26, 35), dim_base, t)
+        border = uk.lerp_color(uk.Theme.CARD_BORDER, accent, t)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border, border_width=1 + round(t),
+                      radius=8, shadow=False)
+        if t > 0.01:
+            uk.draw_soft_glow(screen, rect.center, rect.w // 2 + 4, accent, max_alpha=int(28 * t))
+        icon_col = uk.lerp_color(uk.Theme.TEXT_SECONDARY, accent, t)
+        icon_size = max(16, round(rect.w * 0.4))
+        icon_rect = pygame.Rect(0, 0, icon_size, icon_size)
+        icon_rect.center = rect.center
+        icon_fn(screen, icon_rect, icon_col)
 
-        if self.dialog.get("error"):
-            err = render_text_cached(self.font_sm, self.dialog["error"], C_RED)
-            screen.blit(err, (box.x + 20, box.y + 82))
+    def _draw_footer(self, screen):
+        w, h = self.screen_width, self.screen_height
+        y = h - self.footer_h
+        uk.draw_rect_on(screen, (12, 15, 23), pygame.Rect(0, y, w, self.footer_h), 0, 0)
+        uk.draw_rect_on(screen, (43, 49, 63), pygame.Rect(0, y, w, 1), 0, 0)
 
-        ok_r = pygame.Rect(box.right - 200, box.bottom - 44, 90, 30)
-        cancel_r = pygame.Rect(box.right - 100, box.bottom - 44, 84, 30)
-        draw_button(screen, self.font_sm, ok_r, "Create", color=C_GREEN)
-        draw_button(screen, self.font_sm, cancel_r, "Cancel", color=C_RED)
-        self.dialog["ok_rect"] = ok_r
-        self.dialog["cancel_rect"] = cancel_r
+    def _draw_card_shell(self, screen, rect, t, accent=None):
+        accent = accent or uk.Theme.GOLD
+        t = round(max(0.0, min(1.0, t)) * 20) / 20.0
+        lift = int(round(2 * t))
+        draw_rect = rect.move(0, -lift)
+        base = uk.lerp_color((22, 26, 35), (28, 33, 44), t)
+        border = uk.lerp_color(uk.Theme.CARD_BORDER, accent, t * 0.78)
+        uk.draw_panel(screen, draw_rect, bg=(*base, 255), border=border, border_width=1, radius=10, shadow=False)
+        return draw_rect
+
+    def _draw_pill_button(self, screen, rect, t, label, accent, icon_fn=None, danger=False):
+        col = uk.Theme.DANGER_BRIGHT if danger else accent
+        dim_base = (32, 22, 22) if danger else (28, 33, 44)
+        base = uk.lerp_color((22, 26, 35), dim_base, t)
+        border = uk.lerp_color(uk.Theme.CARD_BORDER, col, t)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border, border_width=1 + round(t), radius=10, shadow=False)
+        if t > 0.01:
+            uk.draw_soft_glow(screen, rect.center, max(rect.w, rect.h) // 2, col, max_alpha=int(30 * t))
+        label_color = uk.lerp_color(uk.Theme.TEXT_SECONDARY, col, t)
+        if icon_fn is not None:
+            icon_rect = pygame.Rect(0, 0, 16, 16)
+            icon_rect.midleft = (rect.x + 14, rect.centery)
+            icon_fn(screen, icon_rect, label_color)
+            label_surf = self.font_medium.render(label, True, label_color)
+            uk.blit_surface(screen, label_surf, (icon_rect.right + 8, rect.centery - label_surf.get_height() // 2),
+                             transient=True)
+        else:
+            label_surf = self.font_medium.render(label, True, label_color)
+            uk.blit_surface(screen, label_surf, label_surf.get_rect(center=rect.center), transient=True)
+
+    def _draw_text_caret(self, screen, x, y, height, color=None):
+        if int(self.cursor_blink * 2) % 2 != 0:
+            return
+        color = color or uk.Theme.TEXT_PRIMARY
+        uk.draw_rect_on(screen, color, pygame.Rect(int(x), int(y), 2, int(height)), 0, 0)
+
+    def _draw_live_text_field(self, screen, font, text_rect, click_rect):
+        self._active_edit_rect = click_rect
+        self._active_edit_text_x = text_rect.x
+        self._active_edit_font = font
+
+        if self._has_text_selection():
+            s, e = self._text_selection_range()
+            sx = text_rect.x + (font.size(self.text_input[:s])[0] if s else 0)
+            ex = text_rect.x + (font.size(self.text_input[:e])[0] if e else 0)
+            sel_rect = pygame.Rect(sx, text_rect.y, max(1, ex - sx), text_rect.height)
+            uk.draw_rect_on(screen, (*uk.Theme.KI_BLUE, 90), sel_rect, 0, 0)
+
+        caret_w = font.size(self.text_input[:self.cursor_pos])[0] if self.cursor_pos else 0
+        self._draw_text_caret(screen, text_rect.x + caret_w, text_rect.y, text_rect.height)
+
+    def _draw_field_row(self, screen, rect, value_text, field_id, placeholder=""):
+        editing = self.editing_field == field_id
+        t = 1.0 if editing else 0.0
+        accent = uk.Theme.GOLD
+        base = uk.lerp_color((20, 23, 32), (27, 31, 42), t)
+        border = accent if editing else uk.Theme.CARD_BORDER
+        border_width = 2 if editing else 1
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border, border_width=border_width, radius=8, shadow=False)
+        self.text_field_rects.append(rect)
+
+        if editing:
+            shown, color = self.text_input, uk.Theme.TEXT_PRIMARY
+        elif value_text:
+            shown, color = value_text, uk.Theme.TEXT_SECONDARY
+        else:
+            shown, color = placeholder, uk.Theme.TEXT_DIM
+
+        val_surf = self.font_medium.render(shown, True, color)
+        val_rect = val_surf.get_rect(x=rect.x + 12, centery=rect.centery)
+        uk.blit_surface(screen, val_surf, val_rect, transient=True)
+
+        if editing:
+            # render("") from the bitmap font comes back near-zero-height,
+            # which collapsed the caret into a dot instead of a bar when
+            # the field is empty. Use a fixed line height (from a
+            # reference glyph) instead of trusting val_rect's height,
+            # which is only meaningful when there's text to measure.
+            line_h = self.font_medium.size("Ag")[1]
+            caret_rect = pygame.Rect(val_rect.x, 0, val_rect.w, line_h)
+            caret_rect.centery = rect.centery
+            self._draw_live_text_field(screen, self.font_medium, caret_rect, rect)
+
+    def _draw_slider(self, screen, x, y, width, spec):
+        key = spec["key"]
+        value = spec["get"]()
+        fmt = spec.get("fmt", "{:.0f}")
+        display = fmt.format(value)
+
+        label_surf = self.font_small.render(spec["label"].upper(), True, uk.Theme.TEXT_MUTED)
+        uk.blit_surface(screen, label_surf, (x, y), transient=True)
+        val_surf = self.font_small.render(display, True, uk.Theme.TEXT_SECONDARY)
+        uk.blit_surface(screen, val_surf, (x + width - val_surf.get_width(), y), transient=True)
+
+        track_y = y + label_surf.get_height() + 6
+        track = pygame.Rect(x, track_y, width, 6)
+        uk.draw_rect_on(screen, uk.Theme.CARD_BG[:3], track, 0, 3)
+
+        t = max(0.0, min(1.0, (value - spec["min"]) / max(1e-9, spec["max"] - spec["min"])))
+        fill_w = max(0, min(width, int(t * width)))
+        if fill_w:
+            uk.draw_rect_on(screen, uk.Theme.GOLD, pygame.Rect(x, track_y, fill_w, 6), 0, 3)
+
+        thumb_x = x + int(t * width)
+        thumb_cy = track_y + 3
+        mx, my = self._logical_mouse_pos
+        dragging = self._slider_drag_key == key
+        hovered = abs(mx - thumb_x) <= 10 and abs(my - thumb_cy) <= 10
+        thumb_color = uk.Theme.GOLD_BRIGHT if (dragging or hovered) else uk.Theme.TEXT_PRIMARY
+        uk.draw_circle_on(screen, thumb_color, (thumb_x, thumb_cy), 7)
+        uk.draw_circle_on(screen, uk.Theme.CARD_BORDER, (thumb_x, thumb_cy), 7, 1)
+
+        self._slider_rects[key] = track
+        self.clickable_rects.append({"rect": track.inflate(0, 16)})
+
+    # ------------------------------------------------------------------ list panel
+    def _draw_filter_dropdown_field(self, screen):
+        rect = self._filter_field_rect
+        open_ = self._filter_dropdown_open
+        accent = uk.Theme.GOLD
+        border = accent if open_ else uk.Theme.CARD_BORDER
+        uk.draw_panel(screen, rect, bg=(*uk.Theme.CARD_BG[:3], 255), border=border,
+                      border_width=2 if open_ else 1, radius=8, shadow=False)
+        self.clickable_rects.append({"rect": rect})
+
+        label = "All Categories" if self.category_filter == "all" else CATEGORY_LABELS[self.category_filter]
+        if self.category_filter != "all":
+            dot_c = pygame.Rect(0, 0, 10, 10)
+            dot_c.midleft = (rect.x + 12, rect.centery)
+            uk.draw_circle_on(screen, CATEGORY_ACCENT[self.category_filter], dot_c.center, 5)
+            text_x = rect.x + 28
+        else:
+            text_x = rect.x + 12
+        label_surf = self.font_medium.render(label, True, uk.Theme.TEXT_PRIMARY)
+        uk.blit_surface(screen, label_surf, label_surf.get_rect(x=text_x, centery=rect.centery), transient=True)
+
+        chev = pygame.Rect(0, 0, 16, 16)
+        chev.midright = (rect.right - 12, rect.centery)
+        _draw_chevron_down(screen, chev, uk.Theme.TEXT_MUTED)
+
+    def _draw_filter_dropdown_list(self, screen):
+        rect = self._filter_field_rect
+        options = ["all"] + [c for c, _, _ in CATEGORIES]
+        item_h = 32
+        list_h = item_h * len(options)
+        list_rect = pygame.Rect(rect.x, rect.bottom + 6, rect.w, list_h)
+        if list_rect.bottom > self.item_list_rect.bottom:
+            list_rect.height = max(item_h, self.item_list_rect.bottom - list_rect.y)
+
+        uk.draw_panel(screen, list_rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD, border_width=1, radius=8)
+
+        mouse_pos = self._logical_mouse_pos
+        self._filter_option_rects = {}
+        for i, opt in enumerate(options):
+            item_rect = pygame.Rect(list_rect.x, list_rect.y + i * item_h, list_rect.w, item_h)
+            if item_rect.bottom > list_rect.bottom:
+                break
+            self._filter_option_rects[opt] = item_rect
+            self.clickable_rects.append({"rect": item_rect})
+            is_current = (opt == self.category_filter)
+            hovered = item_rect.collidepoint(mouse_pos)
+            if is_current or hovered:
+                row_bg = uk.Theme.CARD_BG_SELECTED[:3] if is_current else uk.Theme.CARD_BG_HOVER[:3]
+                uk.draw_rect_on(screen, row_bg, item_rect.inflate(-6, -2), 0, 6)
+            label = "All Categories" if opt == "all" else CATEGORY_LABELS[opt]
+            text_color = uk.Theme.GOLD_BRIGHT if is_current else uk.Theme.TEXT_SECONDARY
+            text_surf = self.font_small.render(label, True, text_color)
+            uk.blit_surface(screen, text_surf,
+                             (item_rect.x + 12, item_rect.y + (item_h - text_surf.get_height()) // 2),
+                             transient=True)
+            if is_current:
+                chk = pygame.Rect(0, 0, 12, 12)
+                chk.midright = (item_rect.right - 10, item_rect.centery)
+                _draw_check_icon(screen, chk, uk.Theme.GOLD_BRIGHT)
+
+    def _draw_item_list(self, screen):
+        rect = self.item_list_rect
+        filtered = self._filtered_ids()
+        old_clip = screen.get_clip()
+        screen.set_clip(rect)
+
+        visible = max(1, rect.h // CARD_H)
+        mouse_pos = self._logical_mouse_pos
+        for i, iid in enumerate(filtered[self.list_scroll:self.list_scroll + visible + 1]):
+            idx = self.list_scroll + i
+            row_y = rect.y + i * CARD_H
+            row_rect = pygame.Rect(rect.x, row_y, rect.w, CARD_H - 8)
+            if row_rect.bottom > rect.bottom:
+                break
+            self.clickable_rects.append({"rect": row_rect})
+
+            is_sel = (iid == self.selected_id)
+            t = self._item_anim(idx) if not is_sel else 1.0
+            item_data = ITEMS.get(iid, {})
+            accent = CATEGORY_ACCENT.get(item_data.get("category"), uk.Theme.GOLD)
+
+            base = uk.Theme.CARD_BG_SELECTED[:3] if is_sel else uk.lerp_color(
+                uk.Theme.CARD_BG[:3], uk.Theme.CARD_BG_HOVER[:3], t)
+            border = accent if is_sel else uk.lerp_color(uk.Theme.CARD_BORDER, accent, t)
+            uk.draw_panel(screen, row_rect, bg=(*base, 255), border=border,
+                          border_width=1 + (1 if is_sel else 0), radius=8, shadow=False)
+
+            dot_center = (row_rect.x + 22, row_rect.centery)
+            uk.draw_circle_on(screen, accent, dot_center, 6)
+
+            name = item_data.get("name", iid)
+            name_color = uk.Theme.TEXT_PRIMARY if (is_sel or t > 0.2) else uk.Theme.TEXT_SECONDARY
+            name_surf = self.font_medium.render(name, True, name_color)
+            name_rect = name_surf.get_rect(x=row_rect.x + 40, y=row_rect.y + 8)
+            uk.blit_surface(screen, name_surf, name_rect, transient=True)
+
+            sub_surf = self.font_tiny.render(iid, True, uk.Theme.TEXT_DIM)
+            uk.blit_surface(screen, sub_surf, (row_rect.x + 40, name_rect.bottom + 2), transient=True)
+
+            if iid in self.custom:
+                star_rect = pygame.Rect(0, 0, 14, 14)
+                star_rect.midright = (row_rect.right - 12, row_rect.centery)
+                _draw_star_icon(screen, star_rect, uk.Theme.GOLD_BRIGHT)
+
+        screen.set_clip(old_clip)
+
+        total_rows = len(filtered)
+        max_scroll = max(0, total_rows - visible)
+        if self.list_scroll > max_scroll:
+            self.list_scroll = max_scroll
+
+        if not filtered:
+            msg = self.font_small.render("No items in this category", True, uk.Theme.TEXT_DIM)
+            uk.blit_surface(screen, msg, msg.get_rect(center=rect.center), transient=True)
+            self._list_scrollbar_track = None
+            self._list_scrollbar_thumb = None
+            self._list_scrollbar_max_scroll = 0
+        elif max_scroll > 0:
+            # Draggable scrollbar — grab and drag the thumb up/down instead
+            # of only being able to use the scroll wheel.
+            track = pygame.Rect(rect.right - 6, rect.y, 5, rect.h)
+            total_content_h = total_rows * CARD_H
+            th = max(24, int(rect.h * rect.h / max(1, total_content_h)))
+            frac = self.list_scroll / max_scroll
+            ty = rect.y + int((rect.h - th) * frac)
+            thumb = pygame.Rect(track.x, ty, track.w, th)
+            self._list_scrollbar_track = track
+            self._list_scrollbar_thumb = thumb
+            self._list_scrollbar_max_scroll = max_scroll
+            self.clickable_rects.append({"rect": track.inflate(12, 0)})
+
+            grabbed = self._list_scroll_dragging
+            hovered = grabbed or thumb.collidepoint(self._logical_mouse_pos)
+            uk.draw_rect_on(screen, (24, 28, 38), track, 0, 2)
+            thumb_col = uk.Theme.GOLD_BRIGHT if hovered else uk.Theme.TEXT_DIM
+            uk.draw_rect_on(screen, thumb_col, thumb, 0, 2)
+        else:
+            self._list_scrollbar_track = None
+            self._list_scrollbar_thumb = None
+            self._list_scrollbar_max_scroll = 0
+
+    def _scrub_list_scroll(self, pos_y: int) -> None:
+        track, thumb = self._list_scrollbar_track, self._list_scrollbar_thumb
+        if track is None or thumb is None or self._list_scrollbar_max_scroll <= 0:
+            return
+        frac = (pos_y - track.y - thumb.h / 2) / max(1, track.h - thumb.h)
+        frac = max(0.0, min(1.0, frac))
+        self.list_scroll = round(frac * self._list_scrollbar_max_scroll)
+
+    def _draw_list_panel(self, screen):
+        uk.draw_panel(screen, self.list_rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.PANEL_BORDER,
+                      border_width=1, radius=12, shadow=False)
+        self._draw_filter_dropdown_field(screen)
+
+        self._draw_new_item_row(screen)
+
+        self._draw_item_list(screen)
+
+        if self._filter_dropdown_open:
+            self._draw_filter_dropdown_list(screen)
+
+    # ------------------------------------------------------------------ editor panel
+    def _draw_icon_preview(self, screen, panel_rect, pad):
+        box = pygame.Rect(0, 0, 96, 96)
+        box.topright = (panel_rect.right - pad, panel_rect.y + pad)
+        label = self.font_small.render("Icon", True, uk.Theme.TEXT_MUTED)
+        uk.blit_surface(screen, label, (box.x, box.y - label.get_height() - 4), transient=True)
+
+        if self._icon is not None:
+            uk.draw_panel(screen, box, bg=(*uk.Theme.CARD_BG[:3], 255), border=uk.Theme.CARD_BORDER,
+                          border_width=1, radius=8, shadow=False)
+            uk.blit_surface(screen, self._icon, box, transient=False)
+        else:
+            uk.draw_panel(screen, box, bg=(*uk.Theme.CARD_BG[:3], 255), border=uk.Theme.CARD_BORDER,
+                          border_width=1, radius=8, shadow=False)
+            dash = 4
+            xx = box.left + 6
+            while xx < box.right - 6:
+                uk.draw_line_on(screen, uk.Theme.TEXT_DIM, (xx, box.top + 6),
+                                (min(xx + dash, box.right - 6), box.top + 6), 1)
+                uk.draw_line_on(screen, uk.Theme.TEXT_DIM, (xx, box.bottom - 6),
+                                (min(xx + dash, box.right - 6), box.bottom - 6), 1)
+                xx += dash * 2
+            no_icon = self.font_tiny.render("no icon", True, uk.Theme.TEXT_DIM)
+            uk.blit_surface(screen, no_icon, no_icon.get_rect(center=box.center), transient=True)
+        return box
+
+    def _draw_section_label(self, screen, text, x, y):
+        surf = self.font_small.render(text.upper(), True, uk.Theme.TEXT_MUTED)
+        uk.blit_surface(screen, surf, (x, y), transient=True)
+        return surf.get_height()
+
+    def _draw_category_picker(self, screen, x, y, width):
+        h = self._draw_section_label(screen, "Category", x, y)
+        y += h + 8
+        cols = 3
+        col_w = (width - (cols - 1) * 10) // cols
+        self._category_rects = {}
+        mouse_pos = self._logical_mouse_pos
+        for i, (cat, label, _slot) in enumerate(CATEGORIES):
+            col, row = i % cols, i // cols
+            rect = pygame.Rect(x + col * (col_w + 10), y + row * GRID_ROW_H, col_w, GRID_BTN_H)
+            self._category_rects[cat] = rect
+            self.clickable_rects.append({"rect": rect})
+            is_current = (self.data["category"] == cat)
+            t = 1.0 if is_current else (0.5 if rect.collidepoint(mouse_pos) else 0.0)
+            accent = CATEGORY_ACCENT[cat]
+            self._draw_pill_button(screen, rect, t, label, accent)
+        rows = math.ceil(len(CATEGORIES) / cols)
+        return y + rows * GRID_ROW_H
+
+    def _draw_effect_type_picker(self, screen, x, y, width):
+        h = self._draw_section_label(screen, "Effect Type", x, y)
+        y += h + 8
+        cols = 4
+        col_w = (width - (cols - 1) * 10) // cols
+        self._effect_type_rects = {}
+        mouse_pos = self._logical_mouse_pos
+        for i, etype in enumerate(EFFECT_TYPES):
+            col, row = (i % cols, 0) if i < cols else (i - cols, 1)
+            rect = pygame.Rect(x + col * (col_w + 10), y + row * GRID_ROW_H, col_w, GRID_BTN_H)
+            self._effect_type_rects[etype] = rect
+            self.clickable_rects.append({"rect": rect})
+            is_current = (self.data["effect"].get("type") == etype)
+            t = 1.0 if is_current else (0.5 if rect.collidepoint(mouse_pos) else 0.0)
+            self._draw_pill_button(screen, rect, t, EFFECT_LABELS[etype], uk.Theme.KI_BLUE)
+        rows = 2
+        return y + rows * GRID_ROW_H
+
+    def _draw_effect_fields(self, screen, x, y, width):
+        specs = self._slider_specs()
+        self._slider_rects = {}
+        etype = self.data["effect"].get("type", "none")
+
+        if not specs:
+            hint_text = {
+                "none": "No mechanical effect — used for key/quest items tracked purely by inventory presence.",
+                "full_restore": "Fully restores HP and EP. No extra fields.",
+            }.get(etype, "")
+            if hint_text:
+                hint = self.font_small.render(hint_text, True, uk.Theme.TEXT_DIM)
+                uk.blit_surface(screen, hint, (x, y), transient=True)
+                y += hint.get_height() + 10
+            return y
+
+        # Stack stat sliders two-per-row where possible to save vertical
+        # space, same footprint the old Slider-widget layout used.
+        col_w = (width - 24) // 2
+        i = 0
+        while i < len(specs):
+            spec = specs[i]
+            if spec["key"].startswith("stat_") and i + 1 < len(specs) and specs[i + 1]["key"].startswith("stat_"):
+                self._draw_slider(screen, x, y, col_w, spec)
+                self._draw_slider(screen, x + col_w + 24, y, col_w, specs[i + 1])
+                i += 2
+            else:
+                self._draw_slider(screen, x, y, width, spec)
+                i += 1
+            y += SLIDER_H
+        return y + 6
+
+    def _draw_description_field(self, screen, x, y, width, bottom):
+        h = self._draw_section_label(screen, "Description", x, y)
+        y += h + 6
+        rect = pygame.Rect(x, y, width, max(60, bottom - y))
+        self._desc_rect = rect
+
+        editing = self.editing_field == "description"
+        border = uk.Theme.GOLD if editing else uk.Theme.CARD_BORDER
+        uk.draw_panel(screen, rect, bg=(*uk.Theme.CARD_BG[:3], 255), border=border,
+                      border_width=2 if editing else 1, radius=8, shadow=False)
+        self.text_field_rects.append(rect)
+
+        text = self.text_input if editing else self.data.get("description", "")
+        self._desc_line_h = self.font_medium.size("Ag")[1] + 4
+        lines = self._wrap_lines(self.font_medium, text, self._desc_wrap_width()) if text else [("", 0)]
+        self._desc_lines = lines
+
+        visible_lines = max(1, rect.h // self._desc_line_h)
+        max_scroll = max(0, len(lines) - visible_lines)
+        self._desc_scroll = max(0, min(self._desc_scroll, max_scroll))
+
+        old_clip = screen.get_clip()
+        screen.set_clip(rect)
+        placeholder = not text
+        if placeholder:
+            ph = self.font_medium.render("Item description...", True, uk.Theme.TEXT_DIM)
+            uk.blit_surface(screen, ph, (rect.x + 10, rect.y + 8), transient=True)
+        else:
+            for row, (line_text, _start) in enumerate(lines[self._desc_scroll:self._desc_scroll + visible_lines + 1]):
+                line_surf = self.font_medium.render(line_text, True, uk.Theme.TEXT_PRIMARY)
+                line_rect = line_surf.get_rect(x=rect.x + 10, y=rect.y + 6 + row * self._desc_line_h)
+                uk.blit_surface(screen, line_surf, line_rect, transient=True)
+
+        if editing:
+            self._active_edit_rect = rect
+            self._active_edit_font = self.font_medium
+            # Selection highlight, drawn per visual line it spans.
+            if self._has_text_selection():
+                s, e = self._text_selection_range()
+                for row, (line_text, line_start) in enumerate(lines):
+                    line_end = line_start + len(line_text)
+                    if line_end < s or line_start > e:
+                        continue
+                    vis_row = row - self._desc_scroll
+                    if vis_row < 0 or vis_row > visible_lines:
+                        continue
+                    ls, le = max(s, line_start), min(e, line_end)
+                    sx = rect.x + 10 + (self.font_medium.size(line_text[:ls - line_start])[0] if ls > line_start else 0)
+                    ex = rect.x + 10 + self.font_medium.size(line_text[:le - line_start])[0]
+                    sel_rect = pygame.Rect(sx, rect.y + 6 + vis_row * self._desc_line_h,
+                                           max(1, ex - sx), self._desc_line_h)
+                    uk.draw_rect_on(screen, (*uk.Theme.KI_BLUE, 90), sel_rect, 0, 0)
+
+            # Caret on whichever visual line currently contains cursor_pos.
+            caret_row = 0
+            for row, (_line_text, line_start) in enumerate(lines):
+                if line_start <= self.cursor_pos:
+                    caret_row = row
+            line_text, line_start = lines[caret_row]
+            vis_row = caret_row - self._desc_scroll
+            if 0 <= vis_row <= visible_lines:
+                caret_w = self.font_medium.size(line_text[:self.cursor_pos - line_start])[0]
+                self._draw_text_caret(screen, rect.x + 10 + caret_w, rect.y + 6 + vis_row * self._desc_line_h,
+                                      self._desc_line_h - 2)
+        screen.set_clip(old_clip)
+
+    def _draw_editor_panel(self, screen):
+        rect = self.editor_rect
+        uk.draw_panel(screen, rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.PANEL_BORDER,
+                      border_width=1, radius=12, shadow=False)
+
+        if not self.selected_id:
+            msg = self.font_medium.render("Select or create an item to begin editing", True, uk.Theme.TEXT_DIM)
+            uk.blit_surface(screen, msg, msg.get_rect(center=rect.center), transient=True)
+            return
+
+        pad = 20
+        x = rect.x + pad
+        y = rect.y + pad
+        icon_box = self._draw_icon_preview(screen, rect, pad)
+        field_width = icon_box.left - x - 16
+
+        h = self._draw_section_label(screen, "Name", x, y)
+        y += h + 4
+        self._name_field_rect = pygame.Rect(x, y, field_width, FIELD_H)
+        self._draw_field_row(screen, self._name_field_rect, self.data.get("name", ""), "name", "Item name")
+        id_surf = self.font_tiny.render(f"id: {self.selected_id}", True, uk.Theme.TEXT_DIM)
+        uk.blit_surface(screen, id_surf, (x, self._name_field_rect.bottom + 4), transient=True)
+        y = max(self._name_field_rect.bottom, icon_box.bottom) + SECTION_GAP - 4
+
+        full_width = rect.w - pad * 2
+        y = self._draw_category_picker(screen, x, y, full_width) + SECTION_GAP
+        y = self._draw_effect_type_picker(screen, x, y, full_width) + SECTION_GAP
+        y = self._draw_effect_fields(screen, x, y, full_width) + 6
+
+        eh = self._draw_section_label(screen, "Effect Text", x, y)
+        y += eh + 4
+        self._effect_text_field_rect = pygame.Rect(x, y, full_width, FIELD_H)
+        self._draw_field_row(screen, self._effect_text_field_rect, self.data.get("effect_text", ""),
+                             "effect_text", "e.g. \"Heals 50 HP\"")
+        y = self._effect_text_field_rect.bottom + SECTION_GAP
+
+        self._draw_description_field(screen, x, y, full_width, rect.bottom - pad)
+
+    # ------------------------------------------------------------------ action row / new-item row / top-level draw
+    def _draw_new_item_row(self, screen):
+        row = self._new_item_row_rect
+        if not self._new_item_dialog_open:
+            # Collapsed: just the plus-icon square button.
+            t = self._new_btn_hover_anim
+            self._draw_icon_square_btn(screen, self._new_item_btn_rect, t, self._icon_plus_png, uk.Theme.GOLD)
+            self.clickable_rects.append({"rect": self._new_item_btn_rect})
+            return
+
+        # Expanded: the row becomes an inline text field right where the
+        # button was — no confirm/cancel buttons. Enter saves, clicking
+        # away cancels (handled in handle_input).
+        field_rect = pygame.Rect(row.x, row.y, row.w, row.h)
+
+        self._draw_field_row(screen, field_rect, "", "new_item_id", "item_id")
+
+        self._dialog_field_rect = field_rect
+
+    # ------------------------------------------------------------------ top-level draw
+
+    def draw(self, screen, dt: float = 0.0) -> None:
+        if not self.active:
+            return
+
+        self.clickable_rects = []
+        self.text_field_rects = []
+        self._active_edit_rect = None
+        self._active_edit_text_x = None
+        self._active_edit_font = None
+
+        self._draw_background(screen)
+        self._draw_header(screen)
+        self._draw_list_panel(screen)
+        self._draw_editor_panel(screen)
+        self._draw_footer(screen)

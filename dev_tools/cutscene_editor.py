@@ -1,10 +1,20 @@
 """
 dev_tools/cutscene_editor.py
 
-Standalone cutscene editor with an After-Effects-inspired layout.
+Cutscene editor — rebuilt on the dev-tool design language (dev_tools.ui_kit +
+DevMenu / RoomEditor): bitmap menu font, navy panels with hairline borders,
+gold accent, header / footer bars, card + pill widgets, one shared dropdown.
 
-Data model (cutscene_data dict, stored as JSON)
-────────────────────────────────────────────────
+Layout (edit view)
+──────────────────
+  ┌ header:  back · name · length · timecode · play · undo/redo · grid · save ┐
+  │ Scene panel    │      Viewport (world preview)      │  Inspector          │
+  │ room · actors  ├────────────────────────────────────┤  (action form,      │
+  │ layers         │ Timeline: toolbar · ruler · tracks │   full height)      │
+  └───────────────────────────────────────────────────────────────────────────┘
+
+Data model (cutscene_data dict, stored as JSON) — unchanged
+────────────────────────────────────────────────────────────
   id:       str           — matches the filename stem
   room:     str           — which room to display in the viewport
   duration: float         — total scene length in seconds
@@ -13,51 +23,29 @@ Data model (cutscene_data dict, stored as JSON)
 
 All mutations must call _push_undo() *before* changing cutscene_data so that
 Ctrl-Z can restore the state that existed just before that edit.
+
+UI architecture
+───────────────
+The UI is immediate-mode.  Every draw pass rebuilds ``self._hits`` — a list of
+(rect, action, arg) registered by the widgets as they are painted — and
+``_on_click`` dispatches the topmost hit through ``_on_action``.  Hover
+animation is eased per widget key in ``_anim``.  Everything is drawn through
+ui_kit's ``*_on`` helpers so it works on a plain Surface or on GPUScreen.
 """
 
+import copy
+import glob
 import json
+import math
 import os
 import pygame
+import dev_tools.ui_kit as uk
 from core.camera import Camera
 from config.settings import RENDER_SCALE
 from dev_tools.room_editor.room_editor_tools.entity_editor import discover_enemy_ids, discover_boss_ids, discover_npc_ids
 from dev_tools.character_creator import discover_attacks
 
-# ── Layout constants ──────────────────────────────────────────────────────────
-_TOP_H       = 42
-_LEFT_W      = 195
-_RIGHT_W     = 270
-_BOTTOM_H    = 220
-
-_TL_HDR_H    = 32    # timeline: top control strip height
-_TL_RULER_H  = 22    # timeline: time ruler strip height
-_TL_ROW_H    = 28    # timeline: per-track row height
-_TL_LABEL_W  = 130   # timeline: left label column width
-
-_BTN_H       = 28
-_ROW_H       = 28
-
-# ── Colour palette ────────────────────────────────────────────────────────────
-_C = {
-    'bg':        (14,  16,  22),
-    'panel':     (22,  25,  36),
-    'panel2':    (18,  21,  30),   # slightly darker panel variant
-    'border':    (48,  54,  82),
-    'accent':    (82, 122, 255),
-    'accent2':   (50, 195, 120),
-    'danger':    (215,  55,  55),
-    'text':      (215, 220, 238),
-    'text_dim':  (110, 122, 155),
-    'highlight': (38,  44,  68),
-    'sel':       (60,  80, 150),
-    'sel2':      (50, 100,  60),   # green selection variant
-    'white':     (255, 255, 255),
-    'black':     (0,   0,   0),
-    'ruler_bg':  (16,  18,  28),
-    'playhead':  (255,  65,  65),
-    'kf_border': (255, 255, 255),
-}
-
+# ── Schema constants (unchanged from the previous editor) ────────────────────
 # Animation states per entity type
 _PLAYER_STATES = ['idle', 'walk', 'run', 'melee', 'kiblast',
                   'charge', 'firebeam', 'hurt', 'transform', 'untransform',
@@ -141,7 +129,7 @@ _ACTION_PARAMS = {
     # assets/sprites/attacks/{attack_type}/ (beam-shaped sheets grow in,
     # a hit/impact/collision sprite is used if the folder has one).
     # attack_type is any id discover_attacks() finds there — see
-    # _cycle_dropdown()'s 'attack_type' branch below — not a fixed list.
+    # _param_pool()'s 'attack_type' branch below — not a fixed list.
     # `duration` is how long the actor holds the attack pose in total
     # before returning to idle — release_delay must be < duration (not just
     # <=): the spawned effect's own lifetime is (duration - release_delay),
@@ -187,14 +175,14 @@ _ACTOR_ACTIONS  = ['set_animation', 'move_to', 'face', 'teleport', 'fly_to',
                    'set_character', 'set_costume', 'attack', 'set_shadow']
 _INVERT_MODES   = ['full', 'red', 'green', 'blue', 'greyscale']
 # Fallback attack_type pool used only if discover_attacks() finds nothing on
-# disk (e.g. assets/sprites/attacks/ missing) — see _cycle_dropdown() below,
+# disk (e.g. assets/sprites/attacks/ missing) — see _param_pool() below,
 # which otherwise sources the full, ever-growing attack roster straight from
 # that folder, same as character_creator.py's Attacks tab.
 _ATTACK_TYPES   = ['melee', 'kiblast', 'firebeam', 'charge']
 
 # Named colour presets for fade_in / fade_out / flash 'color' params — cycled
 # through with the same '<  name  >' button used for other enum fields (see
-# _cycle_dropdown). Stored in the cutscene JSON as an [r, g, b] list (what
+# _param_pool). Stored in the cutscene JSON as an [r, g, b] list (what
 # CutsceneRuntime._execute_action already expects via params.get('color', …)),
 # so _commit_form converts the preset name to its RGB triple on save and
 # _default_param/_draw_action_form convert back the other way for display.
@@ -230,20 +218,40 @@ _ACTOR_COLORS = [
     (255, 215,  60),
 ]
 
-# Fixed track colours
-_CAMERA_COLOR = (82, 122, 255)
-_SCREEN_COLOR = (110, 122, 155)
-_ROOM_COLOR   = (60, 180, 130)
-_SOUND_COLOR  = (230, 165, 60)
+# Fixed track colours (tuned to sit on the navy panels next to the gold accent)
+_CAMERA_COLOR = uk.Theme.KI_BLUE
+_SCREEN_COLOR = (150, 158, 182)
+_ROOM_COLOR   = (76, 200, 150)
+_SOUND_COLOR  = (238, 146, 70)
+
+# ── Surface colours shared by every widget (same values DevMenu / RoomEditor
+#    use for their bars, cards and field rows) ────────────────────────────────
+_BG_BASE     = (8, 11, 17)
+_BG_CONTENT  = (10, 13, 20)
+_BAR_BG      = (12, 15, 23)
+_BAR_LINE    = (43, 49, 63)
+_ROW_BASE    = (22, 26, 35)
+_ROW_HOVER   = (28, 33, 44)
+_FIELD_BASE  = (20, 23, 32)
+_FIELD_HOVER = (27, 31, 42)
+_CANVAS      = (15, 19, 28)      # viewport canvas outside / behind the room
+_WHITE       = (255, 255, 255)
+
+# Transport / playhead accent
+_PLAYHEAD    = uk.Theme.GOLD_BRIGHT
+
+# Field-key constants for the four text-entry buffers
+_ACTOR_TYPES = ['enemy', 'boss', 'npc', 'player']
+_TARGET_FIXED = ['camera', 'screen', 'room', 'sound']
+_PICK_ACTIONS = ('pick_pan_to', 'pick_snap_to', 'pick_move_to', 'pick_fly_to',
+                 'pick_teleport', 'pick_pan_to_start', 'pick_attack_target')
 
 
 def _ensure_dir():
     os.makedirs(_CUTSCENE_DIR, exist_ok=True)
 
-
 def _cutscene_path(name):
     return os.path.join(_CUTSCENE_DIR, f'{name}.json')
-
 
 def discover_cutscene_ids():
     """All saved cutscene ids, sourced the same way CutsceneEditor's own
@@ -264,10 +272,8 @@ def discover_cutscene_ids():
     except OSError:
         return []
 
-
 def _clamp(v, lo, hi):
     return max(lo, min(hi, v))
-
 
 class _ZoomedViewport:
     """Virtual zoom canvas projected directly onto a sub-rect of the real
@@ -439,14 +445,427 @@ class _ZoomedViewport:
         )
 
 
+# =============================================================================
+# Fonts
+# =============================================================================
+
+class _UiFont:
+    """One BitmapFont pinned to a pixel height, exposing the plain
+    ``render(text, antialias, color)`` / ``size(text)`` call shape (same idea
+    as DevMenu / RoomEditor's _BitmapFontView).
+
+    Unlike that adapter this one also covers glyphs the bitmap set doesn't
+    ship (``% < > [ ] | = " * # &`` and so on).  The bitmap font silently
+    drops those, which is fine for fixed UI labels but not for text the
+    designer *types* — dialogue lines, ids, names — where a vanishing
+    character would look like lost input.  Any unsupported character is
+    rendered with a default pygame font at a matching size instead.
+    """
+
+    _CACHE_LIMIT = 1500
+
+    # Per-glyph vertical nudge (pixels, positive = down) for bitmap-font
+    # characters that render sitting too high / flush with the baseline
+    # instead of dropping below it. Comma is the common offender — tune the
+    # value to taste if it still looks off at a given font size.
+    _GLYPH_Y_OFFSET = {',': 4}
+
+    def __init__(self, bitmap_font, height):
+        self._bmp = bitmap_font
+        self.height = int(height)
+        self._fallback = None
+        self._cache = {}
+
+    def _has(self, ch):
+        if ch == ' ':
+            return True
+        try:
+            return self._bmp._glyph(ch) is not None
+        except Exception:
+            return False
+
+    def _kind(self, ch):
+        """'fallback' (bitmap set doesn't have it), 'offset' (bitmap glyph
+        that needs the vertical nudge above), or 'ok' (render as-is)."""
+        if not self._has(ch):
+            return 'fallback'
+        if ch in self._GLYPH_Y_OFFSET:
+            return 'offset'
+        return 'ok'
+
+    def _fb_metrics(self):
+        """(font, baseline_row, cap_h): a fallback pygame font sized so its
+        capital 'H' is as tall as the bitmap font's, plus where its baseline
+        sits — so mixed runs share one baseline and look like one line."""
+        if self._fallback is None:
+            cap_h = self._bmp.render('H', color=(255, 255, 255), height=self.height).get_height()
+            size = max(9, int(cap_h * 1.4))
+            for _ in range(3):
+                bb = uk.Theme.font(None, size).render('H', True, (255, 255, 255)).get_bounding_rect()
+                if bb.h <= 0:
+                    break
+                new = max(9, int(round(size * cap_h / bb.h)))
+                if new == size:
+                    break
+                size = new
+            font = uk.Theme.font(None, size)
+            bb = font.render('H', True, (255, 255, 255)).get_bounding_rect()
+            self._fallback = (font, bb.bottom, cap_h)
+        return self._fallback
+
+    def render(self, text, antialias=True, color=(255, 255, 255)):
+        text = '' if text is None else str(text)
+        color = tuple(color)
+        if all(self._kind(c) == 'ok' for c in text):
+            return self._bmp.render(text, color=color, height=self.height)
+
+        key = (text, color)
+        hit = self._cache.get(key)
+        if hit is not None:
+            return hit
+
+        runs, cur, cur_kind = [], '', None
+        for ch in text:
+            k = self._kind(ch)
+            if cur and k != cur_kind:
+                runs.append((cur, cur_kind))
+                cur = ''
+            cur += ch
+            cur_kind = k
+        if cur:
+            runs.append((cur, cur_kind))
+
+        fb_font, fb_base, cap_h = self._fb_metrics()
+        parts = []          # (surface, y) — bitmap runs hang from y=0 (or their
+                             # glyph offset), fallback runs sit on the baseline
+        for chunk, kind in runs:
+            if kind == 'fallback':
+                parts.append((fb_font.render(chunk, True, color[:3]), cap_h - fb_base))
+            else:
+                y_off = self._GLYPH_Y_OFFSET.get(chunk[0], 0) if kind == 'offset' else 0
+                parts.append((self._bmp.render(chunk, color=color, height=self.height), y_off))
+        top = min(0, min(y for _, y in parts))
+        w = sum(p.get_width() for p, _ in parts) + max(0, len(parts) - 1)
+        h = max(y - top + p.get_height() for p, y in parts)
+        out = pygame.Surface((max(1, w), max(1, h)), pygame.SRCALPHA)
+        x = 0
+        for p, y in parts:
+            out.blit(p, (x, y - top))
+            x += p.get_width() + 1
+        if len(self._cache) >= self._CACHE_LIMIT:
+            self._cache.clear()
+        self._cache[key] = out
+        return out
+
+    def size(self, text):
+        return self.render(text, True, (255, 255, 255)).get_size()
+
+    def get_height(self):
+        return self.size('Ag')[1]
+
+
+def _load_dev_menu_icon(icon_key, box_size, fallback_fn=None, fallback_color=None):
+    """Load one of the shared dev-menu PNG icons (assets/ui/dev_menu/icons/)
+    with the same crop + point-sample scaling DevMenu._load_icon uses, so an
+    icon such as 'back' is pixel-identical here and on the dev menu header.
+    If the PNG isn't on disk, bake the vector fallback instead of returning
+    an invisible surface. fallback_color lets a caller match a specific spot
+    (e.g. a dimmed empty-state icon) instead of the default gold tint."""
+    path = os.path.join('assets', 'ui', 'dev_menu', 'icons', f'{icon_key}.png')
+    try:
+        raw = pygame.image.load(path).convert_alpha()
+    except (FileNotFoundError, pygame.error):
+        if fallback_fn is not None:
+            return uk.render_icon_surface(fallback_fn, box_size, fallback_color or uk.Theme.GOLD)
+        return pygame.Surface((box_size, box_size), pygame.SRCALPHA)
+
+    content_rect = raw.get_bounding_rect(min_alpha=1)
+    if content_rect.width <= 0 or content_rect.height <= 0:
+        content_rect = raw.get_rect()
+    raw = raw.subsurface(content_rect).copy()
+
+    iw, ih = raw.get_size()
+    scale = min(box_size / max(1, iw), box_size / max(1, ih))
+    nw, nh = max(1, round(iw * scale)), max(1, round(ih * scale))
+    if scale >= 1.0:
+        prescale = max(1, math.ceil(scale) * 2)
+        big = pygame.transform.scale(raw, (iw * prescale, ih * prescale))
+        scaled = pygame.transform.scale(big, (nw, nh))
+    else:
+        scaled = pygame.transform.scale(raw, (nw, nh))
+    canvas = pygame.Surface((box_size, box_size), pygame.SRCALPHA)
+    canvas.blit(scaled, ((box_size - nw) // 2, (box_size - nh) // 2))
+    return canvas
+
+
+# =============================================================================
+# Anti-aliased polygon / diamond shapes
+# =============================================================================
+# ui_kit supersamples its rounded rects and circles; it has no polygon helper,
+# and GPUScreen's own draw_polygon is aliased.  Same trick here: rasterise at
+# N x, smoothscale down, cache, blit through uk.blit_surface.
+
+_SS = 6
+_poly_cache = {}
+
+
+def _poly_surface(norm_pts, w, h, color):
+    """Filled polygon whose points are given 0..1 relative to a w x h box."""
+    key = (tuple(norm_pts), w, h, tuple(color))
+    surf = _poly_cache.get(key)
+    if surf is None:
+        hi = pygame.Surface((w * _SS, h * _SS), pygame.SRCALPHA)
+        pts = [(px * w * _SS, py * h * _SS) for px, py in norm_pts]
+        pygame.draw.polygon(hi, uk._rgba(color), pts)
+        surf = pygame.transform.smoothscale(hi, (w, h))
+        _poly_cache[key] = surf
+    return surf
+
+
+def _blit_poly(surface, rect, color, norm_pts):
+    rect = pygame.Rect(rect)
+    if rect.w <= 0 or rect.h <= 0:
+        return
+    uk.blit_surface(surface, _poly_surface(norm_pts, rect.w, rect.h, color),
+                    rect.topleft, transient=False)
+
+
+_diamond_cache = {}
+
+
+def _diamond_surface(half, fill, border, border_w):
+    key = (half, tuple(fill), tuple(border) if border else None, border_w)
+    surf = _diamond_cache.get(key)
+    if surf is None:
+        d = half * 2 + 2
+        hi = pygame.Surface((d * _SS, d * _SS), pygame.SRCALPHA)
+        c = d * _SS / 2
+        r = half * _SS
+
+        def poly(rad, col):
+            pygame.draw.polygon(hi, uk._rgba(col),
+                                [(c, c - rad), (c + rad, c), (c, c + rad), (c - rad, c)])
+        if border and border_w > 0:
+            poly(r, border)
+            poly(max(1.0, r - border_w * _SS * 1.42), fill)
+        else:
+            poly(r, fill)
+        surf = pygame.transform.smoothscale(hi, (d, d))
+        _diamond_cache[key] = surf
+    return surf
+
+
+def _draw_diamond(surface, cx, cy, half, fill, border=None, border_w=0):
+    s = _diamond_surface(int(half), tuple(fill), border, border_w)
+    uk.blit_surface(surface, s, (int(cx) - s.get_width() // 2, int(cy) - s.get_height() // 2),
+                    transient=False)
+
+
+# =============================================================================
+# Vector icon set — fn(surface, rect, color), same shape as ui_kit's icons
+# =============================================================================
+
+def _icon_plus(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.30
+    uk.draw_line_on(surface, color, (cx - s, cy), (cx + s, cy), width)
+    uk.draw_line_on(surface, color, (cx, cy - s), (cx, cy + s), width)
+
+
+def _icon_minus(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.30
+    uk.draw_line_on(surface, color, (cx - s, cy), (cx + s, cy), width)
+
+
+def _icon_check(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.32
+    uk.draw_line_on(surface, color, (cx - s, cy), (cx - s * 0.15, cy + s * 0.8), width)
+    uk.draw_line_on(surface, color, (cx - s * 0.15, cy + s * 0.8), (cx + s, cy - s * 0.7), width)
+
+
+def _icon_close(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.26
+    uk.draw_line_on(surface, color, (cx - s, cy - s), (cx + s, cy + s), width)
+    uk.draw_line_on(surface, color, (cx - s, cy + s), (cx + s, cy - s), width)
+
+
+def _icon_trash(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    body = pygame.Rect(0, 0, s * 0.56, s * 0.52)
+    body.centerx = cx
+    body.top = int(cy - s * 0.06)
+    uk.draw_rect_on(surface, color, body, width, 2)
+    lid = pygame.Rect(0, 0, s * 0.78, s * 0.10)
+    lid.centerx = cx
+    lid.bottom = body.top + 1
+    uk.draw_rect_on(surface, color, lid, 0, 1)
+    handle = pygame.Rect(0, 0, s * 0.28, s * 0.14)
+    handle.centerx = cx
+    handle.bottom = lid.top + 1
+    uk.draw_rect_on(surface, color, handle, 1, 2)
+    for i in (-1, 1):
+        x = cx + i * s * 0.14
+        uk.draw_line_on(surface, color, (x, body.top + 4), (x, body.bottom - 3), 1)
+
+
+def _make_chevron(direction):
+    def fn(surface, rect, color, width=2):
+        cx, cy = rect.center
+        s = min(rect.w, rect.h) * 0.24
+        if direction == 'left':
+            pts = [(cx + s * .6, cy - s), (cx - s * .6, cy), (cx + s * .6, cy + s)]
+        elif direction == 'right':
+            pts = [(cx - s * .6, cy - s), (cx + s * .6, cy), (cx - s * .6, cy + s)]
+        elif direction == 'up':
+            pts = [(cx - s, cy + s * .6), (cx, cy - s * .6), (cx + s, cy + s * .6)]
+        else:
+            pts = [(cx - s, cy - s * .6), (cx, cy + s * .6), (cx + s, cy - s * .6)]
+        uk.draw_line_on(surface, color, pts[0], pts[1], width)
+        uk.draw_line_on(surface, color, pts[1], pts[2], width)
+    return fn
+
+
+_icon_chev_l = _make_chevron('left')
+_icon_chev_r = _make_chevron('right')
+_icon_chev_d = _make_chevron('down')
+_icon_chev_u = _make_chevron('up')
+
+
+def _icon_play(surface, rect, color):
+    box = pygame.Rect(0, 0, rect.w * 0.44, rect.h * 0.52)
+    box.center = (rect.centerx + rect.w * 0.03, rect.centery)
+    _blit_poly(surface, box, color, [(0, 0), (1, 0.5), (0, 1)])
+
+
+def _icon_stop(surface, rect, color):
+    s = min(rect.w, rect.h) * 0.40
+    box = pygame.Rect(0, 0, s, s)
+    box.center = rect.center
+    uk.draw_rect_on(surface, color, box, 0, 3)
+
+
+def _polyline(surface, color, pts, width=2):
+    for p, q in zip(pts, pts[1:]):
+        uk.draw_line_on(surface, color, p, q, width)
+
+
+def _arrow_head(surface, color, tip, toward, size, width=2):
+    """Two barbs at *tip* opening back toward *toward* (a point on the shaft)."""
+    ang = math.atan2(toward[1] - tip[1], toward[0] - tip[0])
+    for d in (0.62, -0.62):
+        a = ang + d
+        uk.draw_line_on(surface, color, tip, (tip[0] + size * math.cos(a), tip[1] + size * math.sin(a)), width)
+
+
+def _curved_arrow(surface, rect, color, width, mirror):
+    """Undo / redo: a 3/4 arc with the arrowhead on its top-left (undo) or
+    top-right (redo) end."""
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    r = s * 0.28
+    sign = -1 if mirror else 1
+    pts = []
+    for i in range(0, 12):
+        a = math.radians(150 - i * 20)          # 150 deg -> -70 deg, clockwise
+        pts.append((cx + sign * r * math.cos(a) + sign * s * 0.03, cy + s * 0.05 - r * math.sin(a)))
+    _polyline(surface, color, pts, width)
+    _arrow_head(surface, color, pts[0], pts[2], s * 0.24, width)
+
+
+def _icon_undo(surface, rect, color, width=2):
+    _curved_arrow(surface, rect, color, width, False)
+
+
+def _icon_redo(surface, rect, color, width=2):
+    _curved_arrow(surface, rect, color, width, True)
+
+
+def _icon_save(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.74
+    body = pygame.Rect(0, 0, s, s)
+    body.center = (cx, cy)
+    uk.draw_rect_on(surface, color, body, width, 3)
+    top = pygame.Rect(0, 0, s * 0.50, s * 0.30)
+    top.midtop = (body.centerx - s * 0.04, body.y + 1)
+    uk.draw_rect_on(surface, color, top, 0, 1)
+    slot = pygame.Rect(0, 0, s * 0.56, s * 0.34)
+    slot.midbottom = (body.centerx, body.bottom - 2)
+    uk.draw_rect_on(surface, color, slot, 1, 1)
+
+
+def _icon_dup(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    a = pygame.Rect(0, 0, s * 0.44, s * 0.44)
+    a.center = (cx - s * 0.10, cy + s * 0.10)
+    b = a.move(int(s * 0.20), -int(s * 0.20))
+    uk.draw_rect_on(surface, color, b, width, 3)
+    uk.draw_rect_on(surface, (*_BAR_BG, 255), a.inflate(1, 1), 0, 3)
+    uk.draw_rect_on(surface, color, a, width, 3)
+
+
+def _icon_grid(surface, rect, color, width=1):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.30
+    for d in (-s * 0.5, s * 0.5):
+        uk.draw_line_on(surface, color, (cx + d, cy - s), (cx + d, cy + s), width + 1)
+        uk.draw_line_on(surface, color, (cx - s, cy + d), (cx + s, cy + d), width + 1)
+
+
+def _icon_pick(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    r = int(s * 0.17)
+    uk.draw_circle_on(surface, color, (cx, cy), r, width)
+    g = s * 0.30
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        uk.draw_line_on(surface, color, (cx + dx * (r + 1), cy + dy * (r + 1)),
+                        (cx + dx * g, cy + dy * g), width)
+
+
+def _icon_speaker(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    box = pygame.Rect(0, 0, s * 0.16, s * 0.20)
+    box.center = (cx - s * 0.14, cy)
+    uk.draw_rect_on(surface, color, box, 0, 1)
+    cone = pygame.Rect(box.right - 1, int(cy - s * 0.17), int(s * 0.18), int(s * 0.34))
+    _blit_poly(surface, cone, color, [(0, 0.3), (1, 0), (1, 1), (0, 0.7)])
+    a = [(cx + s * 0.08 + s * 0.14 * math.cos(math.radians(-50 + 100 * i / 6)),
+          cy - s * 0.14 * math.sin(math.radians(-50 + 100 * i / 6))) for i in range(7)]
+    _polyline(surface, color, a, 2)
+
+
+def _icon_camera_track(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    body = pygame.Rect(0, 0, s * 0.5, s * 0.34)
+    body.center = (cx - s * 0.04, cy)
+    uk.draw_rect_on(surface, color, body, width, 3)
+    lens = pygame.Rect(body.right, int(cy - s * 0.11), int(s * 0.16), int(s * 0.22))
+    _blit_poly(surface, lens, color, [(0, 0.3), (1, 0), (1, 1), (0, 0.7)])
+
+
+
+# =============================================================================
+# CutsceneEditor
+# =============================================================================
+
 class CutsceneEditor:
     """Full cutscene editor.  Mirrors SpriteEditor / RoomEditor API:
     toggle() / handle_input(event) / update(dt) / draw(screen).
 
     Two top-level views:
-      'list' — file browser (create, open, delete cutscenes)
-      'edit' — AE-style editor with viewport, timeline, inspector panels
+      'list' — cutscene browser (create, open, delete)
+      'edit' — workspace with viewport, timeline and inspector panels
     """
+
+    _UNDO_LIMIT = 50
 
     def __init__(self, room_manager, room_editor, screen_width, screen_height,
                  dialogue_box=None, sound_manager=None):
@@ -462,12 +881,33 @@ class CutsceneEditor:
         self.sound_manager = sound_manager
         self.active        = False
 
-        # Fonts
-        self.font_title  = pygame.font.Font(None, 40)
-        self.font_large  = pygame.font.Font(None, 28)
-        self.font_medium = pygame.font.Font(None, 22)
-        self.font_small  = pygame.font.Font(None, 18)
-        self.font_mono   = pygame.font.Font(None, 20)
+        # ── Fonts ─────────────────────────────────────────────────────────────
+        # Same two-glyph-set split as DevMenu / RoomEditor: the plain
+        # upper/lowercase set for big titles, the menu set for everything else.
+        fonts_root = os.path.join('assets', 'ui', 'fonts')
+        self._menu_font = uk.BitmapFont(fonts_root, letter_spacing=1)
+        self._title_bitmap_font = uk.BitmapFont(fonts_root, letter_spacing=1)
+        self._title_bitmap_font.uppercase_dir = os.path.join('assets', 'ui', 'fonts', 'uppercase')
+        self._title_bitmap_font.lowercase_dir = os.path.join('assets', 'ui', 'fonts', 'lowercase')
+        self.font_title  = _UiFont(self._title_bitmap_font, 32)
+        self.font_large  = _UiFont(self._menu_font, 20)
+        self.font_medium = _UiFont(self._menu_font, 16)
+        self.font_small  = _UiFont(self._menu_font, 12)
+
+        # Icons that ship as PNGs with the dev menu (vector fallback if absent)
+        self._icon_back = _load_dev_menu_icon('back', 34, uk.draw_back_icon)
+        self._icon_back_sm = _load_dev_menu_icon('back', 26, uk.draw_back_icon)
+        self._icon_plus_png = _load_dev_menu_icon('plus', 34, _icon_plus)
+        # Header Save button — 18 px is the icon box every labelled button uses.
+        self._icon_save_png = _load_dev_menu_icon('save', 18, _icon_save)
+        # Delete / trash — 18 px for labelled "Delete" buttons (matches Save
+        # above), 26 px for the icon-only trash button on list cards.
+        self._icon_trash_png    = _load_dev_menu_icon('trash', 18, _icon_trash)
+        self._icon_trash_png_sm = _load_dev_menu_icon('trash', 26, _icon_trash)
+        # Pick-in-viewport / duplicate — always used on labelled buttons, so
+        # one 18 px bake each is enough (same convention as Save/Delete).
+        self._icon_pick_png = _load_dev_menu_icon('pick', 18, _icon_pick)
+        self._icon_dup_png  = _load_dev_menu_icon('duplicate', 18, _icon_dup)
 
         # ── Editor state ──────────────────────────────────────────────────────
         self.view          = 'list'
@@ -481,29 +921,40 @@ class CutsceneEditor:
         # restore the state that existed just before that edit.
         self._undo_stack: list = []
         self._redo_stack: list = []
-        # _UNDO_LIMIT is defined as a class variable below the undo methods —
-        # no need to redefine it here; it shadows the class attr unnecessarily.
 
-        # Viewport camera
-        vp_w = screen_width  - _LEFT_W - _RIGHT_W
-        vp_h = screen_height - _TOP_H  - _BOTTOM_H
-        self.camera       = Camera(vp_w, vp_h)
-        self.camera.x     = 0
-        self.camera.y     = 0
-        self.camera_speed = 300
-        self._vp_rect     = pygame.Rect(_LEFT_W, _TOP_H, vp_w, vp_h)
+        # ── UI runtime (immediate-mode plumbing) ──────────────────────────────
+        self._hits         = []       # [(rect, action, arg)] rebuilt every draw
+        self._text_rects   = []       # text-entry rects (I-beam cursor)
+        self._blocks       = []       # rects that shield widgets underneath
+        self._blocks_prev  = []
+        self._in_overlay   = False
+        self._clip_rect    = None
+        self._clip_stack   = []
+        self._anims        = {}       # widget key -> eased 0..1
+        self._dt           = 1 / 60
+        self._blink        = 0.0      # text-caret blink clock
+        self._mouse_pos    = tuple(pygame.mouse.get_pos())
+        self._last_input   = 'mouse'
+        self._fit_cache    = {}
+        self._layout_key   = None
+        self._marker_labels = []
+
+        # Shared dropdown overlay (one instance for every picker)
+        self._dd = None
 
         # ── List view ─────────────────────────────────────────────────────────
         self._files          = []
+        self._file_meta      = {}
         self._list_sel       = -1
         self._list_scroll    = 0
+        self._list_confirm   = None   # cutscene name awaiting delete confirmation
         self._new_name_buf   = ''
         self._new_name_focus = False
         self._list_msg       = ''
 
-        # ── Left panel ────────────────────────────────────────────────────────
-        self._left_track_sel = -1   # which track row is highlighted (-1=none)
-        # 0=camera,1=screen, 2..=actor index
+        # ── Scene panel (left) ────────────────────────────────────────────────
+        self._left_scroll    = 0
+        self._left_content_h = 0
 
         # ── Edit view — timeline ──────────────────────────────────────────────
         self._tl_sel         = -1
@@ -517,7 +968,6 @@ class CutsceneEditor:
         # same spirit as _tl_scroll_y. Missing key == collapsed.
         self._tl_expanded    = {}
 
-        # AE-style graphical timeline
         self._tl_time_zoom   = 70.0   # pixels per second
         self._tl_scroll_x    = 0.0    # horizontal scroll offset (px)
         self._tl_play_drag   = False
@@ -527,7 +977,7 @@ class CutsceneEditor:
         self._tl_auto_scroll = 0.0    # px/sec applied during playhead/kf drag near edges
         self._scrub_pending  = False  # True when _tl_playhead_t moved but seek() hasn't run yet
 
-        # ── Right panel — action form (inspector) ─────────────────────────────
+        # ── Inspector (right) — action form ───────────────────────────────────
         self._form_active    = False
         self._form_new       = False
         self._form_target    = 'camera'
@@ -540,45 +990,10 @@ class CutsceneEditor:
         self._form_type_idx    = 0
         # Tracks the active group filter when browsing rooms for a change_room action.
         self._form_room_group  = ''
+        self._insp_scroll      = 0
+        self._insp_content_h   = 0
 
-        # ── Portrait dropdown overlay ────────────────────────────────────────────
-        self._portrait_dropdown_open   = False
-        self._portrait_dropdown_items  = []
-        self._portrait_dropdown_rect   = None
-        self._portrait_dropdown_scroll = 0
-
-        # ── Character dropdown overlay (set_character action) ────────────────
-        self._character_dropdown_open   = False
-        self._character_dropdown_items  = []
-        self._character_dropdown_rect   = None
-        self._character_dropdown_scroll = 0
-
-        # ── Costume dropdown overlay (set_costume action) ─────────────────────
-        self._costume_dropdown_open   = False
-        self._costume_dropdown_items  = []
-        self._costume_dropdown_rect   = None
-        self._costume_dropdown_scroll = 0
-
-        # ── Sound dropdown overlay (play_music 'track' / play_sfx 'sfx') ──────
-        # Shared between both fields; self._sound_dropdown_field ('track' or
-        # 'sfx') says which _form_params key a selection should be written to.
-        self._sound_dropdown_open   = False
-        self._sound_dropdown_items  = []
-        self._sound_dropdown_rect   = None
-        self._sound_dropdown_scroll = 0
-        self._sound_dropdown_field  = 'track'
-
-        # ── Actor asset-id dropdown (enemy_type / boss id / npc id / player
-        # character for the actor-add form's Type selection) ───────────────────
-        # Items are sourced from entity_editor's discover_*_ids() (and the
-        # player character folder), so the designer always picks a real,
-        # currently-placeable id instead of typing one that might not exist.
-        self._etype_dropdown_open   = False
-        self._etype_dropdown_items  = []
-        self._etype_dropdown_rect   = None
-        self._etype_dropdown_scroll = 0
-
-        # ── Actor add form (shown in left panel) ──────────────────────────────
+        # ── Actor add form (floating card over the viewport) ──────────────────
         self._actor_form     = False
         self._actor_type_idx = 0
         self._actor_id_buf   = 'actor_0'
@@ -586,7 +1001,7 @@ class CutsceneEditor:
         self._actor_focus    = None
         self._actor_sel      = -1
 
-        # ── Duration field (top bar inline editor) ────────────────────────────
+        # ── Duration field (header inline editor) ─────────────────────────────
         self._duration_buf   = '10.0'
         self._duration_focus = False
 
@@ -600,7 +1015,7 @@ class CutsceneEditor:
         # ── Grid visibility (toggled with G) ──────────────────────────────────
         self._show_grid   = True
 
-        # ── Actor placement grid snap ──────────────────────────────────────────
+        # ── Actor placement grid snap ─────────────────────────────────────────
         # Snaps actor spawn position (initial pick_actor placement + drag) to
         # a world-unit grid, same idea as the room editor's tile grid but with
         # its own toggle since actors don't need to sit exactly on a tile.
@@ -608,14 +1023,11 @@ class CutsceneEditor:
         self._actor_snap_sizes   = [8, 16, 32]   # world units; TILE_SIZE == 32
         self._actor_snap_idx     = 1             # default 16x16
 
-        # ── Timeline grid snap ──────────────────────────────────────────────────
+        # ── Timeline grid snap ────────────────────────────────────────────────
         # Snaps keyframe drag time to a fixed interval, with vertical guide
         # lines drawn through the track area at each interval so alignment
         # across tracks (e.g. lining up a fade_in with a dialogue line) is
-        # visual, not just numeric. Interval is user-selectable rather than
-        # fixed to "1 second, finer while zoomed" — precise placement (e.g.
-        # snapping to a quarter-second) shouldn't depend on how zoomed in
-        # the designer happens to be at the time.
+        # visual, not just numeric.
         self._tl_grid_enabled   = False
         self._tl_grid_intervals = [1.0, 0.5, 0.25, 0.1]
         self._tl_grid_idx       = 0
@@ -624,7 +1036,7 @@ class CutsceneEditor:
         self._vp_drag      = False
         self._vp_drag_last = (0, 0)
 
-        # ── Actor sprite previews ──────────────────────────────────────────────
+        # ── Actor sprite previews ─────────────────────────────────────────────
         # Maps actor_id → real entity instance (Enemy / Player / BossEnemy).
         # Created lazily so sprites appear in the viewport without playing.
         self._actor_entities: dict = {}
@@ -645,14 +1057,7 @@ class CutsceneEditor:
         # doesn't jump to snap its centre under the cursor on drag start.
         self._kf_drag_offset = 0.0
 
-        # ── Button rects (rebuilt each draw) ─────────────────────────────────
-        self._btns           = {}
-        self._field_meta     = {}
-
-        # ── Mouse tracking (for ghost previews) ───────────────────────────────
-        self._mouse_pos      = (0, 0)
-
-        # ── Actor initial-position drag ────────────────────────────────────────
+        # ── Actor initial-position drag ───────────────────────────────────────
         # Index into cutscene_data['actors'] of the actor being dragged (-1=idle).
         # Sub-pixel grab offsets keep the actor from snapping its centre to the
         # cursor on drag start — same technique as the keyframe drag.
@@ -668,10 +1073,70 @@ class CutsceneEditor:
         # Animated tiles (water, flags, etc.) can't live in the surface above —
         # it's baked once and never touched again, so a cycling tile would
         # freeze on whatever frame it happened to be baked with. Mirrors
-        # game._animated_tile_lists: tiles whose anchor coord has a
-        # tile_animations entry are pulled out during baking and redrawn
-        # fresh every frame instead. Keyed the same as _vp_tile_surfaces.
+        # game._animated_tile_lists. Keyed the same as _vp_tile_surfaces.
         self._vp_animated_tiles: dict = {}
+
+        # Geometry (also sizes the camera to the viewport panel)
+        self._layout()
+        self.camera       = Camera(self._vp_rect.w, self._vp_rect.h)
+        self.camera.x     = 0
+        self.camera.y     = 0
+        self.camera_speed = 300
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Layout
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _layout(self):
+        """Compute every panel rect from the current screen size.  Re-run from
+        draw() whenever screen_width / screen_height change."""
+        w, h = int(self.screen_width), int(self.screen_height)
+        self._layout_key = (w, h)
+
+        # --- list view: same numbers RoomEditor / DevMenu use ---------------
+        self.margin_x        = 56
+        self.list_header_h   = max(86, round(h * 0.12))
+        self.list_footer_h   = max(42, round(h * 0.065))
+        self.card_h          = 68
+
+        back = max(40, round(self.list_header_h * 0.55))
+        self._list_back_rect = pygame.Rect(self.margin_x, (self.list_header_h - back) // 2, back, back)
+        self._list_add_rect  = pygame.Rect(self.margin_x, h - self.list_footer_h - 24 - back, back, back)
+
+        # --- edit view --------------------------------------------------------
+        gap = self._gap = 10
+        self.header_h = 56
+        mid_top    = self.header_h + gap
+        mid_bottom = h - gap
+
+        tl_h = _clamp(round(h * 0.34), 236, 420)
+        tl_h = min(tl_h, max(190, (mid_bottom - mid_top) - 170))
+        left_w  = _clamp(round(w * 0.18), 216, 320)
+        right_w = _clamp(round(w * 0.235), 270, 420)
+
+        # The Inspector is a full-height sidebar (its forms are the tallest thing
+        # in the editor); the timeline runs under the Scene panel + viewport.
+        self._right_frame = pygame.Rect(w - gap - right_w, mid_top, right_w, mid_bottom - mid_top)
+        self._tl_frame    = pygame.Rect(gap, mid_bottom - tl_h, self._right_frame.left - gap * 2, tl_h)
+        top_h             = self._tl_frame.top - gap - mid_top
+        self._left_frame  = pygame.Rect(gap, mid_top, left_w, top_h)
+        vx = self._left_frame.right + gap
+        self._vp_frame    = pygame.Rect(vx, mid_top, self._right_frame.left - gap - vx, top_h)
+        self._vp_rect     = self._vp_frame.inflate(-12, -12)
+
+        # Timeline inner metrics
+        self._tl_hdr_h   = 44     # toolbar strip
+        self._tl_ruler_h = 26
+        self._tl_row_h   = 32
+        self._tl_label_w = _clamp(round(w * 0.12), 132, 200)
+
+        self._ctl_h = 34          # standard control height
+
+        cam = getattr(self, 'camera', None)
+        if cam is not None:
+            cam.screen_width  = self._vp_rect.w
+            cam.screen_height = self._vp_rect.h
+            self._clamp_camera()
 
     # ══════════════════════════════════════════════════════════════════════════
     # Public API
@@ -693,35 +1158,50 @@ class CutsceneEditor:
         if self.active:
             # Closing the editor — flush any unsaved work and the viewport state
             if self.view == 'edit' and self.cutscene_data:
+                if self._duration_focus:
+                    self._commit_duration()
                 if self.unsaved:
                     self._save_cutscene()
                 else:
                     self._save_viewport_state()
             if self.sound_manager is not None:
                 self.sound_manager.stop_music(fade_out=False)
+            uk.set_text_cursor(False)
+            uk.set_hand_cursor(False)
         self.active = not self.active
+        self._dd = None
+        self._duration_focus = False
+        self._form_focus = None
+        self._actor_focus = None
+        self._new_name_focus = False
+        self._list_confirm = None
         if self.active:
+            self._mouse_pos = tuple(pygame.mouse.get_pos())
             self._refresh_file_list()
 
     def handle_input(self, event):
         """Route a pygame event to the correct sub-handler.
 
-        Priority order so higher-level overlays always get first dibs:
-          KEYDOWN → _on_keydown
-          Left-click down   → _on_click (buttons, timeline, viewport)
-          Left-click up     → finalise playhead/kf drag
+          KEYDOWN           → _on_keydown
+          Left-click down   → _on_click (widgets, timeline, viewport)
+          Left-click up     → finalise playhead/kf/actor drag
           Right-click down  → start viewport pan
           Right-click up    → end viewport pan
-          MOUSEMOTION       → _on_mouse_motion (drag, ghost preview)
-          MOUSEWHEEL        → _on_scroll (zoom / timeline scroll)
+          MOUSEMOTION       → _on_mouse_motion (drag, hover)
+          MOUSEWHEEL        → _on_scroll (zoom / scroll)
         """
         if not self.active:
             return None
 
+        if event.type in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
+            self._mouse_pos = tuple(event.pos)
+
         if event.type == pygame.KEYDOWN:
+            self._last_input = 'keyboard'
             return self._on_keydown(event)
 
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            self._last_input = 'mouse'
             return self._on_click(event.pos)
 
         if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
@@ -749,7 +1229,7 @@ class CutsceneEditor:
                 self._runtime = None  # actor start pos changed; force rebuild
 
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
-            if self.view == 'edit' and self._vp_rect.collidepoint(event.pos):
+            if self.view == 'edit' and self._vp_rect.collidepoint(event.pos) and self._dd is None:
                 self._vp_drag      = True
                 self._vp_drag_last = event.pos
             return None
@@ -758,6 +1238,7 @@ class CutsceneEditor:
             self._vp_drag = False
 
         if event.type == pygame.MOUSEMOTION:
+            self._last_input = 'mouse'
             self._on_mouse_motion(event.pos)
 
         if event.type == pygame.MOUSEWHEEL:
@@ -770,9 +1251,13 @@ class CutsceneEditor:
 
         Handles: WASD camera pan, deferred timeline scrub, edge-scroll while
         dragging, autosave timer, and live playback via CutsceneRuntime.
+        (The OS cursor is resolved in draw(), not here — see _resolve_cursor.)
         """
         if not self.active:
             return
+
+        self._dt     = min(max(dt, 0.0), 1 / 20) if dt > 0 else 1 / 60
+        self._blink += self._dt
 
         # Suppress manual camera pan during active playback — the runtime owns
         # the camera while playing, and fighting it causes jitter.  Also guards
@@ -781,20 +1266,23 @@ class CutsceneEditor:
                 and not self._playing
                 and not self._form_focus
                 and not self._actor_focus
-                and not self._duration_focus):
+                and not self._duration_focus
+                and self._dd is None):
             keys  = pygame.key.get_pressed()
             shift = keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]
+            ctrl  = keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL]
             # Pan speed scales with zoom so movement feels consistent:
             # zoomed out → faster pan (covers more world), zoomed in → slower
             spd = self.camera_speed * (2 if shift else 1) / self._vp_zoom
-            if keys[pygame.K_a] or keys[pygame.K_LEFT]:
-                self.camera.x -= spd * dt
-            if keys[pygame.K_d] or keys[pygame.K_RIGHT]:
-                self.camera.x += spd * dt
-            if keys[pygame.K_w] or keys[pygame.K_UP]:
-                self.camera.y -= spd * dt
-            if keys[pygame.K_s] or keys[pygame.K_DOWN]:
-                self.camera.y += spd * dt
+            if not ctrl:   # Ctrl+S / Ctrl+Z etc. must not also pan the camera
+                if keys[pygame.K_a] or keys[pygame.K_LEFT]:
+                    self.camera.x -= spd * dt
+                if keys[pygame.K_d] or keys[pygame.K_RIGHT]:
+                    self.camera.x += spd * dt
+                if keys[pygame.K_w] or keys[pygame.K_UP]:
+                    self.camera.y -= spd * dt
+                if keys[pygame.K_s] or keys[pygame.K_DOWN]:
+                    self.camera.y += spd * dt
             self._clamp_camera()
 
         # ── Flush deferred scrub (set by _on_mouse_motion during playhead drag).
@@ -810,7 +1298,7 @@ class CutsceneEditor:
         if self.view == 'edit' and self._tl_auto_scroll != 0.0 and self.cutscene_data:
             self._tl_scroll_x = max(0.0, self._tl_scroll_x + self._tl_auto_scroll * dt)
             tl          = self._tl_panel_rect()
-            label_end_x = tl.x + _TL_LABEL_W
+            label_end_x = tl.x + self._tl_label_w
             mx          = self._mouse_pos[0]
             dur         = self.cutscene_data.get('duration', 10.0)
             if self._tl_play_drag:
@@ -871,10 +1359,121 @@ class CutsceneEditor:
     def draw(self, screen):
         if not self.active:
             return
+        if self._layout_key != (int(self.screen_width), int(self.screen_height)):
+            self._layout()
+
+        # Fresh registries every frame — hit-testing is always in sync with
+        # what was actually painted, never cached across frames.
+        self._hits       = []
+        self._text_rects = []
+        self._blocks     = []
+        self._in_overlay = False
+        self._clip_rect  = None
+        self._clip_stack = []
+        # While a dropdown is open, everything underneath stops reacting to hover.
+        if self._dd is not None:
+            self._blocks_prev = [pygame.Rect(0, 0, self.screen_width, self.screen_height)]
+
         if self.view == 'list':
             self._draw_list(screen)
         else:
             self._draw_edit(screen)
+        self._draw_dropdown(screen)
+
+        if self._dd is None:
+            self._blocks_prev = self._blocks
+
+        # OS cursor, resolved dead last — after every widget this frame has
+        # had a chance to register a hit/text-field rect, and after
+        # dev_menu.draw() (called just before this one, see Game.draw())
+        # has already made whatever incidental cursor calls it makes for
+        # its own always-drawn chrome (e.g. its persistent toggle icon,
+        # via ui_kit's shared register_hoverable/update_hover_cursor).
+        # Resolving here, last, is what makes this editor's cursor choice
+        # stick for the frame. Doing this in update() instead — which runs
+        # BEFORE dev_menu.draw() — meant dev_menu's own draw-time cursor
+        # call would stomp ours right back to the arrow a moment later,
+        # every single frame, which is what caused the hand/arrow flicker.
+        self._resolve_cursor()
+
+    def _resolve_cursor(self):
+        """Switch the OS cursor to an I-beam over any real text-entry field
+        registered this frame (self._text_rects), else to a hand over any
+        other clickable hit (self._hits — buttons, list/actor rows, etc.,
+        anything with a non-None, non-'field' action) or an open dropdown's
+        row, else back to the plain arrow. Same convention and priority as
+        ObjectEditor's _resolve_field_cursor + update_hover_cursor: the
+        I-beam always wins where a field and a button happen to overlap.
+
+        Must be called at the very end of draw(), after every widget for
+        this frame has registered its rect — see the call site's comment
+        for why running this any earlier (e.g. from update()) causes the
+        cursor to flicker.
+        """
+        if self._dd is not None:
+            # Dropdown open: only its own rows matter — everything
+            # underneath is blocked from hover/click either way.
+            hovering_text_field = False
+            hovering_widget = any(row.collidepoint(self._mouse_pos)
+                                   for row, _value in self._dd.get('rows', []))
+        else:
+            hovering_text_field = any(r.collidepoint(self._mouse_pos) for r in self._text_rects)
+            hovering_widget = (not hovering_text_field and any(
+                action is not None and action != 'field' and r.collidepoint(self._mouse_pos)
+                for r, action, arg, full in self._hits))
+        uk.set_text_cursor(hovering_text_field)
+        uk.set_hand_cursor(hovering_widget)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Small shared helpers
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _blur_text(self):
+        """Drop focus from every inline text field (committing the duration
+        field, which is the only one that applies on blur)."""
+        if self._duration_focus:
+            self._commit_duration()
+        self._duration_focus = False
+        self._form_focus     = None
+        self._actor_focus    = None
+
+    def _mouse_world(self):
+        """World coords under the cursor (only meaningful inside the viewport)."""
+        vp = self._vp_rect
+        vx, vy = self._mouse_pos[0] - vp.x, self._mouse_pos[1] - vp.y
+        wx = vx / (RENDER_SCALE * self._vp_zoom) + self.camera.x / RENDER_SCALE
+        wy = vy / (RENDER_SCALE * self._vp_zoom) + self.camera.y / RENDER_SCALE
+        return wx, wy
+
+    def _world_to_screen(self, wx, wy):
+        vp = self._vp_rect
+        return (int(vp.x + (wx * RENDER_SCALE - self.camera.x) * self._vp_zoom),
+                int(vp.y + (wy * RENDER_SCALE - self.camera.y) * self._vp_zoom))
+
+    def _leave_edit(self):
+        """Back to the cutscene list, saving first (button and Esc share this
+        so neither can drop unsaved work)."""
+        if self._playing:
+            self._stop_preview()
+        self._blur_text()
+        self._dd = None
+        if self.unsaved:
+            # _save_cutscene internally calls _save_viewport_state too
+            self._save_cutscene()
+        else:
+            self._save_viewport_state()
+        self.view = 'list'
+        self._refresh_file_list()
+
+    def _submit_new_name(self):
+        n = self._new_name_buf.strip()
+        if not n:
+            self._list_msg = 'Enter a name first.'
+            return
+        if os.path.exists(_cutscene_path(n)):
+            self._list_msg = 'A cutscene with that name already exists.'
+            return
+        self._create_and_open(n)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Input handlers
@@ -883,30 +1482,36 @@ class CutsceneEditor:
     def _on_keydown(self, event):
         """Dispatch keyboard events for the editor.
 
-        ESC walks back through layers (dropdown → pick mode → actor form →
-        inspector form → back to list → close editor).
+        ESC walks back through layers (dropdown → text field → pick mode →
+        actor form → inspector form → back to list → close editor).
         Space toggles playback when no text field is active.
         Ctrl-S saves; Ctrl-Z/Y/Shift-Z undo/redo; G toggles the grid.
         Everything else falls through to whichever text field has focus.
         """
         key = event.key
+        typing = bool(self._form_focus or self._actor_focus
+                      or self._new_name_focus or self._duration_focus)
 
         if key == pygame.K_ESCAPE:
             # Dismiss overlays in stack order — most-modal first.
-            if self._portrait_dropdown_open:
-                self._portrait_dropdown_open = False
+            if self._dd is not None:
+                self._dd = None
                 return None
-            if self._character_dropdown_open:
-                self._character_dropdown_open = False
+            if self._duration_focus:
+                self._commit_duration()
+                self._duration_focus = False
                 return None
-            if self._costume_dropdown_open:
-                self._costume_dropdown_open = False
+            if self._new_name_focus:
+                self._new_name_focus = False
+                self._new_name_buf   = ''
+                self._list_msg       = ''
                 return None
-            if self._sound_dropdown_open:
-                self._sound_dropdown_open = False
+            if self._form_focus or self._actor_focus:
+                self._form_focus  = None
+                self._actor_focus = None
                 return None
-            if self._etype_dropdown_open:
-                self._etype_dropdown_open = False
+            if self._list_confirm is not None:
+                self._list_confirm = None
                 return None
             if self._pick_mode:
                 self._pick_mode = None
@@ -917,24 +1522,22 @@ class CutsceneEditor:
             if self._form_active:
                 self._form_active = False
                 self._form_focus  = None
+                self._stop_preview_sound()
                 return None
             if self.view == 'edit':
                 if self._playing:
                     self._stop_preview()
                 else:
-                    self.view = 'list'
-                    self._refresh_file_list()
+                    self._leave_edit()
                 return None
+            # List view with nothing else to dismiss — same as the back
+            # arrow: reopen the Dev Menu instead of vanishing into gameplay.
             self.toggle()
-            return None
+            return 'back_to_dev_menu'
 
         # Space plays / stops — but not while a dialogue box is open because
         # the user needs space to dismiss dialogue lines during preview.
-        if (key == pygame.K_SPACE
-                and self.view == 'edit'
-                and not self._form_focus
-                and not self._actor_focus
-                and not self._new_name_focus):
+        if key == pygame.K_SPACE and self.view == 'edit' and not typing:
             if self.dialogue_box and getattr(self.dialogue_box, 'active', False):
                 return None
             if self._playing:
@@ -974,9 +1577,7 @@ class CutsceneEditor:
 
         # Grid toggle — only when no text field has focus so typing 'g' in a
         # name / param field is never intercepted.
-        if (key == pygame.K_g and self.view == 'edit'
-                and not self._form_focus and not self._actor_focus
-                and not self._new_name_focus):
+        if key == pygame.K_g and self.view == 'edit' and not typing:
             self._show_grid = not self._show_grid
             return None
 
@@ -994,6 +1595,18 @@ class CutsceneEditor:
             self._handle_text_field(None, event, actor_key=self._actor_focus)
             return None
 
+        # List-view keyboard navigation
+        if self.view == 'list' and self._files:
+            n = len(self._files)
+            if key in (pygame.K_DOWN, pygame.K_s):
+                self._list_sel = min(n - 1, self._list_sel + 1)
+            elif key in (pygame.K_UP, pygame.K_w):
+                self._list_sel = max(0, self._list_sel - 1) if self._list_sel >= 0 else 0
+            elif key in (pygame.K_RETURN, pygame.K_KP_ENTER) and 0 <= self._list_sel < n:
+                self._load_cutscene(self._files[self._list_sel])
+            elif key == pygame.K_DELETE and 0 <= self._list_sel < n:
+                self._list_confirm = self._files[self._list_sel]
+
         return None
 
     def _handle_text_field(self, attr, event, field_key=None, actor_key=None):
@@ -1004,20 +1617,24 @@ class CutsceneEditor:
           field_key — a key in _form_params, or 'time' for _form_time_buf
           actor_key — 'id' for the actor-add form's Actor ID buffer
 
-        Tab/Esc always clear focus. Return clears focus for single-line
+        Tab always clears focus. Return clears focus for single-line
         fields; for the dialogue text field it inserts a hard newline
         (Discord-style multiline) instead, so the designer can break lines
-        without leaving the box. OK still commits via the form button.
+        without leaving the box.  In the new-cutscene name row Return creates
+        the cutscene.
         """
         key = event.key
         is_dialogue_text = (field_key == 'text' and self._form_type == 'dialogue')
 
-        if key in (pygame.K_TAB, pygame.K_ESCAPE):
+        if key == pygame.K_TAB:
             self._new_name_focus = False
             self._form_focus     = None
             self._actor_focus    = None
             return
-        if key == pygame.K_RETURN and not is_dialogue_text:
+        if key in (pygame.K_RETURN, pygame.K_KP_ENTER) and attr == '_new_name_buf':
+            self._submit_new_name()
+            return
+        if key in (pygame.K_RETURN, pygame.K_KP_ENTER) and not is_dialogue_text:
             self._new_name_focus = False
             self._form_focus     = None
             self._actor_focus    = None
@@ -1037,7 +1654,8 @@ class CutsceneEditor:
         if key == pygame.K_BACKSPACE:
             buf = buf[:-1]
             self._text_limit_hit = False
-        elif key == pygame.K_RETURN and is_dialogue_text:
+            self._list_msg = ''
+        elif key in (pygame.K_RETURN, pygame.K_KP_ENTER) and is_dialogue_text:
             # Hard line break — still subject to the dialogue box capacity.
             new_buf = buf + '\n'
             if (self.dialogue_box is not None
@@ -1048,7 +1666,13 @@ class CutsceneEditor:
             buf = new_buf
             self._text_limit_hit = False
         elif event.unicode and event.unicode.isprintable():
-            new_buf = buf + event.unicode
+            ch = event.unicode
+            if attr == '_new_name_buf':
+                # The name becomes a filename — keep it to characters every OS accepts.
+                if ch in '\\/:*?"<>|':
+                    return
+                self._list_msg = ''
+            new_buf = buf + ch
             if (is_dialogue_text
                     and self.dialogue_box is not None
                     and not self.dialogue_box.fits_box(
@@ -1072,7 +1696,7 @@ class CutsceneEditor:
 
     def _handle_duration_field(self, event):
         key = event.key
-        if key in (pygame.K_RETURN, pygame.K_TAB, pygame.K_ESCAPE):
+        if key in (pygame.K_RETURN, pygame.K_KP_ENTER, pygame.K_TAB, pygame.K_ESCAPE):
             self._commit_duration()
             self._duration_focus = False
             return
@@ -1087,7 +1711,7 @@ class CutsceneEditor:
             return
         try:
             val = float(self._duration_buf)
-            if val > 0:
+            if val > 0 and round(val, 2) != self.cutscene_data.get('duration'):
                 self._push_undo()
                 self.cutscene_data['duration'] = round(val, 2)
                 self.unsaved = True
@@ -1096,55 +1720,8 @@ class CutsceneEditor:
         # Re-sync buf to whatever is actually stored (rolls back bad input)
         self._duration_buf = str(self.cutscene_data.get('duration', 10.0))
 
-    def _scrub_to(self, t):
-        """Seek the scene to time *t*, creating a paused runtime if needed."""
-        if self._runtime is None and self.cutscene_data:
-            try:
-                from core.cutscene_runtime import CutsceneRuntime
-                self._runtime = CutsceneRuntime(
-                    self.cutscene_data, self.camera, self._entity_factory,
-                    dialogue_box=self.dialogue_box, sound_manager=self.sound_manager)
-            except Exception as e:
-                print(f'[CutsceneEditor] _scrub_to runtime error: {e}')
-                return
-        if self._runtime:
-            self._runtime.seek(t)
-            # Snap the editor camera directly to the camera_target world position.
-            # Don't call camera.update() here — that tweens, causing the camera to
-            # keep drifting after scrub ends. Instead set x/y directly.
-            from config.settings import RENDER_SCALE
-            import math
-            ct = self._runtime.camera_target
-            room = self._get_current_room()
-            w = (room.width  if room else 10000) * RENDER_SCALE
-            h = (room.height if room else 10000) * RENDER_SCALE
-            self.camera.x = ct.x * RENDER_SCALE - self.camera.screen_width  // 2
-            self.camera.y = ct.y * RENDER_SCALE - self.camera.screen_height // 2
-            self.camera.x = max(0, min(self.camera.x, w - self.camera.screen_width))
-            self.camera.y = max(0, min(self.camera.y, h - self.camera.screen_height))
-            # Scrub view is a static snapshot — clear any live shake that seek()
-            # may have applied (shake inside its window) so the camera doesn't
-            # wobble while the playhead is stationary.  A deterministic jitter
-            # offset is added below purely for the scrub preview frame.
-            self._runtime._clear_camera_shake()
-            # Apply a deterministic shake preview when the playhead is inside a
-            # shake window.  Uses the camera_target position (already set above)
-            # as the base; the jitter is overwritten on the next scrub call so it
-            # never bleeds into camera state or playback.
-            for _action in (self.cutscene_data or {}).get('actions', []):
-                if (_action.get('target') == 'camera'
-                        and _action.get('type') == 'shake'):
-                    _p    = _action.get('params', {})
-                    _end  = _action['time'] + _p.get('duration', 0.3)
-                    if _action['time'] <= t < _end:
-                        _i = _p.get('intensity', 8)
-                        self.camera.x += math.sin(t * 50.7) * _i
-                        self.camera.y += math.cos(t * 37.3) * _i
-                        break
-        self._tl_playhead_t = t
-
     def _on_mouse_motion(self, pos):
-        """Drag playhead when scrubbing; also keep mouse position for ghost previews."""
+        """Drag playhead when scrubbing; also keep mouse position for hover."""
         self._mouse_pos = pos
 
         if self._vp_drag:
@@ -1161,7 +1738,7 @@ class CutsceneEditor:
             actions = self.cutscene_data.get('actions', [])
             if self._kf_drag_idx < len(actions):
                 tl          = self._tl_panel_rect()
-                label_end_x = tl.x + _TL_LABEL_W
+                label_end_x = tl.x + self._tl_label_w
                 raw_t       = (pos[0] - label_end_x + self._tl_scroll_x) / self._tl_time_zoom
                 new_t       = raw_t + self._kf_drag_offset
                 dur         = self.cutscene_data.get('duration', 10.0)
@@ -1178,11 +1755,7 @@ class CutsceneEditor:
         if self._actor_drag_idx >= 0 and self.cutscene_data:
             actors = self.cutscene_data.get('actors', [])
             if self._actor_drag_idx < len(actors):
-                vp = self._vp_rect
-                vx = pos[0] - vp.x
-                vy = pos[1] - vp.y
-                wx = vx / (RENDER_SCALE * self._vp_zoom) + self.camera.x / RENDER_SCALE
-                wy = vy / (RENDER_SCALE * self._vp_zoom) + self.camera.y / RENDER_SCALE
+                wx, wy = self._mouse_world()
                 sx, sy = self._snap_actor_xy(wx + self._actor_drag_offset_x,
                                               wy + self._actor_drag_offset_y)
                 actors[self._actor_drag_idx]['x'] = sx
@@ -1195,7 +1768,7 @@ class CutsceneEditor:
             return
         tl = self._tl_panel_rect()
         mx = pos[0]
-        label_end_x = tl.x + _TL_LABEL_W
+        label_end_x = tl.x + self._tl_label_w
         t = (mx - label_end_x + self._tl_scroll_x) / self._tl_time_zoom
         dur = self.cutscene_data.get('duration', 10.0) if self.cutscene_data else 10.0
         # Update the playhead position instantly so it renders at the cursor
@@ -1209,7 +1782,7 @@ class CutsceneEditor:
         """Return px/sec scroll speed based on how close mouse_x is to the
         left/right edge of the timeline time area.  Positive = scroll right."""
         tl          = self._tl_panel_rect()
-        label_end_x = tl.x + _TL_LABEL_W
+        label_end_x = tl.x + self._tl_label_w
         edge_zone   = 60   # px from edge that triggers auto-scroll
         if mouse_x > tl.right - edge_zone:
             return ((mouse_x - (tl.right - edge_zone)) / edge_zone) * 400
@@ -1241,109 +1814,42 @@ class CutsceneEditor:
     def _cycle_tl_grid_interval(self):
         self._tl_grid_idx = (self._tl_grid_idx + 1) % len(self._tl_grid_intervals)
 
+    # ── Clicks ────────────────────────────────────────────────────────────────
+
     def _on_click(self, pos):
-        # Portrait dropdown: consume click before anything else
-        if self._portrait_dropdown_open:
-            if self._portrait_dropdown_rect and self._portrait_dropdown_rect.collidepoint(pos):
-                mx2, my2 = pos
-                item_h   = 22
-                rel_y    = my2 - self._portrait_dropdown_rect.y - 4
-                item_idx = rel_y // item_h
-                actual   = item_idx + self._portrait_dropdown_scroll
-                if 0 <= actual < len(self._portrait_dropdown_items):
-                    self._form_params['portrait'] = self._portrait_dropdown_items[actual]
-            self._portrait_dropdown_open = False
+        self._mouse_pos = pos
+
+        # Open dropdown swallows every click (pick an item, or dismiss).
+        if self._dd is not None:
+            self._click_dropdown(pos)
             return None
 
-        # Character dropdown: consume click before anything else
-        if self._character_dropdown_open:
-            if self._character_dropdown_rect and self._character_dropdown_rect.collidepoint(pos):
-                mx2, my2 = pos
-                item_h   = 22
-                rel_y    = my2 - self._character_dropdown_rect.y - 4
-                item_idx = rel_y // item_h
-                actual   = item_idx + self._character_dropdown_scroll
-                if 0 <= actual < len(self._character_dropdown_items):
-                    self._form_params['character'] = self._character_dropdown_items[actual]
-            self._character_dropdown_open = False
+        top = None
+        for rect, action, arg, full in reversed(self._hits):   # last drawn = on top
+            if rect.collidepoint(pos):
+                top = (full, action, arg)
+                break
+
+        # Clicking anywhere that isn't a text field takes focus off the fields.
+        # (The list view's new-name row is only ended by Enter / Esc.)
+        if not (top and top[1] == 'field'):
+            self._blur_text()
+
+        if top is not None:
+            if top[1] is not None:
+                return self._on_action(top[1], top[2], top[0])
             return None
-
-        # Costume dropdown: consume click before anything else
-        if self._costume_dropdown_open:
-            if self._costume_dropdown_rect and self._costume_dropdown_rect.collidepoint(pos):
-                mx2, my2 = pos
-                item_h   = 22
-                rel_y    = my2 - self._costume_dropdown_rect.y - 4
-                item_idx = rel_y // item_h
-                actual   = item_idx + self._costume_dropdown_scroll
-                if 0 <= actual < len(self._costume_dropdown_items):
-                    self._form_params['costume'] = self._costume_dropdown_items[actual]
-            self._costume_dropdown_open = False
-            return None
-
-        # Sound dropdown (music track / sfx name): consume click before anything else
-        if self._sound_dropdown_open:
-            if self._sound_dropdown_rect and self._sound_dropdown_rect.collidepoint(pos):
-                mx2, my2 = pos
-                item_h   = 22
-                rel_y    = my2 - self._sound_dropdown_rect.y - 4
-                item_idx = rel_y // item_h
-                actual   = item_idx + self._sound_dropdown_scroll
-                if 0 <= actual < len(self._sound_dropdown_items):
-                    self._form_params[self._sound_dropdown_field] = self._sound_dropdown_items[actual]
-            self._sound_dropdown_open = False
-            return None
-
-        # Actor asset-id dropdown (enemy/boss/npc id or player character):
-        # consume click before anything else
-        if self._etype_dropdown_open:
-            if self._etype_dropdown_rect and self._etype_dropdown_rect.collidepoint(pos):
-                mx2, my2 = pos
-                item_h   = 22
-                rel_y    = my2 - self._etype_dropdown_rect.y - 4
-                item_idx = rel_y // item_h
-                actual   = item_idx + self._etype_dropdown_scroll
-                if 0 <= actual < len(self._etype_dropdown_items):
-                    self._actor_etype_buf = self._etype_dropdown_items[actual]
-            self._etype_dropdown_open = False
-            return None
-
-        mx, my = pos
-
-        # Commit an in-progress duration edit when the user clicks elsewhere
-        if self._duration_focus:
-            dur_rect = self._btns.get('dur_field')
-            if not (dur_rect and dur_rect.collidepoint(mx, my)):
-                self._commit_duration()
-                self._duration_focus = False
-
-        if self.view == 'list':
-            tf = pygame.Rect(80, 125, self.screen_width - 280, 30)
-            if tf.collidepoint(mx, my):
-                self._new_name_focus = True
-                return None
-
-        for name, rect in self._btns.items():
-            if rect.collidepoint(mx, my):
-                return self._handle_btn(name)
 
         if self.view == 'edit':
-            if self._vp_rect.collidepoint(mx, my):
-                vx = mx - self._vp_rect.x
-                vy = my - self._vp_rect.y
-                # Correct world coords: viewport pixel → base-scale pixel (÷zoom), then → world (÷RS)
-                wx = vx / (RENDER_SCALE * self._vp_zoom) + self.camera.x / RENDER_SCALE
-                wy = vy / (RENDER_SCALE * self._vp_zoom) + self.camera.y / RENDER_SCALE
+            if self._vp_rect.collidepoint(pos):
+                wx, wy = self._mouse_world()
                 return self._on_viewport_click(wx, wy)
-
             tl = self._tl_panel_rect()
-            if tl.collidepoint(mx, my):
-                self._on_tl_click(mx, my, tl)
+            if tl.collidepoint(pos):
+                self._on_tl_click(pos[0], pos[1], tl)
                 return None
-
-        if self.view == 'list':
-            self._on_list_click(mx, my)
-
+        elif self.view == 'list':
+            self._list_sel = -1
         return None
 
     def _on_viewport_click(self, wx, wy):
@@ -1389,10 +1895,8 @@ class CutsceneEditor:
         # touching a fade_in/fade_out keyframe) creates/keeps a paused
         # CutsceneRuntime alive (see _scrub_to / _stop_preview) so playback
         # can resume instantly — that runtime staying around must NOT lock
-        # out actor dragging, or the only way to move an actor again is to
-        # leave and re-open the editor (which resets self._runtime to None
-        # in _load_cutscene). Hit-testing still uses each actor's stored
-        # spawn position (actor.get('x')/('y')) exactly as before.
+        # out actor dragging. Hit-testing still uses each actor's stored
+        # spawn position (actor.get('x')/('y')).
         if not self._playing and self.cutscene_data:
             actors = self.cutscene_data.get('actors', [])
             hit_radius = 20.0  # world-unit tolerance (≈ one sprite body)
@@ -1409,138 +1913,98 @@ class CutsceneEditor:
 
         return None
 
+    def _tl_geometry(self):
+        """(tl, label_end_x, ruler_y, tracks_y) for the timeline's inner rect."""
+        tl = self._tl_panel_rect()
+        ruler_y = tl.y + self._tl_hdr_h
+        return tl, tl.x + self._tl_label_w, ruler_y, ruler_y + self._tl_ruler_h
+
     def _on_tl_click(self, mx, my, tl):
-        """Handle clicks in the AE-style graphical timeline."""
-        content_top  = tl.y + _TL_HDR_H
-        ruler_bottom = content_top + _TL_RULER_H
-        label_end_x  = tl.x + _TL_LABEL_W
-        time_area_x  = label_end_x
+        """Handle clicks in the graphical timeline (ruler scrub, caret toggle,
+        keyframe select + drag)."""
+        _, label_end_x, ruler_y, tracks_y = self._tl_geometry()
+        time_area_x = label_end_x
+        row_h = self._tl_row_h
 
         # Click in ruler → start playhead drag
-        if content_top <= my < ruler_bottom and mx >= time_area_x:
+        if ruler_y <= my < tracks_y and mx >= time_area_x:
             t = (mx - time_area_x + self._tl_scroll_x) / self._tl_time_zoom
             dur = self.cutscene_data.get('duration', 10.0) if self.cutscene_data else 10.0
             self._scrub_to(_clamp(t, 0.0, dur))
             self._tl_play_drag  = True
             return
 
+        if my < tracks_y or not self.cutscene_data:
+            return
+
         # Click in a track row → find nearest keyframe on that track
         rows = self._tl_visible_rows()
         for i, row in enumerate(rows):
-            row_y = ruler_bottom + i * _TL_ROW_H - self._tl_scroll_y
-            if row_y <= my < row_y + _TL_ROW_H:
-                if not self.cutscene_data:
-                    return
+            row_y = tracks_y + i * row_h - self._tl_scroll_y
+            if not (row_y <= my < row_y + row_h):
+                continue
 
-                # Caret hit-test — only parent rows with >1 action type show
-                # one, and it lives in the label column left of the text.
-                # Handled before keyframe hit-testing so clicking the caret
-                # never also tries to select/drag whatever keyframe happens
-                # to be nearby in the time area.
-                if row['kind'] == 'parent' and row['expandable'] and mx < label_end_x:
+            # Label column: a parent row with >1 action type toggles its
+            # sub-lanes (caret or label — the whole cell is the target).
+            if mx < label_end_x:
+                if row['kind'] == 'parent' and row['expandable']:
                     target = row['target']
                     self._tl_expanded[target] = not self._tl_expanded.get(target, False)
-                    return
-
-                target      = row['target']
-                action_type = row['action_type']  # None for parent rows
-                all_actions = self.cutscene_data.get('actions', [])
-                best_idx   = -1
-                best_dist  = 12  # pixel hit tolerance
-                for ai, action in enumerate(all_actions):
-                    if action.get('target') != target:
-                        continue
-                    if action_type is not None and action.get('type') != action_type:
-                        continue
-                    kf_x = time_area_x + action['time'] * self._tl_time_zoom - self._tl_scroll_x
-                    dist = abs(mx - kf_x)
-                    if dist < best_dist:
-                        best_dist = dist
-                        best_idx  = ai
-
-                if best_idx >= 0:
-                    self._tl_sel = best_idx
-                    self._open_action_form(best_idx)
-                    # Begin drag — store the sub-pixel offset so the keyframe
-                    # doesn't jump on the very first motion event.
-                    clicked_t = (mx - time_area_x + self._tl_scroll_x) / self._tl_time_zoom
-                    self._push_undo()
-                    self._kf_drag_idx    = best_idx
-                    self._kf_drag_offset = all_actions[best_idx]['time'] - clicked_t
-                else:
-                    self._tl_sel      = -1
-                    self._kf_drag_idx = -1
-                    self._form_active = False
                 return
 
-    def _on_list_click(self, mx, my):
-        items_top = 200
-        row_h     = 38
-        for i, name in enumerate(self._files):
-            ry = items_top + i * row_h - self._list_scroll
-            r  = pygame.Rect(60, ry, self.screen_width - 120, row_h - 4)
-            if r.collidepoint(mx, my):
-                self._list_sel = i
-                return
+            target      = row['target']
+            action_type = row['action_type']  # None for parent rows
+            all_actions = self.cutscene_data.get('actions', [])
+            best_idx   = -1
+            best_dist  = 12  # pixel hit tolerance
+            for ai, action in enumerate(all_actions):
+                if action.get('target') != target:
+                    continue
+                if action_type is not None and action.get('type') != action_type:
+                    continue
+                kf_x = time_area_x + action['time'] * self._tl_time_zoom - self._tl_scroll_x
+                dist = abs(mx - kf_x)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_idx  = ai
+
+            if best_idx >= 0:
+                self._tl_sel = best_idx
+                self._open_action_form(best_idx)
+                # Begin drag — store the sub-pixel offset so the keyframe
+                # doesn't jump on the very first motion event.
+                clicked_t = (mx - time_area_x + self._tl_scroll_x) / self._tl_time_zoom
+                self._push_undo()
+                self._kf_drag_idx    = best_idx
+                self._kf_drag_offset = all_actions[best_idx]['time'] - clicked_t
+            else:
+                self._tl_sel      = -1
+                self._kf_drag_idx = -1
+                self._form_active = False
+            return
 
     def _on_scroll(self, event):
         dy = event.y
-        mx, my = pygame.mouse.get_pos()
+        mx, my = self._mouse_pos
 
-        # Portrait dropdown scroll — consumed before any other handler so
-        # scrolling inside the dropdown never also zooms/pans the viewport.
-        if (self._portrait_dropdown_open and self._portrait_dropdown_rect
-                and self._portrait_dropdown_rect.collidepoint(mx, my)):
-            max_scroll = max(0, len(self._portrait_dropdown_items) - 8)
-            self._portrait_dropdown_scroll = max(0, min(max_scroll,
-                self._portrait_dropdown_scroll - dy))
-            return
-
-        # Character dropdown scroll — same deal.
-        if (self._character_dropdown_open and self._character_dropdown_rect
-                and self._character_dropdown_rect.collidepoint(mx, my)):
-            max_scroll = max(0, len(self._character_dropdown_items) - 8)
-            self._character_dropdown_scroll = max(0, min(max_scroll,
-                self._character_dropdown_scroll - dy))
-            return
-
-        # Costume dropdown scroll — same deal.
-        if (self._costume_dropdown_open and self._costume_dropdown_rect
-                and self._costume_dropdown_rect.collidepoint(mx, my)):
-            max_scroll = max(0, len(self._costume_dropdown_items) - 8)
-            self._costume_dropdown_scroll = max(0, min(max_scroll,
-                self._costume_dropdown_scroll - dy))
-            return
-
-        # Sound dropdown scroll — same deal.
-        if (self._sound_dropdown_open and self._sound_dropdown_rect
-                and self._sound_dropdown_rect.collidepoint(mx, my)):
-            max_scroll = max(0, len(self._sound_dropdown_items) - 8)
-            self._sound_dropdown_scroll = max(0, min(max_scroll,
-                self._sound_dropdown_scroll - dy))
-            return
-
-        # Actor asset-id dropdown scroll — same deal.
-        if (self._etype_dropdown_open and self._etype_dropdown_rect
-                and self._etype_dropdown_rect.collidepoint(mx, my)):
-            max_scroll = max(0, len(self._etype_dropdown_items) - 8)
-            self._etype_dropdown_scroll = max(0, min(max_scroll,
-                self._etype_dropdown_scroll - dy))
+        # Open dropdown owns the wheel (scrolls its own list, never the viewport)
+        if self._dd is not None:
+            rect = self._dd.get('rect')
+            if rect is not None and rect.collidepoint(mx, my):
+                max_scroll = max(0, len(self._dd['items']) - self._dd['visible'])
+                self._dd['scroll'] = int(_clamp(self._dd['scroll'] - dy, 0, max_scroll))
             return
 
         if self.view == 'list':
-            self._list_scroll = _clamp(self._list_scroll - dy * 20, 0, 9999)
+            self._list_scroll = _clamp(self._list_scroll - dy * 40, 0, 99999)
             return
 
         # ── Viewport scroll → zoom (no modifier needed) ───────────────────────
-        if self.view == 'edit' and self._vp_rect.collidepoint(mx, my):
+        if self._vp_rect.collidepoint(mx, my):
             # Keep the world point under the mouse fixed as we zoom
             vx = mx - self._vp_rect.x
             vy = my - self._vp_rect.y
-            # World coords of the mouse cursor before zoom (correct formula)
-            pivot_wx = vx / (RENDER_SCALE * self._vp_zoom) + self.camera.x / RENDER_SCALE
-            pivot_wy = vy / (RENDER_SCALE * self._vp_zoom) + self.camera.y / RENDER_SCALE
-            # Apply zoom
+            pivot_wx, pivot_wy = self._mouse_world()
             self._vp_zoom = _clamp(
                 self._vp_zoom * (1.12 ** dy),
                 self._vp_zoom_min, self._vp_zoom_max)
@@ -1551,143 +2015,127 @@ class CutsceneEditor:
             return
 
         # ── Timeline scroll ────────────────────────────────────────────────────
-        tl = self._tl_panel_rect()
-        if tl.collidepoint(mx, my):
+        tl, label_end_x, ruler_y, tracks_y = self._tl_geometry()
+        if self._tl_frame.collidepoint(mx, my):
             keys = pygame.key.get_pressed()
             if keys[pygame.K_LCTRL] or keys[pygame.K_RCTRL]:
-                pivot_t = (mx - tl.x - _TL_LABEL_W + self._tl_scroll_x) / self._tl_time_zoom
+                pivot_t = (mx - label_end_x + self._tl_scroll_x) / self._tl_time_zoom
                 self._tl_time_zoom = _clamp(
                     self._tl_time_zoom * (1.12 ** dy),
                     self._tl_zoom_min, self._tl_zoom_max)
-                self._tl_scroll_x = pivot_t * self._tl_time_zoom - (mx - tl.x - _TL_LABEL_W)
+                self._tl_scroll_x = pivot_t * self._tl_time_zoom - (mx - label_end_x)
                 self._tl_scroll_x = max(0.0, self._tl_scroll_x)
             elif keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]:
                 self._tl_scroll_x = max(0.0, self._tl_scroll_x - dy * 30)
             else:
-                # Vertical scroll through the track list — this was missing
-                # entirely, so with more tracks than fit in the panel
-                # (4 fixed tracks + one per actor) there was no way to
-                # reach the rows below the visible area.
-                visible_h    = tl.height - _TL_HDR_H - _TL_RULER_H
-                content_h    = len(self._tl_visible_rows()) * _TL_ROW_H
+                # Vertical scroll through the track list.
+                visible_h    = tl.bottom - tracks_y
+                content_h    = len(self._tl_visible_rows()) * self._tl_row_h
                 max_scroll_y = max(0.0, content_h - visible_h)
                 self._tl_scroll_y = _clamp(
-                    self._tl_scroll_y - dy * _TL_ROW_H, 0.0, max_scroll_y)
+                    self._tl_scroll_y - dy * self._tl_row_h, 0.0, max_scroll_y)
+            return
 
-        lp = self._left_panel_rect()
-        if lp.collidepoint(mx, my):
-            self._left_scroll = _clamp(
-                getattr(self, '_left_scroll', 0) - dy * 20, 0, 9999)
+        if self._left_frame.collidepoint(mx, my):
+            self._left_scroll = _clamp(self._left_scroll - dy * 30, 0, 99999)
+        elif self._right_frame.collidepoint(mx, my):
+            self._insp_scroll = _clamp(self._insp_scroll - dy * 30, 0, 99999)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Button handler
+    # Action dispatcher — every clickable widget registers (rect, action, arg)
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _handle_btn(self, name):
-        """Dispatch a named button click.
+    def _on_action(self, action, arg, rect):
+        # ── Text-field focus ──────────────────────────────────────────────────
+        if action == 'field':
+            kind, key = arg
+            self._blink = 0.0
+            if kind == 'form':
+                self._form_focus, self._actor_focus = key, None
+            elif kind == 'actor':
+                self._actor_focus, self._form_focus = key, None
+            elif kind == 'new_name':
+                self._new_name_focus = True
+            elif kind == 'duration':
+                if self.cutscene_data:
+                    self._duration_buf   = str(self.cutscene_data.get('duration', 10.0))
+                    self._duration_focus = True
+                    self._form_focus     = None
+                    self._actor_focus    = None
+            return
 
-        Every clickable rect registers itself in self._btns during draw().
-        _on_click() looks up the hit rect's name and calls this method.
-        All branches return None so callers can always forward the return value.
-        """
-        # ── Text-field clicks — the field registered its own metadata ──────────
-        # _field_meta maps the field's btn name → (form_key, actor_key) so we
-        # know which buffer to route keyboard events to.
-        if name.startswith('_field_'):
-            meta = self._field_meta.get(name, (None, None))
-            form_key, actor_key = meta
-            if form_key == 'time':
-                self._form_focus  = 'time'
-                self._actor_focus = None
-            elif form_key:
-                self._form_focus  = form_key
-                self._actor_focus = None
-            elif actor_key:
-                self._actor_focus = actor_key
-                self._form_focus  = None
-            return None
-
-        if name == 'close':
+        # ── Global / header ───────────────────────────────────────────────────
+        if action == 'close':
+            # List view's back arrow — the Dev Menu closed itself when it
+            # launched this editor (see DevMenu._activate_selected), so
+            # signal the game loop to reopen it instead of just vanishing
+            # into gameplay. Mirrors every other dev-tools editor's
+            # 'back_to_dev_menu' convention.
             self.toggle()
-            return None
-
-        if name == 'list_new':
-            n = self._new_name_buf.strip()
-            if not n:
-                self._list_msg = 'Enter a name first.'
-                return None
-            if os.path.exists(_cutscene_path(n)):
-                self._list_msg = 'A cutscene with that name already exists.'
-                return None
-            self._create_and_open(n)
-            return None
-
-        if name == 'list_open':
-            if 0 <= self._list_sel < len(self._files):
-                self._load_cutscene(self._files[self._list_sel])
-            return None
-
-        if name == 'list_delete':
-            if 0 <= self._list_sel < len(self._files):
-                path = _cutscene_path(self._files[self._list_sel])
-                if os.path.exists(path):
-                    os.remove(path)
-                self._refresh_file_list()
-                self._list_sel = -1
-            return None
-
-        if name == 'back':
-            if self._playing:
-                self._stop_preview()
-            if self.unsaved:
-                # _save_cutscene internally calls _save_viewport_state too
-                self._save_cutscene()
-            else:
-                self._save_viewport_state()
-            self.view = 'list'
-            self._refresh_file_list()
-            return None
-
-        if name == 'save':
+            return 'back_to_dev_menu'
+        elif action == 'back':
+            self._leave_edit()
+        elif action == 'save':
             self._save_cutscene()
-            return None
-
-        if name == 'dur_field':
-            # Open the inline duration editor in the top bar
-            if self.cutscene_data:
-                self._duration_buf   = str(self.cutscene_data.get('duration', 10.0))
-                self._duration_focus = True
-                self._form_focus     = None
-                self._actor_focus    = None
-            return None
-
-        if name == 'play':
+        elif action == 'play':
             if self._playing:
                 self._stop_preview()
             else:
                 self._start_preview()
-            return None
+        elif action == 'undo':
+            self._undo()
+        elif action == 'redo':
+            self._redo()
+        elif action == 'grid_toggle':
+            self._show_grid = not self._show_grid
 
-        if name == 'room_prev':
+        # ── List view ─────────────────────────────────────────────────────────
+        elif action == 'list_open':
+            self._load_cutscene(arg)
+        elif action == 'list_new_start':
+            self._new_name_focus = True
+            self._new_name_buf   = ''
+            self._list_msg       = ''
+            self._list_confirm   = None
+            self._list_scroll    = 99999   # clamped in draw → jump to the new row
+            self._blink          = 0.0
+        elif action == 'list_delete_ask':
+            self._list_confirm = arg
+        elif action == 'list_delete_no':
+            self._list_confirm = None
+        elif action == 'list_delete_yes':
+            path = _cutscene_path(arg)
+            if os.path.exists(path):
+                os.remove(path)
+            self._list_confirm = None
+            self._list_sel = -1
+            self._refresh_file_list()
+
+        # ── Scene panel ───────────────────────────────────────────────────────
+        elif action == 'room_prev':
             self._cycle_room(-1)
-            return None
-        if name == 'room_next':
+        elif action == 'room_next':
             self._cycle_room(1)
-            return None
-
-        if name == 'actor_add':
+        elif action == 'room_pick':
+            rooms = [r.name for r in self.room_manager.rooms
+                     if not getattr(r, 'is_transient', False)]
+            self._open_dropdown(rect, rooms, self.cutscene_data.get('room', ''),
+                                self._pick_scene_room, accent=_ROOM_COLOR,
+                                empty='No rooms loaded')
+        elif action == 'actor_row':
+            # Selecting an actor row clears the inspector form
+            self._actor_sel   = arg
+            self._form_active = False
+        elif action == 'actor_add':
             # Pre-fill the actor form with a sensible default ID
-            self._actor_form      = True
-            self._actor_focus     = None
-            self._actor_id_buf    = f'actor_{len(self.cutscene_data["actors"])}'
+            self._actor_form   = True
+            self._actor_focus  = None
+            self._actor_id_buf = f'actor_{len(self.cutscene_data["actors"])}'
             self._sync_actor_etype_default()
-            return None
-
-        if name == 'actor_etype_dropdown':
-            self._open_etype_dropdown(name)
-            return None
-
-        if name == 'actor_del':
+        elif action == 'actor_form_close':
+            self._actor_form = False
+            self._actor_focus = None
+        elif action == 'actor_del':
             actors = self.cutscene_data.get('actors', [])
             if 0 <= self._actor_sel < len(actors):
                 rid = actors[self._actor_sel]['id']
@@ -1700,22 +2148,31 @@ class CutsceneEditor:
                 ]
                 self._actor_entities.pop(rid, None)  # drop cached sprite
                 self._actor_sel = -1
+                self._tl_sel    = -1
+                self._form_active = False
                 self.unsaved    = True
                 self._runtime   = None  # runtime.actors is stale; force full rebuild
-            return None
-
-        if name == 'actor_snap_toggle':
+        elif action == 'actor_snap_toggle':
             self._actor_snap_enabled = not self._actor_snap_enabled
-            return None
-        if name == 'actor_snap_size':
+        elif action == 'actor_snap_size':
             self._cycle_actor_snap_size()
-            return None
-
-        if name == 'actor_place_confirm':
+        elif action in ('actor_type_prev', 'actor_type_next'):
+            step = -1 if action.endswith('prev') else 1
+            self._actor_type_idx = (self._actor_type_idx + step) % len(_ACTOR_TYPES)
+            self._sync_actor_etype_default()
+        elif action == 'actor_type_pick':
+            self._open_dropdown(rect, list(_ACTOR_TYPES),
+                                _ACTOR_TYPES[self._actor_type_idx % len(_ACTOR_TYPES)],
+                                self._pick_actor_type, accent=_ROOM_COLOR)
+        elif action == 'actor_etype_pick':
+            atype = _ACTOR_TYPES[self._actor_type_idx % len(_ACTOR_TYPES)]
+            self._open_dropdown(rect, self._actor_asset_ids(atype), self._actor_etype_buf,
+                                self._pick_actor_etype, accent=_ROOM_COLOR,
+                                empty='None found in entity catalogue')
+        elif action == 'actor_place_confirm':
             # Build the actor def and enter pick mode so the next viewport
             # click sets the spawn position.
-            atype_names = ['enemy', 'boss', 'npc', 'player']
-            atype = atype_names[self._actor_type_idx % len(atype_names)]
+            atype = _ACTOR_TYPES[self._actor_type_idx % len(_ACTOR_TYPES)]
             actor_def = {
                 'id':      self._actor_id_buf.strip() or f'actor_{len(self.cutscene_data["actors"])}',
                 'type':    atype,
@@ -1728,28 +2185,11 @@ class CutsceneEditor:
                 actor_def['character'] = self._actor_etype_buf.strip()
             self._place_actor_def = actor_def
             self._pick_mode = 'pick_actor'
-            return None
 
-        if name == 'actor_type_prev':
-            self._actor_type_idx = (self._actor_type_idx - 1) % 4
-            self._sync_actor_etype_default()
-            return None
-        if name == 'actor_type_next':
-            self._actor_type_idx = (self._actor_type_idx + 1) % 4
-            self._sync_actor_etype_default()
-            return None
-
-        if name.startswith('actor_row_'):
-            # Selecting an actor row in the left panel clears the inspector form
-            self._actor_sel   = int(name.split('_')[-1])
-            self._form_active = False
-            return None
-
-        if name == 'tl_add':
+        # ── Timeline toolbar ──────────────────────────────────────────────────
+        elif action == 'tl_add':
             self._open_new_action_form()
-            return None
-
-        if name == 'tl_del':
+        elif action == 'tl_del':
             actions = self.cutscene_data.get('actions', [])
             if 0 <= self._tl_sel < len(actions):
                 self._push_undo()
@@ -1757,12 +2197,10 @@ class CutsceneEditor:
                 self._tl_sel      = _clamp(self._tl_sel - 1, -1, len(actions) - 1)
                 self._form_active = False
                 self.unsaved      = True
-            return None
-
-        if name == 'tl_dup':
+                self._runtime     = None
+        elif action == 'tl_dup':
             actions = self.cutscene_data.get('actions', [])
             if 0 <= self._tl_sel < len(actions):
-                import copy
                 self._push_undo()
                 dup = copy.deepcopy(actions[self._tl_sel])
                 # Nudge the duplicate forward 0.1 s so it doesn't sit on top
@@ -1771,85 +2209,83 @@ class CutsceneEditor:
                 actions.append(dup)
                 actions.sort(key=lambda a: a['time'])
                 self.unsaved = True
-            return None
+                self._runtime = None
+        elif action == 'tl_zoom_in':
+            self._tl_time_zoom = min(self._tl_zoom_max, self._tl_time_zoom * 1.25)
+        elif action == 'tl_zoom_out':
+            self._tl_time_zoom = max(self._tl_zoom_min, self._tl_time_zoom / 1.25)
+        elif action == 'tl_grid_toggle':
+            self._tl_grid_enabled = not self._tl_grid_enabled
+        elif action == 'tl_grid_interval':
+            self._cycle_tl_grid_interval()
+        elif action == 'vp_zoom_reset':
+            self._vp_zoom = 1.0
 
-        if name == 'form_target_prev':
-            self._cycle_form_target(-1)
-            return None
-        if name == 'form_target_next':
-            self._cycle_form_target(1)
-            return None
-        if name == 'form_type_prev':
-            self._cycle_form_type(-1)
-            return None
-        if name == 'form_type_next':
-            self._cycle_form_type(1)
-            return None
-
-        if name == 'form_commit':
+        # ── Inspector ─────────────────────────────────────────────────────────
+        elif action == 'form_commit':
             self._commit_form()
             self._stop_preview_sound()
-            return None
-        if name == 'form_cancel':
+            self._runtime = None
+        elif action == 'form_cancel':
             self._form_active = False
             self._form_focus  = None
             self._stop_preview_sound()
-            return None
-
-        if name in ('pick_pan_to', 'pick_snap_to', 'pick_move_to', 'pick_fly_to',
-                    'pick_teleport', 'pick_pan_to_start', 'pick_attack_target'):
-            # Enter pick mode — the next viewport click writes coords into the form
-            self._pick_mode = name
-            return None
-
-        if name.startswith('cycle_'):
-            if name == 'cycle_portrait':
-                self._open_portrait_dropdown(name)
-                return None
-            if name == 'cycle_character':
-                self._open_character_dropdown(name)
-                return None
-            if name == 'cycle_costume':
-                self._open_costume_dropdown(name)
-                return None
-            if name == 'cycle_track':
-                self._open_sound_dropdown('track', name)
-                return None
-            if name == 'cycle_sfx':
-                self._open_sound_dropdown('sfx', name)
-                return None
-            self._cycle_dropdown(name)
-            return None
-
-        if name in ('room_group_prev', 'room_group_next'):
-            self._cycle_room_group(-1 if name.endswith('prev') else 1)
-            return None
-        if name in ('room_name_prev', 'room_name_next'):
-            self._cycle_room_in_group(-1 if name.endswith('prev') else 1)
-            return None
-
-        if name == 'preview_sound':
+        elif action == 'form_target_prev':
+            self._cycle_form_target(-1)
+        elif action == 'form_target_next':
+            self._cycle_form_target(1)
+        elif action == 'form_target_pick':
+            self._open_dropdown(rect, self._form_targets(), self._form_target,
+                                self._pick_form_target, accent=self._target_color(self._form_target),
+                                color_fn=self._target_color)
+        elif action == 'form_type_prev':
+            self._cycle_form_type(-1)
+        elif action == 'form_type_next':
+            self._cycle_form_type(1)
+        elif action == 'form_type_pick':
+            self._open_dropdown(rect, self._form_type_pool(), self._form_type,
+                                self._pick_form_type, accent=self._target_color(self._form_target),
+                                label_fn=lambda v: v.replace('_', ' '))
+        elif action in _PICK_ACTIONS:
+            self._pick_mode = action
+        elif action == 'pick':
+            # Toggle: clicking the armed button again cancels the pick.
+            self._pick_mode = None if self._pick_mode == arg else arg
+        elif action == 'param_prev':
+            self._cycle_param(arg[0], arg[1], -1)
+        elif action == 'param_next':
+            self._cycle_param(arg[0], arg[1], 1)
+        elif action == 'param_pick':
+            key, hint = arg
+            pool = self._param_pool(key, hint)
+            if pool is not None:
+                items, label_fn, empty, color_fn = pool
+                self._open_dropdown(rect, items, self._form_params.get(key, ''),
+                                    lambda v, k=key: self._form_params.__setitem__(k, v),
+                                    label_fn=label_fn, empty=empty, color_fn=color_fn,
+                                    accent=self._target_color(self._form_target))
+        elif action == 'param_toggle':
+            cur = self._form_params.get(arg, 'True')
+            self._form_params[arg] = 'False' if cur == 'True' else 'True'
+        elif action in ('room_group_prev', 'room_group_next'):
+            self._cycle_room_group(-1 if action.endswith('prev') else 1)
+        elif action in ('room_name_prev', 'room_name_next'):
+            self._cycle_room_in_group(-1 if action.endswith('prev') else 1)
+        elif action == 'room_group_pick':
+            groups = [''] + list(self.room_manager.groups)
+            self._open_dropdown(rect, groups, self._form_room_group,
+                                self._pick_room_group, accent=_ROOM_COLOR,
+                                label_fn=lambda v: v or 'All Groups')
+        elif action == 'room_name_pick':
+            rooms = self._rooms_for_group(self._form_room_group)
+            self._open_dropdown(rect, rooms, self._form_params.get('room_name', ''),
+                                lambda v: self._form_params.__setitem__('room_name', v),
+                                accent=_ROOM_COLOR, empty='No rooms in this group')
+        elif action == 'preview_sound':
             self._preview_sound()
-            return None
-
-        # ── Timeline zoom buttons ──────────────────────────────────────────────
-        if name == 'tl_zoom_in':
-            self._tl_time_zoom = min(self._tl_zoom_max, self._tl_time_zoom * 1.25)
-            return None
-        if name == 'tl_zoom_out':
-            self._tl_time_zoom = max(self._tl_zoom_min, self._tl_time_zoom / 1.25)
-            return None
-        if name == 'tl_grid_toggle':
-            self._tl_grid_enabled = not self._tl_grid_enabled
-            return None
-        if name == 'tl_grid_interval':
-            self._cycle_tl_grid_interval()
-            return None
-        if name == 'vp_zoom_reset':
-            self._vp_zoom = 1.0
-            return None
-
-        return None
+        elif action == 'summary_edit':
+            if self.cutscene_data and 0 <= self._tl_sel < len(self.cutscene_data.get('actions', [])):
+                self._open_action_form(self._tl_sel)
 
     # ══════════════════════════════════════════════════════════════════════════
     # Form helpers
@@ -1948,44 +2384,150 @@ class CutsceneEditor:
         self._form_type = pool[(idx + delta) % len(pool)]
         self._reset_form_params()
 
-    def _place_dropdown_rect(self, btn_rect, pop_w, pop_h):
-        """Return the popup Rect for a field dropdown, anchored under
-        *btn_rect* like before, but clamped so it can never spill past the
-        bottom of the window and — critically — never past the top edge of
-        the timeline panel (screen_height - _BOTTOM_H).
 
-        Without this, a field low in a long/tall form (e.g. the actor-add
-        form once several actor tracks have pushed it down, or any action
-        form field near the bottom of the inspector) would open its dropdown
-        at btn_rect.bottom + 2 regardless of where that lands, and since
-        dropdowns are drawn last (on top of everything, including the
-        timeline), the popup would visibly cover the timeline. If it doesn't
-        fit below, flip it to open upward from the button instead.
-        """
-        safe_bottom = self.screen_height - _BOTTOM_H
-        if btn_rect.bottom + 2 + pop_h <= safe_bottom:
-            y = btn_rect.bottom + 2
+    def _form_targets(self):
+        actors = self.cutscene_data.get('actors', []) if self.cutscene_data else []
+        return list(_TARGET_FIXED) + [a['id'] for a in actors]
+
+    def _form_type_pool(self):
+        if self._form_target == 'camera':
+            return list(_CAMERA_ACTIONS)
+        if self._form_target == 'screen':
+            return list(_SCREEN_ACTIONS)
+        if self._form_target == 'room':
+            return list(_ROOM_ACTIONS)
+        if self._form_target == 'sound':
+            return list(_SOUND_ACTIONS)
+        return list(_ACTOR_ACTIONS)
+
+    def _target_color(self, target):
+        """Track colour for a target id — fixed tracks have their own, actors
+        take their slot in the palette (same order the timeline uses)."""
+        fixed = {'camera': _CAMERA_COLOR, 'screen': _SCREEN_COLOR,
+                 'room': _ROOM_COLOR, 'sound': _SOUND_COLOR}
+        if target in fixed:
+            return fixed[target]
+        actors = self.cutscene_data.get('actors', []) if self.cutscene_data else []
+        for i, a in enumerate(actors):
+            if a.get('id') == target:
+                return _ACTOR_COLORS[i % len(_ACTOR_COLORS)]
+        return uk.Theme.GOLD
+
+    # ── Dropdown callbacks (the one shared dropdown calls these on pick) ─────
+
+    def _apply_form_target(self, target):
+        """Pick a target directly (the old editor could only step through them
+        with < >) and reset the action type to that target's first type."""
+        targets = self._form_targets()
+        self._form_target_idx = targets.index(target) if target in targets else 0
+        self._form_target = targets[self._form_target_idx]
+        default = {'camera': 'pan_to', 'screen': 'fade_in',
+                   'room': 'change_room', 'sound': 'play_music'}.get(self._form_target, 'set_animation')
+        self._set_form_type(default)
+
+    def _pick_form_target(self, target):
+        self._apply_form_target(target)
+
+    def _pick_form_type(self, atype):
+        self._form_type = atype
+        self._reset_form_params()
+
+    def _pick_actor_type(self, atype):
+        if atype in _ACTOR_TYPES:
+            self._actor_type_idx = _ACTOR_TYPES.index(atype)
+            self._sync_actor_etype_default()
+
+    def _pick_actor_etype(self, value):
+        self._actor_etype_buf = value
+
+    def _pick_room_group(self, group):
+        self._form_room_group = group
+        rooms = self._rooms_for_group(group)
+        self._form_params['room_name'] = rooms[0] if rooms else ''
+
+    # ── Enum-style params ─────────────────────────────────────────────────────
+    # The old editor dispatched on the param *key* (state, loop, fade_in, …) in
+    # _cycle_dropdown and had a separate popup for portrait / character /
+    # costume / track / sfx.  Everything now goes through _param_pool(), keyed
+    # on the type *hint* from _ACTION_PARAMS, and picked either with the < >
+    # steppers or the shared dropdown.  (Dispatching on the hint also fixes
+    # stop_music's Fade Out toggle, which the key-based lookup never matched.)
+
+    @staticmethod
+    def _empty_label(hint):
+        if hint == 'portrait':
+            return 'narrator'
+        if hint in ('music_track', 'sfx_name'):
+            return '(none)'
+        return 'auto'
+
+    def _param_pool(self, key, hint):
+        """(items, label_fn, empty_text, swatch_fn) for an enum-style param, or
+        None for free-text / numeric / bool params."""
+        empty_lbl = self._empty_label(hint)
+        label_fn = lambda v: v if v != '' else empty_lbl
+
+        if hint == 'anim':
+            actor_def = None
+            if self._form_target not in _TARGET_FIXED:
+                for a in (self.cutscene_data or {}).get('actors', []):
+                    if a['id'] == self._form_target:
+                        actor_def = a
+                        break
+            return self._get_actor_anim_states(actor_def), label_fn, 'No animations found', None
+        if hint == 'scroll_dir':
+            return (['right', 'left', 'down', 'up', 'down_right', 'down_left', 'up_right', 'up_left'],
+                    label_fn, None, None)
+        if hint == 'dir':
+            # For move_to / fly_to the first slot is '' (auto-derive from the
+            # movement vector).  For all other actions direction is explicit.
+            if self._form_type in ('move_to', 'fly_to'):
+                return ['', 'down', 'up', 'left', 'right'], label_fn, None, None
+            return list(_DIRECTIONS), label_fn, None, None
+        if hint == 'invert_mode':
+            return list(_INVERT_MODES), label_fn, None, None
+        if hint == 'attack_type':
+            return list(discover_attacks() or _ATTACK_TYPES), label_fn, None, None
+        if hint == 'weather_type':
+            try:
+                files = sorted(glob.glob(os.path.join('assets', 'weather', '*.png')))
+                pool = [os.path.splitext(os.path.basename(f))[0] for f in files]
+            except Exception:
+                pool = []
+            return (pool or ['rain', 'snow', 'fog']), label_fn, None, None
+        if hint == 'color':
+            return list(_COLOR_PRESETS.keys()), label_fn, None, (lambda v: _COLOR_PRESETS.get(v))
+        if hint == 'portrait':
+            # '' (shown as "narrator") = no face art — full-width text box.
+            files = sorted(glob.glob(os.path.join('assets', 'portraits', '*.png')))
+            return [''] + [os.path.splitext(os.path.basename(f))[0] for f in files], label_fn, None, None
+        if hint == 'character':
+            return self._discover_player_characters(), label_fn, 'No characters found in assets/sprites/player/', None
+        if hint == 'costume':
+            return self._discover_costumes_for_actor(self._form_target), label_fn, 'No costumes found for this actor', None
+        if hint == 'music_track':
+            return self._available_music_tracks(), label_fn, 'No music tracks loaded', None
+        if hint == 'sfx_name':
+            return self._available_sfx_names(), label_fn, 'No sound effects loaded', None
+        return None
+
+    def _cycle_param(self, key, hint, delta):
+        pool = self._param_pool(key, hint)
+        if pool is None or not pool[0]:
+            return
+        items = pool[0]
+        cur = self._form_params.get(key, '')
+        if cur in items:
+            new = items[(items.index(cur) + delta) % len(items)]
         else:
-            # Not enough room below — open upward instead.
-            y = max(0, btn_rect.top - 2 - pop_h)
-        x = _clamp(btn_rect.x, 0, max(0, self.screen_width - pop_w))
-        return pygame.Rect(x, y, pop_w, pop_h)
+            new = items[0] if delta > 0 else items[-1]
+        self._form_params[key] = new
 
-    def _open_portrait_dropdown(self, btn_name):
-        import os, glob
-        portraits_dir = os.path.join('assets', 'portraits')
-        files = sorted(glob.glob(os.path.join(portraits_dir, '*.png')))
-        keys  = [''] + [os.path.splitext(os.path.basename(f))[0] for f in files]
-        self._portrait_dropdown_items  = keys
-        self._portrait_dropdown_scroll = 0
-        btn_rect = self._btns.get(btn_name)
-        if btn_rect:
-            item_h  = 22
-            visible = min(8, len(keys))
-            pop_h   = visible * item_h + 8
-            pop_w   = max(btn_rect.width, 160)
-            self._portrait_dropdown_rect = self._place_dropdown_rect(btn_rect, pop_w, pop_h)
-        self._portrait_dropdown_open = True
+
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Asset discovery / sound preview
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _discover_player_characters(self):
         """Return every player character ID, one sub-folder per character
@@ -2003,23 +2545,6 @@ class CutsceneEditor:
     def _default_character(self):
         chars = self._discover_player_characters()
         return chars[0] if chars else 'goku'
-
-    def _open_character_dropdown(self, btn_name):
-        """Popup list of every discovered player character, used by the
-        'character' param of the set_character action (see _ACTION_PARAMS).
-        Mirrors _open_portrait_dropdown(), minus the blank '(none)' entry —
-        a set_character action always needs a real character to switch to."""
-        keys = self._discover_player_characters()
-        self._character_dropdown_items  = keys
-        self._character_dropdown_scroll = 0
-        btn_rect = self._btns.get(btn_name)
-        if btn_rect:
-            item_h  = 22
-            visible = min(8, len(keys))
-            pop_h   = visible * item_h + 8
-            pop_w   = max(btn_rect.width, 160)
-            self._character_dropdown_rect = self._place_dropdown_rect(btn_rect, pop_w, pop_h)
-        self._character_dropdown_open = True
 
     def _discover_costumes_for_actor(self, actor_id: str) -> list:
         """Return the costume folder names for the character currently used by
@@ -2085,21 +2610,6 @@ class CutsceneEditor:
                 costumes.append(entry.name)
         return costumes if costumes else ['base']
 
-    def _open_costume_dropdown(self, btn_name):
-        """Popup list of costumes for the currently targeted actor, used by the
-        'costume' param of the set_costume action (see _ACTION_PARAMS)."""
-        keys = self._discover_costumes_for_actor(self._form_target)
-        self._costume_dropdown_items  = keys
-        self._costume_dropdown_scroll = 0
-        btn_rect = self._btns.get(btn_name)
-        if btn_rect:
-            item_h  = 22
-            visible = min(8, len(keys))
-            pop_h   = visible * item_h + 8
-            pop_w   = max(btn_rect.width, 160)
-            self._costume_dropdown_rect = self._place_dropdown_rect(btn_rect, pop_w, pop_h)
-        self._costume_dropdown_open = True
-
     def _actor_asset_ids(self, atype):
         """Return the placeable ids for the actor-add form's current Type.
 
@@ -2118,23 +2628,6 @@ class CutsceneEditor:
         # 'enemy' — regular enemies only; bosses have their own Type entry.
         bosses = set(discover_boss_ids())
         return [eid for eid in discover_enemy_ids() if eid not in bosses]
-
-    def _open_etype_dropdown(self, btn_name):
-        """Popup list of valid asset ids for the actor-add form's Type
-        selection (see _actor_asset_ids), replacing manual id typing."""
-        atype_names = ['enemy', 'boss', 'npc', 'player']
-        atype = atype_names[self._actor_type_idx % len(atype_names)]
-        keys = self._actor_asset_ids(atype)
-        self._etype_dropdown_items  = keys
-        self._etype_dropdown_scroll = 0
-        btn_rect = self._btns.get(btn_name)
-        if btn_rect:
-            item_h  = 22
-            visible = min(8, len(keys))
-            pop_h   = visible * item_h + 8
-            pop_w   = max(btn_rect.width, 160)
-            self._etype_dropdown_rect = self._place_dropdown_rect(btn_rect, pop_w, pop_h)
-        self._etype_dropdown_open = True
 
     def _sync_actor_etype_default(self):
         """Reset the actor-add form's etype buffer to the first id available
@@ -2168,22 +2661,6 @@ class CutsceneEditor:
         if sm is None or getattr(sm, 'sound_engine', None) is None:
             return []
         return sorted(sm.sound_engine.sound_effects.keys())
-
-    def _open_sound_dropdown(self, field, btn_name):
-        """Popup list of music tracks (field='track') or sound effects
-        (field='sfx'), used by the play_music / play_sfx action forms."""
-        keys = self._available_music_tracks() if field == 'track' else self._available_sfx_names()
-        self._sound_dropdown_field   = field
-        self._sound_dropdown_items   = keys
-        self._sound_dropdown_scroll  = 0
-        btn_rect = self._btns.get(btn_name)
-        if btn_rect:
-            item_h  = 22
-            visible = min(8, len(keys))
-            pop_h   = visible * item_h + 8
-            pop_w   = max(btn_rect.width, 160)
-            self._sound_dropdown_rect = self._place_dropdown_rect(btn_rect, pop_w, pop_h)
-        self._sound_dropdown_open = True
 
     def _preview_sound(self):
         """Instantly play/stop the currently-selected track or sfx through the
@@ -2270,49 +2747,10 @@ class CutsceneEditor:
                 return val
         return None
 
-    def _cycle_dropdown(self, name):
-        field = name[len('cycle_'):]
-        buf   = self._form_params.get(field, '')
-        if field in ('state', 'anim_state'):
-            actor_def = None
-            if self._form_target not in ('camera', 'screen', 'room', 'sound'):
-                for a in (self.cutscene_data or {}).get('actors', []):
-                    if a['id'] == self._form_target:
-                        actor_def = a
-                        break
-            pool = self._get_actor_anim_states(actor_def)
-        elif field in ('loop', 'fade_in', 'deal_damage', 'visible'):
-            pool = ['True', 'False']
-        elif field == 'direction' and self._form_type == 'scroll':
-            pool = ['right', 'left', 'down', 'up',
-                    'down_right', 'down_left', 'up_right', 'up_left']
-        elif field == 'direction':
-            # For move_to, the first slot is '' (auto-derive from movement vector).
-            # For all other actions direction must be explicit.
-            if self._form_type in ('move_to', 'fly_to'):
-                pool = ['', 'down', 'up', 'left', 'right']
-            else:
-                pool = _DIRECTIONS
-        elif field == 'mode' and self._form_type == 'invert':
-            pool = _INVERT_MODES
-        elif field == 'attack_type':
-            pool = discover_attacks() or _ATTACK_TYPES
-        elif field == 'weather_type':
-            import os, glob as _glob
-            weather_dir = os.path.join('assets', 'weather')
-            try:
-                files = sorted(_glob.glob(os.path.join(weather_dir, '*.png')))
-                pool  = [os.path.splitext(os.path.basename(f))[0] for f in files]
-            except Exception:
-                pool = []
-            if not pool:
-                pool = ['rain', 'snow', 'fog']
-        elif field == 'color':
-            pool = list(_COLOR_PRESETS.keys())
-        else:
-            return
-        idx = pool.index(buf) if buf in pool else 0
-        self._form_params[field] = pool[(idx + 1) % len(pool)]
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Form params
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _reset_form_params(self):
         self._form_params = {}
@@ -2437,6 +2875,7 @@ class CutsceneEditor:
         self._form_focus  = None
         self.unsaved      = True
 
+
     # ══════════════════════════════════════════════════════════════════════════
     # Viewport-state persistence  (per-cutscene camera position + zoom)
     # ══════════════════════════════════════════════════════════════════════════
@@ -2484,6 +2923,7 @@ class CutsceneEditor:
         # No saved state → fall back to centering on the room
         self._reset_camera_for_room()
 
+
     # ══════════════════════════════════════════════════════════════════════════
     # File management
     # ══════════════════════════════════════════════════════════════════════════
@@ -2492,6 +2932,55 @@ class CutsceneEditor:
         _ensure_dir()
         self._files = discover_cutscene_ids()
         self._list_msg = ''
+        # Light metadata for the list cards (room · length · action count).
+        self._file_meta = {}
+        for name in self._files:
+            try:
+                with open(_cutscene_path(name), 'r') as f:
+                    d = json.load(f)
+                self._file_meta[name] = (str(d.get('room', '')),
+                                         float(d.get('duration', 0.0)),
+                                         len(d.get('actions', [])),
+                                         len(d.get('actors', [])))
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+        self._list_confirm = None
+        if not (0 <= self._list_sel < len(self._files)):
+            self._list_sel = -1
+
+    def _reset_edit_state(self, data):
+        """Clear every piece of transient state tied to the previously open
+        cutscene (selections, undo history, cached sprites, playback, scroll)
+        so the editor starts fresh for *data*."""
+        self.cutscene_data  = data
+        self.unsaved        = False
+        self._tl_sel        = -1
+        self._actor_sel     = -1
+        self._form_active   = False
+        self._form_focus    = None
+        self._actor_form    = False
+        self._actor_focus   = None
+        self._pick_mode     = None
+        self._dd            = None
+        self._actor_entities.clear()
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self.view           = 'edit'
+        self._new_name_focus = False
+        self._new_name_buf   = ''
+        self._stop_preview()
+        self._runtime       = None   # force fresh runtime for the new cutscene
+        self._duration_buf   = str(data.get('duration', 10.0))
+        self._duration_focus = False
+        self._tl_playhead_t = 0.0
+        self._tl_scroll_x   = 0.0
+        self._tl_scroll_y   = 0.0
+        self._tl_expanded   = {}
+        self._left_scroll   = 0
+        self._insp_scroll   = 0
+        self._autosave_t    = 0.0
+        self._vp_tile_surfaces.clear()
+        self._vp_animated_tiles.clear()
 
     def _create_and_open(self, name):
         _ensure_dir()
@@ -2501,20 +2990,8 @@ class CutsceneEditor:
                 'duration': 10.0, 'actors': [], 'actions': []}
         with open(_cutscene_path(name), 'w') as f:
             json.dump(data, f, indent=2)
-        self.cutscene_name  = name
-        self.cutscene_data  = data
-        self.unsaved        = False
-        self._tl_sel        = -1
-        self._actor_sel     = -1
-        self._form_active   = False
-        self._actor_form    = False
-        self._actor_entities.clear()
-        self._undo_stack.clear()
-        self._redo_stack.clear()
-        self.view           = 'edit'
-        self._new_name_focus = False
-        self._duration_buf   = str(data.get('duration', 10.0))
-        self._duration_focus = False
+        self.cutscene_name = name
+        self._reset_edit_state(data)
         # Centre the viewport on the room
         self._reset_camera_for_room()
 
@@ -2530,28 +3007,15 @@ class CutsceneEditor:
         except (OSError, json.JSONDecodeError) as e:
             self._list_msg = f'Error loading: {e}'
             return
-        self.cutscene_name  = name
-        self.cutscene_data  = data
-        self.unsaved        = False
-        self._tl_sel        = -1
-        self._actor_sel     = -1
-        self._form_active   = False
-        self._actor_form    = False
-        self._actor_entities.clear()
-        self._undo_stack.clear()
-        self._redo_stack.clear()
-        self.view           = 'edit'
-        self._new_name_focus = False
-        self._runtime       = None   # force fresh runtime for new cutscene
-        self._stop_preview()
-        self._duration_buf   = str(data.get('duration', 10.0))
-        self._duration_focus = False
+        self.cutscene_name = name
+        self._reset_edit_state(data)
         # Drop any cached tile data so the new room reloads from disk
         te = getattr(self.room_editor, 'tileset_editor', None)
         if te is not None and hasattr(te, 'room_tiles'):
             te.room_tiles.pop(data.get('room', ''), None)
         # Restore saved viewport (falls back to centring on the room)
         self._restore_viewport_state()
+
 
     def _save_cutscene(self):
         """Write cutscene_data to disk and persist the viewport state."""
@@ -2564,9 +3028,57 @@ class CutsceneEditor:
         self._autosave_t = 0.0   # reset the autosave debounce timer
         self._save_viewport_state()
 
+
     # ══════════════════════════════════════════════════════════════════════════
     # Preview / entity factory
     # ══════════════════════════════════════════════════════════════════════════
+
+    def _scrub_to(self, t):
+        """Seek the scene to time *t*, creating a paused runtime if needed."""
+        if self._runtime is None and self.cutscene_data:
+            try:
+                from core.cutscene_runtime import CutsceneRuntime
+                self._runtime = CutsceneRuntime(
+                    self.cutscene_data, self.camera, self._entity_factory,
+                    dialogue_box=self.dialogue_box, sound_manager=self.sound_manager)
+            except Exception as e:
+                print(f'[CutsceneEditor] _scrub_to runtime error: {e}')
+                return
+        if self._runtime:
+            self._runtime.seek(t)
+            # Snap the editor camera directly to the camera_target world position.
+            # Don't call camera.update() here — that tweens, causing the camera to
+            # keep drifting after scrub ends. Instead set x/y directly.
+            from config.settings import RENDER_SCALE
+            import math
+            ct = self._runtime.camera_target
+            room = self._get_current_room()
+            w = (room.width  if room else 10000) * RENDER_SCALE
+            h = (room.height if room else 10000) * RENDER_SCALE
+            self.camera.x = ct.x * RENDER_SCALE - self.camera.screen_width  // 2
+            self.camera.y = ct.y * RENDER_SCALE - self.camera.screen_height // 2
+            self.camera.x = max(0, min(self.camera.x, w - self.camera.screen_width))
+            self.camera.y = max(0, min(self.camera.y, h - self.camera.screen_height))
+            # Scrub view is a static snapshot — clear any live shake that seek()
+            # may have applied (shake inside its window) so the camera doesn't
+            # wobble while the playhead is stationary.  A deterministic jitter
+            # offset is added below purely for the scrub preview frame.
+            self._runtime._clear_camera_shake()
+            # Apply a deterministic shake preview when the playhead is inside a
+            # shake window.  Uses the camera_target position (already set above)
+            # as the base; the jitter is overwritten on the next scrub call so it
+            # never bleeds into camera state or playback.
+            for _action in (self.cutscene_data or {}).get('actions', []):
+                if (_action.get('target') == 'camera'
+                        and _action.get('type') == 'shake'):
+                    _p    = _action.get('params', {})
+                    _end  = _action['time'] + _p.get('duration', 0.3)
+                    if _action['time'] <= t < _end:
+                        _i = _p.get('intensity', 8)
+                        self.camera.x += math.sin(t * 50.7) * _i
+                        self.camera.y += math.cos(t * 37.3) * _i
+                        break
+        self._tl_playhead_t = t
 
     def _start_preview(self):
         """Begin playing from the current playhead position.
@@ -2606,11 +3118,10 @@ class CutsceneEditor:
         self._last_ticks = pygame.time.get_ticks()
         self._form_active = False
 
+
     # ══════════════════════════════════════════════════════════════════════════
     # Undo / Redo
     # ══════════════════════════════════════════════════════════════════════════
-
-    _UNDO_LIMIT = 50
 
     def _push_undo(self):
         """Snapshot current cutscene_data onto the undo stack before a mutation."""
@@ -2627,7 +3138,6 @@ class CutsceneEditor:
         """Restore the snapshot at the top of the undo stack."""
         if not self._undo_stack or self.cutscene_data is None:
             return
-        import copy
         self._redo_stack.append(copy.deepcopy(self.cutscene_data))
         self.cutscene_data = self._undo_stack.pop()
         self._after_history_jump()
@@ -2636,10 +3146,10 @@ class CutsceneEditor:
         """Reapply the snapshot at the top of the redo stack."""
         if not self._redo_stack or self.cutscene_data is None:
             return
-        import copy
         self._undo_stack.append(copy.deepcopy(self.cutscene_data))
         self.cutscene_data = self._redo_stack.pop()
         self._after_history_jump()
+
 
     def _after_history_jump(self):
         """Tidy up editor state after an undo or redo."""
@@ -2729,8 +3239,9 @@ class CutsceneEditor:
             print(f'[CutsceneEditor] entity_factory error: {ex}')
             return None
 
+
     # ══════════════════════════════════════════════════════════════════════════
-    # Camera helpers
+    # Camera / room helpers
     # ══════════════════════════════════════════════════════════════════════════
 
     def _reset_camera_for_room(self):
@@ -2852,25 +3363,16 @@ class CutsceneEditor:
                 self._actor_entities[aid] = entity
         return self._actor_entities.get(aid)
 
+
     # ══════════════════════════════════════════════════════════════════════════
-    # Panel rect helpers
+    # Panel rect + track helpers
     # ══════════════════════════════════════════════════════════════════════════
 
     def _tl_panel_rect(self):
-        return pygame.Rect(0, self.screen_height - _BOTTOM_H,
-                           self.screen_width, _BOTTOM_H)
+        """Inner (content) rect of the timeline panel — the frame minus its
+        padding, so nothing drawn in it can touch the rounded corners."""
+        return self._tl_frame.inflate(-16, -16)
 
-    def _left_panel_rect(self):
-        return pygame.Rect(0, _TOP_H, _LEFT_W,
-                           self.screen_height - _TOP_H - _BOTTOM_H)
-
-    def _right_panel_rect(self):
-        return pygame.Rect(self.screen_width - _RIGHT_W, _TOP_H,
-                           _RIGHT_W, self.screen_height - _TOP_H - _BOTTOM_H)
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Track list helper
-    # ══════════════════════════════════════════════════════════════════════════
 
     def _tl_tracks(self):
         """Return list of (label, color, target_id) for all tracks."""
@@ -2938,490 +3440,81 @@ class CutsceneEditor:
                     })
         return rows
 
+
     # ══════════════════════════════════════════════════════════════════════════
-    # Drawing — list view
+    # Room browsing (scene room + change_room action)
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _draw_list(self, screen):
-        """Render the file browser (create / open / delete cutscenes).
+    def _set_scene_room(self, new_name):
+        """Point the cutscene at *new_name*.
 
-        Rebuilds self._btns every frame so hit-testing is always in sync with
-        what was actually painted — never cache this dict across frames.
+        Also invalidates baked tile surfaces so the viewport doesn't flash the
+        old room's tiles for one frame before the new ones load.
         """
-        self._btns = {}
-        screen.fill(_C['bg'])
-        W, H = self.screen_width, self.screen_height
+        if not self.cutscene_data or new_name == self.cutscene_data.get('room', ''):
+            return
+        self._push_undo()
+        self.cutscene_data['room'] = new_name
+        self.unsaved = True
+        self._invalidate_tile_cache(new_name)
+        # Drop the tileset_editor's cached tile list so _ensure_room_tiles
+        # reseeds it from room.tiles on the next draw call.
+        te = getattr(self.room_editor, 'tileset_editor', None)
+        if te is not None and hasattr(te, 'room_tiles'):
+            te.room_tiles.pop(new_name, None)
 
-        t = self.font_title.render('CUTSCENE EDITOR', True, _C['text'])
-        screen.blit(t, (W // 2 - t.get_width() // 2, 28))
+    def _pick_scene_room(self, name):
+        self._set_scene_room(name)
 
-        self._btns['close'] = self._draw_button(
-            screen, W - 104, 18, 84, _BTN_H, 'CLOSE', _C['danger'])
+    def _cycle_room(self, delta):
+        """Advance (+1) or reverse (-1) through the room list."""
+        rooms = [r.name for r in self.room_manager.rooms
+                 if not getattr(r, 'is_transient', False)]
+        if not rooms:
+            return
+        cur      = self.cutscene_data.get('room', '')
+        idx      = rooms.index(cur) if cur in rooms else 0
+        self._set_scene_room(rooms[(idx + delta) % len(rooms)])
 
-        # New cutscene box
-        screen.draw_rect(_C['panel'], (60, 88, W - 120, 76), border_radius=6)
-        screen.draw_rect(_C['border'], (60, 88, W - 120, 76), 1, border_radius=6)
-        lbl = self.font_medium.render('New cutscene name:', True, _C['text_dim'])
-        screen.blit(lbl, (78, 102))
-        tf = pygame.Rect(78, 122, W - 286, 30)
-        col = _C['accent'] if self._new_name_focus else _C['border']
-        screen.draw_rect(_C['highlight'], tf, border_radius=4)
-        screen.draw_rect(col, tf, 1, border_radius=4)
-        txt = self.font_medium.render(
-            self._new_name_buf + ('|' if self._new_name_focus else ''), True, _C['white'])
-        screen.blit(txt, (tf.x + 6, tf.y + 6))
-        self._btns['list_new'] = self._draw_button(
-            screen, W - 198, 122, 118, 30, '+ CREATE', _C['accent2'])
 
-        if self._list_msg:
-            screen.blit(self.font_small.render(self._list_msg, True, _C['danger']), (78, 158))
+    def _rooms_for_group(self, group):
+        """Return room names visible in *group*.
 
-        items_top = 188
-        if not self._files:
-            msg = self.font_medium.render('No cutscenes yet.  Create one above.', True, _C['text_dim'])
-            screen.blit(msg, (W // 2 - msg.get_width() // 2, items_top + 20))
-        else:
-            row_h = 38
-            clip  = pygame.Rect(60, items_top, W - 120, H - items_top - 80)
-            screen.set_clip(clip)
-            for i, name in enumerate(self._files):
-                ry  = items_top + i * row_h - self._list_scroll
-                col = _C['sel'] if i == self._list_sel else _C['panel']
-                r   = pygame.Rect(60, ry, W - 120, row_h - 4)
-                screen.draw_rect(col, r, border_radius=5)
-                screen.draw_rect(_C['border'], r, 1, border_radius=5)
-                # colour bar
-                screen.draw_rect(_ACTOR_COLORS[i % len(_ACTOR_COLORS)],
-                                 (r.x, r.y, 4, r.height), border_radius=2)
-                nt = self.font_large.render(name, True, _C['text'])
-                screen.blit(nt, (r.x + 14, r.y + (row_h - 4 - nt.get_height()) // 2))
-            screen.set_clip(None)
-
-        bw, bh, by = 110, 32, H - 55
-        self._btns['list_open']   = self._draw_button(screen, W // 2 - 170, by, bw, bh, 'OPEN',   _C['accent'])
-        self._btns['list_delete'] = self._draw_button(screen, W // 2 -  50, by, bw, bh, 'DELETE', _C['danger'])
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # Drawing — edit view (AE layout)
-    # ══════════════════════════════════════════════════════════════════════════
-
-    def _draw_edit(self, screen):
-        """Render the full edit view.
-
-        Draw order is deliberate — each later pass paints over earlier edges:
-          1. Viewport (fullscreen room + actors)
-          2. Top bar          — overlaps viewport top edge
-          3. Left panel       — overlaps viewport left edge
-          4. Right panel      — overlaps viewport right edge
-          5. Timeline         — overlaps viewport bottom edge
-          6. Dialogue box     — floats inside viewport rect
-          7. Portrait dropdown — topmost overlay, drawn last
+        An empty/None *group* means "All Groups" — every non-transient room is
+        included.  Otherwise only rooms whose .group attribute matches are returned.
         """
-        self._btns       = {}
-        self._field_meta = {}
-        screen.fill(_C['bg'])
+        return [r.name for r in self.room_manager.rooms
+                if not getattr(r, 'is_transient', False)
+                and (not group or r.group == group)]
 
-        # ── 1. Viewport (draw first so panels overlay borders) ─────────────────
-        # Was: render into a CPU pygame.Surface sized to vp, then blit it in
-        # whole. _draw_viewport now draws straight onto the real GPUScreen
-        # through a _ZoomedViewport (see its docstring) -- clip to vp so the
-        # zoomed content can't paint over the surrounding panels, same as
-        # the old vp_surf's bounds did automatically.
-        vp = self._vp_rect
-        screen.set_clip(vp)
-        self._draw_viewport(screen, vp)
-        screen.set_clip(None)
-        screen.draw_rect(_C['border'], vp, 1)
+    def _cycle_room_group(self, delta):
+        """Cycle through room groups in the change_room action form.
 
-        # Pick-mode banner
-        if self._pick_mode:
-            if self._pick_mode == 'pick_attack_target':
-                direction = self._form_params.get('direction', 'down')
-                axis = 'height (Y)' if direction in ('up', 'down') else 'distance (X)'
-                banner_text = f'Click where the beam should stop  —  {axis} only  (Esc to cancel)'
-            else:
-                banner_text = f'Click viewport to pick position  [{self._pick_mode}]  (Esc to cancel)'
-            banner = self.font_medium.render(banner_text, True, _C['accent'])
-            bg = pygame.Surface((banner.get_width() + 18, banner.get_height() + 10),
-                                pygame.SRCALPHA)
-            bg.fill((0, 0, 0, 185))
-            bx, by = vp.x + 10, vp.y + 10
-            screen.blit(bg, (bx - 8, by - 4))
-            screen.blit(banner, (bx, by))
+        Moves to the previous/next group and resets room_name to the first
+        room in that group so the value is always valid.
+        """
+        groups = [g for g in self.room_manager.groups]
+        if not groups:
+            return
+        cur   = self._form_room_group
+        idx   = groups.index(cur) if cur in groups else 0
+        self._form_room_group = groups[(idx + delta) % len(groups)]
+        rooms = self._rooms_for_group(self._form_room_group)
+        self._form_params['room_name'] = rooms[0] if rooms else ''
 
-        # Actor drag banner — shown while dragging an actor's start position
-        if self._actor_drag_idx >= 0 and self.cutscene_data:
-            actors = self.cutscene_data.get('actors', [])
-            if self._actor_drag_idx < len(actors):
-                a = actors[self._actor_drag_idx]
-                drag_txt = (f'Dragging  {a.get("id", "actor")}  ->  '
-                            f'X {a.get("x", 0):.1f}   Y {a.get("y", 0):.1f}')
-                banner = self.font_medium.render(drag_txt, True, _C['accent2'])
-                bg = pygame.Surface((banner.get_width() + 18, banner.get_height() + 10),
-                                    pygame.SRCALPHA)
-                bg.fill((0, 0, 0, 185))
-                bx, by = vp.x + 10, vp.y + 10
-                screen.blit(bg, (bx - 8, by - 4))
-                screen.blit(banner, (bx, by))
+    def _cycle_room_in_group(self, delta):
+        """Cycle through rooms within the currently selected group."""
+        rooms = self._rooms_for_group(self._form_room_group)
+        if not rooms:
+            return
+        cur   = self._form_params.get('room_name', '')
+        idx   = rooms.index(cur) if cur in rooms else 0
+        self._form_params['room_name'] = rooms[(idx + delta) % len(rooms)]
 
-        # Hover highlight — draw a ring around whichever actor the cursor is
-        # near so the user knows it can be dragged (only in static/idle mode).
-        if (not self._playing and not self._pick_mode
-                and self._actor_drag_idx < 0 and self.cutscene_data
-                and vp.collidepoint(pygame.mouse.get_pos())):
-            mx2, my2 = pygame.mouse.get_pos()
-            vx2 = mx2 - vp.x
-            vy2 = my2 - vp.y
-            hwx = vx2 / (RENDER_SCALE * self._vp_zoom) + self.camera.x / RENDER_SCALE
-            hwy = vy2 / (RENDER_SCALE * self._vp_zoom) + self.camera.y / RENDER_SCALE
-            actors = self.cutscene_data.get('actors', [])
-            hit_radius = 20.0
-            for i, actor in enumerate(actors):
-                ax = float(actor.get('x', 0))
-                ay = float(actor.get('y', 0))
-                if abs(hwx - ax) <= hit_radius and abs(hwy - ay) <= hit_radius:
-                    col = _ACTOR_COLORS[i % len(_ACTOR_COLORS)]
-                    # Convert world position → screen position for the ring
-                    scr_x = int(vp.x + (ax * RENDER_SCALE - self.camera.x) * self._vp_zoom)
-                    scr_y = int(vp.y + (ay * RENDER_SCALE - self.camera.y) * self._vp_zoom)
-                    ring_r = int(16 * self._vp_zoom)
-                    screen.draw_circle(col,   (scr_x, scr_y), ring_r, 2)
-                    screen.draw_circle(_C['white'], (scr_x, scr_y), ring_r, 1)
-                    hint = self.font_small.render('drag to move', True, col)
-                    screen.blit(hint, (scr_x + ring_r + 4,
-                                       scr_y - hint.get_height() // 2))
-                    break
 
-        # Mouse world-coords readout in viewport (zoom-corrected)
-        mx, my = pygame.mouse.get_pos()
-        if vp.collidepoint(mx, my):
-            vx = mx - vp.x
-            vy = my - vp.y
-            # Correct: viewport pixel → base-scale pixel (÷zoom) → world (÷RS)
-            wx = vx / (RENDER_SCALE * self._vp_zoom) + self.camera.x / RENDER_SCALE
-            wy = vy / (RENDER_SCALE * self._vp_zoom) + self.camera.y / RENDER_SCALE
-            coord = self.font_mono.render(f'X {wx:.1f}  Y {wy:.1f}', True, _C['text_dim'])
-            screen.blit(coord, (vp.x + 8, vp.y + vp.height - 20))
-
-        # ── Ghost / placement preview overlays ─────────────────────────────────
-        mx, my = pygame.mouse.get_pos()
-        if self._pick_mode and vp.collidepoint(mx, my):
-            vx = mx - vp.x
-            vy = my - vp.y
-            wx = vx / (RENDER_SCALE * self._vp_zoom) + self.camera.x / RENDER_SCALE
-            wy = vy / (RENDER_SCALE * self._vp_zoom) + self.camera.y / RENDER_SCALE
-
-            if self._pick_mode == 'pick_actor':
-                # Ghost actor circle + crosshair at cursor
-                num_actors = len(self.cutscene_data.get('actors', [])) if self.cutscene_data else 0
-                ghost_col = _ACTOR_COLORS[num_actors % len(_ACTOR_COLORS)]
-                screen.draw_circle(ghost_col, (mx, my), 13, 2)
-                screen.draw_circle(_C['white'], (mx, my), 13, 1)
-                screen.draw_line(ghost_col, (mx - 18, my), (mx + 18, my), 1)
-                screen.draw_line(ghost_col, (mx, my - 18), (mx, my + 18), 1)
-                actor_id = self._place_actor_def.get('id', 'actor')
-                lbl = self.font_small.render(actor_id, True, ghost_col)
-                screen.blit(lbl, (mx + 16, my - lbl.get_height() // 2))
-                coord_lbl = self.font_mono.render(f'({wx:.1f}, {wy:.1f})', True, _C['text_dim'])
-                screen.blit(coord_lbl, (mx + 16, my + lbl.get_height() // 2 + 2))
-
-            elif self._pick_mode in ('pick_pan_to', 'pick_snap_to', 'pick_move_to',
-                                     'pick_fly_to', 'pick_teleport'):
-                # Crosshair + world-coord label for camera / move targets
-                arm = 22
-                screen.draw_line(_C['accent'], (mx - arm, my), (mx + arm, my), 1)
-                screen.draw_line(_C['accent'], (mx, my - arm), (mx, my + arm), 1)
-                screen.draw_circle(_C['accent'], (mx, my), 5, 1)
-                coord_lbl = self.font_mono.render(f'({wx:.1f}, {wy:.1f})', True, _C['accent'])
-                screen.blit(coord_lbl, (mx + arm + 4, my - coord_lbl.get_height() // 2))
-
-            elif self._pick_mode == 'pick_attack_target':
-                # Beam-stop picker: the effect only ever travels along the
-                # actor's facing axis, so only one coordinate of the click
-                # is actually used. Draw a guide line locked to that axis
-                # (running from the actor's position) instead of a free
-                # crosshair, so it's visually obvious only the along-axis
-                # distance matters, not the exact click point.
-                direction = self._form_params.get('direction', 'down')
-                actor_def = None
-                if self.cutscene_data:
-                    actor_def = next(
-                        (a for a in self.cutscene_data.get('actors', [])
-                         if a.get('id') == self._form_target), None)
-                ax = float(actor_def.get('x', wx)) if actor_def else wx
-                ay = float(actor_def.get('y', wy)) if actor_def else wy
-                a_scr_x = int(vp.x + (ax * RENDER_SCALE - self.camera.x) * self._vp_zoom)
-                a_scr_y = int(vp.y + (ay * RENDER_SCALE - self.camera.y) * self._vp_zoom)
-
-                if direction in ('up', 'down'):
-                    # Only Y matters: vertical guide from the actor down to
-                    # the cursor's height; the stop marker sits on that line.
-                    screen.draw_line(_C['accent2'], (a_scr_x, a_scr_y), (a_scr_x, my), 2)
-                    screen.draw_circle(_C['accent2'], (a_scr_x, my), 5, 1)
-                    coord_lbl = self.font_mono.render(f'stop Y = {wy:.1f}', True, _C['accent2'])
-                    screen.blit(coord_lbl, (a_scr_x + 10, my - coord_lbl.get_height() // 2))
-                else:
-                    # Only X matters: horizontal guide from the actor across
-                    # to the cursor's position.
-                    screen.draw_line(_C['accent2'], (a_scr_x, a_scr_y), (mx, a_scr_y), 2)
-                    screen.draw_circle(_C['accent2'], (mx, a_scr_y), 5, 1)
-                    coord_lbl = self.font_mono.render(f'stop X = {wx:.1f}', True, _C['accent2'])
-                    screen.blit(coord_lbl, (mx + 10, a_scr_y - coord_lbl.get_height() // 2))
-
-        # Zoom level readout + reset button (bottom-right of viewport).
-        # Click it to snap back to 100%, which matches the in-game zoom level.
-        zoom_pct = int(self._vp_zoom * 100)
-        is_default_zoom = abs(self._vp_zoom - 1.0) < 0.01
-        btn_label = f'{zoom_pct}%  (click to reset)'
-        btn_col   = _C['highlight'] if is_default_zoom else _C['accent']
-        btn_w     = self.font_small.size(btn_label)[0] + 16
-        btn_h     = 22
-        btn_x     = vp.right  - btn_w - 6
-        btn_y     = vp.bottom - btn_h - 6
-        self._btns['vp_zoom_reset'] = self._draw_button(
-            screen, btn_x, btn_y, btn_w, btn_h, btn_label, btn_col)
-
-        # ── 2. Top bar ─────────────────────────────────────────────────────────
-        self._draw_top_bar(screen)
-
-        # ── 3. Left panel ──────────────────────────────────────────────────────
-        lp = self._left_panel_rect()
-        screen.draw_rect(_C['panel2'], lp)
-        screen.draw_line(_C['border'], (lp.right, lp.y), (lp.right, lp.bottom), 1)
-        self._draw_left_panel(screen, lp)
-
-        # ── 4. Right panel ─────────────────────────────────────────────────────
-        rp = self._right_panel_rect()
-        screen.draw_rect(_C['panel2'], rp)
-        screen.draw_line(_C['border'], (rp.x, rp.y), (rp.x, rp.bottom), 1)
-        self._draw_right_panel(screen, rp)
-
-        # ── 5. Timeline ────────────────────────────────────────────────────────
-        tl = self._tl_panel_rect()
-        screen.draw_rect(_C['panel'], tl)
-        screen.draw_line(_C['border'], (tl.x, tl.y), (tl.right, tl.y), 1)
-        self._draw_timeline(screen, tl)
-
-        # ── 6. Dialogue box ────────────────────────────────────────────────────
-        # DialogueBox sizes itself from screen_width/screen_height (integer
-        # frame scale, pixel-perfect). Drawing at full game resolution then
-        # pygame.transform.scale-ing down into the smaller viewport reintroduced
-        # the uneven-pixel-row artifact we fixed in dialogue.py — non-integer
-        # scale maps some source rows to N dest pixels and others to N+1.
-        #
-        # Instead, temporarily tell the box the viewport's size so it builds
-        # at the size it will actually occupy, then blit 1:1. Capacity checks
-        # (fits_box / wrap_text) still use the real game resolution because
-        # we only swap the dimensions for this draw call.
-        if self.dialogue_box and getattr(self.dialogue_box, 'active', False):
-            vp = self._vp_rect
-            _dlg_colors = {
-                'WHITE': (255, 255, 255), 'RED': (220, 60, 60),
-                'DARK_GRAY': (40, 40, 40), 'CYAN': (80, 220, 220),
-            }
-            _ow = self.dialogue_box.screen_width
-            _oh = self.dialogue_box.screen_height
-            self.dialogue_box.screen_width  = vp.width
-            self.dialogue_box.screen_height = vp.height
-            try:
-                _dlg_surf = pygame.Surface((vp.width, vp.height), pygame.SRCALPHA)
-                self.dialogue_box.draw(_dlg_surf, _dlg_colors)
-                screen.blit(_dlg_surf, (vp.x, vp.y))
-            finally:
-                self.dialogue_box.screen_width  = _ow
-                self.dialogue_box.screen_height = _oh
-
-        # Portrait dropdown overlay — drawn last so it sits on top of everything
-        if self._portrait_dropdown_open and self._portrait_dropdown_rect:
-            dr       = self._portrait_dropdown_rect
-            item_h   = 22
-            visible  = min(8, len(self._portrait_dropdown_items))
-            cur_val  = self._form_params.get('portrait', '')
-            shadow = pygame.Surface((dr.width + 4, dr.height + 4), pygame.SRCALPHA)
-            shadow.fill((0, 0, 0, 110))
-            screen.blit(shadow, (dr.x + 2, dr.y + 2))
-            screen.draw_rect(_C['panel2'], dr)
-            screen.draw_rect(_C['accent'],  dr, 1)
-            scroll = self._portrait_dropdown_scroll
-            for i in range(visible):
-                actual = i + scroll
-                if actual >= len(self._portrait_dropdown_items):
-                    break
-                key   = self._portrait_dropdown_items[actual]
-                # Empty string = no portrait = narrator-style (full-width text box).
-                label = key if key else 'narrator'
-                iy    = dr.y + 4 + i * item_h
-                ir    = pygame.Rect(dr.x + 1, iy, dr.width - 2, item_h)
-                if key == cur_val:
-                    screen.draw_rect(_C['accent'], ir)
-                    text_col = _C['bg']
-                else:
-                    hmx, hmy = pygame.mouse.get_pos()
-                    if ir.collidepoint(hmx, hmy):
-                        screen.draw_rect(_C['highlight'], ir)
-                    text_col = _C['text']
-                lbl = self.font_small.render(label, True, text_col)
-                screen.blit(lbl, (ir.x + 6, iy + (item_h - lbl.get_height()) // 2))
-            if len(self._portrait_dropdown_items) > visible:
-                hint = self.font_small.render('scroll', True, _C['text_dim'])
-                screen.blit(hint, (dr.x + dr.width - hint.get_width() - 4,
-                                   dr.bottom - hint.get_height() - 2))
-
-        # Character dropdown overlay — same idea, sourced from discovered
-        # player characters (see _discover_player_characters()).
-        if self._character_dropdown_open and self._character_dropdown_rect:
-            dr       = self._character_dropdown_rect
-            item_h   = 22
-            visible  = min(8, len(self._character_dropdown_items))
-            cur_val  = self._form_params.get('character', '')
-            shadow = pygame.Surface((dr.width + 4, dr.height + 4), pygame.SRCALPHA)
-            shadow.fill((0, 0, 0, 110))
-            screen.blit(shadow, (dr.x + 2, dr.y + 2))
-            screen.draw_rect(_C['panel2'], dr)
-            screen.draw_rect(_C['accent'],  dr, 1)
-            scroll = self._character_dropdown_scroll
-            for i in range(visible):
-                actual = i + scroll
-                if actual >= len(self._character_dropdown_items):
-                    break
-                key   = self._character_dropdown_items[actual]
-                label = key if key else '(none)'
-                iy    = dr.y + 4 + i * item_h
-                ir    = pygame.Rect(dr.x + 1, iy, dr.width - 2, item_h)
-                if key == cur_val:
-                    screen.draw_rect(_C['accent'], ir)
-                    text_col = _C['bg']
-                else:
-                    hmx, hmy = pygame.mouse.get_pos()
-                    if ir.collidepoint(hmx, hmy):
-                        screen.draw_rect(_C['highlight'], ir)
-                    text_col = _C['text']
-                lbl = self.font_small.render(label, True, text_col)
-                screen.blit(lbl, (ir.x + 6, iy + (item_h - lbl.get_height()) // 2))
-            if not self._character_dropdown_items:
-                hint = self.font_small.render(
-                    'No characters found in assets/sprites/player/', True, _C['text_dim'])
-                screen.blit(hint, (dr.x + 6, dr.y + 6))
-            elif len(self._character_dropdown_items) > visible:
-                hint = self.font_small.render('scroll', True, _C['text_dim'])
-                screen.blit(hint, (dr.x + dr.width - hint.get_width() - 4,
-                                   dr.bottom - hint.get_height() - 2))
-
-        # Costume dropdown overlay — sourced from the actor's character folder.
-        if self._costume_dropdown_open and self._costume_dropdown_rect:
-            dr       = self._costume_dropdown_rect
-            item_h   = 22
-            visible  = min(8, len(self._costume_dropdown_items))
-            cur_val  = self._form_params.get('costume', '')
-            shadow = pygame.Surface((dr.width + 4, dr.height + 4), pygame.SRCALPHA)
-            shadow.fill((0, 0, 0, 110))
-            screen.blit(shadow, (dr.x + 2, dr.y + 2))
-            screen.draw_rect(_C['panel2'], dr)
-            screen.draw_rect(_C['accent2'], dr, 1)
-            scroll = self._costume_dropdown_scroll
-            for i in range(visible):
-                actual = i + scroll
-                if actual >= len(self._costume_dropdown_items):
-                    break
-                key   = self._costume_dropdown_items[actual]
-                label = key if key else '(none)'
-                iy    = dr.y + 4 + i * item_h
-                ir    = pygame.Rect(dr.x + 1, iy, dr.width - 2, item_h)
-                if key == cur_val:
-                    screen.draw_rect(_C['accent2'], ir)
-                    text_col = _C['bg']
-                else:
-                    hmx, hmy = pygame.mouse.get_pos()
-                    if ir.collidepoint(hmx, hmy):
-                        screen.draw_rect(_C['highlight'], ir)
-                    text_col = _C['text']
-                lbl = self.font_small.render(label, True, text_col)
-                screen.blit(lbl, (ir.x + 6, iy + (item_h - lbl.get_height()) // 2))
-            if not self._costume_dropdown_items:
-                hint = self.font_small.render(
-                    'No costumes found for this actor', True, _C['text_dim'])
-                screen.blit(hint, (dr.x + 6, dr.y + 6))
-            elif len(self._costume_dropdown_items) > visible:
-                hint = self.font_small.render('scroll', True, _C['text_dim'])
-                screen.blit(hint, (dr.x + dr.width - hint.get_width() - 4,
-                                   dr.bottom - hint.get_height() - 2))
-
-        if self._sound_dropdown_open and self._sound_dropdown_rect:
-            dr       = self._sound_dropdown_rect
-            item_h   = 22
-            visible  = min(8, len(self._sound_dropdown_items))
-            cur_val  = self._form_params.get(self._sound_dropdown_field, '')
-            shadow = pygame.Surface((dr.width + 4, dr.height + 4), pygame.SRCALPHA)
-            shadow.fill((0, 0, 0, 110))
-            screen.blit(shadow, (dr.x + 2, dr.y + 2))
-            screen.draw_rect(_C['panel2'], dr)
-            screen.draw_rect(_SOUND_COLOR, dr, 1)
-            scroll = self._sound_dropdown_scroll
-            for i in range(visible):
-                actual = i + scroll
-                if actual >= len(self._sound_dropdown_items):
-                    break
-                key   = self._sound_dropdown_items[actual]
-                label = key if key else '(none)'
-                iy    = dr.y + 4 + i * item_h
-                ir    = pygame.Rect(dr.x + 1, iy, dr.width - 2, item_h)
-                if key == cur_val:
-                    screen.draw_rect(_SOUND_COLOR, ir)
-                    text_col = _C['bg']
-                else:
-                    hmx, hmy = pygame.mouse.get_pos()
-                    if ir.collidepoint(hmx, hmy):
-                        screen.draw_rect(_C['highlight'], ir)
-                    text_col = _C['text']
-                lbl = self.font_small.render(label, True, text_col)
-                screen.blit(lbl, (ir.x + 6, iy + (item_h - lbl.get_height()) // 2))
-            if not self._sound_dropdown_items:
-                no_what = 'music tracks' if self._sound_dropdown_field == 'track' else 'sound effects'
-                hint = self.font_small.render(
-                    f'No {no_what} loaded', True, _C['text_dim'])
-                screen.blit(hint, (dr.x + 6, dr.y + 6))
-            elif len(self._sound_dropdown_items) > visible:
-                hint = self.font_small.render('scroll', True, _C['text_dim'])
-                screen.blit(hint, (dr.x + dr.width - hint.get_width() - 4,
-                                   dr.bottom - hint.get_height() - 2))
-
-        if self._etype_dropdown_open and self._etype_dropdown_rect:
-            dr       = self._etype_dropdown_rect
-            item_h   = 22
-            visible  = min(8, len(self._etype_dropdown_items))
-            cur_val  = self._actor_etype_buf
-            shadow = pygame.Surface((dr.width + 4, dr.height + 4), pygame.SRCALPHA)
-            shadow.fill((0, 0, 0, 110))
-            screen.blit(shadow, (dr.x + 2, dr.y + 2))
-            screen.draw_rect(_C['panel2'], dr)
-            screen.draw_rect(_C['accent2'], dr, 1)
-            scroll = self._etype_dropdown_scroll
-            for i in range(visible):
-                actual = i + scroll
-                if actual >= len(self._etype_dropdown_items):
-                    break
-                key   = self._etype_dropdown_items[actual]
-                label = key if key else '(none)'
-                iy    = dr.y + 4 + i * item_h
-                ir    = pygame.Rect(dr.x + 1, iy, dr.width - 2, item_h)
-                if key == cur_val:
-                    screen.draw_rect(_C['accent2'], ir)
-                    text_col = _C['bg']
-                else:
-                    hmx, hmy = pygame.mouse.get_pos()
-                    if ir.collidepoint(hmx, hmy):
-                        screen.draw_rect(_C['highlight'], ir)
-                    text_col = _C['text']
-                lbl = self.font_small.render(label, True, text_col)
-                screen.blit(lbl, (ir.x + 6, iy + (item_h - lbl.get_height()) // 2))
-            if not self._etype_dropdown_items:
-                hint = self.font_small.render(
-                    'None found in entity catalogue', True, _C['text_dim'])
-                screen.blit(hint, (dr.x + 6, dr.y + 6))
-            elif len(self._etype_dropdown_items) > visible:
-                hint = self.font_small.render('scroll', True, _C['text_dim'])
-                screen.blit(hint, (dr.x + dr.width - hint.get_width() - 4,
-                                   dr.bottom - hint.get_height() - 2))
+    # ══════════════════════════════════════════════════════════════════════════
+    # Viewport world rendering  (tiles, decorations, actors, weather, overlay)
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _draw_viewport(self, screen, vp):
         """Render the room and actors into viewport rect *vp* on the real
@@ -3451,7 +3544,7 @@ class CutsceneEditor:
         """
         zoom = self._vp_zoom
         vscreen = _ZoomedViewport(screen, zoom, vp.width, vp.height, origin=(vp.x, vp.y))
-        vscreen.fill((30, 120, 30))
+        vscreen.fill(_CANVAS)
 
         # How much world we see at base scale -- vscreen.get_size() already
         # does exactly the iw/ih = real_size/zoom division internally.
@@ -3477,7 +3570,7 @@ class CutsceneEditor:
             # Room boundary outline
             rx = -cam_x
             ry = -cam_y
-            inter.draw_rect(_C['accent'],
+            inter.draw_rect(uk.Theme.GOLD,
                             (rx, ry, room.width * RENDER_SCALE, room.height * RENDER_SCALE), 2)
 
         # Actor placement snap grid — shown only while it's actually relevant
@@ -3549,6 +3642,32 @@ class CutsceneEditor:
             # state on self._runtime but nothing ever blitted it here.
             self._runtime.draw_weather(inter, iw, ih)
             self._runtime.draw_overlay(inter, iw, ih)
+
+    def _draw_viewport_grid(self, surf, room, cell_size=None, grid_col=(52, 66, 98)):
+        """Draw a world-unit grid onto the intermediate surface using
+        base-scale camera coords. Defaults to the room's TILE_SIZE (the
+        [G]-toggled tile grid); pass cell_size explicitly to draw a
+        different-spaced grid, e.g. the actor placement snap grid."""
+        from config.settings import TILE_SIZE
+        size     = cell_size or TILE_SIZE
+        cx, cy   = int(self.camera.x), int(self.camera.y)
+        vw, vh   = surf.get_size()
+
+        xs = (cx // RENDER_SCALE // size) * size
+        x  = xs
+        while x * RENDER_SCALE - cx <= vw:
+            sx = x * RENDER_SCALE - cx
+            if 0 <= sx <= vw:
+                surf.draw_line(grid_col, (sx, 0), (sx, vh), 1)
+            x += size
+
+        ys = (cy // RENDER_SCALE // size) * size
+        y  = ys
+        while y * RENDER_SCALE - cy <= vh:
+            sy = y * RENDER_SCALE - cy
+            if 0 <= sy <= vh:
+                surf.draw_line(grid_col, (0, sy), (vw, sy), 1)
+            y += size
 
     def _invalidate_tile_cache(self, room_name=None):
         """Drop baked tile surfaces so they are rebuilt on the next draw.
@@ -3691,79 +3810,1075 @@ class CutsceneEditor:
             if scaled:
                 inter.blit(scaled, (int(screen_x), int(screen_y)))
 
-    def _draw_viewport_grid(self, surf, room, cell_size=None, grid_col=(40, 140, 40)):
-        """Draw a world-unit grid onto the intermediate surface using
-        base-scale camera coords. Defaults to the room's TILE_SIZE (the
-        [G]-toggled tile grid); pass cell_size explicitly to draw a
-        different-spaced grid, e.g. the actor placement snap grid."""
-        from config.settings import TILE_SIZE
-        size     = cell_size or TILE_SIZE
-        cx, cy   = int(self.camera.x), int(self.camera.y)
-        vw, vh   = surf.get_size()
+    # ══════════════════════════════════════════════════════════════════════════
+    # UI primitives  (immediate-mode: draw + register hit rect in one call)
+    # ══════════════════════════════════════════════════════════════════════════
 
-        xs = (cx // RENDER_SCALE // size) * size
-        x  = xs
-        while x * RENDER_SCALE - cx <= vw:
-            sx = x * RENDER_SCALE - cx
-            if 0 <= sx <= vw:
-                surf.draw_line(grid_col, (sx, 0), (sx, vh), 1)
-            x += size
+    _ENUM_HINTS = frozenset({'dir', 'anim', 'portrait', 'invert_mode', 'weather_type',
+                             'scroll_dir', 'character', 'costume', 'music_track',
+                             'sfx_name', 'attack_type', 'color'})
 
-        ys = (cy // RENDER_SCALE // size) * size
-        y  = ys
-        while y * RENDER_SCALE - cy <= vh:
-            sy = y * RENDER_SCALE - cy
-            if 0 <= sy <= vh:
-                surf.draw_line(grid_col, (0, sy), (vw, sy), 1)
-            y += size
+    def _fh(self, size):
+        """Measured line height of font 's' / 'm' / 'l' (cached)."""
+        cache = self.__dict__.setdefault('_fh_cache', {})
+        if size not in cache:
+            font = {'s': self.font_small, 'm': self.font_medium, 'l': self.font_large}[size]
+            cache[size] = font.get_height()
+        return cache[size]
 
-    def _draw_viewport_tiles(self, inter, room, cam_x, cam_y, foreground: bool):
-        """Draw tiles for *room* onto the intermediate surface.
+    def _anim(self, key, target, speed=12.0):
+        """Eased 0..1 value per widget key, snapped to 21 steps so ui_kit's
+        rounded-rect / glow caches keep hitting instead of rebuilding."""
+        v = self._anims.get(key, 0.0)
+        v += (target - v) * min(1.0, self._dt * speed)
+        if abs(target - v) < 0.004:
+            v = float(target)
+        self._anims[key] = v
+        return round(v * 20) / 20.0
 
-        Reads directly from room.tiles (the canonical game-state list, always
-        populated from disk) rather than te.room_tiles (only populated when the
-        room editor has opened the room at least once).  Falls back to
-        te.room_tiles if room.tiles is empty, so tiles painted during the
-        current session without saving are also visible.
+    def _push_clip(self, screen, rect):
+        prev = self._clip_rect
+        r = pygame.Rect(rect)
+        if prev is not None:
+            r = r.clip(prev)
+        self._clip_stack.append(prev)
+        self._clip_rect = r
+        screen.set_clip(r)
 
-        Culls against the actual inter surface dimensions instead of the
-        tileset_editor's screen_width, which is the full game resolution and
-        would incorrectly allow tiles far outside the viewport to be drawn.
-        """
-        te = getattr(self.room_editor, 'tileset_editor', None)
-        if not te:
+    def _pop_clip(self, screen):
+        prev = self._clip_stack.pop()
+        self._clip_rect = prev
+        screen.set_clip(prev)
+
+    def _hit(self, rect, action, arg=None):
+        """Register a clickable rect (clipped to whatever panel is currently
+        being drawn, so scrolled-away widgets can't steal clicks) and return
+        True if the mouse is over it."""
+        full = pygame.Rect(rect)
+        r = full.clip(self._clip_rect) if self._clip_rect is not None else full
+        if r.w <= 0 or r.h <= 0:
+            return False
+        self._hits.append((r, action, arg, full))
+        m = self._mouse_pos
+        if not r.collidepoint(m):
+            return False
+        if not self._in_overlay and any(b.collidepoint(m) for b in self._blocks_prev):
+            return False
+        return True
+
+    def _hover(self, rect):
+        """Hover test only — does NOT register a hit, so it never swallows the
+        click (use for regions whose click is resolved elsewhere, e.g. the
+        timeline, which does its own hit-testing)."""
+        r = pygame.Rect(rect)
+        if self._clip_rect is not None:
+            r = r.clip(self._clip_rect)
+        m = self._mouse_pos
+        if r.w <= 0 or r.h <= 0 or not r.collidepoint(m):
+            return False
+        return self._in_overlay or not any(b.collidepoint(m) for b in self._blocks_prev)
+
+    def _block(self, rect):
+        """Shield a floating card: swallows clicks and stops hover on whatever
+        it covers."""
+        self._blocks.append(pygame.Rect(rect))
+        self._hit(rect, None)
+
+    def _fit(self, font, text, max_w):
+        """Trim *text* with '..' so it fits max_w pixels."""
+        if max_w <= 0:
+            return ''
+        if font.size(text)[0] <= max_w:
+            return text
+        key = (id(font), text, max_w)
+        hit = self._fit_cache.get(key)
+        if hit is not None:
+            return hit
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if font.size(text[:mid].rstrip() + '..')[0] <= max_w:
+                lo = mid
+            else:
+                hi = mid - 1
+        res = text[:lo].rstrip() + '..'
+        if len(self._fit_cache) > 800:
+            self._fit_cache.clear()
+        self._fit_cache[key] = res
+        return res
+
+    def _txt(self, screen, font, text, pos, color, anchor='topleft', dynamic=False, max_w=None):
+        if max_w is not None:
+            text = self._fit(font, text, max_w)
+        surf = font.render(text, True, color)
+        r = surf.get_rect(**{anchor: (int(pos[0]), int(pos[1]))})
+        uk.blit_surface(screen, surf, r.topleft, transient=dynamic)
+        return r
+
+    def _caret(self, screen, x, y, h, color=None):
+        """Blinking vertical caret bar (same convention RoomEditor uses)."""
+        if int(self._blink * 2) % 2 != 0:
             return
-        iw, ih = inter.get_size()
+        uk.draw_rect_on(screen, color or uk.Theme.TEXT_PRIMARY,
+                        pygame.Rect(int(x), int(y), 2, int(h)), 0, 0)
 
-        tiles = list(getattr(room, 'tiles', None) or [])
-        if not tiles:
-            # Fallback: tiles painted in the current session (room editor open)
-            tiles = te.room_tiles.get(room.name, [])
+    def _backdrop(self, screen, top, bottom):
+        w, h = self.screen_width, self.screen_height
+        uk.draw_rect_on(screen, _BG_BASE, pygame.Rect(0, 0, w, h), 0, 0)
+        uk.draw_rect_on(screen, _BG_CONTENT, pygame.Rect(0, top, w, h - top - bottom), 0, 0)
 
-        for tile in tiles:
-            if foreground and tile.layer < 0:
+    def _bar(self, screen, rect, line_at_bottom):
+        rect = pygame.Rect(rect)
+        uk.draw_rect_on(screen, _BAR_BG, rect, 0, 0)
+        ly = rect.bottom - 1 if line_at_bottom else rect.y
+        uk.draw_rect_on(screen, _BAR_LINE, pygame.Rect(rect.x, ly, rect.w, 1), 0, 0)
+
+    def _panel(self, screen, rect, border=None, border_width=1, radius=10, shadow=False):
+        uk.draw_panel(screen, rect, bg=uk.Theme.PANEL_BG, border=border or uk.Theme.PANEL_BORDER,
+                      border_width=border_width, radius=radius, shadow=shadow)
+
+    # ── Widgets ───────────────────────────────────────────────────────────────
+
+    def _draw_icon_in(self, screen, icon, rect, color):
+        if isinstance(icon, pygame.Surface):
+            uk.blit_surface(screen, icon, icon.get_rect(center=rect.center), transient=False)
+        else:
+            icon(screen, rect, color)
+
+    def _btn_width(self, label, icon=False, font=None, pad=14):
+        font = font or self.font_small
+        w = pad * 2
+        if icon:
+            w += 18 + (6 if label else 0)
+        if label:
+            w += font.size(label)[0]
+        return max(w, 32)
+
+    def _button(self, screen, rect, label=None, icon=None, action=None, arg=None,
+                accent=None, danger=False, active=False, primary=False,
+                enabled=True, font=None, key=None, radius=8):
+        """Pill / icon button in the DevMenu-RoomEditor style: dark card body,
+        hairline border that lights toward the accent on hover, soft glow.
+
+        icon may be a vector fn(surface, rect, color) or a pre-baked PNG Surface.
+        primary=True gives the gold-tinted "main action" look; active=True is
+        the latched/toggled-on look.  Returns True while hovered."""
+        rect = pygame.Rect(rect)
+        col = uk.Theme.DANGER_BRIGHT if danger else (accent or uk.Theme.GOLD)
+        hov = bool(enabled and action is not None and self._hit(rect, action, arg))
+        t = self._anim(key or f'b:{action}:{arg}', 1.0 if (hov or active) and enabled else 0.0)
+
+        if not enabled:
+            base, border, fg = _FIELD_BASE, uk.Theme.CARD_BORDER, uk.Theme.TEXT_DIM
+        elif primary:
+            base = uk.lerp_color((36, 30, 17), (52, 42, 21), t)
+            border = uk.lerp_color(uk.lerp_color(uk.Theme.CARD_BORDER, col, 0.55), col, t)
+            fg = uk.lerp_color(col, uk.Theme.GOLD_BRIGHT if not danger else col, t)
+        elif danger:
+            base = uk.lerp_color(_ROW_BASE, (34, 22, 22), t)
+            border = uk.lerp_color(uk.Theme.CARD_BORDER, col, t)
+            fg = uk.lerp_color(uk.Theme.TEXT_SECONDARY, col, t)
+        else:
+            base = uk.lerp_color(_ROW_BASE, _ROW_HOVER, t)
+            border = uk.lerp_color(uk.Theme.CARD_BORDER, col, t if active else t * 0.78)
+            fg = uk.lerp_color(uk.Theme.TEXT_SECONDARY, col, t)
+            if active:
+                base = uk.lerp_color(base, col, 0.13)
+        bw = 1 + (1 if (t > 0.5 and not primary) else 0)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border, border_width=bw,
+                      radius=radius, shadow=False)
+        if enabled and t > 0.01:
+            uk.draw_soft_glow(screen, rect.center, min(34, max(rect.w, rect.h) // 2 + 4),
+                              col, max_alpha=int(26 * t))
+
+        font = font or self.font_small
+        if label is None and icon is not None:
+            box = pygame.Rect(0, 0, min(rect.w, rect.h) - 10, min(rect.w, rect.h) - 10)
+            box.center = rect.center
+            self._draw_icon_in(screen, icon, box, fg)
+        elif label is not None:
+            lab = font.render(label, True, fg)
+            if icon is not None:
+                gap, isz = 6, 18
+                total = isz + gap + lab.get_width()
+                x0 = rect.centerx - total // 2
+                self._draw_icon_in(screen, icon, pygame.Rect(x0, rect.centery - isz // 2, isz, isz), fg)
+                uk.blit_surface(screen, lab, lab.get_rect(midleft=(x0 + isz + gap, rect.centery)).topleft)
+            else:
+                uk.blit_surface(screen, lab, lab.get_rect(center=rect.center).topleft)
+        return hov
+
+    def _field(self, screen, rect, text, focused, field_arg, placeholder='', font=None):
+        """Single-line text box.  Shows the tail of long text with the caret
+        after it (like any normal input) instead of overflowing."""
+        rect = pygame.Rect(rect)
+        font = font or self.font_medium
+        hov = self._hit(rect, 'field', field_arg)
+        r = rect.clip(self._clip_rect) if self._clip_rect is not None else rect
+        if r.w > 0 and r.h > 0:
+            self._text_rects.append(r)
+        t = self._anim(f'f:{field_arg}', 1.0 if hov else 0.0)
+        base = uk.lerp_color(_FIELD_BASE, _FIELD_HOVER, t)
+        border = uk.Theme.GOLD if focused else uk.lerp_color(uk.Theme.CARD_BORDER, uk.Theme.GOLD, t * 0.78)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border,
+                      border_width=2 if focused else 1 + round(t), radius=8, shadow=False)
+
+        inner = rect.inflate(-24, -4)
+        self._push_clip(screen, inner)
+        shown = text if text else ''
+        color = uk.Theme.TEXT_PRIMARY if (shown or focused) else uk.Theme.TEXT_DIM
+        if not shown and not focused and placeholder:
+            shown = placeholder
+        surf = font.render(shown, True, color)
+        x = inner.x if surf.get_width() <= inner.w - 4 else inner.right - surf.get_width() - 4
+        pos = (x, rect.centery - surf.get_height() // 2)
+        uk.blit_surface(screen, surf, pos, transient=True)
+        if focused:
+            cx = x + (surf.get_width() + 2 if text else 0)
+            self._caret(screen, cx, rect.centery - self._fh('m') // 2, self._fh('m'))
+        self._pop_clip(screen)
+        return hov
+
+    def _wrap_text(self, font, text, max_w):
+        """Word-wrap *text* to fit *max_w* pixels.  Preserves explicit '\\n'
+        hard breaks; oversized single words are hard-broken character by
+        character so nothing can exceed max_w.  Always returns >= 1 line."""
+        max_w = max(1, max_w)
+        lines = []
+        for paragraph in (text.split('\n') if text is not None else ['']):
+            if paragraph == '':
+                lines.append('')
                 continue
-            if not foreground and tile.layer >= 0:
+            current = ''
+            for word in paragraph.split(' '):
+                candidate = word if current == '' else current + ' ' + word
+                if font.size(candidate)[0] <= max_w:
+                    current = candidate
+                    continue
+                if current != '':
+                    lines.append(current)
+                    current = ''
+                if font.size(word)[0] <= max_w:
+                    current = word
+                else:
+                    chunk = ''
+                    for ch in word:
+                        if font.size(chunk + ch)[0] <= max_w:
+                            chunk += ch
+                        else:
+                            if chunk:
+                                lines.append(chunk)
+                            chunk = ch
+                    current = chunk
+            lines.append(current)
+        return lines or ['']
+
+    def _text_area(self, screen, x, y, W, key, buf, focused, max_lines):
+        """Discord-style multiline box that grows downward as the text wraps
+        (dialogue lines).  Returns the y just below it."""
+        font = self.font_medium
+        pad_x, pad_y = 12, 8
+        line_h = self._fh('m') + 4
+        lines = self._wrap_text(font, buf or '', W - pad_x * 2)
+        n_rows = int(_clamp(len(lines), 2, max(2, max_lines)))
+        rect = pygame.Rect(x, y, W, pad_y * 2 + n_rows * line_h)
+
+        hov = self._hit(rect, 'field', ('form', key))
+        r = rect.clip(self._clip_rect) if self._clip_rect is not None else rect
+        if r.w > 0 and r.h > 0:
+            self._text_rects.append(r)
+        t = self._anim(f'ta:{key}', 1.0 if hov else 0.0)
+        base = uk.lerp_color(_FIELD_BASE, _FIELD_HOVER, t)
+        border = uk.Theme.GOLD if focused else uk.lerp_color(uk.Theme.CARD_BORDER, uk.Theme.GOLD, t * 0.78)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border,
+                      border_width=2 if focused else 1 + round(t), radius=8, shadow=False)
+
+        self._push_clip(screen, rect.inflate(-pad_x, -pad_y))
+        start = max(0, len(lines) - n_rows)      # keep the caret's line in view
+        for i, line in enumerate(lines[start:start + n_rows]):
+            ly = rect.y + pad_y + i * line_h
+            if line:
+                surf = font.render(line, True, uk.Theme.TEXT_PRIMARY)
+                uk.blit_surface(screen, surf, (rect.x + pad_x, ly), transient=True)
+            if focused and start + i == len(lines) - 1:
+                cx = rect.x + pad_x + (font.size(line)[0] + 2 if line else 0)
+                self._caret(screen, cx, ly, self._fh('m'))
+        self._pop_clip(screen)
+        return rect.bottom
+
+    def _select(self, screen, rect, text, pick_action, pick_arg=None, prev=None, nxt=None,
+                dim=False, swatch=None, dot=None, key=None, arrow_w=32, caret=True):
+        """Value picker:  [ ‹ ] [  value  v ] [ › ]   — the arrows step through
+        the options, the middle opens the shared dropdown.  prev/nxt are
+        (action, arg) tuples, or None for a dropdown-only picker."""
+        rect = pygame.Rect(rect)
+        az = arrow_w if prev else 0
+        left = pygame.Rect(rect.x, rect.y, az, rect.h)
+        right = pygame.Rect(rect.right - az, rect.y, az, rect.h)
+        mid = pygame.Rect(rect.x + az, rect.y, rect.w - 2 * az, rect.h)
+
+        k = key or f'sel:{pick_action}:{pick_arg}'
+        hm = self._hit(mid, pick_action, pick_arg)
+        hl = bool(prev) and self._hit(left, prev[0], prev[1])
+        hr = bool(nxt) and self._hit(right, nxt[0], nxt[1])
+        tm = self._anim(k + ':m', 1.0 if hm else 0.0)
+        tl_ = self._anim(k + ':l', 1.0 if hl else 0.0)
+        tr_ = self._anim(k + ':r', 1.0 if hr else 0.0)
+        t_any = max(tm, tl_, tr_)
+
+        base = uk.lerp_color(_FIELD_BASE, _FIELD_HOVER, t_any)
+        border = uk.lerp_color(uk.Theme.CARD_BORDER, uk.Theme.GOLD, t_any * 0.78)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border,
+                      border_width=1 + round(t_any), radius=8, shadow=False)
+
+        if prev:
+            for zone, tz, fn in ((left, tl_, _icon_chev_l), (right, tr_, _icon_chev_r)):
+                if tz > 0.01:
+                    uk.draw_rect_on(screen, (255, 255, 255, int(16 * tz)), zone.inflate(-6, -6), 0, 6)
+                fn(screen, zone, uk.lerp_color(uk.Theme.TEXT_MUTED, uk.Theme.GOLD, tz))
+            for x in (left.right, right.x):
+                uk.draw_rect_on(screen, uk.Theme.CARD_BORDER,
+                                pygame.Rect(x, rect.y + 7, 1, rect.h - 14), 0, 0)
+
+        # value (+ optional swatch / track dot), centred in the middle zone
+        cw = 14 if caret else 0
+        avail = mid.w - 16 - cw
+        color = uk.Theme.TEXT_DIM if dim else uk.lerp_color(uk.Theme.TEXT_PRIMARY, uk.Theme.GOLD_BRIGHT, tm)
+        lead = 0
+        if swatch is not None:
+            lead = 22
+        elif dot is not None:
+            lead = 16
+        surf = self.font_medium.render(self._fit(self.font_medium, text, max(10, avail - lead)), True, color)
+        total = lead + surf.get_width()
+        x0 = mid.centerx - cw // 2 - total // 2
+        if swatch is not None:
+            sw = pygame.Rect(x0, mid.centery - 7, 16, 14)
+            uk.draw_rect_on(screen, swatch, sw, 0, 4)
+            uk.draw_rect_on(screen, uk.Theme.CARD_BORDER, sw, 1, 4)
+        elif dot is not None:
+            uk.draw_circle_on(screen, dot, (x0 + 5, mid.centery), 5)
+        uk.blit_surface(screen, surf, surf.get_rect(midleft=(x0 + lead, mid.centery)).topleft)
+        if caret:
+            _icon_chev_d(screen, pygame.Rect(mid.right - cw - 8, mid.centery - 8, cw, 16),
+                         uk.lerp_color(uk.Theme.TEXT_DIM, uk.Theme.GOLD, tm))
+        return hm
+
+    def _switch_row(self, screen, rect, text, checked, action, arg):
+        """Full-width toggle row: value text on the left, iOS-style switch right."""
+        rect = pygame.Rect(rect)
+        hov = self._hit(rect, action, arg)
+        t = self._anim(f'sw:{action}:{arg}', 1.0 if hov else 0.0)
+        on = self._anim(f'swv:{action}:{arg}', 1.0 if checked else 0.0, speed=16.0)
+        base = uk.lerp_color(_FIELD_BASE, _FIELD_HOVER, t)
+        border = uk.lerp_color(uk.Theme.CARD_BORDER, uk.Theme.GOLD, t * 0.78)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border,
+                      border_width=1 + round(t), radius=8, shadow=False)
+        self._txt(screen, self.font_medium, text, (rect.x + 12, rect.centery),
+                  uk.lerp_color(uk.Theme.TEXT_SECONDARY, uk.Theme.TEXT_PRIMARY, on), anchor='midleft')
+        track = pygame.Rect(0, 0, 40, 20)
+        track.midright = (rect.right - 12, rect.centery)
+        uk.draw_rect_on(screen, uk.lerp_color((44, 49, 63), uk.Theme.GOLD, on), track, 0, 10)
+        kx = int(track.x + 10 + on * (track.w - 20))
+        uk.draw_circle_on(screen, uk.lerp_color(uk.Theme.TEXT_MUTED, (24, 20, 10), on), (kx, track.centery), 7)
+        return hov
+
+    def _label(self, screen, x, y, text, color=None, max_w=None):
+        self._txt(screen, self.font_small, text.upper(), (x, y),
+                  color or uk.Theme.TEXT_MUTED, max_w=max_w)
+        return y + self._fh('s') + 5
+
+    def _section(self, screen, x, y, W, text):
+        """Small dim caption with a hairline running out to the right edge."""
+        r = self._txt(screen, self.font_small, text.upper(), (x, y), uk.Theme.TEXT_DIM)
+        uk.draw_rect_on(screen, uk.Theme.CARD_BORDER,
+                        pygame.Rect(r.right + 8, r.centery, max(0, x + W - r.right - 8), 1), 0, 0)
+        return y + self._fh('s') + 9
+
+    def _chip(self, screen, x, y, text, color, font=None, anchor='topleft', border=None,
+              bg=(10, 12, 18, 220), dynamic=True):
+        """Small rounded label plate (viewport HUD, badges).  Width snaps to
+        a multiple of 8 so live-changing text doesn't fill ui_kit's shape
+        cache with one entry per pixel width."""
+        font = font or self.font_small
+        surf = font.render(text, True, color)
+        w = int(math.ceil((surf.get_width() + 20) / 8.0) * 8)
+        h = surf.get_height() + 12
+        r = pygame.Rect(0, 0, w, h)
+        setattr(r, anchor, (int(x), int(y)))
+        uk.draw_panel(screen, r, bg=bg, border=border or uk.Theme.CARD_BORDER,
+                      border_width=1, radius=7, shadow=False)
+        uk.blit_surface(screen, surf, surf.get_rect(center=r.center).topleft, transient=dynamic)
+        return r
+
+    def _scrollbar(self, screen, track, scroll, content_h, view_h):
+        """Slim thumb along the right edge of a scrolling area."""
+        if content_h <= view_h + 1:
+            return
+        track = pygame.Rect(track)
+        th = max(24, int(track.h * view_h / content_h))
+        span = max(1, content_h - view_h)
+        ty = track.y + int((track.h - th) * (scroll / span))
+        uk.draw_rect_on(screen, (255, 255, 255, 34), pygame.Rect(track.x, ty, 4, th), 0, 2)
+
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Edit view
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _draw_edit(self, screen):
+        self._backdrop(screen, self.header_h, 0)
+        self._draw_viewport_panel(screen)
+        self._draw_left_panel(screen)
+        self._draw_right_panel(screen)
+        self._draw_timeline(screen)
+        self._draw_edit_header(screen)
+        self._draw_actor_form(screen)
+
+    # ── Header ────────────────────────────────────────────────────────────────
+
+    def _draw_edit_header(self, screen):
+        w, hh = self.screen_width, self.header_h
+        self._bar(screen, pygame.Rect(0, 0, w, hh), line_at_bottom=True)
+        pad, bs = 12, hh - 16
+
+        # Back (same PNG icon the dev menu / room editor headers use)
+        self._button(screen, pygame.Rect(pad, 8, bs, bs), icon=self._icon_back_sm,
+                     action='back', key='hdr:back')
+
+        # ── right cluster: grid · save ─────────────────────────────────────────
+        xr = w - pad
+        sw = self._btn_width('Save', True)
+        save_r = pygame.Rect(xr - sw, 8, sw, bs)
+        xr = save_r.x - 8
+        gw = self._btn_width('Grid', True)
+        grid_r = pygame.Rect(xr - gw, 8, gw, bs)
+        self._button(screen, grid_r, 'Grid', _icon_grid, 'grid_toggle', active=self._show_grid,
+                     key='hdr:grid')
+        self._button(screen, save_r, 'Save', self._icon_save_png, 'save', primary=self.unsaved,
+                     key='hdr:save')
+
+        # ── centre block: timecode + play ─────────────────────────────────────
+        tc_w = 172
+        pw = max(self._btn_width('Play', True), self._btn_width('Stop', True)) + 10
+        block_w = tc_w + 10 + pw
+        left_end = pad + bs + 14
+        cl = (w - block_w) // 2
+        cl = min(cl, grid_r.x - block_w - 24)
+        cl = max(cl, left_end + 150)
+
+        tc = pygame.Rect(cl, 8, tc_w, bs)
+        uk.draw_panel(screen, tc, bg=(*_FIELD_BASE, 255),
+                      border=uk.Theme.GOLD if self._playing else uk.Theme.CARD_BORDER,
+                      border_width=1, radius=8, shadow=False)
+        dur = self.cutscene_data.get('duration', 10.0) if self.cutscene_data else 10.0
+        cur = self.font_medium.render(f'{self._tl_playhead_t:05.2f}', True,
+                                      uk.Theme.GOLD_BRIGHT if self._playing else uk.Theme.TEXT_PRIMARY)
+        tot = self.font_small.render(f' / {dur:.2f}', True, uk.Theme.TEXT_DIM)
+        gx = tc.centerx - (cur.get_width() + tot.get_width()) // 2
+        uk.blit_surface(screen, cur, (gx, tc.centery - cur.get_height() // 2), transient=True)
+        uk.blit_surface(screen, tot, (gx + cur.get_width(), tc.centery - tot.get_height() // 2 + 2),
+                        transient=True)
+
+        play_r = pygame.Rect(tc.right + 10, 8, pw, bs)
+        if self._playing:
+            self._button(screen, play_r, 'Stop', _icon_stop, 'play', danger=True, key='hdr:play')
+        else:
+            self._button(screen, play_r, 'Play', _icon_play, 'play', primary=True, key='hdr:play')
+
+        # ── left block: name · unsaved dot · length ───────────────────────────
+        len_w, len_lbl = 84, 'LENGTH'
+        lbl_w = self.font_small.size(len_lbl)[0] + 10
+        x = left_end
+        if self.unsaved:
+            uk.draw_circle_on(screen, uk.Theme.GOLD, (x + 4, hh // 2), 4)
+            x += 16
+        name = self.cutscene_name or 'untitled'
+        name_max = max(40, (cl - 24) - x - (lbl_w + len_w + 28))
+        name_r = self._txt(screen, self.font_large, name, (x, hh // 2), uk.Theme.TEXT_PRIMARY,
+                           anchor='midleft', max_w=name_max)
+        len_x = name_r.right + 28 + lbl_w
+        self._txt(screen, self.font_small, len_lbl, (len_x - lbl_w + 2, hh // 2),
+                  uk.Theme.TEXT_MUTED, anchor='midleft')
+        field = pygame.Rect(len_x, 10, len_w, hh - 20)
+        shown = self._duration_buf if self._duration_focus else f'{dur:g}s'
+        self._field(screen, field, shown, self._duration_focus, ('duration', None),
+                    font=self.font_small)
+
+    # ── Scene panel (left) ────────────────────────────────────────────────────
+
+    def _draw_left_panel(self, screen):
+        fr = self._left_frame
+        self._panel(screen, fr)
+        pad = 12
+        x, W = fr.x + pad, fr.w - pad * 2
+        view_h = fr.h - 20
+        self._left_scroll = int(_clamp(self._left_scroll, 0, max(0, self._left_content_h - view_h)))
+        ch = self._ctl_h
+
+        self._push_clip(screen, pygame.Rect(fr.x + 3, fr.y + 6, fr.w - 6, fr.h - 12))
+        y0 = fr.y + 12 - self._left_scroll
+        y = y0
+
+        # Room — dropdown-only middle keeps room names readable; the arrows
+        # still step through the list one room at a time.
+        y = self._section(screen, x, y, W, 'Room')
+        room = self.cutscene_data.get('room', '') if self.cutscene_data else ''
+        self._select(screen, pygame.Rect(x, y, W, ch), room or '(none)', 'room_pick',
+                     prev=('room_prev', None), nxt=('room_next', None),
+                     dot=_ROOM_COLOR, key='sel:scene_room', arrow_w=28, caret=False)
+        y += ch + 18
+
+        # Actor tools sit above the (long, scrolling) layer list so the
+        # controls you reach for most never need scrolling to.
+        y = self._section(screen, x, y, W, 'Actors')
+        half = (W - 8) // 2
+        self._button(screen, pygame.Rect(x, y, half, ch), 'Actor', _icon_plus, 'actor_add',
+                     accent=_ROOM_COLOR, active=self._actor_form, key='left:add')
+        can_del = 0 <= self._actor_sel < len(self.cutscene_data.get('actors', []) if self.cutscene_data else [])
+        self._button(screen, pygame.Rect(x + half + 8, y, W - half - 8, ch), 'Delete', self._icon_trash_png,
+                     'actor_del', danger=True, enabled=can_del, key='left:del')
+        y += ch + 8
+        snap_w = int(W * 0.62)
+        self._button(screen, pygame.Rect(x, y, snap_w, ch), 'Snap', _icon_grid, 'actor_snap_toggle',
+                     active=self._actor_snap_enabled, key='left:snap')
+        self._button(screen, pygame.Rect(x + snap_w + 8, y, W - snap_w - 8, ch),
+                     f'{self._actor_snap_sizes[self._actor_snap_idx]} px', None,
+                     'actor_snap_size', key='left:snapsz')
+        y += ch + 18
+
+        # Layers — the four fixed tracks are read-only, so they collapse into a
+        # 2 x 2 chip grid; the interactive actor rows follow right under it.
+        y = self._section(screen, x, y, W, 'Layers')
+        actions = self.cutscene_data.get('actions', []) if self.cutscene_data else []
+        tracks = self._tl_tracks()
+        cw = (W - 6) // 2
+        for k, (label, color, target) in enumerate(tracks[:4]):
+            chip = pygame.Rect(x + (k % 2) * (cw + 6), y + (k // 2) * 30, cw, 26)
+            uk.draw_panel(screen, chip, bg=(*_FIELD_BASE, 255), border=uk.Theme.CARD_BORDER,
+                          border_width=1, radius=8, shadow=False)
+            uk.draw_circle_on(screen, color, (chip.x + 12, chip.centery), 4)
+            n = sum(1 for a in actions if a.get('target') == target)
+            nw = 0
+            if n:
+                nr = self._txt(screen, self.font_small, str(n), (chip.right - 9, chip.centery),
+                               uk.Theme.TEXT_MUTED, anchor='midright')
+                nw = nr.w + 6
+            self._txt(screen, self.font_small, label, (chip.x + 24, chip.centery),
+                      uk.Theme.TEXT_MUTED, anchor='midleft', max_w=cw - 24 - nw - 8)
+        y += 62
+
+        for ti, (label, color, target) in enumerate(tracks[4:], start=4):
+            aidx = ti - 4
+            selected = aidx == self._actor_sel
+            row = pygame.Rect(x, y, W, 30)
+            hov = self._hit(row, 'actor_row', aidx)
+            t = self._anim(f'layer:{ti}', 1.0 if hov else 0.0)
+            base = uk.lerp_color(_ROW_BASE, _ROW_HOVER, t)
+            if selected:
+                base = uk.Theme.CARD_BG_SELECTED[:3]
+            border = uk.Theme.GOLD if selected else uk.lerp_color(uk.Theme.CARD_BORDER, uk.Theme.GOLD, t * 0.78)
+            uk.draw_panel(screen, row, bg=(*base, 255), border=border,
+                          border_width=1 + (1 if selected else 0), radius=8, shadow=False)
+            uk.draw_circle_on(screen, color, (row.x + 15, row.centery), 5)
+            n = sum(1 for a in actions if a.get('target') == target)
+            badge_w = 0
+            if n:
+                bs_ = self.font_small.render(str(n), True, uk.Theme.TEXT_MUTED)
+                badge = pygame.Rect(0, 0, max(20, bs_.get_width() + 10), 18)
+                badge.midright = (row.right - 8, row.centery)
+                uk.draw_rect_on(screen, uk.Theme.CHIP_BG[:3], badge, 0, 6)
+                uk.blit_surface(screen, bs_, bs_.get_rect(center=badge.center).topleft)
+                badge_w = badge.w + 8
+            self._txt(screen, self.font_small, label, (row.x + 28, row.centery),
+                      uk.Theme.TEXT_PRIMARY if (selected or hov) else uk.Theme.TEXT_SECONDARY,
+                      anchor='midleft', max_w=W - 28 - badge_w - 8)
+            y += 34
+        if not (self.cutscene_data and self.cutscene_data.get('actors')):
+            y += 2
+            for line in self._wrap_text(self.font_small, 'No actors yet. Add one to give it a track.', W):
+                self._txt(screen, self.font_small, line, (x, y), uk.Theme.TEXT_DIM)
+                y += self._fh('s') + 3
+        else:
+            y += 4
+            for line in self._wrap_text(self.font_small, 'Drag an actor in the viewport to move it.', W):
+                self._txt(screen, self.font_small, line, (x, y), uk.Theme.TEXT_DIM)
+                y += self._fh('s') + 3
+
+        self._left_content_h = (y + 6) - (y0 - 12) + 8
+        self._pop_clip(screen)
+        self._scrollbar(screen, pygame.Rect(fr.right - 8, fr.y + 8, 4, fr.h - 16),
+                        self._left_scroll, self._left_content_h, view_h)
+
+    # ── Floating "add actor" card ─────────────────────────────────────────────
+
+    def _draw_actor_form(self, screen):
+        if not self._actor_form or self._pick_mode == 'pick_actor' or not self.cutscene_data:
+            return
+        vf = self._vp_frame
+        ch, fs = 32, self._fh('s')
+        pad, gap = 12, 8
+        W = min(300, vf.w - 24)
+        row_h = fs + 5 + ch + gap
+        # Size the card to its content.  The one-line hint is the first thing
+        # to go on a short viewport; the card itself is never clipped, because
+        # its primary button ("Place in viewport") must always be reachable.
+        avail = vf.h - 16
+        with_hint = True
+        H = pad + 34 + row_h * 3 + (fs + 8) + 36 + pad
+        if H > avail:
+            with_hint = False
+            H -= fs + 8
+        rect = pygame.Rect(vf.x + 12, vf.y + 8, W, H)
+        rect.bottom = min(rect.bottom, self.screen_height - 6)
+
+        self._in_overlay = True
+        self._block(rect)
+        uk.draw_panel(screen, rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD,
+                      border_width=1, radius=10, shadow=True)
+        x, iw, y = rect.x + pad, rect.w - pad * 2, rect.y + pad
+
+        self._txt(screen, self.font_medium, 'ADD ACTOR', (x, y + 13), uk.Theme.GOLD, anchor='midleft')
+        self._button(screen, pygame.Rect(rect.right - pad - 26, y, 26, 26), icon=_icon_close,
+                     action='actor_form_close', key='af:close')
+        y += 34
+
+        atype = _ACTOR_TYPES[self._actor_type_idx % len(_ACTOR_TYPES)]
+        y = self._label(screen, x, y, 'Type')
+        self._select(screen, pygame.Rect(x, y, iw, ch), atype, 'actor_type_pick',
+                     prev=('actor_type_prev', None), nxt=('actor_type_next', None), key='sel:af_type')
+        y += ch + gap
+
+        y = self._label(screen, x, y, 'Actor ID')
+        self._field(screen, pygame.Rect(x, y, iw, ch), self._actor_id_buf,
+                    self._actor_focus == 'id', ('actor', 'id'), placeholder='actor_0')
+        y += ch + gap
+
+        # Which entity to spawn — always picked from the entity catalogue
+        # (or the player character folder), never typed by hand.
+        etype_labels = {'enemy': 'Enemy', 'boss': 'Boss', 'npc': 'NPC', 'player': 'Character'}
+        y = self._label(screen, x, y, etype_labels[atype])
+        self._select(screen, pygame.Rect(x, y, iw, ch), self._actor_etype_buf or '(none found)',
+                     'actor_etype_pick', dim=not self._actor_etype_buf, key='sel:af_etype')
+        y += ch + gap
+
+        if with_hint:
+            self._txt(screen, self.font_small, 'Then click the viewport.', (x, y), uk.Theme.TEXT_DIM,
+                      max_w=iw)
+            y += fs + 8
+        self._button(screen, pygame.Rect(x, y, iw, 36), 'Place in viewport', self._icon_pick_png,
+                     'actor_place_confirm', primary=True, key='af:place')
+        self._in_overlay = False
+
+    # ── Inspector (right) ─────────────────────────────────────────────────────
+
+    def _draw_right_panel(self, screen):
+        fr = self._right_frame
+        self._panel(screen, fr)
+        pad = 14
+        x, W = fr.x + pad, fr.w - pad * 2
+        fs = self._fh('s')
+
+        y = fr.y + 14
+        self._txt(screen, self.font_small, 'INSPECTOR', (x, y), uk.Theme.TEXT_DIM)
+        if self._form_active:
+            new = self._form_new
+            self._chip(screen, fr.right - pad, y - 5, 'NEW' if new else 'EDIT',
+                       uk.Theme.GOLD_BRIGHT if new else uk.Theme.KI_BLUE, anchor='topright',
+                       border=uk.Theme.GOLD if new else uk.Theme.KI_BLUE, dynamic=False)
+        y += fs + 10
+        uk.draw_rect_on(screen, uk.Theme.CARD_BORDER, pygame.Rect(x, y, W, 1), 0, 0)
+        y += 10
+
+        actions_h = 56 if self._form_active else 0
+        body = pygame.Rect(fr.x + 3, y, fr.w - 6, fr.bottom - 8 - actions_h - y)
+
+        # A different form (new action / another keyframe) starts scrolled to the top
+        form_key = (self._form_active, self._form_new, self._tl_sel)
+        if form_key != getattr(self, '_insp_key', None):
+            self._insp_key = form_key
+            self._insp_scroll = 0
+        self._insp_scroll = int(_clamp(self._insp_scroll, 0, max(0, self._insp_content_h - body.h)))
+
+        self._push_clip(screen, body)
+        top = body.y - self._insp_scroll
+        if self._form_active:
+            end = self._draw_action_form(screen, x, top, W)
+        else:
+            end = self._draw_inspector_idle(screen, x, top, W)
+        self._insp_content_h = (end - top) + 6
+        self._pop_clip(screen)
+        self._scrollbar(screen, pygame.Rect(fr.right - 8, body.y + 2, 4, body.h - 4),
+                        self._insp_scroll, self._insp_content_h, body.h)
+
+        if self._form_active:
+            fy = fr.bottom - 12 - 34
+            uk.draw_rect_on(screen, uk.Theme.CARD_BORDER, pygame.Rect(x, fy - 11, W, 1), 0, 0)
+            ok_w = int((W - 8) * 0.56)
+            self._button(screen, pygame.Rect(x, fy, ok_w, 34), 'Apply', None, 'form_commit',
+                         primary=True, key='insp:ok')
+            self._button(screen, pygame.Rect(x + ok_w + 8, fy, W - ok_w - 8, 34), 'Cancel', None,
+                         'form_cancel', danger=True, key='insp:cancel')
+
+    def _draw_inspector_idle(self, screen, x, y, W):
+        """Nothing being edited: a gentle empty state, plus a read-only summary
+        of the selected action if there is one."""
+        actions = self.cutscene_data.get('actions', []) if self.cutscene_data else []
+        sel = actions[self._tl_sel] if 0 <= self._tl_sel < len(actions) else None
+
+        if sel is None:
+            y += 18
+            self._txt(screen, self.font_medium, 'Nothing selected', (x + W // 2, y),
+                      uk.Theme.TEXT_SECONDARY, anchor='midtop')
+            y += self._fh('m') + 8
+            for line in self._wrap_text(self.font_small,
+                                        'Click a keyframe on the timeline to edit it, or add a new action.', W - 8):
+                self._txt(screen, self.font_small, line, (x + W // 2, y), uk.Theme.TEXT_MUTED, anchor='midtop')
+                y += self._fh('s') + 4
+            y += 14
+            self._button(screen, pygame.Rect(x, y, W, 36), 'New action', _icon_plus, 'tl_add',
+                         primary=True, key='insp:new')
+            return y + 36
+
+        # Selected-action summary card
+        color = self._target_color(sel.get('target', ''))
+        card_pad = 12
+        params = _ACTION_PARAMS.get(sel.get('type', ''), [])
+        rows = [('Time', f'{sel.get("time", 0.0):.2f} s'),
+                ('Target', sel.get('target', '')),
+                ('Action', str(sel.get('type', '')).replace('_', ' '))]
+        for key, label, hint in params:
+            val = str(sel.get('params', {}).get(key, ''))
+            rows.append((label, val if val != '' else self._empty_label(hint)))
+        line_h = self._fh('s') + 8
+        H = card_pad * 2 + line_h * len(rows)
+        card = pygame.Rect(x, y, W, H)
+        uk.draw_panel(screen, card, bg=(*_ROW_BASE, 255), border=uk.Theme.CARD_BORDER,
+                      border_width=1, radius=8, shadow=False)
+        uk.draw_rect_on(screen, color, pygame.Rect(card.x + 1, card.y + 10, 3, card.h - 20), 0, 1)
+        cy = card.y + card_pad
+        for k, v in rows:
+            self._txt(screen, self.font_small, k, (card.x + card_pad + 4, cy), uk.Theme.TEXT_MUTED,
+                      max_w=W // 2 - 20)
+            self._txt(screen, self.font_small, v, (card.right - card_pad, cy), uk.Theme.TEXT_PRIMARY,
+                      anchor='topright', max_w=W // 2 - 4)
+            cy += line_h
+        y = card.bottom + 12
+        self._button(screen, pygame.Rect(x, y, W, 34), 'Edit action', self._icon_pick_png, 'summary_edit',
+                     key='insp:edit')
+        y += 34 + 8
+        self._button(screen, pygame.Rect(x, y, W, 34), 'New action', _icon_plus, 'tl_add',
+                     primary=True, key='insp:new2')
+        return y + 34
+
+    # ── Action form ───────────────────────────────────────────────────────────
+
+    _PICK_FOR_PAIR = {
+        ('x', 'y'): (('pan_to', 'snap_to', 'move_to', 'fly_to', 'teleport'), None,
+                     'Pick X, Y in viewport'),
+        ('start_x', 'start_y'): (('pan_to',), 'pick_pan_to_start', 'Pick start X, Y in viewport'),
+        ('target_x', 'target_y'): (('attack',), 'pick_attack_target', 'Pick beam stop in viewport'),
+    }
+
+    def _draw_action_form(self, screen, x, y, W):
+        ch, gap = self._ctl_h, 12
+        tcol = self._target_color(self._form_target)
+
+        y = self._label(screen, x, y, 'Time (sec)')
+        self._field(screen, pygame.Rect(x, y, W, ch), self._form_time_buf,
+                    self._form_focus == 'time', ('form', 'time'), placeholder='0.0')
+        y += ch + gap
+
+        y = self._label(screen, x, y, 'Target')
+        self._select(screen, pygame.Rect(x, y, W, ch), self._form_target, 'form_target_pick',
+                     prev=('form_target_prev', None), nxt=('form_target_next', None),
+                     dot=tcol, key='sel:form_target')
+        y += ch + gap
+
+        y = self._label(screen, x, y, 'Action')
+        self._select(screen, pygame.Rect(x, y, W, ch), self._form_type.replace('_', ' '),
+                     'form_type_pick', prev=('form_type_prev', None), nxt=('form_type_next', None),
+                     key='sel:form_type')
+        y += ch + gap + 2
+
+        y = self._section(screen, x, y, W, 'Parameters')
+
+        params = _ACTION_PARAMS.get(self._form_type, [])
+        if not params:
+            for line in self._wrap_text(self.font_small, 'This action has no parameters.', W):
+                self._txt(screen, self.font_small, line, (x, y), uk.Theme.TEXT_DIM)
+                y += self._fh('s') + 3
+            y += 6
+
+        # Adjacent X / Y params share one row.
+        pair_of = {'x': 'y', 'start_x': 'start_y', 'target_x': 'target_y'}
+        items, i = [], 0
+        while i < len(params):
+            k = params[i][0]
+            if k in pair_of and i + 1 < len(params) and params[i + 1][0] == pair_of[k]:
+                items.append(('pair', params[i], params[i + 1]))
+                i += 2
+            else:
+                items.append(('single', params[i]))
+                i += 1
+
+        for item in items:
+            if item[0] == 'pair':
+                (kx, lx, _hx), (ky, ly, _hy) = item[1], item[2]
+                half = (W - 8) // 2
+                self._label(screen, x, y, lx, max_w=half)
+                y = self._label(screen, x + half + 8, y, ly, max_w=half)
+                self._field(screen, pygame.Rect(x, y, half, ch), self._form_params.get(kx, ''),
+                            self._form_focus == kx, ('form', kx))
+                self._field(screen, pygame.Rect(x + half + 8, y, W - half - 8, ch),
+                            self._form_params.get(ky, ''), self._form_focus == ky, ('form', ky))
+                y += ch + 8
+                types, pick_name, pick_label = self._PICK_FOR_PAIR.get((kx, ky), ((), None, ''))
+                if self._form_type in types:
+                    name = pick_name or f'pick_{self._form_type}'
+                    self._button(screen, pygame.Rect(x, y, W, 30), pick_label, self._icon_pick_png, 'pick', name,
+                                 active=(self._pick_mode == name), key=f'pick:{name}')
+                    y += 30 + 8
+                y += gap - 8
                 continue
 
-            tileset = te.tileset_manager.get_tileset(tile.tileset_name)
-            if not tileset:
+            key, label, hint = item[1]
+            buf = self._form_params.get(key, '')
+            if hint == 'room':
+                y = self._label(screen, x, y, 'Room group')
+                self._select(screen, pygame.Rect(x, y, W, ch), self._form_room_group or 'All groups',
+                             'room_group_pick', prev=('room_group_prev', None),
+                             nxt=('room_group_next', None), key='sel:rgroup')
+                y += ch + 8
+                y = self._label(screen, x, y, label)
+                self._select(screen, pygame.Rect(x, y, W, ch), buf or '(none)', 'room_name_pick',
+                             prev=('room_name_prev', None), nxt=('room_name_next', None),
+                             dim=not buf, dot=_ROOM_COLOR, key='sel:rname')
+                y += ch + gap
                 continue
 
-            # Use the cached pre-scaled surface to avoid per-frame rescaling
-            scaled = tileset.get_scaled_tile_surface(tile.tile_x, tile.tile_y,
-                                                     RENDER_SCALE)
-            if not scaled:
-                continue
+            y = self._label(screen, x, y, label, max_w=W)
+            if hint == 'bool':
+                on = buf != 'False'
+                self._switch_row(screen, pygame.Rect(x, y, W, ch), 'On' if on else 'Off', on,
+                                 'param_toggle', key)
+                y += ch + gap
+            elif hint in self._ENUM_HINTS:
+                shown = buf if buf != '' else self._empty_label(hint)
+                swatch = _COLOR_PRESETS.get(buf) if hint == 'color' else None
+                self._select(screen, pygame.Rect(x, y, W, ch), shown, 'param_pick', (key, hint),
+                             prev=('param_prev', (key, hint)), nxt=('param_next', (key, hint)),
+                             dim=(buf == ''), swatch=swatch, key=f'sel:p:{key}')
+                y += ch + gap
+            elif key == 'text' and self._form_type == 'dialogue':
+                max_lines = getattr(self.dialogue_box, 'MAX_LINES', None) if self.dialogue_box else None
+                y = self._text_area(screen, x, y, W, key, buf, self._form_focus == key,
+                                    max_lines if isinstance(max_lines, int) else 6)
+                if self.dialogue_box is not None:
+                    y = self._draw_dialogue_capacity_hint(screen, x, y, W, buf)
+                y += gap - 2
+            else:
+                self._field(screen, pygame.Rect(x, y, W, ch), buf, self._form_focus == key, ('form', key))
+                y += ch + gap
 
-            sx = int(tile.x * RENDER_SCALE - cam_x)
-            sy = int(tile.y * RENDER_SCALE - cam_y)
-            sw = tileset.tile_width  * RENDER_SCALE
-            sh = tileset.tile_height * RENDER_SCALE
+        if self._form_type in ('play_music', 'play_sfx', 'stop_music') and self.sound_manager is not None:
+            label = 'Preview stop' if self._form_type == 'stop_music' else 'Preview'
+            self._button(screen, pygame.Rect(x, y, W, ch), label, _icon_speaker, 'preview_sound',
+                         accent=_SOUND_COLOR, key='insp:preview')
+            y += ch + gap
+        return y
 
-            # Cull against the actual inter surface size (not the full game screen)
-            if -sw <= sx <= iw and -sh <= sy <= ih:
-                inter.blit(scaled, (sx, sy))
+    def _draw_dialogue_capacity_hint(self, screen, x, y, W, buf):
+        """Small 'lines used' readout under the dialogue text field, so the
+        designer can see how much room is left instead of only discovering
+        the limit when a keystroke gets refused."""
+        portrait_key = self._form_params.get('portrait') or None
+        lines_used   = len(self.dialogue_box.wrap_text(buf, portrait_key=portrait_key)) if buf else 0
+        max_lines    = self.dialogue_box.MAX_LINES
+        at_limit     = self._text_limit_hit and self._form_focus == 'text'
+
+        label = f'Lines {lines_used} / {max_lines}'
+        if at_limit:
+            label += '  -  box is full'
+        col = (uk.Theme.DANGER_BRIGHT if at_limit
+               else uk.Theme.GOLD if lines_used >= max_lines else uk.Theme.TEXT_MUTED)
+        self._txt(screen, self.font_small, label, (x, y + 5), col, dynamic=True, max_w=W)
+        return y + 5 + self._fh('s') + 2
+
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Viewport panel
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _draw_viewport_panel(self, screen):
+        vf, vp = self._vp_frame, self._vp_rect
+        picking = bool(self._pick_mode)
+        uk.draw_panel(screen, vf, bg=(8, 10, 16, 255),
+                      border=uk.Theme.GOLD if picking else uk.Theme.PANEL_BORDER,
+                      border_width=2 if picking else 1, radius=10, shadow=False)
+
+        self._marker_labels = []
+        self._push_clip(screen, vp)
+        self._draw_viewport(screen, vp)
+        self._draw_marker_labels(screen, vp)
+        self._draw_dialogue_overlay(screen, vp)
+        self._draw_viewport_hud(screen, vp)
+        self._pop_clip(screen)
+
+    def _draw_marker_labels(self, screen, vp):
+        """Actor id tags — drawn in screen space (not inside the zoomed canvas)
+        so the pixel font stays crisp at any viewport zoom."""
+        z = self._vp_zoom
+        for text, col, sx, sy in self._marker_labels:
+            px, py = vp.x + sx * z + 14, vp.y + sy * z
+            surf = self.font_small.render(text, True, col)
+            plate = pygame.Rect(0, 0, surf.get_width() + 10, surf.get_height() + 6)
+            plate.midleft = (int(px), int(py))
+            uk.draw_rect_on(screen, (8, 10, 16, 190), plate, 0, 4)
+            uk.blit_surface(screen, surf, surf.get_rect(center=plate.center).topleft)
+
+    def _draw_dialogue_overlay(self, screen, vp):
+        # DialogueBox sizes itself from screen_width/screen_height (integer
+        # frame scale, pixel-perfect). Drawing at full game resolution then
+        # pygame.transform.scale-ing down into the smaller viewport reintroduced
+        # the uneven-pixel-row artifact we fixed in dialogue.py — non-integer
+        # scale maps some source rows to N dest pixels and others to N+1.
+        #
+        # Instead, temporarily tell the box the viewport's size so it builds
+        # at the size it will actually occupy, then blit 1:1. Capacity checks
+        # (fits_box / wrap_text) still use the real game resolution because
+        # we only swap the dimensions for this draw call.
+        #
+        # Draws straight onto `screen` at vp.topleft via DialogueBox.draw's
+        # `offset` param, rather than through an intermediate viewport-sized
+        # SRCALPHA surface. That intermediate surface used to be allocated
+        # and — on the GPU backend — uploaded as a brand-new texture
+        # (blit_surface(..., transient=True)) every single frame the box was
+        # active, sized to the *whole editor viewport* rather than the box
+        # itself (often far bigger than the box content), which is what
+        # made the open/close animation so slow. DialogueBox.draw() already
+        # builds its own tightly-sized internal surface (and, as of the
+        # dialogue.py caching fix, reuses it across frames when the content
+        # hasn't changed) — no need to wrap it in another one.
+        if self.dialogue_box and getattr(self.dialogue_box, 'active', False):
+            _dlg_colors = {
+                'WHITE': (255, 255, 255), 'RED': (220, 60, 60),
+                'DARK_GRAY': (40, 40, 40), 'CYAN': (80, 220, 220),
+            }
+            _ow = self.dialogue_box.screen_width
+            _oh = self.dialogue_box.screen_height
+            self.dialogue_box.screen_width  = vp.width
+            self.dialogue_box.screen_height = vp.height
+            try:
+                self.dialogue_box.draw(screen, _dlg_colors, offset=vp.topleft)
+            finally:
+                self.dialogue_box.screen_width  = _ow
+                self.dialogue_box.screen_height = _oh
+
+    def _draw_viewport_hud(self, screen, vp):
+        """Everything painted over the world: mode banner, drag hint ring,
+        pick-mode ghosts, cursor coordinates and the zoom chip."""
+        mx, my = self._mouse_pos
+        z = self._vp_zoom
+        inside = vp.collidepoint(mx, my) and self._dd is None
+        actors = self.cutscene_data.get('actors', []) if self.cutscene_data else []
+
+        # ── Mode banner ───────────────────────────────────────────────────────
+        banner, bcol = None, uk.Theme.GOLD_BRIGHT
+        if self._pick_mode:
+            if self._pick_mode == 'pick_attack_target':
+                direction = self._form_params.get('direction', 'down')
+                axis = 'height (Y)' if direction in ('up', 'down') else 'distance (X)'
+                banner = f'Click where the beam should stop  -  {axis} only  -  Esc to cancel'
+            elif self._pick_mode == 'pick_actor':
+                banner = 'Click to place the actor  -  Esc to cancel'
+            else:
+                banner = f'Click to pick a position  -  {self._pick_mode}  -  Esc to cancel'
+        elif self._actor_drag_idx >= 0 and self._actor_drag_idx < len(actors):
+            a = actors[self._actor_drag_idx]
+            banner = (f'Dragging {a.get("id", "actor")}  -  '
+                      f'X {a.get("x", 0):.1f}   Y {a.get("y", 0):.1f}')
+            bcol = uk.Theme.TEXT_PRIMARY
+        if banner:
+            self._chip(screen, vp.x + 10, vp.y + 10, banner, bcol, font=self.font_medium,
+                       border=uk.Theme.GOLD, bg=(10, 12, 18, 235))
+
+        # ── Hover ring: this actor can be dragged ─────────────────────────────
+        if (inside and not self._playing and not self._pick_mode
+                and self._actor_drag_idx < 0 and self.cutscene_data and not self._actor_form):
+            hwx, hwy = self._mouse_world()
+            for i, actor in enumerate(actors):
+                ax, ay = float(actor.get('x', 0)), float(actor.get('y', 0))
+                if abs(hwx - ax) <= 20.0 and abs(hwy - ay) <= 20.0:
+                    col = _ACTOR_COLORS[i % len(_ACTOR_COLORS)]
+                    scr_x, scr_y = self._world_to_screen(ax, ay)
+                    ring_r = max(6, int(16 * z))
+                    uk.draw_circle_on(screen, col, (scr_x, scr_y), ring_r, 2)
+                    uk.draw_circle_on(screen, _WHITE, (scr_x, scr_y), ring_r, 1)
+                    self._chip(screen, scr_x + ring_r + 6, scr_y, 'drag to move', col,
+                               anchor='midleft', dynamic=False)
+                    break
+
+        # ── Pick-mode ghosts ──────────────────────────────────────────────────
+        if self._pick_mode and inside:
+            wx, wy = self._mouse_world()
+            acc = uk.Theme.GOLD
+            if self._pick_mode == 'pick_actor':
+                ghost = _ACTOR_COLORS[len(actors) % len(_ACTOR_COLORS)]
+                uk.draw_circle_on(screen, ghost, (mx, my), 13, 2)
+                uk.draw_circle_on(screen, _WHITE, (mx, my), 13, 1)
+                uk.draw_line_on(screen, ghost, (mx - 18, my), (mx + 18, my), 1)
+                uk.draw_line_on(screen, ghost, (mx, my - 18), (mx, my + 18), 1)
+                self._chip(screen, mx + 22, my - 8, self._place_actor_def.get('id', 'actor'), ghost,
+                           anchor='bottomleft')
+                self._chip(screen, mx + 22, my - 4, f'({wx:.1f}, {wy:.1f})', uk.Theme.TEXT_SECONDARY,
+                           anchor='topleft')
+            elif self._pick_mode in ('pick_pan_to', 'pick_snap_to', 'pick_move_to',
+                                     'pick_fly_to', 'pick_teleport', 'pick_pan_to_start'):
+                arm = 22
+                uk.draw_line_on(screen, acc, (mx - arm, my), (mx + arm, my), 1)
+                uk.draw_line_on(screen, acc, (mx, my - arm), (mx, my + arm), 1)
+                uk.draw_circle_on(screen, acc, (mx, my), 5, 1)
+                self._chip(screen, mx + arm + 6, my, f'({wx:.1f}, {wy:.1f})', acc, anchor='midleft')
+            elif self._pick_mode == 'pick_attack_target':
+                # The beam only ever travels along the actor's facing axis, so
+                # only one coordinate of the click matters: draw a guide locked
+                # to that axis, running from the actor to the cursor.
+                direction = self._form_params.get('direction', 'down')
+                actor_def = next((a for a in actors if a.get('id') == self._form_target), None)
+                ax = float(actor_def.get('x', wx)) if actor_def else wx
+                ay = float(actor_def.get('y', wy)) if actor_def else wy
+                a_x, a_y = self._world_to_screen(ax, ay)
+                if direction in ('up', 'down'):
+                    uk.draw_line_on(screen, acc, (a_x, a_y), (a_x, my), 2)
+                    uk.draw_circle_on(screen, acc, (a_x, my), 5, 1)
+                    self._chip(screen, a_x + 12, my, f'stop Y = {wy:.1f}', acc, anchor='midleft')
+                else:
+                    uk.draw_line_on(screen, acc, (a_x, a_y), (mx, a_y), 2)
+                    uk.draw_circle_on(screen, acc, (mx, a_y), 5, 1)
+                    self._chip(screen, mx + 12, a_y, f'stop X = {wx:.1f}', acc, anchor='midleft')
+
+        # ── Cursor coordinates (bottom-left) ──────────────────────────────────
+        if inside and not self._pick_mode:
+            wx, wy = self._mouse_world()
+            self._chip(screen, vp.x + 8, vp.bottom - 8, f'X {wx:.1f}   Y {wy:.1f}',
+                       uk.Theme.TEXT_SECONDARY, anchor='bottomleft')
+
+        # ── Zoom chip (bottom-right) — click to snap back to 1.00x ────────────
+        default_zoom = abs(z - 1.0) < 0.01
+        label = f'{z:.2f}x' if default_zoom else f'{z:.2f}x  -  click to reset'
+        surf = self.font_small.render(label, True, uk.Theme.TEXT_SECONDARY)
+        w = int(math.ceil((surf.get_width() + 24) / 8.0) * 8)
+        rect = pygame.Rect(0, 0, w, surf.get_height() + 14)
+        rect.bottomright = (vp.right - 8, vp.bottom - 8)
+        hov = self._hit(rect, 'vp_zoom_reset')
+        t = self._anim('vp:zoom', 1.0 if hov else 0.0)
+        col = uk.Theme.GOLD if not default_zoom else uk.Theme.TEXT_MUTED
+        uk.draw_panel(screen, rect, bg=(10, 12, 18, 220),
+                      border=uk.lerp_color(uk.Theme.CARD_BORDER, uk.Theme.GOLD, max(t, 0.0 if default_zoom else 0.6)),
+                      border_width=1, radius=7, shadow=False)
+        surf = self.font_small.render(label, True, uk.lerp_color(col, uk.Theme.GOLD_BRIGHT, t))
+        uk.blit_surface(screen, surf, surf.get_rect(center=rect.center).topleft, transient=True)
 
     def _draw_actor_marker(self, inter_surf, actor, idx, selected):
         """Draw actor onto the intermediate surface.
@@ -3771,7 +4886,8 @@ class CutsceneEditor:
         Tries to show the real sprite (via a cached entity).  Falls back to a
         coloured circle if the entity/sprite couldn't be created.
         Drawn at base RENDER_SCALE on the intermediate surface; zoom is handled
-        by the caller scaling the whole surface afterward.
+        by the caller scaling the whole surface afterward.  The id label is
+        queued instead of drawn here so it renders crisp in screen space.
         """
         col = _ACTOR_COLORS[idx % len(_ACTOR_COLORS)]
         cam_x = int(self.camera.x)
@@ -3802,7 +4918,7 @@ class CutsceneEditor:
             # Selection highlight ring around the sprite centre
             if selected:
                 inter_surf.draw_circle(col, (sx, sy), 14, 2)
-                inter_surf.draw_circle(_C['white'], (sx, sy), 14, 1)
+                inter_surf.draw_circle(_WHITE, (sx, sy), 14, 1)
             else:
                 inter_surf.draw_circle(col, (sx, sy), 10, 1)
         else:
@@ -3810,1001 +4926,509 @@ class CutsceneEditor:
             r = 10 if selected else 7
             inter_surf.draw_circle(col, (sx, sy), r)
             if selected:
-                inter_surf.draw_circle(_C['white'], (sx, sy), r, 2)
+                inter_surf.draw_circle(_WHITE, (sx, sy), r, 2)
 
         # Label (always drawn so the actor is identifiable)
-        lbl = self.font_small.render(actor.get('id', '?'), True, col)
-        inter_surf.blit(lbl, (sx + 12, sy - lbl.get_height() // 2))
+        self._marker_labels.append((actor.get('id', '?'), col, sx, sy))
 
-    # ── Top bar ────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Timeline
+    # ══════════════════════════════════════════════════════════════════════════
 
-    def _draw_top_bar(self, screen):
-        bar_w = self.screen_width
-        screen.draw_rect(_C['panel'], (0, 0, bar_w, _TOP_H))
-        screen.draw_line(_C['border'], (0, _TOP_H), (bar_w, _TOP_H), 1)
+    def _ruler_steps(self):
+        """(label_step, subdivisions) so ruler labels stay >= ~56 px apart at
+        any timeline zoom."""
+        z = self._tl_time_zoom
+        step = 60
+        for s in (0.1, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60):
+            if s * z >= 56:
+                step = s
+                break
+        sub = {0.1: 2, 0.25: 5, 0.5: 5, 1: 2, 2: 4, 5: 5, 10: 5, 15: 3, 30: 3, 60: 4}[step]
+        return step, sub
 
-        # Back
-        self._btns['back'] = self._draw_button(
-            screen, 8, 7, 74, _BTN_H, 'BACK', _C['text_dim'])
+    def _draw_tl_toolbar(self, screen, tl, dur, actions):
+        y, h = tl.y + 2, 32
+        x = tl.x
+        sel_ok = 0 <= self._tl_sel < len(actions)
+        interval = self._tl_grid_intervals[self._tl_grid_idx]
+        int_lbl = f'{interval:g}s'
+        total_lbl = f'{dur:.1f}s total'
 
-        # Name + unsaved
-        name_col = _C['danger'] if self.unsaved else _C['text']
-        title = self.font_large.render(
-            self.cutscene_name + (' *' if self.unsaved else ''), True, name_col)
-        screen.blit(title, (92, (_TOP_H - title.get_height()) // 2))
+        # Measure the full layout first; if it can't fit beside the "total"
+        # readout, fall back to icon-only Duplicate / Delete and drop the
+        # zoom caption so nothing ever overprints (narrow windows).
+        w_dup, w_del = self._btn_width('Duplicate', True), self._btn_width('Delete', True)
+        w_snap, w_int = self._btn_width('Snap', True), self._btn_width(int_lbl, False)
+        zoom_cap_w = self.font_small.size('ZOOM')[0] + 10
+        full_w = (w_dup + 8 + w_del + 14 + 15 + zoom_cap_w + h + 6 + h + 8 + 62 + 12
+                  + 15 + w_snap + 6 + w_int)
+        total_w = self.font_small.size(total_lbl)[0]
+        compact = full_w + total_w + 24 > tl.w
+        if compact:
+            w_dup = w_del = h
 
-        # Duration (inline editable — click to change, Enter/Esc to confirm)
-        dur    = self.cutscene_data.get('duration', 10.0) if self.cutscene_data else 10.0
-        dur_x  = 92 + title.get_width() + 14
-        dur_fw = 68
-        dur_fh = 24
-        dur_fy = (_TOP_H - dur_fh) // 2
-        dur_display = (self._duration_buf + '|') if self._duration_focus else f'{dur:.1f} s'
-        dur_col     = _C['accent'] if self._duration_focus else _C['border']
-        dur_r       = pygame.Rect(dur_x, dur_fy, dur_fw, dur_fh)
-        screen.draw_rect(_C['highlight'], dur_r, border_radius=3)
-        screen.draw_rect(dur_col, dur_r, 1, border_radius=3)
-        dur_lbl = self.font_small.render(
-            dur_display, True, _C['white'] if self._duration_focus else _C['text_dim'])
-        screen.blit(dur_lbl, (dur_r.x + 5, dur_r.y + (dur_fh - dur_lbl.get_height()) // 2))
-        self._btns['dur_field'] = dur_r
+        self._button(screen, pygame.Rect(x, y, w_dup, h), None if compact else 'Duplicate', self._icon_dup_png,
+                     'tl_dup', enabled=sel_ok, key='tl:dup')
+        x += w_dup + 8
+        self._button(screen, pygame.Rect(x, y, w_del, h), None if compact else 'Delete', self._icon_trash_png,
+                     'tl_del', danger=True, enabled=sel_ok, key='tl:del')
+        x += w_del + 14
 
-        # Timecode (playhead time)
-        tc = self.font_mono.render(
-            f'{self._tl_playhead_t:05.2f}', True, _C['accent2'])
-        cx = bar_w // 2
-        screen.draw_rect(_C['highlight'],
-                         (cx - tc.get_width() // 2 - 10, 7,
-                          tc.get_width() + 20, _BTN_H), border_radius=4)
-        screen.blit(tc, (cx - tc.get_width() // 2, (_TOP_H - tc.get_height()) // 2))
+        def sep(px):
+            uk.draw_rect_on(screen, uk.Theme.CARD_BORDER, pygame.Rect(px, y + 6, 1, h - 12), 0, 0)
+            return px + 15
 
-        # Play / Stop
-        play_col   = _C['danger']  if self._playing else _C['accent2']
-        play_label = 'STOP'        if self._playing else 'PLAY'
-        self._btns['play'] = self._draw_button(
-            screen, bar_w - 190, 7, 82, _BTN_H, play_label, play_col)
+        x = sep(x)
+        if not compact:
+            self._txt(screen, self.font_small, 'ZOOM', (x, y + h // 2), uk.Theme.TEXT_MUTED, anchor='midleft')
+            x += zoom_cap_w
+        self._button(screen, pygame.Rect(x, y, h, h), icon=_icon_minus, action='tl_zoom_out', key='tl:zo')
+        x += h + 6
+        self._button(screen, pygame.Rect(x, y, h, h), icon=_icon_plus, action='tl_zoom_in', key='tl:zi')
+        x += h + 8
+        if not compact:
+            r = self._txt(screen, self.font_small, f'{self._tl_time_zoom:.0f} px/s', (x, y + h // 2),
+                          uk.Theme.TEXT_DIM, anchor='midleft', dynamic=True)
+            x = max(r.right, x + 62) + 12
+        x = sep(x)
 
-        # Save
-        save_col = _C['accent'] if self.unsaved else _C['border']
-        self._btns['save'] = self._draw_button(
-            screen, bar_w - 100, 7, 88, _BTN_H, 'SAVE', save_col)
+        self._button(screen, pygame.Rect(x, y, w_snap, h), 'Snap', _icon_grid, 'tl_grid_toggle',
+                     active=self._tl_grid_enabled, key='tl:grid')
+        x += w_snap + 6
+        self._button(screen, pygame.Rect(x, y, w_int, h), int_lbl, None, 'tl_grid_interval', key='tl:gridint')
+        x += w_int
 
-        # Grid toggle hint (far-left of the right cluster)
-        grid_col   = _C['accent'] if self._show_grid else _C['text_dim']
-        grid_label = '[G] Grid ON' if self._show_grid else '[G] Grid'
-        grid_hint  = self.font_small.render(grid_label, True, grid_col)
-        screen.blit(grid_hint, (bar_w - 280,
-                                (_TOP_H - grid_hint.get_height()) // 2))
+        if x + 16 + total_w <= tl.right:
+            self._txt(screen, self.font_small, total_lbl, (tl.right - 4, y + h // 2),
+                      uk.Theme.TEXT_MUTED, anchor='midright', dynamic=True)
 
-    # ── Left panel (layers / tracks) ──────────────────────────────────────────
-
-    def _draw_left_panel(self, screen, lp):
-        x  = lp.x + 8
-        y0 = lp.y + 8
-        W  = lp.width - 16
-
-        # _left_scroll is updated on the mouse wheel (see _on_scroll), but it
-        # used to never be applied here — so with enough actors, the
-        # +ACTOR/-DEL buttons, snap controls, and the add-actor form just
-        # kept getting pushed further down, past lp.bottom, into the
-        # timeline panel's screen region. Clipping hid them visually, but
-        # their hit-rects stayed registered in self._btns at those
-        # off-panel coordinates, so clicks meant for the timeline below
-        # would land on these hidden buttons instead ("pushed behind other
-        # menu stuff"). Clamp against last frame's measured content height
-        # (one-frame lag, imperceptible) and actually offset the layout by
-        # it, the same way the timeline handles _tl_scroll_y.
-        visible_h  = lp.bottom - y0
-        content_h  = getattr(self, '_left_panel_content_h', 0)
-        max_scroll = max(0, content_h - visible_h)
-        self._left_scroll = _clamp(getattr(self, '_left_scroll', 0), 0, max_scroll)
-        scroll = self._left_scroll
-        y = y0 - scroll
-
-        # Clip everything drawn in this panel to its own bounds. Without
-        # this, a long LAYERS list (many actor tracks) followed by the
-        # actor-add form could grow past lp.bottom — which sits exactly on
-        # the timeline panel's top edge — and bleed its fields/buttons into
-        # the timeline's screen region (and any dropdown opened from one of
-        # those low fields is drawn on top of everything, visibly covering
-        # the timeline).
-        screen.set_clip(lp)
-
-        # Buttons this call registers at a y outside the visible panel
-        # (i.e. scrolled out of view) must not remain clickable, or they'd
-        # keep intercepting clicks meant for whatever panel sits below/
-        # behind them. Track keys added during this call and prune any
-        # that end up outside lp once we're done laying things out.
-        _btn_keys_before = set(self._btns.keys())
-
-        # ── Section: Room ──────────────────────────────────────────────────────
-        self._draw_section_header(screen, x, y, W, 'ROOM')
-        y += 20
-
-        room_name = self.cutscene_data.get('room', '(none)') if self.cutscene_data else '(none)'
-        bw = 20
-        self._btns['room_prev'] = self._draw_button(
-            screen, x, y, bw, 24, '<', _C['highlight'])
-        rn = self.font_small.render(room_name, True, _C['text'])
-        screen.blit(rn, (x + bw + 4, y + (24 - rn.get_height()) // 2))
-        self._btns['room_next'] = self._draw_button(
-            screen, x + W - bw, y, bw, 24, '>', _C['highlight'])
-        y += 30
-
-        self._draw_divider(screen, x, y, W); y += 8
-
-        # ── Section: Layers ────────────────────────────────────────────────────
-        self._draw_section_header(screen, x, y, W, 'LAYERS')
-        y += 20
-
-        tracks = self._tl_tracks()
-        actors = self.cutscene_data.get('actors', []) if self.cutscene_data else []
-
-        # Fixed tracks (camera, screen)
-        for ti, (label, color, target) in enumerate(tracks):
-            is_actor = ti >= 4
-            actor_idx = ti - 4 if is_actor else -1
-            selected  = (is_actor and actor_idx == self._actor_sel)
-
-            row_r = pygame.Rect(x, y, W, 26)
-            bg    = _C['sel'] if selected else _C['highlight']
-            screen.draw_rect(bg, row_r, border_radius=3)
-
-            # Color strip
-            screen.draw_rect(color, (x, y, 3, 26), border_radius=2)
-
-            # Label
-            it = self.font_small.render(label, True, _C['text'])
-            screen.blit(it, (x + 7, y + (26 - it.get_height()) // 2))
-
-            # Action count badge
-            if self.cutscene_data:
-                n_actions = sum(1 for a in self.cutscene_data.get('actions', [])
-                                if a.get('target') == target)
-                if n_actions:
-                    badge = self.font_small.render(str(n_actions), True, _C['text_dim'])
-                    screen.blit(badge, (x + W - badge.get_width() - 4,
-                                        y + (26 - badge.get_height()) // 2))
-
-            if is_actor:
-                self._btns[f'actor_row_{actor_idx}'] = row_r
-
-            y += 28
-
-        self._draw_divider(screen, x, y, W); y += 8
-
-        # ── Section: Add / Del actor ───────────────────────────────────────────
-        self._btns['actor_add'] = self._draw_button(
-            screen, x, y, W // 2 - 2, 26, '+ ACTOR', _C['accent2'])
-        self._btns['actor_del'] = self._draw_button(
-            screen, x + W // 2 + 2, y, W // 2 - 2, 26, '- DEL', _C['danger'])
-        y += 32
-
-        # ── Section: Actor placement grid snap ─────────────────────────────────
-        # Snaps both the initial pick_actor click and subsequent dragging to
-        # a world-unit grid (see _snap_actor_xy). Size cycles 8/16/32 —
-        # TILE_SIZE itself is 32, so 8/16 are finer subdivisions of a tile.
-        snap_on  = self._actor_snap_enabled
-        self._btns['actor_snap_toggle'] = self._draw_button(
-            screen, x, y, W // 2 - 2, 24,
-            f'SNAP {"ON" if snap_on else "OFF"}',
-            _C['accent2'] if snap_on else _C['highlight'])
-        size_px = self._actor_snap_sizes[self._actor_snap_idx]
-        self._btns['actor_snap_size'] = self._draw_button(
-            screen, x + W // 2 + 2, y, W // 2 - 2, 24, f'{size_px}px', _C['highlight'])
-        y += 30
-
-        # ── Actor add form ─────────────────────────────────────────────────────
-        if self._actor_form:
-            self._draw_divider(screen, x, y, W); y += 8
-            y = self._draw_actor_form(screen, x, y, W)
-
-        # Remember this frame's laid-out content height (undoing the scroll
-        # offset baked into `y`) so next frame's clamp above knows how far
-        # there is to scroll.
-        self._left_panel_content_h = (y + scroll) - y0
-
-        # Drop any button registered above/below the visible panel — see the
-        # comment at the top of this function for why this matters.
-        for k in (self._btns.keys() - _btn_keys_before):
-            if not lp.colliderect(self._btns[k]):
-                del self._btns[k]
-
-        # Scroll indicator arrows in the left panel margin, mirroring the
-        # timeline's, so it's discoverable that there's more below/above.
-        if max_scroll > 0:
-            ax = lp.right - 12
-            if scroll > 0:
-                screen.draw_polygon(_C['text_dim'], [
-                    (ax - 6, y0 + 10), (ax, y0 + 2), (ax + 6, y0 + 10)])
-            if scroll < max_scroll:
-                screen.draw_polygon(_C['text_dim'], [
-                    (ax - 6, lp.bottom - 10), (ax, lp.bottom - 2), (ax + 6, lp.bottom - 10)])
-
-        screen.set_clip(None)
-
-    # ── Right panel (Inspector / Properties) ──────────────────────────────────
-
-    def _draw_right_panel(self, screen, rp):
-        x = rp.x + 10
-        y = rp.y + 8
-        W = rp.width - 20
-
-        # Same reasoning as _draw_left_panel: clip so a long action form
-        # (many params) can't bleed its fields past rp.bottom into the
-        # timeline's screen region.
-        screen.set_clip(rp)
-
-        self._draw_section_header(screen, x, y, W, 'INSPECTOR')
-        y += 22
-        self._draw_divider(screen, x, y, W); y += 8
-
-        if self._form_active:
-            y = self._draw_action_form(screen, x, y, W)
-        else:
-            # Empty state
-            lines = [
-                'Click a keyframe in the',
-                'timeline to edit it,',
-                'or press  + ADD  to create',
-                'a new action.',
-            ]
-            for line in lines:
-                t = self.font_small.render(line, True, _C['text_dim'])
-                screen.blit(t, (x, y)); y += 18
-
-            # Quick summary of selected action if there is one
-            if self._tl_sel >= 0 and self.cutscene_data:
-                actions = self.cutscene_data.get('actions', [])
-                if 0 <= self._tl_sel < len(actions):
-                    a = actions[self._tl_sel]
-                    y += 8
-                    self._draw_divider(screen, x, y, W); y += 8
-                    info = [
-                        ('Time',   f'{a["time"]:.2f} s'),
-                        ('Target', a.get('target', '')),
-                        ('Type',   a.get('type', '')),
-                    ]
-                    for k, v in info:
-                        kl = self.font_small.render(k + ':', True, _C['text_dim'])
-                        vl = self.font_small.render(v,    True, _C['text'])
-                        screen.blit(kl, (x, y))
-                        screen.blit(vl, (x + 60, y))
-                        y += 16
-
-        screen.set_clip(None)
-
-    # ── Actor add form ─────────────────────────────────────────────────────────
-
-    def _draw_actor_form(self, screen, x, y, W):
-        hdr = self.font_medium.render('ADD ACTOR', True, _C['accent2'])
-        screen.blit(hdr, (x, y)); y += 22
-
-        types = ['enemy', 'boss', 'npc', 'player']
-        atype = types[self._actor_type_idx % len(types)]
-        lbl = self.font_small.render('Type:', True, _C['text_dim'])
-        screen.blit(lbl, (x, y)); y += 16
-        self._btns['actor_type_prev'] = self._draw_button(screen, x, y, 20, 22, '<', _C['highlight'])
-        tn = self.font_medium.render(atype, True, _C['accent'])
-        screen.blit(tn, (x + 24, y + 2))
-        self._btns['actor_type_next'] = self._draw_button(screen, x + W - 20, y, 20, 22, '>', _C['highlight'])
-        y += 26
-
-        lbl2 = self.font_small.render('Actor ID:', True, _C['text_dim'])
-        screen.blit(lbl2, (x, y)); y += 14
-        y = self._draw_text_field(screen, x, y, W, '_actor_id', self._actor_id_buf,
-                                  self._actor_focus == 'id', actor_key='id')
-        y += 4
-
-        # Which entity to spawn — always picked from the entity catalogue
-        # (or the player character folder), never typed by hand.
-        etype_labels = {'enemy': 'Enemy:', 'boss': 'Boss:', 'npc': 'NPC:', 'player': 'Character:'}
-        lbl3 = self.font_small.render(etype_labels[atype], True, _C['text_dim'])
-        screen.blit(lbl3, (x, y)); y += 14
-        display_val = self._actor_etype_buf or '(none found)'
-        self._btns['actor_etype_dropdown'] = self._draw_button(
-            screen, x, y, W, 22, f'<  {display_val}  >', _C['highlight'])
-        y += 26
-
-        hint = self.font_small.render('Then click in viewport.', True, _C['text_dim'])
-        screen.blit(hint, (x, y)); y += 16
-        self._btns['actor_place_confirm'] = self._draw_button(
-            screen, x, y, W, 26, 'PLACE IN VIEWPORT', _C['accent'])
-        y += 30
-        return y
-
-    # ── Action inspector form ──────────────────────────────────────────────────
-
-    def _draw_action_form(self, screen, x, y, W):
-        hdr_txt = 'NEW ACTION' if self._form_new else 'EDIT ACTION'
-        col     = _C['accent2'] if self._form_new else _C['accent']
-        screen.blit(self.font_medium.render(hdr_txt, True, col), (x, y)); y += 22
-
-        # Time
-        screen.blit(self.font_small.render('Time (s):', True, _C['text_dim']), (x, y)); y += 14
-        y = self._draw_text_field(screen, x, y, W, 'form_time', self._form_time_buf,
-                                  self._form_focus == 'time', form_key='time')
-        y += 6
-
-        # Target
-        actors  = self.cutscene_data.get('actors', []) if self.cutscene_data else []
-        screen.blit(self.font_small.render('Target:', True, _C['text_dim']), (x, y)); y += 14
-        self._btns['form_target_prev'] = self._draw_button(screen, x, y, 20, 22, '<', _C['highlight'])
-        tc_col = (_CAMERA_COLOR if self._form_target == 'camera' else
-                  _SCREEN_COLOR if self._form_target == 'screen' else
-                  _ROOM_COLOR   if self._form_target == 'room'   else
-                  _SOUND_COLOR  if self._form_target == 'sound'  else _C['accent2'])
-        tn = self.font_medium.render(self._form_target, True, tc_col)
-        screen.blit(tn, (x + 24, y + 2))
-        self._btns['form_target_next'] = self._draw_button(screen, x + W - 20, y, 20, 22, '>', _C['highlight'])
-        y += 26
-
-        # Action type
-        screen.blit(self.font_small.render('Action type:', True, _C['text_dim']), (x, y)); y += 14
-        self._btns['form_type_prev'] = self._draw_button(screen, x, y, 20, 22, '<', _C['highlight'])
-        at = self.font_medium.render(self._form_type, True, _C['text'])
-        screen.blit(at, (x + 24, y + 2))
-        self._btns['form_type_next'] = self._draw_button(screen, x + W - 20, y, 20, 22, '>', _C['highlight'])
-        y += 26
-
-        self._draw_divider(screen, x, y, W); y += 8
-
-        # Parameters
-        for key, label, hint in _ACTION_PARAMS.get(self._form_type, []):
-            screen.blit(self.font_small.render(f'{label}:', True, _C['text_dim']), (x, y))
-            y += 14
-            buf = self._form_params.get(key, '')
-            if hint in ('dir', 'anim', 'anim_player', 'anim_enemy', 'portrait',
-                        'invert_mode', 'weather_type', 'scroll_dir', 'character', 'costume',
-                        'music_track', 'sfx_name', 'bool', 'attack_type', 'color'):
-                # portrait '' = no face = narrator-style dialogue (full-width text).
-                # music/sfx '' = no selection yet. Everything else falls back to 'auto'.
-                if hint == 'portrait':
-                    empty_label = 'narrator'
-                elif hint in ('music_track', 'sfx_name'):
-                    empty_label = '(none)'
-                else:
-                    empty_label = 'auto'
-                display_buf = buf if buf != '' else empty_label
-                if hint == 'color':
-                    # Reserve a swatch on the right showing the actual RGB
-                    # the current preset name resolves to, so it's obvious
-                    # at a glance without having to remember what e.g.
-                    # 'orange' looks like.
-                    swatch_w = 26
-                    self._btns[f'cycle_{key}'] = self._draw_button(
-                        screen, x, y, W - swatch_w - 4, 22,
-                        f'<  {display_buf}  >', _C['highlight'])
-                    rgb = _COLOR_PRESETS.get(buf, (0, 0, 0))
-                    swatch_r = pygame.Rect(x + W - swatch_w, y, swatch_w, 22)
-                    screen.draw_rect(rgb, swatch_r, border_radius=3)
-                    screen.draw_rect(_C['border'], swatch_r, 1, border_radius=3)
-                else:
-                    self._btns[f'cycle_{key}'] = self._draw_button(
-                        screen, x, y, W, 22, f'<  {display_buf}  >', _C['highlight'])
-                y += 26
-            elif hint == 'room':
-                # Two-row browser: group filter on top, room name below.
-                self._btns['room_group_prev'] = self._draw_button(
-                    screen, x, y, 20, 22, '<', _C['highlight'])
-                gname = self._form_room_group or 'All Groups'
-                gs = self.font_small.render(gname, True, _C['text_dim'])
-                screen.blit(gs, (x + 24, y + (22 - gs.get_height()) // 2))
-                self._btns['room_group_next'] = self._draw_button(
-                    screen, x + W - 20, y, 20, 22, '>', _C['highlight'])
-                y += 26
-                self._btns['room_name_prev'] = self._draw_button(
-                    screen, x, y, 20, 22, '<', _C['highlight'])
-                rname = buf or '(none)'
-                rs = self.font_medium.render(rname, True, _C['text'])
-                screen.blit(rs, (x + 24, y + (22 - rs.get_height()) // 2))
-                self._btns['room_name_next'] = self._draw_button(
-                    screen, x + W - 20, y, 20, 22, '>', _C['highlight'])
-                y += 30
-            else:
-                # Dialogue text grows downward like Discord's composer so the
-                # designer can read the full line without horizontal scrolling.
-                if key == 'text' and self._form_type == 'dialogue':
-                    y = self._draw_growing_text_field(
-                        screen, x, y, W, key, buf,
-                        self._form_focus == key, form_key=key)
-                    if self.dialogue_box is not None:
-                        y = self._draw_dialogue_capacity_hint(screen, x, y, W, buf)
-                else:
-                    y = self._draw_text_field(screen, x, y, W, key, buf,
-                                              self._form_focus == key, form_key=key)
-                if key in ('x', 'y') and self._form_type in (
-                        'pan_to', 'snap_to', 'move_to', 'fly_to', 'teleport'):
-                    # Only draw the viewport-pick button once (after the first of x/y)
-                    pick_name = f'pick_{self._form_type}'
-                    if pick_name not in self._btns:
-                        self._btns[pick_name] = self._draw_button(
-                            screen, x, y, W, 20,
-                            'Click viewport for X,Y', _C['highlight'])
-                        y += 24
-                if key in ('start_x', 'start_y') and self._form_type == 'pan_to':
-                    if 'pick_pan_to_start' not in self._btns:
-                        self._btns['pick_pan_to_start'] = self._draw_button(
-                            screen, x, y, W, 20,
-                            'Click viewport for Start X,Y', _C['highlight'])
-                        y += 24
-                if key in ('target_x', 'target_y') and self._form_type == 'attack':
-                    # Only one axis of these ever matters (locked to whichever
-                    # one matches `direction`), so instead of typing both
-                    # coordinates, let the designer click where the beam
-                    # should stop and axis-lock it automatically.
-                    if 'pick_attack_target' not in self._btns:
-                        self._btns['pick_attack_target'] = self._draw_button(
-                            screen, x, y, W, 20,
-                            'Click viewport to set beam stop', _C['highlight'])
-                        y += 24
-                y += 4
-
-        if self._form_type in ('play_music', 'play_sfx', 'stop_music') and self.sound_manager is not None:
-            preview_label = 'Preview Stop' if self._form_type == 'stop_music' else 'Preview'
-            self._btns['preview_sound'] = self._draw_button(
-                screen, x, y, W, _BTN_H, preview_label, _SOUND_COLOR)
-            y += _BTN_H + 6
-
-        y += 6
-        self._btns['form_commit'] = self._draw_button(
-            screen, x, y, W // 2 - 2, _BTN_H, 'OK', _C['accent'])
-        self._btns['form_cancel'] = self._draw_button(
-            screen, x + W // 2 + 2, y, W // 2 - 2, _BTN_H, 'CANCEL', _C['danger'])
-        return y + _BTN_H
-
-    # ── Timeline ───────────────────────────────────────────────────────────────
-
-    def _draw_timeline(self, screen, tl):
-        """AE-style graphical timeline with per-track rows and keyframe diamonds."""
+    def _draw_timeline(self, screen):
+        """Track-based timeline: toolbar, time ruler, one lane per track with
+        keyframe diamonds + duration bars, and the playhead."""
+        self._panel(screen, self._tl_frame)
         if not self.cutscene_data:
             return
 
-        dur          = self.cutscene_data.get('duration', 10.0)
-        time_zoom    = self._tl_time_zoom
-        scroll_x     = self._tl_scroll_x
-        label_end_x  = tl.x + _TL_LABEL_W
-        time_area_w  = tl.width - _TL_LABEL_W
-        hdr_y        = tl.y
-        content_y    = tl.y + _TL_HDR_H
-        ruler_y      = content_y
-        tracks_y     = ruler_y + _TL_RULER_H
+        tl, label_end_x, ruler_y, tracks_y = self._tl_geometry()
+        dur      = self.cutscene_data.get('duration', 10.0)
+        zoom     = self._tl_time_zoom
+        scroll_x = self._tl_scroll_x
+        time_w   = tl.right - label_end_x
+        rh       = self._tl_row_h
+        ruler_h  = self._tl_ruler_h
+        rows     = self._tl_visible_rows()
+        actions  = self.cutscene_data.get('actions', [])
 
-        # ── Header strip ───────────────────────────────────────────────────────
-        screen.draw_rect(_C['panel'], (tl.x, hdr_y, tl.width, _TL_HDR_H))
-        screen.draw_line(_C['border'], (tl.x, hdr_y + _TL_HDR_H),
-                         (tl.right, hdr_y + _TL_HDR_H), 1)
-
-        # ADD / DUP / DEL
-        bx = tl.x + 8
-        by = hdr_y + 2
-        self._btns['tl_add'] = self._draw_button(screen, bx,      by, 52, 26, '+ ADD', _C['accent2'])
-        self._btns['tl_dup'] = self._draw_button(screen, bx + 56, by, 52, 26, 'DUP',  _C['highlight'])
-        self._btns['tl_del'] = self._draw_button(screen, bx +112, by, 52, 26, 'DEL',  _C['danger'])
-
-        # Zoom buttons
-        self._btns['tl_zoom_in']  = self._draw_button(screen, bx + 172, by, 28, 26, '+', _C['highlight'])
-        self._btns['tl_zoom_out'] = self._draw_button(screen, bx + 204, by, 28, 26, '-', _C['highlight'])
-        zm = self.font_small.render('ZOOM', True, _C['text_dim'])
-        screen.blit(zm, (bx + 236, by + (26 - zm.get_height()) // 2))
-
-        # Timeline grid snap: GRID toggles keyframe-drag snapping + the guide
-        # lines below; the interval button cycles 1 / 0.5 / 0.25 / 0.1s and
-        # can be changed whether or not snapping is currently on.
-        grid_on = self._tl_grid_enabled
-        self._btns['tl_grid_toggle'] = self._draw_button(
-            screen, bx + 280, by, 46, 26, 'GRID',
-            _C['accent2'] if grid_on else _C['highlight'])
-        interval = self._tl_grid_intervals[self._tl_grid_idx]
-        self._btns['tl_grid_interval'] = self._draw_button(
-            screen, bx + 330, by, 46, 26, f'{interval:g}s', _C['highlight'])
-
-        # Duration readout
-        dur_t = self.font_mono.render(f'{dur:.1f}s total', True, _C['text_dim'])
-        screen.blit(dur_t, (tl.right - dur_t.get_width() - 10,
-                            hdr_y + (_TL_HDR_H - dur_t.get_height()) // 2))
-
-        # ── Ruler ──────────────────────────────────────────────────────────────
-        screen.draw_rect(_C['ruler_bg'],
-                         (label_end_x, ruler_y, time_area_w, _TL_RULER_H))
-        screen.draw_line(_C['border'],
-                         (label_end_x, ruler_y + _TL_RULER_H),
-                         (tl.right, ruler_y + _TL_RULER_H), 1)
-
-        # Clip the ruler strip on its own (x-clip for horizontal scroll,
-        # y-bounded to just the ruler band) so tick-drawing below can't
-        # touch the row area or vice versa.
-        screen.set_clip(pygame.Rect(label_end_x, ruler_y, time_area_w, _TL_RULER_H))
-
-        # Tick marks at 0.5s intervals, labels every 1s
-        step = 0.5
-        t    = 0.0
-        while t <= dur + step:
-            tx = label_end_x + t * time_zoom - scroll_x
-            is_second = (round(t * 2) % 2 == 0)
-            tick_h    = 10 if is_second else 5
-            col       = _C['text_dim'] if is_second else _C['border']
-            screen.draw_line(col,
-                             (tx, ruler_y + _TL_RULER_H - tick_h),
-                             (tx, ruler_y + _TL_RULER_H), 1)
-            if is_second:
-                lbl = self.font_mono.render(f'{t:.0f}', True, _C['text_dim'])
-                screen.blit(lbl, (tx - lbl.get_width() // 2, ruler_y + 2))
-            t = round(t + step, 3)
-
-        # ── Track rows ─────────────────────────────────────────────────────────
-        # Separate clip starting at tracks_y, NOT ruler_y — this is the fix.
-        # The old clip started at ruler_y and ran to tl.bottom, covering both
-        # the ruler band AND the row area in one rect. That let scrolled-up
-        # rows (e.g. the first row, Camera/Screen) draw past tracks_y into
-        # the ruler band, where nothing clipped them out, so they visibly
-        # painted over the ruler/ticks whenever _tl_scroll_y > 0.
-        screen.set_clip(pygame.Rect(label_end_x, tracks_y, time_area_w, tl.bottom - tracks_y))
-        rows    = self._tl_visible_rows()
-        actions = self.cutscene_data.get('actions', [])
-
-        # Grid-snap guide lines (toggled via the GRID header button) — x
-        # positions precomputed once rather than per-row. Skipped when the
-        # interval would be so dense at the current zoom it'd just paint a
-        # solid block (snapping itself still works either way; this only
-        # affects whether the guide lines are worth drawing).
-        _grid_xs = []
-        if self._tl_grid_enabled:
-            interval = self._tl_grid_intervals[self._tl_grid_idx]
-            if interval * time_zoom >= 4:
-                gt = 0.0
-                while gt <= dur + interval:
-                    gx = label_end_x + gt * time_zoom - scroll_x
-                    if label_end_x <= gx <= tl.right:
-                        _grid_xs.append(gx)
-                    gt = round(gt + interval, 6)
+        self._draw_tl_toolbar(screen, tl, dur, actions)
 
         # Re-clamp here (not just on wheel events) — e.g. deleting an actor
         # while scrolled down would otherwise leave _tl_scroll_y past the
         # new, shorter content height with nothing visible.
-        _visible_h = tl.bottom - tracks_y
-        _max_sy    = max(0.0, len(rows) * _TL_ROW_H - _visible_h)
-        self._tl_scroll_y = _clamp(self._tl_scroll_y, 0.0, _max_sy)
+        visible_h = tl.bottom - tracks_y
+        content_h = len(rows) * rh
+        self._tl_scroll_y = _clamp(self._tl_scroll_y, 0.0, max(0.0, content_h - visible_h))
+        scroll_y = self._tl_scroll_y
 
+        # ── Ruler ─────────────────────────────────────────────────────────────
+        uk.draw_rect_on(screen, (12, 15, 22), pygame.Rect(tl.x, ruler_y, tl.w, ruler_h), 0, 0)
+        uk.draw_rect_on(screen, _BAR_LINE, pygame.Rect(tl.x, tracks_y - 1, tl.w, 1), 0, 0)
+
+        step, sub = self._ruler_steps()
+        minor = step / sub
+        first = max(0, int(scroll_x / zoom / minor) - 1)
+        last = int((scroll_x + time_w) / zoom / minor) + 2
+        last = min(last, int((dur + step) / minor) + 1)
+        major_xs = []
+        self._push_clip(screen, pygame.Rect(label_end_x, ruler_y, time_w, ruler_h))
+        for i in range(first, last + 1):
+            t = i * minor
+            tx = int(label_end_x + t * zoom - scroll_x)
+            if i % sub == 0:
+                major_xs.append(tx)
+                uk.draw_rect_on(screen, uk.Theme.TEXT_DIM, pygame.Rect(tx, tracks_y - 11, 1, 10), 0, 0)
+                self._txt(screen, self.font_small, f'{t:g}', (tx + 5, ruler_y + 4), uk.Theme.TEXT_MUTED)
+            elif minor * zoom >= 6:
+                uk.draw_rect_on(screen, uk.Theme.CARD_BORDER, pygame.Rect(tx, tracks_y - 6, 1, 5), 0, 0)
+        self._pop_clip(screen)
+
+        # Grid-snap guide lines — x positions precomputed once rather than
+        # per-row. Skipped when the interval would be so dense at the current
+        # zoom it'd just paint a solid block (snapping itself still works).
+        grid_xs = []
+        if self._tl_grid_enabled:
+            interval = self._tl_grid_intervals[self._tl_grid_idx]
+            if interval * zoom >= 4:
+                gi0 = max(0, int(scroll_x / zoom / interval) - 1)
+                gi1 = min(int((scroll_x + time_w) / zoom / interval) + 2, int((dur + interval) / interval) + 1)
+                for gi in range(gi0, gi1 + 1):
+                    gx = int(label_end_x + gi * interval * zoom - scroll_x)
+                    if label_end_x <= gx <= tl.right:
+                        grid_xs.append(gx)
+
+        # ── Track lanes ───────────────────────────────────────────────────────
+        rows_rect = pygame.Rect(label_end_x, tracks_y, time_w, visible_h)
+        self._push_clip(screen, rows_rect)
+        row_bgs = []
         for i, row in enumerate(rows):
-            row_y  = tracks_y + i * _TL_ROW_H - self._tl_scroll_y
+            row_y = tracks_y + i * rh - scroll_y
+            if row_y + rh < tracks_y or row_y > tl.bottom:
+                row_bgs.append(None)
+                continue
+            bg = (14, 17, 25) if i % 2 == 0 else (17, 20, 29)
+            if row['kind'] == 'child':
+                bg = (11, 14, 20)
+            row_bgs.append(bg)
+            uk.draw_rect_on(screen, bg, pygame.Rect(label_end_x, int(row_y), time_w, rh), 0, 0)
+
+        # Vertical guides: major ruler ticks (faint) + snap grid (brighter)
+        for gx in major_xs:
+            uk.draw_rect_on(screen, (24, 28, 38), pygame.Rect(gx, tracks_y, 1, visible_h), 0, 0)
+        for gx in grid_xs:
+            uk.draw_rect_on(screen, (52, 60, 88), pygame.Rect(gx, tracks_y, 1, visible_h), 0, 0)
+
+        # Past-the-end shade + end marker
+        end_x = int(label_end_x + dur * zoom - scroll_x)
+        if end_x < tl.right:
+            sx0 = max(end_x, label_end_x)
+            uk.draw_rect_on(screen, (0, 0, 0, 96), pygame.Rect(sx0, tracks_y, tl.right - sx0, visible_h), 0, 0)
+            if end_x >= label_end_x:
+                uk.draw_rect_on(screen, uk.lerp_color(uk.Theme.CARD_BORDER, uk.Theme.GOLD, 0.6),
+                                pygame.Rect(end_x, tracks_y, 1, visible_h), 0, 0)
+
+        bar_h = 14
+        r_cap = bar_h // 2
+        for i, row in enumerate(rows):
+            row_bg = row_bgs[i]
+            if row_bg is None:
+                continue
+            row_y  = int(tracks_y + i * rh - scroll_y)
             color  = row['color']
             target = row['target']
+            kf_cy  = row_y + rh // 2
 
-            # Skip rows scrolled fully out of view — clipping alone would
-            # still draw them correctly, but skipping avoids wasted work.
-            if row_y + _TL_ROW_H < tracks_y or row_y > tl.bottom:
-                continue
-
-            # Row background — child (sub-lane) rows get a subtly darker
-            # tint so the parent/child grouping reads at a glance.
-            row_bg = _C['highlight'] if i % 2 == 0 else _C['panel2']
-            screen.draw_rect(row_bg,
-                             (label_end_x, row_y, time_area_w, _TL_ROW_H))
-            if row['kind'] == 'child':
-                shade = pygame.Surface((time_area_w, _TL_ROW_H), pygame.SRCALPHA)
-                shade.fill((0, 0, 0, 40))
-                screen.blit(shade, (label_end_x, row_y))
-
-            # Grid-snap guide lines — drawn under the keyframes so diamonds
-            # sitting exactly on a grid line still read clearly.
-            for gx in _grid_xs:
-                screen.draw_line((55, 62, 90),
-                                 (gx, row_y), (gx, row_y + _TL_ROW_H), 1)
-
-            # Draw keyframes for this row — parent rows always show every
-            # keyframe on the track (a merged overview, expanded or not);
-            # child rows only show keyframes matching their action type.
             for ai, action in enumerate(actions):
                 if action.get('target') != target:
                     continue
                 if row['action_type'] is not None and action.get('type') != row['action_type']:
                     continue
                 kf_t     = action['time']
-                kf_x     = label_end_x + kf_t * time_zoom - scroll_x
-                kf_cy    = row_y + _TL_ROW_H // 2
+                kf_x     = label_end_x + kf_t * zoom - scroll_x
                 selected = (ai == self._tl_sel)
 
-                # ── Duration bar ───────────────────────────────────────────────
-                # Actions with a 'duration' param span time — draw a filled bar
-                # from the keyframe start to its end time so you can see the
-                # window it occupies in the timeline at a glance.
-                kf_dur = float(action.get('params', {}).get('duration', 0.0))
+                # Duration bar — actions with a 'duration' param span time, so
+                # show the window they occupy as a capsule from the keyframe.
+                try:
+                    kf_dur = float(action.get('params', {}).get('duration', 0.0))
+                except (TypeError, ValueError):
+                    kf_dur = 0.0
                 if kf_dur > 0:
-                    bar_end_x = label_end_x + (kf_t + kf_dur) * time_zoom - scroll_x
-                    bar_left  = max(label_end_x, kf_x)
-                    bar_right = min(tl.right,    bar_end_x)
-                    if bar_right > bar_left:
-                        bar_h    = _TL_ROW_H - 10
-                        bar_top  = row_y + (_TL_ROW_H - bar_h) // 2
-                        bar_w    = bar_right - bar_left
-                        # Opacity: bright for selected, subtle for unselected
-                        alpha    = 160 if selected else 55
-                        bar_surf = pygame.Surface((bar_w, bar_h), pygame.SRCALPHA)
-                        r, g, b  = color
-                        bar_surf.fill((r, g, b, alpha))
-                        screen.blit(bar_surf, (bar_left, bar_top))
-                        # Crisp right-edge cap so the end boundary is obvious
+                    bar_end_x = label_end_x + (kf_t + kf_dur) * zoom - scroll_x
+                    x0 = max(label_end_x, kf_x)
+                    x1 = min(tl.right, bar_end_x)
+                    if x1 - x0 >= 1:
+                        # Opaque pre-blended colours: capsule ends overlap the
+                        # body, which would double-blend if we used alpha.
+                        fill = uk.lerp_color(row_bg, color, 0.60 if selected else 0.30)
+                        body = pygame.Rect(int(x0), kf_cy - bar_h // 2, int(x1 - x0), bar_h)
+                        if body.w >= bar_h:
+                            uk.draw_rect_on(screen, fill, body, 0, 0)
+                            if kf_x >= label_end_x:
+                                uk.draw_circle_on(screen, fill, (body.x + r_cap - 1, kf_cy), r_cap)
+                            if bar_end_x <= tl.right:
+                                uk.draw_circle_on(screen, fill, (body.right - r_cap, kf_cy), r_cap)
+                        else:
+                            uk.draw_rect_on(screen, fill, body, 0, 0)
                         if bar_end_x <= tl.right:
-                            cap_alpha = 200 if selected else 80
-                            cap_surf  = pygame.Surface((2, bar_h), pygame.SRCALPHA)
-                            cap_surf.fill((r, g, b, cap_alpha))
-                            screen.blit(cap_surf, (bar_right - 2, bar_top))
+                            cap = uk.lerp_color(row_bg, color, 0.95 if selected else 0.6)
+                            uk.draw_rect_on(screen, cap, pygame.Rect(int(x1) - 2, kf_cy - 4, 2, 8), 0, 1)
 
+                if kf_x < label_end_x - 12 or kf_x > tl.right + 12:
+                    continue
                 dragging = (ai == self._kf_drag_idx)
-                kf_size  = 8 if dragging else 6
-                self._draw_keyframe_diamond(screen, kf_x, kf_cy, kf_size, color, selected)
+                if selected:
+                    uk.draw_soft_glow(screen, (int(kf_x), kf_cy), 18, uk.Theme.GOLD, max_alpha=52)
+                    _draw_diamond(screen, kf_x, kf_cy, 8 if dragging else 7, color, _WHITE, 2)
+                else:
+                    _draw_diamond(screen, kf_x, kf_cy, 8 if dragging else 6, color, (8, 10, 15), 1)
 
-            screen.draw_line(_C['border'],
-                             (label_end_x, row_y + _TL_ROW_H - 1),
-                             (tl.right, row_y + _TL_ROW_H - 1), 1)
+            uk.draw_rect_on(screen, (26, 30, 41), pygame.Rect(label_end_x, row_y + rh - 1, time_w, 1), 0, 0)
+        self._pop_clip(screen)
 
-        # ── Playhead ───────────────────────────────────────────────────────────
-        # This one legitimately spans the full ruler+rows height (it's a
-        # single deliberate element, not a row that can drift out of place
-        # from scrolling), so restore the full-height clip just for it.
-        screen.set_clip(pygame.Rect(label_end_x, ruler_y, time_area_w, tl.bottom - ruler_y))
-        ph_x = label_end_x + self._tl_playhead_t * time_zoom - scroll_x
-        if label_end_x <= ph_x <= tl.right:
-            screen.draw_line(_C['playhead'],
-                             (ph_x, ruler_y), (ph_x, tl.bottom), 1)
-            # Triangle handle at top of ruler
-            pts = [(ph_x, ruler_y + _TL_RULER_H),
-                   (ph_x - 6, ruler_y + 4),
-                   (ph_x + 6, ruler_y + 4)]
-            screen.draw_polygon(_C['playhead'], pts)
+        # ── Playhead (spans ruler + rows) ─────────────────────────────────────
+        self._push_clip(screen, pygame.Rect(label_end_x, ruler_y, time_w + 1, tl.bottom - ruler_y))
+        ph_x = int(label_end_x + self._tl_playhead_t * zoom - scroll_x)
+        if label_end_x - 8 <= ph_x <= tl.right + 8:
+            uk.draw_rect_on(screen, _PLAYHEAD, pygame.Rect(ph_x - 1, ruler_y + 8, 2, tl.bottom - ruler_y - 8), 0, 0)
+            _blit_poly(screen, pygame.Rect(ph_x - 7, ruler_y + 2, 14, 16), _PLAYHEAD,
+                       [(0, 0), (1, 0), (1, 0.55), (0.5, 1), (0, 0.55)])
+        self._pop_clip(screen)
 
-        screen.set_clip(None)
+        # ── Label column ──────────────────────────────────────────────────────
+        uk.draw_rect_on(screen, (*_BAR_BG,), pygame.Rect(tl.x, tracks_y, self._tl_label_w, visible_h), 0, 0)
+        uk.draw_rect_on(screen, _BAR_LINE, pygame.Rect(label_end_x - 1, ruler_y, 1, tl.bottom - ruler_y), 0, 0)
+        self._txt(screen, self.font_small, f'{self._tl_playhead_t:.2f}s', (tl.x + 10, ruler_y + ruler_h // 2),
+                  uk.Theme.GOLD_BRIGHT, anchor='midleft', dynamic=True)
 
-        # ── Label column ───────────────────────────────────────────────────────
-        # Draw over the clip region so labels are always visible
-        screen.draw_rect(_C['panel'],
-                         (tl.x, content_y, _TL_LABEL_W, tl.height - _TL_HDR_H))
-        screen.draw_line(_C['border'],
-                         (label_end_x, content_y), (label_end_x, tl.bottom), 1)
-
-        # Ruler label cell
-        screen.draw_rect(_C['ruler_bg'],
-                         (tl.x, ruler_y, _TL_LABEL_W, _TL_RULER_H))
-        screen.draw_line(_C['border'],
-                         (tl.x, ruler_y + _TL_RULER_H),
-                         (label_end_x, ruler_y + _TL_RULER_H), 1)
-        ph_lbl = self.font_mono.render(f'{self._tl_playhead_t:.2f}s', True, _C['playhead'])
-        screen.blit(ph_lbl, (tl.x + 6,
-                              ruler_y + (_TL_RULER_H - ph_lbl.get_height()) // 2))
-
-        screen.set_clip(pygame.Rect(tl.x, tracks_y, _TL_LABEL_W, tl.bottom - tracks_y))
+        sel_target = actions[self._tl_sel].get('target') if 0 <= self._tl_sel < len(actions) else None
+        self._push_clip(screen, pygame.Rect(tl.x, tracks_y, self._tl_label_w - 1, visible_h))
         for i, row in enumerate(rows):
-            row_y = tracks_y + i * _TL_ROW_H - self._tl_scroll_y
-            if row_y + _TL_ROW_H < tracks_y or row_y > tl.bottom:
+            row_y = int(tracks_y + i * rh - scroll_y)
+            if row_y + rh < tracks_y or row_y > tl.bottom:
                 continue
-            label, color = row['label'], row['color']
-            row_bg = _C['highlight'] if i % 2 == 0 else _C['panel2']
-            screen.draw_rect(row_bg,
-                             (tl.x, row_y, _TL_LABEL_W, _TL_ROW_H))
-            if row['kind'] == 'child':
-                shade = pygame.Surface((_TL_LABEL_W, _TL_ROW_H), pygame.SRCALPHA)
-                shade.fill((0, 0, 0, 40))
-                screen.blit(shade, (tl.x, row_y))
+            color, child = row['color'], row['kind'] == 'child'
+            cell = pygame.Rect(tl.x, row_y, self._tl_label_w - 1, rh)
+            hov = False
+            if row['kind'] == 'parent' and row['expandable']:
+                hov = self._hover(cell)   # click itself is resolved by _on_tl_click
+            t = self._anim(f'tll:{i}', 1.0 if hov else 0.0)
+            bg = uk.lerp_color((11, 14, 20) if child else _BAR_BG, _ROW_HOVER, t)
+            uk.draw_rect_on(screen, bg, cell, 0, 0)
+            uk.draw_rect_on(screen, color, pygame.Rect(tl.x, row_y + 5, 3, rh - 10), 0, 1)
 
-            # Color swatch
-            screen.draw_rect(color,
-                             (tl.x, row_y + 2, 3, _TL_ROW_H - 4), border_radius=1)
-
-            text_x = tl.x + 7
-            if row['kind'] == 'child':
-                # Indented, dimmer — reads as "belongs to the row above".
+            text_x = tl.x + 14
+            if child:
                 text_x += 14
             elif row['expandable']:
-                # Caret — clicking it (handled in _on_tl_click) toggles
-                # this category's expand/collapse state. Pointing right
-                # when collapsed, down when expanded, matching the ▸/▾
-                # convention from the mockup.
-                cx, cy = tl.x + 11, row_y + _TL_ROW_H // 2
+                cx, cy = tl.x + 20, row_y + rh // 2
                 if row['expanded']:
-                    pts = [(cx - 4, cy - 3), (cx + 4, cy - 3), (cx, cy + 4)]
+                    _blit_poly(screen, pygame.Rect(cx - 5, cy - 3, 10, 7), uk.Theme.TEXT_MUTED,
+                               [(0, 0), (1, 0), (0.5, 1)])
                 else:
-                    pts = [(cx - 3, cy - 4), (cx - 3, cy + 4), (cx + 4, cy)]
-                screen.draw_polygon(_C['text_dim'], pts)
-                text_x += 12
+                    _blit_poly(screen, pygame.Rect(cx - 3, cy - 5, 7, 10), uk.Theme.TEXT_MUTED,
+                               [(0, 0), (1, 0.5), (0, 1)])
+                text_x += 14
+            is_sel_track = (row['kind'] == 'parent' and row['target'] == sel_target)
+            text_col = (uk.Theme.TEXT_DIM if child
+                        else uk.Theme.TEXT_PRIMARY if (is_sel_track or hov) else uk.Theme.TEXT_SECONDARY)
+            self._txt(screen, self.font_small, row['label'], (text_x, row_y + rh // 2), text_col,
+                      anchor='midleft', max_w=self._tl_label_w - (text_x - tl.x) - 8)
+            uk.draw_rect_on(screen, (26, 30, 41), pygame.Rect(tl.x, row_y + rh - 1, self._tl_label_w - 1, 1), 0, 0)
+        self._pop_clip(screen)
 
-            text_col = _C['text_dim'] if row['kind'] == 'child' else _C['text']
-            lbl_surf = self.font_small.render(label, True, text_col)
-            screen.blit(lbl_surf,
-                        (text_x, row_y + (_TL_ROW_H - lbl_surf.get_height()) // 2))
-            screen.draw_line(_C['border'],
-                             (tl.x, row_y + _TL_ROW_H - 1),
-                             (label_end_x, row_y + _TL_ROW_H - 1), 1)
-        screen.set_clip(None)
-
-        # Empty hint
         if not actions:
-            hint = self.font_medium.render(
-                'No actions yet.  Press  + ADD  or double-click a track.',
-                True, _C['text_dim'])
-            hint_y = tracks_y + max(len(rows), 1) * _TL_ROW_H // 2
-            screen.blit(hint, (label_end_x + 20, hint_y))
+            self._txt(screen, self.font_medium, 'No actions yet - press Add to create one.',
+                      (label_end_x + 22, tracks_y + max(len(rows), 1) * rh // 2 - 2),
+                      uk.Theme.TEXT_DIM, anchor='midleft', max_w=max(40, time_w - 44))
 
-        # Scroll indicator — small down/up arrows in the label column when
-        # the track list overflows the visible area, so it's discoverable.
-        content_h = len(rows) * _TL_ROW_H
-        visible_h = tl.bottom - tracks_y
-        if content_h > visible_h:
-            if self._tl_scroll_y > 0:
-                screen.draw_polygon(_C['text_dim'], [
-                    (label_end_x - 14, tracks_y + 10), (label_end_x - 8, tracks_y + 2),
-                    (label_end_x - 2, tracks_y + 10)])
-            if self._tl_scroll_y < content_h - visible_h:
-                screen.draw_polygon(_C['text_dim'], [
-                    (label_end_x - 14, tl.bottom - 10), (label_end_x - 8, tl.bottom - 2),
-                    (label_end_x - 2, tl.bottom - 10)])
+        self._scrollbar(screen, pygame.Rect(tl.right - 5, tracks_y + 2, 4, visible_h - 4),
+                        scroll_y, content_h, visible_h)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Drawing helpers
+    # List view
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _draw_keyframe_diamond(self, screen, cx, cy, size, color, selected):
-        """Draw a diamond (rotated square) keyframe marker centred at (cx, cy).
+    def _draw_list(self, screen):
+        w, h = self.screen_width, self.screen_height
+        self._backdrop(screen, self.list_header_h, self.list_footer_h)
 
-        Selected keyframes get a white outline so they stand out on any colour;
-        unselected ones get a thin dark border to separate overlapping diamonds.
-        """
-        pts = [(cx, cy - size), (cx + size, cy),
-               (cx, cy + size), (cx - size, cy)]
-        screen.draw_polygon(color, pts)
-        if selected:
-            screen.draw_polygon(_C['white'], pts, 2)
-        else:
-            screen.draw_polygon((0, 0, 0, 120), pts, 1)
+        # Header — same bar + centred title as the dev menu
+        self._bar(screen, pygame.Rect(0, 0, w, self.list_header_h), line_at_bottom=True)
+        self._txt(screen, self.font_title, 'CUTSCENE EDITOR', (w // 2, self.list_header_h // 2),
+                  uk.Theme.TEXT_PRIMARY, anchor='center')
+        n = len(self._files)
+        self._button(screen, self._list_back_rect, icon=self._icon_back, action='close', key='list:back')
 
-    def _draw_section_header(self, screen, x, y, W, text):
-        t = self.font_small.render(text, True, _C['text_dim'])
-        screen.blit(t, (x, y))
-        screen.draw_line(_C['border'],
-                         (x + t.get_width() + 6, y + t.get_height() // 2),
-                         (x + W, y + t.get_height() // 2), 1)
+        # Footer (purely visual, like the dev menu's)
+        self._bar(screen, pygame.Rect(0, h - self.list_footer_h, w, self.list_footer_h), line_at_bottom=False)
 
-    def _draw_divider(self, screen, x, y, W):
-        screen.draw_line(_C['border'], (x, y), (x + W, y), 1)
+        # ── Cards ─────────────────────────────────────────────────────────────
+        mx_, gap, ch = self.margin_x, 12, self.card_h
+        top = self.list_header_h + 24
+        add = self._list_add_rect
+        creating = self._new_name_focus
+        bottom = add.top - 16
+        view = pygame.Rect(mx_ - 6, top - 6, w - 2 * mx_ + 12, max(60, bottom - top + 6))
+        card_w = w - 2 * mx_
 
-    def _draw_button(self, screen, x, y, w, h, label, color):
-        r = pygame.Rect(x, y, w, h)
-        screen.draw_rect(color, r, border_radius=4)
-        t = self.font_small.render(label, True, _C['white'])
-        screen.blit(t, (r.centerx - t.get_width() // 2,
-                        r.centery - t.get_height() // 2))
-        return r
+        total = n + (1 if creating else 0)
+        content_h = total * (ch + gap)
+        self._list_scroll = _clamp(self._list_scroll, 0, max(0, content_h - view.h + 6))
+        scroll = int(self._list_scroll)
 
-    def _draw_text_field(self, screen, x, y, W, _id, buf, focused,
-                         form_key=None, actor_key=None):
-        """Draw a single-line text input field and register it for click + keyboard routing.
-
-        Registers two entries each frame:
-          self._btns[f'_field_{_id}']      → the hit rect for _handle_btn
-          self._field_meta[f'_field_{_id}'] → (form_key, actor_key) so
-              _handle_btn knows which buffer to send keypresses to.
-
-        Long text is clipped to the field width so it never spills into the
-        panel or neighbouring widgets. The view keeps the right end (caret)
-        visible while typing — same as a normal single-line input — and
-        prefixes an ellipsis when the start is cut off.
-
-        Returns the Y coordinate immediately below the field (for flow layout).
-        """
-        r   = pygame.Rect(x, y, W, 24)
-        col = _C['accent'] if focused else _C['border']
-        screen.draw_rect(_C['highlight'], r, border_radius=3)
-        screen.draw_rect(col, r, 1, border_radius=3)
-
-        pad = 5
-        max_w = max(1, W - pad * 2)
-        display = buf + ('|' if focused else '')
-        t = self.font_small.render(display, True, _C['white'])
-        if t.get_width() > max_w:
-            # Trim from the left until (ellipsis + remainder) fits so the
-            # caret / end of the string stays visible.
-            ellipsis = '…'
-            cut = display
-            while cut and self.font_small.size(ellipsis + cut)[0] > max_w:
-                cut = cut[1:]
-            t = self.font_small.render(ellipsis + cut, True, _C['white'])
-        text_y = r.y + (24 - t.get_height()) // 2
-        prev_clip = screen.get_clip()
-        screen.set_clip(pygame.Rect(r.x + pad, r.y, max_w, r.height))
-        screen.blit(t, (r.x + pad, text_y))
-        screen.set_clip(prev_clip)
-
-        field_btn_name = f'_field_{_id}'
-        self._btns[field_btn_name] = r
-        self._field_meta[field_btn_name] = (form_key, actor_key)
-        return y + 26
-
-    def _wrap_field_lines(self, text, max_w):
-        """Word-wrap *text* to fit *max_w* pixels using font_small.
-
-        Preserves explicit '\\n' hard breaks. Oversized single words are
-        hard-broken character-by-character so nothing can ever exceed max_w.
-        Always returns at least one line (empty string when *text* is empty).
-        """
-        if max_w < 1:
-            max_w = 1
-        font = self.font_small
-        lines = []
-        paragraphs = text.split('\n') if text is not None else ['']
-        if not paragraphs:
-            paragraphs = ['']
-        for pi, paragraph in enumerate(paragraphs):
-            if paragraph == '':
-                lines.append('')
+        self._push_clip(screen, view)
+        for i, name in enumerate(self._files):
+            rect = pygame.Rect(mx_, top + i * (ch + gap) - scroll, card_w, ch)
+            if rect.bottom < view.top or rect.top > view.bottom:
                 continue
-            words = paragraph.split(' ')
-            current = ''
-            for wi, word in enumerate(words):
-                # Preserve runs of spaces between words (split keeps empties
-                # only at edges for consecutive spaces, so rejoin with ' ').
-                candidate = word if current == '' else current + ' ' + word
-                if font.size(candidate)[0] <= max_w:
-                    current = candidate
-                    continue
-                if current != '':
-                    lines.append(current)
-                    current = ''
-                # Word alone is wider than the field — hard-break it.
-                if font.size(word)[0] <= max_w:
-                    current = word
-                else:
-                    chunk = ''
-                    for ch in word:
-                        if font.size(chunk + ch)[0] <= max_w:
-                            chunk += ch
-                        else:
-                            if chunk:
-                                lines.append(chunk)
-                            chunk = ch
-                    current = chunk
-            lines.append(current)
-        return lines if lines else ['']
+            self._draw_list_card(screen, rect, i, name)
 
-    def _draw_growing_text_field(self, screen, x, y, W, _id, buf, focused,
-                                 form_key=None, actor_key=None,
-                                 min_lines=2, max_lines=None):
-        """Discord-style multiline text box that grows downward as content wraps.
+        if creating:
+            rect = pygame.Rect(mx_, top + n * (ch + gap) - scroll, card_w, ch)
+            uk.draw_panel(screen, rect, bg=(*uk.Theme.CARD_BG_HOVER[:3], 255), border=uk.Theme.GOLD,
+                          border_width=2, radius=12, shadow=False)
+            icon = pygame.Rect(0, 0, 26, 26)
+            icon.center = (rect.x + 40, rect.centery)
+            _icon_plus(screen, icon, uk.Theme.GOLD, 3)
+            inner = pygame.Rect(rect.x + 74, rect.y, rect.w - 74 - 20, rect.h)
+            self._hit(rect, 'field', ('new_name', None))
+            self._text_rects.append(rect.clip(view))
+            self._push_clip(screen, inner)
+            shown = self._new_name_buf
+            surf = self.font_large.render(shown if shown else 'Cutscene name', True,
+                                          uk.Theme.TEXT_PRIMARY if shown else uk.Theme.TEXT_DIM)
+            uk.blit_surface(screen, surf, (inner.x, rect.centery - surf.get_height() // 2), transient=True)
+            self._caret(screen, inner.x + (surf.get_width() + 3 if shown else 0),
+                        rect.centery - self._fh('l') // 2, self._fh('l'))
+            self._pop_clip(screen)
+            hint = self.font_small.render('ENTER to create  -  ESC to cancel', True, uk.Theme.TEXT_DIM)
+            uk.blit_surface(screen, hint, hint.get_rect(midright=(rect.right - 20, rect.centery)).topleft)
+        self._pop_clip(screen)
 
-        Used for the dialogue action's text param so long lines stay readable
-        inside the inspector instead of overflowing a single-line field.
-        Height tracks the wrapped line count (clamped to [min_lines, max_lines]);
-        max_lines defaults to the dialogue box's MAX_LINES when available so the
-        editor field never shows more than the in-game box can hold.
+        if not self._files and not creating:
+            self._txt(screen, self.font_large, 'No cutscenes yet', (w // 2, top + 70),
+                      uk.Theme.TEXT_SECONDARY, anchor='midtop')
+            self._txt(screen, self.font_small, 'Press the + button to create your first one.',
+                      (w // 2, top + 70 + self._fh('l') + 10), uk.Theme.TEXT_MUTED, anchor='midtop')
 
-        Enter inserts a hard newline (see _handle_text_field); Tab/Esc blur.
-        """
-        pad_x = 6
-        pad_y = 4
-        line_h = max(14, self.font_small.get_height() + 2)
-        max_w = max(1, W - pad_x * 2)
+        self._scrollbar(screen, pygame.Rect(w - mx_ + 18, view.y + 4, 4, view.h - 8),
+                        scroll, content_h, view.h)
 
-        if max_lines is None:
-            if self.dialogue_box is not None:
-                max_lines = max(2, int(getattr(self.dialogue_box, 'MAX_LINES', 4)))
-            else:
-                max_lines = 6
-        max_lines = max(min_lines, max_lines)
+        # Add button (bottom-left) — hidden while the inline name row is open
+        if not creating:
+            self._button(screen, add, icon=self._icon_plus_png, action='list_new_start', key='list:add')
+        if self._list_msg:
+            self._txt(screen, self.font_medium, self._list_msg,
+                      (add.right + 18, add.centery), uk.Theme.DANGER_BRIGHT, anchor='midleft',
+                      max_w=w - add.right - 2 * mx_)
 
-        # Wrap the raw buffer; caret is drawn on the last visual line only
-        # when focused (append '|' to the last wrapped line for simplicity).
-        lines = self._wrap_field_lines(buf or '', max_w)
-        # If the buffer ends with a trailing newline, wrap_field_lines already
-        # produced an empty last line — keep it so the caret sits on a new row.
-        n_content = len(lines)
-        n_rows = _clamp(n_content, min_lines, max_lines)
-        box_h = pad_y * 2 + n_rows * line_h
+    def _draw_list_card(self, screen, rect, i, name):
+        """One cutscene card — same shell as the room editor's list cards."""
+        confirming = (self._list_confirm == name)
+        hov = self._hit(rect, 'list_open', name) if not confirming else False
+        focus = (self._last_input == 'keyboard' and i == self._list_sel)
+        t = self._anim(f'card:{name}', 1.0 if (hov or focus) else 0.0)
+        accent = _ACTOR_COLORS[i % len(_ACTOR_COLORS)]
 
-        r = pygame.Rect(x, y, W, box_h)
-        col = _C['accent'] if focused else _C['border']
-        screen.draw_rect(_C['highlight'], r, border_radius=3)
-        screen.draw_rect(col, r, 1, border_radius=3)
+        lift = round(2 * t)
+        r = rect.move(0, -lift)
+        bg = uk.lerp_color(uk.Theme.CARD_BG[:3], uk.Theme.CARD_BG_HOVER[:3], t)
+        if confirming:
+            border, bw = uk.Theme.DANGER_BRIGHT, 2
+            bg = uk.lerp_color(bg, (60, 24, 24), 0.35)
+        else:
+            border, bw = uk.lerp_color(uk.Theme.CARD_BORDER, uk.Theme.GOLD, t * 0.78), 1 + round(t)
+        uk.draw_panel(screen, r, bg=(*bg, 255), border=border, border_width=bw, radius=12, shadow=False)
+        if t > 0.01 and not confirming:
+            uk.draw_soft_glow(screen, r.center, max(r.w, r.h) // 2, uk.Theme.GOLD, max_alpha=int(14 * t))
 
-        prev_clip = screen.get_clip()
-        screen.set_clip(pygame.Rect(r.x + pad_x, r.y + pad_y, max_w, n_rows * line_h))
+        uk.draw_circle_on(screen, accent, (r.x + 40, r.centery), 8)
+        tx = r.x + 74
 
-        # If content exceeds the visible row budget, show the bottom-most lines
-        # so the caret / latest typing stays in view (Discord does the same).
-        start = max(0, n_content - n_rows)
-        visible = lines[start:start + n_rows]
-        # Pad with blank rows up to min_lines so an empty box still looks tall.
-        while len(visible) < n_rows:
-            visible.append('')
-
-        for i, line in enumerate(visible):
-            draw = line
-            # Caret on the last *content* line (or the padded empty last row
-            # when the buffer ends with '\\n' / is empty).
-            is_last_visible = (i == len(visible) - 1)
-            showing_tail = (start + i == n_content - 1) or (n_content == 0 and is_last_visible)
-            if focused and showing_tail:
-                draw = line + '|'
-            t = self.font_small.render(draw, True, _C['white'])
-            screen.blit(t, (r.x + pad_x, r.y + pad_y + i * line_h))
-
-        screen.set_clip(prev_clip)
-
-        field_btn_name = f'_field_{_id}'
-        self._btns[field_btn_name] = r
-        self._field_meta[field_btn_name] = (form_key, actor_key)
-        return y + box_h + 4
-
-    def _draw_dialogue_capacity_hint(self, screen, x, y, W, buf):
-        """Small 'lines used' readout under the dialogue text field, so the
-        designer can see how much room is left instead of only discovering
-        the limit when a keystroke gets refused."""
-        portrait_key = self._form_params.get('portrait') or None
-        lines_used   = len(self.dialogue_box.wrap_text(buf, portrait_key=portrait_key)) if buf else 0
-        max_lines    = self.dialogue_box.MAX_LINES
-        at_limit     = self._text_limit_hit and self._form_focus == 'text'
-
-        label = f'Lines: {lines_used}/{max_lines}'
-        if at_limit:
-            label += '  (box is full — no more will fit)'
-        col = _C['danger'] if at_limit else (_C['accent2'] if lines_used >= max_lines else _C['text_dim'])
-        t = self.font_small.render(label, True, col)
-        screen.blit(t, (x, y))
-        return y + 14
-
-    # ── Room cycle (used by button handler) ───────────────────────────────────
-
-    def _rooms_for_group(self, group):
-        """Return room names visible in *group*.
-
-        An empty/None *group* means "All Groups" — every non-transient room is
-        included.  Otherwise only rooms whose .group attribute matches are returned.
-        """
-        return [r.name for r in self.room_manager.rooms
-                if not getattr(r, 'is_transient', False)
-                and (not group or r.group == group)]
-
-    def _cycle_room_group(self, delta):
-        """Cycle through room groups in the change_room action form.
-
-        Moves to the previous/next group and resets room_name to the first
-        room in that group so the value is always valid.
-        """
-        groups = [g for g in self.room_manager.groups]
-        if not groups:
+        if confirming:
+            self._txt(screen, self.font_large, f'Delete {name}?', (tx, r.centery - 9),
+                      uk.Theme.DANGER_BRIGHT, anchor='midleft', max_w=r.w - 74 - 260)
+            self._txt(screen, self.font_small, 'This removes the file and cannot be undone.',
+                      (tx, r.centery + 15), uk.Theme.TEXT_MUTED, anchor='midleft')
+            bh = 36
+            cw = self._btn_width('Cancel', False, pad=18)
+            dw = self._btn_width('Delete', True, pad=18)
+            cancel = pygame.Rect(r.right - 20 - cw, r.centery - bh // 2, cw, bh)
+            dele = pygame.Rect(cancel.x - 10 - dw, r.centery - bh // 2, dw, bh)
+            self._button(screen, dele, 'Delete', self._icon_trash_png, 'list_delete_yes', name, danger=True,
+                         primary=True, key=f'ld:{name}')
+            self._button(screen, cancel, 'Cancel', None, 'list_delete_no', key='ld:no')
             return
-        cur   = self._form_room_group
-        idx   = groups.index(cur) if cur in groups else 0
-        self._form_room_group = groups[(idx + delta) % len(groups)]
-        rooms = self._rooms_for_group(self._form_room_group)
-        self._form_params['room_name'] = rooms[0] if rooms else ''
 
-    def _cycle_room_in_group(self, delta):
-        """Cycle through rooms within the currently selected group."""
-        rooms = self._rooms_for_group(self._form_room_group)
-        if not rooms:
+        meta = self._file_meta.get(name)
+        title_w = r.w - 74 - 90
+        self._txt(screen, self.font_large, name, (tx, r.centery - (9 if meta else 0)),
+                  uk.lerp_color(uk.Theme.TEXT_PRIMARY, uk.Theme.GOLD_BRIGHT, t), anchor='midleft', max_w=title_w)
+        if meta:
+            room, dur, n_act, n_actors = meta
+            parts = [room or 'no room', f'{dur:g}s', f'{n_act} action{"s" if n_act != 1 else ""}']
+            if n_actors:
+                parts.append(f'{n_actors} actor{"s" if n_actors != 1 else ""}')
+            self._txt(screen, self.font_small, '   -   '.join(parts), (tx, r.centery + 15),
+                      uk.Theme.TEXT_MUTED, anchor='midleft', max_w=title_w)
+        trash = pygame.Rect(0, 0, 42, 36)
+        trash.midright = (r.right - 20, r.centery)
+        self._button(screen, trash, icon=self._icon_trash_png_sm, action='list_delete_ask', arg=name,
+                     danger=True, key=f'lt:{name}')
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Shared dropdown overlay
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _open_dropdown(self, anchor, items, current, on_pick, label_fn=None, accent=None,
+                       empty=None, color_fn=None):
+        """Open the one shared picker under *anchor* (a field rect).  on_pick is
+        called with the chosen value; clicking anywhere else just dismisses."""
+        items = list(items)
+        vis = max(1, min(8, len(items)))
+        scroll = 0
+        if current in items:
+            scroll = int(_clamp(items.index(current) - vis // 2, 0, max(0, len(items) - vis)))
+        self._dd = {
+            'anchor': pygame.Rect(anchor), 'items': items, 'current': current,
+            'on_pick': on_pick, 'label_fn': label_fn or (lambda v: v if v != '' else '(none)'),
+            'accent': accent or uk.Theme.GOLD, 'empty': empty, 'color_fn': color_fn,
+            'scroll': scroll, 'visible': vis, 'rect': None, 'rows': [],
+        }
+
+    def _click_dropdown(self, pos):
+        dd, self._dd = self._dd, None
+        for rect, value in dd['rows']:
+            if rect.collidepoint(pos):
+                dd['on_pick'](value)
+                return
+
+    def _draw_dropdown(self, screen):
+        dd = self._dd
+        if dd is None:
             return
-        cur   = self._form_params.get('room_name', '')
-        idx   = rooms.index(cur) if cur in rooms else 0
-        self._form_params['room_name'] = rooms[(idx + delta) % len(rooms)]
+        w, h = self.screen_width, self.screen_height
+        item_h = 30
+        items = dd['items']
+        n_rows = max(1, min(dd['visible'], len(items)))
+        anchor = dd['anchor']
+        width = int(_clamp(max(anchor.w, 200), 120, w - 16))
+        height = n_rows * item_h + 8
+        x = int(_clamp(anchor.x, 8, w - width - 8))
+        limit = h - 8
+        y = anchor.bottom + 6
+        if y + height > limit:
+            y = anchor.top - 6 - height
+            if y < 8:
+                y = max(8, limit - height)
+        rect = pygame.Rect(x, y, width, height)
+        dd['rect'] = rect
 
-    def _cycle_room(self, delta):
-        """Advance (+1) or reverse (-1) through the room list.
-
-        Also invalidates baked tile surfaces so the viewport doesn't flash the
-        old room's tiles for one frame before the new ones load.
-        """
-        rooms = [r.name for r in self.room_manager.rooms
-                 if not getattr(r, 'is_transient', False)]
-        if not rooms:
-            return
-        cur      = self.cutscene_data.get('room', '')
-        idx      = rooms.index(cur) if cur in rooms else 0
-        new_name = rooms[(idx + delta) % len(rooms)]
-        self._push_undo()
-        self.cutscene_data['room'] = new_name
-        self.unsaved = True
-        self._invalidate_tile_cache(new_name)
-        # Drop the tileset_editor's cached tile list so _ensure_room_tiles
-        # reseeds it from room.tiles on the next draw call.
-        te = getattr(self.room_editor, 'tileset_editor', None)
-        if te is not None and hasattr(te, 'room_tiles'):
-            te.room_tiles.pop(new_name, None)
+        uk.draw_panel(screen, rect, bg=uk.Theme.PANEL_BG, border=dd['accent'],
+                      border_width=1, radius=8, shadow=True)
+        rows = []
+        if not items:
+            self._txt(screen, self.font_small, dd['empty'] or 'Nothing to choose from',
+                      (rect.centerx, rect.centery), uk.Theme.TEXT_MUTED, anchor='center',
+                      max_w=width - 16)
+        else:
+            dd['scroll'] = int(_clamp(dd['scroll'], 0, max(0, len(items) - n_rows)))
+            mouse = self._mouse_pos
+            self._push_clip(screen, rect.inflate(-2, -2))
+            for i in range(n_rows):
+                value = items[dd['scroll'] + i]
+                row = pygame.Rect(rect.x + 4, rect.y + 4 + i * item_h, width - 8, item_h)
+                hov = row.collidepoint(mouse)
+                cur = (value == dd['current'])
+                if cur:
+                    uk.draw_rect_on(screen, uk.Theme.CARD_BG_SELECTED, row, 0, 6)
+                elif hov:
+                    uk.draw_rect_on(screen, uk.Theme.CARD_BG_HOVER, row, 0, 6)
+                tx = row.x + 10
+                sw = dd['color_fn'](value) if dd['color_fn'] else None
+                if isinstance(sw, tuple) and len(sw) >= 3:
+                    sr = pygame.Rect(tx, row.centery - 6, 16, 12)
+                    uk.draw_rect_on(screen, sw[:3], sr, 0, 3)
+                    uk.draw_rect_on(screen, uk.Theme.CARD_BORDER, sr, 1, 3)
+                    tx += 24
+                col = (uk.Theme.GOLD_BRIGHT if cur else
+                       uk.Theme.TEXT_PRIMARY if hov else uk.Theme.TEXT_SECONDARY)
+                self._txt(screen, self.font_small, dd['label_fn'](value), (tx, row.centery), col,
+                          anchor='midleft', max_w=row.right - tx - (26 if cur else 10))
+                if cur:
+                    _icon_check(screen, pygame.Rect(row.right - 26, row.centery - 8, 18, 16), uk.Theme.GOLD)
+                rows.append((row, value))
+            self._pop_clip(screen)
+            self._scrollbar(screen, pygame.Rect(rect.right - 7, rect.y + 6, 4, rect.h - 12),
+                            dd['scroll'], len(items), n_rows)
+        dd['rows'] = rows

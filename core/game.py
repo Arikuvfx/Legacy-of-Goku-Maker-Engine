@@ -11,6 +11,29 @@ Main loop:      handle_events → update → draw → clock.tick(FPS)
 
 import sys
 import os
+
+# Tell Windows this process is DPI-aware so it reports the true screen
+# resolution, BEFORE anything else runs. This has to be the very first
+# thing in the file: `from config.settings import *` below calls
+# pygame.init() as an import-time side effect, which initializes SDL's
+# video subsystem and — on Windows — that's enough to implicitly lock in
+# DPI-unaware mode before this process ever gets a chance to opt in.
+# SetProcessDpiAwareness() can only be called once, before that happens;
+# calling it after (where this used to live, after the config.settings
+# import) silently fails, and Windows then bitmap-stretches the entire
+# window through its DPI virtualization layer to match the real display —
+# which blurs every pixel of every UI element regardless of how it was
+# drawn. This is cheap enough to just always attempt on import.
+if sys.platform == 'win32':
+    try:
+        import ctypes as _ctypes
+        _ctypes.windll.shcore.SetProcessDpiAwareness(1)   # Per-Monitor DPI awareness
+    except Exception:
+        try:
+            _ctypes.windll.user32.SetProcessDPIAware()    # Legacy fallback
+        except Exception:
+            pass   # If both calls fail, just carry on — it's cosmetic only
+
 from collections import OrderedDict
 
 # ── Single-instance guard ────────────────────────────────────────────────────
@@ -88,8 +111,8 @@ from core.transition_controller import TransitionController
 from pygame._sdl2 import video as sdl2_video
 from core.gpu_renderer import GPUScreen
 from dev_tools.dev_menu import DevMenu
+import dev_tools.ui_kit as uk
 from dev_tools.npc_config import NPCConfigMenu
-from dev_tools.transition_config import TransitionConfigMenu
 from entities.enemy import Enemy
 from attacks.bomb_projectile import BombProjectile, ExplosionEffect
 from attacks.burning_attack import BurningAttack, BurningChargeEffect, BurningHitEffect
@@ -150,20 +173,6 @@ from ui.title_screen import TitleScreen
 # (DevMenu, room editor, etc.) isn't gated by this yet; that's a separate,
 # bigger "export build" pass for later.
 DEV_BUILD = True
-
-
-# Tell Windows this process is DPI-aware so it reports the true screen resolution.
-# Must run before pygame.init() or the window will render at the wrong scale on
-# high-DPI displays (e.g. Surface devices, 4K monitors with 150 % scaling).
-if sys.platform == 'win32':
-    try:
-        import ctypes as _ctypes
-        _ctypes.windll.shcore.SetProcessDpiAwareness(1)   # Per-Monitor DPI awareness
-    except Exception:
-        try:
-            _ctypes.windll.user32.SetProcessDPIAware()    # Legacy fallback
-        except Exception:
-            pass   # If both calls fail, just carry on — it's cosmetic only
 
 
 class _LevelUpPlayerSpriteDrawable:
@@ -534,7 +543,6 @@ class Game:
         self.dev_menu             = DevMenu(self.game_config, SCREEN_WIDTH, SCREEN_HEIGHT, self.sound_manager)
         self.npc_config_menu      = NPCConfigMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.sprite_editor        = SpriteEditor(SCREEN_WIDTH, SCREEN_HEIGHT)
-        self.transition_config_menu = TransitionConfigMenu(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.world_map_editor = WorldMapEditor(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.world_map_editor.room_manager = self.room_manager
         self.world_map_editor.on_save = self._on_world_map_saved
@@ -544,6 +552,10 @@ class Game:
         self.item_creator = item_creator.ItemCreator(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.decoration_creator = decoration_creator.DecorationCreator(SCREEN_WIDTH, SCREEN_HEIGHT)
         self.decoration_creator.on_catalog_changed = self._refresh_decoration_catalog
+        # True when the creator was opened from the Dev Menu (menu entry or its
+        # F3 shortcut), False when opened straight from gameplay with F3 - decides
+        # whether Back returns to the Dev Menu or just back to the game.
+        self._decoration_creator_from_dev_menu = False
         self.cutscene_editor = CutsceneEditor(
             self.room_manager,
             self.room_editor,
@@ -1667,6 +1679,59 @@ class Game:
                 self._logical_mouse_pos = self._window_to_logical(*event.pos)
         return event
 
+    def _handle_dev_menu_action(self, result):
+        """Dispatch a dev-menu selection to the right editor/creator.
+
+        This used to be inline in handle_events(), reached only via
+        `self.dev_menu.handle_input(event)` inside the pygame event loop.
+        It's now a standalone method because the DPG-based DevMenu resolves
+        a selection inside DPG's OWN event loop (a separate OS window), not
+        pygame's — so the result can arrive either from handle_events()
+        (kept for interface parity / any future pygame-driven menu) or from
+        DevMenu.poll_action(), called once per frame from update() below.
+        Same action strings as before ('open_room_editor', 'close', ...),
+        same behavior either way.
+        """
+        if result == 'close':
+            # Plain close (ESC at the main menu, or "CLOSE MENU") — if this
+            # dev-menu session started mid test-session, don't just fall
+            # back into the test room: exit test mode and drop into the
+            # room editor instead, same as F2. Resuming the test silently
+            # would leave its music/BGS stopped forever, since nothing else
+            # re-applies a room's audio context on the way back in.
+            if self._dev_menu_opened_while_testing:
+                self._exit_test_mode()
+                self.room_editor.active       = True
+                self.room_editor.current_view = 'view_room'
+        elif result == 'open_room_editor':
+            if self.is_test_mode:
+                self._exit_test_mode()
+            self.room_editor.toggle()
+            self._sync_event_editor_character()
+            self._sync_event_editor_rooms()
+        elif result == 'open_sprite_editor':
+            self.sprite_editor.toggle()
+        elif result == 'open_cutscene_editor':
+            self.cutscene_editor.toggle()
+        elif result == 'open_world_map_editor':
+            self.world_map_editor.toggle()
+            # Bust the cached room->map index (see _get_world_map_room_index)
+            # so pin edits made in this editor session are picked up by the
+            # Scouter's World Map section the moment the editor is closed
+            # again, instead of needing a full restart.
+            self._wm_room_index = None
+        elif result == 'open_character_creator':
+            self.character_creator.toggle()
+        elif result == 'open_attack_creator':
+            self.attack_creator.toggle()
+        elif result == 'open_entity_creator':
+            self.entity_creator.toggle()
+        elif result == 'open_item_creator':
+            self.item_creator.toggle()
+        elif result == 'open_decoration_creator':
+            self._decoration_creator_from_dev_menu = True
+            self.decoration_creator.toggle()
+
     def handle_events(self):
         """
         Process all pending pygame events for the current frame.
@@ -1885,37 +1950,35 @@ class Game:
                     self.pending_npc_position = None
                 continue
 
-            if self.transition_config_menu.active:
-                result = self.transition_config_menu.handle_input(event)
-                if result and result != 'cancel' and self.pending_transition_position:
-                    x, y                       = self.pending_transition_position
-                    transition                 = RoomTransition(x, y, result['width'], result['height'])
-                    transition.target_room     = result['target_room']
-                    transition.exit_direction  = result['exit_direction']
-                    transition.entry_direction = result['entry_direction']
-                    transition.spawn_x         = result['spawn_x']
-                    transition.spawn_y         = result['spawn_y']
-                    self.room_transitions.append(transition)
-                    self.pending_transition_position = None
-                elif result == 'cancel':
-                    self.pending_transition_position = None
-                continue
-
             if self.sprite_editor.active:
                 self.sprite_editor.handle_input(event)
                 continue
 
             if self.cutscene_editor.active:
-                self.cutscene_editor.handle_input(event)
+                result = self.cutscene_editor.handle_input(event)
+                if result == 'back_to_dev_menu':
+                    # Cutscene editor's back-arrow / ESC — the Dev Menu
+                    # closed itself when it launched the editor (see
+                    # DevMenu._activate_selected), so reopen it here instead
+                    # of dropping all the way back into gameplay. Mirrors
+                    # RoomEditor / WorldMapEditor's identical handling above.
+                    self.dev_menu.open()
                 continue
 
             if self.world_map_editor.active:
-                self.world_map_editor.handle_input(event)
+                result = self.world_map_editor.handle_input(event)
+                if result == 'back_to_dev_menu':
+                    # World map editor's back-arrow / F2 / ESC — the Dev Menu
+                    # closed itself when it launched this editor (see
+                    # DevMenu._activate_selected), so reopen it here instead
+                    # of dropping all the way back into gameplay. Mirrors
+                    # RoomEditor's identical 'back_to_dev_menu' handling above.
+                    self.dev_menu.open()
                 continue
 
             if self.character_creator.active:
                 result = self.character_creator.handle_input(event)
-                if result == 'close' and hasattr(self.player, 'character'):
+                if result == 'back_to_dev_menu' and hasattr(self.player, 'character'):
                     # Pick up any config the player just saved for the
                     # character they're currently playing as — otherwise
                     # equipped attacks stay stale until they visit the
@@ -1936,29 +1999,69 @@ class Game:
                         # just changed.
                         self.player.level = min(self.player.level, new_max_level)
                         self.player.exp_to_next_level = self.game_config.get_xp_for_level(self.player.level)
+                if result == 'back_to_dev_menu':
+                    # Character creator's back-arrow / ESC — the Dev Menu
+                    # closed itself when it launched the creator (see
+                    # DevMenu._activate_selected), so reopen it here instead
+                    # of dropping all the way back into gameplay. Mirrors
+                    # RoomEditor / WorldMapEditor's identical handling above.
+                    self.dev_menu.open()
                 continue
 
             if self.attack_creator.active:
-                self.attack_creator.handle_input(event)
+                result = self.attack_creator.handle_input(event)
+                if result == 'back_to_dev_menu':
+                    # Attack creator's header back-arrow / ESC — the Dev
+                    # Menu closed itself when it launched the creator (see
+                    # DevMenu._activate_selected), so reopen it here instead
+                    # of dropping all the way back into gameplay. Mirrors
+                    # CharacterCreator / EntityCreator's handling above.
+                    self.dev_menu.open()
                 continue
 
             if self.entity_creator.active:
-                self.entity_creator.handle_input(event)
+                result = self.entity_creator.handle_input(event)
+                if result == 'back_to_dev_menu':
+                    # Entity creator's header back-arrow / ESC — the Dev
+                    # Menu closed itself when it launched the creator (see
+                    # DevMenu._activate_selected), so reopen it here instead
+                    # of dropping all the way back into gameplay. Mirrors
+                    # CharacterCreator / RoomEditor's handling above.
+                    self.dev_menu.open()
                 continue
 
             if self.item_creator.active:
-                self.item_creator.handle_input(event)
+                result = self.item_creator.handle_input(event)
+                if result == 'back_to_dev_menu':
+                    # Item creator's header back-arrow / ESC — the Dev
+                    # Menu closed itself when it launched the creator (see
+                    # DevMenu._activate_selected), so reopen it here instead
+                    # of dropping all the way back into gameplay. Mirrors
+                    # CharacterCreator / EntityCreator's handling above.
+                    self.dev_menu.open()
                 continue
 
             if self.decoration_creator.active:
                 result = self.decoration_creator.handle_input(event)
-                if result == 'close':
+                if result in ('close', 'back_to_dev_menu'):
                     self._refresh_decoration_catalog()
+                    if result == 'back_to_dev_menu' and self._decoration_creator_from_dev_menu:
+                        # Decoration creator's header back-arrow / ESC — the Dev
+                        # Menu closed itself when it launched the creator, so
+                        # reopen it instead of dropping all the way back into
+                        # gameplay. (Opened via F3 from gameplay? Then there is
+                        # no menu to return to, and we simply land back in-game.)
+                        self.dev_menu.open()
                 continue
 
             if self.room_editor.active:
                 result = self.room_editor.handle_input(event)
-                if result and result.startswith('test_room:'):
+                if result == 'back_to_dev_menu':
+                    # Room editor's header back-arrow / ESC-at-groups-view —
+                    # reopen the Dev Menu instead of dropping all the way
+                    # back into gameplay.
+                    self.dev_menu.open()
+                elif result and result.startswith('test_room:'):
                     self._handle_test_room(result)
                 # Rescan missions whenever the editor closes (NPCs may have changed).
                 if not self.room_editor.active:
@@ -1967,59 +2070,13 @@ class Game:
 
             if self.dev_menu.active:
                 if event.type == pygame.KEYDOWN and event.key == pygame.K_F3:
-                    self.dev_menu.active = False
+                    self.dev_menu.close()
+                    self._decoration_creator_from_dev_menu = True
                     self.decoration_creator.toggle()
                     continue
                 result = self.dev_menu.handle_input(event)
-                if result == 'close':
-                    # Plain close (ESC at the main menu, or "CLOSE MENU") —
-                    # if this dev-menu session started mid test-session,
-                    # don't just fall back into the test room: exit test
-                    # mode and drop into the room editor instead, same as
-                    # F2. Resuming the test silently would leave its
-                    # music/BGS stopped forever, since nothing else
-                    # re-applies a room's audio context on the way back in.
-                    if self._dev_menu_opened_while_testing:
-                        self._exit_test_mode()
-                        self.room_editor.active       = True
-                        self.room_editor.current_view = 'view_room'
-                elif result == 'open_room_editor':
-                    self.dev_menu.active = False
-                    if self.is_test_mode:
-                        self._exit_test_mode()
-                    self.room_editor.toggle()
-                    self._sync_event_editor_character()
-                    self._sync_event_editor_rooms()
-                elif result == 'open_sprite_editor':
-                    self.dev_menu.active = False
-                    self.sprite_editor.toggle()
-                elif result == 'open_cutscene_editor':
-                    self.dev_menu.active = False
-                    self.cutscene_editor.toggle()
-                elif result == 'open_world_map_editor':
-                    self.dev_menu.active = False
-                    self.world_map_editor.toggle()
-                    # Bust the cached room->map index (see
-                    # _get_world_map_room_index) so pin edits made in this
-                    # editor session are picked up by the Scouter's World
-                    # Map section the moment the editor is closed again,
-                    # instead of needing a full restart.
-                    self._wm_room_index = None
-                elif result == 'open_character_creator':
-                    self.dev_menu.active = False
-                    self.character_creator.toggle()
-                elif result == 'open_attack_creator':
-                    self.dev_menu.active = False
-                    self.attack_creator.toggle()
-                elif result == 'open_entity_creator':
-                    self.dev_menu.active = False
-                    self.entity_creator.toggle()
-                elif result == 'open_item_creator':
-                    self.dev_menu.active = False
-                    self.item_creator.toggle()
-                elif result == 'open_decoration_creator':
-                    self.dev_menu.active = False
-                    self.decoration_creator.toggle()
+                if result:
+                    self._handle_dev_menu_action(result)
 
             # ── Normal gameplay input ─────────────────────────────────────────
             # Only reached when no overlay is active.
@@ -2192,6 +2249,7 @@ class Game:
 
         elif event.key == pygame.K_F3:
             if DEV_BUILD:
+                self._decoration_creator_from_dev_menu = False
                 self.decoration_creator.toggle()
 
         elif event.key == pygame.K_F2:
@@ -9117,6 +9175,14 @@ class Game:
                 return
             if self.dev_menu.active:
                 self.dev_menu.update(dt)
+                # The DPG-based dev menu resolves a selection inside its own
+                # window's event loop, not pygame's — handle_events() may
+                # see zero pygame events on a frame where the user clicked a
+                # card in the dev-menu window. poll_action() is how that
+                # selection actually reaches the dispatcher, every frame.
+                action = self.dev_menu.poll_action()
+                if action:
+                    self._handle_dev_menu_action(action)
                 return
             if self.world_map_editor.active:
                 self.world_map_editor.update(dt)
@@ -11643,15 +11709,28 @@ class Game:
         # reusing the player's.
         self._draw_far_attack_silhouettes_if_occluded()
 
-        # Test-mode indicator banner — drawn after foreground tiles so it's always on top.
+        # Test-mode indicator banner — drawn after foreground tiles so it's always
+        # on top. Styled as a gold-bordered uk panel (same look as the room/
+        # tileset editors and toolbar) instead of the old plain black chip.
         if self.is_test_mode:
-            test_font = self._get_font(32)
-            test_text = test_font.render("TEST MODE — Press F2 to return to editor", True, (255, 255, 0))
-            test_bg   = pygame.Surface((test_text.get_width() + 20, test_text.get_height() + 10), pygame.SRCALPHA)
-            test_bg.fill((0, 0, 0, 180))
-            bg_x = (SCREEN_WIDTH - test_text.get_width()) // 2 - 10
-            self.logical_surface.blit(test_bg,   (bg_x, 10))
-            self.logical_surface.blit(test_text, ((SCREEN_WIDTH - test_text.get_width()) // 2, 15))
+            ui_font = self._get_ui_font()
+            title_s = ui_font.render("TEST MODE", color=uk.Theme.GOLD, height=20)
+            hint_s  = ui_font.render("Press F2 to return to editor", color=uk.Theme.TEXT_DIM, height=12)
+
+            pad_x, pad_y, line_gap = 16, 10, 4
+            panel_w = max(title_s.get_width(), hint_s.get_width()) + pad_x * 2
+            panel_h = title_s.get_height() + line_gap + hint_s.get_height() + pad_y * 2
+            panel_rect = pygame.Rect((SCREEN_WIDTH - panel_w) // 2, 10, panel_w, panel_h)
+
+            uk.draw_panel(self.logical_surface, panel_rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD,
+                          border_width=2, radius=uk.Theme.RADIUS_PANEL, shadow=True)
+            uk.blit_surface(self.logical_surface, title_s,
+                            title_s.get_rect(centerx=panel_rect.centerx, y=panel_rect.y + pad_y),
+                            transient=True)
+            uk.blit_surface(self.logical_surface, hint_s,
+                            hint_s.get_rect(centerx=panel_rect.centerx,
+                                            y=panel_rect.y + pad_y + title_s.get_height() + line_gap),
+                            transient=True)
 
         # HUD, menus, and dev overlays.
         # Weather is drawn first (below the dialogue box), then the UI layer which
@@ -11683,6 +11762,17 @@ class Game:
             self._draw_ui(self.dt)
 
         # Dev tools — always drawn last so they sit on top of everything.
+        # cutscene_editor.draw() is deliberately the LAST call in this whole
+        # block (after world_map_editor and the debug outlines below, right
+        # before present()). It resolves the OS cursor (I-beam/hand/arrow)
+        # as the final step of its own draw() — see CutsceneEditor._resolve_cursor.
+        # That only actually sticks for the frame if nothing drawn afterward
+        # also touches the OS cursor (e.g. dev_menu's or world_map_editor's
+        # own always-drawn chrome, via ui_kit's shared cursor state) — each
+        # editor here is a no-op while inactive, but any of them still
+        # touching the cursor on the way to that no-op would fight with
+        # cutscene_editor's choice every frame and flicker it. Keep this one
+        # last if more dev tools are added below.
         self.sprite_editor.draw(self.logical_surface)
         self.character_creator.draw(self.logical_surface, self.dt)
         self.attack_creator.draw(self.logical_surface, self.dt)
@@ -11691,7 +11781,6 @@ class Game:
         self.decoration_creator.draw(self.logical_surface, self.dt)
         self.room_editor.draw(self.logical_surface)
         self.dev_menu.draw(self.logical_surface)
-        self.cutscene_editor.draw(self.logical_surface)
         self.world_map_editor.draw(self.logical_surface)
 
         # Collision and transition outlines in editor view mode.
@@ -11703,6 +11792,8 @@ class Game:
             for transition in self.room_transitions:
                 transition.draw(self.logical_surface, self.camera, RENDER_SCALE,
                                 dev_mode=True, selected=False)
+
+        self.cutscene_editor.draw(self.logical_surface)
 
         # With pygame.SCALED the display handles window-resize scaling in hardware —
         # just flip; no manual surface scale needed.
@@ -11783,6 +11874,15 @@ class Game:
         if size not in self._font_cache:
             self._font_cache[size] = pygame.font.Font(None, size)
         return self._font_cache[size]
+
+    def _get_ui_font(self) -> "uk.BitmapFont":
+        """Lazy-cached uk.BitmapFont — the same font family used by the
+        room/tileset editors and toolbar, for HUD chrome that should read as
+        part of that UI (e.g. the test-mode banner) instead of pygame's
+        default system font."""
+        if not hasattr(self, '_ui_font'):
+            self._ui_font = uk.BitmapFont('assets\\ui\\fonts', letter_spacing=1)
+        return self._ui_font
 
     def _install_tile_change_hook(self):
         """Wire on_tile_changed onto tileset_editor once it has been created.
@@ -13824,8 +13924,6 @@ class Game:
         )
         if not self.scouter_menu.active:
             self.level_up_notification.draw(self.logical_surface, self.colors, sprite_hud=self.sprite_hud, player=self.player)
-
-        self.transition_config_menu.draw(self.logical_surface)
 
         # HUD slide animation — slides in/out when entering/leaving game mode.
         # Suppressed entirely during the world-map flying/landing sequence so the

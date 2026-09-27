@@ -7,6 +7,24 @@ from typing import List, Tuple, Optional, Set
 from enum import Enum
 from config.settings import RENDER_SCALE, TILE_SIZE
 
+import dev_tools.ui_kit as uk
+
+
+# =============================================================================
+# Small vector chevron for the panel show/hide tab — same primitive
+# convention (draw_line_on) as ui_kit's own icon glyphs.
+# =============================================================================
+
+def _draw_chevron_icon(surface, rect, color, left=True, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.28
+    if left:
+        uk.draw_line_on(surface, color, (cx + s * 0.5, cy - s), (cx - s * 0.5, cy), width)
+        uk.draw_line_on(surface, color, (cx - s * 0.5, cy), (cx + s * 0.5, cy + s), width)
+    else:
+        uk.draw_line_on(surface, color, (cx - s * 0.5, cy - s), (cx + s * 0.5, cy), width)
+        uk.draw_line_on(surface, color, (cx + s * 0.5, cy), (cx - s * 0.5, cy + s), width)
+
 
 class TileType(Enum):
     GROUND = 0
@@ -644,6 +662,9 @@ class TilesetEditor:
         self.layer_dropdown_open = False
         self.layer_input_active = False
         self.layer_input_text = ""
+        # True right after 'Custom...' is picked: the pre-filled value gets
+        # replaced by the first key typed, instead of being appended to.
+        self.layer_input_fresh = False
 
         self.foreground_mode = False
 
@@ -669,33 +690,48 @@ class TilesetEditor:
         self.palette_width = 600
         self.palette_x = screen_width - self.palette_width
         self.palette_y = 100
-        self.palette_height = 940
-        self.palette_content_height = 500
+        # Tallest the panel is allowed to get. The actual height (palette_height)
+        # shrinks below this when the current tileset needs less room.
+        self.palette_max_height = 940
         self.tileset_area_y_offset = 35
+        self.tileset_area_bottom_pad = 20
+        # Strip under the tile grid: 10px gap, two checkbox rows (18px, spaced
+        # 26px apart), then the 28px tile layer row 56px below the first.
+        self.palette_controls_height = 94
+        # palette_content_height / palette_height are properties (below): the
+        # tile grid is as tall as the current tileset needs, capped so the
+        # panel never exceeds palette_max_height.
 
         self.grid_cell_size = 32
         self.show_grid = True
 
-        self.font_large = pygame.font.Font(None, 32)
-        self.font_medium = pygame.font.Font(None, 24)
-        self.font_small = pygame.font.Font(None, 18)
+        # Same bitmap font family + Theme colors as DevMenu / EditorToolbar's
+        # own chrome, so the tileset editor reads as part of the same tool
+        # family instead of a mismatched leftover panel.
+        self.font = uk.BitmapFont('assets\\ui\\fonts', letter_spacing=1)
+        self.title_size = 16
+        self.body_size  = 11
+        self.hint_size  = 10
 
-        self.colors = {
-            'bg': (20, 20, 30),
-            'panel': (30, 30, 45),
-            'panel_light': (45, 45, 65),
-            'accent': (255, 215, 0),
-            'selection': (100, 150, 255),
-            'text': (255, 255, 255),
-            'text_dim': (180, 180, 200),
-            'success': (100, 255, 100),
-            'danger': (255, 100, 100),
-            'grid': (44, 149, 44, 80),
-            'grid_dim': (44, 149, 44, 30),
-            'button': (60, 60, 80),
-            'button_hover': (80, 80, 100),
-            'checkbox': (100, 100, 120)
-        }
+        # Optional custom icon for the info ('?') badge — same PNG-override
+        # convention as EditorToolbar (assets/ui/toolbar/<id>.png): drop a
+        # PNG there and it replaces the procedural circle+'?' mark below.
+        self._info_icon = None
+        try:
+            _info_img = pygame.image.load('assets/ui/toolbar/info.png').convert_alpha()
+            _iw, _ih = _info_img.get_size()
+            _scale = min(18 / _iw, 18 / _ih)
+            self._info_icon = pygame.transform.scale(
+                _info_img, (max(1, int(_iw * _scale)), max(1, int(_ih * _scale))))
+        except Exception:
+            pass
+
+        # A couple of accents that don't have a direct Theme constant —
+        # kept local rather than added to ui_kit since they're specific to
+        # this editor's collision/selection overlays.
+        self.SUCCESS   = (140, 220, 140)
+        self.SELECTION = uk.Theme.KI_BLUE
+        self.GRID_LINE = (58, 64, 82)
 
         self.grid_size = 16
         # The anchor-snap grid used when deciding *where* a stamp/erase
@@ -772,6 +808,57 @@ class TilesetEditor:
         self._panel_tab_h = 72
         self._hover_panel_toggle = False
 
+        # Slide animation for the panel opening/closing — chased toward
+        # 1.0 (fully open) or 0.0 (fully closed) each frame, same
+        # exponential-approach pattern EditorToolbar uses for its bar.
+        # Advanced from inside draw_palette() (timed off real elapsed ms)
+        # since this widget has no separate per-frame update(dt) hook of
+        # its own — hover state below is already resolved the same way.
+        self._panel_slide_anim    = 1.0 if self.palette_visible else 0.0
+        self._panel_slide_last_ms = None
+        self._PANEL_SLIDE_RATE    = 9.0
+
+        # Keybinds reference popup — toggled by the '?' info button next to
+        # the palette title. Replaces the old always-on instructions footer.
+        self.show_keybinds_popup = False
+
+    @property
+    def _palette_content_max_height(self) -> int:
+        """The most vertical room the tile-grid box could ever get inside a
+        panel that's palette_max_height tall — i.e. content height when the
+        tileset fills all available space. Used both to cap
+        palette_content_height and to keep the controls strip pinned to a
+        fixed spot regardless of how much shorter the box actually is."""
+        return (self.palette_max_height - self.tileset_area_y_offset
+                - self.tileset_area_bottom_pad - self.palette_controls_height)
+
+    @property
+    def palette_content_height(self) -> int:
+        """Height of the tile grid box: exactly as tall as the current
+        tileset (rows * cell size) when that fits, otherwise the most the
+        panel can give it (the grid then scrolls). This shrinks for a small
+        tileset — but the panel itself (palette_height) does not; see
+        palette_height below."""
+        max_h = self._palette_content_max_height
+        tileset = self.get_current_tileset()
+        if tileset is None:
+            return max_h
+        needed = tileset.rows * self.grid_cell_size
+        return max(self.grid_cell_size, min(max_h, needed))
+
+    @property
+    def palette_height(self) -> int:
+        """Whole panel height. Fixed at palette_max_height so the editor's
+        outer box stays a constant size — only the tile grid box inside it
+        (palette_content_height) shrinks for tilesets that don't need the
+        full height."""
+        return self.palette_max_height
+
+    @palette_height.setter
+    def palette_height(self, value: int):
+        # Assigning a height (e.g. on window resize) sets the maximum.
+        self.palette_max_height = int(value)
+
     def toggle(self):
         """Open or close the tileset editor."""
         self.active = not self.active
@@ -790,25 +877,32 @@ class TilesetEditor:
     # -------------------------------------------------------------------------
 
     def _panel_toggle_rect(self):
-        """Return the rect for the ◀/▶ tab that straddles the panel's left edge."""
+        """Return the rect for the ◀/▶ tab that straddles the panel's left
+        edge. Tracks the animated slide (_panel_slide_anim), not just the
+        instant palette_visible flag, so the tab visually stays glued to
+        the panel's edge as it slides in/out instead of snapping straight
+        to its new spot. This also doubles as the click/hover hit-rect,
+        which is what we want: the tab should be clickable where it's
+        actually drawn. self.palette_x here is always the panel's settled
+        resting position (draw_palette restores it after each shifted
+        draw), so this is stable to call from anywhere, animating or not."""
         gap = 6  # breathing room between tab and panel when panel is visible
-        tx = (self.palette_x - self._panel_tab_w - gap) if self.palette_visible else (self.screen_width - self._panel_tab_w)
+        tx_shown  = self.palette_x - self._panel_tab_w - gap
+        tx_hidden = self.screen_width - self._panel_tab_w
+        tx = round(uk.lerp(tx_hidden, tx_shown, self._panel_slide_anim))
         ty = self.palette_y + (self.palette_height - self._panel_tab_h) // 2
         return pygame.Rect(tx, ty, self._panel_tab_w, self._panel_tab_h)
 
     def _draw_panel_toggle_tab(self, screen):
-        """Render the small ◀/▶ tab — always visible so the panel can be recalled."""
-        rect   = self._panel_toggle_rect()
-        bg     = self.colors['button_hover'] if self._hover_panel_toggle else self.colors['button']
-        border = self.colors['accent']       if self._hover_panel_toggle else (60, 60, 80)
-        screen.draw_rect( bg,     rect, border_radius=6)
-        screen.draw_rect( border, rect, 1, border_radius=6)
-        arrow = '◀' if self.palette_visible else '▶'
-        label = self.font_small.render(
-            arrow, True,
-            self.colors['accent'] if self._hover_panel_toggle else self.colors['text_dim']
-        )
-        screen.blit(label, label.get_rect(center=rect.center))
+        """Render the small show/hide tab — always visible so the panel can be recalled."""
+        rect = self._panel_toggle_rect()
+        lit  = self._hover_panel_toggle
+        bg     = uk.lerp_color((22, 25, 35), (30, 34, 46), 1.0 if lit else 0.0)
+        border = uk.Theme.GOLD if lit else uk.Theme.PANEL_BORDER
+        uk.draw_panel(screen, rect, bg=(*bg, 235), border=border, border_width=1,
+                      radius=6, shadow=False)
+        chevron_color = uk.Theme.GOLD_BRIGHT if lit else uk.Theme.TEXT_MUTED
+        _draw_chevron_icon(screen, rect, chevron_color, left=self.palette_visible, width=2)
 
     def get_current_tileset(self) -> Optional[Tileset]:
         """Return the active tileset object, or None if the list is empty."""
@@ -1047,6 +1141,19 @@ class TilesetEditor:
             return rect.collidepoint(mouse_x, mouse_y)
         return False
 
+    def _commit_layer_input(self):
+        """Apply the typed custom layer. Empty / '-' input just closes the
+        field and keeps the layer that was active before."""
+        try:
+            value = int(self.layer_input_text)
+        except ValueError:
+            value = None
+        if value is not None:
+            self.custom_layer_value = value
+            self.current_layer = value
+        self.layer_input_active = False
+        self.layer_input_fresh = False
+
     def handle_input(self, event, camera_x: int, camera_y: int, current_room_name: str):
         """Route keyboard and mouse events while the editor is active."""
         if not self.active:
@@ -1078,22 +1185,27 @@ class TilesetEditor:
 
             # Handle layer input text entry
             if self.layer_input_active:
-                if event.key == pygame.K_RETURN:
-                    try:
-                        self.custom_layer_value = int(self.layer_input_text)
-                        self.current_layer = self.custom_layer_value
-                        self.layer_input_active = False
-                    except ValueError:
-                        pass
+                if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    self._commit_layer_input()
                 elif event.key == pygame.K_ESCAPE:
                     self.layer_input_active = False
+                    self.layer_input_fresh = False
                 elif event.key == pygame.K_BACKSPACE:
+                    self.layer_input_fresh = False
                     self.layer_input_text = self.layer_input_text[:-1]
-                elif event.key == pygame.K_MINUS or event.unicode == '-':
-                    if not self.layer_input_text:
-                        self.layer_input_text += '-'
-                elif event.unicode.isdigit():
-                    self.layer_input_text += event.unicode
+                else:
+                    ch = event.unicode
+                    if ch == '-' or (ch and ch.isascii() and ch.isdigit()):
+                        # First key after opening Custom... replaces the
+                        # pre-filled current value rather than appending to it.
+                        if self.layer_input_fresh:
+                            self.layer_input_text = ""
+                            self.layer_input_fresh = False
+                        if ch == '-':
+                            if not self.layer_input_text:
+                                self.layer_input_text = '-'
+                        elif len(self.layer_input_text.lstrip('-')) < 6:
+                            self.layer_input_text += ch
                 return
 
             if event.key == pygame.K_TAB:
@@ -1206,6 +1318,17 @@ class TilesetEditor:
                 self.palette_visible = not self.palette_visible
                 return
 
+            if event.button == 1 and self._is_in_ui_rect(mouse_x, mouse_y, 'info_button'):
+                self.show_keybinds_popup = not self.show_keybinds_popup
+                return
+
+            # While the keybinds popup is open, any other click just closes
+            # it — nothing underneath (palette or world) should react to a
+            # click that was really the person dismissing the popup.
+            if self.show_keybinds_popup:
+                self.show_keybinds_popup = False
+                return
+
             if self._is_in_ui_rect(mouse_x, mouse_y, 'layer_dropdown'):
                 self.layer_dropdown_open = not self.layer_dropdown_open
                 return
@@ -1214,15 +1337,26 @@ class TilesetEditor:
                 for i, (name, value) in enumerate(self.LAYER_PRESETS):
                     if self._is_in_ui_rect(mouse_x, mouse_y, f'layer_option_{i}'):
                         self.current_layer_preset_index = i
+                        # Picking ANY option ends a custom entry in progress —
+                        # otherwise the field stays open, swallows every key,
+                        # and keeps showing "Custom: ..." over the new layer.
+                        self.layer_input_active = False
+                        self.layer_input_fresh = False
                         if value is not None:
                             self.current_layer = value
                         else:
                             self.layer_input_active = True
+                            self.layer_input_fresh = True
                             self.layer_input_text = str(self.current_layer)
                         self.layer_dropdown_open = False
                         return
                 self.layer_dropdown_open = False
                 return
+
+            # Clicking anywhere else while typing a custom layer confirms it
+            # (the click then goes on to do whatever it normally would).
+            if self.layer_input_active and event.button in (1, 3):
+                self._commit_layer_input()
 
             if self._is_in_ui_rect(mouse_x, mouse_y, 'delete_checkbox'):
                 self.delete_underlying = not self.delete_underlying
@@ -1720,8 +1854,8 @@ class TilesetEditor:
             )
             preview_surface.fill((0, 0, 0, max(0, min(255, int(self.native_shadow_alpha)))))
             screen.blit(preview_surface, (screen_x, screen_y))
-            screen.draw_rect(
-                self.colors['accent'],
+            uk.draw_rect_on(
+                screen, uk.Theme.GOLD,
                 (screen_x, screen_y, shadow_w * RENDER_SCALE, shadow_h * RENDER_SCALE),
                 2,
             )
@@ -1762,8 +1896,8 @@ class TilesetEditor:
                 screen.blit(preview_surface, (screen_x, screen_y))
 
                 # Accent border so it reads clearly over any background
-                screen.draw_rect( self.colors['accent'],
-                                 (screen_x, screen_y, scaled_width, scaled_height), 2)
+                uk.draw_rect_on(screen, uk.Theme.GOLD,
+                                (screen_x, screen_y, scaled_width, scaled_height), 2)
 
     def _invalidate_sorted_tiles_cache(self, room_name: str):
         """Drop the cached layer-sorted tile order for a room. Call this
@@ -1993,55 +2127,143 @@ class TilesetEditor:
 
         screen.blit(draw_surface, (int(screen_x), int(screen_y)))
 
+    # -------------------------------------------------------------------------
+    # Clip-safe drawing helpers for the palette's tile grid.
+    #
+    # screen.set_clip() only reliably affects direct surface blits; the uk.*
+    # draw helpers (rects, lines, blit_surface) can paint straight past it, so
+    # anything drawn on top of the tileset image (selection, solid hatching,
+    # animation badges, grid lines) was leaking out of the tile area when the
+    # tileset was scrolled. These clip the geometry themselves instead.
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _blit_clipped(screen, surf, pos, clip):
+        dest = pygame.Rect(pos, surf.get_size())
+        vis = dest.clip(clip)
+        if vis.w <= 0 or vis.h <= 0:
+            return
+        area = vis.move(-dest.x, -dest.y)
+        uk.blit_surface(screen, surf.subsurface(area), vis.topleft, transient=True)
+
+    @staticmethod
+    def _rect_border_clipped(screen, color, rect, width, clip):
+        """Inset border drawn as four strips, each clipped — so an edge that's
+        scrolled out of view disappears instead of being redrawn on the clip edge."""
+        r = pygame.Rect(rect)
+        strips = ((r.x, r.y, r.w, width), (r.x, r.bottom - width, r.w, width),
+                  (r.x, r.y, width, r.h), (r.right - width, r.y, width, r.h))
+        for strip in strips:
+            vis = pygame.Rect(strip).clip(clip)
+            if vis.w > 0 and vis.h > 0:
+                uk.draw_rect_on(screen, color, vis, 0, 0)
+
+    @staticmethod
+    def _axis_line_clipped(screen, color, a, b, clip):
+        """1px horizontal or vertical line, trimmed to the clip rect."""
+        (x0, y0), (x1, y1) = a, b
+        if y0 == y1:
+            if not (clip.top <= y0 < clip.bottom):
+                return
+            xa, xb = max(min(x0, x1), clip.left), min(max(x0, x1), clip.right)
+            if xa < xb:
+                uk.draw_line_on(screen, color, (xa, y0), (xb, y0), 1)
+        else:
+            if not (clip.left <= x0 < clip.right):
+                return
+            ya, yb = max(min(y0, y1), clip.top), min(max(y0, y1), clip.bottom)
+            if ya < yb:
+                uk.draw_line_on(screen, color, (x0, ya), (x0, yb), 1)
+
     def draw_palette(self, screen: pygame.Surface):
-        """Draw the tileset palette UI with layer controls"""
+        """Draw the tileset palette UI with layer controls."""
         if not self.active:
             return
 
         # Update hover state for the toggle tab
         mx, my = getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos())
         self._hover_panel_toggle = self._panel_toggle_rect().collidepoint(mx, my)
+        uk.register_hoverable(self._panel_toggle_rect())
+
+        # Advance the panel's open/close slide toward its target (chased,
+        # not a fixed-duration tween — same style as EditorToolbar's bar).
+        now_ms = pygame.time.get_ticks()
+        dt = 0.0
+        if self._panel_slide_last_ms is not None:
+            dt = min(0.05, max(0.0, (now_ms - self._panel_slide_last_ms) / 1000.0))
+        self._panel_slide_last_ms = now_ms
+        target_slide = 1.0 if self.palette_visible else 0.0
+        self._panel_slide_anim += (target_slide - self._panel_slide_anim) * min(1.0, dt * self._PANEL_SLIDE_RATE)
+        if abs(target_slide - self._panel_slide_anim) < 0.001:
+            self._panel_slide_anim = target_slide
 
         # Always draw the toggle tab so the panel can be recalled when hidden
         self._draw_panel_toggle_tab(screen)
 
-        if not self.palette_visible:
+        # Keep drawing the panel for as long as it's still sliding, even
+        # after palette_visible has already flipped to False — otherwise
+        # it would vanish instantly the moment the tab is clicked, before
+        # the slide even starts. palette_visible itself still flips
+        # immediately (unchanged), so anything that reads it for hit-
+        # testing is unaffected — only the drawn frame lags behind.
+        if self._panel_slide_anim <= 0.001:
+            uk.update_hover_cursor((mx, my))
             return
 
         tileset = self.get_current_tileset()
         if not tileset:
+            uk.update_hover_cursor((mx, my))
             return
 
-        palette_height = 940
-        palette_rect = pygame.Rect(self.palette_x, self.palette_y,
-                                   self.palette_width, palette_height)
+        # Slide offset: 0 fully open, palette_width fully closed (panel
+        # pushed entirely past the right edge). Every position below —
+        # including inside the _draw_palette_* helpers this calls — is
+        # already computed from self.palette_x, so temporarily shifting it
+        # moves the whole panel as one unit. Drawn directly to `screen` in
+        # a single pass, same as before; no intermediate offscreen surface
+        # (that caused visible seams and a glow halo on the toolbar bar).
+        dx = round(self.palette_width * (1.0 - self._panel_slide_anim))
+        self.palette_x += dx
 
-        # Background
-        palette_bg = pygame.Surface((self.palette_width, palette_height), pygame.SRCALPHA)
-        palette_bg.fill((*self.colors['bg'], 230))
-        screen.blit(palette_bg, (self.palette_x, self.palette_y))
-        screen.draw_rect( self.colors['accent'], palette_rect, 2)
+        palette_rect = pygame.Rect(self.palette_x, self.palette_y,
+                                   self.palette_width, self.palette_height)
+
+        uk.draw_panel(screen, palette_rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD,
+                      border_width=2, radius=uk.Theme.RADIUS_PANEL, shadow=True)
 
         # Title
-        title_text = self.font_medium.render(f"Tileset: {tileset.name}", True, self.colors['text'])
-        screen.blit(title_text, (self.palette_x + 20, self.palette_y + 10))
+        title_s = self.font.render(f"Tileset: {tileset.name}", color=uk.Theme.GOLD, height=self.title_size)
+        uk.blit_surface(screen, title_s, (self.palette_x + 16, self.palette_y + 10), transient=True)
 
-        # Tileset dimensions
+        # Info button — small '?' badge right after the title that opens the
+        # full keybinds reference (see _draw_keybinds_popup).
+        info_d = 18
+        info_x = self.palette_x + 16 + title_s.get_width() + 14
+        info_y = self.palette_y + 10 + (title_s.get_height() - info_d) // 2
+        info_rect = pygame.Rect(info_x, info_y, info_d, info_d)
+        self.ui_rects['info_button'] = info_rect
+        uk.register_hoverable(info_rect)
+        self._draw_info_button(screen, info_rect)
+
+        # Tileset dimensions, right-aligned so it never collides with the title
         dims_text = f"{tileset.cols}x{tileset.rows} tiles ({tileset.tile_width}px)"
-        dims_surf = self.font_small.render(dims_text, True, self.colors['text_dim'])
-        screen.blit(dims_surf, (self.palette_x + 280, self.palette_y + 15))
+        dims_s = self.font.render(dims_text, color=uk.Theme.TEXT_MUTED, height=self.body_size)
+        uk.blit_surface(screen, dims_s,
+                        (self.palette_x + self.palette_width - dims_s.get_width() - 16, self.palette_y + 15),
+                        transient=True)
 
-        # Draw tileset with grid
+        # Tile grid — a recessed card within the panel
         tileset_y = self.palette_y + self.tileset_area_y_offset
         tileset_x = self.palette_x + 20
 
-        # Create clipping rect for scrollable area
         clip_rect = pygame.Rect(tileset_x, tileset_y,
                                 self.palette_width - 40, self.palette_content_height)
+        uk.draw_rect_on(screen, uk.Theme.CARD_BG, clip_rect, 0, 6)
+        uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER, clip_rect, 1, 6)
         screen.set_clip(clip_rect)
 
-        # Draw the tileset image scaled up
         if tileset.image:
+            uk.register_hoverable(clip_rect)
             scaled_width = tileset.cols * self.grid_cell_size
             scaled_height = tileset.rows * self.grid_cell_size
             scaled_tileset = pygame.transform.scale(tileset.image, (scaled_width, scaled_height))
@@ -2050,31 +2272,32 @@ class TilesetEditor:
             draw_y = tileset_y - self.palette_scroll_y
             screen.blit(scaled_tileset, (draw_x, draw_y))
 
-            # Draw grid overlay
+            # Grid overlay (lines trimmed to the visible tile area)
             for row in range(tileset.rows + 1):
                 y = draw_y + row * self.grid_cell_size
-                screen.draw_line( self.colors['grid_dim'][:3],
-                                 (draw_x, y), (draw_x + scaled_width, y), 1)
-
+                self._axis_line_clipped(screen, self.GRID_LINE,
+                                        (draw_x, y), (draw_x + scaled_width, y), clip_rect)
             for col in range(tileset.cols + 1):
                 x = draw_x + col * self.grid_cell_size
-                screen.draw_line( self.colors['grid_dim'][:3],
-                                 (x, draw_y), (x, draw_y + scaled_height), 1)
+                self._axis_line_clipped(screen, self.GRID_LINE,
+                                        (x, draw_y), (x, draw_y + scaled_height), clip_rect)
 
-            # Mark animated anchor tiles with a small badge so they're
-            # identifiable at a glance while browsing the palette
+            # Mark animated anchor tiles with a small gold badge so they're
+            # identifiable at a glance while browsing the palette. A badge that
+            # would be cut by the edge of the tile area is skipped.
             for (anim_tx, anim_ty) in tileset.tile_animations:
                 if not (0 <= anim_tx < tileset.cols and 0 <= anim_ty < tileset.rows):
                     continue
                 badge_x = draw_x + anim_tx * self.grid_cell_size + self.grid_cell_size - 9
                 badge_y = draw_y + anim_ty * self.grid_cell_size + 2
-                screen.draw_circle( self.colors['accent'], (badge_x, badge_y), 5)
-                screen.draw_circle( (20, 20, 30), (badge_x, badge_y), 5, 1)
+                if not clip_rect.contains(pygame.Rect(badge_x - 5, badge_y - 5, 10, 10)):
+                    continue
+                uk.draw_circle_on(screen, uk.Theme.GOLD, (badge_x, badge_y), 5)
+                uk.draw_circle_on(screen, (14, 17, 25), (badge_x, badge_y), 5, 1)
 
-            # Mark solid (collision) tiles with a red hatch overlay so their
-            # footprint is visible at a glance — echoes the red hatched look
-            # collision walls get drawn with in the room editor itself, so
-            # "red = blocks movement" reads consistently in both places.
+            # Mark solid (collision) tiles with a hatch overlay — the same
+            # "red = blocks movement" language the room editor's own
+            # collision walls use, in the Theme's danger tone.
             #
             # At collision_granularity 16 this hatches whole tiles from
             # solid_tiles, same as always. At granularity 8 it instead
@@ -2087,26 +2310,30 @@ class TilesetEditor:
                         continue
                     cell_x = draw_x + solid_tx * self.grid_cell_size + sub_x * half
                     cell_y = draw_y + solid_ty * self.grid_cell_size + sub_y * half
+                    if not pygame.Rect(cell_x, cell_y, half, half).colliderect(clip_rect):
+                        continue
                     hatch = pygame.Surface((half, half), pygame.SRCALPHA)
-                    hatch.fill((255, 0, 0, 60))
+                    hatch.fill((*uk.Theme.DANGER, 60))
                     for i in range(-half, half * 2, 6):
-                        pygame.draw.line(hatch, (255, 0, 0, 130), (i, 0), (i + half, half), 1)
-                    screen.blit(hatch, (cell_x, cell_y))
-                    screen.draw_rect((255, 0, 0), (cell_x, cell_y, half, half), 1)
+                        pygame.draw.line(hatch, (*uk.Theme.DANGER_BRIGHT, 130), (i, 0), (i + half, half), 1)
+                    self._blit_clipped(screen, hatch, (cell_x, cell_y), clip_rect)
+                    self._rect_border_clipped(screen, uk.Theme.DANGER,
+                                              (cell_x, cell_y, half, half), 1, clip_rect)
                 # Faint quadrant divider on every 16x16 tile (not just solid
                 # ones) so it's clear at a glance the palette is in 8x8
                 # collision mode and where each tile's quarter boundaries
                 # fall, before anything's even been painted solid yet.
+                cell = self.grid_cell_size
                 for row in range(tileset.rows):
                     for col in range(tileset.cols):
-                        mid_x = draw_x + col * self.grid_cell_size + half
-                        mid_y = draw_y + row * self.grid_cell_size + half
-                        screen.draw_line((150, 150, 170),
-                                         (mid_x, draw_y + row * self.grid_cell_size),
-                                         (mid_x, draw_y + row * self.grid_cell_size + self.grid_cell_size), 1)
-                        screen.draw_line((150, 150, 170),
-                                         (draw_x + col * self.grid_cell_size, mid_y),
-                                         (draw_x + col * self.grid_cell_size + self.grid_cell_size, mid_y), 1)
+                        cx = draw_x + col * cell
+                        cy = draw_y + row * cell
+                        if not pygame.Rect(cx, cy, cell, cell).colliderect(clip_rect):
+                            continue
+                        self._axis_line_clipped(screen, uk.Theme.PANEL_BORDER,
+                                                (cx + half, cy), (cx + half, cy + cell), clip_rect)
+                        self._axis_line_clipped(screen, uk.Theme.PANEL_BORDER,
+                                                (cx, cy + half), (cx + cell, cy + half), clip_rect)
             else:
                 for (solid_tx, solid_ty) in tileset.solid_tiles:
                     if not (0 <= solid_tx < tileset.cols and 0 <= solid_ty < tileset.rows):
@@ -2114,14 +2341,18 @@ class TilesetEditor:
                     cell_x = draw_x + solid_tx * self.grid_cell_size
                     cell_y = draw_y + solid_ty * self.grid_cell_size
                     size = self.grid_cell_size
+                    if not pygame.Rect(cell_x, cell_y, size, size).colliderect(clip_rect):
+                        continue
                     hatch = pygame.Surface((size, size), pygame.SRCALPHA)
-                    hatch.fill((255, 0, 0, 60))
+                    hatch.fill((*uk.Theme.DANGER, 60))
                     for i in range(-size, size * 2, 6):
-                        pygame.draw.line(hatch, (255, 0, 0, 130), (i, 0), (i + size, size), 1)
-                    screen.blit(hatch, (cell_x, cell_y))
-                    screen.draw_rect((255, 0, 0), (cell_x, cell_y, size, size), 1)
+                        pygame.draw.line(hatch, (*uk.Theme.DANGER_BRIGHT, 130), (i, 0), (i + size, size), 1)
+                    self._blit_clipped(screen, hatch, (cell_x, cell_y), clip_rect)
+                    self._rect_border_clipped(screen, uk.Theme.DANGER,
+                                              (cell_x, cell_y, size, size), 1, clip_rect)
 
-            # Draw selection rectangle
+            # Selection rectangle — clipped to the tile area so it can't
+            # spill into the rest of the panel / world when scrolled away.
             min_x, max_x, min_y, max_y = self._get_selection_bounds()
             sel_width = max_x - min_x + 1
             sel_height = max_y - min_y + 1
@@ -2129,165 +2360,106 @@ class TilesetEditor:
             sel_y = draw_y + min_y * self.grid_cell_size
             sel_w = sel_width * self.grid_cell_size
             sel_h = sel_height * self.grid_cell_size
+            sel_rect = pygame.Rect(sel_x, sel_y, sel_w, sel_h)
 
-            # Selection fill
-            sel_surf = pygame.Surface((sel_w, sel_h), pygame.SRCALPHA)
-            sel_surf.fill((*self.colors['selection'], 60))
-            screen.blit(sel_surf, (sel_x, sel_y))
-
-            # Selection border
-            screen.draw_rect( self.colors['accent'],
-                             (sel_x, sel_y, sel_w, sel_h), 3)
+            if sel_rect.colliderect(clip_rect):
+                sel_surf = pygame.Surface((sel_w, sel_h), pygame.SRCALPHA)
+                sel_surf.fill((*self.SELECTION, 70))
+                self._blit_clipped(screen, sel_surf, (sel_x, sel_y), clip_rect)
+                self._rect_border_clipped(screen, uk.Theme.GOLD, sel_rect, 3, clip_rect)
 
         screen.set_clip(None)
 
-        # Selection info
-        sel_y = self.palette_y + 45
+        # Selection / status info, overlaid in the top-left corner of the
+        # grid — a compact HUD readout rather than a separate panel.
+        sel_y = self.palette_y + 46
         min_x, max_x, min_y, max_y = self._get_selection_bounds()
         sel_width = max_x - min_x + 1
         sel_height = max_y - min_y + 1
         if sel_width > 1 or sel_height > 1:
-            sel_text = f"Selection: {sel_width}x{sel_height}"
-            sel_surf = self.font_small.render(sel_text, True, self.colors['selection'])
-            screen.blit(sel_surf, (self.palette_x + 20, sel_y))
-
             # Tell the person right here whether 'N' will animate or un-animate
             # this exact selection — no need to remember what the dot meant.
             if not self.fps_input_active:
                 if tileset.is_tile_animated(min_x, min_y):
-                    hint_text, hint_color = "Animated \u2014 press N to remove", self.colors['accent']
+                    hint_text, hint_color = "Animated - press N to remove", uk.Theme.GOLD
                 else:
-                    hint_text, hint_color = "Press N to animate this selection", self.colors['text_dim']
-                hint_surf = self.font_small.render(hint_text, True, hint_color)
-                screen.blit(hint_surf, (self.palette_x + 20 + sel_surf.get_width() + 12, sel_y))
-
-        # Collision hint — shown for any selection (unlike the animation
-        # hint above, which only makes sense for a multi-tile run). Reflects
-        # whether every non-empty tile in the selection is already solid,
-        # so it's accurate even right after a mixed selection gets toggled.
-        #
-        # At collision_granularity 8 with exactly one tile selected, this
-        # instead reports the hovered quadrant's own state — matching what
-        # 'C' will actually do in that case (see _toggle_solid_selection).
-        solid_cells = [
-            (tx, ty)
-            for ty in range(min_y, max_y + 1)
-            for tx in range(min_x, max_x + 1)
-            if not tileset.is_tile_empty(tx, ty)
-        ]
-        if solid_cells:
-            quadrant_hint = None
-            if len(solid_cells) == 1 and tileset.collision_granularity == 8:
-                tx, ty = solid_cells[0]
-                sub = self._hovered_subtile(tx, ty)
-                if sub is not None:
-                    sub_x, sub_y = sub
-                    if tileset.is_subtile_solid(tx, ty, sub_x, sub_y):
-                        quadrant_hint = (f"Quadrant ({sub_x},{sub_y}) solid \u2014 press C to clear",
-                                         (255, 100, 100))
-                    else:
-                        quadrant_hint = (f"Press C to mark quadrant ({sub_x},{sub_y}) solid",
-                                         self.colors['text_dim'])
-
-            if quadrant_hint is not None:
-                collision_hint_text, collision_hint_color = quadrant_hint
-            else:
-                all_solid = all(tileset.is_tile_solid(tx, ty) for tx, ty in solid_cells)
-                if all_solid:
-                    collision_hint_text, collision_hint_color = "Solid \u2014 press C to clear", (255, 100, 100)
-                else:
-                    collision_hint_text, collision_hint_color = "Press C to mark solid (blocks movement)", self.colors['text_dim']
-            collision_hint_surf = self.font_small.render(collision_hint_text, True, collision_hint_color)
-            screen.blit(collision_hint_surf, (self.palette_x + 20, sel_y + 18))
-
-        # Collision granularity indicator — only meaningful for a 16x16
-        # tileset (an 8px tileset has nothing finer to switch to), shown
-        # on its own row below the collision hint / animation prompt /
-        # feedback banner (all of which share sel_y + 36) so it never
-        # overlaps whichever of those happens to be showing.
-        if tileset.tile_width == 16:
-            granularity_text = f"Collision grid: {tileset.collision_granularity}x{tileset.collision_granularity} \u2014 press H to switch"
-            granularity_surf = self.font_small.render(granularity_text, True, self.colors['text_dim'])
-            screen.blit(granularity_surf, (self.palette_x + 20, sel_y + 54))
+                    hint_text, hint_color = "Press N to animate this selection", uk.Theme.TEXT_DIM
+                hint_s = self.font.render(hint_text, color=hint_color, height=self.body_size)
+                uk.blit_surface(screen, hint_s, (self.palette_x + 20, sel_y), transient=True)
 
         # Inline FPS prompt while confirming a new animation
         if self.fps_input_active:
-            prompt_text = f"New animation \u2014 FPS: {self.fps_input_text}_  (Enter to confirm, Esc to cancel)"
-            prompt_surf = self.font_small.render(prompt_text, True, self.colors['accent'])
-            screen.blit(prompt_surf, (self.palette_x + 20, sel_y + 36))
+            prompt_text = f"New animation - FPS: {self.fps_input_text}_  (Enter to confirm, Esc to cancel)"
+            prompt_s = self.font.render(prompt_text, color=uk.Theme.GOLD, height=self.body_size)
+            uk.blit_surface(screen, prompt_s, (self.palette_x + 20, sel_y + 18), transient=True)
 
         # Brief confirmation after animating/un-animating a selection, or
         # after toggling solid/collision on a selection.
         elif self.anim_feedback_text and pygame.time.get_ticks() < self.anim_feedback_until_ms:
-            fb_surf = self.font_small.render(self.anim_feedback_text, True, self.colors['success'])
-            screen.blit(fb_surf, (self.palette_x + 20, sel_y + 36))
+            fb_s = self.font.render(self.anim_feedback_text, color=self.SUCCESS, height=self.body_size)
+            uk.blit_surface(screen, fb_s, (self.palette_x + 20, sel_y + 18), transient=True)
 
-        # Controls below the palette content
-        controls_y = tileset_y + self.palette_content_height + 10
+        # Controls strip: two checkboxes, then the tile layer row. Pinned to
+        # a fixed offset from the panel top (based on the *max* content
+        # height, not the current tileset's possibly-shorter box), so the
+        # strip stays put and the panel's bottom doesn't move even though
+        # the tile grid box above it shrinks for small tilesets. The layer
+        # popup is drawn last so it sits on top.
+        controls_y = tileset_y + self._palette_content_max_height + 10
+        self._draw_palette_checkboxes(screen, controls_y)
+        self._draw_layer_row(screen, controls_y + 56)
+        self._draw_layer_dropdown_popup(screen)
+        self._draw_keybinds_popup(screen)  # centered modal — reads screen_width/height, not palette_x, so it isn't affected by the shift above
 
-        # Delete underlying checkbox
-        checkbox_y = controls_y
+        self.palette_x -= dx  # restore — the shift above was only for this draw pass
+
+        # Resolve the frame's cursor last, now that every clickable rect
+        # drawn above (toggle tab, info button, tile grid) has had a chance
+        # to register itself via register_hoverable.
+        uk.update_hover_cursor((mx, my))
+
+    def _draw_checkbox(self, screen: pygame.Surface, x: int, y: int, checked: bool, label: str) -> pygame.Rect:
+        """One labelled checkbox; returns its rect for click hit-testing."""
+        rect = pygame.Rect(x, y, 18, 18)
+        uk.draw_rect_on(screen, uk.Theme.CARD_BG, rect, 0, 4)
+        uk.draw_rect_on(screen, uk.Theme.GOLD if checked else uk.Theme.PANEL_BORDER, rect, 1, 4)
+        if checked:
+            uk.draw_line_on(screen, self.SUCCESS, (x + 3, y + 9), (x + 7, y + 13), 2)
+            uk.draw_line_on(screen, self.SUCCESS, (x + 7, y + 13), (x + 15, y + 5), 2)
+        label_s = self.font.render(label, color=uk.Theme.TEXT_MUTED, height=self.body_size)
+        uk.blit_surface(screen, label_s, (x + 25, y + 3), transient=True)
+        uk.register_hoverable(rect)
+        return rect
+
+    def _draw_palette_checkboxes(self, screen: pygame.Surface, controls_y: int):
+        """The two checkboxes under the tile grid."""
         checkbox_x = self.palette_x + 20
-        checkbox_size = 18
-
-        checkbox_rect = pygame.Rect(checkbox_x, checkbox_y, checkbox_size, checkbox_size)
-        self.ui_rects['delete_checkbox'] = checkbox_rect
-
-        screen.draw_rect( self.colors['checkbox'], checkbox_rect)
-        screen.draw_rect( self.colors['accent'], checkbox_rect, 1)
-
-        if self.delete_underlying:
-            # Draw checkmark
-            screen.draw_line( self.colors['success'],
-                             (checkbox_x + 3, checkbox_y + 9),
-                             (checkbox_x + 7, checkbox_y + 13), 2)
-            screen.draw_line( self.colors['success'],
-                             (checkbox_x + 7, checkbox_y + 13),
-                             (checkbox_x + 15, checkbox_y + 5), 2)
-
-        checkbox_label = self.font_small.render("Replace tiles on same layer", True, self.colors['text_dim'])
-        screen.blit(checkbox_label, (checkbox_x + 25, checkbox_y + 2))
+        self.ui_rects['delete_checkbox'] = self._draw_checkbox(
+            screen, checkbox_x, controls_y, self.delete_underlying, "Replace tiles on same layer")
 
         # "Hide this layer" checkbox — hides ONLY the currently selected layer
         # (self.current_layer); other layers keep their own independent hidden state.
-        hide_checkbox_y = controls_y + 25
-        hide_checkbox_x = self.palette_x + 20
+        self.ui_rects['hide_layer_checkbox'] = self._draw_checkbox(
+            screen, checkbox_x, controls_y + 26,
+            self.current_layer in self.hidden_layers, "Hide this layer")
 
-        hide_checkbox_rect = pygame.Rect(hide_checkbox_x, hide_checkbox_y, checkbox_size, checkbox_size)
-        self.ui_rects['hide_layer_checkbox'] = hide_checkbox_rect
+    def _draw_layer_row(self, screen: pygame.Surface, layer_row_y: int):
+        """'Tile Layer:' label + dropdown button. Registers ui_rects['layer_dropdown']."""
+        # Layer controls — label + dropdown button
+        layer_label_s = self.font.render("Tile Layer:", color=uk.Theme.TEXT_MUTED, height=self.body_size)
+        uk.blit_surface(screen, layer_label_s, (self.palette_x + 20, layer_row_y + 7), transient=True)
 
-        screen.draw_rect( self.colors['checkbox'], hide_checkbox_rect)
-        screen.draw_rect( self.colors['accent'], hide_checkbox_rect, 1)
-
-        if self.current_layer in self.hidden_layers:
-            # Draw checkmark
-            screen.draw_line( self.colors['success'],
-                             (hide_checkbox_x + 3, hide_checkbox_y + 9),
-                             (hide_checkbox_x + 7, hide_checkbox_y + 13), 2)
-            screen.draw_line( self.colors['success'],
-                             (hide_checkbox_x + 7, hide_checkbox_y + 13),
-                             (hide_checkbox_x + 15, hide_checkbox_y + 5), 2)
-
-        hide_checkbox_label = self.font_small.render("Hide this layer", True, self.colors['text_dim'])
-        screen.blit(hide_checkbox_label, (hide_checkbox_x + 25, hide_checkbox_y + 2))
-
-        # Layer controls — label on the right half, dropdown beside it
-        layer_y = controls_y + 50
-
-        layer_label = self.font_small.render("Tile Layer:", True, self.colors['text_dim'])
-        screen.blit(layer_label, (self.palette_x + 340, layer_y))
-
-        dropdown_x = self.palette_x + 420
-        dropdown_y = layer_y - 5
-        dropdown_width = 150
+        dropdown_x = self.palette_x + 130
+        dropdown_y = layer_row_y
+        dropdown_width = 200
         dropdown_height = 28
 
         self.ui_rects['layer_dropdown'] = pygame.Rect(dropdown_x, dropdown_y, dropdown_width, dropdown_height)
+        uk.draw_panel(screen, self.ui_rects['layer_dropdown'], bg=uk.Theme.CARD_BG,
+                      border=uk.Theme.GOLD if self.layer_dropdown_open else uk.Theme.PANEL_BORDER,
+                      border_width=1, radius=6, shadow=False)
+        uk.register_hoverable(self.ui_rects['layer_dropdown'])
 
-        screen.draw_rect( self.colors['button'], self.ui_rects['layer_dropdown'])
-        screen.draw_rect( self.colors['accent'], self.ui_rects['layer_dropdown'], 1)
-
-        # Current layer text
         if self.layer_input_active:
             layer_display = f"Custom: {self.layer_input_text}_"
         else:
@@ -2297,78 +2469,231 @@ class TilesetEditor:
             else:
                 layer_display = f"{preset_name} ({self.current_layer})"
 
-        layer_text = self.font_small.render(layer_display, True, self.colors['text'])
-        text_width = layer_text.get_width()
-        # Left-align when text overflows; otherwise centre it with a small indent
-        if text_width > dropdown_width - 16:
-            screen.blit(layer_text, (dropdown_x + 4, dropdown_y + 6))
-        else:
-            screen.blit(layer_text, (dropdown_x + 8, dropdown_y + 6))
+        layer_h = self.body_size
+        max_text_w = dropdown_width - 30
+        while layer_h > 7 and self.font.size(layer_display, height=layer_h)[0] > max_text_w:
+            layer_h -= 1
+        layer_text_s = self.font.render(
+            layer_display,
+            color=uk.Theme.GOLD if self.layer_input_active else uk.Theme.TEXT_PRIMARY,
+            height=layer_h)
+        uk.blit_surface(screen, layer_text_s,
+                        (dropdown_x + 10, dropdown_y + (dropdown_height - layer_text_s.get_height()) // 2),
+                        transient=True)
 
-        # Dropdown arrow
-        arrow_x = dropdown_x + dropdown_width - 20
-        arrow_y = dropdown_y + 14
-        screen.draw_polygon( self.colors['text'], [
-            (arrow_x, arrow_y - 4),
-            (arrow_x + 8, arrow_y - 4),
-            (arrow_x + 4, arrow_y + 2)
-        ])
-
-        # Draw dropdown menu if open
+        # Dropdown chevron
+        ax, ay = dropdown_x + dropdown_width - 18, dropdown_y + dropdown_height // 2
+        chevron_color = uk.Theme.GOLD if self.layer_dropdown_open else uk.Theme.TEXT_MUTED
         if self.layer_dropdown_open:
-            menu_y = dropdown_y + dropdown_height
-            for i, (name, value) in enumerate(self.LAYER_PRESETS):
-                option_rect = pygame.Rect(dropdown_x, menu_y + i * 25, dropdown_width, 25)
-                self.ui_rects[f'layer_option_{i}'] = option_rect
+            uk.draw_line_on(screen, chevron_color, (ax - 5, ay + 2), (ax, ay - 3), 2)
+            uk.draw_line_on(screen, chevron_color, (ax, ay - 3), (ax + 5, ay + 2), 2)
+        else:
+            uk.draw_line_on(screen, chevron_color, (ax - 5, ay - 2), (ax, ay + 3), 2)
+            uk.draw_line_on(screen, chevron_color, (ax, ay + 3), (ax + 5, ay - 2), 2)
 
-                # Highlight hovered option
-                mouse_pos = getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos())
-                if option_rect.collidepoint(mouse_pos):
-                    screen.draw_rect( self.colors['button_hover'], option_rect)
-                else:
-                    screen.draw_rect( self.colors['button'], option_rect)
+    def _draw_layer_dropdown_popup(self, screen: pygame.Surface):
+        """The layer dropdown's option list. Drawn last so it sits above the
+        rest of the panel. The dropdown sits at the bottom of the panel, so the
+        list opens upward (over the tile grid) instead of falling off-screen."""
+        if not self.layer_dropdown_open:
+            return
+        drop = self.ui_rects.get('layer_dropdown')
+        if drop is None:
+            return
 
-                screen.draw_rect( self.colors['accent'], option_rect, 1)
+        option_h = 26
+        menu_h = len(self.LAYER_PRESETS) * option_h
+        menu_y = drop.y - menu_h
+        if menu_y < 0:  # not enough room above (very short panel) -> open downward
+            menu_y = drop.bottom
+        mouse_pos = getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos())
+        for i, (name, value) in enumerate(self.LAYER_PRESETS):
+            option_rect = pygame.Rect(drop.x, menu_y + i * option_h, drop.w, option_h)
+            self.ui_rects[f'layer_option_{i}'] = option_rect
+            uk.register_hoverable(option_rect)
 
-                display_text = name if value is None else f"{name} ({value})"
-                option_text = self.font_small.render(display_text, True, self.colors['text'])
-                screen.blit(option_text, (dropdown_x + 8, menu_y + i * 25 + 5))
+            hovered = option_rect.collidepoint(mouse_pos)
+            uk.draw_panel(screen, option_rect,
+                          bg=uk.Theme.CARD_BG_HOVER if hovered else uk.Theme.CARD_BG,
+                          border=uk.Theme.GOLD if hovered else uk.Theme.PANEL_BORDER,
+                          border_width=1, radius=4, shadow=False)
 
-        shadow_status = self.font_small.render(
-            f"Native Shadow: {'ON' if self.native_shadow_enabled else 'OFF'}  ({round(self.native_shadow_alpha / 255 * 100)}%)",
-            True, self.colors['success'] if self.native_shadow_enabled else self.colors['text_dim']
-        )
-        screen.blit(shadow_status, (self.palette_x + 340, layer_y + 35))
-        shadow_help = self.font_small.render(
-            "K: toggle  Click/drag = shadow  -/+ = opacity",
-            True, self.colors['text_dim']
-        )
-        screen.blit(shadow_help, (self.palette_x + 340, layer_y + 53))
+            display_text = name if value is None else f"{name} ({value})"
+            option_color = uk.Theme.GOLD if hovered else uk.Theme.TEXT_PRIMARY
+            option_s = self.font.render(display_text, color=option_color, height=self.body_size)
+            uk.blit_surface(screen, option_s,
+                            (drop.x + 10, option_rect.y + (option_h - option_s.get_height()) // 2),
+                            transient=True)
 
-        # Instructions
-        instructions = [
-            "TAB: Switch Tileset",
-            "L: Cycle Layer Presets",
-            "G: Toggle Grid",
-            "Arrows: Navigate Tiles",
-            "Shift+Arrows: Extend Selection",
-            "Click Dropdown: Choose Layer",
-            "Click/Drag Palette: Select",
-            "Scroll: Pan Tileset",
-            "Click World: Place Pattern",
-            "Right Click: Delete Tile",
-            "K: Toggle Native Shadow brush (works on any layer)",
-            "Shadow opacity: - / +",
-            "Select frames, A: Animate",
-            "\u25cf on tile = animated",
-            "F2: Close Editor"
+    def _draw_info_button(self, screen: pygame.Surface, rect: pygame.Rect):
+        """Small circular badge that toggles the keybinds popup. Uses a
+        custom icon from assets/ui/toolbar/info.png when present, falling
+        back to the procedural '?' mark otherwise."""
+        mouse_pos = getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos())
+        hovered = rect.collidepoint(mouse_pos)
+        center = rect.center
+        radius = rect.width // 2
+
+        if self.show_keybinds_popup:
+            fill = uk.Theme.GOLD
+            mark_color = (14, 17, 25)
+        else:
+            fill = (40, 44, 58) if hovered else (28, 31, 42)
+            mark_color = uk.Theme.GOLD_BRIGHT if hovered else uk.Theme.TEXT_MUTED
+
+        uk.draw_circle_on(screen, fill, center, radius)
+        uk.draw_circle_on(screen, uk.Theme.GOLD, center, radius, 1)
+
+        if self._info_icon:
+            uk.blit_surface(screen, self._info_icon,
+                            self._info_icon.get_rect(center=center), transient=True)
+        else:
+            mark_s = self.font.render("?", color=mark_color, height=self.body_size)
+            uk.blit_surface(screen, mark_s,
+                            (center[0] - mark_s.get_width() // 2, center[1] - mark_s.get_height() // 2),
+                            transient=True)
+
+    def _draw_keybinds_popup(self, screen: pygame.Surface):
+        """Full keybind reference, opened from the '?' info button. Drawn last,
+        over a dimmed backdrop, so it reads as a modal overlay above the whole
+        panel (and the world beneath it). Any click while it's open closes it
+        (handled in the event loop) — this method only ever draws."""
+        if not self.show_keybinds_popup:
+            return
+
+        overlay = pygame.Surface((self.screen_width, self.screen_height), pygame.SRCALPHA)
+        overlay.fill((8, 9, 13, 170))
+        screen.blit(overlay, (0, 0))
+
+        sections = [
+            ("Tileset editor", [
+                ("Click / Drag Palette", "Select tiles"),
+                ("Ctrl + Click", "Extend selection"),
+                ("TAB", "Switch tileset"),
+                ("L", "Swap layer"),
+                ("Scroll / Shift+Scroll", "Pan tileset"),
+            ]),
+            ("Painting", [
+                ("Click", "Select tiles"),
+                ("Right Click", "Delete tiles"),
+            ]),
+            ("Other", [
+                ("N", "Animate current selection"),
+                ("C", "Set collision per tile"),
+                ("C + Scroll", "Set collision granularity"),
+                ("K", "Toggle shadow"),
+                ("F2", "Close editor"),
+            ]),
         ]
 
-        inst_y = layer_y + 35  # sits just below the layer dropdown row
-        for inst in instructions:
-            inst_surf = self.font_small.render(inst, True, self.colors['text_dim'])
-            screen.blit(inst_surf, (self.palette_x + 20, inst_y))
-            inst_y += 18
+        row_h = 20
+        section_gap = 14
+        header_h = 50
+        margin_x = 20
+        key_indent = 10       # key label offset from the left margin
+        col_gap = 18          # gap between the key column and the desc column
+        right_pad = 20
+
+        # Cache rendered surfaces so widths are measured once and reused for
+        # both sizing the panel and drawing it (avoids re-deriving layout
+        # constants from guessed pixel widths, which caused the overflow /
+        # overlap in the old fixed-width layout).
+        key_surfaces = []
+        desc_surfaces = []
+        for _, rows in sections:
+            for key_label, desc in rows:
+                key_surfaces.append(self.font.render(key_label, color=uk.Theme.GOLD, height=self.body_size))
+                desc_surfaces.append(self.font.render(desc, color=uk.Theme.TEXT_PRIMARY, height=self.body_size))
+
+        key_col_w = max(s.get_width() for s in key_surfaces) + col_gap
+        max_desc_w = max(s.get_width() for s in desc_surfaces)
+
+        title_s = self.font.render("Keybinds", color=uk.Theme.GOLD, height=self.title_size)
+        close_s = self.font.render("Click anywhere to close", color=uk.Theme.TEXT_DIM, height=self.hint_size)
+
+        content_w = key_indent + key_col_w + max_desc_w + right_pad
+        header_w = title_s.get_width() + 24 + close_s.get_width()
+        panel_w = max(360, margin_x * 2 + max(content_w, header_w))
+
+        # Every section header line also consumes a row, so count one extra
+        # row per section on top of its keybind rows.
+        content_rows = sum(1 + len(rows) for _, rows in sections)
+        panel_h = header_h + content_rows * row_h + len(sections) * section_gap + 16
+
+        panel_x = (self.screen_width - panel_w) // 2
+        panel_y = max(30, (self.screen_height - panel_h) // 2)
+        panel_rect = pygame.Rect(panel_x, panel_y, panel_w, panel_h)
+
+        uk.draw_panel(screen, panel_rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD,
+                      border_width=2, radius=uk.Theme.RADIUS_PANEL, shadow=True)
+
+        uk.blit_surface(screen, title_s, (panel_x + margin_x, panel_y + 14), transient=True)
+        uk.blit_surface(screen, close_s,
+                        (panel_x + panel_w - close_s.get_width() - margin_x, panel_y + 20), transient=True)
+
+        uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER,
+                        (panel_x + 16, panel_y + header_h - 10, panel_w - 32, 1), 0, 0)
+
+        y = panel_y + header_h
+        i = 0
+        for section_name, rows in sections:
+            section_s = self.font.render(section_name, color=uk.Theme.TEXT_MUTED, height=self.body_size)
+            uk.blit_surface(screen, section_s, (panel_x + margin_x, y), transient=True)
+            y += row_h
+            for _ in rows:
+                key_s = key_surfaces[i]
+                desc_s = desc_surfaces[i]
+                i += 1
+                uk.blit_surface(screen, key_s, (panel_x + margin_x + key_indent, y), transient=True)
+                uk.blit_surface(screen, desc_s,
+                                (panel_x + margin_x + key_indent + key_col_w, y), transient=True)
+                y += row_h
+            y += section_gap
+
+    def _draw_palette_controls(self, screen: pygame.Surface, controls_y: int):
+        """PARKED — not currently called. What's left of the old menu that
+        lived below the tile grid: native shadow status and the instructions
+        footer. Kept intact so options can be re-added bit by bit.
+
+        controls_y is the same anchor the checkboxes use; this lays out from
+        the layer row (controls_y + 56) downward, so the tile grid needs to be
+        shortened (palette_controls_height) to make room before it's called.
+        """
+        layer_row_y = controls_y + 56
+
+        # ── Native shadow status ─────────────────────────────────────────────
+        shadow_y = layer_row_y + 36
+        shadow_status_s = self.font.render(
+            f"Native Shadow: {'ON' if self.native_shadow_enabled else 'OFF'} ({round(self.native_shadow_alpha / 255 * 100)}%)",
+            color=self.SUCCESS if self.native_shadow_enabled else uk.Theme.TEXT_DIM, height=self.body_size)
+        uk.blit_surface(screen, shadow_status_s, (self.palette_x + 20, shadow_y), transient=True)
+        shadow_help_s = self.font.render(
+            "K: toggle - Click/drag = shadow - -/+ = opacity",
+            color=uk.Theme.TEXT_DIM, height=self.hint_size)
+        uk.blit_surface(screen, shadow_help_s, (self.palette_x + 20, shadow_y + 16), transient=True)
+
+        # ── Instructions footer — two compact columns below a hairline ─────
+        divider_y = shadow_y + 36
+        uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER,
+                        (self.palette_x + 16, divider_y, self.palette_width - 32, 1), 0, 0)
+
+        instructions = [
+            "TAB: Switch Tileset", "L: Cycle Layer Presets", "G: Toggle Grid",
+            "Arrows: Navigate Tiles", "Shift+Arrows: Extend Selection",
+            "Click Dropdown: Choose Layer", "Click/Drag Palette: Select", "Scroll: Pan Tileset",
+            "Click World: Place Pattern", "Right Click: Delete Tile",
+            "K: Toggle Native Shadow (any layer)", "N: Animate Selection",
+            "C: Toggle Solid", "H: Collision Granularity", "F2: Close Editor",
+        ]
+        col_w = (self.palette_width - 40) // 2
+        rows_per_col = (len(instructions) + 1) // 2
+        inst_y0 = divider_y + 10
+        for i, inst in enumerate(instructions):
+            col = i // rows_per_col
+            row = i % rows_per_col
+            inst_s = self.font.render(inst, color=uk.Theme.TEXT_DIM, height=self.hint_size)
+            uk.blit_surface(screen, inst_s,
+                            (self.palette_x + 20 + col * col_w, inst_y0 + row * 15), transient=True)
 
     def draw_grid(self, screen: pygame.Surface, camera_x: int, camera_y: int,
                   room_width: int, room_height: int):
@@ -2415,8 +2740,8 @@ class TilesetEditor:
             screen_x = (x * RENDER_SCALE) - camera_x
             if -10 <= screen_x <= viewport_width + 10:
                 px = math.floor(screen_x)
-                screen.draw_line( self.colors['grid'][:3],
-                                 (px, 0), (px, self.screen_height), 1)
+                uk.draw_line_on(screen, self.GRID_LINE,
+                                (px, 0), (px, self.screen_height), 1)
 
         # Draw horizontal lines
         start_y = (visible_y_start // step) * step
@@ -2424,8 +2749,8 @@ class TilesetEditor:
             screen_y = (y * RENDER_SCALE) - camera_y
             if -10 <= screen_y <= self.screen_height + 10:
                 py = math.floor(screen_y)
-                screen.draw_line( self.colors['grid'][:3],
-                                 (0, py), (viewport_width, py), 1)
+                uk.draw_line_on(screen, self.GRID_LINE,
+                                (0, py), (viewport_width, py), 1)
 
         screen.set_clip(None)
 

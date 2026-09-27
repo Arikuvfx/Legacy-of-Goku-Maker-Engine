@@ -1,31 +1,42 @@
 """
-character_creator.py  –  Dev-menu character editor
+character_creator.py  -  Dev-menu character editor
 ====================================================
 Scans assets/sprites/player/ to discover player characters, then lets you
 create or edit per-character JSON configs saved to assets/characters/{id}.json.
 
-Only the player/ sub-folder is scanned — enemies, NPCs, and other sprites
+Only the player/ sub-folder is scanned - enemies, NPCs, and other sprites
 that live elsewhere inside assets/sprites/ are intentionally ignored.
 
-Wire-up (dev_menu.py)
----------------------
-    import character_creator
-    # inside your menu-option handler:
-    character_creator.run(screen, clock)
+Wire-up (game loop)
+-------------------
+    from dev_tools.character_creator import CharacterCreator
+    creator = CharacterCreator(screen_width, screen_height)
+
+    creator.toggle()                      # open / close the overlay
+    if creator.handle_input(event) == "back_to_dev_menu": ...   # per event
+    creator.update(dt)                    # per frame
+    creator.draw(screen)                  # per frame (GPUScreen or Surface)
+
+Layout of this file
+-------------------
+  1. Data layer  - paths, discovery, config / menu / global-settings
+                   persistence, transformation sync. No UI in here.
+  2. UI layer    - the interface, built on dev_tools.ui_kit so it matches
+                   the Dev Menu and Room Editor.
 
 Expected folder conventions
 ----------------------------
 assets/
   sprites/
     player/
-      {char_id}/                ← one folder per player character
-        {costume}/              ← costume sub-folder (e.g. "default", "ssj")
+      {char_id}/                <- one folder per player character
+        {costume}/              <- costume sub-folder (e.g. "default", "ssj")
           walk/
-            0.png  1.png  ...  ← walk-cycle frames
-        walk/                   ← flat layout (no costume sub-dirs) also ok
+            0.png  1.png  ...  <- walk-cycle frames
+        walk/                   <- flat layout (no costume sub-dirs) also ok
           0.png  1.png  ...
   characters/
-    {char_id}.json              ← written here on Save
+    {char_id}.json              <- written here on Save
 """
 
 from __future__ import annotations
@@ -41,6 +52,9 @@ from typing import Optional
 
 import numpy as np
 import pygame
+from types import SimpleNamespace
+
+import dev_tools.ui_kit as uk
 
 # ──────────────────────────────────────────────────────────────────────
 #  Paths
@@ -67,7 +81,7 @@ SPRITES_DIR    = BASE_DIR / "assets/sprites/player"
 CHARACTERS_DIR = BASE_DIR / "assets/characters"
 ATTACKS_DIR    = BASE_DIR / "assets/sprites/attacks"   # global roster, not per-character
 HUD_ICONS_DIR  = BASE_DIR / "assets/ui/hud"            # named icon PNGs used in the HUD picker
-PORTRAITS_DIR  = BASE_DIR / "assets/portraits"         # see CharacterEditor._load_portrait()
+PORTRAITS_DIR  = BASE_DIR / "assets/portraits"         # see CharacterCreator._load_portrait()
 UNIVERSAL_DIR  = BASE_DIR / "assets/sprites/universal" # shadow.png / shadowbig.png — see LayerManager._load_shadow()
 
 
@@ -113,27 +127,6 @@ def resolve_portrait_path(char_id: str, costume: str = "", form: str = "") -> Op
     return None
 
 # ──────────────────────────────────────────────────────────────────────
-#  Palette  (dark dev-tool)
-# ──────────────────────────────────────────────────────────────────────
-C_BG          = (14,  14,  20)
-C_PANEL       = (24,  24,  34)
-C_PANEL_DARK  = (18,  18,  26)
-C_BORDER      = (50,  50,  72)
-C_ACCENT      = (80, 160, 255)
-C_ACCENT2     = (255, 200,  55)    # unsaved / warning gold
-C_TEXT        = (215, 215, 228)
-C_TEXT_DIM    = (110, 110, 138)
-C_RED         = (220,  70,  70)
-C_GREEN       = (70,  200, 100)
-C_BAR_BG      = (38,  38,  55)
-C_BAR_FILL    = (80, 160, 255)
-C_HOVER       = (40,  40,  62)
-C_SELECTED    = (30,  75, 140)
-C_TAB_ACT     = (44,  44,  68)
-C_TAB_INACT   = (24,  24,  34)
-C_DIALOG_BG   = (22,  22,  32)
-
-# ──────────────────────────────────────────────────────────────────────
 #  Default character config skeleton
 # ──────────────────────────────────────────────────────────────────────
 DEFAULT_CONFIG: dict = {
@@ -152,7 +145,7 @@ DEFAULT_CONFIG: dict = {
     # to a specific character in-game (e.g. a level gate's number, so the
     # player can tell at a glance which character it's locked to). Stored
     # as a "#RRGGBB" hex string, picked freely via a color wheel in the
-    # Identity tab (see CharacterEditor's hue-strip/SV-square widget).
+    # Identity tab (see CharacterCreator's hue-strip/SV-square widget).
     "color":        "#FFD700",
     "stats": {
         "max_hp":   100,
@@ -486,11 +479,11 @@ def load_attack_icon(attack_id: str, size: int = ATTACK_ICON_SIZE) -> pygame.Sur
     # ── 4. Placeholder tile ────────────────────────────────────────────
     if icon is None:
         icon = pygame.Surface((size, size), pygame.SRCALPHA)
-        pygame.draw.rect(icon, C_PANEL_DARK, icon.get_rect(), border_radius=6)
-        pygame.draw.rect(icon, C_BORDER, icon.get_rect(), 1, border_radius=6)
+        pygame.draw.rect(icon, uk.Theme.CARD_BG[:3], icon.get_rect(), border_radius=6)
+        pygame.draw.rect(icon, uk.Theme.CARD_BORDER, icon.get_rect(), 1, border_radius=6)
         ph_font = pygame.font.Font(None, size)
         label = (attack_id[:1] or "?").upper()
-        txt = ph_font.render(label, True, C_TEXT_DIM)
+        txt = ph_font.render(label, True, uk.Theme.TEXT_DIM)
         icon.blit(txt, txt.get_rect(center=icon.get_rect().center))
 
     # ── Enlarge small native icons ──────────────────────────────────────
@@ -604,7 +597,7 @@ def load_config(char_id: str) -> dict:
     cfg["display_name"] = char_id.replace("_", " ").title()
     # DEFAULT_CONFIG["costume"] is just the literal placeholder string
     # "default" — it doesn't correspond to any real costume folder on disk.
-    # The character-creator UI itself never leaks this (CharacterEditor
+    # The character-creator UI itself never leaks this (CharacterCreator
     # falls back to costumes[0] whenever cfg["costume"] isn't an actual
     # discovered costume), but callers that use load_config() directly at
     # runtime — Game._switch_character(), TransformationSystem.
@@ -898,17 +891,17 @@ def sync_transformations(cfg: dict, costumes: list[str],
             "defense_mult":  1.0,
             "speed_mult":    1.0,
             "ki_drain":      0.0,
-            # Custom ki-bar color override (see CharacterEditor's Ki Bar
+            # Custom ki-bar color override (see CharacterCreator's Ki Bar
             # Color picker on the Transformations tab). None = use the
             # sprite's baked-in transformed_ki_bar.png colors as before.
             "ki_color":      None,
             # Whether the transformed-ki charge bar shows/fills while the
-            # transform animation plays (see CharacterEditor's "Show Charge
+            # transform animation plays (see CharacterCreator's "Show Charge
             # Bar" checkbox). True = historical behavior. False = the
             # animation plays straight through at its own pace with no bar.
             "ki_bar_enabled":  True,
             # Seconds the charge bar takes to fill before the transform
-            # completes (see CharacterEditor's "Charge Duration" slider).
+            # completes (see CharacterCreator's "Charge Duration" slider).
             # None = use TransformationSystem's built-in default (~3.75s,
             # matched to the stock 'transform' sprite sheet's own length).
             # Ignored entirely when ki_bar_enabled is False.
@@ -916,7 +909,7 @@ def sync_transformations(cfg: dict, costumes: list[str],
             # Prerequisite tier — the form-name (e.g. "ssj") of another
             # transformation on this SAME costume that the player must
             # already be transformed into before this one becomes
-            # reachable (see CharacterEditor's "Requires" picker on the
+            # reachable (see CharacterCreator's "Requires" picker on the
             # Transformations tab). None = a base-level form, reachable
             # directly from the untransformed state like every
             # transformation before this feature existed.
@@ -927,393 +920,6 @@ def sync_transformations(cfg: dict, costumes: list[str],
 
     return added
 
-
-# ══════════════════════════════════════════════════════════════════════
-#  Tiny widget helpers (all draw onto a given surface)
-# ══════════════════════════════════════════════════════════════════════
-
-# ── Cached text rendering (perf) ────────────────────────────────────────
-# pygame's font.render() rasterizes glyphs from scratch on every call, and
-# this editor calls it dozens of times per frame (every button, label,
-# header, and list row re-renders its text every draw() even though most
-# of that text — button captions, section headers, tab names, hint
-# strings, character-list rows — is identical to what was drawn a frame
-# ago). That's wasted CPU for a picture that hasn't changed.
-#
-# render_text_cached() memoizes by (font, exact text, colour): the first
-# time a given combo is drawn it renders and stores the Surface; every
-# repeat afterwards is a dict lookup instead of a re-rasterize. The cache
-# is safe to use anywhere the *set* of distinct text+colour combinations
-# is small and stable (button labels, headers, list entries, tab names,
-# character/attack IDs, status messages, ...).
-#
-# Deliberately NOT routed through this cache: text that changes on every
-# frame or keystroke — slider values while dragging, the text-input's
-# live contents, per-frame animation-frame counters. Those have
-# effectively unlimited distinct values, so caching them would just leak
-# Surfaces into this dict forever for no benefit.
-_TEXT_RENDER_CACHE: dict[tuple[int, str, tuple], pygame.Surface] = {}
-
-
-def render_text_cached(font: pygame.font.Font, text: str, color) -> pygame.Surface:
-    """Cached equivalent of font.render(text, True, color) for text that
-    repeats identically across frames. See _TEXT_RENDER_CACHE note above —
-    don't use this for text with high/unbounded variety."""
-    key = (id(font), text, tuple(color))
-    surface = _TEXT_RENDER_CACHE.get(key)
-    if surface is None:
-        surface = font.render(text, True, color)
-        _TEXT_RENDER_CACHE[key] = surface
-    return surface
-
-
-def draw_rect_outline(surf: pygame.Surface, rect: pygame.Rect,
-                      color=C_BORDER, radius=4, width=1) -> None:
-    """Draw a rounded outline only (no fill) — used for panel/box borders."""
-    surf.draw_rect(color, rect, width, border_radius=radius)
-
-
-def draw_label(surf: pygame.Surface, font: pygame.font.Font,
-               text: str, x: int, y: int, color=C_TEXT_DIM) -> None:
-    """Blit a plain text label at (x, y). Text is cached (see above) since
-    field labels ("Power", "Speed", ...) are the same string every frame."""
-    surf.blit(render_text_cached(font, text, color), (x, y))
-
-
-def draw_section_header(surf: pygame.Surface, font: pygame.font.Font,
-                         text: str, rect: pygame.Rect) -> None:
-    """Draw a horizontal divider line with a small caption label on top of
-    it, used to separate groups of widgets within a tab (e.g. 'Equipped
-    Attacks', 'Edit Selected')."""
-    surf.draw_line(C_BORDER,
-                     (rect.x, rect.y + 8), (rect.right, rect.y + 8))
-    lbl = render_text_cached(font, f"  {text}  ", C_TEXT_DIM)
-    surf.blit(lbl, (rect.x + 12, rect.y))
-
-
-class TextInput:
-    """Single-line text field."""
-    H = 28
-
-    def __init__(self, rect: pygame.Rect, value: str = ""):
-        self.rect    = rect
-        self.value   = value
-        self.active  = False
-        self.cursor  = len(value)
-        self._blink  = 0.0
-
-    def handle_event(self, event: pygame.event.Event) -> bool:
-        """Returns True if value changed."""
-        if event.type == pygame.MOUSEBUTTONDOWN:
-            self.active = self.rect.collidepoint(event.pos)
-            if self.active:
-                self.cursor = len(self.value)
-            return False
-        if not self.active:
-            return False
-        if event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_BACKSPACE:
-                if self.cursor > 0:
-                    self.value  = self.value[:self.cursor-1] + self.value[self.cursor:]
-                    self.cursor -= 1
-                    return True
-            elif event.key == pygame.K_DELETE:
-                self.value = self.value[:self.cursor] + self.value[self.cursor+1:]
-                return True
-            elif event.key == pygame.K_LEFT:
-                self.cursor = max(0, self.cursor - 1)
-            elif event.key == pygame.K_RIGHT:
-                self.cursor = min(len(self.value), self.cursor + 1)
-            elif event.key == pygame.K_HOME:
-                self.cursor = 0
-            elif event.key == pygame.K_END:
-                self.cursor = len(self.value)
-            elif event.key in (pygame.K_RETURN, pygame.K_TAB, pygame.K_ESCAPE):
-                self.active = False
-            elif event.unicode and event.unicode.isprintable():
-                self.value  = self.value[:self.cursor] + event.unicode + self.value[self.cursor:]
-                self.cursor += 1
-                return True
-        return False
-
-    def draw(self, surf: pygame.Surface, font: pygame.font.Font,
-             dt: float) -> None:
-        self._blink = (self._blink + dt) % 1.2
-        border_col = C_ACCENT if self.active else C_BORDER
-        surf.draw_rect(C_PANEL_DARK, self.rect, border_radius=4)
-        surf.draw_rect(border_col, self.rect, 1, border_radius=4)
-        clip = self.rect.inflate(-8, -4)
-        txt  = font.render(self.value, True, C_TEXT)
-        surf.blit(txt, (clip.x, self.rect.y + (self.rect.h - txt.get_height()) // 2),
-                  area=pygame.Rect(0, 0, clip.w, txt.get_height()))
-        if self.active and self._blink < 0.6:
-            cx = clip.x + font.size(self.value[:self.cursor])[0]
-            cy = self.rect.y + 4
-            surf.draw_line(C_TEXT, (cx, cy), (cx, self.rect.bottom - 4))
-
-
-class TextArea:
-    """Multi-line text field with soft word-wrap, for freeform prose fields
-    like the character/entity Description — TextInput above is single-line
-    only, so this is a separate widget rather than an extension of it.
-
-    self.value is always the raw, un-wrapped string (the only thing that
-    ever gets written back into cfg["description"]); wrapping is purely a
-    draw-time concern recomputed from self.rect.w every frame via _wrap(),
-    so resizing the panel (or just re-editing) never desyncs the two.
-    Enter inserts a literal '\\n' (hard break) so an author's intentional
-    paragraph breaks survive re-wrapping instead of being swallowed into
-    one run-on paragraph. Ctrl+Enter (or Tab/Escape) defocuses instead,
-    since plain Enter is needed for line breaks.
-
-    Pass multiline=False for single-line uses (e.g. a display-name field
-    reusing this widget for its wrap-instead-of-clip behavior): plain
-    Enter then defocuses just like Tab/Escape, instead of inserting a
-    '\\n' that a one-line field has no business containing.
-    """
-    H = 100        # default box height if the caller doesn't override rect.h
-    H_SINGLE = 36  # box height for single-line (multiline=False) uses
-
-    def __init__(self, rect: pygame.Rect, value: str = "", max_len: int = 600,
-                 multiline: bool = True):
-        self.rect      = rect
-        self.value     = value
-        self.max_len   = max_len
-        self.multiline = multiline
-        self.active    = False
-        self.cursor    = len(value)
-        self._blink    = 0.0
-        self._scroll   = 0   # index of the first visible wrapped line
-
-    def handle_event(self, event: pygame.event.Event) -> bool:
-        """Returns True if value changed."""
-        if event.type == pygame.MOUSEBUTTONDOWN:
-            self.active = self.rect.collidepoint(event.pos)
-            if self.active:
-                self.cursor = len(self.value)
-            return False
-        if not self.active:
-            return False
-        if event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_BACKSPACE:
-                if self.cursor > 0:
-                    self.value  = self.value[:self.cursor-1] + self.value[self.cursor:]
-                    self.cursor -= 1
-                    return True
-            elif event.key == pygame.K_DELETE:
-                self.value = self.value[:self.cursor] + self.value[self.cursor+1:]
-                return True
-            elif event.key == pygame.K_LEFT:
-                self.cursor = max(0, self.cursor - 1)
-            elif event.key == pygame.K_RIGHT:
-                self.cursor = min(len(self.value), self.cursor + 1)
-            elif event.key == pygame.K_HOME:
-                self.cursor = 0
-            elif event.key == pygame.K_END:
-                self.cursor = len(self.value)
-            elif event.key == pygame.K_RETURN:
-                if not self.multiline or (pygame.key.get_mods() & pygame.KMOD_CTRL):
-                    self.active = False
-                elif len(self.value) < self.max_len:
-                    self.value  = self.value[:self.cursor] + "\n" + self.value[self.cursor:]
-                    self.cursor += 1
-                    return True
-            elif event.key in (pygame.K_TAB, pygame.K_ESCAPE):
-                self.active = False
-            elif event.unicode and event.unicode.isprintable():
-                if len(self.value) < self.max_len:
-                    self.value  = self.value[:self.cursor] + event.unicode + self.value[self.cursor:]
-                    self.cursor += 1
-                    return True
-        return False
-
-    def _wrap(self, font: pygame.font.Font, width: int) -> list[tuple[str, int]]:
-        """Word-wrap self.value to `width` px, returning [(line_text,
-        start_offset_into_value), ...] so the cursor's absolute position
-        can be mapped back to a (line, x) on screen in _cursor_xy()."""
-        lines: list[tuple[str, int]] = []
-        para_start = 0
-        for para in self.value.split("\n"):
-            if para == "":
-                lines.append(("", para_start))
-            else:
-                words = para.split(" ")
-                cur, cur_start, pos = "", para_start, para_start
-                for w in words:
-                    trial = f"{cur} {w}" if cur else w
-                    if cur and font.size(trial)[0] > width:
-                        lines.append((cur, cur_start))
-                        cur, cur_start = w, pos
-                    else:
-                        cur = trial
-                    pos += len(w) + 1   # word + the space that followed it
-                lines.append((cur, cur_start))
-            para_start += len(para) + 1   # +1 for the '\n' that was split on
-        return lines or [("", 0)]
-
-    def _line_of_cursor(self, lines: list[tuple[str, int]]) -> int:
-        for i, (text, start) in enumerate(lines):
-            if start <= self.cursor <= start + len(text):
-                return i
-        return len(lines) - 1
-
-    def draw(self, surf: pygame.Surface, font: pygame.font.Font,
-             dt: float, placeholder: str = "Click to add a description...") -> None:
-        self._blink = (self._blink + dt) % 1.2
-        border_col = C_ACCENT if self.active else C_BORDER
-        surf.draw_rect(C_PANEL_DARK, self.rect, border_radius=4)
-        surf.draw_rect(border_col, self.rect, 1, border_radius=4)
-
-        pad   = 8
-        inner = self.rect.inflate(-pad * 2, -pad * 2)
-        line_h = font.get_height() + 2
-        rows_visible = max(1, inner.h // line_h)
-
-        if not self.value and not self.active:
-            ph = font.render(placeholder, True, C_TEXT_DIM)
-            surf.blit(ph, (inner.x, inner.y))
-            return
-
-        lines = self._wrap(font, inner.w)
-        cur_line = self._line_of_cursor(lines)
-        if cur_line < self._scroll:
-            self._scroll = cur_line
-        elif cur_line >= self._scroll + rows_visible:
-            self._scroll = cur_line - rows_visible + 1
-        self._scroll = max(0, min(self._scroll, max(0, len(lines) - 1)))
-
-        old_clip = surf.get_clip()
-        surf.set_clip(self.rect)
-        y = inner.y
-        for text, _ in lines[self._scroll:self._scroll + rows_visible + 1]:
-            txt = font.render(text, True, C_TEXT)
-            surf.blit(txt, (inner.x, y))
-            y += line_h
-
-        if self.active and self._blink < 0.6 and self._scroll <= cur_line < self._scroll + rows_visible:
-            text, start = lines[cur_line]
-            rel = max(0, min(self.cursor - start, len(text)))
-            cx = inner.x + font.size(text[:rel])[0]
-            cy = inner.y + (cur_line - self._scroll) * line_h
-            surf.draw_line(C_TEXT, (cx, cy), (cx, cy + line_h - 2))
-        surf.set_clip(old_clip)
-
-        # Scroll hint so it's obvious there's more text than fits.
-        if len(lines) > rows_visible:
-            more = render_text_cached(
-                font, f"{self._scroll+1}-{min(len(lines), self._scroll+rows_visible)}/{len(lines)}", C_TEXT_DIM
-            )
-            surf.blit(more, (self.rect.right - more.get_width() - 4, self.rect.y - more.get_height() - 2))
-
-
-class Slider:
-    """Integer or float slider with optional step."""
-    H = 20
-
-    def __init__(self, rect: pygame.Rect, min_val: float, max_val: float,
-                 value: float, step: float = 1.0, fmt: str = "{:.0f}"):
-        self.rect    = rect
-        self.min     = min_val
-        self.max     = max_val
-        self.value   = float(value)
-        self.step    = step
-        self.fmt     = fmt
-        self._drag   = False
-
-    def _val_from_x(self, x: int) -> float:
-        t = (x - self.rect.x) / self.rect.w
-        raw = self.min + t * (self.max - self.min)
-        if self.step:
-            raw = round(raw / self.step) * self.step
-        return max(self.min, min(self.max, raw))
-
-    def handle_event(self, event: pygame.event.Event) -> bool:
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            if self.rect.collidepoint(event.pos):
-                self._drag = True
-                self.value = self._val_from_x(event.pos[0])
-                return True
-        if event.type == pygame.MOUSEBUTTONUP:
-            self._drag = False
-        if event.type == pygame.MOUSEMOTION and self._drag:
-            self.value = self._val_from_x(event.pos[0])
-            return True
-        return False
-
-    def draw(self, surf: pygame.Surface, font: pygame.font.Font) -> None:
-        track = pygame.Rect(self.rect.x, self.rect.centery - 3,
-                            self.rect.w, 6)
-        surf.draw_rect(C_BAR_BG,  track, border_radius=3)
-        t = (self.value - self.min) / (self.max - self.min)
-        fill_w = int(track.w * t)
-        if fill_w > 0:
-            surf.draw_rect(C_BAR_FILL,
-                             pygame.Rect(track.x, track.y, fill_w, 6),
-                             border_radius=3)
-        kx = self.rect.x + int(self.rect.w * t)
-        ky = self.rect.centery
-        surf.draw_circle(C_ACCENT, (kx, ky), 8)
-        surf.draw_circle(C_BG,     (kx, ky), 5)
-        val_txt = font.render(self.fmt.format(self.value), True, C_TEXT)
-        surf.blit(val_txt, (self.rect.right + 8, self.rect.centery - val_txt.get_height() // 2))
-
-
-class StatBar:
-    """Read-only coloured bar for stat display.
-
-    Note: not currently wired into any tab (the Stats tab uses plain
-    Sliders instead) — kept as a ready-made widget for a future
-    read-only stat summary view. `value` changes constantly wherever a
-    live stat is shown, so its text is intentionally NOT cached (see
-    render_text_cached notes above).
-    """
-    H = 18
-
-    @staticmethod
-    def draw(surf: pygame.Surface, font: pygame.font.Font,
-             rect: pygame.Rect, value: int, max_val: int = 255) -> None:
-        surf.draw_rect(C_BAR_BG,   rect, border_radius=3)
-        t = max(0, min(1, value / max_val))
-        # Colour gradient: blue → green → yellow → red
-        r = int(min(255, 2 * 255 * t))
-        g = int(min(255, 2 * 255 * (1 - t)))
-        col = (max(30, 255 - int(200 * t)), max(80, int(160 * t)), C_BAR_FILL[2])
-        fill = rect.copy(); fill.w = int(rect.w * t)
-        if fill.w > 0:
-            surf.draw_rect(C_BAR_FILL, fill, border_radius=3)
-        txt = font.render(str(value), True, C_TEXT)
-        surf.blit(txt, (rect.right + 6, rect.y + (rect.h - txt.get_height()) // 2))
-
-
-def draw_button(surf: pygame.Surface, font: pygame.font.Font,
-                rect: pygame.Rect, label: str,
-                color=C_ACCENT, hover: bool = False,
-                danger: bool = False) -> None:
-    """Draw a rounded, optionally-hover-highlighted button with a caption.
-    Every button on screen (Save, Delete, tab arrows, dialog Confirm/
-    Cancel, ...) goes through here, so the caption text is cached — the
-    same handful of labels get redrawn every single frame."""
-    base = (200, 60, 60) if danger else color
-    bg   = tuple(min(255, c + 30) for c in base) if hover else C_PANEL
-    surf.draw_rect(bg, rect, border_radius=5)
-    surf.draw_rect(base, rect, 1, border_radius=5)
-    txt = render_text_cached(font, label, base if not hover else C_TEXT)
-    surf.blit(txt, txt.get_rect(center=rect.center))
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  Confirm dialog
-# ══════════════════════════════════════════════════════════════════════
-
-# Non-blocking modal dialogs are implemented as state held on CharacterCreator
-# (self.dialog) and drawn/handled inline — see _handle_dialog_event /
-# _draw_dialog below. This lets the editor live inside the host game's main
-# loop like every other dev tool instead of running its own blocking loop.
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  Sprite Preview Panel
-# ══════════════════════════════════════════════════════════════════════
 
 PREVIEW_SCALE = 2      # px scale for sprite display
 ANIM_FPS      = 8.0    # walk-cycle playback speed
@@ -1356,16 +962,17 @@ def _load_shadow_sprite(big: bool = False) -> pygame.Surface:
     return surf
 
 
-def get_preview_shadow(shadow_width: float, big: bool = False) -> pygame.Surface:
+def get_preview_shadow(shadow_width: float, big: bool = False,
+                       scale: float = PREVIEW_SCALE) -> pygame.Surface:
     """Ground shadow scaled for the preview panel, using the exact same
     ~32%-of-width / aspect-locked-to-source-sprite math as
-    LayerManager._get_scaled_shadow(), with PREVIEW_SCALE standing in for
+    LayerManager._get_scaled_shadow(), with `scale` (default PREVIEW_SCALE) standing in for
     RENDER_SCALE (the preview's walk frames are scaled the same way).
     Cached per (variant, rounded target width) since shadow_width only
     actually changes while the Shadow Size slider is being dragged."""
     variant = "big" if big else "small"
     source  = _load_shadow_sprite(big)
-    target_w = max(8, int(max(0, shadow_width) * PREVIEW_SCALE * 0.32))
+    target_w = max(8, int(max(0, shadow_width) * scale * 0.32))
     key = (variant, target_w)
     cached = _SHADOW_SCALED_CACHE.get(key)
     if cached is not None:
@@ -1377,265 +984,38 @@ def get_preview_shadow(shadow_width: float, big: bool = False) -> pygame.Surface
     _SHADOW_SCALED_CACHE[key] = scaled
     return scaled
 
-
-class SpritePreview:
-    def __init__(self, rect: pygame.Rect):
-        self.rect    = rect
-        self.frames: list[pygame.Surface] = []
-        self.frame_i = 0.0
-        self._char   = ""
-        self._costume= ""
-        # In-game px width of the ground shadow (character_creator.py's
-        # cfg["shadow_size"] / the Shadow Size slider on the Identity tab —
-        # this is Player.shadow_width, NOT the legacy 'small'/'big'
-        # Player.shadow_size string, which this tool never sets). Kept as a
-        # live-updatable field so dragging the slider updates the preview
-        # immediately without needing a full sprite reload.
-        self.shadow_width: float = 32
-        # Entity height in game px, for the feet_y offset — see draw().
-        # Falls back to the walk frame's own pixel height if unknown.
-        self.entity_height: Optional[int] = None
-
-    def load(self, char_id: str, costume: str) -> None:
-        if char_id == self._char and costume == self._costume:
-            return
-        self._char   = char_id
-        self._costume= costume
-        raw = load_walk_frames(char_id, costume)
-        if raw:
-            self.frames = [
-                pygame.transform.scale(
-                    f,
-                    (f.get_width() * PREVIEW_SCALE,
-                     f.get_height() * PREVIEW_SCALE)
-                )
-                for f in raw
-            ]
-        else:
-            self.frames = []
-        self.frame_i = 0.0
-
-    def update(self, dt: float) -> None:
-        if self.frames:
-            self.frame_i = (self.frame_i + dt * ANIM_FPS) % len(self.frames)
-
-    def _blit_shadow(self, surf: pygame.Surface, cx: float, feet_y: float) -> None:
-        """Blit the real shadow.png asset, scaled/positioned exactly like
-        LayerManager._draw_shadow(): centred under the given feet point."""
-        shadow = get_preview_shadow(self.shadow_width)
-        sx = round(cx - shadow.get_width()  / 2)
-        sy = round(feet_y - shadow.get_height() / 2)
-        surf.blit(shadow, (sx, sy))
-
-    def draw(self, surf: pygame.Surface, font_sm: pygame.font.Font) -> None:
-        surf.draw_rect(C_PANEL_DARK, self.rect, border_radius=6)
-        surf.draw_rect(C_BORDER,     self.rect, 1, border_radius=6)
-
-        if self.frames:
-            frame = self.frames[int(self.frame_i)]
-            fx = self.rect.centerx - frame.get_width() // 2
-            fy = self.rect.centery - frame.get_height() // 2
-
-            # feet_y mirrors LayerManager._draw_shadow(): obj's vertical
-            # anchor (here, the frame's vertical centre, matching how the
-            # sprite is centred on obj.x/obj.y in-game) plus
-            # entity_height * RENDER_SCALE / 2.25 (PREVIEW_SCALE standing in
-            # for RENDER_SCALE here). entity_height defaults to the walk
-            # frame's own raw pixel height when the real hitbox height
-            # (Player.height) isn't known to this preview.
-            raw_h = self.entity_height if self.entity_height is not None \
-                else frame.get_height() / PREVIEW_SCALE
-            feet_y = self.rect.centery + (raw_h * PREVIEW_SCALE) / 2.25
-
-            # Shadow first (below the sprite), same draw order as
-            # LayerManager.draw_all(): "_draw_shadow just before the entity".
-            self._blit_shadow(surf, self.rect.centerx, feet_y)
-            surf.blit(frame, (fx, fy))
-            info = font_sm.render(
-                f"frame {int(self.frame_i)+1}/{len(self.frames)}",
-                True, C_TEXT_DIM
-            )
-            surf.blit(info, (self.rect.x + 6, self.rect.bottom - 20))
-        else:
-            # Placeholder silhouette
-            ph_w, ph_h = 48 * PREVIEW_SCALE, 64 * PREVIEW_SCALE
-            ph = pygame.Rect(
-                self.rect.centerx - ph_w // 2,
-                self.rect.centery - ph_h // 2,
-                ph_w, ph_h
-            )
-            feet_y = self.rect.centery + (ph_h / 2.25)
-            self._blit_shadow(surf, self.rect.centerx, feet_y)
-            surf.draw_rect(C_BORDER, ph, border_radius=6)
-            lbl = render_text_cached(font_sm, "no sprites", C_TEXT_DIM)
-            surf.blit(lbl, lbl.get_rect(centerx=self.rect.centerx,
-                                         top=ph.bottom + 6))
-
-
 # ══════════════════════════════════════════════════════════════════════
-#  Animation Grid Panel  (Preview tab)
+#  UI layer
 # ══════════════════════════════════════════════════════════════════════
+#
+# Everything below is the Character Creator's interface, rebuilt on
+# dev_tools.ui_kit so it reads as part of the same family as the Dev Menu
+# and the Room Editor: navy backdrop, flat cards with hairline borders
+# that light up gold on hover, bitmap menu font, vector line icons.
+#
+# It draws ONLY through ui_kit's dispatch helpers (draw_rect_on /
+# draw_circle_on / draw_line_on / blit_surface / draw_panel ...), so it
+# works on the engine's GPUScreen as well as on a plain pygame.Surface.
+#
+# The data layer above (discovery, load/save, menu order, global
+# settings, transformation sync) is untouched — this layer only edits the
+# same cfg dict those functions read and write.
 
-CELL_PAD        = 12   # gap between cells and panel edges
-TARGET_CELL_W   = 200  # ideal cell width; actual is computed to fill the panel
+_T = uk.Theme
 
-
-class AnimationGridPanel:
-    """
-    Scrollable grid that shows every discovered animation (state × direction)
-    for the current character / costume, each playing back independently.
-
-    Layout is computed dynamically from self.rect so it always fills the full
-    panel width regardless of resolution.
-    """
-
-    def __init__(self, rect: pygame.Rect):
-        self.rect        = rect
-        self.animations: dict[str, list[pygame.Surface]] = {}
-        self._scaled:    dict[str, list[pygame.Surface]] = {}
-        self._timers:    dict[str, float]                = {}
-        self.scroll      = 0
-        self._max_scroll = 0
-        # computed layout (updated in _compute_layout)
-        self._cols   = 4
-        self._cell_w = TARGET_CELL_W
-        self._cell_h = TARGET_CELL_W + 30
-
-    # ── Layout ────────────────────────────────────────────────────────
-    def set_rect(self, rect: pygame.Rect) -> None:
-        """Update the panel rect, recomputing layout only if size changed."""
-        size_changed = (rect.w != self.rect.w or rect.h != self.rect.h)
-        self.rect = rect
-        if size_changed and self.animations:
-            self._compute_layout()
-            self._rebuild_scaled()
-            self._recalc_scroll()
-            self.scroll = min(self.scroll, self._max_scroll)
-
-    def _compute_layout(self) -> None:
-        """Derive columns and cell dimensions from the current panel width."""
-        avail_w = self.rect.w - CELL_PAD          # space for cells + gaps
-        # how many cols fit at the target width?
-        self._cols   = max(2, avail_w // (TARGET_CELL_W + CELL_PAD))
-        # stretch cells to fill the full width evenly
-        self._cell_w = (avail_w - self._cols * CELL_PAD) // self._cols
-        self._cell_h = self._cell_w + 30          # a bit taller than wide
-
-    # ── Data ──────────────────────────────────────────────────────────
-    def load(self, animations: dict[str, list[pygame.Surface]]) -> None:
-        self.animations = animations
-        self._timers    = {name: 0.0 for name in animations}
-        self.scroll     = 0
-        self._compute_layout()
-        self._rebuild_scaled()
-        self._recalc_scroll()
-
-    def _rebuild_scaled(self) -> None:
-        """Pre-scale every frame to fit inside a cell (done once on load)."""
-        self._scaled = {}
-        label_h      = 22
-        pad          = 10
-        area_w = self._cell_w - pad * 2
-        area_h = self._cell_h - label_h - pad * 2
-        for name, frames in self.animations.items():
-            scaled_frames: list[pygame.Surface] = []
-            for f in frames:
-                s  = min(area_w / max(f.get_width(), 1),
-                         area_h / max(f.get_height(), 1))
-                sw = max(1, int(f.get_width()  * s))
-                sh = max(1, int(f.get_height() * s))
-                scaled_frames.append(pygame.transform.scale(f, (sw, sh)))
-            self._scaled[name] = scaled_frames
-
-    def _recalc_scroll(self) -> None:
-        n       = max(1, len(self.animations))
-        rows    = math.ceil(n / self._cols)
-        total_h = rows * (self._cell_h + CELL_PAD) + CELL_PAD
-        self._max_scroll = max(0, total_h - self.rect.h)
-
-    # ── Events ────────────────────────────────────────────────────────
-    def handle_event(self, event: pygame.event.Event) -> None:
-        if event.type == pygame.MOUSEWHEEL:
-            if self.rect.collidepoint(pygame.mouse.get_pos()):
-                self.scroll = max(0, min(self._max_scroll,
-                                         self.scroll - event.y * 40))
-
-    # ── Update ────────────────────────────────────────────────────────
-    def update(self, dt: float) -> None:
-        for name, frames in self.animations.items():
-            self._timers[name] = (self._timers[name] + dt * ANIM_FPS) % len(frames)
-
-    # ── Draw ──────────────────────────────────────────────────────────
-    def draw(self, surf: pygame.Surface, font_sm: pygame.font.Font) -> None:
-        old_clip = surf.get_clip()
-        surf.set_clip(self.rect)
-
-        if not self.animations:
-            msg = render_text_cached(font_sm, "No animations found for this character / form.",
-                                     C_TEXT_DIM)
-            surf.blit(msg, msg.get_rect(center=self.rect.center))
-            surf.set_clip(old_clip)
-            return
-
-        cw   = self._cell_w
-        ch   = self._cell_h
-        cols = self._cols
-        x0   = self.rect.x + CELL_PAD
-        y0   = self.rect.y + CELL_PAD - int(self.scroll)
-
-        label_h = 22
-        pad     = 10
-
-        for i, name in enumerate(self.animations):
-            col = i % cols
-            row = i // cols
-            cx  = x0 + col * (cw + CELL_PAD)
-            cy  = y0 + row * (ch + CELL_PAD)
-
-            if cy + ch < self.rect.top or cy > self.rect.bottom:
-                continue
-
-            cell = pygame.Rect(cx, cy, cw, ch)
-            surf.draw_rect(C_PANEL_DARK, cell, border_radius=8)
-            surf.draw_rect(C_BORDER,     cell, 1, border_radius=8)
-
-            # Label (cached — the animation name itself never changes)
-            lbl_text = name if len(name) <= 20 else name[:18] + "…"
-            lbl = render_text_cached(font_sm, lbl_text, C_TEXT_DIM)
-            surf.blit(lbl, (cell.x + (cw - lbl.get_width()) // 2, cell.y + 5))
-
-            # Animated sprite — centred in the area below the label
-            scaled_frames = self._scaled.get(name, [])
-            if scaled_frames:
-                frame      = scaled_frames[int(self._timers[name])]
-                area_y     = cell.y + label_h
-                area_h     = ch - label_h - pad
-                fx = cell.x + (cw - frame.get_width())  // 2
-                fy = area_y  + (area_h - frame.get_height()) // 2
-                surf.blit(frame, (fx, fy))
-
-            # Frame counter
-            raw_frames = self.animations[name]
-            fi  = int(self._timers[name]) + 1
-            ctr = font_sm.render(f"{fi}/{len(raw_frames)}", True, C_BORDER)
-            surf.blit(ctr, (cell.right - ctr.get_width() - 5,
-                            cell.bottom - ctr.get_height() - 3))
-
-        # Scrollbar
-        if self._max_scroll > 0:
-            total_h = self.rect.h + self._max_scroll
-            bar_h   = max(24, int(self.rect.h * self.rect.h / total_h))
-            bar_y   = self.rect.y + int(self.scroll / self._max_scroll
-                                        * (self.rect.h - bar_h))
-            bar = pygame.Rect(self.rect.right - 8, bar_y, 5, bar_h)
-            surf.draw_rect(C_BORDER, bar, border_radius=3)
-
-        surf.set_clip(old_clip)
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  Tab renderers
-# ══════════════════════════════════════════════════════════════════════
+# Same flat two-tone backdrop / bar colours DevMenu and RoomEditor use.
+_BG        = (8, 11, 17)
+_BAND      = (10, 13, 20)
+_BAR       = (12, 15, 23)
+_HAIR      = (43, 49, 63)
+_CARD      = (22, 26, 35)
+_CARD_HI   = (28, 33, 44)
+_FIELD     = (20, 23, 32)
+_FIELD_HI  = (27, 31, 42)
+_INSET     = (11, 14, 21)
+_TRACK     = (34, 39, 53)
+_SEL       = (31, 36, 49)
+_OFFSCREEN = (-9999, -9999)
 
 TAB_IDENTITY  = 0
 TAB_STATS     = 1
@@ -1644,788 +1024,2501 @@ TAB_TRANSFORM = 3
 TAB_PREVIEW   = 4
 TAB_SETTINGS  = 5
 TAB_NAMES     = ["Identity", "Stats", "Attacks", "Transformations", "Preview", "Settings"]
+# Settings isn't a peer of the per-character tabs above - it's global and
+# lives in its own small icon button (see _settings_rect / config.png),
+# not in the tab row. BAR_TAB_NAMES is what the tab row itself lays out.
+BAR_TAB_NAMES = TAB_NAMES[:TAB_SETTINGS]
 
 
-class CharacterEditor:
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+# ── Bitmap font wrapper ─────────────────────────────────────────────────
+
+class _Font:
+    """One BitmapFont pinned to one pixel height, plus the text metrics the
+    layout code needs.
+
+    BitmapFont only has glyphs for letters, digits and  . , ! ? : - + / _ ( ) '
+    Anything else (e.g. %, #, quotes) would silently vanish from a text
+    field while still being stored in the data, so unsupported characters
+    are *displayed* as '?' — the stored value is never altered.
+
+    Widths are computed arithmetically from per-glyph advances instead of
+    rendering every prefix, so wrapping / caret placement in a text area
+    doesn't rasterise (and cache) hundreds of throw-away strings.
+
+    Text is positioned by BASELINE, not by its surface rect. BitmapFont
+    sizes each string's canvas to its own tallest glyph (+ descender
+    padding), so centring surfaces makes "no" sit lower than "go".
     """
-    Manages widgets for all three tabs.
-    Rebuilt whenever the selected character changes.
-    """
 
-    def __init__(self, panel: pygame.Rect, char_id: str, cfg: dict,
-                 costumes: list[str], transform_forms: list[str] | None = None,
-                 available_attacks: list[str] | None = None):
-        self.panel           = panel
-        self.char_id         = char_id
-        self.cfg             = cfg
-        self.costumes        = costumes
-        # Form names shown in the Transformations-tab costume picker (e.g. ["ssj", "ssj2"]).
-        # Stored separately from base costumes — these live under transformations/.
-        self.transform_forms = transform_forms or []
-        self.dirty           = False          # unsaved changes flag
+    def __init__(self, bitmap, height):
+        self.bm = bitmap
+        self.height = int(height)
+        self._ok = {}
+        self._adv = {}
+        self._spacing = None
+        native = max(1, bitmap.size("A")[1])
+        self.scale = max(1, int(round(self.height / native)))
+        self.cap_h = max(1, bitmap.size("A", height=self.height)[1])
+        offs = getattr(bitmap, "glyph_y_offsets", None) or {}
+        self.desc_h = max(offs.values(), default=0) * self.scale
+        self.line_h = self.cap_h + self.desc_h
 
-        # Layout constants
-        lx = panel.x + 20             # label column x
-        fx = panel.x + 140            # field column x
-        fw = panel.w - 160            # field width (leave room for val label)
-        row_h = 42
+    def _has(self, ch):
+        ok = self._ok.get(ch)
+        if ok is None:
+            try:
+                ok = ch == " " or self.bm._glyph(ch) is not None
+            except AttributeError:      # kit without the glyph helper: assume drawable
+                ok = True
+            self._ok[ch] = ok
+        return ok
 
-        # ── Identity tab ────────────────────────────────────────────
-        y = panel.y + 60
-        self.name_input    = TextArea(pygame.Rect(fx, y, fw, TextArea.H_SINGLE),
-                                       cfg["display_name"], multiline=False)
+    def disp(self, text):
+        for ch in text:
+            if not self._has(ch):
+                return "".join(c if self._has(c) else "?" for c in text)
+        return text
 
-        y += row_h
-        self.costume_idx   = costumes.index(cfg["costume"]) if cfg["costume"] in costumes else 0
+    def _advance(self, ch):
+        a = self._adv.get(ch)
+        if a is None:
+            a = self.bm.size(ch, height=self.height)[0]
+            self._adv[ch] = a
+        return a
 
-        # Sprite-sheet frame size for normal/base art.
-        self.sprite_width_slider = Slider(
-            pygame.Rect(fx, 0, fw - 50, 20), 4, 256,
-            cfg.get("sprite_width", 32), step=1
-        )
-        self.sprite_height_slider = Slider(
-            pygame.Rect(fx, 0, fw - 50, 20), 4, 256,
-            cfg.get("sprite_height", 32), step=1
-        )
+    def _sp(self):
+        if self._spacing is None:
+            aa = self.bm.size("AA", height=self.height)[0]
+            self._spacing = max(0, aa - 2 * self._advance("A"))
+        return self._spacing
 
-        # Gate/identity color — picked via a hue-strip + saturation/value
-        # square (see _draw_identity), same widget style as the animated
-        # region color picker in dev_tools/object_editor.py. Rects are
-        # recomputed each draw (position depends on layout) and hit-tested
-        # in handle_event; the hue-strip surface is cached since it never
-        # changes, the SV-square surface is cached per-hue.
-        self.selected_color   = cfg.get("color", "#FFD700")
-        self._color_hue_rect: pygame.Rect | None = None
-        self._color_sv_rect:  pygame.Rect | None = None
-        self._color_hue_dragging = False
-        self._color_sv_dragging  = False
-        self._hue_strip_cache = None   # (w, h) -> surface
-        self._sv_square_cache = None   # (hue, w, h) -> surface
+    def width(self, text):
+        if not text:
+            return 0
+        d = self.disp(text)
+        return sum(self._advance(c) for c in d) + self._sp() * (len(d) - 1)
 
-        # Description box — rect is a placeholder here; _draw_identity()
-        # repositions it every frame based on where the portrait preview
-        # ends up, same pattern as name_input/shadow_slider above.
-        self.desc_input = TextArea(pygame.Rect(fx, 0, fw, TextArea.H), cfg.get("description", ""))
+    def render(self, text, color):
+        """-> (surface, descender_px). descender_px is how far below the
+        baseline the surface extends (canvas bottom - baseline)."""
+        d = self.disp(text)
+        surf = self.bm.render(d, color=tuple(color), height=self.height)
+        offs = getattr(self.bm, "glyph_y_offsets", None) or {}
+        desc = 0
+        for c in set(d):
+            o = offs.get(c, 0)
+            if o > desc:
+                desc = o
+        return surf, desc * self.scale
 
-        # Preview tab — must come after costume_idx is resolved.
-        # Dropdown state for the form picker shown at the top of the Preview tab.
-        self.preview_form_idx         = 0       # index into _all_preview_forms()
-        self.preview_dropdown_open    = False
-        self.preview_dropdown_scroll  = 0       # first visible row when list is open
-        self._preview_dropdown_btn:   Optional[pygame.Rect]           = None
-        self._preview_dropdown_rows:  list[tuple[str, pygame.Rect]]   = []
-        self.preview_form_thumbnails: dict[str, list[pygame.Surface]] = {}
-        self._preview_thumb_timers:   dict[str, float]                = {}
-        self._preview_form_changed:   bool                            = False
-        self.anim_grid = AnimationGridPanel(panel)
-        self._reload_anim_grid(char_id, costumes[self.costume_idx] if costumes else "base")
-        self._load_preview_thumbnails()
+    def fit(self, text, max_w):
+        """Ellipsise `text` to at most max_w pixels."""
+        if self.width(text) <= max_w:
+            return text
+        ell = "..."
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self.width(text[:mid].rstrip() + ell) <= max_w:
+                lo = mid
+            else:
+                hi = mid - 1
+        return (text[:lo].rstrip() + ell) if lo else ell
 
-        y += row_h
-        self.shadow_slider = Slider(
-            pygame.Rect(fx, y + 6, fw - 50, 20),
-            8, 96, cfg["shadow_size"], step=4
-        )
+    def wrap(self, text, max_w):
+        """Greedy word-wrap -> list of lines (honours explicit newlines)."""
+        lines = []
+        for para in text.split("\n"):
+            cur = ""
+            for word in para.split(" "):
+                trial = f"{cur} {word}" if cur else word
+                if cur and self.width(trial) > max_w:
+                    lines.append(cur)
+                    cur = word
+                else:
+                    cur = trial
+            lines.append(cur)
+        return lines
 
-        # Halo — toggles drawing assets/sprites/universal/halo.png on top of
-        # the player sprite (same layer, drawn after so it renders above).
-        # Position is not exposed here — it's tuned manually in player.py
-        # via halo_offset_x/halo_offset_y, same pattern as the shadow
-        # offset constants there. This is just the on/off switch.
-        self.halo_enabled = bool(cfg.get("halo_enabled", False))
-        self._halo_checkbox_rect: Optional[pygame.Rect] = None
 
-        # ── Stats tab ───────────────────────────────────────────────
-        stats = cfg["stats"]
-        y0    = panel.y + 60
-        self.stat_sliders: dict[str, Slider] = {}
-        for i, key in enumerate(["max_hp", "max_ki", "power", "ki_power",
-                                   "defense", "vitality", "speed", "ki_regen"]):
-            sy = y0 + i * row_h
-            self.stat_sliders[key] = Slider(
-                pygame.Rect(fx, sy + 6, fw - 50, 20),
-                1, 255, stats[key], step=1
-            )
+# ── Wrapped-text spans (for the multi-line field) ───────────────────────
 
-        # ── Attacks tab ─────────────────────────────────────────────
-        atk = cfg["attacks"]
+_SPAN_CACHE: dict = {}
 
-        y0 = panel.y + 60
-        self.atk_sliders: dict[str, Slider] = {}
-        specs = [
-            ("blast_cost",       1, 100,   atk["blast_cost"],       1,    "{:.0f}"),
-            ("beam_cost",        1, 200,   atk["beam_cost"],         1,    "{:.0f}"),
-            ("melee_duration",   0.1, 3.0, atk["melee_duration"],   0.05, "{:.2f}s"),
-            ("walk_speed",       50, 500,  atk["walk_speed"],        10,   "{:.0f}"),
-            ("run_speed",        100, 800, atk["run_speed"],         10,   "{:.0f}"),
-            ("fly_speed",        100,1200, atk["fly_speed"],         50,   "{:.0f}"),
-        ]
-        for i, (key, mn, mx, val, step, fmt) in enumerate(specs):
-            sy = y0 + i * row_h
-            self.atk_sliders[key] = Slider(
-                pygame.Rect(fx, sy + 6, fw - 60, 20),
-                mn, mx, val, step, fmt
-            )
 
-        # Equipped-attacks icon picker. available_attacks is the GLOBAL
-        # roster from discover_attacks() (every folder under
-        # assets/sprites/attacks/); equipped_attacks is this character's
-        # subset of it, stored directly in cfg so toggling a button mutates
-        # the save data in place — no separate flush() step needed.
-        self.available_attacks = available_attacks or []
-        atk.setdefault("equipped_attacks", [])
-        atk.setdefault("charged_melee_style", "lunge")
-        self._charged_melee_style_rect: Optional[pygame.Rect] = None
-        self.equipped_attacks: list[str] = atk["equipped_attacks"]
-        self.attack_btn_rects: dict[str, pygame.Rect] = {}   # rebuilt on demand, see _build_attack_grid
-        self._attack_grid_y0 = 0
-        self._attack_grid_cache_key = None   # see _build_attack_grid's memoization
+def _split_hard(font, text, s, e, width):
+    """Break one over-long run [s, e) on character boundaries."""
+    out = []
+    while e - s > 1 and font.width(text[s:e]) > width:
+        lo, hi = 1, e - s - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if font.width(text[s:s + mid]) <= width:
+                lo = mid
+            else:
+                hi = mid - 1
+        out.append((s, s + lo))
+        s += lo
+    out.append((s, e))
+    return out
 
-        # ── Transformations tab ────────────────────────────────────
-        # self.transformations is the FULL list for every costume this
-        # character has; a given costume's transformations are the entries
-        # whose "costume" field is "{that costume}/transformations/{form}".
-        # Always go through visible_transformations() (scoped to whichever
-        # costume is selected on the Identity tab) rather than indexing
-        # this list directly — a costume's transformation should only ever
-        # be visible/navigable while that costume itself is selected.
-        self.cfg.setdefault("transformations", [])
-        self.transformations: list[dict] = self.cfg["transformations"]
-        self.transform_idx          = 0 if self.visible_transformations() else -1
-        self.transform_costume_idx  = 0
-        self.transform_name_input: Optional[TextArea] = None
-        self.transform_sliders: dict[str, Slider] = {}
 
-        # Per-form ki-bar color override (hue-strip + SV-square picker,
-        # same widget as the Identity tab's Gate Color). "enabled" tracks
-        # whether this form uses a custom color at all — unchecked means
-        # ki_color stays None in cfg and the original transformed_ki_bar.png
-        # art is used untouched, so existing/unconfigured forms don't
-        # silently get recolored the moment the file is saved.
-        self.transform_ki_color_enabled = False
-        self.transform_ki_color         = "#FFD700"
-        self._tf_ki_color_checkbox_rect: Optional[pygame.Rect] = None
-        self._tf_color_hue_rect: Optional[pygame.Rect] = None
-        self._tf_color_sv_rect:  Optional[pygame.Rect] = None
-        self._tf_color_hue_dragging = False
-        self._tf_color_sv_dragging  = False
+def _wrap_spans(font, text, width):
+    """Word-wrap `text` into [(start, end), ...] index spans of the ORIGINAL
+    string (newlines and the spaces at soft-wrap points sit between spans),
+    so caret / selection maths can map straight back to string offsets."""
+    key = (id(font), text, width)
+    cached = _SPAN_CACHE.get(key)
+    if cached is not None:
+        return cached
+    raw = []
+    pos = 0
+    for para in text.split("\n"):
+        if not para:
+            raw.append((pos, pos))
+        else:
+            s = e = pos
+            wpos = pos
+            first = True
+            for word in para.split(" "):
+                ws, we = wpos, wpos + len(word)
+                if first:
+                    s, e, first = ws, we, False
+                elif font.width(text[s:we]) <= width:
+                    e = we
+                else:
+                    raw.append((s, e))
+                    s, e = ws, we
+                wpos = we + 1
+            raw.append((s, e))
+        pos += len(para) + 1
+    spans = []
+    for s, e in raw:
+        spans.extend(_split_hard(font, text, s, e, width))
+    if len(_SPAN_CACHE) > 160:
+        _SPAN_CACHE.clear()
+    _SPAN_CACHE[key] = spans
+    return spans
 
-        # Whether this form shows/fills the transformed-ki charge bar while
-        # its transform animation plays. Checked (True) by default so
-        # existing/unconfigured forms keep the historical behavior.
-        # Unchecking it lets the transform animation just play straight
-        # through at its own natural pace, with no bar and no fixed
-        # duration — the player lands in the transformed state the instant
-        # the animation finishes.
-        self.transform_ki_bar_enabled = True
-        self._tf_ki_bar_enabled_checkbox_rect: Optional[pygame.Rect] = None
 
-        # Prerequisite tier for the selected transformation — a form-name
-        # (e.g. "ssj") from this same costume's OTHER transformations, or
-        # None for a base-level form reachable directly from untransformed.
-        # See the "Requires" stepper on the Transformations tab.
-        self.transform_requires: Optional[str] = None
+def _line_of(spans, idx):
+    """Index of the wrapped line that string offset `idx` belongs to."""
+    line = 0
+    for i, (s, _e) in enumerate(spans):
+        if s <= idx:
+            line = i
+        else:
+            break
+    return line
 
-        self._load_transform_widgets()
 
-        # ── Identity tab: portrait cycle ─────────────────────────────
-        # Slowly cycles the Identity-tab portrait through the base look
-        # plus every registered transformation — see _portrait_cycle_forms()
-        # / _load_portrait() / _draw_identity_portrait().
-        self.portrait_cache: dict[tuple[str, str], Optional[pygame.Surface]] = {}
-        self.portrait_cycle_timer = 0.0
+# ── Text editing engine (no drawing) ────────────────────────────────────
 
-    # ── Assigned color (hue-strip + SV-square picker) ────────────────
-    # Same widget style as the animated-region color picker in
-    # dev_tools/object_editor.py — a vertical rainbow hue strip plus a
-    # saturation/value square for the chosen hue, so the player can pick
-    # any RGB color instead of a fixed swatch set.
-    def _selected_color_hsv(self) -> tuple:
-        """Current self.selected_color (a '#RRGGBB' string) as (h, s, v),
-        each in 0-1."""
-        r, g, b = hex_to_rgb(self.selected_color)
-        return colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+class _TextEdit:
+    """Caret / selection / clipboard logic shared by every text field and
+    by the New-ID dialogs. Pure state — the creator draws it and feeds it
+    keys. key() returns None, 'changed', 'commit' or 'cancel'."""
 
-    def _set_color_hue_from_mouse_y(self, mouse_y: int, hue_rect: pygame.Rect) -> None:
-        """Vertical hue strip: y position maps to hue 0-1. Keeps the
-        current saturation/value, only the hue changes."""
-        _, s, v = self._selected_color_hsv()
-        frac = (mouse_y - hue_rect.top) / hue_rect.height
-        hue = max(0.0, min(1.0, frac))
-        r, g, b = colorsys.hsv_to_rgb(hue, s, v)
-        self.selected_color = rgb_to_hex((round(r * 255), round(g * 255), round(b * 255)))
+    def __init__(self, value="", multiline=False, max_len=600, allowed=None):
+        self.value = value
+        self.cursor = len(value)
+        self.anchor = None
+        self.multiline = multiline
+        self.max_len = max_len
+        self.allowed = allowed
+        self.blink = 0.0
+        self.goal_x = None            # remembered column (px) for Up/Down
+        self.view = None              # (font, wrap_width) set by the drawer
 
-    def _set_color_sv_from_mouse(self, mouse_pos: tuple, sv_rect: pygame.Rect) -> None:
-        """Saturation/value square: x -> saturation 0-1, y -> value 1-0
-        (top of the square is brightest). Keeps the current hue."""
-        h, _, _ = self._selected_color_hsv()
-        s = max(0.0, min(1.0, (mouse_pos[0] - sv_rect.left) / sv_rect.width))
-        v = max(0.0, min(1.0, 1 - (mouse_pos[1] - sv_rect.top) / sv_rect.height))
-        r, g, b = colorsys.hsv_to_rgb(h, s, v)
-        self.selected_color = rgb_to_hex((round(r * 255), round(g * 255), round(b * 255)))
+    # -- selection ------------------------------------------------------
+    def has_sel(self):
+        return self.anchor is not None and self.anchor != self.cursor
+
+    def sel_range(self):
+        a, b = self.anchor, self.cursor
+        return (a, b) if a <= b else (b, a)
+
+    def _del_sel(self):
+        if not self.has_sel():
+            return False
+        s, e = self.sel_range()
+        self.value = self.value[:s] + self.value[e:]
+        self.cursor = s
+        self.anchor = None
+        return True
+
+    def insert(self, text):
+        """Type/paste `text` at the caret. True if the value changed."""
+        if not self.multiline:
+            text = text.replace("\r", "").replace("\n", " ")
+        else:
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+        keep = []
+        for ch in text:
+            if ch == "\n" and self.multiline:
+                keep.append(ch)
+            elif ch.isprintable() and (self.allowed is None or self.allowed(ch)):
+                keep.append(ch)
+        text = "".join(keep)
+        if not text:
+            return False
+        changed = self._del_sel()
+        room = self.max_len - len(self.value)
+        if room <= 0:
+            return changed
+        text = text[:room]
+        self.value = self.value[:self.cursor] + text + self.value[self.cursor:]
+        self.cursor += len(text)
+        self.goal_x = None
+        return True
+
+    # -- caret movement -------------------------------------------------
+    def _move(self, idx, shift):
+        idx = _clamp(idx, 0, len(self.value))
+        if shift:
+            if self.anchor is None:
+                self.anchor = self.cursor
+        else:
+            self.anchor = None
+        self.cursor = idx
+
+    def _word_left(self, i):
+        v = self.value
+        while i > 0 and v[i - 1] == " ":
+            i -= 1
+        while i > 0 and v[i - 1] != " ":
+            i -= 1
+        return i
+
+    def _word_right(self, i):
+        v, n = self.value, len(self.value)
+        while i < n and v[i] == " ":
+            i += 1
+        while i < n and v[i] != " ":
+            i += 1
+        return i
+
+    def _spans(self):
+        if not self.view:
+            return None
+        font, width = self.view
+        return _wrap_spans(font, self.value, width)
+
+    def _vertical(self, delta, shift):
+        spans = self._spans()
+        if not spans:
+            return
+        font, _w = self.view
+        line = _line_of(spans, self.cursor)
+        s, e = spans[line]
+        if self.goal_x is None:
+            self.goal_x = font.width(self.value[s:_clamp(self.cursor, s, e)])
+        tgt = line + delta
+        if tgt < 0:
+            self._move(0, shift)
+            return
+        if tgt >= len(spans):
+            self._move(len(self.value), shift)
+            return
+        ts, te = spans[tgt]
+        self._move(ts + _index_at_x(font, self.value[ts:te], self.goal_x), shift)
+
+    def key(self, event):
+        mods = getattr(event, "mod", 0) | pygame.key.get_mods()
+        ctrl = bool(mods & (pygame.KMOD_CTRL | pygame.KMOD_META))
+        shift = bool(mods & pygame.KMOD_SHIFT)
+        k = event.key
+        self.blink = 0.0
+        if k not in (pygame.K_UP, pygame.K_DOWN):
+            self.goal_x = None
+
+        if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            if self.multiline and not ctrl:
+                return "changed" if self.insert("\n") else None
+            return "commit"
+        if k == pygame.K_ESCAPE:
+            return "cancel"
+        if k == pygame.K_TAB:
+            return "commit"
+        if ctrl and k == pygame.K_a:
+            self.anchor, self.cursor = 0, len(self.value)
+            return None
+        if ctrl and k in (pygame.K_c, pygame.K_x):
+            if self.has_sel():
+                s, e = self.sel_range()
+                uk.clipboard_set_text(self.value[s:e])
+                if k == pygame.K_x:
+                    self._del_sel()
+                    return "changed"
+            return None
+        if ctrl and k == pygame.K_v:
+            return "changed" if self.insert(uk.clipboard_get_text()) else None
+
+        if k == pygame.K_LEFT:
+            if not shift and self.has_sel():
+                self.cursor = self.sel_range()[0]
+                self.anchor = None
+            else:
+                self._move(self._word_left(self.cursor) if ctrl else self.cursor - 1, shift)
+        elif k == pygame.K_RIGHT:
+            if not shift and self.has_sel():
+                self.cursor = self.sel_range()[1]
+                self.anchor = None
+            else:
+                self._move(self._word_right(self.cursor) if ctrl else self.cursor + 1, shift)
+        elif k in (pygame.K_UP, pygame.K_DOWN) and self.multiline:
+            self._vertical(-1 if k == pygame.K_UP else 1, shift)
+        elif k == pygame.K_HOME:
+            spans = self._spans() if (self.multiline and not ctrl) else None
+            self._move(spans[_line_of(spans, self.cursor)][0] if spans else 0, shift)
+        elif k == pygame.K_END:
+            spans = self._spans() if (self.multiline and not ctrl) else None
+            self._move(spans[_line_of(spans, self.cursor)][1] if spans else len(self.value), shift)
+        elif k == pygame.K_BACKSPACE:
+            if self._del_sel():
+                return "changed"
+            if self.cursor > 0:
+                start = self._word_left(self.cursor) if ctrl else self.cursor - 1
+                self.value = self.value[:start] + self.value[self.cursor:]
+                self.cursor = start
+                return "changed"
+        elif k == pygame.K_DELETE:
+            if self._del_sel():
+                return "changed"
+            if self.cursor < len(self.value):
+                end = self._word_right(self.cursor) if ctrl else self.cursor + 1
+                self.value = self.value[:self.cursor] + self.value[end:]
+                return "changed"
+        elif event.unicode and not ctrl:
+            return "changed" if self.insert(event.unicode) else None
+        return None
+
+
+def _index_at_x(font, line_text, x):
+    """String offset within `line_text` whose caret is nearest to pixel x."""
+    if x <= 0 or not line_text:
+        return 0
+    shown = font.disp(line_text)          # 1:1 with line_text (unsupported -> '?')
+    sp = font._sp()
+    best_i, best_d = 0, x
+    acc = 0
+    for i, ch in enumerate(shown, 1):
+        acc += font._advance(ch) + (sp if i > 1 else 0)
+        d = abs(acc - x)
+        if d < best_d:
+            best_i, best_d = i, d
+    return best_i
+
+
+# ── Colour picker surfaces ──────────────────────────────────────────────
+
+def _hex_to_hsv(hex_str):
+    r, g, b = hex_to_rgb(hex_str)
+    return colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+
+
+def _hsv_to_hex(h, s, v):
+    r, g, b = colorsys.hsv_to_rgb(h, s, v)
+    return rgb_to_hex((round(r * 255), round(g * 255), round(b * 255)))
+
+
+def _round_bake(rgb_surface, radius):
+    """Copy an opaque surface into an SRCALPHA one with anti-aliased rounded
+    corners (multiplied by ui_kit's cached supersampled rounded-rect)."""
+    w, h = rgb_surface.get_size()
+    out = pygame.Surface((w, h), pygame.SRCALPHA)
+    out.blit(rgb_surface, (0, 0))
+    try:
+        mask = uk._rounded_rect_surface(w, h, radius, (255, 255, 255, 255), None, 0)
+        out.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+    except Exception:
+        pass
+    return out
+
+
+_HUE_STRIP_CACHE: dict = {}
+_SV_CACHE: dict = {}
+
+
+def _hue_strip_surface(w, h, radius=6):
+    key = (w, h, radius)
+    surf = _HUE_STRIP_CACHE.get(key)
+    if surf is None:
+        col = np.zeros((h, 3), dtype=np.uint8)
+        for i in range(h):
+            r, g, b = colorsys.hsv_to_rgb(i / max(1, h - 1), 1.0, 1.0)
+            col[i] = (round(r * 255), round(g * 255), round(b * 255))
+        arr = np.tile(col[np.newaxis, :, :], (w, 1, 1))          # (w, h, 3)
+        surf = _round_bake(pygame.surfarray.make_surface(arr), radius)
+        _HUE_STRIP_CACHE[key] = surf
+    return surf
+
+
+def _sv_surface(hue, w, h, radius=6):
+    """Saturation (x) / value (y, top = bright) square for one hue."""
+    key = (round(hue, 3), w, h, radius)
+    surf = _SV_CACHE.get(key)
+    if surf is None:
+        if len(_SV_CACHE) > 96:
+            _SV_CACHE.clear()
+        base = np.array(colorsys.hsv_to_rgb(hue, 1.0, 1.0), dtype=np.float32)
+        s = np.linspace(0.0, 1.0, w, dtype=np.float32)[:, None, None]     # (w,1,1)
+        v = np.linspace(1.0, 0.0, h, dtype=np.float32)[None, :, None]     # (1,h,1)
+        rgb = v * ((1.0 - s) + s * base[None, None, :])                    # (w,h,3)
+        arr = np.clip(rgb * 255, 0, 255).astype(np.uint8)
+        surf = _round_bake(pygame.surfarray.make_surface(arr), radius)
+        _SV_CACHE[key] = surf
+    return surf
+
+
+def _fit_surface(surf, max_w, max_h):
+    """Scale to fit a box: whole-number nearest-neighbour when enlarging
+    (keeps pixel art crisp), smooth when shrinking."""
+    w, h = surf.get_size()
+    if w <= 0 or h <= 0 or max_w <= 0 or max_h <= 0:
+        return surf
+    s = min(max_w / w, max_h / h)
+    if s >= 1:
+        k = int(s)
+        return pygame.transform.scale(surf, (w * k, h * k)) if k > 1 else surf
+    return pygame.transform.smoothscale(surf, (max(1, int(w * s)), max(1, int(h * s))))
+
+
+# ── Vector icons (same fn(surface, rect, color[, width]) shape as ui_kit) ─
+
+def _ic_check(surface, rect, color, width=3):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.32
+    uk.draw_line_on(surface, color, (cx - s, cy), (cx - s * 0.15, cy + s * 0.8), width)
+    uk.draw_line_on(surface, color, (cx - s * 0.15, cy + s * 0.8), (cx + s, cy - s * 0.7), width)
+
+
+def _ic_plus(surface, rect, color, width=3):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.34
+    uk.draw_line_on(surface, color, (cx - s, cy), (cx + s, cy), width)
+    uk.draw_line_on(surface, color, (cx, cy - s), (cx, cy + s), width)
+
+
+def _ic_trash(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    body = pygame.Rect(0, 0, int(s * 0.58), int(s * 0.56))
+    body.centerx = cx
+    body.top = int(cy - s * 0.10)
+    uk.draw_rect_on(surface, color, body, width, 2)
+    lid = pygame.Rect(0, 0, int(s * 0.80), max(2, int(s * 0.10)))
+    lid.centerx = cx
+    lid.bottom = body.top + 1
+    uk.draw_rect_on(surface, color, lid, width, 1)
+    handle = pygame.Rect(0, 0, int(s * 0.30), max(2, int(s * 0.14)))
+    handle.centerx = cx
+    handle.bottom = lid.top + 2
+    uk.draw_rect_on(surface, color, handle, width, 2)
+    for i in (-1, 1):
+        x = cx + i * s * 0.13
+        uk.draw_line_on(surface, color, (x, body.top + 5), (x, body.bottom - 4), width)
+
+
+def _make_chevron(direction):
+    def draw(surface, rect, color, width=2):
+        cx, cy = rect.center
+        s = min(rect.w, rect.h) * 0.26
+        if direction == "left":
+            pts = [(cx + s * 0.6, cy - s), (cx - s * 0.6, cy), (cx + s * 0.6, cy + s)]
+        elif direction == "right":
+            pts = [(cx - s * 0.6, cy - s), (cx + s * 0.6, cy), (cx - s * 0.6, cy + s)]
+        elif direction == "up":
+            pts = [(cx - s, cy + s * 0.6), (cx, cy - s * 0.6), (cx + s, cy + s * 0.6)]
+        else:
+            pts = [(cx - s, cy - s * 0.6), (cx, cy + s * 0.6), (cx + s, cy - s * 0.6)]
+        uk.draw_line_on(surface, color, pts[0], pts[1], width)
+        uk.draw_line_on(surface, color, pts[1], pts[2], width)
+    return draw
+
+
+_ic_left = _make_chevron("left")
+_ic_right = _make_chevron("right")
+_ic_up = _make_chevron("up")
+_ic_down = _make_chevron("down")
+
+
+def _ic_bars(surface, rect, color, width=2):
+    """Three vertical bars of different heights — Stats tab."""
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    for i, hgt in enumerate((0.34, 0.56, 0.44)):
+        x = cx + (i - 1) * s * 0.26
+        uk.draw_line_on(surface, color, (x, cy + s * 0.28), (x, cy + s * 0.28 - s * hgt), width + 1)
+
+
+def _tab_icon(fn, width=2):
+    def draw(surface, rect, color):
+        try:
+            fn(surface, rect, color, width)
+        except TypeError:
+            fn(surface, rect, color)
+    return draw
+
+
+# Fallback for the Settings icon button when config.png isn't on disk yet.
+_gear_icon = _tab_icon(uk.draw_gear_icon)
+
+
+# ── Sidebar sprite preview (state only; drawn by CharacterCreator) ──────
+
+class SpritePreview:
+    """Down-facing walk cycle of the selected character/form, plus the
+    shadow width, for the sidebar preview panel."""
+
+    def __init__(self):
+        self.frames: list[pygame.Surface] = []
+        self._scaled: dict[int, list[pygame.Surface]] = {}
+        self._char = ""
+        self._form = ""
+        self.frame_i = 0.0
+        # In-game px width of the ground shadow (cfg["shadow_size"]).
+        self.shadow_width: float = 32
+        # Entity height in game px for the feet offset; falls back to the
+        # walk frame's own pixel height when unknown.
+        self.entity_height: Optional[int] = None
+
+    def invalidate(self) -> None:
+        self._char = ""
+        self._form = ""
+
+    def load(self, char_id: str, form: str) -> None:
+        if char_id == self._char and form == self._form:
+            return
+        self._char, self._form = char_id, form
+        self.frames = load_walk_frames(char_id, form) if char_id else []
+        self._scaled = {}
+        self.frame_i = 0.0
+
+    def update(self, dt: float) -> None:
+        if self.frames:
+            self.frame_i = (self.frame_i + dt * ANIM_FPS) % len(self.frames)
+
+    def frame(self, scale: int) -> Optional[pygame.Surface]:
+        if not self.frames:
+            return None
+        lst = self._scaled.get(scale)
+        if lst is None:
+            if scale > 1:
+                lst = [pygame.transform.scale(f, (f.get_width() * scale, f.get_height() * scale))
+                       for f in self.frames]
+            else:
+                lst = list(self.frames)
+            self._scaled[scale] = lst
+        return lst[int(self.frame_i) % len(lst)]
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  CharacterCreator — non-blocking overlay
+#  (host loop drives toggle() / handle_input(event) / update(dt) /
+#   draw(screen), same as SpriteEditor / RoomEditor / DevMenu)
+# ══════════════════════════════════════════════════════════════════════
+
+ROSTER_ROW_H   = 46
+ROSTER_ROW_GAP = 6
+
+
+def _id_char_ok(ch: str) -> bool:
+    """Characters allowed in a new character / transformation ID."""
+    return ch.isascii() and (ch.isalnum() or ch in "_- ")
+
+
+def _hex_char_ok(ch: str) -> bool:
+    """Characters allowed while typing a hex color code."""
+    return ch in "0123456789ABCDEFabcdef#"
+
+
+
+class CharacterCreator:
+    """Dev-tool overlay for browsing / editing character configs and
+    previewing every discovered animation. Lives inside the host game's
+    main loop — it does not own the display, event polling, or the clock."""
+
+    def __init__(self, screen_width: int, screen_height: int):
+        self.screen_width = int(screen_width)
+        self.screen_height = int(screen_height)
+        self.active = False
+
+        pygame.font.init()
+        self._init_fonts()
+
+        # ── model ──────────────────────────────────────────────────
+        self.active_tab = TAB_IDENTITY
+        self.chars: list[str] = []
+        self.selected_id: Optional[str] = None
+        self.costumes: list[str] = ["base"]
+        self.costume_idx = 0
+        self.transform_forms: list[str] = []
+        self.available_attacks: list[str] = []      # global roster, see discover_attacks()
+        self.cfg: dict = copy.deepcopy(DEFAULT_CONFIG)
+        self.dirty = False
+        self.tf_idx = -1            # index into visible_transformations()
+        self.tf_form_idx = 0        # index into transform_forms (the "Form" stepper)
+        self.preview_form = "base"  # form shown in sidebar preview + Preview tab
+        self.preview = SpritePreview()
+        self.global_settings = load_global_settings()
+        self._settings_pending = False
+        self._char_colors: dict[str, tuple] = {}
+        self._tf_color_memory: dict[str, str] = {}
+
+        # ── status / dialog ────────────────────────────────────────
+        self.status_msg = ""
+        self.status_ok = True
+        self.status_timer = 0.0
+        # None, or {'kind': 'confirm'|'input', 'title', 'message', 'on_confirm',
+        #           'edit', 'error', 'confirm_label', 'danger', 'scroll'}
+        self.dialog: Optional[dict] = None
+
+        # ── per-frame UI plumbing ──────────────────────────────────
+        self._mouse = (screen_width // 2, screen_height // 2)
+        self._hm = self._mouse           # mouse used for hover (offscreen under a dialog)
+        self._dt = 1 / 60
+        self._clock = 0.0                # animation clock, in frames (ANIM_FPS)
+        self._pulse = 0.0
+        self._updated = False
+        self._hits: list[dict] = []
+        self._vp: Optional[pygame.Rect] = None
+        self._drag: Optional[dict] = None
+        self._focus = None               # SimpleNamespace(key, edit, set)
+        self._repeat_on = False
+        self._hv: dict = {}
+        self._tscroll: dict = {}
+        self._text_rects: list[pygame.Rect] = []
+        self._text_rects_new: list[pygame.Rect] = []
+        self._ml_info: dict = {}
+        self._ml_info_new: dict = {}
+        self._tip: Optional[str] = None
+        self._scroll = [0.0] * len(TAB_NAMES)
+        self._content_h = [0] * len(TAB_NAMES)
+        self._roster_scroll = 0.0
+        self._hsv: dict = {}
+        self._thumbs: dict = {}
+        self._portraits: dict = {}
+        self._portrait_t = 0.0
+        self._grid_key = None
+        self._grid_anims: dict = {}
+        self._grid_scaled_cache: dict = {}
+        self._icon_cache: dict = {}
+        self._close_requested = False    # set by the header Back button
+
+        self._layout()
+
+    # ── setup ──────────────────────────────────────────────────────
+    @staticmethod
+    def _font_root() -> str:
+        anchored = BASE_DIR / "assets" / "ui" / "fonts"
+        return str(anchored) if anchored.exists() else os.path.join("assets", "ui", "fonts")
+
+    def _init_fonts(self) -> None:
+        """Same bitmap family as DevMenu / RoomEditor: title text uses the
+        plain uppercase/lowercase glyph folders, everything else the menu
+        glyph set."""
+        root = self._font_root()
+        menu = uk.BitmapFont(root, letter_spacing=1)
+        title = uk.BitmapFont(root, letter_spacing=1)
+        title.uppercase_dir = os.path.join(root, "uppercase")
+        title.lowercase_dir = os.path.join(root, "lowercase")
+        self.f_title = _Font(title, 32)
+        self.f_lg = _Font(menu, 20)
+        self.f_md = _Font(menu, 16)
+        self.f_sm = _Font(menu, 12)
+
+        icon_path = os.path.join(str(BASE_DIR), "assets", "ui", "dev_menu", "icons", "back.png")
+        if not os.path.exists(icon_path):
+            icon_path = os.path.join("assets", "ui", "dev_menu", "icons", "back.png")
+        self._back_icon = self._load_png_icon(icon_path, 34)
+
+        # Small standalone Settings button (global game settings, not
+        # per-character) - lives next to the tab row rather than as a tab
+        # of its own. Falls back to the drawn gear icon if config.png is
+        # missing so a bare asset folder doesn't leave the button blank.
+        settings_icon_path = os.path.join(str(BASE_DIR), "assets", "ui", "dev_menu", "icons", "config.png")
+        if not os.path.exists(settings_icon_path):
+            settings_icon_path = os.path.join("assets", "ui", "dev_menu", "icons", "config.png")
+        self._settings_icon = self._load_png_icon(settings_icon_path, 24)
+
+        # Delete-character button (roster panel) - uses the real trash.png
+        # art instead of the drawn vector icon. Falls back to the vector
+        # icon if the asset isn't there.
+        trash_icon_path = os.path.join(str(BASE_DIR), "assets", "ui", "dev_menu", "icons", "trash.png")
+        if not os.path.exists(trash_icon_path):
+            trash_icon_path = os.path.join("assets", "ui", "dev_menu", "icons", "trash.png")
+        self._trash_icon = self._load_png_icon(trash_icon_path, 24)
+
+        # Add-transformation button (Transformations tab) - uses plus.png,
+        # same fallback convention as the icons above.
+        plus_icon_path = os.path.join(str(BASE_DIR), "assets", "ui", "dev_menu", "icons", "plus.png")
+        if not os.path.exists(plus_icon_path):
+            plus_icon_path = os.path.join("assets", "ui", "dev_menu", "icons", "plus.png")
+        self._plus_icon = self._load_png_icon(plus_icon_path, 24)
+
+        # Header save button - icon-only, uses save.png (same as the Entity
+        # Creator), with the same fallback convention as the icons above.
+        save_icon_path = os.path.join(str(BASE_DIR), "assets", "ui", "dev_menu", "icons", "save.png")
+        if not os.path.exists(save_icon_path):
+            save_icon_path = os.path.join("assets", "ui", "dev_menu", "icons", "save.png")
+        self._save_icon = self._load_png_icon(save_icon_path, 26)
 
     @staticmethod
-    def _hsv_to_rgb_grid(hue, s_grid, v_grid):
-        """Vectorized HSV->RGB for arrays of s/v sharing one fixed hue.
-        Returns an (..., 3) float array in 0-1."""
-        h6 = hue * 6.0
-        sector = int(h6) % 6
-        factor = 1 - abs(h6 % 2 - 1)
+    def _load_png_icon(path: str, box: int) -> Optional[pygame.Surface]:
+        """Same crop + integer-blow-up + point-sample path DevMenu uses for
+        its header icons, so the back arrow is pixel-identical. Returns
+        None when the file is missing (caller falls back to a vector icon)."""
+        try:
+            raw = pygame.image.load(path).convert_alpha()
+        except (FileNotFoundError, pygame.error):
+            return None
+        rect = raw.get_bounding_rect(min_alpha=1)
+        if rect.w <= 0 or rect.h <= 0:
+            rect = raw.get_rect()
+        raw = raw.subsurface(rect).copy()
+        iw, ih = raw.get_size()
+        scale = min(box / max(1, iw), box / max(1, ih))
+        nw, nh = max(1, round(iw * scale)), max(1, round(ih * scale))
+        if scale >= 1.0:
+            pre = max(1, math.ceil(scale) * 2)
+            scaled = pygame.transform.scale(pygame.transform.scale(raw, (iw * pre, ih * pre)), (nw, nh))
+        else:
+            scaled = pygame.transform.scale(raw, (nw, nh))
+        canvas = pygame.Surface((box, box), pygame.SRCALPHA)
+        canvas.blit(scaled, ((box - nw) // 2, (box - nh) // 2))
+        return canvas
 
-        c_grid = v_grid * s_grid
-        x_grid = c_grid * factor
-        m_grid = v_grid - c_grid
-        zero = np.zeros_like(c_grid)
+    def _layout(self) -> None:
+        w, h = self.screen_width, self.screen_height
+        # Same proportions DevMenu / RoomEditor use for their bars.
+        self.header_h = max(86, round(h * 0.12))
+        self.footer_h = max(42, round(h * 0.065))
+        m = 32
+        top = self.header_h + 20
+        bottom = h - self.footer_h - 20
+        area_h = max(240, bottom - top)
 
-        order = {
-            0: (c_grid, x_grid, zero),
-            1: (x_grid, c_grid, zero),
-            2: (zero, c_grid, x_grid),
-            3: (zero, x_grid, c_grid),
-            4: (x_grid, zero, c_grid),
-            5: (c_grid, zero, x_grid),
-        }[sector]
-        return np.stack([order[0] + m_grid, order[1] + m_grid, order[2] + m_grid], axis=-1)
+        sm, md = self.f_sm, self.f_md
+        self.m_field_h = max(40, md.line_h + 20)
+        self.m_slider_h = sm.cap_h + 8 + 16
+        self.m_pitch = self.m_slider_h + 22
+        self.m_pill_h = max(44, md.line_h + 22)
 
-    def _get_hue_strip_surface(self, w: int, h: int) -> pygame.Surface:
-        """Vertical rainbow gradient (full saturation/value, hue 0-1 top to
-        bottom). Doesn't depend on the current color, so it's computed once
-        and reused for the lifetime of this editor."""
-        cache = self._hue_strip_cache
-        if cache and cache[0] == (w, h):
-            return cache[1]
+        back = max(40, round(self.header_h * 0.55))
+        self.back_rect = pygame.Rect(0, 0, back, back)
+        self.back_rect.left = m
+        self.back_rect.centery = self.header_h // 2
+        self.save_rect = pygame.Rect(0, 0, back, back)
+        self.save_rect.right = w - m
+        self.save_rect.centery = self.header_h // 2
 
-        hues = np.linspace(0.0, 1.0, h, dtype=np.float32)
-        column = np.zeros((h, 3), dtype=np.float32)
-        for i, hue in enumerate(hues):
-            column[i] = self._hsv_to_rgb_grid(float(hue), np.float32(1.0), np.float32(1.0))
-        column = np.clip(column * 255, 0, 255).astype(np.uint8)
+        side_w = _clamp(round(w * 0.225), 250, 330)
+        prev_h = _clamp(round(area_h * 0.40), 180, 280)
+        self.list_rect = pygame.Rect(m, top, side_w, max(160, area_h - prev_h - 16))
+        self.prev_rect = pygame.Rect(m, self.list_rect.bottom + 16, side_w, prev_h)
+        self.roster_view = pygame.Rect(self.list_rect.x + 8, self.list_rect.y + 46,
+                                       side_w - 16, max(40, self.list_rect.h - 46 - 62))
+        self.roster_btn_y = self.list_rect.bottom - 52
 
-        arr = np.tile(column[np.newaxis, :, :], (w, 1, 1))  # (w, h, 3) for surfarray
-        surf = pygame.surfarray.make_surface(arr)
-        self._hue_strip_cache = ((w, h), surf)
-        return surf
+        main_x = m + side_w + 24
+        main_w = w - m - main_x
+        self.tab_h = 46
+        gap = 8
 
-    def _get_sv_square_surface(self, hue: float, w: int, h: int) -> pygame.Surface:
-        """Saturation (x, 0-1) / value (y, 1-0 top-to-bottom) gradient for a
-        fixed hue. Recomputed only when the hue actually changes."""
-        cache = self._sv_square_cache
-        if cache and abs(cache[0][0] - hue) < 1e-6 and cache[0][1] == w and cache[0][2] == h:
-            return cache[1]
+        # Small square Settings button, right end of the row - reserve its
+        # space first, then lay the real per-character tabs out in what's
+        # left of the row.
+        self.settings_rect = pygame.Rect(0, top, self.tab_h, self.tab_h)
+        self.settings_rect.right = main_x + main_w
+        tabs_w = main_w - self.tab_h - gap
 
-        s = np.linspace(0.0, 1.0, w, dtype=np.float32)
-        v = np.linspace(1.0, 0.0, h, dtype=np.float32)
-        s_grid, v_grid = np.meshgrid(s, v, indexing='xy')  # shape (h, w)
+        n = len(BAR_TAB_NAMES)
+        avail = tabs_w - gap * (n - 1)
+        # One consistent tab style for every tab: the roomiest of medium or
+        # small labels that all fit (no icons - text-only tabs).
+        pad = 14
+        widths = None
+        for font in (md, sm):
+            need = [font.width(nm) + 2 * pad for nm in BAR_TAB_NAMES]
+            if sum(need) <= avail:
+                widths, self._tab_font = need, font
+                break
+        if widths is None:                      # nothing fits: even split, labels get ellipsised
+            widths, self._tab_font = [avail // n] * n, sm
+        else:                                   # share the spare room out evenly
+            extra = avail - sum(widths)
+            widths = [wd + extra // n for wd in widths]
+            widths[-1] += avail - sum(widths)
+        self.tab_rects = []
+        tx = main_x
+        for wd in widths:
+            self.tab_rects.append(pygame.Rect(tx, top, wd, self.tab_h))
+            tx += wd + gap
+        self.panel_rect = pygame.Rect(main_x, top + self.tab_h + 12, main_w, area_h - self.tab_h - 12)
 
-        rgb = self._hsv_to_rgb_grid(hue, s_grid, v_grid)
-        rgb = np.clip(rgb * 255, 0, 255).astype(np.uint8)
-        rgb = np.transpose(rgb, (1, 0, 2))  # (w, h, 3) for surfarray
+    def resize(self, width: int, height: int) -> None:
+        """Re-layout for a new draw-target size (e.g. native-resolution mode)."""
+        width, height = int(width), int(height)
+        if (width, height) != (self.screen_width, self.screen_height):
+            self.screen_width, self.screen_height = width, height
+            self._layout()
 
-        surf = pygame.surfarray.make_surface(rgb)
-        self._sv_square_cache = ((hue, w, h), surf)
-        return surf
+    # ── lifecycle ──────────────────────────────────────────────────
+    def toggle(self) -> None:
+        """Toggle overlay visibility. Refreshes the roster on open."""
+        if self.active:
+            self._shutdown()
+        else:
+            self.active = True
+            self._mouse = tuple(pygame.mouse.get_pos())
+            self.dialog = None
+            self._drag = None
+            self._blur()
+            self._refresh_char_list()
 
-    # ── Transformation ki-bar color (hue-strip + SV-square picker) ───
-    # Same widget/math as the Identity tab's Gate Color picker above, but
-    # operating on self.transform_ki_color (per-form, reloaded by
-    # _load_transform_widgets whenever the selected transformation changes)
-    # instead of the single per-character self.selected_color.
-    def _ki_color_hsv(self) -> tuple:
-        r, g, b = hex_to_rgb(self.transform_ki_color)
-        return colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+    def _shutdown(self) -> None:
+        self._blur()
+        self._close_dialog()
+        self._flush_settings()
+        self._drag = None
+        self.active = False
+        uk.set_text_cursor(False)
+        self._set_key_repeat(False)
 
-    def _set_ki_color_hue_from_mouse_y(self, mouse_y: int, hue_rect: pygame.Rect) -> None:
-        _, s, v = self._ki_color_hsv()
-        frac = (mouse_y - hue_rect.top) / hue_rect.height
-        hue = max(0.0, min(1.0, frac))
-        r, g, b = colorsys.hsv_to_rgb(hue, s, v)
-        self.transform_ki_color = rgb_to_hex((round(r * 255), round(g * 255), round(b * 255)))
+    def _close(self) -> str:
+        self._shutdown()
+        return "back_to_dev_menu"
 
-    def _set_ki_color_sv_from_mouse(self, mouse_pos: tuple, sv_rect: pygame.Rect) -> None:
-        h, _, _ = self._ki_color_hsv()
-        s = max(0.0, min(1.0, (mouse_pos[0] - sv_rect.left) / sv_rect.width))
-        v = max(0.0, min(1.0, 1 - (mouse_pos[1] - sv_rect.top) / sv_rect.height))
-        r, g, b = colorsys.hsv_to_rgb(h, s, v)
-        self.transform_ki_color = rgb_to_hex((round(r * 255), round(g * 255), round(b * 255)))
+    def _set_key_repeat(self, on: bool) -> None:
+        if on and not self._repeat_on:
+            pygame.key.set_repeat(400, 50)
+            self._repeat_on = True
+        elif not on and self._repeat_on:
+            pygame.key.set_repeat(0, 0)
+            self._repeat_on = False
 
-    # ── Transformation scoping ───────────────────────────────────────
+    def _refresh_char_list(self) -> None:
+        self.chars = discover_characters()
+        self.available_attacks = discover_attacks()
+        self.global_settings = load_global_settings()
+        self._char_colors = {cid: self._peek_color(cid) for cid in self.chars}
+        self.preview.invalidate()
+        self._thumbs.clear()
+        self._portraits.clear()
+        keep = self.selected_id if self.selected_id in self.chars else (self.chars[0] if self.chars else None)
+        if keep:
+            self._load_char(keep)
+        else:
+            self._clear_selection()
+
+    @staticmethod
+    def _peek_color(cid: str) -> tuple:
+        try:
+            with open(CHARACTERS_DIR / f"{cid}.json", encoding="utf-8") as f:
+                return hex_to_rgb(json.load(f).get("color"), _T.GOLD)
+        except Exception:
+            return _T.GOLD
+
+    def _clear_selection(self) -> None:
+        self.selected_id = None
+        self.cfg = copy.deepcopy(DEFAULT_CONFIG)
+        self.costumes, self.costume_idx = ["base"], 0
+        self.transform_forms = []
+        self.tf_idx, self.tf_form_idx = -1, 0
+        self.dirty = False
+        self.preview.load("", "base")
+        self._grid_key = None
+
+    # ── character switching ────────────────────────────────────────
+    def _load_char(self, cid: str) -> None:
+        self.selected_id = cid
+        self.costumes = discover_costumes(cid)
+        self.cfg = load_config(cid)
+        cfg_costume = self.cfg.get("costume", "")
+        base = cfg_costume if cfg_costume in self.costumes else self.costumes[0]
+        self.costume_idx = self.costumes.index(base)
+        self.transform_forms = discover_transformations(cid, base)
+        added = sync_transformations(self.cfg, self.costumes, self.transform_forms)
+        self.cfg.setdefault("transformations", [])
+        self.cfg["attacks"].setdefault("equipped_attacks", [])
+        self.cfg["attacks"].setdefault("charged_melee_style", "lunge")
+        self.dirty = bool(added)
+        self.tf_idx = 0 if self.visible_transformations() else -1
+        self._sync_tf_form_idx()
+        self._blur()
+        self._scroll = [0.0] * len(TAB_NAMES)
+        self._portrait_t = 0.0
+        self._set_preview_form(base)
+        self._char_colors[cid] = hex_to_rgb(self.cfg.get("color"), _T.GOLD)
+        if added:
+            self._set_status("Detected new transformation(s) - Save to keep them")
+
+    def _switch_char(self, cid: str) -> None:
+        self._load_char(cid)
+
+    def _set_status(self, msg: str, ok: bool = True) -> None:
+        self.status_msg = msg
+        self.status_ok = ok
+        self.status_timer = 3.0
+
+    def _mark_dirty(self) -> None:
+        self.dirty = True
+
+    # ── model helpers (ported from the old editor) ─────────────────
     def _current_costume(self) -> str:
-        """The base costume currently selected on the Identity tab."""
         return self.costumes[self.costume_idx] if self.costumes else "base"
 
-    def _form_name_of(self, tf: dict) -> str:
-        """Folder form-name for a transformation entry, parsed from its
-        'costume' field (e.g. 'base/transformations/ssj' -> 'ssj'). This is
-        the same identifier game.py's unlocked_transformations / ki-mode
-        slots / TransformationSystem's "requires" gating all use — keep in
-        sync with Game._transformation_form_id()."""
+    @staticmethod
+    def _form_name_of(tf: dict) -> str:
+        """Folder form-name of a transformation ('base/transformations/ssj'
+        -> 'ssj'). Same identifier game.py's unlocked_transformations /
+        TransformationSystem's 'requires' gating use."""
         costume = tf.get("costume", "")
         if "/transformations/" in costume:
             return costume.split("/transformations/")[-1]
         return tf.get("id", "")
 
+    def _transforms_for_costume(self, costume: str) -> list[dict]:
+        prefix = f"{costume}/transformations/"
+        return [t for t in self.cfg.get("transformations", []) if t.get("costume", "").startswith(prefix)]
+
+    def visible_transformations(self) -> list[dict]:
+        """Only the transformations owned by the currently selected costume."""
+        return self._transforms_for_costume(self._current_costume())
+
+    def _tf(self) -> Optional[dict]:
+        vis = self.visible_transformations()
+        return vis[self.tf_idx] if 0 <= self.tf_idx < len(vis) else None
+
     def _requires_candidates(self) -> list[str]:
-        """Form-names eligible to be picked as the currently-selected
-        transformation's prerequisite via the "Requires" stepper: every
-        OTHER transformation on this costume, except ones that already
-        (directly or transitively) require the current one — picking one
-        of those would create a dependency cycle (A requires B requires A),
-        which TransformationSystem has no way to ever satisfy."""
+        """Form-names eligible as the selected transformation's prerequisite:
+        every OTHER form on this costume that doesn't (transitively) already
+        require it — that would be a cycle TransformationSystem can never
+        satisfy."""
         visible = self.visible_transformations()
-        if not (0 <= self.transform_idx < len(visible)):
+        if not (0 <= self.tf_idx < len(visible)):
             return []
-        current_form = self._form_name_of(visible[self.transform_idx])
+        current = self._form_name_of(visible[self.tf_idx])
         by_form = {self._form_name_of(t): t for t in visible}
 
-        def depends_on_current(form_name: str, seen: set) -> bool:
-            if form_name in seen:
-                return False  # already-cyclic elsewhere; don't loop forever
-            seen.add(form_name)
-            tf = by_form.get(form_name)
+        def depends_on_current(name: str, seen: set) -> bool:
+            if name in seen:
+                return False
+            seen.add(name)
+            tf = by_form.get(name)
             req = tf.get("requires") if tf else None
             if not req:
                 return False
-            if req == current_form:
-                return True
-            return depends_on_current(req, seen)
+            return True if req == current else depends_on_current(req, seen)
 
-        return [
-            form for form in by_form
-            if form != current_form and not depends_on_current(form, set())
-        ]
+        return [f for f in by_form if f != current and not depends_on_current(f, set())]
 
-    def _transforms_for_costume(self, costume: str) -> list[dict]:
-        """Transformations that belong to `costume` — i.e. entries stored as
-        '{costume}/transformations/{form}'. A costume's transformation is its
-        own thing, distinct from the costume itself, and should never show up
-        while a *different* costume is selected."""
-        prefix = f"{costume}/transformations/"
-        return [t for t in self.transformations if t.get("costume", "").startswith(prefix)]
+    def _all_preview_forms(self) -> list[str]:
+        base = self._current_costume()
+        return [base] + [f"{base}/transformations/{tf}" for tf in self.transform_forms]
 
-    def visible_transformations(self) -> list[dict]:
-        """Transformations to display/navigate on the Transformations tab:
-        only those owned by the costume currently selected on the Identity tab."""
-        return self._transforms_for_costume(self._current_costume())
-
-    # ── Transformation widget (re)build ─────────────────────────────
-    def _load_transform_widgets(self) -> None:
-        """(Re)build the edit-form widgets for the currently selected
-        transformation. Called whenever the selection, or the list itself,
-        changes (add / remove / step)."""
-        fx = self.panel.x + 140
-        fw = self.panel.w - 160
-        visible = self.visible_transformations()
-        if not (0 <= self.transform_idx < len(visible)):
-            self.transform_name_input = None
-            self.transform_sliders    = {}
-            self.transform_ki_color_enabled = False
-            self.transform_ki_color         = "#FFD700"
-            self.transform_ki_bar_enabled   = True
-            self.transform_requires         = None
+    def _sync_tf_form_idx(self) -> None:
+        tf = self._tf()
+        if not tf:
+            self.tf_form_idx = 0
             return
+        costume = tf.get("costume", "")
+        name = costume.split("/transformations/")[-1] if "/transformations/" in costume else costume
+        self.tf_form_idx = self.transform_forms.index(name) if name in self.transform_forms else 0
 
-        tf = visible[self.transform_idx]
+    def _reset_transform_scope(self) -> None:
+        """Switching costume changes which transformations are in scope."""
+        self.tf_idx = 0 if self.visible_transformations() else -1
+        self._sync_tf_form_idx()
 
-        # Prerequisite tier — None means base-level (reachable from
-        # untransformed, same as every form before this feature existed).
-        self.transform_requires = tf.get("requires")
+    def _set_preview_form(self, form: str) -> None:
+        """Point the sidebar preview and the Preview tab at `form` (a costume
+        name or '{costume}/transformations/{form}')."""
+        if "/transformations/" not in form and form not in self.costumes:
+            form = self.costumes[0] if self.costumes else "base"
+        self.preview_form = form
+        if self.selected_id:
+            self.preview.load(self.selected_id, form)
+        self._grid_key = None
 
-        # Ki bar color override — None means "not customized", keep the
-        # checkbox unchecked but still seed the picker with a sensible
-        # starting color in case the user turns it on.
-        saved_ki_color = tf.get("ki_color")
-        self.transform_ki_color_enabled = saved_ki_color is not None
-        self.transform_ki_color         = saved_ki_color or "#FFD700"
+    def _select_costume(self, delta: int) -> None:
+        if not self.selected_id:
+            return
+        self.costume_idx = (self.costume_idx + delta) % max(1, len(self.costumes))
+        costume = self.costumes[self.costume_idx]
+        self.cfg["costume"] = costume
+        self.transform_forms = discover_transformations(self.selected_id, costume)
+        self._reset_transform_scope()
+        self._set_preview_form(costume)
+        self._mark_dirty()
 
-        # Whether the charge bar is shown/filled for this form. Missing
-        # entries (old configs saved before this feature existed) default
-        # to True, same as TransformationSystem._resolve_transform_ki_bar_enabled.
-        self.transform_ki_bar_enabled = tf.get("ki_bar_enabled", True)
-        self.transform_name_input = TextArea(
-            pygame.Rect(fx, 0, fw, TextArea.H_SINGLE), tf.get("display_name", ""),
-            multiline=False,
-        )
-        # The costume field is stored as e.g. "base/transformations/ssj".
-        # Extract just the form name ("ssj") for the transform_forms picker index.
-        saved_costume = tf.get("costume", "")
-        if "/transformations/" in saved_costume:
-            form_name = saved_costume.split("/transformations/")[-1]
+    def _tf_step(self, delta: int) -> None:
+        vis = self.visible_transformations()
+        if not vis:
+            return
+        self._blur()
+        self.tf_idx = (self.tf_idx + delta) % len(vis)
+        self._sync_tf_form_idx()
+        self._set_preview_form(vis[self.tf_idx].get("costume", ""))
+
+    def _tf_form_step(self, delta: int) -> None:
+        tf = self._tf()
+        if not tf or not self.transform_forms:
+            return
+        self._blur()
+        self.tf_form_idx = (self.tf_form_idx + delta) % len(self.transform_forms)
+        tf["costume"] = f"{self._current_costume()}/transformations/{self.transform_forms[self.tf_form_idx]}"
+        self._mark_dirty()
+        self._set_preview_form(tf["costume"])
+
+    def _tf_requires_step(self, delta: int) -> None:
+        tf = self._tf()
+        if not tf:
+            return
+        options = [None] + self._requires_candidates()
+        if len(options) < 2:
+            return
+        cur = tf.get("requires")
+        idx = options.index(cur) if cur in options else 0
+        tf["requires"] = options[(idx + delta) % len(options)]
+        self._mark_dirty()
+
+    # ── roster actions ─────────────────────────────────────────────
+    def _move_selected(self, delta: int) -> None:
+        if not self.selected_id or self.selected_id not in self.chars:
+            return
+        i = self.chars.index(self.selected_id)
+        j = i + delta
+        if not (0 <= j < len(self.chars)):
+            return
+        self.chars[i], self.chars[j] = self.chars[j], self.chars[i]
+        save_character_order(self.chars)
+        self._ensure_roster_visible(j)
+        self._set_status("Character order updated")
+
+    def _ensure_roster_visible(self, index: int) -> None:
+        pitch = ROSTER_ROW_H + ROSTER_ROW_GAP
+        top, bottom = index * pitch, index * pitch + ROSTER_ROW_H
+        if top < self._roster_scroll:
+            self._roster_scroll = top
+        elif bottom > self._roster_scroll + self.roster_view.h:
+            self._roster_scroll = bottom - self.roster_view.h
+
+    def _do_create_char(self, new_id: str) -> None:
+        order, removed = load_character_menu()
+        removed.discard(new_id)
+        if new_id not in self.chars:
+            self.chars.append(new_id)   # lands at the end; move it with the arrows
+        save_character_menu(self.chars, removed)
+        self._char_colors.setdefault(new_id, _T.GOLD)
+        self._switch_char(new_id)
+        self.active_tab = TAB_IDENTITY
+        self._ensure_roster_visible(self.chars.index(new_id))
+
+    def _do_delete_selected(self) -> None:
+        deleted_id = self.selected_id
+        if not deleted_id:
+            return
+        delete_config(deleted_id)
+        # Remove from the roster itself (not just the config) and persist
+        # it, or discover_characters() would find the sprite folder again.
+        removed = load_removed_characters()
+        removed.add(deleted_id)
+        idx = self.chars.index(deleted_id) if deleted_id in self.chars else 0
+        if deleted_id in self.chars:
+            self.chars.remove(deleted_id)
+        save_character_menu(self.chars, removed)
+        self._set_status(f"Deleted {deleted_id}", ok=False)
+        if self.chars:
+            self._load_char(self.chars[min(idx, len(self.chars) - 1)])
         else:
-            form_name = saved_costume
-        picker_list = self.transform_forms
-        self.transform_costume_idx = (
-            picker_list.index(form_name)
-            if form_name in picker_list else 0
-        )
-        self.transform_sliders = {
-            "sprite_width":  Slider(pygame.Rect(fx, 0, fw - 50, 20), 4, 256,
-                                    tf.get("sprite_width", self.cfg.get("sprite_width", 32)),
-                                    1, "{:.0f}px"),
-            "sprite_height": Slider(pygame.Rect(fx, 0, fw - 50, 20), 4, 256,
-                                    tf.get("sprite_height", self.cfg.get("sprite_height", 32)),
-                                    1, "{:.0f}px"),
-            "power_mult":   Slider(pygame.Rect(fx, 0, fw - 50, 20),
-                                    0.5, 5.0, tf.get("power_mult", 1.0), 0.05, "{:.2f}x"),
-            "defense_mult": Slider(pygame.Rect(fx, 0, fw - 50, 20),
-                                    0.5, 5.0, tf.get("defense_mult", 1.0), 0.05, "{:.2f}x"),
-            "speed_mult":   Slider(pygame.Rect(fx, 0, fw - 50, 20),
-                                    0.5, 5.0, tf.get("speed_mult", 1.0), 0.05, "{:.2f}x"),
-            "ki_drain":     Slider(pygame.Rect(fx, 0, fw - 50, 20),
-                                    0.0, 50.0, tf.get("ki_drain", 0.0), 0.5, "{:.1f}/s"),
-            # How long the charge bar takes to fill before the transform
-            # completes. Only meaningful (and only drawn) while "Show
-            # Charge Bar" is checked — see draw()/handle_event() below.
-            # Seeded from the saved value, or the built-in ~3.75s default
-            # (matching TransformationSystem.DEFAULT_TRANSFORM_ANIMATION_DURATION)
-            # if this form hasn't customized it yet.
-            "charge_duration": Slider(pygame.Rect(fx, 0, fw - 50, 20),
-                                    0.5, 10.0, tf.get("charge_duration") or 3.75, 0.05, "{:.2f}s"),
+            self._clear_selection()
+
+    # ── transformation actions ─────────────────────────────────────
+    def _do_add_transformation(self, raw_id: str) -> None:
+        if not self.selected_id:
+            return
+        existing = {t.get("id") for t in self.cfg["transformations"]}
+        new_id, n = raw_id or "transformation", 2
+        while new_id in existing:
+            new_id = f"{raw_id}_{n}"
+            n += 1
+        base_costume = self._current_costume()
+        # A new transformation always nests under the costume selected right
+        # now — a costume is not itself a transformation.
+        form = self.transform_forms[self.tf_form_idx] if self.transform_forms else new_id
+        default_costume = f"{base_costume}/transformations/{form}"
+        self.cfg["transformations"].append({
+            "id":              new_id,
+            "display_name":    new_id.replace("_", " ").title(),
+            "costume":         default_costume,
+            "sprite_width":    int(self.cfg.get("sprite_width", 32)),
+            "sprite_height":   int(self.cfg.get("sprite_height", 32)),
+            "power_mult":      1.0,
+            "defense_mult":    1.0,
+            "speed_mult":      1.0,
+            "ki_drain":        0.0,
+            "ki_color":        None,
+            "ki_bar_enabled":  True,
+            "charge_duration": None,
+            "requires":        None,
+        })
+        self._blur()
+        self.tf_idx = len(self.visible_transformations()) - 1
+        self._sync_tf_form_idx()
+        self._mark_dirty()
+        self._set_preview_form(default_costume)
+        self._set_status(f"Added transformation '{new_id}' to '{base_costume}'")
+
+    def _do_remove_transformation(self) -> None:
+        tf = self._tf()
+        if not tf:
+            return
+        self._blur()
+        self.cfg["transformations"].remove(tf)
+        # Remember the path was deliberately deleted so sync_transformations()
+        # doesn't re-add it next load while its sprite folder still exists.
+        removed_costume = tf.get("costume", "")
+        if removed_costume:
+            rem = self.cfg.setdefault("removed_transformations", [])
+            if removed_costume not in rem:
+                rem.append(removed_costume)
+        vis = self.visible_transformations()
+        self.tf_idx = min(self.tf_idx, len(vis) - 1) if vis else -1
+        self._sync_tf_form_idx()
+        self._mark_dirty()
+        if vis:
+            self._set_preview_form(vis[self.tf_idx].get("costume", ""))
+        else:
+            self._set_preview_form(self._current_costume())
+        self._set_status(f"Removed transformation '{tf.get('id', '')}'", ok=False)
+
+    # ── save ───────────────────────────────────────────────────────
+    def _normalize_cfg(self) -> None:
+        """Fields are edited straight into self.cfg as the user works; this
+        tidies them into the shape the runtime expects right before saving
+        (trimmed names, real ints, and the keys older saves always carried)."""
+        cfg = self.cfg
+        cid = self.selected_id or cfg.get("id", "")
+        cfg["display_name"] = (cfg.get("display_name") or "").strip() or cid
+        cfg["description"] = (cfg.get("description") or "").strip()
+        if self.costumes:
+            cfg["costume"] = self.costumes[self.costume_idx]
+        cfg["sprite_width"] = int(cfg.get("sprite_width", 32))
+        cfg["sprite_height"] = int(cfg.get("sprite_height", 32))
+        cfg["shadow_size"] = int(cfg.get("shadow_size", 32))
+        cfg["halo_enabled"] = bool(cfg.get("halo_enabled", False))
+        cfg["color"] = cfg.get("color") or "#FFD700"
+        for k, dv in DEFAULT_CONFIG["stats"].items():
+            cfg["stats"][k] = int(cfg["stats"].get(k, dv))
+        atk = cfg["attacks"]
+        atk["ki_attack_mode"] = atk.get("ki_attack_mode", "blast")
+        for k in ("blast_cost", "beam_cost", "walk_speed", "run_speed", "fly_speed"):
+            atk[k] = int(atk.get(k, DEFAULT_CONFIG["attacks"][k]))
+        atk["melee_duration"] = round(float(atk.get("melee_duration", 0.5)), 3)
+
+        tf = self._tf()
+        if tf:
+            tf["display_name"] = (tf.get("display_name") or "").strip() or tf.get("id", "")
+            base = self._current_costume()
+            if self.transform_forms:
+                tf["costume"] = f"{base}/transformations/{self.transform_forms[self.tf_form_idx]}"
+            else:
+                tf.setdefault("costume", f"{base}/transformations/{tf.get('id', '')}")
+            tf["sprite_width"] = int(tf.get("sprite_width", cfg["sprite_width"]))
+            tf["sprite_height"] = int(tf.get("sprite_height", cfg["sprite_height"]))
+            for k in ("power_mult", "defense_mult", "speed_mult"):
+                tf[k] = round(float(tf.get(k, 1.0)), 2)
+            tf["ki_drain"] = round(float(tf.get("ki_drain", 0.0)), 1)
+            tf.setdefault("ki_color", None)
+            tf["ki_bar_enabled"] = bool(tf.get("ki_bar_enabled", True))
+            tf.setdefault("requires", None)
+
+    def _save(self) -> None:
+        if not self.selected_id:
+            return
+        self._blur()
+        self._normalize_cfg()
+        try:
+            save_config(self.cfg)
+        except OSError as exc:
+            self._set_status(f"Could not save: {exc.strerror or exc}", ok=False)
+            return
+        self.dirty = False
+        self._char_colors[self.selected_id] = hex_to_rgb(self.cfg.get("color"), _T.GOLD)
+        self._set_status(f"Saved  {self.cfg['id']}.json")
+
+    def _flush_settings(self) -> None:
+        if self._settings_pending:
+            self._settings_pending = False
+            try:
+                save_global_settings(self.global_settings)
+                self._set_status(f"Max level set to {self.global_settings['max_level']}")
+            except OSError as exc:
+                self._set_status(f"Could not save settings: {exc.strerror or exc}", ok=False)
+
+    # ── dialogs (non-blocking) ─────────────────────────────────────
+    def _open_confirm(self, title: str, message: str, on_confirm, confirm_label: str = "Confirm",
+                      danger: bool = True) -> None:
+        self._blur()
+        self.dialog = {"kind": "confirm", "title": title, "message": message, "on_confirm": on_confirm,
+                       "confirm_label": confirm_label, "danger": danger}
+
+    def _open_input(self, title: str, message: str, on_confirm, default: str = "",
+                    confirm_label: str = "Create") -> None:
+        self._blur()
+        edit = _TextEdit(default, multiline=False, max_len=32, allowed=_id_char_ok)
+        self.dialog = {"kind": "input", "title": title, "message": message, "on_confirm": on_confirm,
+                       "edit": edit, "error": "", "confirm_label": confirm_label, "danger": False,
+                       "scroll": 0, "selecting": False}
+        self._set_key_repeat(True)
+
+    def _close_dialog(self) -> None:
+        if self.dialog is not None:
+            self.dialog = None
+            if self._focus is None:
+                self._set_key_repeat(False)
+
+    def _dialog_rects(self) -> dict:
+        d = self.dialog
+        sw, sh = self.screen_width, self.screen_height
+        W = 500 if d["kind"] == "input" else 460
+        pad = 28
+        lines = self.f_md.wrap(d["message"], W - pad * 2)
+        line_h = self.f_md.line_h + 6
+        y = pad + self.f_lg.line_h + 14
+        msg_y = y
+        y += len(lines) * line_h + 12
+        field_y = y
+        if d["kind"] == "input":
+            y += self.m_field_h + 8 + self.f_sm.line_h + 6
+        y += 10
+        btn_y = y
+        H = btn_y + self.m_pill_h + pad
+        panel = pygame.Rect(0, 0, W, H)
+        panel.center = (sw // 2, sh // 2)
+        bw = (W - pad * 2 - 14) // 2
+        return {
+            "panel": panel, "lines": lines, "line_h": line_h, "pad": pad,
+            "msg_y": panel.y + msg_y,
+            "field": pygame.Rect(panel.x + pad, panel.y + field_y, W - pad * 2, self.m_field_h),
+            "hint_y": panel.y + field_y + self.m_field_h + 8,
+            "ok": pygame.Rect(panel.x + pad, panel.y + btn_y, bw, self.m_pill_h),
+            "cancel": pygame.Rect(panel.right - pad - bw, panel.y + btn_y, bw, self.m_pill_h),
         }
 
-    # ── Animation grid reload ──────────────────────────────────────
-    # ── Preview helpers ────────────────────────────────────────────
-    def _all_preview_forms(self) -> list[str]:
-        """Flat list of every browsable form for the currently selected costume:
-        the base costume itself first, then its transformation sub-folders as
-        '{costume}/transformations/{name}'.
-        This is the list the Preview-tab dropdown cycles through."""
-        base_costume = self.costumes[self.costume_idx] if self.costumes else "base"
-        forms: list[str] = [base_costume]
-        for tf in self.transform_forms:
-            forms.append(f"{base_costume}/transformations/{tf}")
-        return forms
+    def _dialog_submit(self) -> None:
+        d = self.dialog
+        if d["kind"] == "input":
+            v = d["edit"].value.strip().lower().replace(" ", "_")
+            if not v:
+                d["error"] = "ID cannot be empty"
+                return
+            cb = d["on_confirm"]
+            self._close_dialog()
+            cb(v)
+        else:
+            cb = d["on_confirm"]
+            self._close_dialog()
+            cb()
 
-    THUMB_H       = 48    # thumbnail height inside the dropdown rows
-    DROP_ROW_H    = 60    # total row height (thumbnail + padding)
-    DROP_ROWS_VIS = 5     # max rows visible without scrolling
-
-    def _load_preview_thumbnails(self) -> None:
-        """Pre-load animated walk frames for every form so the dropdown
-        can show a live sprite preview next to each entry."""
-        self.preview_form_thumbnails = {}
-        self._preview_thumb_timers   = {}
-        for form in self._all_preview_forms():
-            raw = load_walk_frames(self.char_id, form)
-            if raw:
-                scale = self.THUMB_H / max(raw[0].get_height(), 1)
-                sw    = max(1, int(raw[0].get_width()  * scale))
-                sh    = max(1, int(raw[0].get_height() * scale))
-                self.preview_form_thumbnails[form] = [
-                    pygame.transform.smoothscale(f, (sw, sh)) for f in raw
-                ]
-            else:
-                ph = pygame.Surface((self.THUMB_H, self.THUMB_H), pygame.SRCALPHA)
-                pygame.draw.rect(ph, C_PANEL_DARK, ph.get_rect(), border_radius=4)
-                pygame.draw.rect(ph, C_BORDER,     ph.get_rect(), 1, border_radius=4)
-                self.preview_form_thumbnails[form] = [ph]
-            self._preview_thumb_timers[form] = 0.0
-
-    def _reload_anim_grid(self, char_id: str, costume: str) -> None:
-        anims = discover_animations(char_id, costume)
-        self.anim_grid.set_rect(self.panel)   # keep rect in sync
-        self.anim_grid.load(anims)
-
-    # ── Sync widget values → cfg ───────────────────────────────────
-    def flush(self) -> None:
-        self.cfg["display_name"] = self.name_input.value.strip() or self.char_id
-        self.cfg["description"]  = self.desc_input.value.strip()
-        self.cfg["costume"]      = self.costumes[self.costume_idx]
-        self.cfg["sprite_width"]  = int(self.sprite_width_slider.value)
-        self.cfg["sprite_height"] = int(self.sprite_height_slider.value)
-        self.cfg["shadow_size"]  = int(self.shadow_slider.value)
-        self.cfg["halo_enabled"] = self.halo_enabled
-        self.cfg["color"]       = self.selected_color
-
-        for key, sl in self.stat_sliders.items():
-            self.cfg["stats"][key] = int(sl.value)
-
-        self.cfg["attacks"]["ki_attack_mode"] = self.cfg["attacks"].get("ki_attack_mode", "blast")
-        for key, sl in self.atk_sliders.items():
-            if "duration" in key:
-                self.cfg["attacks"][key] = round(sl.value, 3)
-            else:
-                self.cfg["attacks"][key] = int(sl.value)
-
-        visible = self.visible_transformations()
-        if 0 <= self.transform_idx < len(visible) and self.transform_name_input:
-            tf = visible[self.transform_idx]
-            tf["display_name"] = self.transform_name_input.value.strip() or tf.get("id", "")
-            base_costume = self._current_costume()
-            # A transformation's "costume" field always nests under the
-            # costume that owns it — never a bare costume name, since a
-            # costume is not itself a transformation.
-            if self.transform_forms:
-                form = self.transform_forms[self.transform_costume_idx]
-                tf["costume"] = f"{base_costume}/transformations/{form}"
-            else:
-                tf.setdefault("costume", f"{base_costume}/transformations/{tf.get('id', '')}")
-            for key, sl in self.transform_sliders.items():
-                if key in ("sprite_width", "sprite_height"):
-                    tf[key] = int(sl.value)
-                elif key == "ki_drain":
-                    tf[key] = round(sl.value, 1)
+    def _dialog_event(self, event: pygame.event.Event) -> None:
+        d = self.dialog
+        r = self._dialog_rects()
+        if event.type == pygame.KEYDOWN:
+            if d["kind"] == "input":
+                res = d["edit"].key(event)
+                if res == "commit":
+                    self._dialog_submit()
+                elif res == "cancel":
+                    self._close_dialog()
+                elif res == "changed":
+                    d["error"] = ""
+            elif event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self._dialog_submit()
+            elif event.key == pygame.K_ESCAPE:
+                self._close_dialog()
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            pos = event.pos
+            if r["ok"].collidepoint(pos):
+                self._dialog_submit()
+            elif r["cancel"].collidepoint(pos):
+                self._close_dialog()
+            elif d["kind"] == "input" and r["field"].collidepoint(pos):
+                edit = d["edit"]
+                idx = _index_at_x(self.f_md, edit.value, pos[0] - (r["field"].x + 14) + d["scroll"])
+                if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+                    if edit.anchor is None:
+                        edit.anchor = edit.cursor
                 else:
-                    tf[key] = round(sl.value, 2)
-            tf["ki_color"] = self.transform_ki_color if self.transform_ki_color_enabled else None
-            tf["ki_bar_enabled"] = self.transform_ki_bar_enabled
-            tf["requires"] = self.transform_requires
+                    edit.anchor = idx
+                edit.cursor = idx
+                edit.blink = 0.0
+                d["selecting"] = True
+        elif event.type == pygame.MOUSEMOTION and d["kind"] == "input" and d.get("selecting"):
+            edit = d["edit"]
+            x = _clamp(event.pos[0], r["field"].left + 14, r["field"].right - 14)
+            edit.cursor = _index_at_x(self.f_md, edit.value, x - (r["field"].x + 14) + d["scroll"])
+        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1 and self.dialog is not None:
+            d["selecting"] = False
 
-    # ── Event routing ──────────────────────────────────────────────
-    def handle_event(self, event: pygame.event.Event, active_tab: int) -> None:
-        changed = False
-        # Unconditional so a drag can't get stuck 'active' if the user
-        # switches tabs mid-drag (mirrors object_editor.py's region color
-        # picker, which resets its drag flags the same way).
-        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-            self._color_sv_dragging = False
-            self._color_hue_dragging = False
-            self._tf_color_sv_dragging = False
-            self._tf_color_hue_dragging = False
-        if active_tab == TAB_IDENTITY:
-            changed |= self.name_input.handle_event(event)
-            changed |= self.desc_input.handle_event(event)
-            changed |= self.sprite_width_slider.handle_event(event)
-            changed |= self.sprite_height_slider.handle_event(event)
-            changed |= self.shadow_slider.handle_event(event)
-            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if self._halo_checkbox_rect and self._halo_checkbox_rect.collidepoint(event.pos):
-                    self.halo_enabled = not self.halo_enabled
-                    changed = True
-                elif self._color_sv_rect and self._color_sv_rect.collidepoint(event.pos):
-                    self._color_sv_dragging = True
-                    self._set_color_sv_from_mouse(event.pos, self._color_sv_rect)
-                    changed = True
-                elif self._color_hue_rect and self._color_hue_rect.collidepoint(event.pos):
-                    self._color_hue_dragging = True
-                    self._set_color_hue_from_mouse_y(event.pos[1], self._color_hue_rect)
-                    changed = True
-            elif event.type == pygame.MOUSEMOTION and self._color_sv_dragging:
-                if self._color_sv_rect:
-                    self._set_color_sv_from_mouse(event.pos, self._color_sv_rect)
-                    changed = True
-            elif event.type == pygame.MOUSEMOTION and self._color_hue_dragging:
-                if self._color_hue_rect:
-                    self._set_color_hue_from_mouse_y(event.pos[1], self._color_hue_rect)
-                    changed = True
-        elif active_tab == TAB_STATS:
-            for sl in self.stat_sliders.values():
-                changed |= sl.handle_event(event)
-        elif active_tab == TAB_ATTACKS:
-            for sl in self.atk_sliders.values():
-                changed |= sl.handle_event(event)
-        elif active_tab == TAB_TRANSFORM:
-            if self.transform_name_input:
-                changed |= self.transform_name_input.handle_event(event)
-            for key, sl in self.transform_sliders.items():
-                # The charge-duration slider is only drawn (and hit-testable)
-                # while "Show Charge Bar" is checked — see draw(). Skip it
-                # here too so a hidden slider can't swallow clicks meant for
-                # whatever's drawn in its place.
-                if key == "charge_duration" and not self.transform_ki_bar_enabled:
-                    continue
-                changed |= sl.handle_event(event)
-            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                if self._tf_ki_bar_enabled_checkbox_rect and self._tf_ki_bar_enabled_checkbox_rect.collidepoint(event.pos):
-                    self.transform_ki_bar_enabled = not self.transform_ki_bar_enabled
-                    changed = True
-                elif self._tf_ki_color_checkbox_rect and self._tf_ki_color_checkbox_rect.collidepoint(event.pos):
-                    self.transform_ki_color_enabled = not self.transform_ki_color_enabled
-                    changed = True
-                elif (self.transform_ki_color_enabled and self._tf_color_sv_rect
-                      and self._tf_color_sv_rect.collidepoint(event.pos)):
-                    self._tf_color_sv_dragging = True
-                    self._set_ki_color_sv_from_mouse(event.pos, self._tf_color_sv_rect)
-                    changed = True
-                elif (self.transform_ki_color_enabled and self._tf_color_hue_rect
-                      and self._tf_color_hue_rect.collidepoint(event.pos)):
-                    self._tf_color_hue_dragging = True
-                    self._set_ki_color_hue_from_mouse_y(event.pos[1], self._tf_color_hue_rect)
-                    changed = True
-            elif event.type == pygame.MOUSEMOTION and self._tf_color_sv_dragging:
-                if self._tf_color_sv_rect:
-                    self._set_ki_color_sv_from_mouse(event.pos, self._tf_color_sv_rect)
-                    changed = True
-            elif event.type == pygame.MOUSEMOTION and self._tf_color_hue_dragging:
-                if self._tf_color_hue_rect:
-                    self._set_ki_color_hue_from_mouse_y(event.pos[1], self._tf_color_hue_rect)
-                    changed = True
-        elif active_tab == TAB_PREVIEW:
-            self.anim_grid.handle_event(event)
-            if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                mx, my    = event.pos
-                all_forms = self._all_preview_forms()
-                if self._preview_dropdown_btn and self._preview_dropdown_btn.collidepoint(mx, my):
-                    self.preview_dropdown_open = not self.preview_dropdown_open
-                elif self.preview_dropdown_open:
-                    hit = False
-                    for form, rect in self._preview_dropdown_rows:
-                        if rect.collidepoint(mx, my):
-                            idx = all_forms.index(form) if form in all_forms else 0
-                            if idx != self.preview_form_idx:
-                                self.preview_form_idx = idx
-                                self._reload_anim_grid(self.char_id, form)
-                                self._preview_form_changed = True
-                            self.preview_dropdown_open = False
-                            hit = True
-                            break
-                    if not hit:
-                        self.preview_dropdown_open = False
-            elif event.type == pygame.MOUSEWHEEL and self.preview_dropdown_open:
-                all_forms  = self._all_preview_forms()
-                max_scroll = max(0, len(all_forms) - self.DROP_ROWS_VIS)
-                self.preview_dropdown_scroll = max(
-                    0, min(max_scroll, self.preview_dropdown_scroll - event.y)
-                )
-        if changed:
-            self.dirty = True
+    # ── text focus ─────────────────────────────────────────────────
+    def _focus_text(self, key, get, set_, multiline=False, max_len=600, allowed=None):
+        edit = _TextEdit(get() or "", multiline=multiline, max_len=max_len, allowed=allowed)
+        self._focus = SimpleNamespace(key=key, edit=edit, set=set_)
+        self._set_key_repeat(True)
+        return edit
 
-    # ── Draw ───────────────────────────────────────────────────────
-    def draw(self, surf: pygame.Surface,
-             font: pygame.font.Font, font_sm: pygame.font.Font,
-             active_tab: int, dt: float) -> None:
-        lx = self.panel.x + 20
-        fx = self.panel.x + 140
-        fw = self.panel.w - 160
-        row_h = 42
+    def _blur(self) -> None:
+        self._focus = None
+        if self.dialog is None:
+            self._set_key_repeat(False)
 
-        if active_tab == TAB_IDENTITY:
-            self._draw_identity(surf, font, font_sm, lx, fx, fw, row_h, dt)
-        elif active_tab == TAB_STATS:
-            self._draw_stats(surf, font, font_sm, lx, fx, fw, row_h)
-        elif active_tab == TAB_ATTACKS:
-            self._draw_attacks(surf, font, font_sm, lx, fx, fw, row_h)
-        elif active_tab == TAB_TRANSFORM:
-            self._draw_transformations(surf, font, font_sm, lx, fx, fw, row_h, dt)
-        elif active_tab == TAB_PREVIEW:
-            self._draw_preview(surf, font, font_sm, dt)
+    # ── input ──────────────────────────────────────────────────────
+    def handle_input(self, event: pygame.event.Event):
+        """Returns 'back_to_dev_menu' when the overlay was just closed (via
+        the header Back button or ESC), else None. The Dev Menu closes
+        itself when it launches this creator, so the caller should reopen
+        it on this signal rather than dropping all the way to gameplay —
+        see world_map_editor / room_editor's identical convention."""
+        if not self.active:
+            return None
+        et = event.type
+        if et in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP) and hasattr(event, "pos"):
+            self._mouse = tuple(event.pos)
 
-    def _draw_preview(self, surf: pygame.Surface,
-                      font: pygame.font.Font, font_sm: pygame.font.Font,
-                      dt: float) -> None:
-        """Preview tab: animated-thumbnail dropdown + full animation grid."""
-        lx        = self.panel.x + 20
-        mx, my    = pygame.mouse.get_pos()
-        all_forms = self._all_preview_forms()
-        n         = len(all_forms)
+        if self.dialog is not None:
+            self._dialog_event(event)
+            return None
 
-        # Advance thumbnail timers so they animate while the dropdown is open
-        for form, frames in self.preview_form_thumbnails.items():
-            self._preview_thumb_timers[form] = (
-                self._preview_thumb_timers.get(form, 0.0) + dt * ANIM_FPS
-            ) % max(len(frames), 1)
+        if et == pygame.KEYDOWN:
+            mods = getattr(event, "mod", 0) | pygame.key.get_mods()
+            if (mods & (pygame.KMOD_CTRL | pygame.KMOD_META)) and event.key == pygame.K_s:
+                self._save()
+                return None
+            if self._focus is not None:
+                res = self._focus.edit.key(event)
+                if res == "changed":
+                    self._focus.set(self._focus.edit.value)
+                elif res in ("commit", "cancel"):
+                    self._blur()
+                return None
+            if event.key == pygame.K_ESCAPE:
+                return self._close()
+        elif et == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            self._mouse_down(event.pos)
+            if self._close_requested:
+                self._close_requested = False
+                return self._close()
+        elif et == pygame.MOUSEMOTION:
+            if self._drag is not None and self._drag.get("drag"):
+                self._drag["drag"](event.pos)
+        elif et == pygame.MOUSEBUTTONUP and event.button == 1:
+            d, self._drag = self._drag, None
+            if d is not None and d.get("up"):
+                d["up"](event.pos)
+        elif et == pygame.MOUSEWHEEL:
+            self._wheel(event.y)
+        return None
 
-        # ── Dropdown button ──────────────────────────────────────────
-        BTN_H    = 32
-        BTN_W    = min(320, self.panel.w - 40)
-        btn_rect = pygame.Rect(lx, self.panel.y + 10, BTN_W, BTN_H)
-        self._preview_dropdown_btn = btn_rect
+    def _hit_at(self, pos):
+        for hit in reversed(self._hits):
+            if hit["rect"].collidepoint(pos):
+                return hit
+        return None
 
-        current = all_forms[self.preview_form_idx] if all_forms else ""
-        display = current.split("/")[-1] if "/" in current else current or "—"
-        counter = f"  {self.preview_form_idx + 1}/{n}" if n > 1 else ""
-
-        hov_btn  = btn_rect.collidepoint(mx, my)
-        btn_bg   = C_HOVER if (hov_btn or self.preview_dropdown_open) else C_PANEL_DARK
-        btn_bord = C_ACCENT if self.preview_dropdown_open else C_BORDER
-        surf.draw_rect(btn_bg,   btn_rect, border_radius=5)
-        surf.draw_rect(btn_bord, btn_rect, 1, border_radius=5)
-        lbl = render_text_cached(font, display + counter, C_TEXT)
-        surf.blit(lbl, (btn_rect.x + 10,
-                        btn_rect.y + (BTN_H - lbl.get_height()) // 2))
-        arrow = render_text_cached(font_sm, "▴" if self.preview_dropdown_open else "▾", C_TEXT_DIM)
-        surf.blit(arrow, (btn_rect.right - arrow.get_width() - 10,
-                          btn_rect.y + (BTN_H - arrow.get_height()) // 2))
-
-        # ── Animation grid (always drawn, behind the dropdown) ───────
-        HEADER_H  = BTN_H + 18
-        grid_rect = pygame.Rect(self.panel.x, self.panel.y + HEADER_H,
-                                self.panel.w, self.panel.h - HEADER_H)
-        self.anim_grid.set_rect(grid_rect)
-        self.anim_grid.update(dt)
-        self.anim_grid.draw(surf, font_sm)
-
-        # ── Dropdown list (floats on top of grid when open) ──────────
-        if not self.preview_dropdown_open or not all_forms:
-            self._preview_dropdown_rows = []
+    def _mouse_down(self, pos) -> None:
+        hit = self._hit_at(pos)
+        if self._focus is not None and (hit is None or hit["key"] != self._focus.key):
+            self._blur()
+        if hit is None:
             return
+        if hit["down"]:
+            hit["down"](pos)
+        if hit["drag"] or hit["up"]:
+            self._drag = hit
 
-        ROW_H     = self.DROP_ROW_H
-        VIS       = self.DROP_ROWS_VIS
-        THUMB_W   = self.THUMB_H
-        PAD       = 6
-        DROP_W    = max(BTN_W, 280)
-        vis_count = min(n, VIS)
-        drop_h    = vis_count * ROW_H + PAD * 2
-        drop_rect = pygame.Rect(lx, btn_rect.bottom + 2, DROP_W, drop_h)
+    def _max_scroll(self) -> float:
+        return max(0, self._content_h[self.active_tab] - (self.panel_rect.h - 8))
 
-        surf.draw_rect(C_PANEL,  drop_rect, border_radius=6)
-        surf.draw_rect(C_ACCENT, drop_rect, 1, border_radius=6)
+    def _wheel(self, dy: int) -> None:
+        pos = self._mouse
+        if self.roster_view.collidepoint(pos):
+            total = len(self.chars) * (ROSTER_ROW_H + ROSTER_ROW_GAP)
+            self._roster_scroll = _clamp(self._roster_scroll - dy * (ROSTER_ROW_H + ROSTER_ROW_GAP),
+                                         0, max(0, total - self.roster_view.h))
+            return
+        for key, (rect, total, rows) in self._ml_info.items():
+            if rect.collidepoint(pos) and total > rows:
+                self._tscroll[key] = _clamp(self._tscroll.get(key, 0) - dy, 0, total - rows)
+                return
+        if self.panel_rect.collidepoint(pos):
+            self._scroll[self.active_tab] = _clamp(self._scroll[self.active_tab] - dy * 64, 0, self._max_scroll())
 
-        self._preview_dropdown_rows = []
-        for vis_i in range(vis_count):
-            form_i = self.preview_dropdown_scroll + vis_i
-            if form_i >= n:
-                break
-            form = all_forms[form_i]
+    # ── update ─────────────────────────────────────────────────────
+    def update(self, dt: float, mouse_pos=None) -> None:
+        if not self.active:
+            uk.set_text_cursor(False)
+            uk.set_hand_cursor(False)
+            return
+        if mouse_pos is not None:
+            self._mouse = tuple(mouse_pos)
+        dt = min(dt, 1 / 20)          # a slow frame shouldn't make animation jump
+        self._dt = max(dt, 1 / 240)
+        self._updated = True
+        self._clock += dt * ANIM_FPS
+        self._pulse += dt
+        if self.status_timer > 0:
+            self.status_timer -= dt
+        self.preview.update(dt)
+        if self.active_tab == TAB_IDENTITY:
+            self._portrait_t += dt
+        if self._focus is not None:
+            self._focus.edit.blink += dt
+        if self.dialog is not None and self.dialog.get("edit") is not None:
+            self.dialog["edit"].blink += dt
+        # Cursor itself is resolved in draw() (_resolve_cursor), once every
+        # widget for the frame has actually registered its rect — see that
+        # method's docstring for why doing it here instead would mean
+        # judging hover against the previous frame's (possibly stale) rects.
 
-            ry        = drop_rect.y + PAD + vis_i * ROW_H
-            item_rect = pygame.Rect(drop_rect.x + PAD, ry,
-                                    DROP_W - PAD * 2, ROW_H - PAD)
-            self._preview_dropdown_rows.append((form, item_rect))
+    # ══════════════════════════════════════════════════════════════
+    #  Drawing: plumbing
+    # ══════════════════════════════════════════════════════════════
 
-            is_sel    = (form_i == self.preview_form_idx)
-            is_hov    = item_rect.collidepoint(mx, my)
-            item_bg   = C_SELECTED if is_sel else (C_HOVER if is_hov else C_PANEL_DARK)
-            item_bord = C_ACCENT   if is_sel else C_BORDER
-            surf.draw_rect(item_bg,   item_rect, border_radius=5)
-            surf.draw_rect(item_bord, item_rect, 1, border_radius=5)
+    def draw(self, screen, dt: float = 0.0) -> None:
+        """`screen` may be the engine's GPUScreen or a plain pygame.Surface.
+        `dt` is only used if the host never calls update() this frame."""
+        if not self.active:
+            return
+        if not self._updated and dt > 0:
+            self.update(dt)
+        self._updated = False
 
-            # Animated walk thumbnail
-            frames = self.preview_form_thumbnails.get(form, [])
-            if frames:
-                frame     = frames[int(self._preview_thumb_timers.get(form, 0)) % len(frames)]
-                thumb_box = pygame.Rect(item_rect.x + 4,
-                                        item_rect.y + (item_rect.h - self.THUMB_H) // 2,
-                                        THUMB_W, self.THUMB_H)
-                tx = thumb_box.x + (THUMB_W - frame.get_width())  // 2
-                ty = thumb_box.y + (self.THUMB_H - frame.get_height()) // 2
-                surf.blit(frame, (tx, ty))
+        self._hits = []
+        self._text_rects_new = []
+        self._ml_info_new = {}
+        self._tip = None
+        self._vp = None
+        modal = self.dialog is not None
+        self._hm = _OFFSCREEN if modal else self._mouse
+
+        w, h = self.screen_width, self.screen_height
+        uk.draw_rect_on(screen, _BG, pygame.Rect(0, 0, w, h), 0, 0)
+        uk.draw_rect_on(screen, _BAND, pygame.Rect(0, self.header_h, w, h - self.header_h - self.footer_h), 0, 0)
+
+        self._draw_sidebar(screen)
+        self._draw_tabs(screen)
+        self._draw_content(screen)
+        self._draw_header(screen)
+        self._draw_footer(screen)
+
+        self._text_rects = self._text_rects_new
+        self._ml_info = self._ml_info_new
+        if modal:
+            self._draw_dialog(screen)
+
+        # OS cursor, resolved dead last — after every widget this frame has
+        # had a chance to register a hit/text-field rect. See _resolve_cursor.
+        self._resolve_cursor()
+
+    def _resolve_cursor(self) -> None:
+        """Switch the OS cursor to an I-beam over a text field, a hand over
+        anything clickable (buttons, tabs, list rows, sliders, chips...),
+        or back to the plain arrow otherwise — same priority and
+        once-per-frame convention as CutsceneEditor._resolve_cursor (I-beam
+        always wins where a field and a button happen to overlap).
+
+        While the confirm/rename/delete dialog is open the base UI is
+        blocked (see `modal` in draw()), so only the dialog's own field/
+        ok/cancel rects should count — the underlying tabs and buttons are
+        still sitting in self._hits with their real coordinates, but
+        clicking them does nothing while the dialog is up, so hovering them
+        shouldn't show a hand either.
+        """
+        if self.dialog is not None:
+            r = self._dialog_rects()
+            hovering_text_field = self.dialog["kind"] == "input" and r["field"].collidepoint(self._mouse)
+            hovering_widget = (not hovering_text_field
+                                and (r["ok"].collidepoint(self._mouse) or r["cancel"].collidepoint(self._mouse)))
+        else:
+            hovering_text_field = any(rect.collidepoint(self._mouse) for rect in self._text_rects)
+            hovering_widget = (not hovering_text_field
+                                and any(hit["rect"].collidepoint(self._mouse) for hit in self._hits))
+        uk.set_text_cursor(hovering_text_field)
+        uk.set_hand_cursor(hovering_widget)
+
+    # -- hover / hit plumbing -----------------------------------------
+    def _anim(self, key, on: bool) -> float:
+        """Eased 0..1 hover amount for `key`, quantised to 20 steps so the
+        bitmap-font / rounded-rect caches don't fill with near-duplicates."""
+        v = self._hv.get(key, 0.0)
+        target = 1.0 if on else 0.0
+        v += (target - v) * min(1.0, self._dt * 14.0)
+        if abs(target - v) < 0.01:
+            v = target
+        self._hv[key] = v
+        return round(v * 20) / 20
+
+    def _hov(self, rect) -> bool:
+        if not pygame.Rect(rect).collidepoint(self._hm):
+            return False
+        return self._vp is None or self._vp.collidepoint(self._hm)
+
+    def _add_hit(self, rect, key=None, down=None, drag=None, up=None, tip=None):
+        r = pygame.Rect(rect)
+        if self._vp is not None:
+            r = r.clip(self._vp)
+        if r.w <= 0 or r.h <= 0:
+            return None
+        hit = {"rect": r, "key": key, "down": down, "drag": drag, "up": up, "tip": tip}
+        self._hits.append(hit)
+        if tip and r.collidepoint(self._hm):
+            self._tip = tip
+        return hit
+
+    # -- clipping -----------------------------------------------------
+    @staticmethod
+    def _push_clip(screen, rect):
+        old = screen.get_clip()
+        r = pygame.Rect(rect)
+        if old is not None:
+            try:
+                r = r.clip(pygame.Rect(old))
+            except Exception:
+                pass
+        screen.set_clip(r)
+        return old
+
+    @staticmethod
+    def _pop_clip(screen, old) -> None:
+        screen.set_clip(old)
+
+    # -- text ---------------------------------------------------------
+    def _put(self, screen, font, text, color, x, base_y, anchor="l", dyn=False) -> int:
+        if not text:
+            return 0
+        surf, desc = font.render(text, color)
+        tw, th = surf.get_size()
+        if anchor == "c":
+            x -= tw // 2
+        elif anchor == "r":
+            x -= tw
+        uk.blit_surface(screen, surf, (int(x), int(base_y - (th - desc))), transient=dyn)
+        return tw
+
+    def _text_top(self, screen, font, text, color, x, y, anchor="l", dyn=False) -> int:
+        """Draw with the top of the capital letters at y."""
+        return self._put(screen, font, text, color, x, y + font.cap_h, anchor, dyn)
+
+    def _text_mid(self, screen, font, text, color, x, cy, anchor="l", dyn=False, max_w=None) -> int:
+        """Draw vertically centred on cy (by cap-height, so 'no' and 'go' align)."""
+        if max_w is not None:
+            text = font.fit(text, max_w)
+        return self._put(screen, font, text, color, x, cy + (font.cap_h + 1) // 2, anchor, dyn)
+
+    # -- primitives ---------------------------------------------------
+    @staticmethod
+    def _panel(screen, rect, bg, border, bw=1, radius=10) -> None:
+        if len(bg) == 3:
+            bg = (*bg, 255)
+        uk.draw_panel(screen, rect, bg=bg, border=border, border_width=bw, radius=radius, shadow=False)
+
+    def _pill(self, screen, key, rect, label, accent, icon=None, danger=False, enabled=True,
+              on_click=None, tip=None) -> None:
+        if danger:
+            accent = _T.DANGER_BRIGHT
+        hov = enabled and self._hov(rect)
+        t = self._anim(key, hov)
+        if enabled:
+            self._panel(screen, rect, uk.lerp_color(_CARD, _CARD_HI, t),
+                        uk.lerp_color(_T.CARD_BORDER, accent, 0.5 + 0.5 * t))
+            fg = uk.lerp_color(_T.TEXT_SECONDARY, accent, 0.55 + 0.45 * t)
+            if t > 0:
+                uk.draw_soft_glow(screen, rect.center, int(rect.w * 0.55), accent, max_alpha=int(26 * t))
+        else:
+            self._panel(screen, rect, _CARD, _T.CARD_BORDER)
+            fg = _T.TEXT_DIM
+        font = self.f_md
+        ic = 22 if icon else 0
+        gap = 10 if icon and label else 0
+        if icon and label and font.width(label) + 28 + ic + gap > rect.w:
+            label, gap = "", 0            # too narrow for icon + label: keep just the icon
+        text = font.fit(label, rect.w - 28 - ic - gap) if label else ""
+        tw = font.width(text)
+        x = rect.centerx - (ic + gap + tw) // 2
+        if icon:
+            icon(screen, pygame.Rect(x, rect.centery - ic // 2, ic, ic), fg, 3)
+        if text:
+            self._text_mid(screen, font, text, fg, x + ic + gap, rect.centery)
+        if enabled and on_click:
+            self._add_hit(rect, key=key, down=lambda p, cb=on_click: cb(), tip=tip)
+
+    def _icon_btn(self, screen, key, rect, icon, on_click, danger=False, enabled=True, tip=None) -> None:
+        accent = _T.DANGER_BRIGHT if danger else _T.GOLD
+        hov = enabled and self._hov(rect)
+        t = self._anim(key, hov)
+        if enabled:
+            self._panel(screen, rect, uk.lerp_color(_CARD, _CARD_HI, t),
+                        uk.lerp_color(_T.CARD_BORDER, accent, 0.78 * t))
+            fg = uk.lerp_color(_T.TEXT_SECONDARY, accent, t)
+        else:
+            self._panel(screen, rect, _CARD, _T.CARD_BORDER)
+            fg = _T.TEXT_DIM
+        icon(screen, pygame.Rect(0, 0, 28, 28).move(rect.centerx - 14, rect.centery - 14), fg, 3)
+        if enabled and on_click:
+            self._add_hit(rect, key=key, down=lambda p, cb=on_click: cb(), tip=tip)
+
+    def _icon_trash_png(self, screen, rect, color, width=2) -> None:
+        """Drop-in replacement for _ic_trash that draws the real trash.png
+        art instead of the vector icon. Falls back to the vector icon if
+        the asset is missing so the button never renders blank."""
+        if self._trash_icon is not None:
+            uk.blit_surface(screen, self._trash_icon, self._trash_icon.get_rect(center=rect.center))
+        else:
+            _ic_trash(screen, rect, color, width)
+
+    def _icon_plus_png(self, screen, rect, color, width=3) -> None:
+        """Drop-in replacement for _ic_plus that draws the real plus.png
+        art instead of the vector icon. Falls back to the vector icon if
+        the asset is missing so the button never renders blank."""
+        if self._plus_icon is not None:
+            uk.blit_surface(screen, self._plus_icon, self._plus_icon.get_rect(center=rect.center))
+        else:
+            _ic_plus(screen, rect, color, width)
+
+    def _icon_save_png(self, screen, rect, color, width=3) -> None:
+        """Drop-in replacement for _ic_check that draws the real save.png
+        art instead of the vector icon. Falls back to the vector icon if
+        the asset is missing so the button never renders blank."""
+        if self._save_icon is not None:
+            uk.blit_surface(screen, self._save_icon, self._save_icon.get_rect(center=rect.center))
+        else:
+            _ic_check(screen, rect, color, width)
+
+    # ══════════════════════════════════════════════════════════════
+    #  Drawing: form widgets
+    # ══════════════════════════════════════════════════════════════
+
+    def _field_label(self, screen, text, x, y) -> int:
+        self._text_top(screen, self.f_sm, text.upper(), _T.TEXT_MUTED, x, y)
+        return self.f_sm.cap_h + 8
+
+    def _caption(self, screen, text, x, y, w, right=None) -> int:
+        """Section heading: small caps label with a hairline running out to
+        the right edge (and an optional right-aligned count/note)."""
+        sm = self.f_sm
+        label = text.upper()
+        self._text_top(screen, sm, label, _T.TEXT_MUTED, x, y)
+        x0 = x + sm.width(label) + 14
+        x1 = x + w
+        if right:
+            rw = self._text_top(screen, sm, right, _T.TEXT_DIM, x + w, y, "r", dyn=True)
+            x1 -= rw + 14
+        if x1 > x0:
+            uk.draw_line_on(screen, _HAIR, (x0, y + sm.cap_h // 2), (x1, y + sm.cap_h // 2), 1)
+        return sm.cap_h + 18
+
+    def _note(self, screen, x, y, w, text, color=None, font=None) -> int:
+        font = font or self.f_sm
+        color = color or _T.TEXT_DIM
+        lh = font.line_h + 4
+        lines = font.wrap(text, w)
+        for i, line in enumerate(lines):
+            self._text_top(screen, font, line, color, x, y + i * lh)
+        return len(lines) * lh
+
+    def _slider(self, screen, key, x, y, w, label, value, vmin, vmax, step, fmt, setter) -> int:
+        sm = self.f_sm
+        self._text_top(screen, sm, label.upper(), _T.TEXT_MUTED, x, y)
+        self._text_top(screen, sm, fmt.format(value), _T.TEXT_SECONDARY, x + w, y, "r", dyn=True)
+        cy = y + sm.cap_h + 16
+        track = pygame.Rect(x, cy - 3, w, 6)
+        dragging = self._drag is not None and self._drag.get("key") == key
+        hover_zone = pygame.Rect(x - 8, cy - 12, w + 16, 24)
+        t = self._anim(key, self._hov(hover_zone) or dragging)
+        frac = _clamp((value - vmin) / (vmax - vmin), 0.0, 1.0) if vmax > vmin else 0.0
+        uk.draw_rect_on(screen, _TRACK, track, 0, 3)
+        fill = pygame.Rect(x, cy - 3, max(0, int(w * frac)), 6)
+        if fill.w > 0:
+            uk.draw_rect_on(screen, uk.lerp_color(_T.GOLD, _T.GOLD_BRIGHT, t), fill, 0, 3)
+        tx = x + int(w * frac)
+        if t > 0:
+            uk.draw_soft_glow(screen, (tx, cy), 20, _T.GOLD, max_alpha=int(38 * t))
+        uk.draw_circle_on(screen, uk.lerp_color(_T.TEXT_SECONDARY, _T.TEXT_PRIMARY, t), (tx, cy), 8)
+        uk.draw_circle_on(screen, uk.lerp_color(_T.CARD_BORDER, _T.GOLD, t), (tx, cy), 8, 2)
+
+        def apply(pos, x=x, w=w):
+            f = _clamp((pos[0] - x) / max(1, w), 0.0, 1.0)
+            raw = vmin + f * (vmax - vmin)
+            if step:
+                raw = round(raw / step) * step
+            setter(_clamp(raw, vmin, vmax))
+
+        self._add_hit(hover_zone, key=key, down=apply, drag=apply)
+        return self.m_slider_h
+
+    def _slider_grid(self, screen, x, y, w, specs) -> int:
+        """Lay sliders out row-major in as many columns as fit."""
+        gap = 32
+        cols = _clamp((w + gap) // (300 + gap), 1, 3)
+        cw = (w - gap * (cols - 1)) // cols
+        for i, sp in enumerate(specs):
+            r, c = divmod(i, cols)
+            self._slider(screen, sp["key"], x + c * (cw + gap), y + r * self.m_pitch, cw, sp["label"],
+                         sp["get"](), sp["vmin"], sp["vmax"], sp["step"], sp["fmt"], sp["set"])
+        rows = (len(specs) + cols - 1) // cols
+        return rows * self.m_pitch
+
+    def _num_setter(self, container, key, kind):
+        def set_(v):
+            if kind == "int":
+                v = int(round(v))
             else:
-                thumb_box = pygame.Rect(item_rect.x + 4, item_rect.y + 4, THUMB_W, self.THUMB_H)
+                v = round(float(v), {"f1": 1, "f2": 2, "f3": 3}[kind])
+            if container.get(key) != v:
+                container[key] = v
+                self._mark_dirty()
+        return set_
 
-            form_display = form.split("/")[-1] if "/" in form else form
-            name_lbl = render_text_cached(font, form_display,
-                                          C_TEXT if is_sel else C_TEXT_DIM)
-            surf.blit(name_lbl, (thumb_box.right + 10,
-                                 item_rect.y + (item_rect.h - name_lbl.get_height()) // 2))
+    def _stepper(self, screen, key, rect, text, sub, on_prev, on_next, enabled=True) -> None:
+        hov = enabled and self._hov(rect)
+        t = self._anim(key, hov)
+        self._panel(screen, rect, uk.lerp_color(_FIELD, _FIELD_HI, t),
+                    uk.lerp_color(_T.CARD_BORDER, _T.GOLD, 0.5 * t))
+        bw = rect.h
+        sides = (("l", pygame.Rect(rect.x, rect.y, bw, rect.h), _ic_left, on_prev),
+                 ("r", pygame.Rect(rect.right - bw, rect.y, bw, rect.h), _ic_right, on_next))
+        for side, r, icon, cb in sides:
+            bt = self._anim((key, side), enabled and self._hov(r))
+            if bt > 0:
+                uk.draw_rect_on(screen, uk.lerp_color(_FIELD_HI, _CARD_HI, bt), r.inflate(-8, -8), 0, 8)
+            icon(screen, r, uk.lerp_color(_T.TEXT_MUTED, _T.GOLD, bt) if enabled else _T.TEXT_DIM, 3)
+            if enabled:
+                self._add_hit(r, key=(key, side), down=lambda p, cb=cb: cb())
+        mid = pygame.Rect(rect.x + bw, rect.y, rect.w - 2 * bw, rect.h)
+        subw = self.f_sm.width(sub) + 14 if sub else 0
+        fg = _T.TEXT_PRIMARY if enabled else _T.TEXT_DIM
+        self._text_mid(screen, self.f_md, text, fg, mid.centerx, mid.centery, "c", dyn=True,
+                       max_w=mid.w - 2 * (subw + 8))
+        if sub:
+            self._text_mid(screen, self.f_sm, sub, _T.TEXT_DIM, mid.right - 10, mid.centery, "r", dyn=True)
 
-        # Scroll indicators
-        if self.preview_dropdown_scroll > 0:
-            up_txt = render_text_cached(font_sm, "▲", C_TEXT_DIM)
-            surf.blit(up_txt, (drop_rect.right - up_txt.get_width() - 6,
-                               drop_rect.y + 2))
-        if self.preview_dropdown_scroll + VIS < n:
-            dn_txt = render_text_cached(font_sm, "▼", C_TEXT_DIM)
-            surf.blit(dn_txt, (drop_rect.right - dn_txt.get_width() - 6,
-                               drop_rect.bottom - dn_txt.get_height() - 2))
+    def _checkbox(self, screen, key, x, y, w, label, checked, on_toggle) -> int:
+        h = 32
+        row = pygame.Rect(x, y, min(w, 420), h)
+        t = self._anim(key, self._hov(row))
+        box = pygame.Rect(x, y + (h - 24) // 2, 24, 24)
+        if checked:
+            self._panel(screen, box, (48, 39, 19), _T.GOLD, 1, 6)
+            _ic_check(screen, box, _T.GOLD_BRIGHT, 3)
+        else:
+            self._panel(screen, box, uk.lerp_color(_FIELD, _FIELD_HI, t),
+                        uk.lerp_color(_T.CARD_BORDER, _T.GOLD, 0.78 * t), 1, 6)
+        fg = _T.TEXT_PRIMARY if checked else uk.lerp_color(_T.TEXT_SECONDARY, _T.TEXT_PRIMARY, t)
+        self._text_mid(screen, self.f_md, label, fg, box.right + 14, box.centery)
+        self._add_hit(row, key=key, down=lambda p: on_toggle())
+        return h
 
-    # ── Identity tab: portrait cycle ────────────────────────────────
-    PORTRAIT_BOX          = 120   # px square the portrait preview is framed in
+    def _segmented(self, screen, key, x, y, w, options, current, on_select) -> int:
+        fh = self.m_field_h
+        rect = pygame.Rect(x, y, w, fh)
+        self._panel(screen, rect, _FIELD, _T.CARD_BORDER)
+        seg_w = w // len(options)
+        for i, (val, label) in enumerate(options):
+            r = pygame.Rect(x + i * seg_w, y, seg_w if i < len(options) - 1 else w - seg_w * i, fh)
+            inner = r.inflate(-8, -8)
+            active = val == current
+            t = self._anim((key, val), self._hov(r) and not active)
+            if active:
+                self._panel(screen, inner, (48, 39, 19), _T.GOLD, 1, 8)
+            elif t > 0:
+                uk.draw_rect_on(screen, uk.lerp_color(_FIELD, _CARD_HI, t), inner, 0, 8)
+            fg = _T.GOLD_BRIGHT if active else uk.lerp_color(_T.TEXT_MUTED, _T.TEXT_PRIMARY, t)
+            self._text_mid(screen, self.f_md, label, fg, r.centerx, r.centery, "c")
+            self._add_hit(r, key=(key, val), down=lambda p, v=val: on_select(v))
+        return fh
+
+    # -- text fields --------------------------------------------------
+    def _text_field(self, screen, key, rect, get, set_, placeholder="", multiline=False,
+                    max_len=600, allowed=None) -> None:
+        md = self.f_md
+        focus = self._focus if (self._focus is not None and self._focus.key == key) else None
+        edit = focus.edit if focus else None
+        hov = self._hov(rect)
+        t = self._anim(key, hov and not focus)
+        bg = uk.lerp_color(_FIELD, _FIELD_HI, t if not focus else 1.0)
+        if focus:
+            self._panel(screen, rect, bg, _T.GOLD, 2)
+        else:
+            self._panel(screen, rect, bg, uk.lerp_color(_T.CARD_BORDER, _T.GOLD, 0.6 * t))
+        value = edit.value if edit else (get() or "")
+        pad = 14
+        blink_on = edit is not None and int(edit.blink * 2) % 2 == 0
+        fg = _T.TEXT_PRIMARY if (focus or hov) else _T.TEXT_SECONDARY
+        if self.dialog is None:
+            self._text_rects_new.append(rect.clip(self._vp) if self._vp is not None else pygame.Rect(rect))
+
+        if not multiline:
+            inner = pygame.Rect(rect.x + pad, rect.y + 2, rect.w - 2 * pad, rect.h - 4)
+            cy = rect.centery
+            scroll = self._tscroll.get(key, 0)
+            if edit:
+                cw = md.width(value[:edit.cursor])
+                if md.width(value) <= inner.w - 2:
+                    scroll = 0
+                else:
+                    if cw - scroll > inner.w - 2:
+                        scroll = cw - inner.w + 2
+                    if cw < scroll:
+                        scroll = cw
+                    scroll = max(0, scroll)
+                self._tscroll[key] = scroll
+            old = self._push_clip(screen, inner)
+            if not value and not focus:
+                self._text_mid(screen, md, placeholder, _T.TEXT_DIM, inner.x, cy)
+            elif focus:
+                if edit.has_sel():
+                    s, e = edit.sel_range()
+                    sx = inner.x - scroll + md.width(value[:s])
+                    ex = inner.x - scroll + md.width(value[:e])
+                    uk.draw_rect_on(screen, (*_T.GOLD, 70), pygame.Rect(sx, cy - md.cap_h // 2 - 4, ex - sx,
+                                                                      md.line_h + 8), 0, 3)
+                self._text_mid(screen, md, value, fg, inner.x - scroll, cy, dyn=True)
+                if blink_on:
+                    cx = inner.x - scroll + md.width(value[:edit.cursor])
+                    uk.draw_rect_on(screen, _T.GOLD_BRIGHT,
+                                    pygame.Rect(cx, cy - md.cap_h // 2 - 4, 2, md.line_h + 8), 0, 0)
+            else:
+                self._text_mid(screen, md, md.fit(value, inner.w), fg, inner.x, cy, dyn=True)
+            self._pop_clip(screen, old)
+
+            def idx_at(pos, rect=rect, key=key):
+                sc = self._tscroll.get(key, 0)
+                cur = self._focus.edit.value if self._focus and self._focus.key == key else value
+                return _index_at_x(md, cur, pos[0] - (rect.x + pad) + sc)
+        else:
+            inner = pygame.Rect(rect.x + pad, rect.y + 10, rect.w - 2 * pad, rect.h - 20)
+            lh = md.line_h + 6
+            rows = max(1, inner.h // lh)
+            spans = _wrap_spans(md, value, inner.w)
+            if edit:
+                edit.view = (md, inner.w)
+            scroll = int(_clamp(self._tscroll.get(key, 0), 0, max(0, len(spans) - rows)))
+            if edit:
+                line = _line_of(spans, edit.cursor)
+                if line < scroll:
+                    scroll = line
+                elif line >= scroll + rows:
+                    scroll = line - rows + 1
+                scroll = int(_clamp(scroll, 0, max(0, len(spans) - rows)))
+            self._tscroll[key] = scroll
+            self._ml_info_new[key] = (pygame.Rect(rect), len(spans), rows)
+            old = self._push_clip(screen, inner)
+            if not value and not focus:
+                self._text_top(screen, md, placeholder, _T.TEXT_DIM, inner.x, inner.y)
+            for i in range(scroll, min(len(spans), scroll + rows)):
+                s, e = spans[i]
+                ly = inner.y + (i - scroll) * lh
+                if focus and edit.has_sel():
+                    a, b = edit.sel_range()
+                    lo, hi = max(a, s), min(b, e)
+                    if lo < hi or (a <= s and b > e):     # selection spans this line
+                        sx = inner.x + md.width(value[s:max(lo, s)])
+                        ex = inner.x + md.width(value[s:min(max(hi, s), e)]) + (6 if b > e else 0)
+                        if ex > sx:
+                            uk.draw_rect_on(screen, (*_T.GOLD, 70),
+                                            pygame.Rect(sx, ly - 4, ex - sx, md.line_h + 8), 0, 3)
+                self._text_top(screen, md, value[s:e], fg, inner.x, ly, dyn=True)
+            if focus and blink_on:
+                line = _line_of(spans, edit.cursor)
+                if scroll <= line < scroll + rows:
+                    s, e = spans[line]
+                    cx = inner.x + md.width(value[s:_clamp(edit.cursor, s, e)])
+                    ly = inner.y + (line - scroll) * lh
+                    uk.draw_rect_on(screen, _T.GOLD_BRIGHT, pygame.Rect(cx, ly - 4, 2, md.line_h + 8), 0, 0)
+            self._pop_clip(screen, old)
+            if len(spans) > rows:       # tiny "more below" scroll hint
+                frac = scroll / max(1, len(spans) - rows)
+                th = max(14, int(inner.h * rows / len(spans)))
+                ty = inner.y + int((inner.h - th) * frac)
+                uk.draw_rect_on(screen, _T.CHIP_BORDER, pygame.Rect(rect.right - 8, ty, 3, th), 0, 1)
+
+            def idx_at(pos, rect=rect, key=key, inner=inner, lh=lh):
+                cur = self._focus.edit.value if self._focus and self._focus.key == key else value
+                sp = _wrap_spans(md, cur, inner.w)
+                sc = self._tscroll.get(key, 0)
+                ln = int(_clamp(sc + (pos[1] - inner.y) // lh, 0, len(sp) - 1))
+                s, e = sp[ln]
+                return s + _index_at_x(md, cur[s:e], pos[0] - inner.x)
+
+        def click(pos):
+            shift = bool(pygame.key.get_mods() & pygame.KMOD_SHIFT)
+            if self._focus is None or self._focus.key != key:
+                self._focus_text(key, get, set_, multiline, max_len, allowed)
+                shift = False
+            ed = self._focus.edit
+            idx = idx_at(pos)
+            if shift and ed.anchor is None:
+                ed.anchor = ed.cursor
+            elif not shift:
+                ed.anchor = idx
+            ed.cursor = idx
+            ed.blink = 0.0
+
+        def drag(pos):
+            if self._focus is not None and self._focus.key == key:
+                self._focus.edit.cursor = idx_at(pos)
+                self._focus.edit.blink = 0.0
+
+        self._add_hit(rect, key=key, down=click, drag=drag)
+
+    def _static_field(self, screen, rect, text) -> None:
+        self._panel(screen, rect, _INSET, _T.CARD_BORDER)
+        self._text_mid(screen, self.f_md, text, _T.TEXT_MUTED, rect.x + 14, rect.centery, max_w=rect.w - 28)
+
+    # -- colour picker ------------------------------------------------
+    def _color_picker(self, screen, key, x, y, w, get_hex, set_hex) -> int:
+        """Swatch + editable hex textbox + saturation/value square + hue
+        strip. Remembers hue / saturation while you drag through black or
+        white, where a hex value alone can't say which hue you were on."""
+        y0 = y
+        hx = get_hex() or "#FFD700"
+        st = self._hsv.get(key)
+        if st is None or st[3].upper() != hx.upper():
+            h_, s_, v_ = _hex_to_hsv(hx)
+            st = (h_, s_, v_, hx)
+            self._hsv[key] = st
+        h_, s_, v_ = st[0], st[1], st[2]
+
+        fh = self.m_field_h
+        sw = pygame.Rect(x, y, fh, fh)
+        uk.draw_rect_on(screen, hex_to_rgb(hx), sw, 0, 8)
+        uk.draw_rect_on(screen, _T.CHIP_BORDER, sw, 1, 8)
+
+        # Editable hex textbox next to the swatch - lets the player type a
+        # code directly instead of only dragging the wheel. Only commits
+        # (and repaints the swatch/wheel) once it's a complete, valid
+        # "#RRGGBB" value; invalid/partial text while typing is left alone
+        # rather than corrupting the stored color.
+        hex_key = f"{key}:hex"
+        field = pygame.Rect(sw.right + 14, y, min(140, max(100, w - fh - 14)), fh)
+
+        def get_hex_text():
+            return hx.upper()
+
+        def set_hex_text(v):
+            h = v.strip().lstrip("#").upper()
+            if len(h) == 6 and all(c in "0123456789ABCDEF" for c in h):
+                new_hex = "#" + h
+                self._hsv[key] = (*_hex_to_hsv(new_hex), new_hex)
+                if new_hex.upper() != hx.upper():
+                    set_hex(new_hex)
+
+        self._text_field(screen, hex_key, field, get_hex_text, set_hex_text, placeholder="#RRGGBB",
+                         max_len=7, allowed=_hex_char_ok)
+        y += sw.h + 14
+
+        strip_w, gap = 24, 12
+        sv_w = _clamp(w - strip_w - gap, 120, 300)
+        sv_h = 150
+        sv = pygame.Rect(x, y, sv_w, sv_h)
+        hue = pygame.Rect(sv.right + gap, y, strip_w, sv_h)
+        uk.blit_surface(screen, _sv_surface(h_, sv.w, sv.h), sv, transient=True)
+        uk.blit_surface(screen, _hue_strip_surface(hue.w, hue.h), hue)
+        uk.draw_rect_on(screen, _T.CHIP_BORDER, sv, 1, 6)
+        uk.draw_rect_on(screen, _T.CHIP_BORDER, hue, 1, 6)
+        # SV marker (dark + light ring so it reads on any colour)
+        mx = sv.x + int(s_ * (sv.w - 1))
+        my = sv.y + int((1.0 - v_) * (sv.h - 1))
+        uk.draw_circle_on(screen, (0, 0, 0), (mx, my), 8, 2)
+        uk.draw_circle_on(screen, (255, 255, 255), (mx, my), 6, 2)
+        # hue marker
+        hy = hue.y + int(h_ * (hue.h - 1))
+        uk.draw_rect_on(screen, (0, 0, 0), pygame.Rect(hue.x - 4, hy - 3, hue.w + 8, 6), 0, 3)
+        uk.draw_rect_on(screen, (255, 255, 255), pygame.Rect(hue.x - 3, hy - 2, hue.w + 6, 4), 0, 2)
+
+        def commit(hh, ss, vv):
+            new_hex = _hsv_to_hex(hh, ss, vv)
+            self._hsv[key] = (hh, ss, vv, new_hex)
+            if new_hex.upper() != hx.upper():
+                set_hex(new_hex)
+
+        def sv_apply(pos, sv=sv, hh=h_):
+            s2 = _clamp((pos[0] - sv.x) / max(1, sv.w - 1), 0.0, 1.0)
+            v2 = 1.0 - _clamp((pos[1] - sv.y) / max(1, sv.h - 1), 0.0, 1.0)
+            commit(self._hsv[key][0], s2, v2)
+
+        def hue_apply(pos, hue=hue):
+            h2 = _clamp((pos[1] - hue.y) / max(1, hue.h - 1), 0.0, 1.0)
+            cur = self._hsv[key]
+            commit(h2, cur[1], cur[2])
+
+        self._add_hit(sv, key=(key, "sv"), down=sv_apply, drag=sv_apply)
+        self._add_hit(hue.inflate(8, 0), key=(key, "hue"), down=hue_apply, drag=hue_apply)
+        return y + sv_h - y0
+
+    # ══════════════════════════════════════════════════════════════
+    #  Drawing: chrome (header, sidebar, tabs, footer)
+    # ══════════════════════════════════════════════════════════════
+
+    def _draw_header(self, screen) -> None:
+        w, hh = self.screen_width, self.header_h
+        uk.draw_rect_on(screen, _BAR, pygame.Rect(0, 0, w, hh), 0, 0)
+        uk.draw_line_on(screen, _HAIR, (0, hh - 1), (w, hh - 1), 1)
+
+        # back
+        r = self.back_rect
+        t = self._anim("back", self._hov(r))
+        self._panel(screen, r, uk.lerp_color(_CARD, _CARD_HI, t), uk.lerp_color(_T.CARD_BORDER, _T.GOLD, 0.78 * t))
+        if t > 0:
+            uk.draw_soft_glow(screen, r.center, int(r.w * 0.8), _T.GOLD, max_alpha=int(28 * t))
+        if self._back_icon is not None:
+            uk.blit_surface(screen, self._back_icon, self._back_icon.get_rect(center=r.center))
+        else:
+            _ic_left(screen, r, uk.lerp_color(_T.TEXT_SECONDARY, _T.GOLD, t), 3)
+        self._add_hit(r, key="back", down=lambda p: setattr(self, "_close_requested", True),
+                      tip="Close the Character Creator")
+
+        # title
+        cx = w // 2
+        self._text_mid(screen, self.f_title, "CHARACTER CREATOR", _T.TEXT_PRIMARY, cx, hh // 2, "c")
+
+        # save (+ unsaved chip)
+        has = bool(self.selected_id)
+        self._icon_btn(screen, "save", self.save_rect, self._icon_save_png, self._save,
+                       enabled=has, tip="Save this character  (Ctrl+S)")
+        if self.dirty and has:
+            label = "UNSAVED"
+            tw = self.f_sm.width(label)
+            chip = pygame.Rect(0, 0, tw + 42, 32)
+            chip.right = self.save_rect.left - 14
+            chip.centery = self.save_rect.centery
+            self._panel(screen, chip, (36, 30, 16), (110, 88, 40), 1, 16)
+            pulse = 0.5 + 0.5 * math.sin(self._pulse * 4.0)
+            dot = (chip.x + 17, chip.centery)
+            uk.draw_soft_glow(screen, dot, 12, _T.GOLD, max_alpha=int(30 + 50 * pulse))
+            uk.draw_circle_on(screen, _T.GOLD, dot, 4)
+            self._text_mid(screen, self.f_sm, label, _T.GOLD_BRIGHT, chip.x + 30, chip.centery)
+
+    def _draw_footer(self, screen) -> None:
+        w, h = self.screen_width, self.screen_height
+        fy = h - self.footer_h
+        uk.draw_rect_on(screen, _BAR, pygame.Rect(0, fy, w, self.footer_h), 0, 0)
+        uk.draw_line_on(screen, _HAIR, (0, fy), (w, fy), 1)
+        cy = fy + self.footer_h // 2
+        x = 32
+        if self.status_timer > 0 and self.status_msg:
+            col = _T.KI_BLUE if self.status_ok else _T.DANGER_BRIGHT
+            uk.draw_circle_on(screen, col, (x + 4, cy), 4)
+            self._text_mid(screen, self.f_sm, self.status_msg, col, x + 18, cy, dyn=True, max_w=w // 2)
+        elif self._tip:
+            self._text_mid(screen, self.f_sm, self._tip, _T.TEXT_MUTED, x, cy, dyn=True, max_w=w // 2)
+
+    # -- sidebar ------------------------------------------------------
+    def _draw_sidebar(self, screen) -> None:
+        lr = self.list_rect
+        self._panel(screen, lr, _T.PANEL_BG, _T.PANEL_BORDER, 1, 12)
+        self._text_top(screen, self.f_sm, "CHARACTERS", _T.TEXT_MUTED, lr.x + 18, lr.y + 18)
+        self._text_top(screen, self.f_sm, str(len(self.chars)), _T.TEXT_DIM, lr.right - 18, lr.y + 18, "r", dyn=True)
+
+        rv = self.roster_view
+        pitch = ROSTER_ROW_H + ROSTER_ROW_GAP
+        total = len(self.chars) * pitch
+        self._roster_scroll = _clamp(self._roster_scroll, 0, max(0, total - rv.h))
+        old_vp = self._vp
+        self._vp = rv
+        old = self._push_clip(screen, rv)
+        if not self.chars:
+            self._text_mid(screen, self.f_md, "No characters found", _T.TEXT_DIM, rv.centerx, rv.y + 40, "c")
+        for i, cid in enumerate(self.chars):
+            ry = rv.y + i * pitch - int(self._roster_scroll)
+            row = pygame.Rect(rv.x, ry, rv.w - (8 if total > rv.h else 0), ROSTER_ROW_H)
+            if row.bottom < rv.y or row.y > rv.bottom:
+                continue
+            sel = cid == self.selected_id
+            t = self._anim(("char", cid), self._hov(row) and not sel)
+            base = _SEL if sel else uk.lerp_color(_CARD, _CARD_HI, t)
+            border = _T.GOLD if sel else uk.lerp_color(_T.CARD_BORDER, _T.GOLD, 0.78 * t)
+            self._panel(screen, row, base, border, 1, 9)
+            col = hex_to_rgb(self.cfg.get("color"), _T.GOLD) if sel else self._char_colors.get(cid, _T.GOLD)
+            dot = (row.x + 22, row.centery)
+            if sel or t > 0:
+                uk.draw_soft_glow(screen, dot, 16, col, max_alpha=int(50 if sel else 40 * t))
+            uk.draw_circle_on(screen, col, dot, 8)
+            uk.draw_circle_on(screen, uk.lerp_color(col, (255, 255, 255), 0.4), dot, 8, 1)
+            fg = _T.TEXT_PRIMARY if sel else uk.lerp_color(_T.TEXT_SECONDARY, _T.TEXT_PRIMARY, t)
+            reserve = 34 if (sel and self.dirty) else 16
+            self._text_mid(screen, self.f_md, cid, fg, row.x + 42, row.centery, max_w=row.w - 42 - reserve)
+            if sel and self.dirty:
+                uk.draw_circle_on(screen, _T.GOLD, (row.right - 18, row.centery), 4)
+            self._add_hit(row, key=("char", cid), down=lambda p, c=cid: self._on_pick_char(c))
+        self._pop_clip(screen, old)
+        self._vp = old_vp
+        if total > rv.h:
+            frac = self._roster_scroll / max(1, total - rv.h)
+            th = max(24, int(rv.h * rv.h / total))
+            ty = rv.y + int((rv.h - th) * frac)
+            uk.draw_rect_on(screen, _T.CHIP_BORDER, pygame.Rect(rv.right - 4, ty, 3, th), 0, 1)
+
+        # action row
+        by = self.roster_btn_y
+        bx, gap = lr.x + 12, 8
+        sq = 40
+        has = bool(self.selected_id) and self.selected_id in self.chars
+        idx = self.chars.index(self.selected_id) if has else -1
+        self._icon_btn(screen, "c_up", pygame.Rect(bx, by, sq, sq), _ic_up, lambda: self._move_selected(-1),
+                       enabled=has and idx > 0, tip="Move character up in the menu")
+        self._icon_btn(screen, "c_dn", pygame.Rect(bx + sq + gap, by, sq, sq), _ic_down,
+                       lambda: self._move_selected(1), enabled=has and idx < len(self.chars) - 1,
+                       tip="Move character down in the menu")
+        new_r = pygame.Rect(bx + 2 * (sq + gap), by, sq, sq)
+        self._icon_btn(screen, "c_new", new_r, self._icon_plus_png, self._open_new_char,
+                       tip="Create a new character")
+        trash = pygame.Rect(new_r.right + gap, by, sq, sq)
+        self._icon_btn(screen, "c_del", trash, self._icon_trash_png, self._ask_delete_char, danger=True,
+                       enabled=has, tip="Delete this character's config")
+
+        self._draw_preview_panel(screen)
+
+    def _on_pick_char(self, cid: str) -> None:
+        if cid != self.selected_id:
+            self._switch_char(cid)
+            self.active_tab = TAB_IDENTITY
+
+    def _open_new_char(self) -> None:
+        self._open_input("New character", "Enter an ID for the new character (letters, digits, _ and -).",
+                         self._do_create_char)
+
+    def _ask_delete_char(self) -> None:
+        if self.selected_id:
+            sid = self.selected_id
+            self._open_confirm("Delete character", f"Delete the config for '{sid}'? This removes it from the "
+                               "roster and can't be undone.", self._do_delete_selected, "Delete")
+
+    def _draw_preview_panel(self, screen) -> None:
+        pr = self.prev_rect
+        self._panel(screen, pr, _T.PANEL_BG, _T.PANEL_BORDER, 1, 12)
+        self._text_top(screen, self.f_sm, "PREVIEW", _T.TEXT_MUTED, pr.x + 18, pr.y + 18)
+        form = self.preview_form.split("/")[-1] if self.selected_id else ""
+        if form:
+            self._text_top(screen, self.f_sm, self.f_sm.fit(form.upper(), pr.w // 2), _T.TEXT_DIM,
+                           pr.right - 18, pr.y + 18, "r", dyn=True)
+        stage = pygame.Rect(pr.x + 12, pr.y + 44, pr.w - 24, pr.h - 44 - 12)
+        uk.draw_rect_on(screen, _INSET, stage, 0, 10)
+        uk.draw_rect_on(screen, _T.CARD_BORDER, stage, 1, 10)
+
+        col = hex_to_rgb(self.cfg.get("color"), _T.GOLD)
+        old = self._push_clip(screen, stage.inflate(-2, -2))
+        uk.draw_soft_glow(screen, (stage.centerx, stage.centery + 6), int(min(stage.w, stage.h) * 0.6), col,
+                          max_alpha=34)
+        pv = self.preview
+        pv.shadow_width = self.cfg.get("shadow_size", 32)
+        if pv.frames:
+            fw, fh = pv.frames[0].get_size()
+            scale = PREVIEW_SCALE
+            while scale > 1 and (fw * scale > stage.w - 16 or fh * scale > stage.h - 16):
+                scale -= 1
+            frame = pv.frame(scale)
+            rw, rh = frame.get_size()
+            fx = stage.centerx - rw // 2
+            fy = stage.centery - rh // 2
+            # feet_y mirrors LayerManager._draw_shadow(): the frame's vertical
+            # centre + entity_height * scale / 2.25. entity_height falls back to
+            # the walk frame's own raw pixel height when the real hitbox height
+            # (Player.height) isn't known here.
+            raw_h = pv.entity_height if pv.entity_height is not None else rh / scale
+            feet = stage.centery + (raw_h * scale) / 2.25
+            shadow = get_preview_shadow(pv.shadow_width, scale=scale)
+            # Shadow first (below the sprite), same draw order as LayerManager.draw_all().
+            uk.blit_surface(screen, shadow, (round(stage.centerx - shadow.get_width() / 2),
+                                             round(feet - shadow.get_height() / 2)))
+            uk.blit_surface(screen, frame, (fx, fy))
+            self._text_top(screen, self.f_sm, f"{int(pv.frame_i) % len(pv.frames) + 1}/{len(pv.frames)}",
+                           _T.TEXT_DIM, stage.x + 10, stage.bottom - 10 - self.f_sm.cap_h, dyn=True)
+        else:
+            msg = "NO SPRITES" if self.selected_id else "NO CHARACTER"
+            bw = min(stage.w - 40, 96)
+            box = pygame.Rect(0, 0, bw, min(stage.h - 40, 120))
+            box.center = (stage.centerx, stage.centery - 8)
+            uk.draw_rect_on(screen, _T.CARD_BORDER, box, 1, 10)
+            self._text_mid(screen, self.f_sm, msg, _T.TEXT_DIM, stage.centerx, box.bottom + 18, "c")
+        self._pop_clip(screen, old)
+
+    # -- tabs ---------------------------------------------------------
+    def _draw_tabs(self, screen) -> None:
+        for i, (name, r) in enumerate(zip(BAR_TAB_NAMES, self.tab_rects)):
+            active = i == self.active_tab
+            t = self._anim(("tab", i), self._hov(r) and not active)
+            base = _SEL if active else uk.lerp_color(_CARD, _CARD_HI, t)
+            border = _T.GOLD if active else uk.lerp_color(_T.CARD_BORDER, _T.GOLD, 0.78 * t)
+            self._panel(screen, r, base, border, 1, 10)
+            if active:
+                uk.draw_rect_on(screen, _T.GOLD, pygame.Rect(r.x + 14, r.bottom - 4, r.w - 28, 3), 0, 1)
+            fg = _T.GOLD_BRIGHT if active else uk.lerp_color(_T.TEXT_SECONDARY, _T.TEXT_PRIMARY, t)
+            font = self._tab_font
+            label = font.fit(name, r.w - 28)
+            x = r.centerx - font.width(label) // 2
+            self._text_mid(screen, font, label, fg, x, r.centery - 1)
+            self._add_hit(r, key=("tab", i), down=lambda p, i=i: self._select_tab(i))
+        self._draw_settings_button(screen)
+
+    def _draw_settings_button(self, screen) -> None:
+        """Small icon-only button (config.png) that opens the global
+        Settings tab - kept out of the tab row since it isn't per-character
+        like the rest of the tabs."""
+        r = self.settings_rect
+        active = self.active_tab == TAB_SETTINGS
+        t = self._anim(("tab", TAB_SETTINGS), self._hov(r) and not active)
+        base = _SEL if active else uk.lerp_color(_CARD, _CARD_HI, t)
+        border = _T.GOLD if active else uk.lerp_color(_T.CARD_BORDER, _T.GOLD, 0.78 * t)
+        self._panel(screen, r, base, border, 1, 10)
+        if active:
+            uk.draw_rect_on(screen, _T.GOLD, pygame.Rect(r.x + 8, r.bottom - 4, r.w - 16, 3), 0, 1)
+        fg = _T.GOLD_BRIGHT if active else uk.lerp_color(_T.TEXT_SECONDARY, _T.TEXT_PRIMARY, t)
+        if self._settings_icon is not None:
+            uk.blit_surface(screen, self._settings_icon, self._settings_icon.get_rect(center=r.center))
+        else:
+            _gear_icon(screen, pygame.Rect(0, 0, 22, 22).move(r.centerx - 11, r.centery - 11), fg)
+        self._add_hit(r, key=("tab", TAB_SETTINGS), down=lambda p: self._select_tab(TAB_SETTINGS),
+                      tip="Game settings")
+
+    def _select_tab(self, i: int) -> None:
+        if i == self.active_tab:
+            return
+        self._flush_settings()
+        self._blur()
+        self.active_tab = i
+        self._scroll[i] = 0.0
+        if i == TAB_TRANSFORM:
+            tf = self._tf()
+            if tf:      # show the selected transformation's sprites, like the old tab did
+                self._set_preview_form(tf.get("costume", ""))
+        if i == TAB_IDENTITY:
+            self._portrait_t = 0.0
+
+    # -- scrolling content panel --------------------------------------
+    def _draw_content(self, screen) -> None:
+        pr = self.panel_rect
+        self._panel(screen, pr, _T.PANEL_BG, _T.PANEL_BORDER, 1, 12)
+        tab = self.active_tab
+        if not self.selected_id and tab != TAB_SETTINGS:
+            self._text_mid(screen, self.f_lg, "No character selected", _T.TEXT_MUTED, pr.centerx, pr.centery - 14, "c")
+            self._text_mid(screen, self.f_md, "Pick one from the list, or create one with New.", _T.TEXT_DIM,
+                           pr.centerx, pr.centery + 22, "c")
+            return
+        pad = 24
+        vp = pygame.Rect(pr.x + 3, pr.y + 3, pr.w - 6, pr.h - 6)
+        self._scroll[tab] = _clamp(self._scroll[tab], 0, self._max_scroll())
+        fn = (self._tab_identity, self._tab_stats, self._tab_attacks, self._tab_transform,
+              self._tab_preview, self._tab_settings)[tab]
+        old_vp = self._vp
+        self._vp = vp
+        old = self._push_clip(screen, vp)
+        x = pr.x + pad
+        w = pr.w - pad * 2 - 10
+        y = pr.y + pad - int(self._scroll[tab])
+        used = fn(screen, x, y, w)
+        self._pop_clip(screen, old)
+        self._vp = old_vp
+        self._content_h[tab] = used + pad * 2
+
+        max_scroll = self._max_scroll()
+        if max_scroll > 0:
+            track = pygame.Rect(pr.right - 12, pr.y + 14, 5, pr.h - 28)
+            th = max(30, int(track.h * (pr.h - 8) / self._content_h[tab]))
+            frac = self._scroll[tab] / max_scroll
+            thumb = pygame.Rect(track.x, track.y + int((track.h - th) * frac), track.w, th)
+            grab = self._drag is not None and self._drag.get("key") == "scrollbar"
+            t = self._anim("scrollbar", self._hov(track.inflate(10, 0)) or grab)
+            uk.draw_rect_on(screen, (24, 28, 38), track, 0, 2)
+            uk.draw_rect_on(screen, uk.lerp_color(_T.CHIP_BORDER, _T.GOLD, t), thumb, 0, 2)
+
+            def scrub(pos, track=track, th=th, ms=max_scroll, tab=tab):
+                f = _clamp((pos[1] - track.y - th / 2) / max(1, track.h - th), 0.0, 1.0)
+                self._scroll[tab] = f * ms
+
+            self._add_hit(track.inflate(12, 0), key="scrollbar", down=scrub, drag=scrub)
+
+    # ══════════════════════════════════════════════════════════════
+    #  Dialogs
+    # ══════════════════════════════════════════════════════════════
+
+    def _draw_dialog(self, screen) -> None:
+        d = self.dialog
+        r = self._dialog_rects()
+        uk.draw_rect_on(screen, (0, 0, 0, 170), pygame.Rect(0, 0, self.screen_width, self.screen_height), 0, 0)
+        accent = _T.DANGER_BRIGHT if d.get("danger") else _T.GOLD
+        pn = r["panel"]
+        uk.draw_panel(screen, pn, bg=_T.PANEL_BG, border=accent, border_width=2, radius=14)
+        self._text_top(screen, self.f_lg, d["title"], _T.TEXT_PRIMARY, pn.x + r["pad"], pn.y + r["pad"])
+        for i, line in enumerate(r["lines"]):
+            self._text_top(screen, self.f_md, line, _T.TEXT_SECONDARY, pn.x + r["pad"], r["msg_y"] + i * r["line_h"])
+
+        if d["kind"] == "input":
+            edit = d["edit"]
+            f = r["field"]
+            self._panel(screen, f, _FIELD_HI, _T.GOLD, 2)
+            md = self.f_md
+            inner = pygame.Rect(f.x + 14, f.y + 2, f.w - 28, f.h - 4)
+            cw = md.width(edit.value[:edit.cursor])
+            sc = d["scroll"]
+            if md.width(edit.value) <= inner.w - 2:
+                sc = 0
+            else:
+                if cw - sc > inner.w - 2:
+                    sc = cw - inner.w + 2
+                if cw < sc:
+                    sc = cw
+            d["scroll"] = sc
+            old = self._push_clip(screen, inner)
+            if edit.has_sel():
+                s, e = edit.sel_range()
+                sx, ex = inner.x - sc + md.width(edit.value[:s]), inner.x - sc + md.width(edit.value[:e])
+                uk.draw_rect_on(screen, (*_T.GOLD, 70),
+                                pygame.Rect(sx, f.centery - md.cap_h // 2 - 4, ex - sx, md.line_h + 8), 0, 3)
+            if edit.value:
+                self._text_mid(screen, md, edit.value, _T.TEXT_PRIMARY, inner.x - sc, f.centery, dyn=True)
+            else:
+                self._text_mid(screen, md, "e.g. gohan", _T.TEXT_DIM, inner.x, f.centery)
+            if int(edit.blink * 2) % 2 == 0:
+                cx = inner.x - sc + cw
+                uk.draw_rect_on(screen, _T.GOLD_BRIGHT,
+                                pygame.Rect(cx, f.centery - md.cap_h // 2 - 4, 2, md.line_h + 8), 0, 0)
+            self._pop_clip(screen, old)
+            self._text_rects.append(f)
+            if d["error"]:
+                self._text_top(screen, self.f_sm, d["error"], _T.DANGER_BRIGHT, f.x, r["hint_y"])
+            else:
+                self._text_top(screen, self.f_sm, "Lowercase, spaces become underscores.  Enter to confirm.",
+                               _T.TEXT_DIM, f.x, r["hint_y"])
+
+        # buttons (hover computed with the real mouse; base UI is blocked)
+        for key, rect, label, acc, icon in (
+                ("d_ok", r["ok"], d["confirm_label"], accent, _ic_check if d["kind"] == "input" else _ic_trash),
+                ("d_cancel", r["cancel"], "Cancel", _T.TEXT_SECONDARY, None)):
+            hov = rect.collidepoint(self._mouse)
+            t = self._anim(key, hov)
+            self._panel(screen, rect, uk.lerp_color(_CARD, _CARD_HI, t), uk.lerp_color(_T.CARD_BORDER, acc, 0.55 + 0.45 * t))
+            fg = uk.lerp_color(_T.TEXT_SECONDARY, acc, 0.55 + 0.45 * t)
+            ic = 20 if icon else 0
+            tw = self.f_md.width(label)
+            x = rect.centerx - (tw + (ic + 10 if icon else 0)) // 2
+            if icon:
+                icon(screen, pygame.Rect(x, rect.centery - 10, 20, 20), fg, 3)
+                x += 30
+            self._text_mid(screen, self.f_md, label, fg, x, rect.centery)
+
+    # ══════════════════════════════════════════════════════════════
+    #  Tab: Identity
+    # ══════════════════════════════════════════════════════════════
+
+    PORTRAIT_BOX          = 132   # px square the portrait preview is framed in
     PORTRAIT_HOLD_SECONDS = 2.5   # how long each form's portrait is shown
 
-    def _portrait_cycle_forms(self) -> list[tuple[str, str]]:
-        """(form_suffix, display_label) pairs to cycle through in the
-        Identity-tab portrait preview: the currently selected costume's
-        base look, followed only by *that costume's own* registered
-        transformations, in order. A different costume's transformation
-        never appears here — it isn't relevant until that costume is
-        selected.
+    def _tab_identity(self, screen, x, y, w) -> int:
+        cfg = self.cfg
+        y0 = y
+        two = w >= 720
+        gap = 40
+        lw = (w - gap) // 2 if two else w
+        if two:
+            hl = self._identity_left(screen, x, y, lw)
+            hr = self._identity_right(screen, x + lw + gap, y, w - gap - lw)
+            y += max(hl, hr)
+        else:
+            y += self._identity_left(screen, x, y, w)
+            y += 12
+            y += self._identity_right(screen, x, y, w)
+        y += 14
+        desc = cfg.get("description") or ""
+        y += self._caption(screen, "Description", x, y, w, right=f"{len(desc)}/600")
 
-        form_suffix is "" for the base look (portrait file has no suffix,
-        e.g. "goku.png") and the bare form name for a transformation (e.g.
-        "ssj" → "goku_ssj.png"), matching assets/portraits/{char_id}[_{form}].png.
-        """
-        forms: list[tuple[str, str]] = [("", "Base")]
+        def set_desc(v):
+            if cfg.get("description") != v:
+                cfg["description"] = v
+                self._mark_dirty()
+
+        self._text_field(screen, "desc", pygame.Rect(x, y, w, 132), lambda: cfg.get("description", ""), set_desc,
+                         "Short description shown in the scouter...", multiline=True, max_len=600)
+        y += 132
+        return y - y0
+
+    def _identity_left(self, screen, x, y, w) -> int:
+        cfg = self.cfg
+        y0, fh = y, self.m_field_h
+        y += self._caption(screen, "Basics", x, y, w)
+        y += self._field_label(screen, "ID (read-only)", x, y)
+        self._static_field(screen, pygame.Rect(x, y, w, fh), self.selected_id or "")
+        y += fh + 16
+
+        y += self._field_label(screen, "Display name", x, y)
+
+        def set_name(v):
+            if cfg.get("display_name") != v:
+                cfg["display_name"] = v
+                self._mark_dirty()
+
+        self._text_field(screen, "name", pygame.Rect(x, y, w, fh), lambda: cfg.get("display_name", ""), set_name,
+                         "Click to add a display name...", max_len=40)
+        y += fh + 16
+
+        y += self._field_label(screen, "Costume", x, y)
+        n = len(self.costumes)
+        self._stepper(screen, "costume", pygame.Rect(x, y, w, fh), self._current_costume(),
+                      f"{self.costume_idx + 1}/{n}" if n > 1 else "",
+                      lambda: self._select_costume(-1), lambda: self._select_costume(1), enabled=n > 1)
+        y += fh + 22
+
+        y += self._caption(screen, "Sprite and shadow", x, y, w)
+        specs = [
+            dict(key="sprite_width", label="Sprite width", vmin=4, vmax=256, step=1, fmt="{:.0f}px",
+                 get=lambda: cfg.get("sprite_width", 32), set=self._num_setter(cfg, "sprite_width", "int")),
+            dict(key="sprite_height", label="Sprite height", vmin=4, vmax=256, step=1, fmt="{:.0f}px",
+                 get=lambda: cfg.get("sprite_height", 32), set=self._num_setter(cfg, "sprite_height", "int")),
+            dict(key="shadow_size", label="Shadow size", vmin=8, vmax=96, step=4, fmt="{:.0f}px",
+                 get=lambda: cfg.get("shadow_size", 32), set=self._num_setter(cfg, "shadow_size", "int")),
+        ]
+        y += self._slider_grid(screen, x, y, w, specs)
+
+        # Draws assets/sprites/universal/halo.png over the sprite; its offset is
+        # tuned in player.py (halo_offset_x / halo_offset_y), not here.
+        def toggle_halo():
+            cfg["halo_enabled"] = not cfg.get("halo_enabled", False)
+            self._mark_dirty()
+
+        y += self._checkbox(screen, "halo", x, y, w, "Halo", bool(cfg.get("halo_enabled", False)), toggle_halo)
+        return y - y0
+
+    def _identity_right(self, screen, x, y, w) -> int:
+        cfg = self.cfg
+        y0 = y
+        y += self._caption(screen, "Gate color", x, y, w)
+
+        def set_color(hx):
+            cfg["color"] = hx
+            self._mark_dirty()
+
+        y += self._color_picker(screen, "gate", x, y, w, lambda: cfg.get("color") or "#FFD700", set_color)
+        y += 12
+        y += self._note(screen, x, y, w, "Colour-codes anything tied to this character in game, e.g. the number "
+                                         "on a level gate locked to them.")
+        y += 18
+        y += self._caption(screen, "Portrait", x, y, w)
+        y += self._identity_portrait(screen, x, y, w)
+        return y - y0
+
+    # -- portrait cycle -----------------------------------------------
+    def _portrait_cycle_forms(self) -> list:
+        """(form_suffix, label) pairs: the selected costume's base look, then
+        only *that costume's own* transformations, in order. '' = base look
+        (portrait file has no suffix); otherwise the bare form name."""
+        forms = [("", "Base")]
         for tf in self.visible_transformations():
             costume = tf.get("costume", "")
             form = costume.split("/")[-1] if costume else ""
@@ -2433,1391 +3526,435 @@ class CharacterEditor:
                 forms.append((form, tf.get("display_name") or tf.get("id", "?")))
         return forms
 
-    def _load_portrait(self, form: str) -> Optional[pygame.Surface]:
-        """Load (and cache) the portrait for the currently selected costume
-        + a given transformation form (see resolve_portrait_path())."""
+    def _load_portrait(self, form: str, box: int):
         costume = self._current_costume()
-        cache_key = (costume, form)
-        if cache_key in self.portrait_cache:
-            return self.portrait_cache[cache_key]
+        key = (self.selected_id, costume, form, box)
+        if key in self._portraits:
+            return self._portraits[key]
         surf = None
-        path = resolve_portrait_path(self.char_id, costume, form)
+        path = resolve_portrait_path(self.selected_id, costume, form)
         if path:
             try:
-                surf = pygame.image.load(str(path)).convert_alpha()
+                img = pygame.image.load(str(path)).convert_alpha()
+                s = min((box - 16) / max(img.get_width(), 1), (box - 16) / max(img.get_height(), 1))
+                surf = pygame.transform.smoothscale(
+                    img, (max(1, int(img.get_width() * s)), max(1, int(img.get_height() * s))))
             except Exception:
                 surf = None
-        self.portrait_cache[cache_key] = surf
+        self._portraits[key] = surf
         return surf
 
-    def _draw_identity_portrait(self, surf: pygame.Surface,
-                                font_sm: pygame.font.Font,
-                                x: int, y: int, dt: float) -> None:
+    def _identity_portrait(self, screen, x, y, w) -> int:
         forms = self._portrait_cycle_forms()
-        n     = len(forms)
-        box   = self.PORTRAIT_BOX
-
-        self.portrait_cycle_timer = (
-            (self.portrait_cycle_timer + dt) % (self.PORTRAIT_HOLD_SECONDS * n)
-        )
-        idx = int(self.portrait_cycle_timer // self.PORTRAIT_HOLD_SECONDS) % n
+        n = len(forms)
+        span = self.PORTRAIT_HOLD_SECONDS * n
+        self._portrait_t %= span
+        idx = int(self._portrait_t // self.PORTRAIT_HOLD_SECONDS) % n
         form, label = forms[idx]
-
+        box = self.PORTRAIT_BOX
         rect = pygame.Rect(x, y, box, box)
-        surf.draw_rect(C_PANEL_DARK, rect, border_radius=8)
-        surf.draw_rect(C_BORDER,     rect, 1, border_radius=8)
-
-        img = self._load_portrait(form)
-        if img:
-            s  = min((box - 12) / max(img.get_width(), 1),
-                     (box - 12) / max(img.get_height(), 1))
-            sw = max(1, int(img.get_width()  * s))
-            sh = max(1, int(img.get_height() * s))
-            scaled = pygame.transform.smoothscale(img, (sw, sh))
-            surf.blit(scaled, scaled.get_rect(center=rect.center))
+        self._panel(screen, rect, _INSET, _T.CARD_BORDER, 1, 10)
+        img = self._load_portrait(form, box)
+        if img is not None:
+            uk.blit_surface(screen, img, img.get_rect(center=rect.center))
         else:
-            ph = render_text_cached(font_sm, "no portrait", C_TEXT_DIM)
-            surf.blit(ph, ph.get_rect(center=rect.center))
+            self._text_mid(screen, self.f_sm, "NO PORTRAIT", _T.TEXT_DIM, rect.centerx, rect.centery, "c")
 
-        cap_txt = f"{label}   ({idx + 1}/{n})" if n > 1 else label
-        cap = render_text_cached(font_sm, cap_txt, C_TEXT_DIM)
-        surf.blit(cap, (rect.x, rect.bottom + 8))
-
-        # Progress dots — one per form, filled for whichever is on screen.
+        tx = rect.right + 20
+        cy = rect.y + 14
+        self._text_top(screen, self.f_md, self.f_md.fit(label, w - box - 20), _T.TEXT_PRIMARY, tx, cy, dyn=True)
         if n > 1:
-            dot_r   = 3
-            gap     = 10
-            total_w = (n - 1) * gap
-            dx      = rect.centerx - total_w // 2
-            dy      = rect.bottom + 28
+            self._text_top(screen, self.f_sm, f"{idx + 1} of {n}", _T.TEXT_DIM, tx, cy + self.f_md.line_h + 6,
+                           dyn=True)
+            dot_y = cy + self.f_md.line_h + self.f_sm.line_h + 26
             for i in range(n):
-                col = C_ACCENT if i == idx else C_BORDER
-                surf.draw_circle(col, (dx + i * gap, dy), dot_r)
+                on = i == idx
+                uk.draw_circle_on(screen, _T.GOLD if on else _T.CHIP_BORDER, (tx + 4 + i * 14, dot_y), 4 if on else 3)
+        return box
 
-    def _draw_identity(self, surf, font, font_sm, lx, fx, fw, row_h, dt):
-        y = self.panel.y + 60
+    # ══════════════════════════════════════════════════════════════
+    #  Tab: Stats
+    # ══════════════════════════════════════════════════════════════
 
-        draw_label(surf, font_sm, "ID (read-only)", lx, y + 6)
-        id_txt = render_text_cached(font, self.char_id, C_ACCENT)
-        surf.blit(id_txt, (fx, y + 4))
-        y += row_h
+    _STAT_LABELS = [
+        ("max_hp",   "Max HP"),
+        ("max_ki",   "Max Ki"),
+        ("power",    "STR (Melee)"),
+        ("ki_power", "POW (Ki Blast)"),
+        ("vitality", "END (Defense)"),
+        ("speed",    "SPD"),
+        ("ki_regen", "Ki Regen"),
+    ]
 
-        draw_label(surf, font_sm, "Display Name", lx, y + 6)
-        self.name_input.rect.y = y
-        self.name_input.draw(surf, font_sm, dt, placeholder="Click to add a display name...")
-        y += row_h
+    def _tab_stats(self, screen, x, y, w) -> int:
+        stats = self.cfg["stats"]
+        y0 = y
+        y += self._caption(screen, "Combat stats", x, y, w)
+        specs = [dict(key=f"stat:{k}", label=label, vmin=1, vmax=255, step=1, fmt="{:.0f}",
+                      get=lambda k=k: stats.get(k, DEFAULT_CONFIG["stats"][k]),
+                      set=self._num_setter(stats, k, "int"))
+                 for k, label in self._STAT_LABELS]
+        y += self._slider_grid(screen, x, y, w, specs)
+        return y - y0
 
-        draw_label(surf, font_sm, "Costume", lx, y + 6)
-        # Cycle arrows
-        arr_l = pygame.Rect(fx,        y + 2, 26, 26)
-        arr_r = pygame.Rect(fx + 160,  y + 2, 26, 26)
-        mx, my = pygame.mouse.get_pos()
-        draw_button(surf, font_sm, arr_l, "◄",
-                    hover=arr_l.collidepoint(mx, my))
-        draw_button(surf, font_sm, arr_r, "►",
-                    hover=arr_r.collidepoint(mx, my))
-        costume_lbl = render_text_cached(
-            font, self.costumes[self.costume_idx] if self.costumes else "—", C_TEXT
-        )
-        surf.blit(costume_lbl, (fx + 34, y + 5))
-        y += row_h
+    # ══════════════════════════════════════════════════════════════
+    #  Tab: Attacks
+    # ══════════════════════════════════════════════════════════════
 
-        draw_label(surf, font_sm, "Sprite Width", lx, y + 6)
-        self.sprite_width_slider.rect.y = y + 6
-        self.sprite_width_slider.draw(surf, font_sm)
-        y += row_h
+    def _tab_attacks(self, screen, x, y, w) -> int:
+        atk = self.cfg["attacks"]
+        y0 = y
+        y += self._caption(screen, "Ki and melee", x, y, w)
+        specs = [
+            dict(key="atk:blast_cost", label="Blast Ki cost", vmin=0, vmax=100, step=1, fmt="{:.0f}",
+                 get=lambda: atk.get("blast_cost", 20), set=self._num_setter(atk, "blast_cost", "int")),
+            dict(key="atk:beam_cost", label="Beam Ki cost", vmin=0, vmax=100, step=1, fmt="{:.0f}",
+                 get=lambda: atk.get("beam_cost", 50), set=self._num_setter(atk, "beam_cost", "int")),
+            dict(key="atk:melee_duration", label="Melee duration", vmin=0.1, vmax=2.0, step=0.05, fmt="{:.2f}s",
+                 get=lambda: atk.get("melee_duration", 0.5), set=self._num_setter(atk, "melee_duration", "f3")),
+        ]
+        y += self._slider_grid(screen, x, y, w, specs)
 
-        draw_label(surf, font_sm, "Sprite Height", lx, y + 6)
-        self.sprite_height_slider.rect.y = y + 6
-        self.sprite_height_slider.draw(surf, font_sm)
-        y += row_h
+        y += self._field_label(screen, "Charged melee style", x, y)
 
-        draw_label(surf, font_sm, "Shadow Size", lx, y + 6)
-        self.shadow_slider.rect.y = y + 6
-        self.shadow_slider.draw(surf, font_sm)
-        y += row_h
+        def set_style(v):
+            if atk.get("charged_melee_style") != v:
+                atk["charged_melee_style"] = v
+                self._mark_dirty()
 
-        # ── Halo — draws assets/sprites/universal/halo.png on top of the
-        # player sprite when checked. Position is tuned manually in
-        # player.py (halo_offset_x/halo_offset_y), not here.
-        draw_label(surf, font_sm, "Halo", lx, y + 6)
-        halo_cb_rect = pygame.Rect(fx, y + 4, 20, 20)
-        surf.draw_rect(C_PANEL_DARK, halo_cb_rect, border_radius=3)
-        surf.draw_rect(C_BORDER, halo_cb_rect, 1, border_radius=3)
-        if self.halo_enabled:
-            surf.draw_line(C_ACCENT, halo_cb_rect.topleft, halo_cb_rect.bottomright, 2)
-            surf.draw_line(C_ACCENT, halo_cb_rect.topright, halo_cb_rect.bottomleft, 2)
-        self._halo_checkbox_rect = halo_cb_rect
-        y += row_h
+        y += self._segmented(screen, "melee_style", x, y, min(w, 300), [("lunge", "Lunge"), ("spin", "Spin")],
+                             atk.get("charged_melee_style", "lunge"), set_style)
+        y += 8
+        y += self._note(screen, x, y, w, "What a fully charged melee does: dash forward at the target, or spin "
+                                         "in place.")
+        y += 22
 
-        # ── Assigned color — hue-strip + saturation/value picker. Used to
-        # color-code anything tied to this specific character in-game, e.g.
-        # a level gate locked to them shows its number in this color.
-        # Same widget style as the animated-region color picker in
-        # dev_tools/object_editor.py: SV square for the current hue, plus a
-        # vertical hue strip. Rects are recomputed each draw (position
-        # depends on layout) and stored for handle_event's hit-testing.
-        draw_label(surf, font_sm, "Gate Color", lx, y + 6)
-
-        preview_rect = pygame.Rect(fx, y + 2, 30, 22)
-        surf.draw_rect(hex_to_rgb(self.selected_color), preview_rect, border_radius=4)
-        surf.draw_rect(C_BORDER, preview_rect, 1, border_radius=4)
-        hex_lbl = render_text_cached(font_sm, self.selected_color.upper(), C_TEXT_DIM)
-        surf.blit(hex_lbl, (preview_rect.right + 10, y + 7))
-        y += 32
-
-        hue, sat, val = self._selected_color_hsv()
-        sv_w, sv_h, hue_w, gap = 130, 90, 18, 10
-
-        sv_rect = pygame.Rect(fx, y, sv_w, sv_h)
-        sv_surf = self._get_sv_square_surface(hue, sv_w, sv_h)
-        surf.blit(sv_surf, sv_rect.topleft)
-        surf.draw_rect(C_BORDER, sv_rect, 1)
-
-        # Cursor ring — white on dark colors, black on light ones so it's
-        # always visible against whatever's under it.
-        sv_cursor_x = sv_rect.left + int(sat * sv_rect.width)
-        sv_cursor_y = sv_rect.top + int((1 - val) * sv_rect.height)
-        ring_color = (255, 255, 255) if val < 0.6 else (0, 0, 0)
-        surf.draw_circle(ring_color, (sv_cursor_x, sv_cursor_y), 6, 2)
-
-        hue_rect = pygame.Rect(sv_rect.right + gap, y, hue_w, sv_h)
-        hue_surf = self._get_hue_strip_surface(hue_w, sv_h)
-        surf.blit(hue_surf, hue_rect.topleft)
-        surf.draw_rect(C_BORDER, hue_rect, 1)
-
-        hue_marker_y = hue_rect.top + int(hue * hue_rect.height)
-        marker_rect = pygame.Rect(hue_rect.left - 2, hue_marker_y - 2, hue_rect.width + 4, 4)
-        surf.draw_rect((255, 255, 255), marker_rect, 1)
-
-        self._color_sv_rect  = sv_rect
-        self._color_hue_rect = hue_rect
-
-        y += sv_h + 14
-
-        # ── Description — freeform prose shown in the Scouter Data panel
-        # (see ui/scouter_menu.py's _get_entity_description). Lives on the
-        # Identity tab, next to the other "who is this character" fields,
-        # rather than tucked into Stats/Attacks/Transformations. ─────────
-        y += 14
-        draw_label(surf, font_sm, "Description", lx, y + 6)
-        self.desc_input.rect = pygame.Rect(fx, y, fw, TextArea.H)
-        self.desc_input.draw(surf, font_sm, dt)
-        y += TextArea.H + row_h - 28
-
-        # ── Portrait preview — cycles slowly through the base look and
-        # every registered transformation, so you can sanity-check each
-        # form's portrait art without leaving the Identity tab. ─────────
-        y += 14
-        draw_section_header(surf, font_sm, "Portrait Preview",
-                            pygame.Rect(lx, y + 4, fw + 80, 0))
-        y += 30
-        self._draw_identity_portrait(surf, font_sm, lx, y, dt)
-
-    def _draw_stats(self, surf, font, font_sm, lx, fx, fw, row_h):
-        LABELS = {
-            "max_hp":   "Max HP",
-            "max_ki":   "Max Ki",
-            "power":    "STR (Melee)",
-            "ki_power": "POW (Ki Blast)",
-            "defense":  "Defense (legacy)",
-            "vitality": "END (Defense)",
-            "speed":    "SPD",
-            "ki_regen": "Ki Regen",
-        }
-        y = self.panel.y + 60
-        for key, sl in self.stat_sliders.items():
-            draw_label(surf, font_sm, LABELS[key], lx, y + 6)
-            sl.rect.y = y + 6
-            sl.draw(surf, font_sm)
-            y += row_h
-
-    def _build_attack_grid(self) -> None:
-        """
-        (Re)compute icon-button rects for every discovered attack.
-
-        Called from _draw_attacks every frame so it always matches the
-        current panel size; the click handler in CharacterCreator.
-        handle_input() reads the same self.attack_btn_rects, so drawing
-        and hit-testing can never drift out of sync with each other.
-
-        PERF: the layout only actually depends on the attack roster, the
-        panel width, and the grid's top y-offset — none of which change
-        from one frame to the next while the Attacks tab just sits open.
-        We memoize on those three things and skip the recompute (which
-        touches every attack, doing a dict rebuild + N Rect allocations)
-        when nothing has actually moved.
-
-        Icon size is derived from the actual pixel dimensions of the first
-        available icon — load_attack_icon() already enlarges small native
-        icons up to a sane display size, so what we get back here is
-        picker-ready — falling back to ATTACK_ICON_SIZE if nothing is
-        loaded yet.
-        """
-        cache_key = (tuple(self.available_attacks), self.panel.w, self._attack_grid_y0)
-        if getattr(self, "_attack_grid_cache_key", None) == cache_key:
-            return  # layout unchanged since last frame — nothing to do
-        self._attack_grid_cache_key = cache_key
-
-        self.attack_btn_rects = {}
+        equipped = atk.setdefault("equipped_attacks", [])
+        y += 4
+        y += self._caption(screen, "Equipped attacks", x, y, w,
+                           right=f"{len(equipped)} equipped" if self.available_attacks else None)
         if not self.available_attacks:
-            return
-
-        # Determine cell size from the real icon surface dimensions so that
-        # high-res HUD PNGs are shown at their native resolution. Icons are
-        # NOT guaranteed to be uniform in size — each attack's icon.png loads
-        # at its own native resolution and the "enlarge small icons" step
-        # preserves aspect ratio rather than forcing a square — so sizing the
-        # grid off a single (e.g. the first) attack's icon lets a wider icon
-        # from a later attack spill into the next cell and overlap it. Use
-        # the max across every discovered attack instead.
-        icon_w = icon_h = 0
-        for aid in self.available_attacks:
-            icon = load_attack_icon(aid)
-            icon_w = max(icon_w, icon.get_width())
-            icon_h = max(icon_h, icon.get_height())
-
-        lx      = self.panel.x + 20
-        avail_w = max(icon_w, self.panel.w - 40)
-        gap     = 16
-        cell_w  = icon_w + gap
-        cols    = max(1, (avail_w + gap) // cell_w)
-        cell_h  = icon_h + 30   # icon + label row + gap to next row
-
+            y += self._note(screen, x, y, w, "No attacks found in assets/sprites/attacks/ - add an attack folder "
+                                             "(e.g. 'ki_blast') to populate this list.")
+            return y - y0
+        tile_w, tile_h, tg = 116, 124, 14
+        cols = max(1, (w + tg) // (tile_w + tg))
         for i, aid in enumerate(self.available_attacks):
-            col = i % cols
-            row = i // cols
-            x = lx + col * cell_w
-            y = self._attack_grid_y0 + row * cell_h
-            self.attack_btn_rects[aid] = pygame.Rect(x, y, icon_w, icon_h)
+            r, c = divmod(i, cols)
+            self._attack_tile(screen, aid, pygame.Rect(x + c * (tile_w + tg), y + r * (tile_h + tg), tile_w, tile_h),
+                              aid in equipped, equipped)
+        rows = (len(self.available_attacks) + cols - 1) // cols
+        y += rows * (tile_h + tg)
+        y += self._note(screen, x, y, w, "Click an icon to equip / unequip that attack for this character.")
+        return y - y0
 
-    def _draw_attacks(self, surf, font, font_sm, lx, fx, fw, row_h):
-        y = self.panel.y + 60
+    def _attack_icon(self, aid: str, box: int):
+        key = (aid, box)
+        surf = self._icon_cache.get(key)
+        if surf is None:
+            surf = _fit_surface(load_attack_icon(aid), box, box)
+            self._icon_cache[key] = surf
+        return surf
 
-        LABELS = {
-            "blast_cost":      "Blast Ki Cost",
-            "beam_cost":       "Beam Ki Cost",
-            "melee_duration":  "Melee Duration",
-            "walk_speed":      "Walk Speed",
-            "run_speed":       "Run Speed",
-            "fly_speed":       "Fly Speed",
-        }
-        for key, sl in self.atk_sliders.items():
-            draw_label(surf, font_sm, LABELS[key], lx, y + 6)
-            sl.rect.y = y + 6
-            sl.draw(surf, font_sm)
-            y += row_h
+    def _attack_tile(self, screen, aid, rect, selected, equipped) -> None:
+        t = self._anim(("atk", aid), self._hov(rect))
+        lift = int(2 * t)
+        r = rect.move(0, -lift)
+        base = _SEL if selected else uk.lerp_color(_CARD, _CARD_HI, t)
+        border = _T.GOLD if selected else uk.lerp_color(_T.CARD_BORDER, _T.GOLD, 0.78 * t)
+        if selected or t > 0:
+            uk.draw_soft_glow(screen, r.center, int(r.w * 0.62), _T.GOLD, max_alpha=int(22 if selected else 20 * t))
+        self._panel(screen, r, base, border, 2 if selected else 1, 10)
+        icon = self._attack_icon(aid, 56)
+        uk.blit_surface(screen, icon, icon.get_rect(center=(r.centerx, r.y + 14 + 28)))
+        label = aid.replace("_", " ").title()
+        fg = _T.TEXT_PRIMARY if selected else uk.lerp_color(_T.TEXT_MUTED, _T.TEXT_PRIMARY, t)
+        self._text_mid(screen, self.f_sm, label, fg, r.centerx, r.bottom - 22, "c", max_w=r.w - 14)
+        if selected:
+            badge = pygame.Rect(0, 0, 22, 22)
+            badge.topright = (r.right - 6, r.y + 6)
+            uk.draw_circle_on(screen, _T.GOLD, badge.center, 11)
+            _ic_check(screen, badge, (30, 24, 10), 3)
 
-        # ── Charged Melee style ──────────────────────────────────────
-        # Holding the melee attack button (see Player.start_charging_melee)
-        # rolls into either a forward lunge or a rooted in-place spin once
-        # fully charged — pick which one this character uses. Read by
-        # Game._reload_attack_config() into player.charged_melee_style.
-        y += 14
-        mx, my = pygame.mouse.get_pos()
-        draw_label(surf, font_sm, "Charged Melee Style", lx, y + 6)
-        style = self.cfg["attacks"].get("charged_melee_style", "lunge")
-        style_btn = pygame.Rect(fx, y + 2, 140, 28)
-        self._charged_melee_style_rect = style_btn
-        draw_button(surf, font_sm, style_btn, "Lunge" if style == "lunge" else "Spin",
-                   hover=style_btn.collidepoint(mx, my))
-        y += row_h
+        def toggle(pos, aid=aid):
+            if aid in equipped:
+                equipped.remove(aid)
+            else:
+                equipped.append(aid)
+            self._mark_dirty()
 
-        # ── Equipped Attacks (icon picker) ──────────────────────────
-        # Click an icon to toggle whether this character has that attack
-        # equipped — see discover_attacks() for where the roster comes
-        # from, and the TAB_ATTACKS block in CharacterCreator.handle_input
-        # for the click handling that pairs with this layout.
-        y += 14
-        draw_section_header(surf, font_sm, "Equipped Attacks", pygame.Rect(lx, y + 4, fw + 80, 0))
-        y += 30
+        self._add_hit(rect, key=("atk", aid), down=toggle)
 
-        if not self.available_attacks:
-            hint = render_text_cached(
-                font_sm,
-                "No attacks found in assets/sprites/attacks/ — add an attack "
-                "folder (e.g. 'ki_blast') to populate this list.",
-                C_TEXT_DIM,
-            )
-            surf.blit(hint, (lx, y + 4))
-            return
+    # ══════════════════════════════════════════════════════════════
+    #  Tab: Transformations
+    # ══════════════════════════════════════════════════════════════
 
-        self._attack_grid_y0 = y
-        self._build_attack_grid()
-
-        mx, my = pygame.mouse.get_pos()
-        for aid, icon_rect in self.attack_btn_rects.items():
-            selected = aid in self.equipped_attacks
-            hovered  = icon_rect.collidepoint(mx, my)
-
-            # load_attack_icon() already enlarges small native icons, so
-            # this is display-ready regardless of the source art's size.
-            icon = load_attack_icon(aid)
-            # Re-use the icon's actual dimensions for the drawn rect in case
-            # icons have varying sizes (future-proofing).
-            draw_rect = pygame.Rect(icon_rect.x, icon_rect.y,
-                                    icon.get_width(), icon.get_height())
-            frame      = draw_rect.inflate(8, 8)
-            bg_col     = C_SELECTED if selected else (C_HOVER if hovered else C_PANEL_DARK)
-            border_col = C_ACCENT   if selected else C_BORDER
-            surf.draw_rect(bg_col, frame, border_radius=6)
-            surf.draw_rect(border_col, frame, 2 if selected else 1, border_radius=6)
-            surf.blit(icon, draw_rect.topleft)
-
-            # Cached: attack id is fixed, "selected" only ever toggles
-            # between two colours, so the label set is small and stable.
-            label = render_text_cached(
-                font_sm, aid.replace("_", " ").title(), C_TEXT if selected else C_TEXT_DIM
-            )
-            surf.blit(label, label.get_rect(centerx=draw_rect.centerx, top=draw_rect.bottom + 6))
-
-        bottom = max(r.bottom for r in self.attack_btn_rects.values()) + 24
-        hint = render_text_cached(
-            font_sm, "Click an icon to equip / unequip that attack for this character.", C_TEXT_DIM
-        )
-        surf.blit(hint, (lx, bottom))
-
-    def _draw_transformations(self, surf, font, font_sm, lx, fx, fw, row_h, dt):
-        mx, my  = pygame.mouse.get_pos()
+    def _tab_transform(self, screen, x, y, w) -> int:
+        y0, fh = y, self.m_field_h
         visible = self.visible_transformations()
-        has_tf  = bool(visible)
-        y = self.panel.y + 60
+        has = bool(visible)
+        if has and not (0 <= self.tf_idx < len(visible)):
+            self.tf_idx = 0
+            self._sync_tf_form_idx()
+        costume = self._current_costume()
 
-        # ── Stepper: step through this costume's own transformations ──
-        draw_label(surf, font_sm, f"Preview ({self._current_costume()})", lx, y + 6)
-        arr_l = pygame.Rect(fx,       y + 2, 26, 26)
-        arr_r = pygame.Rect(fx + 160, y + 2, 26, 26)
-        draw_button(surf, font_sm, arr_l, "◄", hover=has_tf and arr_l.collidepoint(mx, my))
-        draw_button(surf, font_sm, arr_r, "►", hover=has_tf and arr_r.collidepoint(mx, my))
-        if has_tf:
-            tf = visible[self.transform_idx]
-            name_txt = tf.get("display_name") or tf.get("id", "—")
-            counter  = f"({self.transform_idx + 1}/{len(visible)})"
+        y += self._field_label(screen, f"Transformation ({costume})", x, y)
+        sq = fh
+        st_w = _clamp(w - sq - sq - 24, 200, 440)
+        if has:
+            tf0 = visible[self.tf_idx]
+            name = tf0.get("display_name") or tf0.get("id", "-")
+            sub = f"{self.tf_idx + 1}/{len(visible)}"
         else:
-            name_txt, counter = "— none —", ""
-        surf.blit(render_text_cached(font, name_txt, C_TEXT), (fx + 34, y + 5))
-        if counter:
-            surf.blit(render_text_cached(font_sm, counter, C_TEXT_DIM), (fx + 200, y + 8))
-        y += row_h
+            name, sub = "- none -", ""
+        self._stepper(screen, "tf_sel", pygame.Rect(x, y, st_w, fh), name, sub,
+                      lambda: self._tf_step(-1), lambda: self._tf_step(1), enabled=has and len(visible) > 1)
+        bx = x + st_w + 12
+        self._icon_btn(screen, "tf_add", pygame.Rect(bx, y, sq, sq), self._icon_plus_png,
+                       on_click=lambda: self._open_input(
+                           "New transformation",
+                           f"Enter an ID for the new transformation of '{costume}' (e.g. ssj, ssj2, kaioken).",
+                           self._do_add_transformation),
+                       tip="Add a transformation to this costume")
+        self._icon_btn(screen, "tf_rem", pygame.Rect(bx + sq + 12, y, sq, sq), self._icon_trash_png,
+                       danger=True, enabled=has,
+                       on_click=lambda: self._open_confirm(
+                           "Remove transformation",
+                           f"Remove '{(self._tf() or {}).get('id', '')}' from the list?",
+                           self._do_remove_transformation, "Remove"),
+                       tip="Remove the selected transformation")
+        y += fh + 24
 
-        # ── Add / Remove ─────────────────────────────────────────────
-        btn_add    = pygame.Rect(fx,       y + 2, 150, 28)
-        btn_remove = pygame.Rect(fx + 160, y + 2, 110, 28)
-        draw_button(surf, font_sm, btn_add, "+ Add Transformation",
-                    hover=btn_add.collidepoint(mx, my))
-        if has_tf:
-            draw_button(surf, font_sm, btn_remove, "Remove", danger=True,
-                        hover=btn_remove.collidepoint(mx, my))
-        y += row_h
+        if not has:
+            y += self._note(screen, x, y, w, f"'{costume}' has no transformations yet. Click Add to create one "
+                                              "(e.g. 'ssj', 'ssj2', 'kaioken').", _T.TEXT_MUTED, self.f_md)
+            return y - y0
 
-        if not has_tf:
-            hint = render_text_cached(
-                font_sm,
-                f"'{self._current_costume()}' has no transformations yet — click "
-                "+ Add Transformation (e.g. 'ssj', 'ssj2', 'kaioken') to create one.",
-                C_TEXT_DIM,
-            )
-            surf.blit(hint, (lx, y + 10))
-            return
+        tf = visible[self.tf_idx]
+        tfk = tf.get("costume") or tf.get("id", "")
+        y += self._caption(screen, "Edit selected", x, y, w)
 
-        draw_section_header(surf, font_sm, "Edit Selected",
-                            pygame.Rect(lx, y + 14, fw + 80, 0))
-        y += 30
+        # Display name + Form + Requires side by side when there's room.
+        cols = 3 if w >= 900 else (2 if w >= 620 else 1)
+        gap = 24
+        cw = (w - gap * (cols - 1)) // cols
+        cells = []
 
-        draw_label(surf, font_sm, "Display Name", lx, y + 6)
-        if self.transform_name_input:
-            self.transform_name_input.rect.y = y
-            self.transform_name_input.draw(surf, font_sm, dt,
-                                            placeholder="Click to add a display name...")
-        y += row_h
+        def set_name(v):
+            if tf.get("display_name") != v:
+                tf["display_name"] = v
+                self._mark_dirty()
 
-        draw_label(surf, font_sm, "Form", lx, y + 6)
-        c_arr_l = pygame.Rect(fx,       y + 2, 26, 26)
-        c_arr_r = pygame.Rect(fx + 160, y + 2, 26, 26)
-        draw_button(surf, font_sm, c_arr_l, "◄", hover=c_arr_l.collidepoint(mx, my))
-        draw_button(surf, font_sm, c_arr_r, "►", hover=c_arr_r.collidepoint(mx, my))
-        picker_list = self.transform_forms
-        form_display = picker_list[self.transform_costume_idx] if picker_list else "—"
-        costume_lbl = render_text_cached(font, form_display, C_TEXT)
-        surf.blit(costume_lbl, (fx + 34, y + 5))
-        y += row_h
+        cells.append(("Display name", lambda r: self._text_field(
+            screen, f"tf_name:{tfk}", r, lambda: tf.get("display_name", ""), set_name, "Display name",
+            max_len=40)))
+        forms = self.transform_forms
+        form_txt = forms[self.tf_form_idx] if forms and 0 <= self.tf_form_idx < len(forms) else "-"
+        cells.append(("Form (sprite folder)", lambda r: self._stepper(
+            screen, "tf_form", r, form_txt, f"{self.tf_form_idx + 1}/{len(forms)}" if len(forms) > 1 else "",
+            lambda: self._tf_form_step(-1), lambda: self._tf_form_step(1), enabled=len(forms) > 1)))
 
-        # ── Requires — the prerequisite tier this form needs before it can
-        # be transformed into (e.g. SSJ3 requiring SSJ). None (default)
-        # means it's reachable directly from the untransformed state, same
-        # as every transformation before this feature existed. Once set,
-        # this form gets its own slot in the TAB ki-mode cycle instead of
-        # sharing the costume's main transform slot — see game.py's
-        # _transform_mode_slots() — and pressing the transform key on that
-        # slot only works while the player is currently in the required
-        # form.
-        draw_label(surf, font_sm, "Requires", lx, y + 6)
-        req_arr_l = pygame.Rect(fx,       y + 2, 26, 26)
-        req_arr_r = pygame.Rect(fx + 160, y + 2, 26, 26)
-        req_candidates = self._requires_candidates()
-        draw_button(surf, font_sm, req_arr_l, "◄",
-                    hover=bool(req_candidates) and req_arr_l.collidepoint(mx, my))
-        draw_button(surf, font_sm, req_arr_r, "►",
-                    hover=bool(req_candidates) and req_arr_r.collidepoint(mx, my))
-        if self.transform_requires:
-            req_tf = next((t for t in visible if self._form_name_of(t) == self.transform_requires), None)
-            req_label = (req_tf.get("display_name") if req_tf else None) or self.transform_requires
+        options = [None] + self._requires_candidates()
+        cur = tf.get("requires")
+        if cur:
+            req_tf = next((t for t in visible if self._form_name_of(t) == cur), None)
+            req_txt = (req_tf.get("display_name") if req_tf else None) or cur
         else:
-            req_label = "None (base form)"
-        surf.blit(render_text_cached(font, req_label, C_TEXT), (fx + 34, y + 5))
-        y += row_h
+            req_txt = "None (base form)"
+        cells.append(("Requires", lambda r: self._stepper(
+            screen, "tf_req", r, req_txt, "", lambda: self._tf_requires_step(-1),
+            lambda: self._tf_requires_step(1), enabled=len(options) > 1)))
 
-        LABELS = {
-            "sprite_width":  "Sprite Width",
-            "sprite_height": "Sprite Height",
-            "power_mult":   "Power x",
-            "defense_mult": "Defense x",
-            "speed_mult":   "Speed x",
-            "ki_drain":     "Ki Drain /s",
-        }
-        for key in ("sprite_width", "sprite_height", "power_mult", "defense_mult", "speed_mult", "ki_drain"):
-            sl = self.transform_sliders.get(key)
-            if not sl:
+        for i in range(0, len(cells), cols):
+            for c, (label, draw_cell) in enumerate(cells[i:i + cols]):
+                cx = x + c * (cw + gap)
+                ly = self._field_label(screen, label, cx, y)
+                draw_cell(pygame.Rect(cx, y + ly, cw, fh))
+            y += (self.f_sm.cap_h + 8) + fh + 18
+
+        y += 6
+        y += self._caption(screen, "Multipliers and size", x, y, w)
+        specs = [
+            dict(key="tf:sprite_width", label="Sprite width", vmin=4, vmax=256, step=1, fmt="{:.0f}px",
+                 get=lambda: tf.get("sprite_width", self.cfg.get("sprite_width", 32)),
+                 set=self._num_setter(tf, "sprite_width", "int")),
+            dict(key="tf:sprite_height", label="Sprite height", vmin=4, vmax=256, step=1, fmt="{:.0f}px",
+                 get=lambda: tf.get("sprite_height", self.cfg.get("sprite_height", 32)),
+                 set=self._num_setter(tf, "sprite_height", "int")),
+            dict(key="tf:power_mult", label="Power multiplier", vmin=0.5, vmax=5.0, step=0.05, fmt="{:.2f}x",
+                 get=lambda: tf.get("power_mult", 1.0), set=self._num_setter(tf, "power_mult", "f2")),
+            dict(key="tf:defense_mult", label="Defense multiplier", vmin=0.5, vmax=5.0, step=0.05, fmt="{:.2f}x",
+                 get=lambda: tf.get("defense_mult", 1.0), set=self._num_setter(tf, "defense_mult", "f2")),
+            dict(key="tf:speed_mult", label="Speed multiplier", vmin=0.5, vmax=5.0, step=0.05, fmt="{:.2f}x",
+                 get=lambda: tf.get("speed_mult", 1.0), set=self._num_setter(tf, "speed_mult", "f2")),
+            dict(key="tf:ki_drain", label="Ki drain", vmin=0.0, vmax=50.0, step=0.5, fmt="{:.1f}/s",
+                 get=lambda: tf.get("ki_drain", 0.0), set=self._num_setter(tf, "ki_drain", "f1")),
+        ]
+        # Sliders are keyed by form so a drag can't carry over between forms.
+        for sp in specs:
+            sp["key"] = f"{sp['key']}:{tfk}"
+        y += self._slider_grid(screen, x, y, w, specs)
+
+        y += 4
+        y += self._caption(screen, "Transformation sequence", x, y, w)
+        bar_on = bool(tf.get("ki_bar_enabled", True))
+
+        def toggle_bar():
+            tf["ki_bar_enabled"] = not bool(tf.get("ki_bar_enabled", True))
+            self._mark_dirty()
+
+        y += self._checkbox(screen, f"tf_bar:{tfk}", x, y, w, "Show charge bar", bar_on, toggle_bar)
+        y += 10
+        if bar_on:
+            spec = [dict(key=f"tf:charge_duration:{tfk}", label="Charge duration", vmin=0.5, vmax=10.0, step=0.05,
+                         fmt="{:.2f}s", get=lambda: tf.get("charge_duration") or 3.75,
+                         set=self._num_setter(tf, "charge_duration", "f2"))]
+            y += self._slider_grid(screen, x, y, w, spec)
+        else:
+            y += self._note(screen, x, y, w, "Bar disabled - the transform animation plays through at its own "
+                                             "pace.") + 14
+
+        y += 6
+        y += self._caption(screen, "Ki bar color", x, y, w)
+        custom = bool(tf.get("ki_color"))
+
+        def toggle_color():
+            if tf.get("ki_color"):
+                self._tf_color_memory[tfk] = tf["ki_color"]
+                tf["ki_color"] = None
+            else:
+                tf["ki_color"] = self._tf_color_memory.get(tfk) or "#FFD700"
+            self._mark_dirty()
+
+        y += self._checkbox(screen, f"tf_kic:{tfk}", x, y, w, "Custom", custom, toggle_color)
+        if custom:
+            y += 12
+
+            def set_ki(hx):
+                tf["ki_color"] = hx
+                self._mark_dirty()
+
+            y += self._color_picker(screen, f"kicolor:{tfk}", x, y, min(w, 420), lambda: tf.get("ki_color") or "#FFD700",
+                                    set_ki)
+        else:
+            y += 6
+            y += self._note(screen, x, y, w, "Off: the bar keeps the colours baked into its artwork.")
+        return y - y0
+
+    # ══════════════════════════════════════════════════════════════
+    #  Tab: Preview (every animation of one form, animated)
+    # ══════════════════════════════════════════════════════════════
+
+    def _thumb_frames(self, form: str, box: int) -> list:
+        key = (self.selected_id, form, box)
+        frames = self._thumbs.get(key)
+        if frames is None:
+            frames = [_fit_surface(f, box, box) for f in load_walk_frames(self.selected_id, form)]
+            self._thumbs[key] = frames
+        return frames
+
+    def _ensure_grid(self) -> None:
+        key = (self.selected_id, self.preview_form)
+        if self._grid_key != key:
+            self._grid_key = key
+            self._grid_anims = discover_animations(self.selected_id, self.preview_form)
+            self._grid_scaled_cache = {}
+
+    def _grid_frames(self, name: str, area_w: int, area_h: int) -> list:
+        key = (name, area_w, area_h)
+        frames = self._grid_scaled_cache.get(key)
+        if frames is None:
+            frames = [_fit_surface(f, area_w, area_h) for f in self._grid_anims.get(name, [])]
+            self._grid_scaled_cache[key] = frames
+        return frames
+
+    def _tab_preview(self, screen, x, y, w) -> int:
+        y0 = y
+        forms = self._all_preview_forms()
+        y += self._caption(screen, "Form", x, y, w, right=f"{len(forms)}")
+        gap, chip_h = 12, 68
+        cols = max(1, (w + gap) // (230 + gap))
+        chip_w = (w - gap * (cols - 1)) // cols
+        for i, form in enumerate(forms):
+            r, c = divmod(i, cols)
+            rect = pygame.Rect(x + c * (chip_w + gap), y + r * (chip_h + gap), chip_w, chip_h)
+            self._form_chip(screen, form, rect, i, len(forms))
+        y += ((len(forms) + cols - 1) // cols) * (chip_h + gap) + 8
+
+        self._ensure_grid()
+        anims = self._grid_anims
+        y += self._caption(screen, "Animations", x, y, w, right=f"{len(anims)}")
+        if not anims:
+            y += self._note(screen, x, y, w, "No animations found for this character / form.", _T.TEXT_MUTED,
+                            self.f_md)
+            return y - y0
+        cols = max(2, (w + gap) // (200 + gap))
+        cw = (w - gap * (cols - 1)) // cols
+        ch = min(cw + 26, 250)
+        head = self.f_sm.line_h + 18
+        for i, name in enumerate(anims):
+            r, c = divmod(i, cols)
+            rect = pygame.Rect(x + c * (cw + gap), y + r * (ch + gap), cw, ch)
+            if self._vp is not None and not rect.colliderect(self._vp):
                 continue
-            draw_label(surf, font_sm, LABELS[key], lx, y + 6)
-            sl.rect.y = y + 6
-            sl.draw(surf, font_sm)
-            y += row_h
-
-        # ── Show Charge Bar — checked (default) plays the usual charge-up:
-        # the transformed-ki bar fills over "Charge Duration" seconds and
-        # the transform sprite holds on frames 2<->3 until it does.
-        # Unchecked skips the hold entirely — the transform animation just
-        # plays straight through at its own natural pace, with no bar, and
-        # the player lands in the transformed state the moment it finishes.
-        draw_label(surf, font_sm, "Show Charge Bar", lx, y + 6)
-        bar_cb_rect = pygame.Rect(fx, y + 4, 20, 20)
-        surf.draw_rect(C_PANEL_DARK, bar_cb_rect, border_radius=3)
-        surf.draw_rect(C_BORDER, bar_cb_rect, 1, border_radius=3)
-        if self.transform_ki_bar_enabled:
-            surf.draw_line(C_ACCENT, bar_cb_rect.topleft, bar_cb_rect.bottomright, 2)
-            surf.draw_line(C_ACCENT, bar_cb_rect.topright, bar_cb_rect.bottomleft, 2)
-        self._tf_ki_bar_enabled_checkbox_rect = bar_cb_rect
-        y += row_h
-
-        if self.transform_ki_bar_enabled:
-            dur_sl = self.transform_sliders.get("charge_duration")
-            if dur_sl:
-                draw_label(surf, font_sm, "Charge Duration", lx, y + 6)
-                dur_sl.rect.y = y + 6
-                dur_sl.draw(surf, font_sm)
-                y += row_h
-        else:
-            hint = render_text_cached(
-                font_sm,
-                "Bar disabled — the transform animation plays through at its own pace.",
-                C_TEXT_DIM,
-            )
-            surf.blit(hint, (lx, y + 6))
-            y += row_h
-
-        # ── Ki Bar Color override — hue-strip + SV-square picker, same
-        # widget style as the Identity tab's Gate Color. Unchecked =
-        # keep using transformed_ki_bar.png's baked-in colors as before;
-        # checked = recolor that bar art to this hue at the player's
-        # current lightness pattern (see SpriteHUD._get_recolored_bar_surface).
-        draw_label(surf, font_sm, "Ki Bar Color", lx, y + 6)
-        cb_rect = pygame.Rect(fx, y + 4, 20, 20)
-        surf.draw_rect(C_PANEL_DARK, cb_rect, border_radius=3)
-        surf.draw_rect(C_BORDER, cb_rect, 1, border_radius=3)
-        if self.transform_ki_color_enabled:
-            surf.draw_line(C_ACCENT, cb_rect.topleft, cb_rect.bottomright, 2)
-            surf.draw_line(C_ACCENT, cb_rect.topright, cb_rect.bottomleft, 2)
-        self._tf_ki_color_checkbox_rect = cb_rect
-        cb_lbl = render_text_cached(font_sm, "Custom", C_TEXT_DIM)
-        surf.blit(cb_lbl, (cb_rect.right + 8, y + 7))
-        y += row_h
-
-        if self.transform_ki_color_enabled:
-            preview_rect = pygame.Rect(fx, y + 2, 30, 22)
-            surf.draw_rect(hex_to_rgb(self.transform_ki_color), preview_rect, border_radius=4)
-            surf.draw_rect(C_BORDER, preview_rect, 1, border_radius=4)
-            hex_lbl = render_text_cached(font_sm, self.transform_ki_color.upper(), C_TEXT_DIM)
-            surf.blit(hex_lbl, (preview_rect.right + 10, y + 7))
-            y += 32
-
-            hue, sat, val = self._ki_color_hsv()
-            sv_w, sv_h, hue_w, gap = 130, 90, 18, 10
-
-            sv_rect = pygame.Rect(fx, y, sv_w, sv_h)
-            sv_surf = self._get_sv_square_surface(hue, sv_w, sv_h)
-            surf.blit(sv_surf, sv_rect.topleft)
-            surf.draw_rect(C_BORDER, sv_rect, 1)
-
-            sv_cursor_x = sv_rect.left + int(sat * sv_rect.width)
-            sv_cursor_y = sv_rect.top + int((1 - val) * sv_rect.height)
-            ring_color = (255, 255, 255) if val < 0.6 else (0, 0, 0)
-            surf.draw_circle(ring_color, (sv_cursor_x, sv_cursor_y), 6, 2)
-
-            hue_rect = pygame.Rect(sv_rect.right + gap, y, hue_w, sv_h)
-            hue_surf = self._get_hue_strip_surface(hue_w, sv_h)
-            surf.blit(hue_surf, hue_rect.topleft)
-            surf.draw_rect(C_BORDER, hue_rect, 1)
-
-            hue_marker_y = hue_rect.top + int(hue * hue_rect.height)
-            marker_rect = pygame.Rect(hue_rect.left - 2, hue_marker_y - 2, hue_rect.width + 4, 4)
-            surf.draw_rect((255, 255, 255), marker_rect, 1)
-
-            self._tf_color_sv_rect  = sv_rect
-            self._tf_color_hue_rect = hue_rect
-            y += sv_h + 14
-        else:
-            self._tf_color_sv_rect  = None
-            self._tf_color_hue_rect = None
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  Character List Panel (left sidebar)
-# ══════════════════════════════════════════════════════════════════════
-
-class CharacterList:
-    ITEM_H = 36
-
-    def __init__(self, rect: pygame.Rect):
-        self.rect        = rect
-        self.chars: list[str] = []
-        self.selected    = ""
-        self.scroll      = 0
-        self._hovered    = ""
-
-        # Reorder controls (▲/▼ buttons in the reserved bottom strip).
-        # order_changed is set True right after a successful move; the
-        # owner (CharacterCreator) checks it each frame and is
-        # responsible for persisting self.chars via save_character_order()
-        # and clearing the flag.
-        self.order_changed = False
-
-    def set_chars(self, chars: list[str], selected: str = "") -> None:
-        self.chars    = chars
-        self.selected = selected or (chars[0] if chars else "")
-
-    def _reorder_button_rects(self) -> tuple[pygame.Rect, pygame.Rect]:
-        """Rects for the ▲ Up / ▼ Down buttons, in the strip reserved
-        below the scrollable item list."""
-        bar_y = self.rect.bottom - 38
-        half  = (self.rect.w - 16) // 2
-        btn_up   = pygame.Rect(self.rect.x + 6, bar_y, half, 28)
-        btn_down = pygame.Rect(btn_up.right + 4, bar_y, half, 28)
-        return btn_up, btn_down
-
-    def move_selected(self, delta: int) -> bool:
-        """Swap the selected character with its neighbor delta steps away
-        (-1 = up, +1 = down). Returns True if a swap happened."""
-        if not self.selected or self.selected not in self.chars:
-            return False
-        i = self.chars.index(self.selected)
-        j = i + delta
-        if not (0 <= j < len(self.chars)):
-            return False
-        self.chars[i], self.chars[j] = self.chars[j], self.chars[i]
-        self._ensure_visible(j)
-        return True
-
-    def _ensure_visible(self, index: int) -> None:
-        """Scroll just enough so the row at `index` is on-screen."""
-        visible_count = max(1, (self.rect.h - 80) // self.ITEM_H)
-        if index < self.scroll:
-            self.scroll = index
-        elif index >= self.scroll + visible_count:
-            self.scroll = index - visible_count + 1
-        self.scroll = max(0, min(self.scroll, max(0, len(self.chars) - 1)))
-
-    def handle_event(self, event: pygame.event.Event) -> Optional[str]:
-        """Returns char_id if selection changed, else None."""
-        visible_rect = self.rect.inflate(0, -80)   # leave room for button
-        if event.type == pygame.MOUSEWHEEL:
-            if visible_rect.collidepoint(pygame.mouse.get_pos()):
-                self.scroll = max(0, min(
-                    len(self.chars) - 1,
-                    self.scroll - event.y
-                ))
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            mx, my = event.pos
-
-            btn_up, btn_down = self._reorder_button_rects()
-            if btn_up.collidepoint(mx, my):
-                if self.move_selected(-1):
-                    self.order_changed = True
-                return None
-            if btn_down.collidepoint(mx, my):
-                if self.move_selected(1):
-                    self.order_changed = True
-                return None
-
-            for i, cid in enumerate(self.chars):
-                item_y = visible_rect.y + (i - self.scroll) * self.ITEM_H
-                item_r = pygame.Rect(visible_rect.x, item_y,
-                                     visible_rect.w, self.ITEM_H)
-                if item_r.collidepoint(mx, my) and visible_rect.collidepoint(mx, my):
-                    if self.selected != cid:
-                        self.selected = cid
-                        return cid
-        return None
-
-    def draw(self, surf: pygame.Surface, font: pygame.font.Font,
-             font_sm: pygame.font.Font, dirty_id: str) -> None:
-        surf.draw_rect(C_PANEL_DARK, self.rect, border_radius=6)
-        surf.draw_rect(C_BORDER,     self.rect, 1, border_radius=6)
-
-        hdr = render_text_cached(font_sm, "CHARACTERS", C_TEXT_DIM)
-        surf.blit(hdr, (self.rect.x + 12, self.rect.y + 10))
-
-        mx, my = pygame.mouse.get_pos()
-        visible_rect = pygame.Rect(self.rect.x, self.rect.y + 34,
-                                   self.rect.w, self.rect.h - 80)
-
-        old_clip = surf.get_clip()
-        surf.set_clip(visible_rect)
-
-        for i, cid in enumerate(self.chars):
-            item_y = visible_rect.y + (i - self.scroll) * self.ITEM_H
-            item_r = pygame.Rect(visible_rect.x + 2, item_y,
-                                 visible_rect.w - 4, self.ITEM_H - 2)
-            if item_y < visible_rect.top - self.ITEM_H:
-                continue
-            if item_y > visible_rect.bottom:
-                break
-
-            is_sel = (cid == self.selected)
-            is_hov = item_r.collidepoint(mx, my)
-            bg = C_SELECTED if is_sel else (C_HOVER if is_hov else C_PANEL_DARK)
-            surf.draw_rect(bg, item_r, border_radius=4)
-
-            dot_col = C_ACCENT2 if cid == dirty_id else C_TEXT_DIM
-            surf.draw_circle(dot_col,
-                               (item_r.x + 12, item_r.centery), 4)
-
-            # Cached: character ids are a small, fixed set, and each one
-            # only ever appears in the selected/unselected colour.
-            lbl = render_text_cached(font, cid, C_TEXT if is_sel else C_TEXT_DIM)
-            surf.blit(lbl, (item_r.x + 24, item_r.y + (item_r.h - lbl.get_height()) // 2))
-
-        surf.set_clip(old_clip)
-
-        # ── Reorder controls ──────────────────────────────────────
-        btn_up, btn_down = self._reorder_button_rects()
-        surf.draw_line(C_BORDER,
-                         (self.rect.x + 4, btn_up.y - 6),
-                         (self.rect.right - 4, btn_up.y - 6))
-
-        idx      = self.chars.index(self.selected) if self.selected in self.chars else -1
-        can_up   = idx > 0
-        can_down = idx != -1 and idx < len(self.chars) - 1
-
-        draw_button(surf, font_sm, btn_up, "▲ Up",
-                   color=C_ACCENT if can_up else C_TEXT_DIM,
-                   hover=can_up and btn_up.collidepoint(mx, my))
-        draw_button(surf, font_sm, btn_down, "▼ Down",
-                   color=C_ACCENT if can_down else C_TEXT_DIM,
-                   hover=can_down and btn_down.collidepoint(mx, my))
-
-
-# ══════════════════════════════════════════════════════════════════════
-#  Main entry point — non-blocking overlay (matches SpriteEditor /
-#  CutsceneEditor / WorldMapEditor pattern: toggle() / handle_input() /
-#  update(dt) / draw(screen), driven each frame by the host game loop).
-# ══════════════════════════════════════════════════════════════════════
-
-HEADER_H  = 44
-FOOTER_H  = 52
-LIST_W    = 190
-PREVIEW_H = 220
-TAB_H     = 34
-PAD       = 8
-
-
-class CharacterCreator:
-    """
-    Dev-tool overlay for browsing / editing character configs and previewing
-    every discovered animation. Lives inside the host game's main loop —
-    it does not own the display, event polling, or the clock.
-    """
-
-    def __init__(self, screen_width: int, screen_height: int):
-        self.screen_width  = screen_width
-        self.screen_height = screen_height
-        self.active = False
-
-        pygame.font.init()
-        try:
-            self.font    = pygame.font.SysFont("segoeui,dejavusans,arial", 16, bold=False)
-            self.font_sm = pygame.font.SysFont("segoeui,dejavusans,arial", 13, bold=False)
-            self.font_hd = pygame.font.SysFont("segoeui,dejavusans,arial", 20, bold=True)
-        except Exception:
-            self.font = self.font_sm = self.font_hd = pygame.font.Font(None, 18)
-
-        self._build_layout()
-
-        # ── State ───────────────────────────────────────────────────
-        self.active_tab = TAB_IDENTITY
-        self.chars      = []
-        self.char_list  = CharacterList(self.list_rect)
-        self.selected_id = None
-        self.costumes    = ["base"]
-        self.available_attacks: list[str] = []   # global roster, see discover_attacks()
-        self.cfg         = copy.deepcopy(DEFAULT_CONFIG)
-        self.editor      = None
-        self.preview     = SpritePreview(self.preview_rect)
-
-        self.status_msg   = ""
-        self.status_col   = C_TEXT_DIM
-        self.status_timer = 0.0
-
-        # ── Global (non-per-character) settings ──────────────────────
-        self.global_settings = load_global_settings()
-        self.max_level_slider = Slider(
-            pygame.Rect(0, 0, 260, 20),   # rect.y positioned in _draw_settings
-            1, 999, self.global_settings["max_level"], step=1
-        )
-
-        # Non-blocking modal dialog state. None when no dialog is open.
-        # dict keys: kind ('confirm'/'input'), message, field (TextInput,
-        # input-only), error (input-only), on_confirm (callable)
-        self.dialog = None
-
-    # ── Layout ──────────────────────────────────────────────────────
-    def _build_layout(self) -> None:
-        sw, sh = self.screen_width, self.screen_height
-
-        self.list_rect = pygame.Rect(PAD, HEADER_H + PAD,
-                                     LIST_W, sh - HEADER_H - FOOTER_H - PAD * 2)
-        self.preview_rect = pygame.Rect(PAD, sh - FOOTER_H - PREVIEW_H - PAD,
-                                        LIST_W, PREVIEW_H)
-        self.list_rect.height -= PREVIEW_H + PAD
-
-        editor_x = LIST_W + PAD * 2
-        self.editor_rect = pygame.Rect(editor_x, HEADER_H + PAD + TAB_H,
-                                       sw - editor_x - PAD,
-                                       sh - HEADER_H - FOOTER_H - PAD * 2 - TAB_H)
-
-        self.tab_rects: list[pygame.Rect] = []
-        tab_w = self.editor_rect.w // len(TAB_NAMES)
-        for i in range(len(TAB_NAMES)):
-            self.tab_rects.append(pygame.Rect(
-                editor_x + i * tab_w, HEADER_H + PAD, tab_w, TAB_H
-            ))
-
-        self.btn_save   = pygame.Rect(sw - 230, sh - FOOTER_H + 10, 100, 32)
-        self.btn_delete = pygame.Rect(sw - 120, sh - FOOTER_H + 10, 100, 32)
-        self.btn_new    = pygame.Rect(PAD + 4,  sh - FOOTER_H + 10, LIST_W - 8, 32)
-
-    # ── Lifecycle ──────────────────────────────────────────────────
-    def toggle(self) -> None:
-        """Toggle overlay visibility. Refreshes the character list on open."""
-        self.active = not self.active
-        if self.active:
-            self._refresh_char_list()
-
-    def _refresh_char_list(self) -> None:
-        self.chars = discover_characters()
-        self.available_attacks = discover_attacks()
-        self.char_list.set_chars(self.chars)
-        self.selected_id = self.char_list.selected
-        if self.selected_id:
-            self._load_char(self.selected_id)
-        else:
-            self.editor = None
-
-    # ── Character switching ───────────────────────────────────────
-    def _load_char(self, cid: str) -> None:
-        self.selected_id      = cid
-        self.costumes         = discover_costumes(cid)
-        self.cfg              = load_config(cid)
-        # Discover transforms for whichever costume is set in the config (or the first one)
-        cfg_costume = self.cfg.get("costume", "")
-        base_costume = cfg_costume if cfg_costume in self.costumes else (self.costumes[0] if self.costumes else "base")
-        self.transform_forms  = discover_transformations(cid, base_costume)
-        added                 = sync_transformations(self.cfg, self.costumes, self.transform_forms)
-        self.editor           = CharacterEditor(self.editor_rect, cid, self.cfg,
-                                                self.costumes, self.transform_forms,
-                                                self.available_attacks)
-        self.preview.load(cid, base_costume)
-        self.preview.shadow_width = self.cfg.get("shadow_size", 32)
-        if added:
-            self.editor.dirty = True
-            self._set_status("Detected new transformation(s) — Save to keep them")
-
-    def _switch_char(self, cid: str) -> None:
-        if self.editor:
-            self.editor.flush()
-        self._load_char(cid)
-
-    def _set_status(self, msg: str, ok: bool = True) -> None:
-        self.status_msg   = msg
-        self.status_col   = C_GREEN if ok else C_RED
-        self.status_timer = 3.0
-
-    # ── Dialog helpers (non-blocking) ────────────────────────────
-    def _open_confirm(self, message: str, on_confirm) -> None:
-        self.dialog = {"kind": "confirm", "message": message, "on_confirm": on_confirm}
-
-    def _open_input(self, prompt: str, on_confirm, default: str = "") -> None:
-        field = TextInput(pygame.Rect(0, 0, 392, 32), default)  # rect set in _draw_dialog
-        field.active = True
-        field.cursor = len(default)
-        self.dialog = {"kind": "input", "message": prompt, "field": field,
-                       "error": "", "on_confirm": on_confirm}
-
-    def _close_dialog(self) -> None:
-        self.dialog = None
-
-    def _do_delete_selected(self) -> None:
-        deleted_id = self.selected_id
-        delete_config(deleted_id)
-
-        # Remove from the roster itself, not just its config, and persist
-        # that removal so it doesn't reappear next time the panel opens
-        # (discover_characters() would otherwise keep finding its sprite
-        # folder and re-adding it to the list).
-        removed = load_removed_characters()
-        removed.add(deleted_id)
-
-        if deleted_id in self.chars:
-            self.chars.remove(deleted_id)
-        save_character_menu(self.chars, removed)
-        self.char_list.set_chars(self.chars)
-
-        self._set_status(f"Deleted {deleted_id}", ok=False)
-
-        self.selected_id = self.char_list.selected
-        if self.selected_id:
-            self._load_char(self.selected_id)
-        else:
-            self.editor = None
-
-    def _do_create_char(self, new_id: str) -> None:
-        order, removed = load_character_menu()
-        removed.discard(new_id)
-        if new_id not in self.chars:
-            self.chars.append(new_id)   # lands at the end of the menu order;
-            self.char_list.set_chars(self.chars, new_id)   # move it with ▲/▼ if needed
-        save_character_menu(self.chars, removed)
-        self._switch_char(new_id)
-
-    # ── Transformations ──────────────────────────────────────────
-    def _reset_transform_scope(self) -> None:
-        """Switching the Identity-tab costume changes which transformations
-        are in scope, so re-point transform_idx/widgets at the new costume's
-        own list instead of leaving them on the previous costume's entry."""
-        ed = self.editor
-        if not ed:
-            return
-        visible = ed.visible_transformations()
-        ed.transform_idx = 0 if visible else -1
-        ed._load_transform_widgets()
-
-    def _set_transform_preview(self, costume: str) -> None:
-        """Show the given costume's sprites in both the sidebar quick
-        preview and the Preview-tab animation grid.
-
-        Accepts base costume names and transformation paths like
-        '{costume}/transformations/ssj' (which are not in self.costumes)."""
-        if not self.editor or not self.selected_id:
-            return
-        is_transform = "/transformations/" in costume
-        if not is_transform and costume not in self.costumes:
-            costume = self.costumes[0] if self.costumes else "base"
-        self.preview.load(self.selected_id, costume)
-        self.editor._reload_anim_grid(self.selected_id, costume)
-        # The Preview tab's dropdown label is driven by preview_form_idx,
-        # not by whatever the grid happens to currently hold — without
-        # this, switching forms here (sidebar/grid) leaves that index
-        # pointing at the old form, so the Preview tab shows a label like
-        # "base" next to sprites that are actually SSJ until the dropdown
-        # is opened and a selection is made there.
-        all_forms = self.editor._all_preview_forms()
-        if costume in all_forms:
-            self.editor.preview_form_idx = all_forms.index(costume)
-
-    def _do_add_transformation(self, raw_id: str) -> None:
-        if not self.editor:
-            return
-        ed = self.editor
-        existing = {t.get("id") for t in ed.transformations}
-        new_id, n = raw_id or "transformation", 2
-        while new_id in existing:
-            new_id = f"{raw_id}_{n}"
-            n += 1
-        base_costume = ed._current_costume()
-        # A new transformation always belongs to the costume that's selected
-        # right now — it's stored nested under that costume, never as a bare
-        # costume name, since a costume is not itself a transformation.
-        if ed.transform_forms:
-            form = ed.transform_forms[ed.transform_costume_idx]
-        else:
-            form = new_id
-        default_costume = f"{base_costume}/transformations/{form}"
-        ed.transformations.append({
-            "id":            new_id,
-            "display_name":  new_id.replace("_", " ").title(),
-            "costume":       default_costume,
-            "sprite_width":  int(ed.cfg.get("sprite_width", 32)),
-            "sprite_height": int(ed.cfg.get("sprite_height", 32)),
-            "power_mult":    1.0,
-            "defense_mult":  1.0,
-            "speed_mult":    1.0,
-            "ki_drain":      0.0,
-            "ki_color":      None,
-            "ki_bar_enabled":   True,
-            "charge_duration":  None,
-            "requires":         None,
-        })
-        ed.transform_idx = len(ed.visible_transformations()) - 1
-        ed._load_transform_widgets()
-        ed.dirty = True
-        self._set_transform_preview(default_costume)
-        self._set_status(f"Added transformation '{new_id}' to '{base_costume}'")
-
-    def _do_remove_transformation(self) -> None:
-        ed = self.editor
-        if not ed:
-            return
-        visible = ed.visible_transformations()
-        if not (0 <= ed.transform_idx < len(visible)):
-            return
-        removed = visible[ed.transform_idx]
-        ed.transformations.remove(removed)
-        # Remember this costume path was deliberately deleted so
-        # sync_transformations() doesn't silently re-add it next time this
-        # character is loaded, as long as its sprite folder still exists.
-        removed_costume = removed.get("costume", "")
-        if removed_costume:
-            ed.cfg.setdefault("removed_transformations", [])
-            if removed_costume not in ed.cfg["removed_transformations"]:
-                ed.cfg["removed_transformations"].append(removed_costume)
-        new_visible = ed.visible_transformations()
-        ed.transform_idx = min(ed.transform_idx, len(new_visible) - 1) if new_visible else -1
-        ed._load_transform_widgets()
-        ed.dirty = True
-        if new_visible:
-            self._set_transform_preview(new_visible[ed.transform_idx].get("costume", ""))
-        else:
-            self._set_transform_preview(self.cfg.get("costume", "base"))
-        self._set_status(f"Removed transformation '{removed.get('id', '')}'", ok=False)
-
-    def _handle_dialog_event(self, event: pygame.event.Event) -> None:
-        d = self.dialog
-        sw, sh = self.screen_width, self.screen_height
-
-        if d["kind"] == "confirm":
-            W, H = 420, 160
-            dlg = pygame.Rect((sw - W) // 2, (sh - H) // 2, W, H)
-            btn_ok = pygame.Rect(dlg.x + 30,      dlg.bottom - 52, 160, 36)
-            btn_no = pygame.Rect(dlg.right - 190, dlg.bottom - 52, 160, 36)
-
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_RETURN:
-                    cb = d["on_confirm"]; self._close_dialog(); cb()
-                elif event.key == pygame.K_ESCAPE:
-                    self._close_dialog()
-            elif event.type == pygame.MOUSEBUTTONDOWN:
-                mx, my = event.pos
-                if btn_ok.collidepoint(mx, my):
-                    cb = d["on_confirm"]; self._close_dialog(); cb()
-                elif btn_no.collidepoint(mx, my):
-                    self._close_dialog()
-
-        elif d["kind"] == "input":
-            W, H = 440, 170
-            dlg = pygame.Rect((sw - W) // 2, (sh - H) // 2, W, H)
-            field_rect = pygame.Rect(dlg.x + 24, dlg.y + 80, W - 48, 32)
-            d["field"].rect = field_rect
-            btn_ok = pygame.Rect(dlg.x + 30,      dlg.bottom - 50, 160, 34)
-            btn_no = pygame.Rect(dlg.right - 190, dlg.bottom - 50, 160, 34)
-
-            def try_submit():
-                v = d["field"].value.strip().lower().replace(" ", "_")
-                if v:
-                    cb = d["on_confirm"]; self._close_dialog(); cb(v)
-                else:
-                    d["error"] = "ID cannot be empty"
-
-            if event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    self._close_dialog(); return
-                if event.key == pygame.K_RETURN:
-                    try_submit(); return
-            d["field"].handle_event(event)
-            if event.type == pygame.MOUSEBUTTONDOWN:
-                mx, my = event.pos
-                if btn_no.collidepoint(mx, my):
-                    self._close_dialog()
-                elif btn_ok.collidepoint(mx, my):
-                    try_submit()
-
-    def _draw_dialog(self, screen: pygame.Surface, dt: float) -> None:
-        d = self.dialog
-        sw, sh = self.screen_width, self.screen_height
-        overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 160))
-        screen.blit(overlay, (0, 0))
-        mx, my = pygame.mouse.get_pos()
-
-        if d["kind"] == "confirm":
-            W, H = 420, 160
-            dlg = pygame.Rect((sw - W) // 2, (sh - H) // 2, W, H)
-            screen.draw_rect(C_DIALOG_BG, dlg, border_radius=8)
-            screen.draw_rect(C_BORDER,    dlg, 1, border_radius=8)
-
-            msg = render_text_cached(self.font, d["message"], C_TEXT)
-            screen.blit(msg, msg.get_rect(centerx=dlg.centerx, top=dlg.y + 28))
-
-            btn_ok = pygame.Rect(dlg.x + 30,      dlg.bottom - 52, 160, 36)
-            btn_no = pygame.Rect(dlg.right - 190, dlg.bottom - 52, 160, 36)
-            for btn, lbl, danger in [(btn_ok, "Confirm", True), (btn_no, "Cancel", False)]:
-                draw_button(screen, self.font_sm, btn, lbl, danger=danger,
-                           hover=btn.collidepoint(mx, my))
-
-        elif d["kind"] == "input":
-            W, H = 440, 170
-            dlg = pygame.Rect((sw - W) // 2, (sh - H) // 2, W, H)
-            screen.draw_rect(C_DIALOG_BG, dlg, border_radius=8)
-            screen.draw_rect(C_BORDER,    dlg, 1, border_radius=8)
-
-            msg = render_text_cached(self.font, d["message"], C_TEXT)
-            screen.blit(msg, (dlg.x + 24, dlg.y + 24))
-
-            d["field"].rect = pygame.Rect(dlg.x + 24, dlg.y + 80, W - 48, 32)
-            d["field"].draw(screen, self.font_sm, dt)
-
-            hint = render_text_cached(self.font_sm, "lowercase, underscores only", C_TEXT_DIM)
-            screen.blit(hint, (dlg.x + 24, d["field"].rect.bottom + 4))
-            if d["error"]:
-                err = render_text_cached(self.font_sm, d["error"], C_RED)
-                screen.blit(err, (dlg.x + 24, d["field"].rect.bottom + 4))
-
-            btn_ok = pygame.Rect(dlg.x + 30,      dlg.bottom - 50, 160, 34)
-            btn_no = pygame.Rect(dlg.right - 190, dlg.bottom - 50, 160, 34)
-            for btn, lbl, danger in [(btn_ok, "Create", False), (btn_no, "Cancel", True)]:
-                draw_button(screen, self.font_sm, btn, lbl, danger=danger,
-                           hover=btn.collidepoint(mx, my))
-
-    # ── Input ──────────────────────────────────────────────────────
-    def handle_input(self, event: pygame.event.Event):
-        """Returns 'close' when the overlay was just closed, else None."""
-        if not self.active:
-            return None
-
-        if self.dialog is not None:
-            self._handle_dialog_event(event)
-            return None
-
-        mx, my = pygame.mouse.get_pos()
-
-        if event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_ESCAPE:
-                if self.editor:
-                    self.editor.flush()
-                self.active = False
-                return "close"
-            if event.key == pygame.K_s and (event.mod & pygame.KMOD_CTRL):
-                if self.editor:
-                    self.editor.flush()
-                    save_config(self.cfg)
-                    self.editor.dirty = False
-                    self._set_status(f"Saved  {self.cfg['id']}.json")
-
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            for i, tr in enumerate(self.tab_rects):
-                if tr.collidepoint(mx, my):
-                    prev_tab = self.active_tab
-                    self.active_tab = i
-                    # The sidebar preview otherwise still shows whatever
-                    # costume the previous tab left it on, and only
-                    # updates once the user clicks a form arrow inside
-                    # this tab — so jump straight to the currently
-                    # selected transformation's form as soon as the tab
-                    # is opened.
-                    if i == TAB_TRANSFORM and i != prev_tab and self.editor:
-                        visible = self.editor.visible_transformations()
-                        idx = self.editor.transform_idx
-                        if 0 <= idx < len(visible):
-                            self._set_transform_preview(visible[idx].get("costume", ""))
-
-            if self.btn_save.collidepoint(mx, my) and self.editor:
-                self.editor.flush()
-                save_config(self.cfg)
-                self.editor.dirty = False
-                self._set_status(f"Saved  {self.cfg['id']}.json")
-
-            if self.btn_delete.collidepoint(mx, my) and self.selected_id:
-                sid = self.selected_id
-                self._open_confirm(f"Delete config for  '{sid}'?", self._do_delete_selected)
-
-            if self.btn_new.collidepoint(mx, my):
-                self._open_input("New character ID:", self._do_create_char)
-
-            if self.active_tab == TAB_IDENTITY and self.editor:
-                arr_l = pygame.Rect(self.editor_rect.x + 140, 0, 26, 26)
-                arr_r = pygame.Rect(self.editor_rect.x + 300, 0, 26, 26)
-                y_costume = self.editor_rect.y + 60 + 2 * 42   # +60 matches _draw_identity's top margin
-                arr_l.y = y_costume + 2
-                arr_r.y = y_costume + 2
-                if arr_l.collidepoint(mx, my):
-                    self.editor.costume_idx = (self.editor.costume_idx - 1) % max(1, len(self.costumes))
-                    self.editor.dirty = True
-                    new_costume = self.costumes[self.editor.costume_idx]
-                    self.transform_forms = discover_transformations(self.selected_id, new_costume)
-                    self.editor.transform_forms = self.transform_forms
-                    self.preview.load(self.selected_id, new_costume)
-                    self.editor._reload_anim_grid(self.selected_id, new_costume)
-                    self._reset_transform_scope()
-                if arr_r.collidepoint(mx, my):
-                    self.editor.costume_idx = (self.editor.costume_idx + 1) % max(1, len(self.costumes))
-                    self.editor.dirty = True
-                    new_costume = self.costumes[self.editor.costume_idx]
-                    self.transform_forms = discover_transformations(self.selected_id, new_costume)
-                    self.editor.transform_forms = self.transform_forms
-                    self.preview.load(self.selected_id, new_costume)
-                    self.editor._reload_anim_grid(self.selected_id, new_costume)
-                    self._reset_transform_scope()
-
-            if self.active_tab == TAB_ATTACKS and self.editor:
-                # _charged_melee_style_rect is kept in sync with
-                # _draw_attacks (set every frame it draws the button), same
-                # pattern as attack_btn_rects below.
-                style_rect = self.editor._charged_melee_style_rect
-                if style_rect and style_rect.collidepoint(mx, my):
-                    atk = self.editor.cfg["attacks"]
-                    atk["charged_melee_style"] = (
-                        "spin" if atk.get("charged_melee_style", "lunge") == "lunge" else "lunge"
-                    )
-                    self.editor.dirty = True
-
-                # attack_btn_rects is kept in sync with _draw_attacks (see
-                # CharacterEditor._build_attack_grid), so it always reflects
-                # the icons currently on screen — no separate layout math
-                # needed here, just hit-test against it directly.
-                for aid, rect in self.editor.attack_btn_rects.items():
-                    if rect.collidepoint(mx, my):
-                        if aid in self.editor.equipped_attacks:
-                            self.editor.equipped_attacks.remove(aid)
-                        else:
-                            self.editor.equipped_attacks.append(aid)
-                        self.editor.dirty = True
-
-            if self.active_tab == TAB_TRANSFORM and self.editor:
-                ed      = self.editor
-                fx_t    = self.editor_rect.x + 140
-                y0      = self.editor_rect.y + 60   # matches _draw_transformations's top margin
-                row_h_  = 42
-                visible = ed.visible_transformations()
-                n       = len(visible)
-
-                arr_l = pygame.Rect(fx_t,       y0 + 2, 26, 26)
-                arr_r = pygame.Rect(fx_t + 160, y0 + 2, 26, 26)
-                if n and arr_l.collidepoint(mx, my):
-                    ed.flush()
-                    ed.transform_idx = (ed.transform_idx - 1) % n
-                    ed._load_transform_widgets()
-                    self._set_transform_preview(ed.visible_transformations()[ed.transform_idx].get("costume", ""))
-                if n and arr_r.collidepoint(mx, my):
-                    ed.flush()
-                    ed.transform_idx = (ed.transform_idx + 1) % n
-                    ed._load_transform_widgets()
-                    self._set_transform_preview(ed.visible_transformations()[ed.transform_idx].get("costume", ""))
-
-                btn_add    = pygame.Rect(fx_t,       y0 + row_h_ + 2, 150, 28)
-                btn_remove = pygame.Rect(fx_t + 160, y0 + row_h_ + 2, 110, 28)
-                if btn_add.collidepoint(mx, my):
-                    self._open_input("New transformation ID:", self._do_add_transformation)
-                if n and btn_remove.collidepoint(mx, my):
-                    tf    = visible[ed.transform_idx]
-                    label = tf.get("display_name") or tf.get("id", "")
-                    self._open_confirm(f"Remove transformation '{label}'?", self._do_remove_transformation)
-
-                picker_list = self.editor.transform_forms
-                y_costume = y0 + 3 * row_h_ + 30   # matches _draw_transformations's "Form" row
-                if n and picker_list:
-                    c_arr_l = pygame.Rect(fx_t,       y_costume + 2, 26, 26)
-                    c_arr_r = pygame.Rect(fx_t + 160, y_costume + 2, 26, 26)
-                    if c_arr_l.collidepoint(mx, my):
-                        ed.flush()
-                        ed.transform_costume_idx = (ed.transform_costume_idx - 1) % len(picker_list)
-                        ed.dirty = True
-                        form = picker_list[ed.transform_costume_idx]
-                        self._set_transform_preview(f"{ed._current_costume()}/transformations/{form}")
-                    if c_arr_r.collidepoint(mx, my):
-                        ed.flush()
-                        ed.transform_costume_idx = (ed.transform_costume_idx + 1) % len(picker_list)
-                        ed.dirty = True
-                        form = picker_list[ed.transform_costume_idx]
-                        self._set_transform_preview(f"{ed._current_costume()}/transformations/{form}")
-
-                # "Requires" stepper — one row below Form (drawn
-                # unconditionally by _draw_transformations regardless of
-                # picker_list, so its click handling lives outside that
-                # gate too). Steps through [None] + every other
-                # transformation on this costume that wouldn't create a
-                # dependency cycle (see CharacterEditor._requires_candidates()).
-                if n:
-                    y_requires = y_costume + row_h_
-                    req_arr_l = pygame.Rect(fx_t,       y_requires + 2, 26, 26)
-                    req_arr_r = pygame.Rect(fx_t + 160, y_requires + 2, 26, 26)
-                    req_options = [None] + ed._requires_candidates()
-                    if len(req_options) > 1 and (req_arr_l.collidepoint(mx, my)
-                                                  or req_arr_r.collidepoint(mx, my)):
-                        ed.flush()
-                        cur_idx = (req_options.index(ed.transform_requires)
-                                   if ed.transform_requires in req_options else 0)
-                        step = -1 if req_arr_l.collidepoint(mx, my) else 1
-                        ed.transform_requires = req_options[(cur_idx + step) % len(req_options)]
-                        ed.dirty = True
-
-        if self.active_tab == TAB_SETTINGS:
-            if self.max_level_slider.handle_event(event):
-                new_max = int(self.max_level_slider.value)
-                if new_max != self.global_settings["max_level"]:
-                    self.global_settings["max_level"] = new_max
-                    save_global_settings(self.global_settings)
-                    self._set_status(f"Max level set to {new_max}")
-
-        new_sel = self.char_list.handle_event(event)
-        if new_sel:
-            self._switch_char(new_sel)
-            self.active_tab = TAB_IDENTITY
-
-        if self.char_list.order_changed:
-            self.char_list.order_changed = False
-            save_character_order(self.char_list.chars)
-            self._set_status("Character order updated")
-
-        if self.editor:
-            self.editor.handle_event(event, self.active_tab)
-            if self.editor._preview_form_changed:
-                self.editor._preview_form_changed = False
-                all_forms = self.editor._all_preview_forms()
-                if all_forms:
-                    self.preview.load(self.selected_id,
-                                      all_forms[self.editor.preview_form_idx])
-
-        return None
-
-    # ── Update ─────────────────────────────────────────────────────
-    def update(self, dt: float) -> None:
-        if not self.active:
-            return
-        self.preview.update(dt)
-        if self.status_timer > 0:
-            self.status_timer -= dt
-
-    # ── Draw ───────────────────────────────────────────────────────
-    def draw(self, screen: pygame.Surface, dt: float = 0.0) -> None:
-        if not self.active:
-            return
-
-        sw, sh = self.screen_width, self.screen_height
-        font, font_sm, font_hd = self.font, self.font_sm, self.font_hd
-        mx, my = pygame.mouse.get_pos()
-
-        screen.fill(C_BG)
-
-        hdr_rect = pygame.Rect(0, 0, sw, HEADER_H)
-        screen.draw_rect(C_PANEL, hdr_rect)
-        screen.draw_line(C_BORDER, (0, HEADER_H - 1), (sw, HEADER_H - 1))
-        title = render_text_cached(font_hd, "CHARACTER CREATOR", C_TEXT)
-        screen.blit(title, (16, (HEADER_H - title.get_height()) // 2))
-        hint = render_text_cached(font_sm, "ESC to close  •  Ctrl+S to save", C_TEXT_DIM)
-        screen.blit(hint, (sw - hint.get_width() - 16, (HEADER_H - hint.get_height()) // 2))
-
-        footer_rect = pygame.Rect(0, sh - FOOTER_H, sw, FOOTER_H)
-        screen.draw_rect(C_PANEL, footer_rect)
-        screen.draw_line(C_BORDER, (0, sh - FOOTER_H), (sw, sh - FOOTER_H))
-
-        if self.status_timer > 0:
-            # Cached: a given status message ("Saved x.json", ...) is shown
-            # unchanged for status_timer's whole countdown, so this would
-            # otherwise re-rasterize the same string every frame for ~2s.
-            sm = render_text_cached(font_sm, self.status_msg, self.status_col)
-            screen.blit(sm, (LIST_W + PAD * 3, sh - FOOTER_H + 18))
-
-        draw_button(screen, font_sm, self.btn_save, "Save  ✓",
-                    color=C_ACCENT, hover=self.btn_save.collidepoint(mx, my))
-        draw_button(screen, font_sm, self.btn_delete, "Delete",
-                    color=C_RED, danger=True, hover=self.btn_delete.collidepoint(mx, my))
-        draw_button(screen, font_sm, self.btn_new, "+ New Character",
-                    hover=self.btn_new.collidepoint(mx, my))
-
-        if self.editor and self.editor.dirty:
-            dot_txt = render_text_cached(font_sm, "● unsaved", C_ACCENT2)
-            screen.blit(dot_txt, (self.btn_save.x - dot_txt.get_width() - 12, self.btn_save.y + 8))
-
-        dirty_id = (self.selected_id or "") if (self.editor and self.editor.dirty) else ""
-        self.char_list.draw(screen, font, font_sm, dirty_id)
-
-        preview_rect_adj = pygame.Rect(PAD, self.list_rect.bottom + PAD,
-                                       LIST_W, sh - FOOTER_H - self.list_rect.bottom - PAD * 2)
-        self.preview.rect = preview_rect_adj
-        # Keep the preview's shadow in sync with the Identity tab's Shadow
-        # Size slider live, frame-by-frame — not just on save/flush — so
-        # dragging the slider is reflected immediately, the same way the
-        # walk-cycle sprite itself updates as the costume/form changes.
-        if self.editor:
-            self.preview.shadow_width = self.editor.shadow_slider.value
-        self.preview.draw(screen, font_sm)
-
-        screen.draw_rect(C_PANEL, self.editor_rect.union(
-            pygame.Rect(self.editor_rect.x, HEADER_H + PAD, self.editor_rect.w, TAB_H)
-        ), border_radius=6)
-        screen.draw_rect(C_BORDER, self.editor_rect.inflate(0, TAB_H), 1, border_radius=6)
-
-        for i, (name, tr) in enumerate(zip(TAB_NAMES, self.tab_rects)):
-            is_act = (i == self.active_tab)
-            bg = C_TAB_ACT if is_act else C_TAB_INACT
-            screen.draw_rect(bg, tr,
-                             border_radius=6 if i == 0 else (6 if i == len(TAB_NAMES)-1 else 0))
-            col = C_BORDER if not is_act else C_ACCENT
-            screen.draw_rect(col, tr, 1)
-            lbl = render_text_cached(font, name, C_TEXT if is_act else C_TEXT_DIM)
-            screen.blit(lbl, lbl.get_rect(center=tr.center))
-        tr = self.tab_rects[self.active_tab]
-        screen.draw_line(C_TAB_ACT, (tr.x + 1, tr.bottom), (tr.right - 1, tr.bottom), 2)
-
-        if self.editor:
-            self.editor.panel = self.editor_rect
-            old_clip = screen.get_clip()
-            screen.set_clip(self.editor_rect)
-            self.editor.draw(screen, font, font_sm, self.active_tab, dt)
-            screen.set_clip(old_clip)
-        elif self.chars == []:
-            msg = render_text_cached(
-                font, "No characters found in assets/sprites/player/ — create one with + New Character",
-                C_TEXT_DIM,
-            )
-            screen.blit(msg, msg.get_rect(center=self.editor_rect.center))
-
-        # Settings is global, not tied to whichever character is selected,
-        # so it draws independently of self.editor (and even when no
-        # character exists yet).
-        if self.active_tab == TAB_SETTINGS:
-            self._draw_settings(screen, font, font_sm)
-
-        if self.dialog is not None:
-            self._draw_dialog(screen, dt)
-
-    def _draw_settings(self, screen: pygame.Surface,
-                       font: pygame.font.Font, font_sm: pygame.font.Font) -> None:
-        """Global (not per-character) game settings — currently just max
-        level, persisted to GLOBAL_SETTINGS_FILE via save_global_settings()
-        and picked up by GameConfig at game startup."""
-        lx = self.editor_rect.x + 20
-        fx = self.editor_rect.x + 180
-        y  = self.editor_rect.y + 60
-
-        draw_label(screen, font_sm, "Max Level", lx, y + 6)
-        self.max_level_slider.rect.x = fx
-        self.max_level_slider.rect.y = y + 6
-        self.max_level_slider.draw(screen, font_sm)
-
-        hint = render_text_cached(
-            font_sm,
-            "Applies game-wide (all characters share the same level cap). "
-            "Takes effect next time the game starts.",
-            C_TEXT_DIM,
-        )
-        screen.blit(hint, (lx, y + 42))
+            self._panel(screen, rect, _CARD, _T.CARD_BORDER, 1, 10)
+            self._text_top(screen, self.f_sm, self.f_sm.fit(name.upper(), rect.w - 24), _T.TEXT_MUTED,
+                           rect.x + 12, rect.y + 12)
+            frames = self._grid_frames(name, rect.w - 24, rect.h - head - 20)
+            if frames:
+                fi = int(self._clock) % len(frames)
+                fr = frames[fi]
+                cy = rect.y + head + (rect.h - head - 10) // 2
+                uk.blit_surface(screen, fr, fr.get_rect(center=(rect.centerx, cy)))
+                self._text_top(screen, self.f_sm, f"{fi + 1}/{len(frames)}", _T.TEXT_DIM,
+                               rect.right - 12, rect.bottom - 12 - self.f_sm.cap_h, "r", dyn=True)
+        y += ((len(anims) + cols - 1) // cols) * (ch + gap)
+        return y - y0
+
+    def _form_chip(self, screen, form, rect, i, n) -> None:
+        sel = form == self.preview_form
+        t = self._anim(("chip", form), self._hov(rect) and not sel)
+        r = rect.move(0, -int(2 * t))
+        self._panel(screen, r, _SEL if sel else uk.lerp_color(_CARD, _CARD_HI, t),
+                    _T.GOLD if sel else uk.lerp_color(_T.CARD_BORDER, _T.GOLD, 0.78 * t), 2 if sel else 1, 10)
+        box = r.h - 20
+        thumb = pygame.Rect(r.x + 10, r.y + 10, box, box)
+        uk.draw_rect_on(screen, _INSET, thumb, 0, 8)
+        frames = self._thumb_frames(form, box - 6)
+        if frames:
+            fr = frames[int(self._clock) % len(frames)]
+            uk.blit_surface(screen, fr, fr.get_rect(center=thumb.center))
+        label = form.split("/")[-1]
+        tx = thumb.right + 14
+        fg = _T.GOLD_BRIGHT if sel else uk.lerp_color(_T.TEXT_SECONDARY, _T.TEXT_PRIMARY, t)
+        self._text_mid(screen, self.f_md, label, fg, tx, r.centery - 9, max_w=r.right - tx - 12)
+        kind = "BASE" if form == self._current_costume() else "TRANSFORMATION"
+        self._text_mid(screen, self.f_sm, kind, _T.TEXT_DIM, tx, r.centery + 12, max_w=r.right - tx - 12)
+        self._add_hit(rect, key=("chip", form), down=lambda p, f=form: self._set_preview_form(f))
+
+    # ══════════════════════════════════════════════════════════════
+    #  Tab: Settings (global, not per-character)
+    # ══════════════════════════════════════════════════════════════
+
+    def _tab_settings(self, screen, x, y, w) -> int:
+        y0 = y
+        y += self._caption(screen, "Game settings", x, y, w)
+        gs = self.global_settings
+
+        def set_max(v):
+            v = int(round(v))
+            if gs.get("max_level") != v:
+                gs["max_level"] = v
+                self._settings_pending = True
+
+        sw = min(w, 560)
+        # Persisted when the drag ends (see _flush_settings) rather than on every mouse-move.
+        hit_before = len(self._hits)
+        y += self._slider(screen, "max_level", x, y, sw, "Max level", gs.get("max_level", 99), 1, 999, 1,
+                          "{:.0f}", set_max)
+        if len(self._hits) > hit_before:
+            self._hits[-1]["up"] = lambda pos: self._flush_settings()
+        y += 14
+        y += self._note(screen, x, y, sw, "Applies game-wide (all characters share the same level cap). "
+                                          "Takes effect next time the game starts.")
+        return y - y0
