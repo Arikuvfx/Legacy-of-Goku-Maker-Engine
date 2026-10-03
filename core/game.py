@@ -51,44 +51,82 @@ from collections import OrderedDict
 # strip it out.
 _SINGLE_INSTANCE_NAME = "Global\\DBZGame_SingleInstance_8f3a1c2d"
 
-def _enforce_single_instance():
+def _try_claim_instance():
+    """Try to take the single-instance lock. True if we now hold it."""
     if sys.platform == 'win32':
         import ctypes
         kernel32 = ctypes.windll.kernel32
         ERROR_ALREADY_EXISTS = 183
         mutex = kernel32.CreateMutexW(None, False, _SINGLE_INSTANCE_NAME)
         if kernel32.GetLastError() == ERROR_ALREADY_EXISTS:
-            ctypes.windll.user32.MessageBoxW(
-                None,
-                "The game is already running.\n\nClose the other window "
-                "before opening a new one — running two copies at once can "
-                "overwrite your saved room/editor data.",
-                "Already Running",
-                0x30,  # MB_ICONWARNING | MB_OK
-            )
-            sys.exit(0)
+            kernel32.CloseHandle(mutex)
+            return False
         # Stash the handle at module scope so it lives for the whole process
         # (and isn't released early by garbage collection).
         global _single_instance_mutex_handle
         _single_instance_mutex_handle = mutex
-    else:
-        # Cross-platform fallback for dev runs on macOS/Linux: an exclusive
-        # advisory lock on a file in the OS temp dir. Held for the life of
-        # the process; the OS releases it automatically if the process dies
-        # or crashes, so it can never get "stuck" locked.
-        import tempfile
-        import atexit
-        lock_path = os.path.join(tempfile.gettempdir(), "dbz_game.instance.lock")
-        try:
-            import fcntl
-            lock_file = open(lock_path, 'w')
-            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            global _single_instance_lock_file
-            _single_instance_lock_file = lock_file
-            atexit.register(lock_file.close)
-        except (ImportError, OSError):
-            print("The game is already running. Close the other window first.")
+        return True
+    # Cross-platform fallback for dev runs on macOS/Linux: an exclusive
+    # advisory lock on a file in the OS temp dir. Held for the life of
+    # the process; the OS releases it automatically if the process dies
+    # or crashes, so it can never get "stuck" locked.
+    import tempfile
+    import atexit
+    lock_path = os.path.join(tempfile.gettempdir(), "dbz_game.instance.lock")
+    try:
+        import fcntl
+        lock_file = open(lock_path, 'w')
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        global _single_instance_lock_file
+        _single_instance_lock_file = lock_file
+        atexit.register(lock_file.close)
+        return True
+    except (ImportError, OSError):
+        return False
+
+def _release_instance_lock():
+    """Drop the single-instance lock right now instead of waiting for the
+    process to finish exiting, so a relaunched copy can claim it at once
+    even if this process is slow to die (lingering threads, etc.)."""
+    global _single_instance_mutex_handle, _single_instance_lock_file
+    try:
+        if sys.platform == 'win32':
+            import ctypes
+            handle = globals().get('_single_instance_mutex_handle')
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+            _single_instance_mutex_handle = None
+        else:
+            lock_file = globals().get('_single_instance_lock_file')
+            if lock_file:
+                lock_file.close()
+            _single_instance_lock_file = None
+    except Exception:
+        pass
+
+def _enforce_single_instance():
+    # A copy started by "Apply and Restart" (DBZ_RELAUNCH=1) is launched while
+    # its parent is still shutting down and flushing data, so it waits for the
+    # parent's lock instead of treating it as a second copy. A normal launch
+    # never waits.
+    import time as _time
+    wait_until = _time.time() + 20.0 if os.environ.pop('DBZ_RELAUNCH', None) else 0.0
+    while not _try_claim_instance():
+        if _time.time() >= wait_until:
+            if sys.platform == 'win32':
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(
+                    None,
+                    "The game is already running.\n\nClose the other window "
+                    "before opening a new one — running two copies at once can "
+                    "overwrite your saved room/editor data.",
+                    "Already Running",
+                    0x30,  # MB_ICONWARNING | MB_OK
+                )
+            else:
+                print("The game is already running. Close the other window first.")
             sys.exit(0)
+        _time.sleep(0.1)
 
 _enforce_single_instance()
 
@@ -148,7 +186,7 @@ from objects.save_point import SavePoint, SavePointMenu, SavePointManager
 from objects.fishing_area import FishingArea, FishingAreaManager, FishingPrompt
 from objects.decoration_objects import Decoration
 from ui.character_switch_menu import CharacterSwitchMenu
-from ui.pause_menu import PauseMenu
+from ui.pause_menu import PauseMenu, DESIGN_W, DESIGN_H
 from ui.credits_screen import CreditsScreen
 from ui.scouter_menu import ScouterMenu
 from core.items import ITEMS, spawn_item_pickup, item_icon_path
@@ -163,6 +201,7 @@ from dev_tools import entity_creator
 from dev_tools import item_creator
 from dev_tools import decoration_creator
 from ui.title_screen import TitleScreen
+from core.discord_presence import DiscordPresence
 
 # Flip to False when building an exported/player-facing release — gates the
 # F1 "skip the title screen straight into the test room" dev shortcut (see
@@ -173,69 +212,6 @@ from ui.title_screen import TitleScreen
 # (DevMenu, room editor, etc.) isn't gated by this yet; that's a separate,
 # bigger "export build" pass for later.
 DEV_BUILD = True
-
-
-class _LevelUpPlayerSpriteDrawable:
-    """Stand-in for the player while the level-up animation plays.
-
-    Registered with the LayerManager using the exact same draw_layer and
-    fixed (non-Y-sorted) get_sort_key() that LayerIntegrationHelper.
-    setup_player() gives the real player — see core/draw_layers.py. That
-    means it slots into precisely the spot the player would occupy in the
-    y-sort, so NPCs/enemies/foreground tiles keep drawing in front of or
-    behind it correctly instead of the animation always landing on top of
-    everything (which was the previous behavior, when it was blitted
-    directly after layer_manager.draw_all() instead of going through it).
-
-    The class name deliberately contains "Player" — LayerManager._draw_shadow
-    checks type(obj).__name__ against _SHADOW_TYPES, and only draws a ground
-    shadow for matching classes. That gives this the player's normal shadow
-    during the animation instead of none. shadow_size/shadow_width/
-    shadow_y_offset are forwarded from the real player so the shadow matches
-    exactly (falling back to _draw_shadow's own defaults if the player
-    doesn't set one of them).
-    """
-
-    def __init__(self, game):
-        self._game = game
-        self.draw_layer = DrawLayer.PLAYER
-        self.y_sort = False
-        self.active = True
-
-    @property
-    def x(self):
-        return self._game.player.x
-
-    @property
-    def y(self):
-        return self._game.player.y
-
-    @property
-    def width(self):
-        return self._game.player.width
-
-    @property
-    def height(self):
-        return self._game.player.height
-
-    @property
-    def shadow_size(self):
-        return getattr(self._game.player, 'shadow_size', 'small')
-
-    @property
-    def shadow_width(self):
-        return getattr(self._game.player, 'shadow_width', self._game.player.width)
-
-    @property
-    def shadow_y_offset(self):
-        return getattr(self._game.player, 'shadow_y_offset', 0)
-
-    def get_sort_key(self):
-        return (self.draw_layer, 0)
-
-    def draw(self, screen, camera, colors):
-        self._game._draw_levelup_sprite(screen, camera, colors)
-
 
 
 # ── Frame-time profiler ──────────────────────────────────────────────────────
@@ -387,13 +363,27 @@ class Game:
         # player sees and that every draw call in the engine targets.
         pygame.display.set_mode((1, 1), pygame.HIDDEN)
 
+        # The engine renders at SCREEN_WIDTH x SCREEN_HEIGHT (chosen in
+        # config/settings.py from display_settings.json; default = desktop
+        # native). In borderless/fullscreen at that resolution the frame is
+        # 1:1 with the screen. logical_size stays set so that an unusual
+        # combination (e.g. windowed on a desktop too small for the chosen
+        # resolution) is scaled by the GPU with correct mouse mapping
+        # instead of breaking.
+        self.display_cfg = load_display_settings()
+        _mode = self.display_cfg["mode"]
         self.window = sdl2_video.Window(
             "Legacy of Goku Style Engine",
-            size=(SCREEN_WIDTH, SCREEN_HEIGHT),
-            resizable=True,
+            size=((SCREEN_WIDTH, SCREEN_HEIGHT) if _mode == "fullscreen"
+                  else self._windowed_size()),
+            fullscreen=(_mode == "fullscreen"),
+            fullscreen_desktop=(_mode == "borderless"),
+            resizable=False,
         )
+        self._apply_window_icon("Legacy of Goku Style Engine")
         self.renderer = sdl2_video.Renderer(self.window, vsync=True)
         self.renderer.logical_size = (SCREEN_WIDTH, SCREEN_HEIGHT)
+        self._update_integer_scale(_mode)
 
         # logical_surface is now a GPUScreen, not a Surface. Every draw()
         # method in the engine still calls .blit()/.draw_rect()/etc on it —
@@ -458,6 +448,9 @@ class Game:
             poll_interval=1.0,
         )
         self.sprite_watcher.start()
+
+        # Discord Rich Presence — optional, no-op without pypresence/client ID.
+        self.discord_presence = DiscordPresence()
 
         # ── Player ────────────────────────────────────────────────────────────
         # Respect the saved character menu order (character_creator's
@@ -645,10 +638,10 @@ class Game:
         # Lower  → shallower angle, strong perspective (ground rushes toward horizon).
         # Higher → steeper angle, flatter look (more overhead / top-down).
         # The horizon line (horizon_y) is set independently and is never affected.
-        self._MJF_FOCAL              = 160   # default ≈ 80 px
+        self._MJF_FOCAL              = round(160 * UI_SCALE)   # default ≈ 80 px @1080p
         self._MJF_HORIZON_OFFSET     = 2
         # Max upward pixel shift at the horizon (curvature effect). 0 = flat plane.
-        self._MJF_CURVATURE          = 100
+        self._MJF_CURVATURE          = round(100 * UI_SCALE)
 
         # ── Active game-object lists ──────────────────────────────────────────
         self.projectiles          = []
@@ -680,6 +673,12 @@ class Game:
         self.it_selector = None
         self.enemies              = []
         self.npcs                 = []
+        # Entities hidden by the npc_state / enemy_state / boss_state actions.
+        # They're parked here instead of in self.enemies / self.npcs, so every
+        # update / collision / interaction / draw loop skips them without each
+        # one needing its own "hidden" check. 'show' moves them back.
+        self._hidden_enemies      = []
+        self._hidden_npcs         = []
         self.critters = []  # ambient wildlife: squirrels, birds, butterflies
         self.destructible_stones  = []
         self.decorations          = []  # trees, etc. — see objects/decoration_object.py
@@ -1020,14 +1019,10 @@ class Game:
         self._levelup_turn_timer = 0.0
         self._LEVELUP_TURN_DURATION = 0.12       # seconds per facing change
 
-        self._levelup_anim_frames        = []
-        self._levelup_anim_idx           = 0
         self._levelup_anim_timer         = 0.0
         self._levelup_anim_loops         = 0
         self._LEVELUP_ANIM_LOOPS_TARGET  = 2      # play the animation twice
         self._LEVELUP_ANIM_FRAME_DURATION = 0.4
-        self._levelup_anim_scaled_cache  = {}
-        self._levelup_drawable = _LevelUpPlayerSpriteDrawable(self)
 
         # Snapshot of who/what leveled up, captured at trigger time so the
         # dialogue text and sprite folder stay correct even if something
@@ -1127,6 +1122,9 @@ class Game:
         self.event_runner.register_handler('modify_quest_variable', self._handle_modify_quest_variable_action)
         self.event_runner.register_handler('mission', self._handle_mission_action)
         self.event_runner.register_handler('toggle_flying_pad', self._handle_toggle_flying_pad_action)
+        self.event_runner.register_handler('npc_state', self._handle_npc_state_action)
+        self.event_runner.register_handler('enemy_state', self._handle_enemy_state_action)
+        self.event_runner.register_handler('boss_state', self._handle_boss_state_action)
 
         # Create the default starting room (a fresh transient "green dev" room).
         self._create_default_room()
@@ -1638,6 +1636,214 @@ class Game:
 
     # ── Event handling ────────────────────────────────────────────────────────
 
+    def _windowed_size(self):
+        """Size of the OS window when windowed: the render resolution, shrunk
+        (aspect preserved) only if it wouldn't fit on the desktop."""
+        dw, dh = get_desktop_size()
+        k = min(1.0, dw * 0.95 / SCREEN_WIDTH, dh * 0.90 / SCREEN_HEIGHT)
+        return (int(SCREEN_WIDTH * k), int(SCREEN_HEIGHT * k))
+
+    def _update_integer_scale(self, mode):
+        """Make SDL present the logical frame at a whole-number scale
+        (1x, 2x, ...) centered with black bars, instead of stretching it to
+        fill the window. Without this, a 1920x1080 frame on a 2560x1440
+        borderless desktop is blown up 1.333x (blurry, uneven pixels), while
+        2560x1080 looked right only because its scale happened to be 1.0.
+
+        pygame doesn't expose SDL_RenderSetIntegerScale, so call it through
+        the SDL2 library pygame already loaded. It is only switched on when
+        the target window is at least as big as the frame in both axes: SDL2
+        integer scaling collapses to a 0-size viewport (black screen) when
+        the window is smaller than the logical size.
+        """
+        try:
+            import ctypes
+            if mode == 'windowed':
+                target = self._windowed_size()
+            elif mode == 'borderless':
+                target = get_desktop_size()
+            else:
+                target = (SCREEN_WIDTH, SCREEN_HEIGHT)
+            enable = target[0] >= SCREEN_WIDTH and target[1] >= SCREEN_HEIGHT
+
+            lib_dir = os.path.dirname(pygame.__file__)
+            sdl = None
+            for name in (os.path.join(lib_dir, 'SDL2.dll'), 'SDL2.dll', 'libSDL2-2.0.so.0',
+                         'libSDL2-2.0.0.dylib'):
+                try:
+                    sdl = ctypes.CDLL(name)
+                    break
+                except OSError:
+                    continue
+            if sdl is None:
+                return
+            sdl.SDL_GetWindowFromID.restype = ctypes.c_void_p
+            sdl.SDL_GetWindowFromID.argtypes = [ctypes.c_uint32]
+            sdl.SDL_GetRenderer.restype = ctypes.c_void_p
+            sdl.SDL_GetRenderer.argtypes = [ctypes.c_void_p]
+            sdl.SDL_RenderSetIntegerScale.argtypes = [ctypes.c_void_p, ctypes.c_int]
+            win = sdl.SDL_GetWindowFromID(self.window.id)
+            rend = sdl.SDL_GetRenderer(win) if win else None
+            if rend:
+                sdl.SDL_RenderSetIntegerScale(rend, 1 if enable else 0)
+        except Exception:
+            pass   # cosmetic only - fall back to SDL's normal stretch-to-fit
+
+    def _set_display_mode(self, mode):
+        """Switch window mode live: 'borderless' | 'fullscreen' | 'windowed'.
+        The render resolution itself does not change (needs a restart)."""
+        if mode == 'windowed':
+            self.window.set_windowed()
+            self.window.size = self._windowed_size()
+            dw, dh = get_desktop_size()
+            w, h = self.window.size
+            self.window.position = (max(0, (dw - w) // 2), max(0, (dh - h) // 2))
+        elif mode == 'borderless':
+            self.window.set_fullscreen(desktop=True)
+        else:
+            self.window.size = (SCREEN_WIDTH, SCREEN_HEIGHT)
+            self.window.set_fullscreen(desktop=False)
+        self.display_cfg['mode'] = mode
+        self._update_integer_scale(mode)
+        save_display_settings(self.display_cfg)
+
+    def _cycle_display_mode(self):
+        """Dev menu: borderless -> fullscreen -> windowed -> borderless (live)."""
+        order = ['borderless', 'fullscreen', 'windowed']
+        cur = self.display_cfg['mode']
+        nxt = order[(order.index(cur) + 1) % len(order)] if cur in order else order[0]
+        self._set_display_mode(nxt)
+
+    def _cycle_display_resolution(self):
+        """Dev menu: pick the next resolution. Saved for the next launch --
+        the engine's layout constants are fixed at startup, so it takes
+        'Apply and Restart' to take effect."""
+        choices = get_resolution_choices()
+        key = display_resolution_key(self.display_cfg)
+        nxt = choices[(choices.index(key) + 1) % len(choices)] if key in choices else choices[0]
+        self.display_cfg['resolution'] = nxt
+        save_display_settings(self.display_cfg)
+
+    def _apply_window_icon(self, title):
+        """Give the SDL window the game's icon instead of SDL's default one.
+
+        Sources, first hit wins: the running exe's embedded icon (frozen
+        build), then any icon image on disk, then the embedded icon of a
+        built game .exe found in the project (dist/ etc.) when running from
+        source. Prints why it failed so a missing icon is diagnosable.
+        """
+        import glob
+        win = sys.platform == 'win32'
+        try:
+            if win:
+                import ctypes
+                from ctypes import wintypes
+                user32, shell32 = ctypes.windll.user32, ctypes.windll.shell32
+                shell32.ExtractIconExW.argtypes = [wintypes.LPCWSTR, ctypes.c_int,
+                                                   ctypes.POINTER(wintypes.HICON),
+                                                   ctypes.POINTER(wintypes.HICON), wintypes.UINT]
+                shell32.ExtractIconExW.restype = wintypes.UINT
+                user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                                wintypes.WPARAM, wintypes.LPARAM]
+                user32.SendMessageW.restype = ctypes.c_ssize_t
+                user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+                user32.FindWindowW.restype = wintypes.HWND
+
+                def _from_exe(path):
+                    big, small = wintypes.HICON(), wintypes.HICON()
+                    n = shell32.ExtractIconExW(path, 0, ctypes.byref(big), ctypes.byref(small), 1)
+                    hwnd = user32.FindWindowW(None, title)
+                    if not (n and hwnd and (big.value or small.value)):
+                        return False
+                    if small.value:
+                        user32.SendMessageW(hwnd, 0x0080, 0, small.value)  # WM_SETICON small
+                    if big.value:
+                        user32.SendMessageW(hwnd, 0x0080, 1, big.value)    # WM_SETICON big
+                    return True
+
+                def _app_id():
+                    try:
+                        shell32.SetCurrentProcessExplicitAppUserModelID("LegacyOfGokuStyleEngine.Game")
+                    except Exception:
+                        pass
+
+                if getattr(sys, 'frozen', False):
+                    if _from_exe(sys.executable):
+                        _app_id()
+                        return
+                    print("[icon] frozen exe has no extractable icon / window not found")
+
+            dirs = [d for d in (os.getcwd(), getattr(sys, '_MEIPASS', None),
+                                os.path.dirname(os.path.abspath(__file__))) if d]
+            for d in dirs:
+                cands = [os.path.join(d, n) for n in (
+                    'icon.ico', 'icon.png', 'game_icon.png', 'game.ico',
+                    os.path.join('assets', 'icon.ico'), os.path.join('assets', 'icon.png'),
+                    os.path.join('assets', 'game_icon.png'), os.path.join('assets', 'ui', 'icon.png'))]
+                cands += glob.glob(os.path.join(d, '*.ico')) + glob.glob(os.path.join(d, 'assets', '*.ico'))
+                for p in cands:
+                    if os.path.isfile(p):
+                        self.window.set_icon(pygame.image.load(p).convert_alpha())
+                        if win:
+                            _app_id()
+                        return
+
+            if win and not getattr(sys, 'frozen', False):
+                for d in dirs:
+                    for p in glob.glob(os.path.join(d, '*.exe')) + glob.glob(os.path.join(d, 'dist', '*.exe')):
+                        if _from_exe(p):
+                            _app_id()
+                            return
+            print("[icon] no icon found; put icon.png or icon.ico next to game.py")
+        except Exception as e:
+            print(f"[icon] could not set window icon: {e}")
+
+    def _spawn_relaunch(self):
+        """Start a fresh copy of the game (it waits for this process's
+        single-instance lock to be released -- see _enforce_single_instance)."""
+        import subprocess
+        env = dict(os.environ)
+        env['DBZ_RELAUNCH'] = '1'
+        env['PYINSTALLER_RESET_ENVIRONMENT'] = '1'   # needed to relaunch a onefile .exe
+        if getattr(sys, 'frozen', False):
+            args = [sys.executable] + sys.argv[1:]
+        else:
+            # orig_argv (Python 3.10+) is the exact original command line,
+            # including `-m module` / interpreter flags that sys.argv drops.
+            args = list(getattr(sys, 'orig_argv', None) or ([sys.executable] + sys.argv))
+        kwargs = dict(env=env, cwd=os.getcwd(), close_fds=True, stdin=subprocess.DEVNULL)
+        if sys.platform == 'win32':
+            # Detach from this process's console/process group so the new
+            # copy isn't torn down along with us (IDE run windows, terminals).
+            kwargs['creationflags'] = 0x00000008 | 0x00000200  # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+        log = None
+        try:
+            # The new copy's output goes here, so a failed relaunch leaves a
+            # reason behind instead of vanishing with the closed window.
+            log = open(os.path.join(os.getcwd(), 'relaunch.log'), 'w', encoding='utf-8')
+            log.write(f"relaunch args: {args!r}\ncwd: {os.getcwd()}\n\n")
+            log.flush()
+            kwargs['stdout'] = log
+            kwargs['stderr'] = subprocess.STDOUT
+            subprocess.Popen(args, **kwargs)
+        except Exception:
+            import traceback
+            try:
+                with open(os.path.join(os.getcwd(), 'relaunch.log'), 'a', encoding='utf-8') as f:
+                    f.write("relaunch FAILED to start:\n" + traceback.format_exc())
+            except Exception:
+                pass
+            traceback.print_exc()
+        finally:
+            if log is not None:
+                log.close()   # the child keeps its own duplicated handle
+
+    def _toggle_display_mode(self):
+        """F11 / Alt+Enter: borderless <-> windowed (exclusive fullscreen
+        goes to windowed)."""
+        self._set_display_mode(
+            'windowed' if self.display_cfg['mode'] != 'windowed' else 'borderless')
+
     def _window_to_logical(self, ox, oy):
         """Normalize a mouse coordinate that SDL has already mapped to logical space.
 
@@ -1692,6 +1898,16 @@ class Game:
         Same action strings as before ('open_room_editor', 'close', ...),
         same behavior either way.
         """
+        if result in ('display_cycle_mode', 'display_cycle_resolution', 'restart_game'):
+            if result == 'display_cycle_mode':
+                self._cycle_display_mode()
+            elif result == 'display_cycle_resolution':
+                self._cycle_display_resolution()
+            else:
+                self._relaunch_requested = True
+                self.running = False
+            self.dev_menu.refresh_config()
+            return
         if result == 'close':
             # Plain close (ESC at the main menu, or "CLOSE MENU") — if this
             # dev-menu session started mid test-session, don't just fall
@@ -1755,6 +1971,13 @@ class Game:
                 break      # queue is empty, done for this frame
 
             event = self._rescale_event(event)
+
+            # F11 / Alt+Enter: toggle borderless <-> windowed, in any game state.
+            if (event.type == pygame.KEYDOWN and
+                    (event.key == pygame.K_F11 or
+                     (event.key == pygame.K_RETURN and event.mod & pygame.KMOD_ALT))):
+                self._toggle_display_mode()
+                continue
 
             # WINDOWCLOSE is the event the X button posts on our separate SDL2
             # Window; QUIT covers the hidden display-module window / Alt+F4
@@ -2703,10 +2926,13 @@ class Game:
         # _draw_saving_popup computes it precisely per-glyph.
         block_h = max_h + 8
 
-        pad_x   = max(48, int(SCREEN_WIDTH * 0.05))
-        pad_y   = max(40, int(SCREEN_HEIGHT * 0.06))
-        popup_w = max(block_w + pad_x * 2, int(SCREEN_WIDTH * 0.22)) - 100
-        popup_h = max(block_h + pad_y * 2, int(SCREEN_HEIGHT * 0.125)) - 26
+        # Everything here is in the pause menu's 1920x1080 DESIGN space (same
+        # space TitleScreen's save-select frame is drawn in), not real screen
+        # pixels — _draw_saving_popup draws through TitleScreen.make_ui_screen().
+        pad_x   = max(48, int(DESIGN_W * 0.05))
+        pad_y   = max(40, int(DESIGN_H * 0.06))
+        popup_w = max(block_w + pad_x * 2, int(DESIGN_W * 0.22)) - 100
+        popup_h = max(block_h + pad_y * 2, int(DESIGN_H * 0.125)) - 26
 
         # The border is drawn as a 9-slice (PauseMenu._draw_9slice_sprite,
         # shared by every bordered box in the game) whose flat left/right
@@ -2738,8 +2964,8 @@ class Game:
             popup_x = frame_rect.x + (frame_rect.width  - popup_w) // 2
             popup_y = frame_rect.y + (frame_rect.height - popup_h) // 2 - 33
         else:
-            popup_x = (SCREEN_WIDTH  - popup_w) // 2
-            popup_y = (SCREEN_HEIGHT - popup_h) // 2
+            popup_x = (DESIGN_W - popup_w) // 2
+            popup_y = (DESIGN_H - popup_h) // 2
 
         return pygame.Rect(popup_x, popup_y, popup_w, popup_h)
 
@@ -2757,6 +2983,11 @@ class Game:
         pm = self.pause_menu
         if pm is None:
             return
+
+        # Draw in design space, scaled onto the real screen — same as the
+        # SAVE SELECT frame this popup sits in front of.
+        real_screen = screen
+        screen = self.title_screen.make_ui_screen(real_screen)
 
         text = 'Saving...'
         # Same offsets PauseMenu's own renderers use — how far below the
@@ -2795,9 +3026,9 @@ class Game:
             screen, pm.box_sprite, popup_x, popup_y, popup_w, popup_h, corner_size=20
         )
         if not drawn:
-            pygame.draw.rect(screen, pm.border_outer, (popup_x-6, popup_y-6, popup_w+12, popup_h+12))
-            pygame.draw.rect(screen, pm.border_inner, (popup_x-3, popup_y-3, popup_w+6,  popup_h+6))
-            pygame.draw.rect(screen, pm.border_green, (popup_x-1, popup_y-1, popup_w+2,  popup_h+2))
+            screen.draw_rect(pm.border_outer, (popup_x-6, popup_y-6, popup_w+12, popup_h+12))
+            screen.draw_rect(pm.border_inner, (popup_x-3, popup_y-3, popup_w+6,  popup_h+6))
+            screen.draw_rect(pm.border_green, (popup_x-1, popup_y-1, popup_w+2,  popup_h+2))
             pm._draw_tiled_background(screen, pygame.Rect(popup_x, popup_y, popup_w, popup_h))
 
         # Text is centered on the full block_w/block_h (not popup_w/
@@ -3092,11 +3323,10 @@ class Game:
         Assumes one row of frames, each player.width x player.height (32x32
         by default) — let me know if the sheet is laid out differently.
         """
-        self._levelup_anim_frames       = []
-        self._levelup_anim_idx          = 0
+        self.player.levelup_frames      = []
+        self.player.levelup_frame_idx   = 0
         self._levelup_anim_timer        = 0.0
         self._levelup_anim_loops        = 0
-        self._levelup_anim_scaled_cache = {}
 
         path = f'{self.player.sprite.base_path}/levelup.png'
         try:
@@ -3104,7 +3334,7 @@ class Game:
             frame_w = self.player.width
             frame_h = self.player.height
             num_frames = max(1, sheet.get_width() // frame_w)
-            self._levelup_anim_frames = [
+            self.player.levelup_frames = [
                 sheet.subsurface(pygame.Rect(i * frame_w, 0, frame_w, frame_h))
                 for i in range(num_frames)
             ]
@@ -3129,7 +3359,8 @@ class Game:
                 self._levelup_turn_idx += 1
                 if self._levelup_turn_idx >= len(self._LEVELUP_TURN_SEQUENCE):
                     self._levelup_state = 'playing_anim'
-                    if not self._levelup_anim_frames:
+                    self.player.is_levelup_animating = True
+                    if not self.player.levelup_frames:
                         # Sheet missing — nothing to animate, go straight to dialogue.
                         self._finish_levelup_animation()
                 else:
@@ -3141,9 +3372,9 @@ class Game:
             self._levelup_anim_timer += dt
             if self._levelup_anim_timer >= self._LEVELUP_ANIM_FRAME_DURATION:
                 self._levelup_anim_timer -= self._LEVELUP_ANIM_FRAME_DURATION
-                self._levelup_anim_idx += 1
-                if self._levelup_anim_idx >= len(self._levelup_anim_frames):
-                    self._levelup_anim_idx = 0
+                self.player.levelup_frame_idx += 1
+                if self.player.levelup_frame_idx >= len(self.player.levelup_frames):
+                    self.player.levelup_frame_idx = 0
                     self._levelup_anim_loops += 1
                     if self._levelup_anim_loops >= self._LEVELUP_ANIM_LOOPS_TARGET:
                         self._finish_levelup_animation()
@@ -3154,6 +3385,7 @@ class Game:
         stays frozen) until _end_levelup_sequence() fires after the second
         box closes."""
         self._levelup_state = None
+        self.player.is_levelup_animating = False
         name = self._levelup_char_at_trigger.replace('_', ' ').title()
         text = f"{name} has reached level {self._levelup_level_at_trigger}!"
         self.dialogue_box.show(
@@ -3172,6 +3404,7 @@ class Game:
     def _end_levelup_sequence(self):
         """Second dialogue box closed — unfreeze the world."""
         self._levelup_active = False
+        self.player.is_levelup_animating = False
         # Release any zeni (see _flush_pending_zeni_drops) that dropped
         # while this sequence was starting/active — held back so pickups
         # didn't pop out and start hopping while the popups were still
@@ -3186,38 +3419,6 @@ class Game:
         self.player.is_attacking = False
         self.player.attack_cooldown = 0
         self.player.enter_idle()
-
-    def _draw_levelup_sprite(self, screen, camera, colors):
-        """Blit the current levelup.png animation frame at the player's
-        screen position. Signature matches DrawableObject.draw() so this
-        can be called by the layer manager like any other sprite — see
-        _LevelUpPlayerSpriteDrawable, which registers this with the same
-        draw_layer/get_sort_key the player itself uses, so NPCs/enemies/
-        foreground tiles correctly draw in front of or behind it instead
-        of it always landing on top."""
-        frames = self._levelup_anim_frames
-        if not frames:
-            return
-        idx = min(self._levelup_anim_idx, len(frames) - 1)
-        # Scaled by RENDER_SCALE to match the player's normal in-world sprite
-        # (and every other sprite in the game world, e.g. _draw_landing_sprite) —
-        # NOT sprite_hud.scale, which is for blowing up tiny HUD icons and made
-        # the player sprite huge here.
-        sw  = int(self.player.width  * RENDER_SCALE)
-        sh  = int(self.player.height * RENDER_SCALE)
-
-        # Pre-scaled-frame cache — same source frame + same scale always
-        # produces the same size, so scale once per (frame, scale) pair
-        # instead of every draw().
-        cache_key = (idx, RENDER_SCALE)
-        scaled = self._levelup_anim_scaled_cache.get(cache_key)
-        if scaled is None:
-            scaled = pygame.transform.scale(frames[idx], (sw, sh))
-            self._levelup_anim_scaled_cache[cache_key] = scaled
-
-        cx = int(self.player.x * RENDER_SCALE - camera.x)
-        cy = int(self.player.y * RENDER_SCALE - camera.y)
-        screen.blit(scaled, (cx - sw // 2, cy - sh // 2))
 
     def _handle_menu_keydown(self, event):
         """Key-down events while the main menu is open."""
@@ -3257,6 +3458,8 @@ class Game:
 
         # Clear all active entities and projectiles before entering test mode.
         self._clear_active_entities()
+        # Start every test run with no leftover cutscene state.
+        self._stop_cutscene_immediately()
 
         # If the player was mid-way through (or fully inside) the world-map
         # flying sequence when "Test Room" was triggered, force it back to
@@ -3616,6 +3819,8 @@ class Game:
         # Entities (enemies and NPCs)
         self.enemies = []
         self.npcs    = []
+        self._hidden_enemies = []
+        self._hidden_npcs    = []
         self.critters = []  # ambient wildlife: squirrels, birds, butterflies
         self._spawn_room_entities(room)
 
@@ -3634,10 +3839,84 @@ class Game:
         # Give the player and all enemies a shared obstacle list for knockback.
         self._assign_obstacles()
 
+    def _stop_cutscene_immediately(self):
+        """Hard-stop any playing/queued cutscene without running its
+        completion callback.
+
+        Used when test mode is entered/exited (F2, dev menu). Without it the
+        CutsceneRuntime, its fade state machine (_csf_*) and the blocking
+        'play_cutscene' callback all survive the exit, so the cutscene kept
+        playing / resumed the next time the room was tested. No-op when
+        nothing is active.
+        """
+        rt = self.active_cutscene_runtime
+
+        # Drop the completion callback FIRST so nothing downstream resumes a
+        # stale trigger-box action sequence.
+        self._cutscene_on_finished = None
+
+        # Cancel a queued (fade_out / start) or fading-in cutscene.
+        self._csf_state   = None
+        self._csf_alpha   = 0.0
+        self._csf_pending = None
+
+        if rt is not None:
+            # Stop camera shake the runtime may have started.
+            try:
+                rt._clear_camera_shake()
+            except Exception:
+                pass
+            # Restore the player's pre-cutscene transformation state
+            # (same as the normal finish path).
+            snap = getattr(self, '_pre_cutscene_transform', None)
+            if snap and self.player.transformation:
+                _ts = self.player.transformation
+                _ts.is_transformed    = snap['is_transformed']
+                _ts.is_transforming   = snap['is_transforming']
+                _ts.is_untransforming = snap['is_untransforming']
+                _ts.transformed_ki    = snap['transformed_ki']
+                self.player.sprite = snap['sprite']
+                self.player.current_animation_state = snap['anim_state']
+        self._pre_cutscene_transform = None
+        self.active_cutscene_runtime = None
+
+        # Close any dialogue the cutscene / event sequence opened, without
+        # firing its on_close (which would resume the event sequence).
+        try:
+            if self.dialogue_box.active:
+                if hasattr(self.dialogue_box, 'on_close'):
+                    self.dialogue_box.on_close = None
+                if hasattr(self.dialogue_box, '_on_close'):
+                    self.dialogue_box._on_close = None
+                self.dialogue_box.hide()
+        except Exception:
+            pass
+        self._event_dialogue_active = False
+
+        # Cancel any event sequence still waiting on the cutscene, if the
+        # EventRunner exposes a way to do so.
+        for _name in ('cancel_all', 'cancel', 'stop_all', 'stop', 'clear', 'reset'):
+            _fn = getattr(self.event_runner, _name, None)
+            if callable(_fn):
+                try:
+                    _fn()
+                except Exception:
+                    pass
+                break
+
+        # Scripted beams and the HUD/camera state the cutscene changed.
+        self.cutscene_beams = []
+        self.sprite_hud._hud_slide_out = False
+        self.sprite_hud._hud_slide_in  = True
+        self.camera._lerp_active       = True
+
     def _exit_test_mode(self):
         """Restore all rooms to their pre-test state and clear test entities."""
         if not self.is_test_mode or not self.test_room_backup:
             return
+        # F2 / dev-menu exit must stop any cutscene that's playing or queued,
+        # otherwise it resumes the next time the room is tested.
+        self._stop_cutscene_immediately()
         # Do not leave test-mode ambient channels playing after restoring
         # the editor state.
         self.sound_manager.stop_all_positional_bgs()
@@ -3830,6 +4109,8 @@ class Game:
         # Spawn entities.
         self.enemies = []
         self.npcs    = []
+        self._hidden_enemies = []
+        self._hidden_npcs    = []
         self.critters = []  # ambient wildlife: squirrels, birds, butterflies
         self._spawn_room_entities(room)
 
@@ -4270,6 +4551,8 @@ class Game:
         """Clear enemies, NPCs, and all projectile/attack lists."""
         self.enemies = []
         self.npcs    = []
+        self._hidden_enemies = []
+        self._hidden_npcs    = []
         self.critters = []  # ambient wildlife: squirrels, birds, butterflies
         self._clear_projectiles()
 
@@ -5012,6 +5295,63 @@ class Game:
             if pad.pad_id == pad_id:
                 pad.active = (mode == 'enable')
                 break
+
+    def _apply_entity_state(self, live, hidden, matches, mode):
+        """Shared body of the npc_state / enemy_state / boss_state handlers.
+
+        live / hidden — the room's live list and its parked-hidden list
+        (both mutated in place, so `self.enemies` etc. keep their identity).
+        matches(e)    — True for entities the action targets.
+        mode          — 'show' | 'hide' | 'despawn'.
+
+        'hide' parks matching entities in `hidden`, so they stop updating,
+        colliding, being hit, being interacted with and being drawn;
+        'show' puts them back; 'despawn' removes them from both lists for
+        good. Changes only last for the current room visit, since rooms
+        rebuild their entities from the room data on load."""
+        if mode == 'hide':
+            moving = [e for e in live if matches(e)]
+            for e in moving:
+                live.remove(e)
+            hidden.extend(moving)
+        elif mode == 'show':
+            moving = [e for e in hidden if matches(e)]
+            for e in moving:
+                hidden.remove(e)
+            live.extend(moving)
+        elif mode == 'despawn':
+            live[:]   = [e for e in live if not matches(e)]
+            hidden[:] = [e for e in hidden if not matches(e)]
+        else:
+            return
+        # Keep each enemy's obstacle / neighbour lists in step with the change.
+        if live is self.enemies:
+            for enemy in self.enemies:
+                enemy.other_enemies = [o for o in self.enemies if o is not enemy]
+
+    def _handle_npc_state_action(self, npc_id, mode='hide'):
+        """EventRunner handler for 'npc_state' — mode: 'show' | 'hide' |
+        'despawn'. Targets every NPC in the room whose npc_id matches."""
+        self._apply_entity_state(self.npcs, self._hidden_npcs,
+                                 lambda e: getattr(e, 'npc_id', None) == npc_id, mode)
+        if mode != 'show' and getattr(self, 'nearby_npc', None) is not None \
+                and getattr(self.nearby_npc, 'npc_id', None) == npc_id:
+            self.nearby_npc = None
+
+    def _handle_enemy_state_action(self, enemy_id, mode='hide'):
+        """EventRunner handler for 'enemy_state' — mode: 'show' | 'hide' |
+        'despawn'. Targets every enemy in the room whose enemy_type (or
+        boss_id, since the enemy picker also lists bosses) matches."""
+        self._apply_entity_state(
+            self.enemies, self._hidden_enemies,
+            lambda e: (getattr(e, 'enemy_type', None) == enemy_id
+                       or getattr(e, 'boss_id', None) == enemy_id), mode)
+
+    def _handle_boss_state_action(self, boss_id, mode='hide'):
+        """EventRunner handler for 'boss_state' — mode: 'show' | 'hide' |
+        'despawn'. Targets the boss whose BossEnemy.boss_id matches."""
+        self._apply_entity_state(self.enemies, self._hidden_enemies,
+                                 lambda e: getattr(e, 'boss_id', None) == boss_id, mode)
 
     def _handle_weather_action(self, mode, weather_type=None):
         """EventRunner handler for the 'weather' action — mode: 'set' | 'stop'.
@@ -9040,6 +9380,18 @@ class Game:
                 from core.sprite_system import apply_watcher_events as apply_sprite_watcher_events
                 apply_sprite_watcher_events(sprite_events)
 
+        # Discord Rich Presence — cheap; the worker thread handles throttling.
+        _dp = getattr(self, 'discord_presence', None)
+        if _dp is not None and _dp.enabled:
+            if self.game_mode == 'title':
+                _dp.set_state('On the title screen')
+            elif self.room_editor.active:
+                _rn = self.current_room.name if self.current_room else ''
+                _dp.set_state('Editing a room', _rn or None)
+            else:
+                _rn = self.current_room.name if self.current_room else ''
+                _dp.set_state('Exploring', _rn or None)
+
         # Title screen — nothing else in the engine ticks while this is up.
         if self.game_mode == 'title':
             self.title_screen.update(dt)
@@ -11367,18 +11719,12 @@ class Game:
         # its own actor layer separately).
         if not self.active_cutscene_runtime:
             self.layer_manager.clear()
-            # During landing_fade_in (world-map descent) or the level-up
-            # animation phase, a special animation replaces the normal
-            # player sprite. For landing, no sprite goes into the layered
-            # list at all (it's drawn separately below, same as before).
-            # For level-up, _levelup_drawable takes the player's spot in
-            # the layered list — same draw_layer/sort_key as the player —
-            # so it still y-sorts correctly against NPCs/enemies/tiles
-            # instead of always drawing on top of them.
+            # During landing_fade_in (world-map descent) a special animation
+            # replaces the normal player sprite, so no sprite goes into the
+            # layered list at all (it's drawn separately below). The level-up
+            # animation is handled inside Player.draw() itself.
             if self._mjf_state == 'landing_fade_in':
                 _player_objs = []
-            elif self._levelup_state == 'playing_anim':
-                _player_objs = [self._levelup_drawable]
             else:
                 _player_objs = [self.player]
             # Cull zeni pickups outside the camera viewport — a pile can be in
@@ -13504,7 +13850,10 @@ class Game:
 
         # Cache key: room name + id of the tile list (changes when tiles are
         # repainted or the room switches, matching tile-surface invalidation).
-        cache_key = (room_name, id(tiles))
+        # _tile_content_generation is included because painting without
+        # "replace" appends to the SAME list object, so id(tiles) alone never
+        # changes and the cached foreground list/grid went stale.
+        cache_key = (room_name, id(tiles), self._tile_content_generation)
         cached = getattr(self, '_fg_tiles_cache', None)
         if cached is not None and cached[0] == cache_key:
             return cached[1]
@@ -14205,6 +14554,9 @@ class Game:
         if hasattr(self, 'sprite_watcher'):
             self.sprite_watcher.stop()
 
+        if hasattr(self, 'discord_presence'):
+            self.discord_presence.shutdown()
+
         # Flush the cutscene editor — catches crashes and abrupt window closes.
         if hasattr(self, 'cutscene_editor') and self.cutscene_editor:
             ce = self.cutscene_editor
@@ -14274,9 +14626,23 @@ class Game:
             traceback.print_exc()   # print the real crash reason before exiting
             raise                   # re-raise so the OS exit code becomes 1
         finally:
-            self.frame_profiler.close()
-            self.cleanup()
-            pygame.quit()
+            # Each shutdown step is isolated so one failing can't stop the
+            # relaunch below from happening.
+            import traceback as _tb
+            for _step in (self.frame_profiler.close, self.cleanup, pygame.quit):
+                try:
+                    _step()
+                except Exception:
+                    _tb.print_exc()
+            if getattr(self, '_relaunch_requested', False):
+                _release_instance_lock()
+                self._spawn_relaunch()
+                try:
+                    sys.stdout.flush()
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+                os._exit(0)   # data is already flushed by cleanup(); don't let a stray thread keep this copy alive
             sys.exit()
 
 

@@ -8,6 +8,7 @@ from enum import Enum
 from config.settings import RENDER_SCALE, TILE_SIZE
 
 import dev_tools.ui_kit as uk
+from config.settings import ui, ui_text
 
 
 # =============================================================================
@@ -656,7 +657,7 @@ class TilesetEditor:
         # ── Layer state ──────────────────────────────────────────────────────
         self.current_layer_preset_index = 0
         self.current_layer = -100
-        self.hidden_layers = set()  # layer values fully hidden via the per-layer checkbox
+        self.show_only_active_layer = False  # when True, only current_layer is drawn ("Show only this layer" checkbox)
         self.custom_layer_value = -100
         self.delete_underlying = True
         self.layer_dropdown_open = False
@@ -687,31 +688,34 @@ class TilesetEditor:
         self.anim_feedback_until_ms = 0
 
         # ── Palette geometry ─────────────────────────────────────────────────
-        self.palette_width = 600
+        self.palette_width = ui(600)
         self.palette_x = screen_width - self.palette_width
-        self.palette_y = 100
+        self.palette_y = ui(100)
         # Tallest the panel is allowed to get. The actual height (palette_height)
         # shrinks below this when the current tileset needs less room.
-        self.palette_max_height = 940
-        self.tileset_area_y_offset = 35
-        self.tileset_area_bottom_pad = 20
+        # Never taller than the screen allows (940 was tuned for 1080p).
+        self.palette_max_height = max(ui(300), min(ui(940), screen_height - self.palette_y - ui(10)))
+        self.tileset_area_y_offset = ui(35)
+        self.tileset_area_bottom_pad = ui(20)
         # Strip under the tile grid: 10px gap, two checkbox rows (18px, spaced
         # 26px apart), then the 28px tile layer row 56px below the first.
-        self.palette_controls_height = 94
+        self.palette_controls_height = ui(94)
         # palette_content_height / palette_height are properties (below): the
         # tile grid is as tall as the current tileset needs, capped so the
         # panel never exceeds palette_max_height.
 
-        self.grid_cell_size = 32
+        # Palette cell stays an integer multiple of the 16px tile so the scaled
+        # tile art stays crisp (32 @1080p, 48 @1440p, 64 @4K, 16 @720p).
+        self.grid_cell_size = max(16, round(ui(32) / 16) * 16)
         self.show_grid = True
 
         # Same bitmap font family + Theme colors as DevMenu / EditorToolbar's
         # own chrome, so the tileset editor reads as part of the same tool
         # family instead of a mismatched leftover panel.
         self.font = uk.BitmapFont('assets\\ui\\fonts', letter_spacing=1)
-        self.title_size = 16
-        self.body_size  = 11
-        self.hint_size  = 10
+        self.title_size = ui_text(16)
+        self.body_size  = ui_text(11)
+        self.hint_size  = ui_text(10)
 
         # Optional custom icon for the info ('?') badge — same PNG-override
         # convention as EditorToolbar (assets/ui/toolbar/<id>.png): drop a
@@ -804,8 +808,8 @@ class TilesetEditor:
 
         # Panel show/hide toggle (same pattern as EditorToolbar)
         self.palette_visible = True
-        self._panel_tab_w = 18
-        self._panel_tab_h = 72
+        self._panel_tab_w = ui(18)
+        self._panel_tab_h = ui(72)
         self._hover_panel_toggle = False
 
         # Slide animation for the panel opening/closing — chased toward
@@ -886,7 +890,7 @@ class TilesetEditor:
         actually drawn. self.palette_x here is always the panel's settled
         resting position (draw_palette restores it after each shifted
         draw), so this is stable to call from anywhere, animating or not."""
-        gap = 6  # breathing room between tab and panel when panel is visible
+        gap = ui(6)  # breathing room between tab and panel when panel is visible
         tx_shown  = self.palette_x - self._panel_tab_w - gap
         tx_hidden = self.screen_width - self._panel_tab_w
         tx = round(uk.lerp(tx_hidden, tx_shown, self._panel_slide_anim))
@@ -900,7 +904,7 @@ class TilesetEditor:
         bg     = uk.lerp_color((22, 25, 35), (30, 34, 46), 1.0 if lit else 0.0)
         border = uk.Theme.GOLD if lit else uk.Theme.PANEL_BORDER
         uk.draw_panel(screen, rect, bg=(*bg, 235), border=border, border_width=1,
-                      radius=6, shadow=False)
+                      radius=ui(6), shadow=False)
         chevron_color = uk.Theme.GOLD_BRIGHT if lit else uk.Theme.TEXT_MUTED
         _draw_chevron_icon(screen, rect, chevron_color, left=self.palette_visible, width=2)
 
@@ -944,6 +948,8 @@ class TilesetEditor:
         if tileset.is_tile_animated(*anchor):
             tileset.remove_animation(anchor)
             self._set_anim_feedback("Animation removed")
+            # Which placed tiles count as animated just changed.
+            self.notify_tile_changed(None)
             return
 
         frames = [
@@ -976,6 +982,8 @@ class TilesetEditor:
         self._set_anim_feedback(f"Animated: {len(self._pending_anim_frames)} frames @ {fps:g}fps")
         self._pending_anim_anchor = None
         self._pending_anim_frames = None
+        # Which placed tiles count as animated just changed.
+        self.notify_tile_changed(None)
 
     def add_tile_change_listener(self, fn):
         """Register an extra callback for notify_tile_changed() (see below),
@@ -997,6 +1005,24 @@ class TilesetEditor:
         add_tile_change_listener (the room editor's auto tile-collision
         resync).
         """
+        # Drop this editor's own render caches (layer-sorted list, animated
+        # list, and the painting-mode background frame snapshot).
+        #
+        # Paint/erase invalidate these themselves, but several other paths
+        # in room_editor.py (undo/redo of box-delete/paste, quick right-click
+        # delete, dragging selected tiles, undoing a move) mutate room_tiles
+        # directly and only call notify_tile_changed(). Without this, the
+        # editor kept drawing the stale sorted list / frame snapshot, so
+        # restored tiles didn't show up and deleted/moved ones lingered
+        # until the game was reloaded.
+        if room_name is None:
+            self._sorted_tiles_cache.clear()
+            self._animated_tiles_cache.clear()
+            self._paint_bg_frame_cache.clear()
+            self._tile_content_generation += 1
+        else:
+            self._invalidate_sorted_tiles_cache(room_name)
+
         if callable(getattr(self, 'on_tile_changed', None)):
             self.on_tile_changed(room_name, cells=cells)
         for listener in self._tile_change_listeners:
@@ -1096,7 +1122,7 @@ class TilesetEditor:
         boundary is always exactly the midpoint of the cell on screen,
         regardless of how many actual pixels that maps to.
         """
-        tileset_x = self.palette_x + 20
+        tileset_x = self.palette_x + ui(20)
         tileset_y = self.palette_y + self.tileset_area_y_offset
         rel_x = mouse_x - tileset_x + self.palette_scroll_x
         rel_y = mouse_y - tileset_y + self.palette_scroll_y
@@ -1135,7 +1161,16 @@ class TilesetEditor:
                 and self.palette_y <= mouse_y < self.palette_y + self.palette_height)
 
     def _is_in_ui_rect(self, mouse_x: int, mouse_y: int, rect_name: str) -> bool:
-        """Returns True when the mouse is inside a named UI rect."""
+        """Returns True when the mouse is inside a named UI rect.
+
+        Every rect in ui_rects belongs to the palette panel and is only
+        refreshed while the panel is drawn. Once the panel is hidden the
+        last-drawn rects go stale, so they must not be clickable then --
+        otherwise a world click that happens to land there would toggle
+        e.g. "Show only this layer" instead of placing a tile.
+        """
+        if not self.palette_visible:
+            return False
         if rect_name in self.ui_rects:
             rect = self.ui_rects[rect_name]
             return rect.collidepoint(mouse_x, mouse_y)
@@ -1313,12 +1348,24 @@ class TilesetEditor:
         elif event.type == pygame.MOUSEBUTTONDOWN:
             mouse_x, mouse_y = event.pos
 
+            # Real screen position of the click. While the room editor is
+            # zoomed, RoomEditor._zoom_adjust_event rewrites event.pos into
+            # zoom/world space, but ALL palette chrome (panel tab, layer
+            # dropdown, checkboxes, info button) lives in fixed real-screen
+            # coordinates. Hit-testing those against the rewritten
+            # mouse_x/mouse_y meant a plain tile-placing click on the map
+            # could land "inside" the Show-only-this-layer checkbox (or the
+            # dropdown, etc.) and toggle it instead -- which made the layer
+            # you were painting vanish until the game was reloaded.
+            # mouse_x/mouse_y stay world-space and are only used for placing.
+            real_x, real_y = event.dict.get('_room_editor_raw_pos', getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos()))
+
             # Panel show/hide toggle — checked first so it always fires
-            if event.button == 1 and self._panel_toggle_rect().collidepoint(mouse_x, mouse_y):
+            if event.button == 1 and self._panel_toggle_rect().collidepoint(real_x, real_y):
                 self.palette_visible = not self.palette_visible
                 return
 
-            if event.button == 1 and self._is_in_ui_rect(mouse_x, mouse_y, 'info_button'):
+            if event.button == 1 and self._is_in_ui_rect(real_x, real_y, 'info_button'):
                 self.show_keybinds_popup = not self.show_keybinds_popup
                 return
 
@@ -1329,13 +1376,13 @@ class TilesetEditor:
                 self.show_keybinds_popup = False
                 return
 
-            if self._is_in_ui_rect(mouse_x, mouse_y, 'layer_dropdown'):
+            if self._is_in_ui_rect(real_x, real_y, 'layer_dropdown'):
                 self.layer_dropdown_open = not self.layer_dropdown_open
                 return
 
             if self.layer_dropdown_open:
                 for i, (name, value) in enumerate(self.LAYER_PRESETS):
-                    if self._is_in_ui_rect(mouse_x, mouse_y, f'layer_option_{i}'):
+                    if self._is_in_ui_rect(real_x, real_y, f'layer_option_{i}'):
                         self.current_layer_preset_index = i
                         # Picking ANY option ends a custom entry in progress —
                         # otherwise the field stays open, swallows every key,
@@ -1358,17 +1405,14 @@ class TilesetEditor:
             if self.layer_input_active and event.button in (1, 3):
                 self._commit_layer_input()
 
-            if self._is_in_ui_rect(mouse_x, mouse_y, 'delete_checkbox'):
+            if self._is_in_ui_rect(real_x, real_y, 'delete_checkbox'):
                 self.delete_underlying = not self.delete_underlying
                 return
 
-            if self._is_in_ui_rect(mouse_x, mouse_y, 'hide_layer_checkbox'):
-                # Toggles visibility of only the currently selected layer —
-                # other layers are unaffected and keep their own hidden state.
-                if self.current_layer in self.hidden_layers:
-                    self.hidden_layers.discard(self.current_layer)
-                else:
-                    self.hidden_layers.add(self.current_layer)
+            if self._is_in_ui_rect(real_x, real_y, 'solo_layer_checkbox'):
+                # Toggle "show only the selected layer" mode. It follows the
+                # selection: switching layers while it's on shows just the new one.
+                self.show_only_active_layer = not self.show_only_active_layer
                 # Invalidate the baked tile cache so the visibility change is
                 # reflected immediately — without this the old surface persists.
                 self.notify_tile_changed(current_room_name)
@@ -1379,7 +1423,7 @@ class TilesetEditor:
             # Only scroll the palette when the wheel happens over the palette
             # box itself, and consume the event (return) so it doesn't also
             # fall through to the room camera pan handler.
-            if event.button in (4, 5) and self._is_in_palette(mouse_x, mouse_y):
+            if event.button in (4, 5) and self._is_in_palette(real_x, real_y):
                 if event.button == 4:
                     if shift_pressed:
                         self.palette_scroll_x = max(0, self.palette_scroll_x - self.grid_cell_size)
@@ -1389,7 +1433,7 @@ class TilesetEditor:
                     tileset = self.get_current_tileset()
                     if tileset:
                         if shift_pressed:
-                            max_scroll_x = max(0, tileset.cols * self.grid_cell_size - self.palette_width + 40)
+                            max_scroll_x = max(0, tileset.cols * self.grid_cell_size - self.palette_width + ui(40))
                             self.palette_scroll_x = min(max_scroll_x, self.palette_scroll_x + self.grid_cell_size)
                         else:
                             max_scroll_y = max(0, tileset.rows * self.grid_cell_size - self.palette_content_height)
@@ -1403,7 +1447,7 @@ class TilesetEditor:
             # constants. Checking the rewritten coords against them makes
             # every off-palette click in a room bigger than the screen look
             # like it landed on the palette once zoomed out far enough.
-            real_x, real_y = event.dict.get('_room_editor_raw_pos', getattr(self, '_logical_mouse_pos', pygame.mouse.get_pos()))
+            # (real_x / real_y are computed once at the top of this branch.)
 
             if event.button == 1:
                 if self._is_in_palette(real_x, real_y):
@@ -1457,7 +1501,7 @@ class TilesetEditor:
 
         Returns (tile_x, tile_y) or None if the position is outside the tileset area.
         """
-        tileset_x = self.palette_x + 20
+        tileset_x = self.palette_x + ui(20)
         tileset_y = self.palette_y + self.tileset_area_y_offset
         rel_x = mouse_x - tileset_x + self.palette_scroll_x
         rel_y = mouse_y - tileset_y + self.palette_scroll_y
@@ -1946,16 +1990,16 @@ class TilesetEditor:
         """Draw all tiles for a room at the specified rendering pass ('background' or 'foreground').
 
         Tiles with layer >= 0 are drawn in the foreground pass; everything below 0 is background.
-        Layers toggled off via the "Hide this layer" checkbox (self.hidden_layers) are skipped
-        entirely. Of the remaining layers, the active editing layer (current_layer) is always
-        drawn at full opacity; every other layer is always dimmed, so surrounding layers stay
+        When the "Show only this layer" checkbox is on (self.show_only_active_layer), every
+        layer except current_layer is skipped entirely. Otherwise the active editing layer
+        (current_layer) is always drawn at full opacity; every other layer is always dimmed, so surrounding layers stay
         visible as context without obscuring what's being edited. Uses the tileset's
         scaled/dimmed surface caches to avoid per-frame transform.scale() calls.
 
         The background pass splits static tiles from animated ones. Static
         tiles are baked into a cached composite (see _paint_bg_frame_cache)
         and reused with a single opaque blit as long as the camera, layer
-        selection, hidden-layer set, and tile data haven't changed — no
+        selection, show-only flag, and tile data haven't changed — no
         per-pixel alpha blending on frames where nothing moved. Animated
         tiles are deliberately excluded from that composite (their frame
         advances independently of all of that) and are instead redrawn
@@ -1969,7 +2013,7 @@ class TilesetEditor:
         if layer == 'background':
             cache_key = (
                 camera_x, camera_y, self.screen_width, self.screen_height,
-                self.current_layer, frozenset(self.hidden_layers),
+                self.current_layer, self.show_only_active_layer,
                 self._tile_content_generation,
             )
             cached = self._paint_bg_frame_cache.get(room_name)
@@ -2005,16 +2049,13 @@ class TilesetEditor:
         """
         tick_ms = pygame.time.get_ticks()
 
-        # If the currently-selected layer is itself hidden, there's no visible
-        # "active" layer to compare against — don't dim everything else just
-        # because the reference layer happens to be invisible.
-        active_layer_is_visible = self.current_layer not in self.hidden_layers
+        # The active layer is never hidden, so it's always the dimming reference.
+        active_layer_is_visible = True
 
         for tile in self._get_sorted_tiles(room_name):
-            # Layers hidden via the per-layer checkbox are skipped entirely —
-            # unlike dimming, this is a full hide, and only ever affects the
-            # specific layer(s) the checkbox was toggled on.
-            if tile.layer in self.hidden_layers:
+            # In "show only this layer" mode every other layer is skipped
+            # entirely — unlike dimming, this is a full hide.
+            if self.show_only_active_layer and tile.layer != self.current_layer:
                 continue
 
             # Split world tiles into two draw passes so foreground tiles render on top
@@ -2047,10 +2088,10 @@ class TilesetEditor:
         (usually short) _get_animated_tiles list instead of every tile in
         the room, so this stays cheap regardless of total tile count."""
         tick_ms = pygame.time.get_ticks()
-        active_layer_is_visible = self.current_layer not in self.hidden_layers
+        active_layer_is_visible = True
 
         for tile in self._get_animated_tiles(room_name):
-            if tile.layer in self.hidden_layers:
+            if self.show_only_active_layer and tile.layer != self.current_layer:
                 continue
             if layer == 'background' and tile.layer >= 0:
                 continue
@@ -2233,13 +2274,13 @@ class TilesetEditor:
 
         # Title
         title_s = self.font.render(f"Tileset: {tileset.name}", color=uk.Theme.GOLD, height=self.title_size)
-        uk.blit_surface(screen, title_s, (self.palette_x + 16, self.palette_y + 10), transient=True)
+        uk.blit_surface(screen, title_s, (self.palette_x + ui(16), self.palette_y + ui(10)), transient=True)
 
         # Info button — small '?' badge right after the title that opens the
         # full keybinds reference (see _draw_keybinds_popup).
-        info_d = 18
-        info_x = self.palette_x + 16 + title_s.get_width() + 14
-        info_y = self.palette_y + 10 + (title_s.get_height() - info_d) // 2
+        info_d = ui(18)
+        info_x = self.palette_x + ui(16) + title_s.get_width() + ui(14)
+        info_y = self.palette_y + ui(10) + (title_s.get_height() - info_d) // 2
         info_rect = pygame.Rect(info_x, info_y, info_d, info_d)
         self.ui_rects['info_button'] = info_rect
         uk.register_hoverable(info_rect)
@@ -2249,17 +2290,17 @@ class TilesetEditor:
         dims_text = f"{tileset.cols}x{tileset.rows} tiles ({tileset.tile_width}px)"
         dims_s = self.font.render(dims_text, color=uk.Theme.TEXT_MUTED, height=self.body_size)
         uk.blit_surface(screen, dims_s,
-                        (self.palette_x + self.palette_width - dims_s.get_width() - 16, self.palette_y + 15),
+                        (self.palette_x + self.palette_width - dims_s.get_width() - ui(16), self.palette_y + ui(15)),
                         transient=True)
 
         # Tile grid — a recessed card within the panel
         tileset_y = self.palette_y + self.tileset_area_y_offset
-        tileset_x = self.palette_x + 20
+        tileset_x = self.palette_x + ui(20)
 
         clip_rect = pygame.Rect(tileset_x, tileset_y,
-                                self.palette_width - 40, self.palette_content_height)
-        uk.draw_rect_on(screen, uk.Theme.CARD_BG, clip_rect, 0, 6)
-        uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER, clip_rect, 1, 6)
+                                self.palette_width - ui(40), self.palette_content_height)
+        uk.draw_rect_on(screen, uk.Theme.CARD_BG, clip_rect, 0, ui(6))
+        uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER, clip_rect, 1, ui(6))
         screen.set_clip(clip_rect)
 
         if tileset.image:
@@ -2288,12 +2329,12 @@ class TilesetEditor:
             for (anim_tx, anim_ty) in tileset.tile_animations:
                 if not (0 <= anim_tx < tileset.cols and 0 <= anim_ty < tileset.rows):
                     continue
-                badge_x = draw_x + anim_tx * self.grid_cell_size + self.grid_cell_size - 9
+                badge_x = draw_x + anim_tx * self.grid_cell_size + self.grid_cell_size - ui(9)
                 badge_y = draw_y + anim_ty * self.grid_cell_size + 2
-                if not clip_rect.contains(pygame.Rect(badge_x - 5, badge_y - 5, 10, 10)):
+                if not clip_rect.contains(pygame.Rect(badge_x - ui(5), badge_y - ui(5), ui(10), ui(10))):
                     continue
-                uk.draw_circle_on(screen, uk.Theme.GOLD, (badge_x, badge_y), 5)
-                uk.draw_circle_on(screen, (14, 17, 25), (badge_x, badge_y), 5, 1)
+                uk.draw_circle_on(screen, uk.Theme.GOLD, (badge_x, badge_y), ui(5))
+                uk.draw_circle_on(screen, (14, 17, 25), (badge_x, badge_y), ui(5), 1)
 
             # Mark solid (collision) tiles with a hatch overlay — the same
             # "red = blocks movement" language the room editor's own
@@ -2372,7 +2413,7 @@ class TilesetEditor:
 
         # Selection / status info, overlaid in the top-left corner of the
         # grid — a compact HUD readout rather than a separate panel.
-        sel_y = self.palette_y + 46
+        sel_y = self.palette_y + ui(46)
         min_x, max_x, min_y, max_y = self._get_selection_bounds()
         sel_width = max_x - min_x + 1
         sel_height = max_y - min_y + 1
@@ -2385,19 +2426,19 @@ class TilesetEditor:
                 else:
                     hint_text, hint_color = "Press N to animate this selection", uk.Theme.TEXT_DIM
                 hint_s = self.font.render(hint_text, color=hint_color, height=self.body_size)
-                uk.blit_surface(screen, hint_s, (self.palette_x + 20, sel_y), transient=True)
+                uk.blit_surface(screen, hint_s, (self.palette_x + ui(20), sel_y), transient=True)
 
         # Inline FPS prompt while confirming a new animation
         if self.fps_input_active:
             prompt_text = f"New animation - FPS: {self.fps_input_text}_  (Enter to confirm, Esc to cancel)"
             prompt_s = self.font.render(prompt_text, color=uk.Theme.GOLD, height=self.body_size)
-            uk.blit_surface(screen, prompt_s, (self.palette_x + 20, sel_y + 18), transient=True)
+            uk.blit_surface(screen, prompt_s, (self.palette_x + ui(20), sel_y + ui(18)), transient=True)
 
         # Brief confirmation after animating/un-animating a selection, or
         # after toggling solid/collision on a selection.
         elif self.anim_feedback_text and pygame.time.get_ticks() < self.anim_feedback_until_ms:
             fb_s = self.font.render(self.anim_feedback_text, color=self.SUCCESS, height=self.body_size)
-            uk.blit_surface(screen, fb_s, (self.palette_x + 20, sel_y + 18), transient=True)
+            uk.blit_surface(screen, fb_s, (self.palette_x + ui(20), sel_y + ui(18)), transient=True)
 
         # Controls strip: two checkboxes, then the tile layer row. Pinned to
         # a fixed offset from the panel top (based on the *max* content
@@ -2405,9 +2446,9 @@ class TilesetEditor:
         # strip stays put and the panel's bottom doesn't move even though
         # the tile grid box above it shrinks for small tilesets. The layer
         # popup is drawn last so it sits on top.
-        controls_y = tileset_y + self._palette_content_max_height + 10
+        controls_y = tileset_y + self._palette_content_max_height + ui(10)
         self._draw_palette_checkboxes(screen, controls_y)
-        self._draw_layer_row(screen, controls_y + 56)
+        self._draw_layer_row(screen, controls_y + ui(56))
         self._draw_layer_dropdown_popup(screen)
         self._draw_keybinds_popup(screen)  # centered modal — reads screen_width/height, not palette_x, so it isn't affected by the shift above
 
@@ -2420,44 +2461,44 @@ class TilesetEditor:
 
     def _draw_checkbox(self, screen: pygame.Surface, x: int, y: int, checked: bool, label: str) -> pygame.Rect:
         """One labelled checkbox; returns its rect for click hit-testing."""
-        rect = pygame.Rect(x, y, 18, 18)
-        uk.draw_rect_on(screen, uk.Theme.CARD_BG, rect, 0, 4)
-        uk.draw_rect_on(screen, uk.Theme.GOLD if checked else uk.Theme.PANEL_BORDER, rect, 1, 4)
+        rect = pygame.Rect(x, y, ui(18), ui(18))
+        uk.draw_rect_on(screen, uk.Theme.CARD_BG, rect, 0, ui(4))
+        uk.draw_rect_on(screen, uk.Theme.GOLD if checked else uk.Theme.PANEL_BORDER, rect, 1, ui(4))
         if checked:
-            uk.draw_line_on(screen, self.SUCCESS, (x + 3, y + 9), (x + 7, y + 13), 2)
-            uk.draw_line_on(screen, self.SUCCESS, (x + 7, y + 13), (x + 15, y + 5), 2)
+            uk.draw_line_on(screen, self.SUCCESS, (x + ui(3), y + ui(9)), (x + ui(7), y + ui(13)), 2)
+            uk.draw_line_on(screen, self.SUCCESS, (x + ui(7), y + ui(13)), (x + ui(15), y + ui(5)), 2)
         label_s = self.font.render(label, color=uk.Theme.TEXT_MUTED, height=self.body_size)
-        uk.blit_surface(screen, label_s, (x + 25, y + 3), transient=True)
+        uk.blit_surface(screen, label_s, (x + ui(25), y + ui(3)), transient=True)
         uk.register_hoverable(rect)
         return rect
 
     def _draw_palette_checkboxes(self, screen: pygame.Surface, controls_y: int):
         """The two checkboxes under the tile grid."""
-        checkbox_x = self.palette_x + 20
+        checkbox_x = self.palette_x + ui(20)
         self.ui_rects['delete_checkbox'] = self._draw_checkbox(
             screen, checkbox_x, controls_y, self.delete_underlying, "Replace tiles on same layer")
 
-        # "Hide this layer" checkbox — hides ONLY the currently selected layer
-        # (self.current_layer); other layers keep their own independent hidden state.
-        self.ui_rects['hide_layer_checkbox'] = self._draw_checkbox(
-            screen, checkbox_x, controls_y + 26,
-            self.current_layer in self.hidden_layers, "Hide this layer")
+        # "Show only this layer" checkbox — draws ONLY the currently selected
+        # layer (self.current_layer) and hides all others while checked.
+        self.ui_rects['solo_layer_checkbox'] = self._draw_checkbox(
+            screen, checkbox_x, controls_y + ui(26),
+            self.show_only_active_layer, "Show only this layer")
 
     def _draw_layer_row(self, screen: pygame.Surface, layer_row_y: int):
         """'Tile Layer:' label + dropdown button. Registers ui_rects['layer_dropdown']."""
         # Layer controls — label + dropdown button
         layer_label_s = self.font.render("Tile Layer:", color=uk.Theme.TEXT_MUTED, height=self.body_size)
-        uk.blit_surface(screen, layer_label_s, (self.palette_x + 20, layer_row_y + 7), transient=True)
+        uk.blit_surface(screen, layer_label_s, (self.palette_x + ui(20), layer_row_y + ui(7)), transient=True)
 
-        dropdown_x = self.palette_x + 130
+        dropdown_x = self.palette_x + ui(130)
         dropdown_y = layer_row_y
-        dropdown_width = 200
-        dropdown_height = 28
+        dropdown_width = ui(200)
+        dropdown_height = ui(28)
 
         self.ui_rects['layer_dropdown'] = pygame.Rect(dropdown_x, dropdown_y, dropdown_width, dropdown_height)
         uk.draw_panel(screen, self.ui_rects['layer_dropdown'], bg=uk.Theme.CARD_BG,
                       border=uk.Theme.GOLD if self.layer_dropdown_open else uk.Theme.PANEL_BORDER,
-                      border_width=1, radius=6, shadow=False)
+                      border_width=1, radius=ui(6), shadow=False)
         uk.register_hoverable(self.ui_rects['layer_dropdown'])
 
         if self.layer_input_active:
@@ -2470,7 +2511,7 @@ class TilesetEditor:
                 layer_display = f"{preset_name} ({self.current_layer})"
 
         layer_h = self.body_size
-        max_text_w = dropdown_width - 30
+        max_text_w = dropdown_width - ui(30)
         while layer_h > 7 and self.font.size(layer_display, height=layer_h)[0] > max_text_w:
             layer_h -= 1
         layer_text_s = self.font.render(
@@ -2478,18 +2519,18 @@ class TilesetEditor:
             color=uk.Theme.GOLD if self.layer_input_active else uk.Theme.TEXT_PRIMARY,
             height=layer_h)
         uk.blit_surface(screen, layer_text_s,
-                        (dropdown_x + 10, dropdown_y + (dropdown_height - layer_text_s.get_height()) // 2),
+                        (dropdown_x + ui(10), dropdown_y + (dropdown_height - layer_text_s.get_height()) // 2),
                         transient=True)
 
         # Dropdown chevron
-        ax, ay = dropdown_x + dropdown_width - 18, dropdown_y + dropdown_height // 2
+        ax, ay = dropdown_x + dropdown_width - ui(18), dropdown_y + dropdown_height // 2
         chevron_color = uk.Theme.GOLD if self.layer_dropdown_open else uk.Theme.TEXT_MUTED
         if self.layer_dropdown_open:
-            uk.draw_line_on(screen, chevron_color, (ax - 5, ay + 2), (ax, ay - 3), 2)
-            uk.draw_line_on(screen, chevron_color, (ax, ay - 3), (ax + 5, ay + 2), 2)
+            uk.draw_line_on(screen, chevron_color, (ax - ui(5), ay + 2), (ax, ay - ui(3)), 2)
+            uk.draw_line_on(screen, chevron_color, (ax, ay - ui(3)), (ax + ui(5), ay + 2), 2)
         else:
-            uk.draw_line_on(screen, chevron_color, (ax - 5, ay - 2), (ax, ay + 3), 2)
-            uk.draw_line_on(screen, chevron_color, (ax, ay + 3), (ax + 5, ay - 2), 2)
+            uk.draw_line_on(screen, chevron_color, (ax - ui(5), ay - 2), (ax, ay + ui(3)), 2)
+            uk.draw_line_on(screen, chevron_color, (ax, ay + ui(3)), (ax + ui(5), ay - 2), 2)
 
     def _draw_layer_dropdown_popup(self, screen: pygame.Surface):
         """The layer dropdown's option list. Drawn last so it sits above the
@@ -2501,7 +2542,7 @@ class TilesetEditor:
         if drop is None:
             return
 
-        option_h = 26
+        option_h = ui(26)
         menu_h = len(self.LAYER_PRESETS) * option_h
         menu_y = drop.y - menu_h
         if menu_y < 0:  # not enough room above (very short panel) -> open downward
@@ -2516,13 +2557,13 @@ class TilesetEditor:
             uk.draw_panel(screen, option_rect,
                           bg=uk.Theme.CARD_BG_HOVER if hovered else uk.Theme.CARD_BG,
                           border=uk.Theme.GOLD if hovered else uk.Theme.PANEL_BORDER,
-                          border_width=1, radius=4, shadow=False)
+                          border_width=1, radius=ui(4), shadow=False)
 
             display_text = name if value is None else f"{name} ({value})"
             option_color = uk.Theme.GOLD if hovered else uk.Theme.TEXT_PRIMARY
             option_s = self.font.render(display_text, color=option_color, height=self.body_size)
             uk.blit_surface(screen, option_s,
-                            (drop.x + 10, option_rect.y + (option_h - option_s.get_height()) // 2),
+                            (drop.x + ui(10), option_rect.y + (option_h - option_s.get_height()) // 2),
                             transient=True)
 
     def _draw_info_button(self, screen: pygame.Surface, rect: pygame.Rect):
@@ -2586,13 +2627,13 @@ class TilesetEditor:
             ]),
         ]
 
-        row_h = 20
-        section_gap = 14
-        header_h = 50
-        margin_x = 20
-        key_indent = 10       # key label offset from the left margin
-        col_gap = 18          # gap between the key column and the desc column
-        right_pad = 20
+        row_h = ui(20)
+        section_gap = ui(14)
+        header_h = ui(50)
+        margin_x = ui(20)
+        key_indent = ui(10)       # key label offset from the left margin
+        col_gap = ui(18)          # gap between the key column and the desc column
+        right_pad = ui(20)
 
         # Cache rendered surfaces so widths are measured once and reused for
         # both sizing the panel and drawing it (avoids re-deriving layout
@@ -2612,27 +2653,27 @@ class TilesetEditor:
         close_s = self.font.render("Click anywhere to close", color=uk.Theme.TEXT_DIM, height=self.hint_size)
 
         content_w = key_indent + key_col_w + max_desc_w + right_pad
-        header_w = title_s.get_width() + 24 + close_s.get_width()
+        header_w = title_s.get_width() + ui(24) + close_s.get_width()
         panel_w = max(360, margin_x * 2 + max(content_w, header_w))
 
         # Every section header line also consumes a row, so count one extra
         # row per section on top of its keybind rows.
         content_rows = sum(1 + len(rows) for _, rows in sections)
-        panel_h = header_h + content_rows * row_h + len(sections) * section_gap + 16
+        panel_h = header_h + content_rows * row_h + len(sections) * section_gap + ui(16)
 
         panel_x = (self.screen_width - panel_w) // 2
-        panel_y = max(30, (self.screen_height - panel_h) // 2)
+        panel_y = max(ui(30), (self.screen_height - panel_h) // 2)
         panel_rect = pygame.Rect(panel_x, panel_y, panel_w, panel_h)
 
         uk.draw_panel(screen, panel_rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD,
                       border_width=2, radius=uk.Theme.RADIUS_PANEL, shadow=True)
 
-        uk.blit_surface(screen, title_s, (panel_x + margin_x, panel_y + 14), transient=True)
+        uk.blit_surface(screen, title_s, (panel_x + margin_x, panel_y + ui(14)), transient=True)
         uk.blit_surface(screen, close_s,
-                        (panel_x + panel_w - close_s.get_width() - margin_x, panel_y + 20), transient=True)
+                        (panel_x + panel_w - close_s.get_width() - margin_x, panel_y + ui(20)), transient=True)
 
         uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER,
-                        (panel_x + 16, panel_y + header_h - 10, panel_w - 32, 1), 0, 0)
+                        (panel_x + ui(16), panel_y + header_h - ui(10), panel_w - ui(32), 1), 0, 0)
 
         y = panel_y + header_h
         i = 0
@@ -2659,23 +2700,23 @@ class TilesetEditor:
         the layer row (controls_y + 56) downward, so the tile grid needs to be
         shortened (palette_controls_height) to make room before it's called.
         """
-        layer_row_y = controls_y + 56
+        layer_row_y = controls_y + ui(56)
 
         # ── Native shadow status ─────────────────────────────────────────────
-        shadow_y = layer_row_y + 36
+        shadow_y = layer_row_y + ui(36)
         shadow_status_s = self.font.render(
             f"Native Shadow: {'ON' if self.native_shadow_enabled else 'OFF'} ({round(self.native_shadow_alpha / 255 * 100)}%)",
             color=self.SUCCESS if self.native_shadow_enabled else uk.Theme.TEXT_DIM, height=self.body_size)
-        uk.blit_surface(screen, shadow_status_s, (self.palette_x + 20, shadow_y), transient=True)
+        uk.blit_surface(screen, shadow_status_s, (self.palette_x + ui(20), shadow_y), transient=True)
         shadow_help_s = self.font.render(
             "K: toggle - Click/drag = shadow - -/+ = opacity",
             color=uk.Theme.TEXT_DIM, height=self.hint_size)
-        uk.blit_surface(screen, shadow_help_s, (self.palette_x + 20, shadow_y + 16), transient=True)
+        uk.blit_surface(screen, shadow_help_s, (self.palette_x + ui(20), shadow_y + ui(16)), transient=True)
 
         # ── Instructions footer — two compact columns below a hairline ─────
-        divider_y = shadow_y + 36
+        divider_y = shadow_y + ui(36)
         uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER,
-                        (self.palette_x + 16, divider_y, self.palette_width - 32, 1), 0, 0)
+                        (self.palette_x + ui(16), divider_y, self.palette_width - ui(32), 1), 0, 0)
 
         instructions = [
             "TAB: Switch Tileset", "L: Cycle Layer Presets", "G: Toggle Grid",
@@ -2685,15 +2726,15 @@ class TilesetEditor:
             "K: Toggle Native Shadow (any layer)", "N: Animate Selection",
             "C: Toggle Solid", "H: Collision Granularity", "F2: Close Editor",
         ]
-        col_w = (self.palette_width - 40) // 2
+        col_w = (self.palette_width - ui(40)) // 2
         rows_per_col = (len(instructions) + 1) // 2
-        inst_y0 = divider_y + 10
+        inst_y0 = divider_y + ui(10)
         for i, inst in enumerate(instructions):
             col = i // rows_per_col
             row = i % rows_per_col
             inst_s = self.font.render(inst, color=uk.Theme.TEXT_DIM, height=self.hint_size)
             uk.blit_surface(screen, inst_s,
-                            (self.palette_x + 20 + col * col_w, inst_y0 + row * 15), transient=True)
+                            (self.palette_x + ui(20) + col * col_w, inst_y0 + row * ui(15)), transient=True)
 
     def draw_grid(self, screen: pygame.Surface, camera_x: int, camera_y: int,
                   room_width: int, room_height: int):
@@ -2706,19 +2747,10 @@ class TilesetEditor:
 
         step = self.snap_size
 
-        # Room viewport is everything left of the palette panel (when it's
-        # open). During continuous editor zoom, `screen` is a virtual
-        # coordinate space (screen_width == real_width / zoom), while
-        # palette_x is still a REAL screen coordinate. Convert the palette edge
-        # into that virtual space before clipping.
-        if self.palette_visible:
-            zoom = max(0.001, float(getattr(self, 'editor_zoom', 1.0)))
-            viewport_width = min(
-                self.screen_width,
-                int(math.ceil(self.palette_x / zoom))
-            )
-        else:
-            viewport_width = self.screen_width
+        # Draw the grid across the full viewport, including the area behind
+        # the palette panel. The panel is drawn on top afterwards, so the
+        # grid stays visible through it instead of being cut off at its edge.
+        viewport_width = self.screen_width
 
         visible_x_start = camera_x // RENDER_SCALE
         visible_y_start = camera_y // RENDER_SCALE
@@ -2738,7 +2770,7 @@ class TilesetEditor:
         start_x = (visible_x_start // step) * step
         for x in range(start_x, visible_x_end + step, step):
             screen_x = (x * RENDER_SCALE) - camera_x
-            if -10 <= screen_x <= viewport_width + 10:
+            if -10 <= screen_x <= viewport_width + ui(10):
                 px = math.floor(screen_x)
                 uk.draw_line_on(screen, self.GRID_LINE,
                                 (px, 0), (px, self.screen_height), 1)
@@ -2747,7 +2779,7 @@ class TilesetEditor:
         start_y = (visible_y_start // step) * step
         for y in range(start_y, visible_y_end + step, step):
             screen_y = (y * RENDER_SCALE) - camera_y
-            if -10 <= screen_y <= self.screen_height + 10:
+            if -10 <= screen_y <= self.screen_height + ui(10):
                 py = math.floor(screen_y)
                 uk.draw_line_on(screen, self.GRID_LINE,
                                 (0, py), (viewport_width, py), 1)

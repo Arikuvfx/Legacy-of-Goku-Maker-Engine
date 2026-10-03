@@ -11,6 +11,8 @@ import os
 import pygame
 
 import dev_tools.ui_kit as uk
+from config.settings import (SCREEN_WIDTH, SCREEN_HEIGHT, load_display_settings,
+                             display_resolution_key, effective_resolution)
 
 
 CATEGORIES = [
@@ -66,7 +68,32 @@ CONFIG_ACTION = 'open_configuration'
 #   {'id': 'walk_speed', 'label': 'WALK SPEED', 'icon': 'config', 'value_key': 'walk_speed'}
 # 'value_key' is read straight off `game_config` via getattr/setattr, and the
 # live value is appended to the label automatically.
-CONFIG_OPTIONS = []
+#
+# Display entries use 'display' instead of 'value_key'; activating one returns
+# an action string for game.py to run (see Game._handle_dev_menu_action):
+#   'mode'       cycles BORDERLESS / FULLSCREEN / WINDOWED, applied live
+#   'resolution' cycles NATIVE and the standard 16:9 sizes that fit this
+#                desktop; saved, takes effect on the next launch
+#   'apply'      shown only when the saved resolution differs from the
+#                running one; saves and relaunches the game
+CONFIG_OPTIONS = [
+    # 'page' entries open a sub-page of the CONFIGURATION screen instead of
+    # doing something themselves (the page's entries live in the table below).
+    {'id': 'graphics', 'label': 'GRAPHICS', 'page': 'graphics'},
+]
+# Entries shown on the GRAPHICS page (CONFIGURATION > GRAPHICS).
+GRAPHICS_OPTIONS = [
+    {'id': 'display_mode',       'label': 'WINDOW MODE',       'display': 'mode'},
+    {'id': 'display_resolution', 'label': 'RESOLUTION',        'display': 'resolution'},
+    {'id': 'display_apply',      'label': 'APPLY AND RESTART', 'display': 'apply'},
+]
+_CONFIG_PAGES = {'root': CONFIG_OPTIONS, 'graphics': GRAPHICS_OPTIONS}
+_CONFIG_PAGE_TITLES = {'root': 'CONFIGURATION', 'graphics': 'GRAPHICS'}
+_DISPLAY_ACTIONS = {
+    'mode':       'display_cycle_mode',
+    'resolution': 'display_cycle_resolution',
+    'apply':      'restart_game',
+}
 
 
 class _BitmapFontView:
@@ -109,6 +136,7 @@ class DevMenu:
         self.previous_context = None
         self._last_input = 'mouse'
         self._view = 'main'  # 'main' or 'config'
+        self._config_page = 'root'  # 'root' or 'graphics' (sub-page of 'config')
 
         # main<->config slide transition. _prev_view is the view we're
         # sliding away from; None means settled (no transition playing).
@@ -141,7 +169,7 @@ class DevMenu:
         self._pulse = 0.0
         self._icons = [self._load_icon(item[3], item[4], 50) for item in CATEGORIES]
         self._title_surf_main = None
-        self._title_surf_config = None
+        self._title_surfs_config = {}
         self._card_label_cache = [None] * len(CATEGORIES)
 
         # Config button, top-right of the header bar next to "DEV TOOLS".
@@ -167,8 +195,8 @@ class DevMenu:
         self._config_menu = uk.IconGridMenu(
             items=[],
             columns=1,
-            card_size=(self._content_rect.width, 64),
-            gap=(0, 14),
+            card_size=self._config_card_size(),
+            gap=(0, 20),
             font_label=self.font,
             font_label_hi=self.font,
             icon_size=40,
@@ -280,6 +308,14 @@ class DevMenu:
         canvas.blit(scaled, ((box_size - nw) // 2, (box_size - nh) // 2))
         return canvas
 
+    def _config_card_size(self):
+        """Narrow, tall cards for the CONFIGURATION screens (instead of
+        full-width strips)."""
+        cw = self._content_rect.width
+        card_w = max(300, min(cw, round(cw * 0.34)))
+        card_h = max(96, min(132, round(self.screen_height * 0.13)))
+        return (card_w, card_h)
+
     def _layout(self):
         w, h = self.screen_width, self.screen_height
         self.header_h = max(86, round(h * 0.12))
@@ -333,13 +369,16 @@ class DevMenu:
         # Titles never change at runtime - render both once here instead of
         # every frame in _draw_header.
         self._title_surf_main = self.title_font.render('DEV TOOLS', color=(242, 244, 248), height=self.title_size)
-        self._title_surf_config = self.title_font.render('CONFIGURATION', color=(242, 244, 248), height=self.title_size)
+        self._title_surfs_config = {
+            page: self.title_font.render(title, color=(242, 244, 248), height=self.title_size)
+            for page, title in _CONFIG_PAGE_TITLES.items()
+        }
 
         # Keep the configuration card list's geometry in sync with the same
         # content area the main grid uses (only exists after __init__ has
         # finished building it - guard for the first _layout() call).
         if getattr(self, '_config_menu', None) is not None:
-            self._config_menu.set_card_geometry((self._content_rect.width, 64), (0, 14))
+            self._config_menu.set_card_geometry(self._config_card_size(), (0, 20))
             self._config_menu.layout(self._content_rect)
 
     def _resize_to(self, w, h):
@@ -411,6 +450,7 @@ class DevMenu:
             self._prev_view = 'main'
             self._transition_elapsed = 0.0
         self._view = 'config'
+        self._config_page = 'root'
         self.hover_index = -1
         self._back_hovered = False
         self._refresh_config_items()
@@ -421,22 +461,50 @@ class DevMenu:
         """Build the CONFIGURATION screen's card list fresh, so any
         'value_key' field shows the live value currently on game_config."""
         items = []
-        for opt in CONFIG_OPTIONS:
+        disp_cfg = load_display_settings()
+        for opt in _CONFIG_PAGES[self._config_page]:
             label = opt['label']
-            if 'value_key' in opt:
+            if 'display' in opt:
+                kind = opt['display']
+                if kind == 'mode':
+                    label = f"{label}: {disp_cfg['mode'].upper()}"
+                elif kind == 'resolution':
+                    label = f"{label}: {display_resolution_key(disp_cfg).upper()}"
+                else:
+                    # Only offer the restart when it would change something.
+                    w, h = effective_resolution(disp_cfg)
+                    if (w, h) == (SCREEN_WIDTH, SCREEN_HEIGHT):
+                        continue
+                    label = f"RESTART AT {w}X{h}"
+            elif 'value_key' in opt:
                 value = getattr(self.config, opt['value_key'], '?')
                 label = f"{label}: {value}"
-            drawer = uk.DEV_MENU_ICON_DRAWERS.get(opt.get('icon', 'config'),
-                                                   uk.DEV_MENU_ICON_DRAWERS['config'])
-            icon = uk.render_icon_surface(drawer, 40, uk.Theme.GOLD)
-            items.append(uk.GridItem(opt['id'], label, icon=icon, accent=uk.Theme.GOLD))
+            items.append(uk.GridItem(opt['id'], label, icon=None, accent=uk.Theme.GOLD))
         return items
 
     def _refresh_config_items(self):
         self._config_menu.set_items(self._config_items())
         self._config_menu.layout(self._content_rect)
 
+    def refresh_config(self):
+        """Rebuild the CONFIGURATION labels (game.py calls this after it has
+        applied a display action, so the new value shows immediately)."""
+        self._refresh_config_items()
+
+    def _open_config_page(self, page):
+        self._config_page = page
+        self._refresh_config_items()
+
+    def _config_back(self):
+        """Back button / ESC: sub-page -> CONFIGURATION, otherwise out to
+        the main launcher."""
+        if self._config_page != 'root':
+            self._open_config_page('root')
+        else:
+            self._leave_config()
+
     def _leave_config(self):
+        self._config_page = 'root'
         if self._view != 'main':
             self._prev_view = 'config'
             self._transition_elapsed = 0.0
@@ -446,7 +514,12 @@ class DevMenu:
         self._config_menu.hover_index = -1
 
     def _activate_config_item(self, item_id):
-        opt = next((o for o in CONFIG_OPTIONS if o['id'] == item_id), None)
+        opt = next((o for pg in _CONFIG_PAGES.values() for o in pg if o['id'] == item_id), None)
+        if opt and 'page' in opt:
+            self._open_config_page(opt['page'])
+            return None
+        if opt and 'display' in opt:
+            return _DISPLAY_ACTIONS[opt['display']]
         if opt and 'value_key' in opt:
             self._text_input.open(opt['value_key'])
         return None
@@ -489,7 +562,7 @@ class DevMenu:
 
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 if self._back_rect.collidepoint(event.pos):
-                    self._leave_config()
+                    self._config_back()
                     return None
                 item_id = self._config_menu.handle_event(event)
                 if item_id is not None:
@@ -497,7 +570,7 @@ class DevMenu:
                 return None
 
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                self._leave_config()
+                self._config_back()
                 return None
 
             item_id = self._config_menu.handle_event(event)
@@ -613,7 +686,8 @@ class DevMenu:
         uk.draw_rect_on(surface, (12, 15, 23), pygame.Rect(0, 0, w, self.header_h), 0, 0)
         uk.draw_rect_on(surface, (43, 49, 63), pygame.Rect(0, self.header_h - 1, w, 1), 0, 0)
 
-        title_surf = self._title_surf_config if self._view == 'config' else self._title_surf_main
+        title_surf = (self._title_surfs_config[self._config_page]
+                      if self._view == 'config' else self._title_surf_main)
         title_rect = title_surf.get_rect(centerx=w // 2, centery=self.header_h // 2)
         uk.blit_surface(surface, title_surf, title_rect, transient=False)
 

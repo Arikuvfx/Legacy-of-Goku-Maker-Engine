@@ -32,6 +32,7 @@ from core.items import (
     get_items_by_category, CATEGORY_SUPPLIES, CATEGORY_STORY_ITEMS, CATEGORY_EQUIP_BODY,
     CATEGORY_EQUIP_HANDS, CATEGORY_EQUIP_FEET, CATEGORY_EQUIP_ACCESSORY,
 )
+from config.settings import ui, ui_text
 
 
 # =============================================================================
@@ -43,29 +44,29 @@ from core.items import (
 # see the `tools`/`actions` tables below.
 # =============================================================================
 
-def _draw_tiles_icon(surface, rect, color, width=3):
+def _draw_tiles_icon(surface, rect, color, width=ui(3)):
     """2x2 tile grid — Tiles tool."""
     cx, cy = rect.center
     s = min(rect.w, rect.h) * 0.32
     box = pygame.Rect(0, 0, s * 2, s * 2)
     box.center = (cx, cy)
-    uk.draw_rect_on(surface, color, box, width, 3)
+    uk.draw_rect_on(surface, color, box, width, ui(3))
     uk.draw_line_on(surface, color, (box.centerx, box.top + 1), (box.centerx, box.bottom - 1), max(1, width - 1))
     uk.draw_line_on(surface, color, (box.left + 1, box.centery), (box.right - 1, box.centery), max(1, width - 1))
 
 
-def _draw_objects_icon(surface, rect, color, width=3):
+def _draw_objects_icon(surface, rect, color, width=ui(3)):
     """Crate with a cross seam — Objects tool."""
     cx, cy = rect.center
     s = min(rect.w, rect.h)
     box = pygame.Rect(0, 0, s * 0.56, s * 0.5)
     box.center = (cx, cy)
-    uk.draw_rect_on(surface, color, box, width, 3)
-    uk.draw_line_on(surface, color, (box.left + 3, box.top + 3), (box.right - 3, box.bottom - 3), max(1, width - 1))
-    uk.draw_line_on(surface, color, (box.right - 3, box.top + 3), (box.left + 3, box.bottom - 3), max(1, width - 1))
+    uk.draw_rect_on(surface, color, box, width, ui(3))
+    uk.draw_line_on(surface, color, (box.left + ui(3), box.top + ui(3)), (box.right - ui(3), box.bottom - ui(3)), max(1, width - 1))
+    uk.draw_line_on(surface, color, (box.right - ui(3), box.top + ui(3)), (box.left + ui(3), box.bottom - ui(3)), max(1, width - 1))
 
 
-def _draw_map_paint_icon(surface, rect, color, width=3):
+def _draw_map_paint_icon(surface, rect, color, width=ui(3)):
     """Blob outline with a brush-stroke corner — paints the Scouter minimap
     shape, distinct from ui_kit's folded-paper draw_map_icon (World Map)."""
     cx, cy = rect.center
@@ -101,7 +102,7 @@ def _draw_grid_icon(surface, rect, color, width=2, size=16):
             uk.draw_line_on(surface, color, (box.left, y), (box.right, y), 1)
 
 
-def _draw_zoom_icon(surface, rect, color, width=3):
+def _draw_zoom_icon(surface, rect, color, width=ui(3)):
     """Magnifying glass — 'zoom to fit whole room' action."""
     cx, cy = rect.center
     s = min(rect.w, rect.h)
@@ -114,7 +115,7 @@ def _draw_zoom_icon(surface, rect, color, width=3):
     uk.draw_line_on(surface, color, start, end, width)
 
 
-def _draw_play_icon(surface, rect, color, width=3):
+def _draw_play_icon(surface, rect, color, width=ui(3)):
     """Right-pointing triangle outline — Test action."""
     cx, cy = rect.center
     s = min(rect.w, rect.h) * 0.28
@@ -132,14 +133,14 @@ def _draw_save_icon(surface, rect, color, width=2):
     s = min(rect.w, rect.h)
     body = pygame.Rect(0, 0, s * 0.5, s * 0.5)
     body.center = (cx, cy + s * 0.02)
-    uk.draw_rect_on(surface, color, body, width, 3)
+    uk.draw_rect_on(surface, color, body, width, ui(3))
     label = pygame.Rect(0, 0, body.w * 0.62, body.h * 0.34)
     label.centerx = body.centerx
-    label.bottom = body.bottom - 4
+    label.bottom = body.bottom - ui(4)
     uk.draw_rect_on(surface, color, label, width, 1)
     slot = pygame.Rect(0, 0, body.w * 0.36, body.h * 0.2)
     slot.centerx = body.centerx
-    slot.top = body.top + 4
+    slot.top = body.top + ui(4)
     uk.draw_rect_on(surface, color, slot, width, 1)
 
 
@@ -195,16 +196,16 @@ class EditorToolbar:
 
     # ── Item panel constants ────────────────────────────────────────────────
     ITEM_SPRITE_DIR = os.path.join('assets', 'sprites', 'items')
-    ITEM_THUMB_SIZE  = 72
-    ITEM_THUMB_PAD   = 10
+    ITEM_THUMB_SIZE  = ui(72)
+    ITEM_THUMB_PAD   = ui(10)
     ITEM_COLS        = 5
-    ITEM_PANEL_W     = ITEM_COLS * (ITEM_THUMB_SIZE + ITEM_THUMB_PAD) + ITEM_THUMB_PAD + 16
+    ITEM_PANEL_W     = ITEM_COLS * (ITEM_THUMB_SIZE + ITEM_THUMB_PAD) + ITEM_THUMB_PAD + ui(16)
     # Default/floor height. The panel now opens filling the available
     # height below the toolbar (see _draw_item_panel's `available_h`)
     # rather than a short fixed size — this is only the minimum a user
     # drag-resize can shrink it to.
-    ITEM_PANEL_MIN_H = 260
-    ITEM_RESIZE_GRIP = 8  # px-tall grab strip along the bottom edge
+    ITEM_PANEL_MIN_H = ui(260)
+    ITEM_RESIZE_GRIP = ui(8)  # px-tall grab strip along the bottom edge
     ITEM_CATEGORY_LABELS = {
         CATEGORY_SUPPLIES:    'Supplies',
         CATEGORY_STORY_ITEMS: 'Story Items',
@@ -228,18 +229,18 @@ class EditorToolbar:
 
         # Layout constants — a slimmer bar than the old toolbar, in line
         # with dev_menu's "functional editor first, decoration second" bars.
-        self.height  = 82
-        self.padding = 14
-        self.btn_w   = 72
-        self.btn_h   = 60
-        self.gap     = 8
+        self.height  = ui(82)
+        self.padding = ui(14)
+        self.btn_w   = ui(72)
+        self.btn_h   = ui(60)
+        self.gap     = ui(8)
 
         # Same bitmap font family DevMenu and RoomEditor's own chrome use.
         self.font = uk.BitmapFont('assets\\ui\\fonts', letter_spacing=1)
-        self.label_size = 10
-        self.hint_size  = 11
-        self.title_size = 18
-        self.body_size  = 11
+        self.label_size = ui_text(10)
+        self.hint_size  = ui_text(11)
+        self.title_size = ui_text(18)
+        self.body_size  = ui_text(11)
 
         # Which editor mode is active
         self.current_tool = 'tiles'
@@ -302,8 +303,8 @@ class EditorToolbar:
 
         # Show/hide toggle
         self.visible      = True
-        self.tab_w        = 26
-        self.tab_h        = 20
+        self.tab_w        = ui(26)
+        self.tab_h        = ui(20)
         self.hover_toggle = False
         self._toggle_anim = 0.0
 
@@ -413,7 +414,7 @@ class EditorToolbar:
     # =========================================================================
 
     def _load_sprites(self):
-        icon_size = 44  # bigger custom-icon box (was 34) — still comfortably inside the 72x60 button
+        icon_size = ui(44)  # bigger custom-icon box (was 34) — still comfortably inside the 72x60 button
         for sid in self._icon_builders:
             try:
                 img = pygame.image.load(f'assets/ui/toolbar/{sid}.png').convert_alpha()
@@ -434,16 +435,25 @@ class EditorToolbar:
         if cached:
             return cached
         if bid == 'grid':
-            return self._icon_builders['grid']()
+            return self._fit_icon(self._icon_builders['grid']())
         builder = self._icon_builders.get(bid)
-        return builder() if builder else None
+        return self._fit_icon(builder()) if builder else None
+
+    @staticmethod
+    def _fit_icon(surf):
+        """The procedural icon builders draw on a fixed 32x32 canvas;
+        scale the finished icon to the current UI scale."""
+        target = ui(32)
+        if surf is None or target == 32:
+            return surf
+        return pygame.transform.smoothscale(surf, (target, target))
 
     def _create_tile_icon(self):
         surf   = pygame.Surface((32, 32), pygame.SRCALPHA)
         colors = [(139, 69, 19), (160, 82, 45), (101, 67, 33)]
         for i in range(3):
             for j in range(3):
-                x, y = 2 + i * 10, 2 + j * 10
+                x, y = 2 + i * ui(10), 2 + j * ui(10)
                 pygame.draw.rect(surf, colors[(i + j) % 3], (x, y, 8, 8))
                 pygame.draw.rect(surf, (80, 50, 20), (x, y, 8, 8), 1)
         return surf
@@ -507,9 +517,9 @@ class EditorToolbar:
             pygame.draw.rect(surf, col, (5, 5, 22, 22), 2)
             step = 22 / divisions
             for i in range(1, divisions):
-                x = int(5 + i * step)
+                x = int(ui(5) + i * step)
                 pygame.draw.line(surf, col, (x, 5), (x, 27), 1)
-                y = int(5 + i * step)
+                y = int(ui(5) + i * step)
                 pygame.draw.line(surf, col, (5, y), (27, y), 1)
         return surf
 
@@ -777,11 +787,11 @@ class EditorToolbar:
         border_w = 2 if lit else 1
 
         uk.draw_panel(screen, draw_rect, bg=(*base, 235), border=border_col,
-                      border_width=border_w, radius=8, shadow=False)
+                      border_width=border_w, radius=ui(8), shadow=False)
 
         glow_t = max(t, 0.35 if lit else 0.0)
         if glow_t > 0.02:
-            uk.draw_soft_glow(screen, draw_rect.center, 22, accent, max_alpha=int(24 * glow_t))
+            uk.draw_soft_glow(screen, draw_rect.center, ui(22), accent, max_alpha=int(24 * glow_t))
 
         icon = self._get_icon_surface(bid)
         if icon:
@@ -794,7 +804,7 @@ class EditorToolbar:
         t = self._toggle_anim
         base = uk.lerp_color((22, 25, 35), (30, 34, 46), t)
         border = uk.lerp_color(uk.Theme.CARD_BORDER, uk.Theme.GOLD, t)
-        uk.draw_panel(screen, rect, bg=(*base, 235), border=border, border_width=1, radius=6, shadow=False)
+        uk.draw_panel(screen, rect, bg=(*base, 235), border=border, border_width=1, radius=ui(6), shadow=False)
         # Always clickable (handle_click checks this rect before the item
         # panel's click-intercept logic), so register unconditionally.
         uk.register_hoverable(rect)
@@ -810,11 +820,11 @@ class EditorToolbar:
         pad_x, pad_y = 12, 7
         w = label.get_width() + pad_x * 2
         h = label.get_height() + pad_y * 2
-        x = max(6, min(mouse_x - w // 2, self.screen_width - w - 6))
-        y = self.height + 8
+        x = max(6, min(mouse_x - w // 2, self.screen_width - w - ui(6)))
+        y = self.height + ui(8)
         rect = pygame.Rect(x, y, w, h)
         uk.draw_panel(screen, rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD,
-                      border_width=1, radius=6, shadow=True)
+                      border_width=1, radius=ui(6), shadow=True)
         uk.blit_surface(screen, label, label.get_rect(center=rect.center), transient=True)
 
     # =========================================================================
@@ -866,7 +876,7 @@ class EditorToolbar:
 
         if self._item_resizing:
             if pressed:
-                available_h = self.screen_height - self.height - 20
+                available_h = self.screen_height - self.height - ui(20)
                 new_h = mouse_pos[1] - self._item_panel_rect.top - self._item_resize_offset
                 self._item_win_height = max(self.ITEM_PANEL_MIN_H, min(new_h, available_h))
             else:
@@ -1022,7 +1032,7 @@ class EditorToolbar:
             img = pygame.image.load(
                 os.path.join(self.ITEM_SPRITE_DIR, subdir, f'{item_id}.png')).convert_alpha()
             iw, ih = img.get_size()
-            size  = self.ITEM_THUMB_SIZE - 16
+            size  = self.ITEM_THUMB_SIZE - ui(16)
             scale = min(size / iw, size / ih)
             self._item_icons[item_id] = pygame.transform.scale(
                 img, (max(1, int(iw * scale)), max(1, int(ih * scale))))
@@ -1072,7 +1082,7 @@ class EditorToolbar:
         from core.items import get_item
 
         SW, SH      = self.screen_width, self.screen_height
-        available_h = SH - self.height - 20
+        available_h = SH - self.height - ui(20)
         if self._item_win_height is None:
             raw_h = available_h
         else:
@@ -1095,12 +1105,12 @@ class EditorToolbar:
             PX, PY = self._item_win_pos
         else:
             PX = (SW - self.ITEM_PANEL_W) // 2
-            PY = self.height + 10
+            PY = self.height + ui(10)
         # Clamp every frame (rather than clamping the stored preference) so
         # a window dragged to an edge stays reachable even if the screen
         # size changes, without losing the raw dragged position.
-        PX = max(4, min(PX, SW - self.ITEM_PANEL_W - 4))
-        PY = max(self.height + 4, min(PY, SH - PANEL_H - 8))
+        PX = max(4, min(PX, SW - self.ITEM_PANEL_W - ui(4)))
+        PY = max(self.height + ui(4), min(PY, SH - PANEL_H - ui(8)))
 
         self._item_panel_rect = pygame.Rect(PX, PY, self.ITEM_PANEL_W, PANEL_H)
         uk.draw_panel(screen, self._item_panel_rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD,
@@ -1108,8 +1118,8 @@ class EditorToolbar:
 
         # Small grab-bar, purely a visual cue that the header can be
         # dragged — same affordance language as a mobile bottom-sheet.
-        grip_w = 28
-        grip_rect = pygame.Rect(PX + (self.ITEM_PANEL_W - grip_w) // 2, PY + 5, grip_w, 3)
+        grip_w = ui(28)
+        grip_rect = pygame.Rect(PX + (self.ITEM_PANEL_W - grip_w) // 2, PY + ui(5), grip_w, ui(3))
         uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER, grip_rect, 0, 2)
 
         # Bottom-edge resize strip — same poll-based drag pattern as the
@@ -1122,25 +1132,25 @@ class EditorToolbar:
         )
         resize_hov = self._item_resize_rect.collidepoint(pygame.mouse.get_pos())
         bottom_grip_rect = pygame.Rect(
-            PX + (self.ITEM_PANEL_W - grip_w) // 2, self._item_panel_rect.bottom - 4, grip_w, 3
+            PX + (self.ITEM_PANEL_W - grip_w) // 2, self._item_panel_rect.bottom - ui(4), grip_w, ui(3)
         )
         uk.draw_rect_on(
             screen, uk.Theme.GOLD if (resize_hov or self._item_resizing) else uk.Theme.PANEL_BORDER,
             bottom_grip_rect, 0, 2
         )
 
-        title_y = PY + 12
+        title_y = PY + ui(12)
         title_s = self.font.render('Items', color=uk.Theme.GOLD, height=self.title_size)
-        uk.blit_surface(screen, title_s, (PX + 16, title_y), transient=True)
+        uk.blit_surface(screen, title_s, (PX + ui(16), title_y), transient=True)
 
         # Close button, top-right of the header — same rounded hover-card
         # language as ui_kit.IconButton's gear/close affordances.
-        close_size = 20
-        close_rect = pygame.Rect(PX + self.ITEM_PANEL_W - close_size - 12, title_y - 2, close_size, close_size)
+        close_size = ui(20)
+        close_rect = pygame.Rect(PX + self.ITEM_PANEL_W - close_size - ui(12), title_y - 2, close_size, close_size)
         self._item_close_rect = close_rect
         close_hov = close_rect.collidepoint(pygame.mouse.get_pos())
-        uk.draw_rect_on(screen, uk.Theme.CARD_BG_HOVER if close_hov else uk.Theme.CARD_BG, close_rect, 0, 6)
-        uk.draw_rect_on(screen, uk.Theme.DANGER_BRIGHT if close_hov else uk.Theme.CARD_BORDER, close_rect, 1, 6)
+        uk.draw_rect_on(screen, uk.Theme.CARD_BG_HOVER if close_hov else uk.Theme.CARD_BG, close_rect, 0, ui(6))
+        uk.draw_rect_on(screen, uk.Theme.DANGER_BRIGHT if close_hov else uk.Theme.CARD_BORDER, close_rect, 1, ui(6))
         uk.draw_close_icon(screen, close_rect, uk.Theme.DANGER_BRIGHT if close_hov else uk.Theme.TEXT_MUTED)
         uk.register_hoverable(close_rect)
 
@@ -1154,28 +1164,28 @@ class EditorToolbar:
         # Wrapped (not just measured-and-hoped-for) so a long selected item
         # name, or this instruction text at a narrow panel width, can never
         # run past the panel edge or under the close button.
-        content_w = self.ITEM_PANEL_W - 32 - close_size - 8
+        content_w = self.ITEM_PANEL_W - ui(32) - close_size - ui(8)
         sub_lines = self._wrap_text(sub_text, self.body_size, content_w)
-        sub_line_h = self.body_size + 4
-        sub_top = title_y + self.title_size + 6
+        sub_line_h = self.body_size + ui(4)
+        sub_top = title_y + self.title_size + ui(6)
         for i, line in enumerate(sub_lines):
             line_s = self.font.render(line, color=uk.Theme.TEXT_MUTED, height=self.body_size)
-            uk.blit_surface(screen, line_s, (PX + 16, sub_top + i * sub_line_h), transient=True)
+            uk.blit_surface(screen, line_s, (PX + ui(16), sub_top + i * sub_line_h), transient=True)
 
         header_bottom = sub_top + len(sub_lines) * sub_line_h
-        divider_y = header_bottom + 6
+        divider_y = header_bottom + ui(6)
         uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER,
-                        pygame.Rect(PX + 16, divider_y, self.ITEM_PANEL_W - 32, 1), 0, 0)
+                        pygame.Rect(PX + ui(16), divider_y, self.ITEM_PANEL_W - ui(32), 1), 0, 0)
 
         # The whole header block (grip through divider) is the drag handle —
         # see _update_item_panel_drag, which reads this rect back next frame.
-        header_h = (divider_y - PY) + 8
+        header_h = (divider_y - PY) + ui(8)
         self._item_panel_header_rect = pygame.Rect(PX, PY, self.ITEM_PANEL_W, header_h)
 
         # Reserve space at the bottom for the hovered item's description
-        DESC_H = 62
+        DESC_H = ui(62)
         grid_top    = PY + header_h
-        grid_bottom = PY + PANEL_H - DESC_H - 8
+        grid_bottom = PY + PANEL_H - DESC_H - ui(8)
         grid_rect   = pygame.Rect(PX, grid_top, self.ITEM_PANEL_W, grid_bottom - grid_top)
         self._item_grid_rect = grid_rect
 
@@ -1183,17 +1193,17 @@ class EditorToolbar:
         screen.set_clip(grid_rect)
 
         self._item_rects = {}
-        row_h = self.ITEM_THUMB_SIZE + self.ITEM_THUMB_PAD + 14  # + name label
+        row_h = self.ITEM_THUMB_SIZE + self.ITEM_THUMB_PAD + ui(14)  # + name label
         cy    = grid_top + self.ITEM_THUMB_PAD - self._item_scroll
 
         if not self._item_sections:
             no_s = self.font.render('No items defined', color=uk.Theme.TEXT_MUTED, height=self.body_size)
-            self._blit_clipped(screen, no_s, (PX + 12, grid_top + 12), grid_rect)
+            self._blit_clipped(screen, no_s, (PX + ui(12), grid_top + ui(12)), grid_rect)
         else:
             for label, category, item_ids in self._item_sections:
                 hdr_s = self.font.render(label, color=uk.Theme.TEXT_SECONDARY, height=self.body_size + 1)
                 self._blit_clipped(screen, hdr_s, (PX + self.ITEM_THUMB_PAD, cy), grid_rect)
-                cy += 22
+                cy += ui(22)
 
                 col = 0
                 for item_id in item_ids:
@@ -1212,14 +1222,14 @@ class EditorToolbar:
                     else:
                         cell_bg, border, bw = uk.Theme.CARD_BG, uk.Theme.CARD_BORDER, 1
 
-                    uk.draw_rect_on(screen, cell_bg, cell, 0, 6)
-                    uk.draw_rect_on(screen, border, cell, bw, 6)
+                    uk.draw_rect_on(screen, cell_bg, cell, 0, ui(6))
+                    uk.draw_rect_on(screen, border, cell, bw, ui(6))
 
                     icon = self._load_item_icon(item_id, category)
                     if icon:
                         uk.blit_surface(screen, icon, icon.get_rect(center=cell.center), transient=False)
                     else:
-                        q = self.font.render('?', color=uk.Theme.TEXT_MUTED, height=20)
+                        q = self.font.render('?', color=uk.Theme.TEXT_MUTED, height=ui_text(20))
                         self._blit_clipped(screen, q, q.get_rect(center=cell.center).topleft, grid_rect)
 
                     item_data = get_item(item_id)
@@ -1228,7 +1238,7 @@ class EditorToolbar:
                                  else uk.Theme.GOLD if is_hov
                                  else uk.Theme.TEXT_MUTED)
                     name = self._fit_label(name, 9, self.ITEM_THUMB_SIZE)
-                    lbl  = self.font.render(name, color=lbl_color, height=9)
+                    lbl  = self.font.render(name, color=lbl_color, height=ui_text(9))
                     lbl_rect = lbl.get_rect(midtop=(cell.centerx, cell.bottom + 2))
                     self._blit_clipped(screen, lbl, lbl_rect.topleft, grid_rect)
 
@@ -1238,7 +1248,7 @@ class EditorToolbar:
                         cy += row_h
                 if col != 0:
                     cy += row_h
-                cy += 10  # gap before next section header
+                cy += ui(10)  # gap before next section header
 
         max_scroll = max(0, cy + self._item_scroll - (grid_top + self.ITEM_THUMB_PAD) - grid_rect.height)
         self._item_scroll = min(self._item_scroll, max_scroll)
@@ -1248,17 +1258,17 @@ class EditorToolbar:
         # Scroll indicator dots on right edge
         if max_scroll > 0:
             n = 8
-            dot_x = PX + self.ITEM_PANEL_W - 6
+            dot_x = PX + self.ITEM_PANEL_W - ui(6)
             for d in range(n):
                 dot_y  = grid_rect.top + int(grid_rect.height * d / max(1, n - 1))
                 ratio  = self._item_scroll / max(1, max_scroll)
                 active = abs(d / max(1, n - 1) - ratio) < 0.15
-                uk.draw_circle_on(screen, uk.Theme.GOLD if active else uk.Theme.CARD_BORDER, (dot_x, dot_y), 3)
+                uk.draw_circle_on(screen, uk.Theme.GOLD if active else uk.Theme.CARD_BORDER, (dot_x, dot_y), ui(3))
 
         # ── Hovered item description strip ──────────────────────────────────
-        desc_rect = pygame.Rect(PX + 8, PY + PANEL_H - DESC_H, self.ITEM_PANEL_W - 16, DESC_H - 6)
+        desc_rect = pygame.Rect(PX + ui(8), PY + PANEL_H - DESC_H, self.ITEM_PANEL_W - ui(16), DESC_H - ui(6))
         uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER,
-                        pygame.Rect(PX + 8, desc_rect.top - 4, self.ITEM_PANEL_W - 16, 1), 0, 0)
+                        pygame.Rect(PX + ui(8), desc_rect.top - ui(4), self.ITEM_PANEL_W - ui(16), 1), 0, 0)
 
         if self._item_hover:
             item_data = get_item(self._item_hover)
@@ -1278,8 +1288,8 @@ class EditorToolbar:
                     desc_lines[1] = self._fit_label(overflow, self.body_size, desc_rect.width)
                 for i, line in enumerate(desc_lines):
                     desc_s = self.font.render(line, color=uk.Theme.TEXT_MUTED, height=self.body_size)
-                    uk.blit_surface(screen, desc_s, (desc_rect.x, desc_rect.y + 20 + i * (self.body_size + 4)),
+                    uk.blit_surface(screen, desc_s, (desc_rect.x, desc_rect.y + ui(20) + i * (self.body_size + ui(4))),
                                     transient=True)
         else:
             hint = self.font.render('Hover an item to see its effect.', color=uk.Theme.TEXT_DIM, height=self.body_size)
-            uk.blit_surface(screen, hint, (desc_rect.x, desc_rect.y + 8), transient=True)
+            uk.blit_surface(screen, hint, (desc_rect.x, desc_rect.y + ui(8)), transient=True)

@@ -61,6 +61,82 @@ _WEATHER_START_FADE_IN = 1.5
 _WEATHER_STOP_FADE_OUT = 1.5
 
 
+
+# ── Looping sound effects ─────────────────────────────────────────────────────
+# SoundManager.play_sfx() is a one-shot. Looping is layered on here so the
+# editor's inspector preview and the runtime share one implementation and one
+# registry of which loops are running (id(sound_manager) -> {sfx names}).
+_LOOPING_SFX: dict = {}
+
+
+def _sfx_sound_obj(sm, name):
+    """The raw Sound object for `name` from the SoundEngine, or None."""
+    effects = getattr(getattr(sm, 'sound_engine', None), 'sound_effects', None)
+    try:
+        return effects.get(name) if effects else None
+    except Exception:
+        return None
+
+
+def play_sfx_on(sm, name, loop=False):
+    """Play SFX `name` through `sm`; repeat it until stopped when loop=True.
+
+    Uses the manager's own loop argument if play_sfx() has one; otherwise
+    starts the engine's Sound object with loops=-1. If neither is possible it
+    degrades to a normal one-shot instead of failing.
+    """
+    if not loop:
+        sm.play_sfx(name)
+        return
+    started = False
+    try:
+        import inspect
+        params = inspect.signature(sm.play_sfx).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if 'loop' in params:
+        sm.play_sfx(name, loop=True)
+        started = True
+    elif 'loops' in params:
+        sm.play_sfx(name, loops=-1)
+        started = True
+    else:
+        snd = _sfx_sound_obj(sm, name)
+        if snd is not None and hasattr(snd, 'play'):
+            try:
+                snd.play(loops=-1)
+                started = True
+            except Exception:
+                started = False
+    if not started:
+        sm.play_sfx(name)          # no loop support available -- one-shot fallback
+        return
+    _LOOPING_SFX.setdefault(id(sm), set()).add(name)
+
+
+def stop_sfx_on(sm, name=None):
+    """Stop a looping SFX by name, or every loop started via play_sfx_on()
+    when name is None/blank. One-shots that aren't looping are left alone."""
+    if sm is None:
+        return
+    active = _LOOPING_SFX.get(id(sm), set())
+    names = [name] if name else list(active)
+    for n in names:
+        stop_fn = getattr(sm, 'stop_sfx', None)
+        if callable(stop_fn):
+            try:
+                stop_fn(n)
+            except Exception:
+                pass
+        snd = _sfx_sound_obj(sm, n)
+        if snd is not None and hasattr(snd, 'stop'):
+            try:
+                snd.stop()
+            except Exception:
+                pass
+        active.discard(n)
+
+
 class _WeatherEffect:
     """Scrolling tiled weather overlay (rain, snow, fog, dust, etc.).
 
@@ -368,6 +444,20 @@ class CutsceneRuntime:
         self._flash_start    = None   # elapsed time (s) the active flash fired, or None
         self._flash_duration = 0.0
 
+        # Fades are resolved analytically from elapsed time (like flash), not by
+        # adding dt every frame: start time + duration + from/to alpha. That
+        # keeps live playback and seek() identical, starts a fade exactly at its
+        # timestamp, and lets a fade stay frozen while a dialogue pauses time.
+        self._fade_start = None   # elapsed time (s) the active fade fired, or None
+        self._fade_dur   = 0.0
+        self._fade_from  = 0.0
+        self._fade_to    = 0.0
+        # Alpha the overlay rests at once any fade/flash is done. A fade_out
+        # leaves this at 255 so the screen STAYS black (a later flash no longer
+        # wipes it back to 0).
+        self._overlay_rest = 0.0
+        self._rest_color   = (0, 0, 0)   # colour the overlay returns to after a flash
+
         # Camera target starts at the current view centre so the first pan_to
         # has a sensible origin even if no snap_to fires at t=0.
         self.camera_target = CutsceneCameraTarget(
@@ -522,18 +612,14 @@ class CutsceneRuntime:
             # elapsed time rather than the linear overlay_speed tween.
             f_elapsed = self.elapsed - self._flash_start
             if f_elapsed >= self._flash_duration:
-                self.overlay_alpha = 0.0
+                self.overlay_alpha = self._overlay_rest   # back to rest (black stays black)
+                self.overlay_color = self._rest_color
                 self._flash_start  = None
             else:
-                self.overlay_alpha = self._flash_alpha(f_elapsed, self._flash_duration)
-        elif self.overlay_speed > 0:
-            diff = self.overlay_target - self.overlay_alpha
-            step = self.overlay_speed * dt
-            if abs(diff) <= step:
-                self.overlay_alpha = self.overlay_target
-                self.overlay_speed = 0.0
-            else:
-                self.overlay_alpha += step if diff > 0 else -step
+                self.overlay_alpha = max(self._overlay_rest,
+                                         self._flash_alpha(f_elapsed, self._flash_duration))
+        elif self._fade_start is not None:
+            self._tick_fade()
 
         # Expire the invert effect once its window closes.
         if self._invert_active and self.elapsed >= self._invert_end_time:
@@ -547,6 +633,43 @@ class CutsceneRuntime:
         duration = self.data.get('duration', 0)
         if duration > 0 and self.elapsed >= duration:
             self._handle_end_of_duration()
+
+    @property
+    def ends_black(self):
+        """True while the overlay is (or will settle) fully opaque -- i.e. the
+        cutscene ended on a fade_out. Callers that tear the runtime down when
+        `finished` flips (e.g. game.py) should keep drawing the last overlay
+        (overlay_color at overlay_alpha) until their own transition takes over,
+        otherwise the scene pops back into view after the fade."""
+        return self._overlay_rest >= 255.0
+
+    def _tick_fade(self):
+        """Resolve the active fade_in/fade_out alpha from elapsed time."""
+        if self._fade_start is None:
+            return
+        if self._fade_dur <= 0:
+            p = 1.0
+        else:
+            p = max(0.0, min(1.0, (self.elapsed - self._fade_start) / self._fade_dur))
+        self.overlay_alpha = self._fade_from + (self._fade_to - self._fade_from) * p
+        if p >= 1.0:
+            self.overlay_alpha  = self._fade_to
+            self._overlay_rest  = self._fade_to
+            self._fade_start    = None
+
+    def _start_fade(self, alpha_from, alpha_to, duration, color):
+        self.overlay_color = tuple(color)
+        self._flash_start  = None      # a fade takes over the overlay from any flash
+        self._fade_from    = float(alpha_from)
+        self._fade_to      = float(alpha_to)
+        self._fade_dur     = max(0.0, float(duration))
+        self._fade_start   = self.elapsed
+        self._overlay_rest = float(alpha_to)
+        self._rest_color   = tuple(color)
+        self.overlay_alpha = float(alpha_from)
+        self.overlay_target = float(alpha_to)
+        self.overlay_speed  = 0.0      # legacy per-frame tween is no longer used
+        self._tick_fade()              # zero-length fades land immediately
 
     def _tick_weather_fade(self, dt):
         """Advance the weather opacity tween and clear weather when it fully fades out."""
@@ -580,6 +703,7 @@ class CutsceneRuntime:
             # Waiting for the auto fade-out to complete.
             if self._weather is None:
                 self.finished = True
+                self.stop_looping_sfx()
 
         elif self._weather is not None:
             # Timeline weather is still active at the natural end. Fade it out
@@ -594,6 +718,7 @@ class CutsceneRuntime:
 
         else:
             self.finished = True
+            self.stop_looping_sfx()
 
     def draw_actors(self, screen, camera, colors):
         """Draw all cutscene actors in Y-sorted order.
@@ -718,8 +843,13 @@ class CutsceneRuntime:
             inv.fill(fill)
             screen.blit(inv, (0, 0), special_flags=pygame.BLEND_RGB_XOR)
 
+    def stop_looping_sfx(self):
+        """Cut every looping sound effect (scrubbing, stopping, finishing)."""
+        stop_sfx_on(self.sound_manager, None)
+
     def restart(self):
         """Reset to the beginning (used by the editor's play loop)."""
+        self.stop_looping_sfx()
         self.elapsed        = 0.0
         self.action_index   = 0
         self.finished       = False
@@ -727,6 +857,10 @@ class CutsceneRuntime:
         self.overlay_alpha  = 0.0
         self.overlay_target = 0.0
         self.overlay_speed  = 0.0
+        self._flash_start   = None
+        self._fade_start    = None
+        self._overlay_rest  = 0.0
+        self._rest_color    = (0, 0, 0)
         self._invert_active   = False
         self._invert_end_time = 0.0
         self.camera_target.stop()
@@ -755,7 +889,8 @@ class CutsceneRuntime:
         Works like scrubbing in After Effects — every action whose timestamp
         <= t is executed instantly, giving a correct scene snapshot at any point.
         """
-        # Full state reset.
+        # Full state reset. Scrubbing never plays audio, so silence any SFX loop.
+        self.stop_looping_sfx()
         self.elapsed             = 0.0
         self.finished            = False
         self.paused              = False
@@ -764,6 +899,9 @@ class CutsceneRuntime:
         self.overlay_speed       = 0.0
         self._flash_start        = None
         self._flash_duration     = 0.0
+        self._fade_start         = None
+        self._overlay_rest       = 0.0
+        self._rest_color         = (0, 0, 0)
         self._dialogue_paused    = False
         self._pre_dialogue_state = {}
         self._invert_active      = False
@@ -1004,63 +1142,67 @@ class CutsceneRuntime:
                                      if self.camera_target._tweens else None)
         self.camera_target._recompute_xy()
 
-        # ── Overlay: interpolate alpha to the correct value at t ──────────────
-        # _execute_action sets overlay_alpha/speed but never advances time, so
-        # without this the screen stays fully black/transparent while scrubbing.
-        if last_overlay_action is not None:
-            oa     = last_overlay_action
-            atype  = oa.get('type', '')
+        # ── Overlay: resolve fade / flash state at t ──────────────────────────
+        # Replay ran every overlay action with self.elapsed == 0, so rebuild the
+        # overlay analytically from the action timestamps. Two layers, matching
+        # live playback: a BASE state (fade_in / fade_out / set_overlay -- a
+        # fade_out holds black forever) and an optional FLASH on top of it.
+        self._fade_start = None
+        self._flash_start = None
+        rest_alpha, rest_color = 0.0, (0, 0, 0)
+        base_t = -1.0
+        flash_act = None
+        for oa in self.pending_actions:
+            if oa['time'] > t:
+                break
+            if oa.get('target') != 'screen':
+                continue
+            otype = oa.get('type', '')
+            op    = oa.get('params', {})
             t_fire = oa['time']
-            params = oa.get('params', {})
-            # For each type: if the fade/flash window has already elapsed,
-            # settle to its resting value with speed=0 (nothing left to
-            # animate). Otherwise, in addition to setting the correct alpha
-            # for this instant, restore overlay_target/overlay_speed so that
-            # live playback (update()) can keep animating the tween forward
-            # from here — without this, scrubbing to a mid-fade moment and
-            # then hitting Play left the overlay frozen at that alpha forever,
-            # since update()'s tween step only runs while overlay_speed > 0.
-            if atype == 'fade_in':
-                dur = params.get('duration', 1.0)
-                elapsed = t - t_fire
-                self.overlay_color  = tuple(params.get('color', [0, 0, 0]))
-                if elapsed >= dur:
-                    self.overlay_alpha  = 0.0
-                    self.overlay_target = 0.0
-                    self.overlay_speed  = 0.0
-                else:
-                    self.overlay_alpha  = 255.0 * (1.0 - elapsed / dur) if dur > 0 else 0.0
-                    self.overlay_target = 0.0
-                    self.overlay_speed  = 255.0 / dur if dur > 0 else 9999.0
-            elif atype == 'fade_out':
-                dur = params.get('duration', 1.0)
-                elapsed = t - t_fire
-                self.overlay_color  = tuple(params.get('color', [0, 0, 0]))
-                if elapsed >= dur:
-                    self.overlay_alpha  = 255.0
-                    self.overlay_target = 255.0
-                    self.overlay_speed  = 0.0
-                else:
-                    self.overlay_alpha  = 255.0 * (elapsed / dur) if dur > 0 else 255.0
-                    self.overlay_target = 255.0
-                    self.overlay_speed  = 255.0 / dur if dur > 0 else 9999.0
-            elif atype == 'flash':
-                dur = params.get('duration', 0.3)
-                elapsed = t - t_fire
-                self.overlay_color  = tuple(params.get('color', [255, 255, 255]))
-                self.overlay_target = 0.0
-                self.overlay_speed  = 0.0   # flash isn't driven by the linear tween
-                if elapsed >= dur:
-                    self.overlay_alpha = 0.0
-                    self._flash_start  = None
-                else:
-                    self.overlay_alpha   = self._flash_alpha(elapsed, dur)
-                    # Store the actual fire time (not t) so update() computes
-                    # the same elapsed-since-fire value if playback resumes.
-                    self._flash_start    = t_fire
-                    self._flash_duration = dur
-            # set_overlay: _execute_action already wrote the correct alpha,
-            # and it has no time-based tween to resume (overlay_speed stays 0).
+            if otype == 'flash':
+                flash_act = oa
+                continue
+            if otype not in ('fade_in', 'fade_out', 'set_overlay'):
+                continue
+            base_t = t_fire
+            flash_act = None           # a later base action cancels an earlier flash
+            self._fade_start = None    # ...and any earlier, still-running fade
+            prev_rest = rest_alpha
+            if otype == 'set_overlay':
+                rest_alpha = float(op.get('alpha', 255))
+                rest_color = tuple(op.get('color', [0, 0, 0]))
+                self.overlay_alpha = rest_alpha
+                continue
+            dur   = float(op.get('duration', 1.0))
+            color = tuple(op.get('color', [0, 0, 0]))
+            a_from, a_to = (255.0, 0.0) if otype == 'fade_in' else (prev_rest, 255.0)
+            rest_alpha, rest_color = a_to, color
+            if t - t_fire >= dur:
+                self.overlay_alpha = a_to            # finished: hold the end state
+            else:
+                self._fade_from, self._fade_to = a_from, a_to
+                self._fade_dur, self._fade_start = dur, t_fire
+                # _tick_fade reads self.elapsed; set it so the alpha is right now
+                # and keeps advancing correctly when live playback resumes.
+                self.elapsed = t
+                self._tick_fade()
+        self._overlay_rest = rest_alpha
+        self._rest_color   = rest_color
+        self.overlay_color = rest_color
+        if self._fade_start is None:
+            self.overlay_alpha = rest_alpha
+        self.overlay_target = rest_alpha
+        self.overlay_speed  = 0.0
+        if flash_act is not None:
+            fp    = flash_act.get('params', {})
+            f_dur = float(fp.get('duration', 0.3))
+            f_el  = t - flash_act['time']
+            if f_el < f_dur:
+                self.overlay_color   = tuple(fp.get('color', [255, 255, 255]))
+                self._flash_start    = flash_act['time']
+                self._flash_duration = f_dur
+                self.overlay_alpha   = max(rest_alpha, self._flash_alpha(f_el, f_dur))
 
         # ── Invert: activate if t is inside the effect's time window ──────────
         if last_invert_action is not None:
@@ -1395,37 +1537,35 @@ class CutsceneRuntime:
         elif atype == 'play_sfx':
             sfx = params.get('sfx', '').strip()
             if sfx:
-                self.sound_manager.play_sfx(sfx)
+                # 'loop' is absent on older saves -> False (plain one-shot).
+                play_sfx_on(self.sound_manager, sfx, loop=bool(params.get('loop', False)))
+        elif atype == 'stop_sfx':
+            # Blank sfx = stop every looping SFX this cutscene started.
+            stop_sfx_on(self.sound_manager, params.get('sfx', '').strip() or None)
         elif atype == 'stop_music':
             self.sound_manager.stop_music(fade_out=params.get('fade_out', True))
 
     def _do_screen(self, atype, params):
         if atype == 'fade_out':
-            duration = params.get('duration', 1.0)
-            self.overlay_color  = tuple(params.get('color', [0, 0, 0]))
-            self.overlay_target = 255.0
-            self.overlay_speed  = 255.0 / duration if duration > 0 else 9999.0
-            self._flash_start   = None  # a fade_out takes over the overlay from any active flash
+            # Ramp from the current overlay to full colour, then HOLD there.
+            self._start_fade(self.overlay_alpha if self._flash_start is None
+                             else self._overlay_rest, 255.0,
+                             params.get('duration', 1.0),
+                             params.get('color', [0, 0, 0]))
         elif atype == 'fade_in':
-            duration = params.get('duration', 1.0)
-            self.overlay_color  = tuple(params.get('color', [0, 0, 0]))
-            # Force the starting point to fully opaque before tweening down.
-            # Without this, a fade_in that isn't preceded by a fade_out/
-            # set_overlay leaves overlay_alpha at its initial 0.0, so the
-            # target (also 0.0) is already "reached" and update()'s tween
-            # step no-ops on the very first frame — no black screen, no
-            # visible fade. seek() already special-cases this (it derives
-            # alpha from elapsed/duration assuming a 255 start); this makes
-            # live playback match that same assumption.
-            self.overlay_alpha  = 255.0
-            self.overlay_target = 0.0
-            self.overlay_speed  = 255.0 / duration if duration > 0 else 9999.0
-            self._flash_start   = None  # a fade_in takes over the overlay from any active flash
+            # Always starts fully opaque and clears to transparent (a fade_in
+            # that isn't preceded by a fade_out must still start black).
+            self._start_fade(255.0, 0.0,
+                             params.get('duration', 1.0),
+                             params.get('color', [0, 0, 0]))
         elif atype == 'set_overlay':
             self.overlay_color  = tuple(params.get('color', [0, 0, 0]))
             self.overlay_alpha  = float(params.get('alpha', 255))
             self.overlay_target = self.overlay_alpha
             self.overlay_speed  = 0.0
+            self._overlay_rest  = self.overlay_alpha
+            self._rest_color    = self.overlay_color
+            self._fade_start    = None
             self._flash_start   = None  # set_overlay takes over the overlay from any active flash
         elif atype == 'flash':
             # Overlay that ramps up to full opacity and back down again over
@@ -1439,7 +1579,8 @@ class CutsceneRuntime:
             self.overlay_speed   = 0.0   # flash isn't driven by the linear tween
             self._flash_start    = self.elapsed
             self._flash_duration = duration
-            self.overlay_alpha   = self._flash_alpha(0.0, duration)
+            self._fade_start     = None
+            self.overlay_alpha   = max(self._overlay_rest, self._flash_alpha(0.0, duration))
         elif atype == 'invert':
             duration = params.get('duration', 1.0)
             self._invert_active   = True
@@ -1524,7 +1665,8 @@ class CutsceneRuntime:
                     self._pre_dialogue_state[aid] = {
                         'tween': actor._tween,
                         'charge_effects': actor._charge_effects,
-                        'anim':  getattr(actor.entity, 'current_animation_state', 'idle'),
+                        'anim':  actor.current_anim_state,
+                        'loop':  actor._anim_loop,
                         'dir':   getattr(actor.entity, 'direction', 'down'),
                     }
                     actor._tween = None
@@ -1544,11 +1686,15 @@ class CutsceneRuntime:
                 # continues exactly where it left off.
                 actor._tween = tween
                 actor._charge_effects = snap.get('charge_effects', [])
-                actor.set_animation(snap['anim'], snap['dir'])
             else:
                 actor._tween = None
                 actor._charge_effects = []
-                actor.set_animation(snap['anim'], snap['dir'])
+            # Only touch the sprite if something actually changed it while the
+            # box was open. Re-issuing the same set_animation would be harmless
+            # for a looping pose, but would restart a play-once animation.
+            if (actor.current_anim_state != snap['anim']
+                    or getattr(actor.entity, 'direction', None) != snap['dir']):
+                actor.set_animation(snap['anim'], snap['dir'], loop=snap.get('loop'))
         self._pre_dialogue_state = {}
 
     def _do_actor(self, actor, atype, params):
@@ -1556,6 +1702,7 @@ class CutsceneRuntime:
             actor.set_animation(
                 params.get('state', 'idle'),
                 params.get('direction', 'down'),
+                loop=params.get('loop'),   # absent (old cutscenes) -> None -> unchanged
             )
         elif atype == 'move_to':
             actor.move_to(
@@ -1595,12 +1742,12 @@ class CutsceneRuntime:
             new_char = params.get('character', '').strip()
             if new_char and hasattr(actor.entity, 'sprite'):
                 from core.sprite_system import create_character_sprite
-                current_anim = getattr(actor.entity, 'current_animation_state', 'idle')
+                current_anim = actor.current_anim_state
                 current_dir  = getattr(actor.entity, 'direction', 'down')
                 actor.entity.character = new_char
                 actor.entity.sprite    = create_character_sprite(new_char, 'base', 32, 32)
                 actor.entity.direction = current_dir
-                actor.set_animation(current_anim, current_dir)
+                actor.set_animation(current_anim, current_dir, loop=actor._anim_loop)
         elif atype == 'set_costume':
             new_costume = params.get('costume', '').strip()
             if new_costume:

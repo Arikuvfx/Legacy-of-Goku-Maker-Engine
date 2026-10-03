@@ -80,7 +80,7 @@ import pygame
 # the engine's current default (4) instead of tracking that setting.
 # Changing RENDER_SCALE elsewhere no longer resizes anything in this file.
 RENDER_SCALE = 4
-from ui.pause_menu import FlatBitmapFont
+from ui.pause_menu import FlatBitmapFont, DESIGN_W, DESIGN_H, make_scaled_screen
 
 DEFAULT_PATH = os.path.join('data', 'game_flow.json')
 DEFAULT_TITLE_TEXT = 'GAME TITLE'
@@ -127,7 +127,12 @@ _MENU_FADE_OUT     = 0.4   # save-select's fade-to-black after confirming
 # multiplayer actually exists; change/remove once it does.
 _DENIED_FLASH_TIME = 0.4
 
-_BOX_Y_RATIO = 0.68   # main-menu option box's top edge, as a fraction of screen height
+# Main-menu option box's top edge, as a fraction of the 1920x1080 DESIGN height.
+# Everything on the title menu / save-select pages is laid out in that fixed design
+# space and scaled to the real screen (see TitleScreen.make_ui_screen); only the
+# full-screen layers — intro pictures, menu background image, fade veils — are
+# sized to the real screen.
+_BOX_Y_RATIO = 0.68
 _ARROW_BLINK_INTERVAL = 0.2   # seconds visible, then seconds hidden — matches PauseMenu's cursor arrow
 
 
@@ -692,7 +697,7 @@ class TitleScreen:
         self._save_popup_occlusion_rect = None
 
     def get_save_select_frame_rect(self):
-        """The SAVE SELECT / "Save Game" bordered box's screen-space rect,
+        """The SAVE SELECT / "Save Game" bordered box's rect in 1920x1080 DESIGN coordinates (draw into it via make_ui_screen()),
         as of the last time _draw_save_select ran (see the stash there).
         Used by Game._draw_saving_popup to center the "Saving..." popup
         inside the actual frame instead of the whole screen. Returns None
@@ -1117,6 +1122,28 @@ class TitleScreen:
         surf.fill(color if color is not None else self.text_color, special_flags=pygame.BLEND_RGBA_MULT)
         return surf
 
+    def make_ui_screen(self, screen):
+        """Draw target for everything laid out in 1920x1080 design space:
+        the shared PauseMenu's (so this screen, the Options page and the
+        in-game "Saving..." popup all share one scale/origin/pixel grid), or
+        a standalone one if no PauseMenu has been wired in."""
+        pm = self._pause_menu
+        return pm.make_ui_screen(screen) if pm else make_scaled_screen(screen)
+
+    def _real_hit_rects(self, ui):
+        """Hit rects are recorded while drawing, in design coordinates; mouse
+        events are in real screen coordinates, so convert once per frame."""
+        self._option_hit_rects    = [ui.to_real_rect(r) for r in self._option_hit_rects]
+        self._save_slot_hit_rects = [ui.to_real_rect(r) for r in self._save_slot_hit_rects]
+        self._save_lr_hit_rects   = {k: ui.to_real_rect(r) for k, r in self._save_lr_hit_rects.items()}
+
+    @staticmethod
+    def _draw_veil(screen, alpha):
+        veil = pygame.Surface(screen.get_size())
+        veil.fill((0, 0, 0))
+        veil.set_alpha(alpha)
+        screen.blit(veil, (0, 0))
+
     def draw(self, screen):
         if not self.active:
             return
@@ -1130,7 +1157,8 @@ class TitleScreen:
         if self._intro_phase_idx >= len(self._intro_phases):
             return
         phase  = self._intro_phases[self._intro_phase_idx]
-        center = (self.screen_width // 2, self.screen_height // 2)
+        sw, sh = screen.get_size()
+        center = (sw // 2, sh // 2)
 
         if phase['type'] == 'hold':
             img = self._intro_images[phase['img']] if phase['img'] is not None else None
@@ -1152,10 +1180,7 @@ class TitleScreen:
             fading.set_alpha(int(255 * t))
             screen.blit(fading, fading.get_rect(center=center))
         elif frm:
-            veil = pygame.Surface((self.screen_width, self.screen_height))
-            veil.fill((0, 0, 0))
-            veil.set_alpha(int(255 * t))
-            screen.blit(veil, (0, 0))
+            self._draw_veil(screen, int(255 * t))
 
     def _draw_menu_background(self, screen):
         if self._menu_bg:
@@ -1167,36 +1192,48 @@ class TitleScreen:
         if self._options_open and self._pause_menu:
             # PauseMenu paints its own full-screen tiled background first —
             # nothing from the main menu would be visible underneath it
-            # anyway, so skip drawing it.
+            # anyway, so skip drawing it. (It scales itself; hand it the real
+            # screen, not a design-space proxy.)
             self._pause_menu.draw(screen)
             return
 
+        ui = self.make_ui_screen(screen)
+
+        # Hit rects are recorded in design coordinates while drawing and then
+        # converted to real coordinates in place (see _real_hit_rects). A page
+        # only rebuilds the lists IT draws, so clear them all first — otherwise
+        # a stale, already-converted list from another page would be converted
+        # again every frame and grow without bound.
+        self._option_hit_rects    = []
+        self._save_slot_hit_rects = []
+        self._save_lr_hit_rects   = {}
+
         if self._menu_page == 'save_select':
-            self._draw_save_select(screen)
+            self._draw_save_select(ui)
+            self._real_hit_rects(ui)
+            screen.set_clip(None)
             if self._menu_fade_alpha < 255:
-                veil = pygame.Surface((self.screen_width, self.screen_height))
-                veil.fill((0, 0, 0))
-                veil.set_alpha(255 - int(self._menu_fade_alpha))
-                screen.blit(veil, (0, 0))
+                self._draw_veil(screen, 255 - int(self._menu_fade_alpha))
             return
 
+        # Real-screen layer: the background picture is stretched to the
+        # whole window. Everything after this is design space.
         self._draw_menu_background(screen)
 
         if self.title_text:
             title_surf = self._render_text(self.title_font, self.title_text, color=self.title_color)
-            title_rect = title_surf.get_rect(center=(self.screen_width // 2, int(self.screen_height * 0.22)))
+            title_rect = title_surf.get_rect(center=(DESIGN_W // 2, int(DESIGN_H * 0.22)))
             shadow_surf = title_surf.copy()
             shadow_surf.fill(self.text_shadow_color, special_flags=pygame.BLEND_RGBA_MULT)
-            screen.blit(shadow_surf, title_rect.move(self.shadow_offset))
-            screen.blit(title_surf, title_rect)
+            ui.blit(shadow_surf, title_rect.move(self.shadow_offset))
+            ui.blit(title_surf, title_rect)
 
-        self._draw_option_box(screen)
+        self._draw_option_box(ui)
+        self._real_hit_rects(ui)
+        screen.set_clip(None)
 
         if self._menu_fade_alpha < 255:
-            veil = pygame.Surface((self.screen_width, self.screen_height))
-            veil.fill((0, 0, 0))
-            veil.set_alpha(255 - int(self._menu_fade_alpha))
-            screen.blit(veil, (0, 0))
+            self._draw_veil(screen, 255 - int(self._menu_fade_alpha))
 
     # ── SAVE SELECT (reached from SINGLE PLAYER) ────────────────────────────
     #
@@ -1223,7 +1260,8 @@ class TitleScreen:
             screen.fill(self.bg_color)
             return
 
-        pm._draw_tiled_background(screen, pygame.Rect(0, 0, self.screen_width, self.screen_height))
+        # Whole real screen (the design area plus any margin around it).
+        pm._draw_tiled_background(screen, screen.full_rect)
 
         # Same frame geometry PauseMenu.draw() uses, off the shared canvas
         # so the box lands in exactly the same place/size as every other
@@ -1247,9 +1285,9 @@ class TitleScreen:
             screen, pm.box_sprite, box_x, box_y, inner_w, inner_h, corner_size=20
         )
         if not drawn:
-            pygame.draw.rect(screen, pm.border_outer, (box_x-6, box_y-6, inner_w+12, inner_h+12))
-            pygame.draw.rect(screen, pm.border_inner, (box_x-3, box_y-3, inner_w+6,  inner_h+6))
-            pygame.draw.rect(screen, pm.border_green, (box_x-1, box_y-1, inner_w+2,  inner_h+2))
+            screen.draw_rect(pm.border_outer, (box_x-6, box_y-6, inner_w+12, inner_h+12))
+            screen.draw_rect(pm.border_inner, (box_x-3, box_y-3, inner_w+6,  inner_h+6))
+            screen.draw_rect(pm.border_green, (box_x-1, box_y-1, inner_w+2,  inner_h+2))
             pm._draw_tiled_background(screen, pygame.Rect(box_x, box_y, inner_w, inner_h))
 
         # L/R shoulder-button sprites above the frame, same position as
@@ -2371,8 +2409,8 @@ class TitleScreen:
         pad_y = int(14 * RENDER_SCALE)
         box_w = max_label_w + pad_x * 2
         box_h = line_h * len(options) + line_gap * (len(options) - 1) + pad_y * 2
-        box_x = (self.screen_width - box_w) // 2
-        box_y = int(self.screen_height * _BOX_Y_RATIO)
+        box_x = (DESIGN_W - box_w) // 2
+        box_y = int(DESIGN_H * _BOX_Y_RATIO)
 
         box_surf = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
         box_surf.fill((0, 0, 0, 102))   # ~40% opacity

@@ -1,28 +1,64 @@
 """
 core/event_editor.py
 
-The full RPG-Maker-style Event Editor in one file: Conditions builder,
-Actions builder, and the modal window that hosts both — merged from what
-was previously condition_builder.py / action_sequence_builder.py /
-event_editor_window.py since the three were only ever used together.
+The Event Editor: build a Conditions list ("only if ...") and an Actions list
+("then do ...") for a Trigger Box / NPC / quest step / anything that fires an
+event.
+
+The interface is built on dev_tools.ui_kit, so it reads as part of the same
+family as the Dev Menu, Room Editor and Character Creator: navy backdrop, flat
+cards with hairline borders that light up on hover, the bitmap menu font and
+vector line icons. It draws ONLY through ui_kit's dispatch helpers, so it works
+on the engine's GPUScreen as well as on a plain pygame.Surface.
+
+Nothing of the old popup UI is left. What is kept is the *functionality* and
+the data model:
+
+    * every condition kind and every action type (same dict shapes out),
+    * every picker (flags, characters, skills, portraits, rooms, music, ...),
+      including the row-scoped ones (skins / animations / transformations /
+      map locations) and the live-data hooks the host pushes in,
+    * dialogue_choice options and conditional IF / ELSE IF / ELSE branches,
+      each with their own nested action lists,
+    * the mouse "Set Spawn" / "Set Position" room picker.
+
+Usage (same as before):
 
     from core.event_editor import EventEditorWindow
 
-    self.event_editor = EventEditorWindow(flag_manager, colors=self.colors)
+    self.event_editor = EventEditorWindow(flag_manager)
     self.event_editor.open(title="...", existing_conditions=[...], existing_actions=[...],
-                            on_save=lambda conditions, actions: ...)
-    # each frame while self.event_editor.active:
+                           on_save=lambda conditions, actions: ...)
+    # every event while self.event_editor.active (mouse motion / wheel / keys too):
     self.event_editor.handle_input(event)
+    # every frame while self.event_editor.active:
     self.event_editor.draw(screen)
 
-ConditionBuilder and ActionSequenceBuilder are also exported individually
-in case you ever want either half standalone.
+The editor is a full-screen tool overlay (like the other dev tools) rather than a
+small popup. Save (icon / Ctrl+S) calls on_save(conditions, actions) and closes;
+Back / Esc closes without saving (with a confirm if something changed).
+
+ConditionBuilder / ActionSequenceBuilder still exist and still hold the rows and
+the discovery/picker data, but they are pure data models now - all drawing and
+input lives in EventEditorWindow.
 """
+
+from __future__ import annotations
 
 import copy
 import json
+import math
+import os
+import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pygame
+
+try:
+    import dev_tools.ui_kit as uk
+except ImportError:                                  # running from a flat folder
+    import ui_kit as uk
 
 from core.flag_manager import (
     flag_is, flag_is_not, variable_is,
@@ -30,6 +66,14 @@ from core.flag_manager import (
     check_timer, check_boss_hp, check_bar, check_room_kills,
 )
 from core.event_actions import ACTION_TYPES
+
+# Same anchoring rule the Character Creator uses: the .exe's own folder when
+# frozen, else the project root (one level up from this package folder).
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent.parent
+
 
 
 def _discover_character_ids():
@@ -267,6 +311,63 @@ def _discover_cutscene_ids():
         return []
 
 
+def _discover_item_ids():
+    """Item ids for the item picker on the 'item' action, sourced from the
+    game's own item registry (data/items.py) so the list never drifts from
+    what items actually exist. Best-effort like the other _discover_*
+    helpers: tries a few likely registry names/accessors, returns [] if
+    nothing importable is found rather than breaking the event editor."""
+    def _ids_from(obj):
+        out = []
+        if isinstance(obj, dict):
+            out = [k for k in obj.keys() if isinstance(k, str)]
+        elif isinstance(obj, (list, tuple, set)):
+            for e in obj:
+                if isinstance(e, str):
+                    out.append(e)
+                elif isinstance(e, dict):
+                    v = e.get('id') or e.get('name')
+                    if isinstance(v, str):
+                        out.append(v)
+                else:
+                    v = getattr(e, 'id', None) or getattr(e, 'name', None)
+                    if isinstance(v, str):
+                        out.append(v)
+        return out
+
+    def _scan(mod):
+        for attr in ('ITEMS', 'ITEM_DB', 'ITEM_DATA', 'ITEM_DEFS', 'ITEM_DEFINITIONS',
+                     'ITEM_REGISTRY', 'ITEM_CATALOG', 'ALL_ITEMS'):
+            ids = _ids_from(getattr(mod, attr, None))
+            if ids:
+                return ids
+        for fn in ('get_all_items', 'all_items', 'list_items', 'get_item_ids', 'item_ids'):
+            f = getattr(mod, fn, None)
+            if callable(f):
+                try:
+                    ids = _ids_from(f())
+                except Exception:
+                    ids = []
+                if ids:
+                    return ids
+        for attr in dir(mod):
+            if attr.isupper() and 'ITEM' in attr:
+                ids = _ids_from(getattr(mod, attr, None))
+                if ids:
+                    return ids
+        return []
+
+    for modname in ('data.items', 'items'):
+        try:
+            import importlib
+            ids = _scan(importlib.import_module(modname))
+            if ids:
+                return sorted(set(ids), key=str.lower)
+        except Exception:
+            continue
+    return []
+
+
 def _discover_weather_types():
     """Weather type ids, sourced the same way cutscene_editor.py's
     weather_type field does: filenames in assets/weather/ (one PNG per
@@ -410,30 +511,6 @@ def _discover_world_map_location_names(map_name):
 # actually read and mutate at runtime).
 _STAT_KEYS = ['strength', 'ki_power', 'vitality', 'energy', 'speed', 'defense', 'ki_regen']
 
-_DEFAULT_COLORS = {
-    'bg': (20, 20, 30), 'bg_transparent': (20, 20, 30, 230),
-    'panel': (35, 35, 55), 'panel_light': (45, 45, 65),
-    'accent': (255, 215, 0), 'accent_dim': (200, 170, 0),
-    'text': (255, 255, 255), 'text_dim': (180, 180, 200), 'text_dark': (120, 120, 140),
-    'grid': (60, 60, 80), 'success': (100, 255, 100),
-    'delete': (255, 50, 50), 'delete_hover': (255, 100, 100),
-    'input_bg': (60, 60, 75), 'input_active': (80, 80, 100),
-}
-
-
-# ═════════════════════════════════════════════════════════════════════════
-# ConditionBuilder — the "Conditions" half
-# ═════════════════════════════════════════════════════════════════════════
-
-_DEFAULT_COLORS = {
-    'bg': (20, 20, 30), 'bg_transparent': (20, 20, 30, 230),
-    'panel': (35, 35, 55), 'panel_light': (45, 45, 65),
-    'accent': (255, 215, 0), 'accent_dim': (200, 170, 0),
-    'text': (255, 255, 255), 'text_dim': (180, 180, 200), 'text_dark': (120, 120, 140),
-    'grid': (60, 60, 80), 'success': (100, 255, 100),
-    'delete': (255, 50, 50), 'delete_hover': (255, 100, 100),
-    'input_bg': (60, 60, 75), 'input_active': (80, 80, 100),
-}
 
 _CMP_OPTIONS = ['==', '!=', '<', '<=', '>', '>=']
 
@@ -464,6 +541,7 @@ def _placeholder_for(field_name, field_kind, kind=None):
         'boss_picker': '<select boss>',
         'npc_picker': '<select npc>',
         'cutscene_picker': '<select cutscene>',
+        'item_picker': '<select item>',
         'timer_picker': '<select timer>',
         'bar_picker': '<select bar>',
     }
@@ -652,637 +730,6 @@ CONDITION_KINDS = {
 _KIND_ORDER = ['flag', 'flag_not', 'variable', 'item', 'stat', 'character', 'zeni', 'resource', 'skill', 'timer', 'bar', 'room_kills', 'boss_hp']
 
 
-class ConditionBuilder:
-    """Row-based UI for building a flat, implicitly-ANDed condition list."""
-
-    def __init__(self, flag_manager, colors=None):
-        self.flag_manager = flag_manager
-        self.colors = colors or _DEFAULT_COLORS
-        self.font_small = pygame.font.Font(None, 16)
-        self.font_medium = pygame.font.Font(None, 20)
-
-        self.rows = []          # list of {'kind': str, 'params': {field_name: str}}
-        self.scroll_offset = 0
-        self._known_flags = []
-        self._known_characters = []
-        self._known_skills = []
-        self._known_bosses = []
-        self._known_timers = []
-        self._known_bars = []
-
-        self._active_field = None      # (row_index, field_name)
-        self._active_text = ""
-
-        self._open_kind_dropdown_row = None   # row index whose "kind" dropdown is open
-        self._open_flag_dropdown = None       # (row_index, field_name) whose flag picker is open
-        self._open_char_dropdown = None       # (row_index, field_name) whose character picker is open
-        self._open_skill_dropdown = None      # (row_index, field_name) whose skill picker is open
-        self._open_boss_dropdown = None       # (row_index, field_name) whose boss picker is open
-        self._open_timer_dropdown = None      # (row_index, field_name) whose timer picker is open
-        self._open_bar_dropdown = None        # (row_index, field_name) whose bar picker is open
-        self._add_picker_open = False         # True while the full kind grid (from "+ Add Condition") is open
-
-        self._rects = {}        # populated by draw(), read by handle_input()
-
-    # ── Lifecycle ────────────────────────────────────────────────────────────
-
-    def refresh(self, existing_conditions=None):
-        """Call when opening the popup. Refreshes the known-flags list and,
-        if given, rebuilds rows from a previously-saved condition list so
-        editing round-trips instead of starting blank every time."""
-        self._known_flags = sorted(getattr(self.flag_manager, 'flags', {}).keys())
-        self._known_characters = _discover_character_ids()
-        self._known_skills = _discover_skill_ids()
-        self._known_bosses = _discover_boss_ids()
-        self._known_timers = sorted(self.flag_manager.get_condition_names().get('timer_names', []))
-        self._known_bars = sorted(self.flag_manager.get_condition_names().get('bar_names', []))
-        self._active_field = None
-        self._active_text = ""
-        self._open_kind_dropdown_row = None
-        self._open_flag_dropdown = None
-        self._open_char_dropdown = None
-        self._open_skill_dropdown = None
-        self._open_boss_dropdown = None
-        self._open_timer_dropdown = None
-        self._open_bar_dropdown = None
-        self._add_picker_open = False
-        self.scroll_offset = 0
-
-        if existing_conditions is None:
-            return
-
-        rows = []
-        for cond in existing_conditions:
-            matched = False
-            for kind in _KIND_ORDER:
-                params = CONDITION_KINDS[kind]['unbuild'](cond)
-                if params is not None:
-                    rows.append({'kind': kind, 'params': {k: str(v) for k, v in params.items()}})
-                    matched = True
-                    break
-            if not matched:
-                # Unknown/unsupported condition shape — keep it as an opaque
-                # passthrough row so re-saving doesn't silently drop it.
-                rows.append({'kind': '__raw__', 'params': {}, '_raw': cond})
-        self.rows = rows
-
-    def get_condition_list(self):
-        """Build the actual condition dicts from current row state."""
-        result = []
-        for row in self.rows:
-            if row['kind'] == '__raw__':
-                result.append(row.get('_raw'))
-                continue
-            spec = CONDITION_KINDS.get(row['kind'])
-            if spec is None:
-                continue
-            try:
-                result.append(spec['build'](row['params']))
-            except Exception:
-                continue  # malformed row — skip rather than crash the popup
-        return result
-
-    # ── Row management ──────────────────────────────────────────────────────
-
-    def _add_row(self, kind='flag'):
-        defaults = {}
-        for field_name, field_kind, extra in CONDITION_KINDS[kind]['fields']:
-            if field_kind == 'cmp':
-                defaults[field_name] = '=='
-            elif field_kind == 'choice':
-                defaults[field_name] = extra[0]
-            else:
-                defaults[field_name] = ''
-        self.rows.append({'kind': kind, 'params': defaults})
-
-    def _remove_row(self, index):
-        if 0 <= index < len(self.rows):
-            self.rows.pop(index)
-        if self._active_field and self._active_field[0] == index:
-            self._active_field = None
-
-    def _set_row_kind(self, index, kind):
-        if 0 <= index < len(self.rows) and kind in CONDITION_KINDS:
-            defaults = {}
-            for field_name, field_kind, extra in CONDITION_KINDS[kind]['fields']:
-                defaults[field_name] = '==' if field_kind == 'cmp' else (extra[0] if field_kind == 'choice' else '')
-            self.rows[index] = {'kind': kind, 'params': defaults}
-
-    # ── Input ────────────────────────────────────────────────────────────────
-
-    def handle_input(self, event, x, y):
-        if event.type == pygame.KEYDOWN:
-            if self._active_field is not None:
-                row_index, field_name = self._active_field
-                if event.key == pygame.K_RETURN or event.key == pygame.K_ESCAPE:
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = self._active_text
-                    self._active_field = None
-                elif event.key == pygame.K_BACKSPACE:
-                    self._active_text = self._active_text[:-1]
-                elif event.unicode and event.unicode.isprintable():
-                    if len(self._active_text) < 60:
-                        self._active_text += event.unicode
-                return
-
-        if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
-            return
-        mouse_pos = event.pos
-
-        # Add-kind grid open — clicking an option adds it and stays open,
-        # so multiple conditions can be added back-to-back. Any other click
-        # closes it (consistent with how the other dropdowns dismiss).
-        if self._add_picker_open:
-            for rect, kind in self._rects.get('add_kind_grid_items', []):
-                if rect.collidepoint(mouse_pos):
-                    self._add_row(kind)
-                    return
-            self._add_picker_open = False
-            return
-
-        # Kind dropdown open — item list takes priority over everything else
-        if self._open_kind_dropdown_row is not None:
-            for rect, kind in self._rects.get('kind_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    self._set_row_kind(self._open_kind_dropdown_row, kind)
-                    self._open_kind_dropdown_row = None
-                    return
-            self._open_kind_dropdown_row = None
-            return
-
-        # Flag picker dropdown open
-        if self._open_flag_dropdown is not None:
-            for rect, name in self._rects.get('flag_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_flag_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = name
-                    self._open_flag_dropdown = None
-                    return
-            self._open_flag_dropdown = None
-            return
-
-        # Character picker dropdown open
-        if self._open_char_dropdown is not None:
-            for rect, name in self._rects.get('char_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_char_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = name
-                    self._open_char_dropdown = None
-                    return
-            self._open_char_dropdown = None
-            return
-
-        # Skill picker dropdown open
-        if self._open_skill_dropdown is not None:
-            for rect, name in self._rects.get('skill_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_skill_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = name
-                    self._open_skill_dropdown = None
-                    return
-            self._open_skill_dropdown = None
-            return
-
-        # Boss picker dropdown open
-        if self._open_boss_dropdown is not None:
-            for rect, name in self._rects.get('boss_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_boss_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = name
-                    self._open_boss_dropdown = None
-                    return
-            self._open_boss_dropdown = None
-            return
-
-        # Timer picker dropdown open
-        if self._open_timer_dropdown is not None:
-            for rect, name in self._rects.get('timer_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_timer_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = name
-                    self._open_timer_dropdown = None
-                    return
-            self._open_timer_dropdown = None
-            return
-
-        # Bar picker dropdown open
-        if self._open_bar_dropdown is not None:
-            for rect, name in self._rects.get('bar_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_bar_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = name
-                    self._open_bar_dropdown = None
-                    return
-            self._open_bar_dropdown = None
-            return
-
-        # Commit any open text field if the click lands elsewhere
-        if self._active_field is not None:
-            row_index, field_name = self._active_field
-            if 0 <= row_index < len(self.rows):
-                self.rows[row_index]['params'][field_name] = self._active_text
-            self._active_field = None
-
-        # "+ Add Condition" button — toggles the full kind grid
-        add_rect = self._rects.get('add_condition_btn')
-        if add_rect and add_rect.collidepoint(mouse_pos):
-            self._add_picker_open = not self._add_picker_open
-            return
-
-        # Per-row hit testing
-        for row_index, row_rects in self._rects.get('rows', []):
-            kind_rect = row_rects.get('kind')
-            if kind_rect and kind_rect.collidepoint(mouse_pos):
-                self._open_kind_dropdown_row = row_index
-                return
-
-            delete_rect = row_rects.get('delete')
-            if delete_rect and delete_rect.collidepoint(mouse_pos):
-                self._remove_row(row_index)
-                return
-
-            for field_name, field_rect, field_kind, extra in row_rects.get('fields', []):
-                if not field_rect.collidepoint(mouse_pos):
-                    continue
-                if field_kind == 'cmp':
-                    row = self.rows[row_index]
-                    cur = row['params'].get(field_name, '==')
-                    nxt = _CMP_OPTIONS[(_CMP_OPTIONS.index(cur) + 1) % len(_CMP_OPTIONS)] \
-                        if cur in _CMP_OPTIONS else '=='
-                    row['params'][field_name] = nxt
-                elif field_kind == 'choice':
-                    row = self.rows[row_index]
-                    cur = row['params'].get(field_name, extra[0])
-                    nxt = extra[(extra.index(cur) + 1) % len(extra)] if cur in extra else extra[0]
-                    row['params'][field_name] = nxt
-                elif field_kind == 'flag_picker':
-                    picker_btn = row_rects.get('flag_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_flag_dropdown = (row_index, field_name)
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                elif field_kind == 'char_picker':
-                    picker_btn = row_rects.get('char_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_char_dropdown = (row_index, field_name)
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                elif field_kind == 'skill_picker':
-                    picker_btn = row_rects.get('skill_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_skill_dropdown = (row_index, field_name)
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                elif field_kind == 'boss_picker':
-                    picker_btn = row_rects.get('boss_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_boss_dropdown = (row_index, field_name)
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                elif field_kind == 'timer_picker':
-                    picker_btn = row_rects.get('timer_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_timer_dropdown = (row_index, field_name)
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                elif field_kind == 'bar_picker':
-                    picker_btn = row_rects.get('bar_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_bar_dropdown = (row_index, field_name)
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                else:  # text / number
-                    self._active_field = (row_index, field_name)
-                    self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                return
-
-    # ── Draw ─────────────────────────────────────────────────────────────────
-
-    def draw(self, screen, x, y, w):
-        colors = self.colors
-        self._rects = {'rows': []}
-
-        header = self.font_medium.render(
-            "Conditions (all must be true)" if self.rows else "Conditions (none — always true)",
-            True, colors['text'])
-        screen.blit(header, (x, y))
-        cur_y = y + 26
-
-        for row_index, row in enumerate(self.rows):
-            row_rects = {'fields': []}
-            row_y = cur_y
-            row_x = x
-
-            if row['kind'] == '__raw__':
-                label = self.font_small.render("(unrecognized condition — kept as-is)", True, colors['text_dim'])
-                screen.blit(label, (row_x, row_y + 6))
-            else:
-                spec = CONDITION_KINDS[row['kind']]
-
-                kind_rect = pygame.Rect(row_x, row_y, 150, _FIELD_H)
-                screen.draw_rect(colors['input_bg'], kind_rect, border_radius=4)
-                screen.draw_rect(colors['accent'], kind_rect, 1, border_radius=4)
-                kind_label = self.font_small.render(spec['label'], True, colors['text'])
-                screen.blit(kind_label, (kind_rect.x + 6, kind_rect.y + 5))
-                row_rects['kind'] = kind_rect
-
-                field_x = kind_rect.right + _FIELD_GAP
-                max_x = x + w - 30 - _FIELD_GAP
-
-                # Text fields soak up whatever width is left in the row
-                # instead of sitting at a fixed 90px with dead space out
-                # to the delete button.
-                fixed_total = sum(
-                    (50 if fk == 'cmp' else 90) + _FIELD_GAP for _, fk, _ in spec['fields'])
-                stretch_names = [fn for fn, fk, _ in spec['fields'] if fk == 'text']
-                leftover = max_x - field_x - fixed_total
-                stretch_bonus = max(0, min(280, leftover) // len(stretch_names)) if stretch_names else 0
-
-                for field_name, field_kind, extra in spec['fields']:
-                    field_w = 50 if field_kind == 'cmp' else 90
-                    if field_kind == 'text':
-                        field_w += stretch_bonus
-                    field_rect = pygame.Rect(field_x, row_y, field_w, _FIELD_H)
-
-                    active = self._active_field == (row_index, field_name)
-                    bg = colors['input_active'] if active else colors['input_bg']
-                    screen.draw_rect(bg, field_rect, border_radius=4)
-                    screen.draw_rect(colors['grid'], field_rect, 1, border_radius=4)
-
-                    if field_kind == 'flag_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['flag_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
-                    elif field_kind == 'char_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['char_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
-                    elif field_kind == 'skill_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['skill_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
-                    elif field_kind == 'boss_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['boss_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
-                    elif field_kind == 'timer_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['timer_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
-                    elif field_kind == 'bar_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['bar_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
-
-                    display = self._active_text if active else row['params'].get(field_name, '')
-                    if not active and not display:
-                        display = _placeholder_for(field_name, field_kind, row['kind'])
-                    clip = pygame.Rect(field_rect.x + 4, field_rect.y, field_rect.w - 8, field_rect.h)
-                    screen.set_clip(clip)
-                    text_surf = self.font_small.render(str(display), True, colors['text'])
-                    screen.blit(text_surf, (field_rect.x + 4, field_rect.y + 5))
-                    screen.set_clip(None)
-
-                    row_rects['fields'].append((field_name, field_rect, field_kind, extra))
-                    field_x = field_rect.right + _FIELD_GAP
-
-            delete_rect = pygame.Rect(x + w - 26, row_y, 20, _FIELD_H)
-            screen.draw_rect(colors['delete'], delete_rect, border_radius=4)
-            x_label = self.font_small.render('X', True, colors['text'])
-            screen.blit(x_label, x_label.get_rect(center=delete_rect.center))
-            row_rects['delete'] = delete_rect
-
-            self._rects['rows'].append((row_index, row_rects))
-            cur_y += _ROW_H
-
-            # Open dropdown slots in right after its own row, pushing
-            # everything below (later rows, Add button) down to fit —
-            # rather than floating below the Add button at the bottom.
-            if self._open_kind_dropdown_row == row_index:
-                self._draw_kind_dropdown(screen, x, cur_y)
-                cur_y += len(_KIND_ORDER) * 22
-            elif self._open_flag_dropdown is not None and self._open_flag_dropdown[0] == row_index:
-                names = self._known_flags or ['(no flags used yet)']
-                self._draw_flag_dropdown(screen, x, cur_y)
-                cur_y += len(names[:8]) * 22
-            elif self._open_char_dropdown is not None and self._open_char_dropdown[0] == row_index:
-                names = self._known_characters or ['(no characters found)']
-                self._draw_char_dropdown(screen, x, cur_y)
-                cur_y += len(names[:8]) * 22
-            elif self._open_skill_dropdown is not None and self._open_skill_dropdown[0] == row_index:
-                names = self._known_skills or ['(no skills found)']
-                self._draw_skill_dropdown(screen, x, cur_y)
-                cur_y += len(names[:8]) * 22
-            elif self._open_boss_dropdown is not None and self._open_boss_dropdown[0] == row_index:
-                names = self._known_bosses or ['(no bosses found)']
-                self._draw_boss_dropdown(screen, x, cur_y)
-                cur_y += len(names[:8]) * 22
-            elif self._open_timer_dropdown is not None and self._open_timer_dropdown[0] == row_index:
-                names = self._known_timers or ['(no timers made yet)']
-                self._draw_timer_dropdown(screen, x, cur_y)
-                cur_y += len(names[:8]) * 22
-            elif self._open_bar_dropdown is not None and self._open_bar_dropdown[0] == row_index:
-                names = self._known_bars or ['(no bars made yet)']
-                self._draw_bar_dropdown(screen, x, cur_y)
-                cur_y += len(names[:8]) * 22
-
-        if self._add_picker_open:
-            cur_y += self._draw_add_kind_grid(screen, x, cur_y, w)
-
-        add_rect = pygame.Rect(x, cur_y, 160, _FIELD_H)
-        screen.draw_rect(colors['input_bg'], add_rect, border_radius=4)
-        screen.draw_rect(colors['success'], add_rect, 1, border_radius=4)
-        add_label = self.font_small.render("+ Add Condition", True, colors['success'])
-        screen.blit(add_label, (add_rect.x + 8, add_rect.y + 5))
-        self._rects['add_condition_btn'] = add_rect
-        cur_y += _ROW_H
-
-        self._content_height = cur_y - y
-
-    def _draw_add_kind_grid(self, screen, x, y, w):
-        colors = self.colors
-        item_w, item_h, gap = 170, 26, 6
-        cols = max(1, (w + gap) // (item_w + gap))
-        items = []
-        for i, kind in enumerate(_KIND_ORDER):
-            col, row = i % cols, i // cols
-            rect = pygame.Rect(x + col * (item_w + gap), y + row * (item_h + gap), item_w, item_h)
-            screen.draw_rect(colors['panel_light'], rect, border_radius=4)
-            screen.draw_rect(colors['accent'], rect, 1, border_radius=4)
-            clip = pygame.Rect(rect.x + 4, rect.y, rect.w - 8, rect.h)
-            screen.set_clip(clip)
-            label = self.font_small.render(CONDITION_KINDS[kind]['label'], True, colors['text'])
-            screen.blit(label, (rect.x + 6, rect.y + 5))
-            screen.set_clip(None)
-            items.append((rect, kind))
-        self._rects['add_kind_grid_items'] = items
-        rows_used = (len(_KIND_ORDER) + cols - 1) // cols
-        return rows_used * (item_h + gap)
-
-    def _draw_kind_dropdown(self, screen, x, list_y):
-        colors = self.colors
-        items = []
-        list_w = 180
-        list_rect = pygame.Rect(x, list_y, list_w, len(_KIND_ORDER) * 22)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, kind in enumerate(_KIND_ORDER):
-            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
-            label = self.font_small.render(CONDITION_KINDS[kind]['label'], True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            items.append((item_rect, kind))
-        self._rects['kind_dropdown_items'] = items
-
-    def _draw_flag_dropdown(self, screen, x, list_y):
-        colors = self.colors
-        items = []
-        list_w = 180
-        names = self._known_flags or ['(no flags used yet)']
-        visible = names[:8]
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if self._known_flags:
-                items.append((item_rect, name))
-        self._rects['flag_dropdown_items'] = items
-
-    def _draw_char_dropdown(self, screen, x, list_y):
-        colors = self.colors
-        items = []
-        list_w = 180
-        names = self._known_characters or ['(no characters found)']
-        visible = names[:8]
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if self._known_characters:
-                items.append((item_rect, name))
-        self._rects['char_dropdown_items'] = items
-
-    def _draw_skill_dropdown(self, screen, x, list_y):
-        colors = self.colors
-        items = []
-        list_w = 180
-        names = self._known_skills or ['(no skills found)']
-        visible = names[:8]
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if self._known_skills:
-                items.append((item_rect, name))
-        self._rects['skill_dropdown_items'] = items
-
-    def _draw_boss_dropdown(self, screen, x, list_y):
-        colors = self.colors
-        items = []
-        list_w = 180
-        names = self._known_bosses or ['(no bosses found)']
-        visible = names[:8]
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if self._known_bosses:
-                items.append((item_rect, name))
-        self._rects['boss_dropdown_items'] = items
-
-    def _draw_timer_dropdown(self, screen, x, list_y):
-        colors = self.colors
-        items = []
-        list_w = 180
-        names = self._known_timers or ['(no timers made yet)']
-        visible = names[:8]
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if self._known_timers:
-                items.append((item_rect, name))
-        self._rects['timer_dropdown_items'] = items
-
-    def _draw_bar_dropdown(self, screen, x, list_y):
-        colors = self.colors
-        items = []
-        list_w = 180
-        names = self._known_bars or ['(no bars made yet)']
-        visible = names[:8]
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if self._known_bars:
-                items.append((item_rect, name))
-        self._rects['bar_dropdown_items'] = items
-
-    def content_height(self):
-        """Total drawn height from the last draw() call, for the caller to
-        size the popup window around."""
-        return getattr(self, '_content_height', 40)
-
-# ═════════════════════════════════════════════════════════════════════════
-# ActionSequenceBuilder — the "Command list" half
-# ═════════════════════════════════════════════════════════════════════════
-
-_FIELD_H = 24
-_FIELD_GAP = 6
-_ROW_GAP = 6
-_TYPE_DROPDOWN_VISIBLE = 10
-_MUSIC_DROPDOWN_VISIBLE = 8
-_SOUND_DROPDOWN_VISIBLE = 8
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Per-action-type field schema. field_kind: 'text' | 'number' | 'bool' |
-# 'choice' (extra=options list) | 'json' (raw JSON text, for list/dict params)
-# Params not listed here (e.g. 'blocking', which some builders set from a
-# 'wait' flag) are left out of the row editor and just passed through as
-# whatever the builder function defaults to.
-# ─────────────────────────────────────────────────────────────────────────────
-
 ACTION_SCHEMA = {
     'dialogue_box': [('speaker_type', 'choice', ['character', 'narrator', 'info']),
                       ('speaker_name', 'text', None), ('text', 'text', None),
@@ -1296,7 +743,7 @@ ACTION_SCHEMA = {
     'timer_pause': [('timer_id', 'text', None)],
     'timer_stop': [('timer_id', 'text', None)],
     'zeni': [('mode', 'choice', ['set', 'add', 'remove']), ('amount', 'number', None)],
-    'item': [('mode', 'choice', ['add', 'remove']), ('item_id', 'text', None), ('quantity', 'number', None)],
+    'item': [('mode', 'choice', ['add', 'remove']), ('item_id', 'item_picker', None), ('quantity', 'number', None)],
     'level': [('mode', 'choice', ['set', 'add', 'remove']), ('amount', 'number', None), ('character_id', 'char_picker', None)],
     'exp': [('mode', 'choice', ['set', 'add', 'remove']), ('amount', 'number', None), ('character_id', 'char_picker', None)],
     'stat': [('mode', 'choice', ['set', 'add', 'remove']), ('stat_name', 'choice', _STAT_KEYS),
@@ -1351,7 +798,15 @@ ACTION_SCHEMA = {
     # 'room_1_pad_1', when the pad is placed) — plain text field, same
     # pattern as timer_id above, since pads aren't tied to a fixed catalogue
     # the way skills/npcs/enemies are.
+    'mission': [('mode', 'choice', ['start', 'complete', 'fail', 'reset']), ('mission_id', 'text', None)],
     'toggle_flying_pad': [('pad_id', 'text', None), ('mode', 'choice', ['enable', 'disable'])],
+    # Show / hide / despawn an entity that already exists in the room (typically
+    # fired by a Trigger Box). 'show' / 'hide' only toggle visibility + interaction
+    # (the entity stays in the room and can be shown again); 'despawn' removes it
+    # from the room for good. Ids come from the entity editor's catalogue pickers.
+    'npc_state': [('npc_id', 'npc_picker', None), ('mode', 'choice', ['show', 'hide', 'despawn'])],
+    'enemy_state': [('enemy_id', 'enemy_picker', None), ('mode', 'choice', ['show', 'hide', 'despawn'])],
+    'boss_state': [('boss_id', 'boss_picker', None), ('mode', 'choice', ['show', 'hide', 'despawn'])],
 }
 
 # For action types whose schema pairs a 'set'/'stop' mode choice with a
@@ -1423,108 +878,201 @@ class _NullFlagManager:
         return False
 
 
-class ActionSequenceBuilder:
-    """Row-based UI for building an ordered action list."""
+
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# Data models — rows + discovery data, no drawing, no input
+# ═════════════════════════════════════════════════════════════════════════
+
+class _RowListMixin:
+    """Row-list housekeeping shared by the condition and action models."""
+
+    def _remove_row(self, index):
+        if 0 <= index < len(self.rows):
+            self.rows.pop(index)
+
+    def _move_row(self, index, delta):
+        self._move_row_to(index, index + delta)
+
+    def _move_row_to(self, index, target):
+        if 0 <= index < len(self.rows) and 0 <= target < len(self.rows) and index != target:
+            self.rows.insert(target, self.rows.pop(index))
+
+    def _duplicate_row(self, index):
+        if 0 <= index < len(self.rows):
+            self.rows.insert(index + 1, copy.deepcopy(self.rows[index]))
+
+
+class ConditionBuilder(_RowListMixin):
+    """Rows of a flat, implicitly-ANDed condition list (+ the picker data)."""
+
+    def __init__(self, flag_manager, colors=None):
+        self.flag_manager = flag_manager
+        self.rows = []          # list of {'kind': str, 'params': {field_name: str}}
+        self._known_flags = []
+        self._known_characters = []
+        self._known_skills = []
+        self._known_bosses = []
+        self._known_timers = []
+        self._known_bars = []
+
+    # ── Lifecycle ────────────────────────────────────────────────────────────
+
+    def inherit(self, other):
+        """Borrow another builder's already-scanned picker lists (used by the
+        nested branch editors so they don't rescan the disk)."""
+        self._known_flags = list(other._known_flags)
+        self._known_characters = list(other._known_characters)
+        self._known_skills = list(other._known_skills)
+        self._known_bosses = list(other._known_bosses)
+        self._known_timers = list(other._known_timers)
+        self._known_bars = list(other._known_bars)
+
+    def refresh(self, existing_conditions=None, parent=None):
+        """Refresh the picker lists and, if given, rebuild the rows from a
+        previously-saved condition list so editing round-trips."""
+        if parent is not None:
+            self.inherit(parent)
+        else:
+            self._known_flags = sorted(getattr(self.flag_manager, 'flags', {}).keys())
+            self._known_characters = _discover_character_ids()
+            self._known_skills = _discover_skill_ids()
+            self._known_bosses = _discover_boss_ids()
+            try:
+                names = self.flag_manager.get_condition_names() or {}
+            except Exception:
+                names = {}
+            self._known_timers = sorted(names.get('timer_names', []))
+            self._known_bars = sorted(names.get('bar_names', []))
+
+        if existing_conditions is None:
+            return
+
+        rows = []
+        for cond in existing_conditions:
+            matched = False
+            # room_kills is a specially-named 'variable' condition, so it has to
+            # be tried before the generic Custom Variable kind or it would
+            # always reload as one.
+            for kind in ('room_kills',) + tuple(k for k in _KIND_ORDER if k != 'room_kills'):
+                params = CONDITION_KINDS[kind]['unbuild'](cond)
+                if params is not None:
+                    rows.append({'kind': kind, 'params': {k: str(v) for k, v in params.items()}})
+                    matched = True
+                    break
+            if not matched:
+                # Unknown/unsupported condition shape — keep it as an opaque
+                # passthrough row so re-saving doesn't silently drop it.
+                rows.append({'kind': '__raw__', 'params': {}, '_raw': cond})
+        self.rows = rows
+
+    def get_condition_list(self):
+        """Build the actual condition dicts from current row state."""
+        result = []
+        for row in self.rows:
+            if row['kind'] == '__raw__':
+                result.append(row.get('_raw'))
+                continue
+            spec = CONDITION_KINDS.get(row['kind'])
+            if spec is None:
+                continue
+            try:
+                result.append(spec['build'](row['params']))
+            except Exception:
+                continue  # malformed row — skip rather than crash
+        return result
+
+    # ── Row management ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _defaults_for(kind):
+        defaults = {}
+        for field_name, field_kind, extra in CONDITION_KINDS[kind]['fields']:
+            if field_kind == 'cmp':
+                defaults[field_name] = '=='
+            elif field_kind == 'choice':
+                defaults[field_name] = extra[0]
+            else:
+                defaults[field_name] = ''
+        return defaults
+
+    def _add_row(self, kind='flag'):
+        if kind in CONDITION_KINDS:
+            self.rows.append({'kind': kind, 'params': self._defaults_for(kind)})
+
+    def _set_row_kind(self, index, kind):
+        if 0 <= index < len(self.rows) and kind in CONDITION_KINDS:
+            self.rows[index] = {'kind': kind, 'params': self._defaults_for(kind)}
+
+    # ── Picker data ─────────────────────────────────────────────────────────
+
+    def choices(self, field_kind):
+        """(names, empty-placeholder) for a picker field kind."""
+        table = {
+            'flag_picker': (self._known_flags, '(no flags used yet)'),
+            'char_picker': (self._known_characters, '(no characters found)'),
+            'skill_picker': (self._known_skills, '(no skills found)'),
+            'boss_picker': (self._known_bosses, '(no bosses found)'),
+            'timer_picker': (self._known_timers, '(no timers made yet)'),
+            'bar_picker': (self._known_bars, '(no bars made yet)'),
+        }
+        return table.get(field_kind, ([], ''))
+
+
+
+
+_PICKER_KINDS = (
+    'portrait_picker', 'char_picker', 'enemy_picker', 'npc_picker', 'item_picker',
+    'cutscene_picker', 'skill_picker', 'transformation_picker', 'skin_picker',
+    'animation_picker', 'weather_picker', 'music_picker', 'sound_picker',
+    'room_picker', 'world_map_picker', 'wm_location_picker',
+    # condition-side pickers
+    'flag_picker', 'boss_picker', 'timer_picker', 'bar_picker',
+)
+
+
+def _new_branch(is_else=False):
+    return {'is_else': is_else, 'conditions': [], 'actions': []}
+
+
+class ActionSequenceBuilder(_RowListMixin):
+    """Rows of an ordered action list (+ the picker data and the live-game
+    context the host pushes in)."""
 
     def __init__(self, colors=None):
-        self.colors = colors or _DEFAULT_COLORS
-        self.font_small = pygame.font.Font(None, 16)
-        self.font_medium = pygame.font.Font(None, 20)
-
         self.rows = []   # list of {'type': action_type, 'params': {field_name: str}}
-                          # dialogue_choice rows also carry '_options':
-                          # [{'text': str, 'actions': [...]}]
-
-        self._active_field = None      # (row_index, field_name)
-        self._active_text = ""
-
-        self._active_option_field = None   # (row_index, option_index) — editing an option's label
-        self._active_option_text = ""
-
-        self._open_type_dropdown_row = None
-        self._type_dropdown_scroll = 0
-        self._open_portrait_dropdown = None   # (row_index, field_name) whose portrait picker is open
+                         # dialogue_choice rows also carry '_options':
+                         #   [{'text': str, 'actions': [...]}]
+                         # conditional rows carry '_branches':
+                         #   [{'is_else': bool, 'conditions': [...], 'actions': [...]}]
         self._known_portraits = []
-        self._open_char_dropdown = None       # (row_index, field_name) whose character picker is open
         self._known_characters = []
-        self._open_enemy_dropdown = None      # (row_index, field_name) whose enemy picker is open
         self._known_enemies = []
-        self._open_npc_dropdown = None        # (row_index, field_name) whose npc picker is open
+        self._known_bosses = []
         self._known_npcs = []
-        self._open_cutscene_dropdown = None   # (row_index, field_name) whose cutscene picker is open
         self._known_cutscenes = []
-        self._open_skill_dropdown = None      # (row_index, field_name) whose skill picker is open
+        self._known_items = []
         self._known_skills = []
-        self._open_transformation_dropdown = None  # (row_index, field_name) whose transformation picker is open
-        # Which character's equipped-skill list backs the skill_id picker's
-        # 'add'/'remove' options — set externally via set_current_character()
-        # (e.g. by the room editor, from self.player.character) since this
-        # builder has no live game state of its own to read it from.
-        self._current_character_id = None
-        # Optional callable returning the character's LIVE equipped-skill
-        # list (e.g. lambda: self.player.equipped_attacks), also supplied via
-        # set_current_character(). Runtime 'skill' actions mutate the live
-        # player object directly and are never written back to the
-        # character-creator's saved config, so falling back to
-        # _discover_equipped_skills() (which reads that saved config from
-        # disk) would show stale data — skills added at runtime wouldn't
-        # show up as equipped, and the 'add' filter wouldn't exclude them.
-        self._get_equipped_skills = None
-        # Same idea as _get_equipped_skills, but for the transformation
-        # picker's 'add'/'remove' options — a callable returning the LIVE
-        # unlocked-forms list (e.g. lambda: self.player.
-        # unlocked_transformations), also supplied via
-        # set_current_character(). Falls back to treating every configured
-        # form as unlocked (see _transformation_choices_for_row()) when
-        # unset, matching the default-fully-unlocked behavior in
-        # game.py's _reload_attack_config().
-        self._get_unlocked_transformations = None
-        # Which room the 'x' position_picker for set_player_location should
-        # preview/place against — set externally via set_current_room()
-        # (e.g. by the room editor/trigger box editor, from the room the
-        # event/trigger box actually lives in), since unlike change_map's
-        # spawn point this action has no room_name field of its own to
-        # read a target room from — it always affects the current room.
-        self._current_room_name = None
-        self._open_skin_dropdown = None       # (row_index, field_name) whose skin/costume picker is open
-        self._open_animation_dropdown = None  # (row_index, field_name) whose animation picker is open
         self._known_weather_types = []
-        self._open_weather_dropdown = None    # (row_index, field_name) whose weather picker is open
         self._known_music_tracks = []
-        self._open_music_dropdown = None      # (row_index, field_name) whose music picker is open
-        self._music_dropdown_scroll = 0
         self._known_sound_effects = []
-        self._open_sound_dropdown = None      # (row_index, field_name) whose sound picker is open
-        self._sound_dropdown_scroll = 0
-        self._open_room_dropdown = None       # (row_index, field_name) whose room picker is open
         self._known_rooms = []
-        self._open_world_map_dropdown = None  # (row_index, field_name) whose world_map_location map_name picker is open
         self._known_world_maps = []
-        self._open_wm_location_dropdown = None  # (row_index, field_name) whose world_map_location name picker is open — choices are row-scoped, see _wm_location_choices_for_row()
-        # room_name -> (width, height) in world units, set externally via
-        # set_known_rooms() (e.g. by the room editor, from the live
-        # RoomManager) — used to scale the Set Spawn preview canvas.
-        # Rooms missing here fall back to _ROOM_PICKER_DEFAULT_DIMS.
+        # Which character's equipped-skill list backs the skill picker's
+        # add/remove options — set via set_current_character().
+        self._current_character_id = None
+        # Optional callables returning LIVE state (see set_current_character()).
+        self._get_equipped_skills = None
+        self._get_unlocked_transformations = None
+        # Room the set_player_location position picker previews/places against.
+        self._current_room_name = None
+        # room_name -> (width, height) in world units (set_known_rooms()).
         self._known_room_dims = {}
-        # Optional callable (room_name -> pygame.Surface | None) for
-        # rendering an actual tile preview in the Set Spawn overlay — set
-        # externally via set_room_preview_provider(). Falls back to a
-        # plain grid rectangle when unset/returns None.
+        # Optional callable room_name -> pygame.Surface | None
+        # (set_room_preview_provider()).
         self._room_preview_provider = None
-        # Active "Set Spawn" mouse-picking overlay state (see
-        # _open_spawn_picker()/_draw_spawn_picker() below), or None when
-        # closed — same shape as _option_editor one level down.
-        self._spawn_picker = None
-        self._add_picker_open = False   # True while the full type grid (from "+ Add Command") is open
-
-        # Nested action-list editor for a single dialogue_choice option:
-        # {'row_index':, 'option_index':, 'builder': ActionSequenceBuilder,
-        #  'origin': (x, y), 'save_rect':, 'cancel_rect':} while open, else None.
-        self._option_editor = None
-        self._conditional_editor = None
         self._condition_flag_manager = None
-
-        self._rects = {}
 
     # ── Lifecycle ────────────────────────────────────────────────────────────
 
@@ -1739,57 +1287,52 @@ class ActionSequenceBuilder:
         names = _discover_world_map_location_names(map_name)
         return names, '(no locations found on this map)'
 
-    def refresh(self, existing_actions=None):
-        self._active_field = None
-        self._active_text = ""
-        self._active_option_field = None
-        self._active_option_text = ""
-        self._open_type_dropdown_row = None
-        self._open_portrait_dropdown = None
-        self._known_portraits = _discover_portrait_ids()
-        self._open_char_dropdown = None
-        self._known_characters = _discover_character_ids()
-        self._open_enemy_dropdown = None
-        self._known_enemies = _discover_enemy_ids()
-        self._open_npc_dropdown = None
-        self._known_npcs = _discover_npc_ids()
-        self._open_cutscene_dropdown = None
-        self._known_cutscenes = _discover_cutscene_ids()
-        self._open_skill_dropdown = None
-        self._known_skills = _discover_skill_ids()
-        self._open_transformation_dropdown = None
-        self._open_skin_dropdown = None
-        self._open_animation_dropdown = None
-        self._known_weather_types = _discover_weather_types()
-        self._open_weather_dropdown = None
-        self._known_music_tracks = _discover_music_tracks()
-        self._open_music_dropdown = None
-        self._music_dropdown_scroll = 0
-        self._known_sound_effects = _discover_sound_effects()
-        self._open_sound_dropdown = None
-        self._sound_dropdown_scroll = 0
-        self._open_room_dropdown = None
-        # Unlike _known_characters/_known_skills above (which re-scan disk
-        # fresh every refresh() since that scan IS their source of truth),
-        # _known_rooms' real source of truth is the live push from
-        # set_known_rooms() (see there) — refresh() runs every time this
-        # popup opens, which is *after* the host's sync call, so
-        # unconditionally overwriting here would wipe out that live list
-        # right before it's needed. Only fall back to the disk scan if
-        # nothing's ever been pushed.
-        if not self._known_rooms:
-            self._known_rooms = _discover_room_names()
-        self._open_world_map_dropdown = None
-        self._known_world_maps = _discover_world_map_names()
-        self._open_wm_location_dropdown = None
-        self._spawn_picker = None
-        self._add_picker_open = False
-        self._option_editor = None
-        self._conditional_editor = None
+
+    def inherit(self, other):
+        """Borrow another builder's scanned picker lists and live-game context
+        (used by the nested option / branch editors, so a nested Set Position
+        or skill picker still knows the current room / character)."""
+        for name in ('_known_portraits', '_known_characters', '_known_enemies', '_known_npcs',
+                     '_known_bosses', '_known_cutscenes', '_known_items', '_known_skills', '_known_weather_types',
+                     '_known_music_tracks', '_known_sound_effects', '_known_rooms',
+                     '_known_world_maps'):
+            setattr(self, name, list(getattr(other, name)))
+        self._current_character_id = other._current_character_id
+        self._get_equipped_skills = other._get_equipped_skills
+        self._get_unlocked_transformations = other._get_unlocked_transformations
+        self._current_room_name = other._current_room_name
+        self._known_room_dims = dict(other._known_room_dims)
+        self._room_preview_provider = other._room_preview_provider
+        self._condition_flag_manager = other._condition_flag_manager
+
+    def refresh(self, existing_actions=None, parent=None):
+        if parent is not None:
+            self.inherit(parent)
+        else:
+            self._known_portraits = _discover_portrait_ids()
+            self._known_characters = _discover_character_ids()
+            self._known_enemies = _discover_enemy_ids()
+            self._known_bosses = _discover_boss_ids()
+            self._known_npcs = _discover_npc_ids()
+            self._known_cutscenes = _discover_cutscene_ids()
+            self._known_items = _discover_item_ids()
+            self._known_skills = _discover_skill_ids()
+            self._known_weather_types = _discover_weather_types()
+            self._known_music_tracks = _discover_music_tracks()
+            self._known_sound_effects = _discover_sound_effects()
+            # _known_rooms' real source of truth is the live push from
+            # set_known_rooms(); refresh() runs after the host's sync call, so
+            # only fall back to the disk scan if nothing was ever pushed.
+            if not self._known_rooms:
+                self._known_rooms = _discover_room_names()
+            self._known_world_maps = _discover_world_map_names()
 
         if existing_actions is None:
             return
+        self.rows = self._rows_from_actions(existing_actions)
 
+    @staticmethod
+    def _rows_from_actions(existing_actions):
         rows = []
         for action in existing_actions:
             action_type = action.get('type')
@@ -1809,14 +1352,10 @@ class ActionSequenceBuilder:
             row = {'type': action_type, 'params': params}
             if action_type == 'change_map':
                 # spawn_y rides along with spawn_x (the schema-registered
-                # 'spawn_picker' field) but has no schema entry of its own
-                # — see the ACTION_SCHEMA comment on 'change_map'.
+                # 'spawn_picker' field) but has no schema entry of its own.
                 raw_spawn_y = action.get('spawn_y')
                 params['spawn_y'] = '' if raw_spawn_y is None else str(raw_spawn_y)
             if action_type == 'set_player_location':
-                # y rides along with x (the schema-registered
-                # 'position_picker' field) — see the ACTION_SCHEMA comment
-                # on 'set_player_location'.
                 raw_y = action.get('y')
                 params['y'] = '' if raw_y is None else str(raw_y)
             if action_type == 'dialogue_choice':
@@ -1824,7 +1363,7 @@ class ActionSequenceBuilder:
             if action_type == 'conditional':
                 row['_branches'] = _clone_branches(action.get('branches'))
             rows.append(row)
-        self.rows = rows
+        return rows
 
     def get_action_list(self):
         result = []
@@ -1856,12 +1395,8 @@ class ActionSequenceBuilder:
                     else:
                         action[field_name] = raw
                 if row['type'] == 'change_map':
-                    # spawn_y's companion to the spawn_x 'spawn_picker'
-                    # field above — see the ACTION_SCHEMA comment.
                     action['spawn_y'] = _coerce_number(row['params'].get('spawn_y', ''))
                 if row['type'] == 'set_player_location':
-                    # y's companion to the x 'position_picker' field above
-                    # — see the ACTION_SCHEMA comment.
                     action['y'] = _coerce_number(row['params'].get('y', ''))
                 if row['type'] == 'dialogue_choice':
                     action['options'] = _clone_options(row.get('_options'))
@@ -1870,16 +1405,50 @@ class ActionSequenceBuilder:
                 continue  # malformed row (usually bad JSON) — skip rather than crash
         return result
 
+    # ── Picker data ─────────────────────────────────────────────────────────
+
+    def choices(self, row_index, field_kind):
+        """(names, empty-placeholder) for a picker field kind on a given row."""
+        simple = {
+            'portrait_picker': (self._known_portraits, '(no portraits found)'),
+            'char_picker': (self._known_characters, '(no characters found)'),
+            'enemy_picker': (self._known_enemies, '(no enemies found)'),
+            'boss_picker': (self._known_bosses, '(no bosses found)'),
+            'npc_picker': (self._known_npcs, '(no npcs found)'),
+            'item_picker': (self._known_items, '(no items found)'),
+            'cutscene_picker': (self._known_cutscenes, '(no cutscenes found)'),
+            'weather_picker': (self._known_weather_types, '(no weather found)'),
+            'music_picker': (self._known_music_tracks, '(no music found)'),
+            'sound_picker': (self._known_sound_effects, '(no sfx found)'),
+            'room_picker': (self._known_rooms, '(no rooms found)'),
+            'world_map_picker': (self._known_world_maps, '(no world maps found)'),
+        }
+        if field_kind in simple:
+            return simple[field_kind]
+        if field_kind == 'skill_picker':
+            return self._skill_choices_for_row(row_index)
+        if field_kind == 'transformation_picker':
+            return self._transformation_choices_for_row(row_index)
+        if field_kind == 'skin_picker':
+            return self._costume_choices_for_row(row_index)
+        if field_kind == 'animation_picker':
+            return self._animation_choices_for_row(row_index)
+        if field_kind == 'wm_location_picker':
+            return self._wm_location_choices_for_row(row_index)
+        return [], ''
+
     # ── Row management ──────────────────────────────────────────────────────
 
-    def _add_row(self, action_type='dialogue_box'):
+    def _new_row(self, action_type):
         row = {'type': action_type, 'params': self._defaults_for(action_type)}
         if action_type == 'dialogue_choice':
             row['_options'] = []
         if action_type == 'conditional':
-            row['_branches'] = [{'is_else': False, 'conditions': [], 'actions': []},
-                                {'is_else': True, 'conditions': [], 'actions': []}]
-        self.rows.append(row)
+            row['_branches'] = [_new_branch(False), _new_branch(True)]
+        return row
+
+    def _add_row(self, action_type='dialogue_box'):
+        self.rows.append(self._new_row(action_type))
 
     def _defaults_for(self, action_type):
         defaults = {}
@@ -1896,26 +1465,9 @@ class ActionSequenceBuilder:
             defaults['y'] = ''  # companion to x's 'position_picker' field
         return defaults
 
-    def _remove_row(self, index):
-        if 0 <= index < len(self.rows):
-            self.rows.pop(index)
-        if self._active_field and self._active_field[0] == index:
-            self._active_field = None
-
-    def _move_row(self, index, delta):
-        new_index = index + delta
-        if 0 <= index < len(self.rows) and 0 <= new_index < len(self.rows):
-            self.rows[index], self.rows[new_index] = self.rows[new_index], self.rows[index]
-
     def _set_row_type(self, index, action_type):
         if 0 <= index < len(self.rows):
-            row = {'type': action_type, 'params': self._defaults_for(action_type)}
-            if action_type == 'dialogue_choice':
-                row['_options'] = []
-            if action_type == 'conditional':
-                row['_branches'] = [{'is_else': False, 'conditions': [], 'actions': []},
-                                    {'is_else': True, 'conditions': [], 'actions': []}]
-            self.rows[index] = row
+            self.rows[index] = self._new_row(action_type)
 
     # ── conditional branch management ───────────────────────────────────────
 
@@ -1925,119 +1477,18 @@ class ActionSequenceBuilder:
             if is_else:
                 if any(b.get('is_else') for b in branches):
                     return
-                branches.append({'is_else': True, 'conditions': [], 'actions': []})
+                branches.append(_new_branch(True))
             else:
-                new_branch = {'is_else': False, 'conditions': [], 'actions': []}
                 else_index = next((i for i, b in enumerate(branches) if b.get('is_else')), len(branches))
-                branches.insert(else_index, new_branch)
+                branches.insert(else_index, _new_branch(False))
 
     def _remove_conditional_branch(self, row_index, branch_index):
         if 0 <= row_index < len(self.rows) and self.rows[row_index]['type'] == 'conditional':
             branches = self.rows[row_index].get('_branches', [])
             if 0 <= branch_index < len(branches):
-                # Keep at least one branch and never leave an ELSE before another branch.
                 branches.pop(branch_index)
                 if not branches:
-                    branches.append({'is_else': False, 'conditions': [], 'actions': []})
-
-    def _open_conditional_editor(self, row_index, branch_index):
-        if not (0 <= row_index < len(self.rows)):
-            return
-        row = self.rows[row_index]
-        if row.get('type') != 'conditional':
-            return
-        branches = row.get('_branches', [])
-        if not (0 <= branch_index < len(branches)):
-            return
-        branch = branches[branch_index]
-        condition_manager = getattr(self, '_condition_flag_manager', None) or _NullFlagManager()
-        condition_builder = ConditionBuilder(condition_manager, colors=self.colors)
-        # Prefer the host-provided flag manager when the builder has one; nested
-        # action editors created from EventEditorWindow populate this attribute.
-        condition_builder.refresh(branch.get('conditions', []))
-        action_builder = ActionSequenceBuilder(colors=self.colors)
-        action_builder._condition_flag_manager = getattr(self, '_condition_flag_manager', None)
-        action_builder.refresh(branch.get('actions', []))
-        self._conditional_editor = {
-            'row_index': row_index, 'branch_index': branch_index,
-            'condition_builder': condition_builder, 'action_builder': action_builder,
-        }
-
-    def _close_conditional_editor(self, save):
-        editor = self._conditional_editor
-        if editor is None:
-            return
-        if save:
-            cb = editor['condition_builder']
-            ab = editor['action_builder']
-            if ab._active_field is not None:
-                r, f = ab._active_field
-                if 0 <= r < len(ab.rows):
-                    ab.rows[r]['params'][f] = ab._active_text
-                ab._active_field = None
-            ri, bi = editor['row_index'], editor['branch_index']
-            if 0 <= ri < len(self.rows):
-                branches = self.rows[ri].get('_branches', [])
-                if 0 <= bi < len(branches):
-                    branches[bi]['conditions'] = cb.get_condition_list()
-                    branches[bi]['actions'] = ab.get_action_list()
-        self._conditional_editor = None
-
-    def _handle_conditional_editor_input(self, event):
-        editor = self._conditional_editor
-        if editor is None:
-            return
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-            self._close_conditional_editor(False)
-            return
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            if editor.get('save_rect') and editor['save_rect'].collidepoint(event.pos):
-                self._close_conditional_editor(True)
-                return
-            if editor.get('cancel_rect') and editor['cancel_rect'].collidepoint(event.pos):
-                self._close_conditional_editor(False)
-                return
-        x, y = editor.get('origin', (0, 0))
-        editor['condition_builder'].handle_input(event, x, y)
-        editor['action_builder'].handle_input(event, x + 360, y)
-
-    def _draw_conditional_editor(self, screen):
-        editor = self._conditional_editor
-        if editor is None:
-            return
-        colors = self.colors
-        sw, sh = screen.get_size()
-        overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 190))
-        screen.blit(overlay, (0, 0))
-        margin = 45
-        panel = pygame.Rect(margin, margin, sw - margin * 2, sh - margin * 2)
-        panel_surf = pygame.Surface((panel.width, panel.height), pygame.SRCALPHA)
-        panel_surf.fill(colors.get('bg_transparent', (20, 20, 20, 240)))
-        screen.blit(panel_surf, panel.topleft)
-        screen.draw_rect(colors['accent'], panel, 2)
-        title = self.font_medium.render('Conditional Branch — IF / ELSE IF / ELSE', True, colors['text'])
-        screen.blit(title, (panel.x + 12, panel.y + 10))
-        hint = self.font_small.render('Esc to cancel', True, colors['text_dim'])
-        screen.blit(hint, (panel.right - 12 - hint.get_width(), panel.y + 16))
-        cx, cy = panel.x + 12, panel.y + 42
-        cw = int(panel.width * 0.38)
-        aw = panel.width - cw - 36
-        screen.draw_rect(colors['panel'], pygame.Rect(cx - 6, cy - 4, cw + 12, panel.height - 72), border_radius=5)
-        screen.draw_rect(colors['panel'], pygame.Rect(cx + cw + 18, cy - 4, aw + 12, panel.height - 72), border_radius=5)
-        editor['condition_builder'].draw(screen, cx, cy, cw)
-        editor['action_builder'].draw(screen, cx + cw + 30, cy, aw)
-        editor['origin'] = (cx, cy)
-        btn_w = 90
-        save_rect = pygame.Rect(panel.right - 12 - btn_w, panel.bottom - 14 - 30, btn_w, 30)
-        cancel_rect = pygame.Rect(save_rect.x - btn_w - 10, save_rect.y, btn_w, 30)
-        screen.draw_rect(colors['success'], save_rect, border_radius=5)
-        screen.blit(self.font_small.render('Save', True, colors['bg']), self.font_small.render('Save', True, colors['bg']).get_rect(center=save_rect.center))
-        screen.draw_rect(colors['panel_light'], cancel_rect, border_radius=5)
-        screen.draw_rect(colors['grid'], cancel_rect, 1, border_radius=5)
-        screen.blit(self.font_small.render('Cancel', True, colors['text']), self.font_small.render('Cancel', True, colors['text']).get_rect(center=cancel_rect.center))
-        editor['save_rect'] = save_rect
-        editor['cancel_rect'] = cancel_rect
+                    branches.append(_new_branch(False))
 
     # ── dialogue_choice option management ────────────────────────────────────
 
@@ -2050,8 +1501,6 @@ class ActionSequenceBuilder:
             options = self.rows[row_index].get('_options', [])
             if 0 <= option_index < len(options):
                 options.pop(option_index)
-        if self._active_option_field == (row_index, option_index):
-            self._active_option_field = None
 
     def _move_option(self, row_index, option_index, delta):
         if 0 <= row_index < len(self.rows):
@@ -2060,1909 +1509,2915 @@ class ActionSequenceBuilder:
             if 0 <= option_index < len(options) and 0 <= new_index < len(options):
                 options[option_index], options[new_index] = options[new_index], options[option_index]
 
-    def _open_option_editor(self, row_index, option_index):
-        if not (0 <= row_index < len(self.rows)):
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# UI layer — built on dev_tools.ui_kit (same family as the Character Creator)
+# ═════════════════════════════════════════════════════════════════════════
+
+_T = uk.Theme
+
+# Same flat two-tone backdrop / bar colours DevMenu, RoomEditor and the
+# Character Creator use.
+_BG        = (8, 11, 17)
+_BAND      = (10, 13, 20)
+_BAR       = (12, 15, 23)
+_HAIR      = (43, 49, 63)
+_CARD      = (22, 26, 35)
+_CARD_HI   = (28, 33, 44)
+_FIELD     = (20, 23, 32)
+_FIELD_HI  = (27, 31, 42)
+_INSET     = (11, 14, 21)
+_TRACK     = (34, 39, 53)
+_SEL       = (31, 36, 49)
+_OFFSCREEN = (-9999, -9999)
+
+COND_ACCENT = _T.KI_BLUE      # conditions are "ki blue"
+ACT_ACCENT = _T.GOLD          # actions are gold
+
+_PAD = 14                     # card padding
+_FIELD_GAP = 12
+_ROW_GAP = 10
+_STRIPE = 6                   # room left of the card content for the accent stripe
+_UNDO_LIMIT = 60
+
+_CMP_LABELS = {'==': 'equals', '!=': 'not equal', '<': 'less than',
+               '<=': 'at most', '>': 'greater than', '>=': 'at least'}
+
+_ACRONYMS = {'qte': 'QTE', 'id': 'ID', 'npc': 'NPC', 'hp': 'HP', 'exp': 'EXP', 'xp': 'XP',
+             'sfx': 'SFX', 'ui': 'UI'}
+
+# (kind, field) -> label for the small caps caption above a field.
+_FIELD_LABELS = {
+    ('flag', 'flag_id'): 'Flag', ('flag_not', 'flag_id'): 'Flag',
+    ('variable', 'name'): 'Variable',
+    ('item', 'arg0'): 'Item', ('item', 'value'): 'Quantity',
+    ('stat', 'arg0'): 'Stat', ('character', 'arg0'): 'Character',
+    ('resource', 'arg0'): 'Resource', ('skill', 'arg0'): 'Skill',
+    ('timer', 'arg0'): 'Timer', ('bar', 'arg0'): 'Bar',
+    ('boss_hp', 'arg0'): 'Boss', ('boss_hp', 'mode'): 'Measure',
+}
+
+_COND_CATEGORIES = [
+    ('Flags and variables', ['flag', 'flag_not', 'variable']),
+    ('Player', ['item', 'stat', 'character', 'zeni', 'resource', 'skill']),
+    ('World', ['timer', 'bar', 'room_kills', 'boss_hp']),
+]
+
+_COND_DESCS = {
+    'flag': "A flag has been set.",
+    'flag_not': "A flag has not been set.",
+    'variable': "Compare a custom variable.",
+    'item': "Player owns enough of an item.",
+    'stat': "Compare a player stat.",
+    'character': "A specific character is played.",
+    'zeni': "Compare the zeni amount.",
+    'resource': "Compare health, energy or gauge.",
+    'skill': "Player has a skill equipped.",
+    'timer': "Compare a timer's time left.",
+    'bar': "Compare a QTE bar's fill.",
+    'room_kills': "Enemies defeated in this room.",
+    'boss_hp': "Compare a boss's health.",
+}
+
+_ACTION_CATEGORIES = [
+    ('Dialogue and flow', ['dialogue_box', 'set_portrait', 'dialogue_choice', 'conditional',
+                           'play_cutscene']),
+    ('Timers', ['timer_start', 'timer_pause', 'timer_stop']),
+    ('Player', ['zeni', 'item', 'level', 'exp', 'stat', 'resource', 'skill', 'transformation',
+                'charged_melee', 'set_player_character', 'set_player_skin', 'character_list',
+                'play_character_animation', 'set_player_location']),
+    ('Screen and audio', ['screen_fade', 'screen_shake', 'spam_qte', 'weather', 'room_music',
+                          'play_sound']),
+    ('World', ['change_map', 'spawn_enemies', 'spawn_npc', 'npc_state', 'enemy_state',
+               'boss_state', 'toggle_flying_pad', 'world_map_location']),
+    ('Story and data', ['quest', 'mission', 'modify_quest_variable', 'set_custom_variable',
+                        'save_game']),
+]
+
+_ACTION_DESCS = {
+    'dialogue_box': "Show a line of dialogue.",
+    'set_portrait': "Change a speaker's portrait.",
+    'dialogue_choice': "Ask a question with options.",
+    'conditional': "IF / ELSE IF / ELSE branching.",
+    'timer_start': "Start a named countdown timer.",
+    'timer_pause': "Pause a running timer.",
+    'timer_stop': "Stop and clear a timer.",
+    'zeni': "Set, add or remove zeni.",
+    'item': "Give or take an item.",
+    'level': "Change a character's level.",
+    'exp': "Change a character's experience.",
+    'stat': "Change a character stat.",
+    'resource': "Change health, energy or gauge.",
+    'skill': "Equip or remove a skill.",
+    'transformation': "Unlock or lock a form.",
+    'charged_melee': "Grant or remove charged melee.",
+    'set_player_character': "Switch the playable character.",
+    'set_player_skin': "Change the current costume.",
+    'character_list': "Add or remove roster members.",
+    'screen_fade': "Fade the screen in or out.",
+    'screen_shake': "Shake the screen.",
+    'spam_qte': "Start a button-mash meter.",
+    'weather': "Start or stop weather.",
+    'room_music': "Set or stop the room music.",
+    'play_sound': "Play a sound effect.",
+    'play_character_animation': "Play an animation on a character.",
+    'save_game': "Save the game.",
+    'change_map': "Move to another room.",
+    'set_player_location': "Teleport within this room.",
+    'spawn_enemies': "Spawn an enemy at a position.",
+    'spawn_npc': "Spawn an NPC at a position.",
+    'play_cutscene': "Run a cutscene.",
+    'quest': "Add or remove a quest.",
+    'modify_quest_variable': "Change a quest variable.",
+    'set_custom_variable': "Set a custom variable.",
+    'world_map_location': "Show or hide a map location.",
+    'mission': "Start, complete or fail a mission.",
+    'toggle_flying_pad': "Enable or disable a flying pad.",
+    'npc_state': "Show, hide or despawn an NPC.",
+    'enemy_state': "Show, hide or despawn an enemy.",
+    'boss_state': "Show, hide or despawn a boss.",
+}
+
+
+def _humanize(name):
+    words = str(name).replace('_', ' ').split()
+    return ' '.join(_ACRONYMS.get(w.lower(), w.capitalize()) for w in words)
+
+
+def _opt_label(opt):
+    return _CMP_LABELS.get(opt, str(opt).replace('_', ' '))
+
+
+def _num_ok(ch):
+    return ch in '0123456789.-'
+
+
+def _plural(n, word):
+    return "%d %s%s" % (n, word, '' if n == 1 else ('es' if word.endswith('ch') else 's'))
+
+
+def _action_type_list():
+    """Every action type the editor can build: ACTION_TYPES order, plus any
+    schema-only extras."""
+    seen = list(ACTION_TYPES)
+    for t in ACTION_SCHEMA:
+        if t not in seen:
+            seen.append(t)
+    return seen
+
+
+# ── Vector icons (same fn(surface, rect, color[, width]) shape as ui_kit) ──
+
+def _ic_x(surface, rect, color, width=3):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.26
+    uk.draw_line_on(surface, color, (cx - s, cy - s), (cx + s, cy + s), width)
+    uk.draw_line_on(surface, color, (cx - s, cy + s), (cx + s, cy - s), width)
+
+
+def _ic_copy(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    a = pygame.Rect(0, 0, int(s * 0.34), int(s * 0.40))
+    b = a.copy()
+    a.center = (cx - int(s * 0.08), cy - int(s * 0.08))
+    b.center = (cx + int(s * 0.08), cy + int(s * 0.08))
+    uk.draw_rect_on(surface, color, a, width, 2)
+    uk.draw_rect_on(surface, color, b, width, 2)
+
+
+def _ic_grip(surface, rect, color, width=3):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    for col in (-1, 1):
+        for row in (-1, 0, 1):
+            uk.draw_circle_on(surface, color, (int(cx + col * s * 0.16), int(cy + row * s * 0.24)), 2)
+
+
+def _ic_search(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    r = max(3, int(s * 0.20))
+    c = (int(cx - s * 0.06), int(cy - s * 0.06))
+    uk.draw_circle_on(surface, color, c, r, width)
+    uk.draw_line_on(surface, color, (c[0] + r * 0.7, c[1] + r * 0.7),
+                    (cx + s * 0.26, cy + s * 0.26), width)
+
+
+def _ic_target(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    uk.draw_circle_on(surface, color, (cx, cy), max(3, int(s * 0.20)), width)
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        uk.draw_line_on(surface, color, (cx + dx * s * 0.28, cy + dy * s * 0.28),
+                        (cx + dx * s * 0.42, cy + dy * s * 0.42), width)
+
+
+def _ic_edit(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    uk.draw_line_on(surface, color, (cx - s * 0.26, cy + s * 0.26), (cx + s * 0.24, cy - s * 0.24), width + 1)
+    uk.draw_line_on(surface, color, (cx - s * 0.30, cy + s * 0.30), (cx - s * 0.16, cy + s * 0.28), width)
+    uk.draw_line_on(surface, color, (cx - s * 0.30, cy + s * 0.30), (cx - s * 0.28, cy + s * 0.16), width)
+
+
+def _make_curve_arrow(flip):
+    """Undo (flip=False) / redo (flip=True) arrow: a 3/4 arc with a head."""
+    def draw(surface, rect, color, width=2):
+        cx, cy = rect.center
+        r = min(rect.w, rect.h) * 0.26
+        sgn = -1 if flip else 1
+        pts = []
+        for i in range(0, 11):
+            a = math.radians(200 - i * 22)
+            pts.append((cx + sgn * math.cos(a) * r, cy + 1 - math.sin(a) * r))
+        for a, b in zip(pts, pts[1:]):
+            uk.draw_line_on(surface, color, a, b, width)
+        tip = pts[0]
+        uk.draw_line_on(surface, color, tip, (tip[0] + sgn * r * 0.75, tip[1] - r * 0.05), width)
+        uk.draw_line_on(surface, color, tip, (tip[0] + sgn * r * 0.10, tip[1] + r * 0.80), width)
+    return draw
+
+
+_ic_undo = _make_curve_arrow(False)
+_ic_redo = _make_curve_arrow(True)
+
+
+
+def _clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+# ── Bitmap font wrapper ─────────────────────────────────────────────────
+
+class _Font:
+    """One BitmapFont pinned to one pixel height, plus the text metrics the
+    layout code needs.
+
+    BitmapFont only has glyphs for letters, digits and  . , ! ? : - + / _ ( ) '
+    Anything else (e.g. %, #, quotes) would silently vanish from a text
+    field while still being stored in the data, so unsupported characters
+    are *displayed* as '?' — the stored value is never altered.
+
+    Widths are computed arithmetically from per-glyph advances instead of
+    rendering every prefix, so wrapping / caret placement in a text area
+    doesn't rasterise (and cache) hundreds of throw-away strings.
+
+    Text is positioned by BASELINE, not by its surface rect. BitmapFont
+    sizes each string's canvas to its own tallest glyph (+ descender
+    padding), so centring surfaces makes "no" sit lower than "go".
+    """
+
+    def __init__(self, bitmap, height):
+        self.bm = bitmap
+        self.height = int(height)
+        self._ok = {}
+        self._adv = {}
+        self._spacing = None
+        native = max(1, bitmap.size("A")[1])
+        self.scale = max(1, int(round(self.height / native)))
+        self.cap_h = max(1, bitmap.size("A", height=self.height)[1])
+        offs = getattr(bitmap, "glyph_y_offsets", None) or {}
+        self.desc_h = max(offs.values(), default=0) * self.scale
+        self.line_h = self.cap_h + self.desc_h
+
+    def _has(self, ch):
+        ok = self._ok.get(ch)
+        if ok is None:
+            try:
+                ok = ch == " " or self.bm._glyph(ch) is not None
+            except AttributeError:      # kit without the glyph helper: assume drawable
+                ok = True
+            self._ok[ch] = ok
+        return ok
+
+    def disp(self, text):
+        for ch in text:
+            if not self._has(ch):
+                return "".join(c if self._has(c) else "?" for c in text)
+        return text
+
+    def _advance(self, ch):
+        a = self._adv.get(ch)
+        if a is None:
+            a = self.bm.size(ch, height=self.height)[0]
+            self._adv[ch] = a
+        return a
+
+    def _sp(self):
+        if self._spacing is None:
+            aa = self.bm.size("AA", height=self.height)[0]
+            self._spacing = max(0, aa - 2 * self._advance("A"))
+        return self._spacing
+
+    def width(self, text):
+        if not text:
+            return 0
+        d = self.disp(text)
+        return sum(self._advance(c) for c in d) + self._sp() * (len(d) - 1)
+
+    def render(self, text, color):
+        """-> (surface, descender_px). descender_px is how far below the
+        baseline the surface extends (canvas bottom - baseline)."""
+        d = self.disp(text)
+        surf = self.bm.render(d, color=tuple(color), height=self.height)
+        offs = getattr(self.bm, "glyph_y_offsets", None) or {}
+        desc = 0
+        for c in set(d):
+            o = offs.get(c, 0)
+            if o > desc:
+                desc = o
+        return surf, desc * self.scale
+
+    def fit(self, text, max_w):
+        """Ellipsise `text` to at most max_w pixels."""
+        if self.width(text) <= max_w:
+            return text
+        ell = "..."
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if self.width(text[:mid].rstrip() + ell) <= max_w:
+                lo = mid
+            else:
+                hi = mid - 1
+        return (text[:lo].rstrip() + ell) if lo else ell
+
+    def wrap(self, text, max_w):
+        """Greedy word-wrap -> list of lines (honours explicit newlines)."""
+        lines = []
+        for para in text.split("\n"):
+            cur = ""
+            for word in para.split(" "):
+                trial = f"{cur} {word}" if cur else word
+                if cur and self.width(trial) > max_w:
+                    lines.append(cur)
+                    cur = word
+                else:
+                    cur = trial
+            lines.append(cur)
+        return lines
+
+
+# ── Wrapped-text spans (for the multi-line field) ───────────────────────
+
+_SPAN_CACHE: dict = {}
+
+
+def _split_hard(font, text, s, e, width):
+    """Break one over-long run [s, e) on character boundaries."""
+    out = []
+    while e - s > 1 and font.width(text[s:e]) > width:
+        lo, hi = 1, e - s - 1
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if font.width(text[s:s + mid]) <= width:
+                lo = mid
+            else:
+                hi = mid - 1
+        out.append((s, s + lo))
+        s += lo
+    out.append((s, e))
+    return out
+
+
+def _wrap_spans(font, text, width):
+    """Word-wrap `text` into [(start, end), ...] index spans of the ORIGINAL
+    string (newlines and the spaces at soft-wrap points sit between spans),
+    so caret / selection maths can map straight back to string offsets."""
+    key = (id(font), text, width)
+    cached = _SPAN_CACHE.get(key)
+    if cached is not None:
+        return cached
+    raw = []
+    pos = 0
+    for para in text.split("\n"):
+        if not para:
+            raw.append((pos, pos))
+        else:
+            s = e = pos
+            wpos = pos
+            first = True
+            for word in para.split(" "):
+                ws, we = wpos, wpos + len(word)
+                if first:
+                    s, e, first = ws, we, False
+                elif font.width(text[s:we]) <= width:
+                    e = we
+                else:
+                    raw.append((s, e))
+                    s, e = ws, we
+                wpos = we + 1
+            raw.append((s, e))
+        pos += len(para) + 1
+    spans = []
+    for s, e in raw:
+        spans.extend(_split_hard(font, text, s, e, width))
+    if len(_SPAN_CACHE) > 160:
+        _SPAN_CACHE.clear()
+    _SPAN_CACHE[key] = spans
+    return spans
+
+
+def _line_of(spans, idx):
+    """Index of the wrapped line that string offset `idx` belongs to."""
+    line = 0
+    for i, (s, _e) in enumerate(spans):
+        if s <= idx:
+            line = i
+        else:
+            break
+    return line
+
+
+# ── Text editing engine (no drawing) ────────────────────────────────────
+
+class _TextEdit:
+    """Caret / selection / clipboard logic shared by every text field and
+    by the New-ID dialogs. Pure state — the creator draws it and feeds it
+    keys. key() returns None, 'changed', 'commit' or 'cancel'."""
+
+    def __init__(self, value="", multiline=False, max_len=600, allowed=None):
+        self.value = value
+        self.cursor = len(value)
+        self.anchor = None
+        self.multiline = multiline
+        self.max_len = max_len
+        self.allowed = allowed
+        self.blink = 0.0
+        self.goal_x = None            # remembered column (px) for Up/Down
+        self.view = None              # (font, wrap_width) set by the drawer
+
+    # -- selection ------------------------------------------------------
+    def has_sel(self):
+        return self.anchor is not None and self.anchor != self.cursor
+
+    def sel_range(self):
+        a, b = self.anchor, self.cursor
+        return (a, b) if a <= b else (b, a)
+
+    def _del_sel(self):
+        if not self.has_sel():
+            return False
+        s, e = self.sel_range()
+        self.value = self.value[:s] + self.value[e:]
+        self.cursor = s
+        self.anchor = None
+        return True
+
+    def insert(self, text):
+        """Type/paste `text` at the caret. True if the value changed."""
+        if not self.multiline:
+            text = text.replace("\r", "").replace("\n", " ")
+        else:
+            text = text.replace("\r\n", "\n").replace("\r", "\n")
+        keep = []
+        for ch in text:
+            if ch == "\n" and self.multiline:
+                keep.append(ch)
+            elif ch.isprintable() and (self.allowed is None or self.allowed(ch)):
+                keep.append(ch)
+        text = "".join(keep)
+        if not text:
+            return False
+        changed = self._del_sel()
+        room = self.max_len - len(self.value)
+        if room <= 0:
+            return changed
+        text = text[:room]
+        self.value = self.value[:self.cursor] + text + self.value[self.cursor:]
+        self.cursor += len(text)
+        self.anchor = None      # a click leaves a zero-width anchor; typing must not turn it into a selection
+        self.goal_x = None
+        return True
+
+    # -- caret movement -------------------------------------------------
+    def _move(self, idx, shift):
+        idx = _clamp(idx, 0, len(self.value))
+        if shift:
+            if self.anchor is None:
+                self.anchor = self.cursor
+        else:
+            self.anchor = None
+        self.cursor = idx
+
+    def _word_left(self, i):
+        v = self.value
+        while i > 0 and v[i - 1] == " ":
+            i -= 1
+        while i > 0 and v[i - 1] != " ":
+            i -= 1
+        return i
+
+    def _word_right(self, i):
+        v, n = self.value, len(self.value)
+        while i < n and v[i] == " ":
+            i += 1
+        while i < n and v[i] != " ":
+            i += 1
+        return i
+
+    def _spans(self):
+        if not self.view:
+            return None
+        font, width = self.view
+        return _wrap_spans(font, self.value, width)
+
+    def _vertical(self, delta, shift):
+        spans = self._spans()
+        if not spans:
             return
-        options = self.rows[row_index].get('_options', [])
+        font, _w = self.view
+        line = _line_of(spans, self.cursor)
+        s, e = spans[line]
+        if self.goal_x is None:
+            self.goal_x = font.width(self.value[s:_clamp(self.cursor, s, e)])
+        tgt = line + delta
+        if tgt < 0:
+            self._move(0, shift)
+            return
+        if tgt >= len(spans):
+            self._move(len(self.value), shift)
+            return
+        ts, te = spans[tgt]
+        self._move(ts + _index_at_x(font, self.value[ts:te], self.goal_x), shift)
+
+    def key(self, event):
+        mods = getattr(event, "mod", 0) | pygame.key.get_mods()
+        ctrl = bool(mods & (pygame.KMOD_CTRL | pygame.KMOD_META))
+        shift = bool(mods & pygame.KMOD_SHIFT)
+        k = event.key
+        self.blink = 0.0
+        if k not in (pygame.K_UP, pygame.K_DOWN):
+            self.goal_x = None
+
+        if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            if self.multiline and not ctrl:
+                return "changed" if self.insert("\n") else None
+            return "commit"
+        if k == pygame.K_ESCAPE:
+            return "cancel"
+        if k == pygame.K_TAB:
+            return "commit"
+        if ctrl and k == pygame.K_a:
+            self.anchor, self.cursor = 0, len(self.value)
+            return None
+        if ctrl and k in (pygame.K_c, pygame.K_x):
+            if self.has_sel():
+                s, e = self.sel_range()
+                uk.clipboard_set_text(self.value[s:e])
+                if k == pygame.K_x:
+                    self._del_sel()
+                    return "changed"
+            return None
+        if ctrl and k == pygame.K_v:
+            return "changed" if self.insert(uk.clipboard_get_text()) else None
+
+        if k == pygame.K_LEFT:
+            if not shift and self.has_sel():
+                self.cursor = self.sel_range()[0]
+                self.anchor = None
+            else:
+                self._move(self._word_left(self.cursor) if ctrl else self.cursor - 1, shift)
+        elif k == pygame.K_RIGHT:
+            if not shift and self.has_sel():
+                self.cursor = self.sel_range()[1]
+                self.anchor = None
+            else:
+                self._move(self._word_right(self.cursor) if ctrl else self.cursor + 1, shift)
+        elif k in (pygame.K_UP, pygame.K_DOWN) and self.multiline:
+            self._vertical(-1 if k == pygame.K_UP else 1, shift)
+        elif k == pygame.K_HOME:
+            spans = self._spans() if (self.multiline and not ctrl) else None
+            self._move(spans[_line_of(spans, self.cursor)][0] if spans else 0, shift)
+        elif k == pygame.K_END:
+            spans = self._spans() if (self.multiline and not ctrl) else None
+            self._move(spans[_line_of(spans, self.cursor)][1] if spans else len(self.value), shift)
+        elif k == pygame.K_BACKSPACE:
+            if self._del_sel():
+                return "changed"
+            if self.cursor > 0:
+                start = self._word_left(self.cursor) if ctrl else self.cursor - 1
+                self.value = self.value[:start] + self.value[self.cursor:]
+                self.cursor = start
+                return "changed"
+        elif k == pygame.K_DELETE:
+            if self._del_sel():
+                return "changed"
+            if self.cursor < len(self.value):
+                end = self._word_right(self.cursor) if ctrl else self.cursor + 1
+                self.value = self.value[:self.cursor] + self.value[end:]
+                return "changed"
+        elif event.unicode and not ctrl:
+            return "changed" if self.insert(event.unicode) else None
+        return None
+
+
+def _index_at_x(font, line_text, x):
+    """String offset within `line_text` whose caret is nearest to pixel x."""
+    if x <= 0 or not line_text:
+        return 0
+    shown = font.disp(line_text)          # 1:1 with line_text (unsupported -> '?')
+    sp = font._sp()
+    best_i, best_d = 0, x
+    acc = 0
+    for i, ch in enumerate(shown, 1):
+        acc += font._advance(ch) + (sp if i > 1 else 0)
+        d = abs(acc - x)
+        if d < best_d:
+            best_i, best_d = i, d
+    return best_i
+
+
+
+
+def _ic_check(surface, rect, color, width=3):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.32
+    uk.draw_line_on(surface, color, (cx - s, cy), (cx - s * 0.15, cy + s * 0.8), width)
+    uk.draw_line_on(surface, color, (cx - s * 0.15, cy + s * 0.8), (cx + s, cy - s * 0.7), width)
+
+
+def _ic_plus(surface, rect, color, width=3):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h) * 0.34
+    uk.draw_line_on(surface, color, (cx - s, cy), (cx + s, cy), width)
+    uk.draw_line_on(surface, color, (cx, cy - s), (cx, cy + s), width)
+
+
+def _ic_trash(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    body = pygame.Rect(0, 0, int(s * 0.58), int(s * 0.56))
+    body.centerx = cx
+    body.top = int(cy - s * 0.10)
+    uk.draw_rect_on(surface, color, body, width, 2)
+    lid = pygame.Rect(0, 0, int(s * 0.80), max(2, int(s * 0.10)))
+    lid.centerx = cx
+    lid.bottom = body.top + 1
+    uk.draw_rect_on(surface, color, lid, width, 1)
+    handle = pygame.Rect(0, 0, int(s * 0.30), max(2, int(s * 0.14)))
+    handle.centerx = cx
+    handle.bottom = lid.top + 2
+    uk.draw_rect_on(surface, color, handle, width, 2)
+    for i in (-1, 1):
+        x = cx + i * s * 0.13
+        uk.draw_line_on(surface, color, (x, body.top + 5), (x, body.bottom - 4), width)
+
+
+def _make_chevron(direction):
+    def draw(surface, rect, color, width=2):
+        cx, cy = rect.center
+        s = min(rect.w, rect.h) * 0.26
+        if direction == "left":
+            pts = [(cx + s * 0.6, cy - s), (cx - s * 0.6, cy), (cx + s * 0.6, cy + s)]
+        elif direction == "right":
+            pts = [(cx - s * 0.6, cy - s), (cx + s * 0.6, cy), (cx - s * 0.6, cy + s)]
+        elif direction == "up":
+            pts = [(cx - s, cy + s * 0.6), (cx, cy - s * 0.6), (cx + s, cy + s * 0.6)]
+        else:
+            pts = [(cx - s, cy - s * 0.6), (cx, cy + s * 0.6), (cx + s, cy - s * 0.6)]
+        uk.draw_line_on(surface, color, pts[0], pts[1], width)
+        uk.draw_line_on(surface, color, pts[1], pts[2], width)
+    return draw
+
+
+_ic_left = _make_chevron("left")
+_ic_right = _make_chevron("right")
+_ic_up = _make_chevron("up")
+_ic_down = _make_chevron("down")
+
+
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# EventEditorWindow — the full-screen editor
+# ═════════════════════════════════════════════════════════════════════════
+
+class EventEditorWindow:
+    """Full-screen Conditions + Actions editor, in the Dev Menu / Room Editor /
+    Character Creator style.
+
+    Layout: header (back / title / save) · breadcrumb + undo bar · a Conditions
+    panel on the left and an Actions panel on the right (each scrolls on its
+    own) · footer with tooltips and status.
+
+    Dialogue-choice options and conditional branches open as nested pages
+    (crumbs in the breadcrumb bar), instead of the old stacked popups.
+    """
+
+    def __init__(self, flag_manager, colors=None):
+        self.flag_manager = flag_manager if flag_manager is not None else _NullFlagManager()
+        # `colors` is only accepted so old call sites keep working; the look
+        # now comes from ui_kit.Theme like every other dev tool.
+        self.colors = colors
+
+        self.condition_builder = ConditionBuilder(self.flag_manager)
+        self.action_builder = ActionSequenceBuilder()
+        self.action_builder._condition_flag_manager = self.flag_manager
+
+        self.active = False
+        self.title = "Edit Event"
+        self._on_save = None
+        self.last_conditions = []
+        self.last_actions = []
+
+        self.screen_width = 0
+        self.screen_height = 0
+        self._fonts_ready = False
+        self._laid_out = False
+        self._reset_ui_state()
+
+    def _reset_ui_state(self):
+        self.pages = []
+        self._rev = 0
+        self._rev_seen = -1
+        self._dirty_cache = False
+        self.status_msg = ""
+        self.status_ok = True
+        self.status_timer = 0.0
+        self.dialog = None          # confirm dialog
+        self.popup = None           # dropdown list / add-type grid
+        self.spawn = None           # Set Spawn / Set Position room picker
+        self._mouse = tuple(pygame.mouse.get_pos()) if pygame.get_init() else (0, 0)
+        self._hm = self._mouse
+        self._dt = 1 / 60
+        self._pulse = 0.0
+        self._updated = False
+        self._last_ticks = None
+        self._hits = []
+        self._hv = {}
+        self._focus = None
+        self._focus_before = None
+        self._drag = None
+        self._drag_before = None
+        self._reorder = None
+        self._tscroll = {}
+        self._text_rects = []
+        self._text_rects_new = []
+        self._ml_info = {}
+        self._ml_info_new = {}
+        self._tip = None
+        self._vp = None
+        self._blocked = False
+        self._modal_start = 0
+        self._row_rects = {'c': [], 'a': []}
+        self._list_vp = {}
+        self._panel_rects = {}
+        self._repeat_on = False
+
+    # ── Host-facing context hooks (forwarded to every open builder) ─────────
+
+    def _all_action_builders(self):
+        seen = [self.action_builder]
+        for page in self.pages[1:]:
+            seen.append(page['act'])
+        return seen
+
+    def set_current_character(self, character_id, get_equipped_skills=None,
+                              get_unlocked_transformations=None):
+        """See ActionSequenceBuilder.set_current_character()."""
+        for b in self._all_action_builders():
+            b.set_current_character(character_id, get_equipped_skills, get_unlocked_transformations)
+
+    def set_current_room(self, room_name):
+        """See ActionSequenceBuilder.set_current_room()."""
+        for b in self._all_action_builders():
+            b.set_current_room(room_name)
+
+    def set_known_rooms(self, room_names, room_dims=None):
+        """See ActionSequenceBuilder.set_known_rooms()."""
+        for b in self._all_action_builders():
+            b.set_known_rooms(room_names, room_dims)
+
+    def set_room_preview_provider(self, provider):
+        """See ActionSequenceBuilder.set_room_preview_provider()."""
+        for b in self._all_action_builders():
+            b.set_room_preview_provider(provider)
+
+    # ── Assets / fonts ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _font_root():
+        anchored = BASE_DIR / "assets" / "ui" / "fonts"
+        return str(anchored) if anchored.exists() else os.path.join("assets", "ui", "fonts")
+
+    @staticmethod
+    def _load_png_icon(name, box):
+        """Same crop + integer-blow-up + point-sample path the Character Creator
+        uses for its header icons. None when the file is missing (the caller
+        falls back to a vector icon)."""
+        path = os.path.join(str(BASE_DIR), "assets", "ui", "dev_menu", "icons", name)
+        if not os.path.exists(path):
+            path = os.path.join("assets", "ui", "dev_menu", "icons", name)
+        try:
+            raw = pygame.image.load(path).convert_alpha()
+        except (FileNotFoundError, pygame.error):
+            return None
+        rect = raw.get_bounding_rect(min_alpha=1)
+        if rect.w <= 0 or rect.h <= 0:
+            rect = raw.get_rect()
+        raw = raw.subsurface(rect).copy()
+        iw, ih = raw.get_size()
+        scale = min(box / max(1, iw), box / max(1, ih))
+        nw, nh = max(1, round(iw * scale)), max(1, round(ih * scale))
+        if scale >= 1.0:
+            pre = max(1, math.ceil(scale) * 2)
+            scaled = pygame.transform.scale(pygame.transform.scale(raw, (iw * pre, ih * pre)), (nw, nh))
+        else:
+            scaled = pygame.transform.scale(raw, (nw, nh))
+        canvas = pygame.Surface((box, box), pygame.SRCALPHA)
+        canvas.blit(scaled, ((box - nw) // 2, (box - nh) // 2))
+        return canvas
+
+    def _ensure_fonts(self):
+        if self._fonts_ready:
+            return
+        pygame.font.init()
+        root = self._font_root()
+        menu = uk.BitmapFont(root, letter_spacing=1)
+        title = uk.BitmapFont(root, letter_spacing=1)
+        title.uppercase_dir = os.path.join(root, "uppercase")
+        title.lowercase_dir = os.path.join(root, "lowercase")
+        self.f_title = _Font(title, 32)
+        self.f_lg = _Font(menu, 20)
+        self.f_md = _Font(menu, 16)
+        self.f_sm = _Font(menu, 12)
+        self._back_icon = self._load_png_icon("back.png", 34)
+        self._save_icon = self._load_png_icon("save.png", 26)
+        self._plus_icon = self._load_png_icon("plus.png", 24)
+        self._trash_icon = self._load_png_icon("trash.png", 24)
+        # Duplicate-row icon: the user's own PNG (first name found wins), else the vector one.
+        self._dup_icon = None
+        for _n in ("duplicate.png", "copy.png", "dup.png"):
+            self._dup_icon = self._load_png_icon(_n, 24)
+            if self._dup_icon is not None:
+                break
+        self._fonts_ready = True
+
+    def _ensure_layout(self, screen):
+        w, h = screen.get_size()
+        if self._laid_out and (w, h) == (self.screen_width, self.screen_height):
+            return
+        self.screen_width, self.screen_height = int(w), int(h)
+        self._laid_out = True
+        self.header_h = max(86, round(h * 0.12))
+        self.footer_h = max(42, round(h * 0.065))
+        m = 32
+        md = self.f_md
+        self.m_field_h = max(40, md.line_h + 20)
+        self.m_pill_h = max(44, md.line_h + 22)
+        self.m_btn = 30                     # small icon buttons on rows
+        back = max(40, round(self.header_h * 0.55))
+        self.back_rect = pygame.Rect(m, (self.header_h - back) // 2, back, back)
+        self.save_rect = pygame.Rect(w - m - back, (self.header_h - back) // 2, back, back)
+        self.ctx_rect = pygame.Rect(m, self.header_h + 14, w - 2 * m, 44)
+        top = self.ctx_rect.bottom + 12
+        bottom = h - self.footer_h - 20
+        self.area_rect = pygame.Rect(m, top, w - 2 * m, max(200, bottom - top))
+
+    def resize(self, width, height):
+        """Optional: force a re-layout for a new draw-target size."""
+        self._laid_out = False
+
+    # ── Lifecycle ────────────────────────────────────────────────────────────
+
+    def open(self, title="Edit Event", existing_conditions=None, existing_actions=None, on_save=None):
+        self._set_key_repeat(False)
+        self._reset_ui_state()
+        self.title = title or "Edit Event"
+        self._on_save = on_save
+        self.condition_builder.refresh(copy.deepcopy(list(existing_conditions or [])))
+        self.action_builder.refresh(copy.deepcopy(list(existing_actions or [])))
+        self.pages = [self._make_page('root', 'Event', self.condition_builder, self.action_builder)]
+        self.active = True
+
+    def close(self, save):
+        if save:
+            self.last_conditions = self.condition_builder.get_condition_list()
+            self.last_actions = self.action_builder.get_action_list()
+            if self._on_save:
+                self._on_save(self.last_conditions, self.last_actions)
+        self._focus = None
+        self._focus_before = None
+        self.popup = None
+        self.spawn = None
+        self.dialog = None
+        self._drag = None
+        self._reorder = None
+        self.active = False
+        self._on_save = None
+        uk.set_text_cursor(False)
+        uk.set_hand_cursor(False)
+        self._set_key_repeat(False)
+
+    def _set_key_repeat(self, on):
+        if on and not self._repeat_on:
+            pygame.key.set_repeat(400, 50)
+            self._repeat_on = True
+        elif not on and self._repeat_on:
+            pygame.key.set_repeat(0)
+            self._repeat_on = False
+
+    def _set_status(self, msg, ok=True):
+        self.status_msg = msg
+        self.status_ok = ok
+        self.status_timer = 2.4
+
+    # ── Pages (root event + nested option / branch editors) ─────────────────
+
+    def _make_page(self, kind, crumb, cond, act, apply=None, cond_locked=False, note=None):
+        page = {'kind': kind, 'crumb': crumb, 'cond': cond, 'act': act, 'apply': apply,
+                'cond_locked': cond_locked, 'note': note,
+                'scroll': {'c': 0.0, 'a': 0.0}, 'content_h': {'c': 0, 'a': 0},
+                'undo': [], 'redo': [], 'collapsed': set()}
+        page['snapshot'] = self._page_sig(page)
+        return page
+
+    @property
+    def page(self):
+        return self.pages[-1]
+
+    @staticmethod
+    def _page_sig(page):
+        conds = page['cond'].get_condition_list() if page['cond'] is not None else []
+        acts = page['act'].get_action_list()
+        return json.dumps([conds, acts], sort_keys=True, default=str)
+
+    def _is_dirty(self):
+        if not self.pages:
+            return False
+        if self._rev != self._rev_seen:
+            self._dirty_cache = self._page_sig(self.page) != self.page['snapshot']
+            self._rev_seen = self._rev
+        return self._dirty_cache
+
+    def _nested_actions(self, actions, parent_model):
+        builder = ActionSequenceBuilder()
+        builder.refresh(actions, parent=parent_model)
+        builder._condition_flag_manager = self.flag_manager
+        return builder
+
+    def _open_option_page(self, row_index, option_index):
+        model = self.page['act']
+        if not (0 <= row_index < len(model.rows)):
+            return
+        options = model.rows[row_index].get('_options', [])
         if not (0 <= option_index < len(options)):
             return
-        builder = ActionSequenceBuilder(colors=self.colors)
-        builder.refresh(options[option_index].get('actions', []))
-        self._option_editor = {'row_index': row_index, 'option_index': option_index, 'builder': builder}
+        opt = options[option_index]
+        builder = self._nested_actions(opt.get('actions', []), model)
 
-    def _close_option_editor(self, save):
-        editor = self._option_editor
-        if editor is None:
+        def apply(conds, acts, opt=opt):
+            opt['actions'] = acts
+
+        self._push_page(self._make_page(
+            'option', "Option %d" % (option_index + 1), None, builder, apply,
+            note="These actions run when the player picks this option."))
+
+    def _open_branch_page(self, row_index, branch_index):
+        model = self.page['act']
+        if not (0 <= row_index < len(model.rows)):
             return
-        if save:
-            builder = editor['builder']
-            active = getattr(builder, '_active_field', None)
-            if active is not None:
-                r, f = active
-                if 0 <= r < len(builder.rows):
-                    builder.rows[r]['params'][f] = builder._active_text
-                builder._active_field = None
-            row_index, option_index = editor['row_index'], editor['option_index']
-            if 0 <= row_index < len(self.rows):
-                options = self.rows[row_index].get('_options', [])
-                if 0 <= option_index < len(options):
-                    options[option_index]['actions'] = builder.get_action_list()
-        self._option_editor = None
+        row = model.rows[row_index]
+        if row.get('type') != 'conditional':
+            return
+        branches = row.get('_branches', [])
+        if not (0 <= branch_index < len(branches)):
+            return
+        branch = branches[branch_index]
+        is_else = bool(branch.get('is_else'))
+        label = 'ELSE' if is_else else ('IF' if branch_index == 0 else 'ELSE IF')
+        cond = None
+        if not is_else:
+            cond = ConditionBuilder(self.flag_manager)
+            cond.refresh(branch.get('conditions', []), parent=self.condition_builder)
+        builder = self._nested_actions(branch.get('actions', []), model)
 
-    def _handle_option_editor_input(self, event):
-        """The nested per-option action editor owns all input while open —
-        same shape as EventEditorWindow.handle_input's own Escape/Save/Cancel
-        handling, one level down."""
-        editor = self._option_editor
+        def apply(conds, acts, branch=branch):
+            if conds is not None:
+                branch['conditions'] = conds
+            branch['actions'] = acts
 
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-            self._close_option_editor(save=False)
+        self._push_page(self._make_page(
+            'branch', "%s branch" % label, cond, builder, apply, cond_locked=is_else,
+            note="ELSE runs when none of the branches above matched, so it has no conditions."))
+
+    def _push_page(self, page):
+        self._blur()
+        self.popup = None
+        self.pages.append(page)
+        self._rev += 1
+
+    def _apply_page(self, page):
+        apply = page.get('apply')
+        if apply is None:
+            return
+        conds = page['cond'].get_condition_list() if page['cond'] is not None else None
+        apply(conds, page['act'].get_action_list())
+
+    def _pop_page(self, apply):
+        if len(self.pages) <= 1:
+            return
+        self._blur()
+        self.popup = None
+        child, parent = self.pages[-1], self.pages[-2]
+        if apply:
+            before = self._state_of(parent)
+            self._apply_page(child)
+            self._note_change(parent, before)
+        self.pages.pop()
+        self._rev += 1
+
+    def _pop_to(self, level):
+        """Return to page `level` (0 = the event), keeping what was edited."""
+        while len(self.pages) - 1 > level:
+            self._pop_page(True)
+
+    # ── Undo / redo (per page) ──────────────────────────────────────────────
+
+    @staticmethod
+    def _state_of(page):
+        return (copy.deepcopy(page['cond'].rows) if page['cond'] is not None else None,
+                copy.deepcopy(page['act'].rows))
+
+    def _note_change(self, page, before):
+        """Record `before` as an undo step if the page's rows changed since."""
+        if self._state_of(page) != before:
+            page['undo'].append(before)
+            del page['undo'][:-_UNDO_LIMIT]
+            page['redo'].clear()
+            self._rev += 1
+
+    def _tracked(self, fn, *args):
+        page = self.page
+        before = self._state_of(page)
+        fn(*args)
+        self._note_change(page, before)
+
+    def _restore(self, page, state):
+        if page['cond'] is not None and state[0] is not None:
+            page['cond'].rows = copy.deepcopy(state[0])
+        page['act'].rows = copy.deepcopy(state[1])
+        page['collapsed'].clear()
+
+    def _undo(self):
+        page = self.page
+        if not page['undo']:
+            return
+        self._blur()
+        self.popup = None
+        page['redo'].append(self._state_of(page))
+        self._restore(page, page['undo'].pop())
+        self._rev += 1
+        self._set_status("Undid the last change")
+
+    def _redo(self):
+        page = self.page
+        if not page['redo']:
+            return
+        self._blur()
+        self.popup = None
+        page['undo'].append(self._state_of(page))
+        self._restore(page, page['redo'].pop())
+        self._rev += 1
+        self._set_status("Redid the change")
+
+    # ── Close / save / discard flows ────────────────────────────────────────
+
+    def _request_cancel(self):
+        if self._is_dirty():
+            self._open_confirm("Discard changes?",
+                               "This event has unsaved changes. Close the editor without saving them?",
+                               lambda: self.close(False), "Discard", True)
+        else:
+            self.close(False)
+
+    def _discard_level(self):
+        if len(self.pages) <= 1:
+            self._request_cancel()
+            return
+        if self._is_dirty():
+            self._open_confirm("Discard changes?",
+                               "Throw away what you changed on this page and go back?",
+                               lambda: self._pop_page(False), "Discard", True)
+        else:
+            self._pop_page(False)
+
+    def _request_save(self):
+        """Apply every open nested page, then save the whole event."""
+        self._blur()
+        while len(self.pages) > 1:
+            self._pop_page(True)
+        self.close(True)
+
+    def _escape(self):
+        if self.spawn is not None:
+            self.spawn = None
+        elif len(self.pages) > 1:
+            self._discard_level()
+        else:
+            self._request_cancel()
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Input
+    # ══════════════════════════════════════════════════════════════════════
+
+    def handle_input(self, event):
+        """Feed every pygame event here while `active` (mouse motion, buttons,
+        wheel and keys — hover / drag / scroll need the non-click ones too)."""
+        if not self.active:
+            return
+        et = event.type
+        if et in (pygame.MOUSEMOTION, pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP) and hasattr(event, "pos"):
+            self._mouse = tuple(event.pos)
+
+        if self.dialog is not None:
+            self._dialog_event(event)
             return
 
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            save_rect = editor.get('save_rect')
-            if save_rect and save_rect.collidepoint(event.pos):
-                self._close_option_editor(save=True)
+        if et == pygame.KEYDOWN:
+            mods = getattr(event, "mod", 0) | pygame.key.get_mods()
+            ctrl = bool(mods & (pygame.KMOD_CTRL | pygame.KMOD_META))
+            shift = bool(mods & pygame.KMOD_SHIFT)
+            if ctrl and event.key == pygame.K_s:
+                self._request_save()
                 return
-            cancel_rect = editor.get('cancel_rect')
-            if cancel_rect and cancel_rect.collidepoint(event.pos):
-                self._close_option_editor(save=False)
+            if ctrl and event.key == pygame.K_z and self.popup is None and self.spawn is None:
+                self._redo() if shift else self._undo()
+                return
+            if ctrl and event.key == pygame.K_y and self.popup is None and self.spawn is None:
+                self._redo()
+                return
+            if self.popup is not None:
+                self._popup_key(event)
+                return
+            if self._focus is not None:
+                res = self._focus.edit.key(event)
+                if res == "changed":
+                    self._focus.set(self._focus.edit.value)
+                    self._rev += 1
+                elif res in ("commit", "cancel"):
+                    self._blur()
+                return
+            if self.spawn is not None:
+                if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                    self._spawn_done()
+                elif event.key == pygame.K_ESCAPE:
+                    self.spawn = None
+                return
+            if event.key == pygame.K_ESCAPE:
+                self._escape()
+        elif et == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            self._mouse_down(event.pos)
+        elif et == pygame.MOUSEMOTION:
+            if self._drag is not None and self._drag.get("drag"):
+                self._drag["drag"](event.pos)
+        elif et == pygame.MOUSEBUTTONUP and event.button == 1:
+            d, self._drag = self._drag, None
+            if d is not None and d.get("up"):
+                d["up"](event.pos)
+            if self._drag_before is not None:
+                page, before = self._drag_before
+                self._note_change(page, before)
+            self._drag_before = None
+            self._reorder = None
+        elif et == pygame.MOUSEWHEEL:
+            self._wheel(event.y)
+
+    def _hit_at(self, pos):
+        for hit in reversed(self._hits):
+            if hit["rect"].collidepoint(pos):
+                return hit
+        return None
+
+    def _mouse_down(self, pos):
+        hit = self._hit_at(pos)
+        if self._focus is not None and (hit is None or hit["key"] != self._focus.key):
+            self._blur()
+        if hit is None:
+            return
+        page = self.page
+        before = self._state_of(page)
+        if hit["down"]:
+            hit["down"](pos)
+        if hit["drag"] or hit["up"]:
+            self._drag = hit
+            self._drag_before = (page, before)
+        else:
+            self._note_change(page, before)
+        self._rev += 1
+
+    def _max_scroll(self, which):
+        vp = self._list_vp.get(which)
+        if vp is None:
+            return 0
+        return max(0, self.page['content_h'][which] - vp.h)
+
+    def _wheel(self, dy):
+        pos = self._mouse
+        if self.popup is not None:
+            self._popup_wheel(dy)
+            return
+        if self.spawn is not None:
+            return
+        for key, (rect, total, rows) in self._ml_info.items():
+            if rect.collidepoint(pos) and total > rows:
+                self._tscroll[key] = _clamp(self._tscroll.get(key, 0) - dy, 0, total - rows)
+                return
+        for which, rect in self._panel_rects.items():
+            if rect.collidepoint(pos):
+                sc = self.page['scroll']
+                sc[which] = _clamp(sc[which] - dy * 64, 0, self._max_scroll(which))
                 return
 
-        editor['builder'].handle_input(event, *editor.get('origin', (0, 0)))
+    # ── text focus ──────────────────────────────────────────────────────────
 
-    # ── Input ────────────────────────────────────────────────────────────────
+    def _focus_text(self, key, get, set_, multiline=False, max_len=600, allowed=None):
+        edit = _TextEdit(get() or "", multiline=multiline, max_len=max_len, allowed=allowed)
+        self._focus = SimpleNamespace(key=key, edit=edit, set=set_)
+        page = self.page
+        self._focus_before = (page, self._state_of(page))
+        return edit
 
-    def handle_input(self, event, x, y):
-        if self._conditional_editor is not None:
-            self._handle_conditional_editor_input(event)
-            return
-        if self._spawn_picker is not None:
-            self._handle_spawn_picker_input(event)
-            return
+    def _blur(self):
+        if self._focus is not None and self._focus_before is not None:
+            page, before = self._focus_before
+            self._focus = None
+            self._focus_before = None
+            self._note_change(page, before)
+        self._focus = None
+        self._focus_before = None
 
-        if self._option_editor is not None:
-            self._handle_option_editor_input(event)
-            return
+    # ── confirm dialog ──────────────────────────────────────────────────────
 
+    def _open_confirm(self, title, message, on_confirm, confirm_label="Confirm", danger=True):
+        self._blur()
+        self.popup = None
+        self.dialog = {"title": title, "message": message, "on_confirm": on_confirm,
+                       "confirm_label": confirm_label, "danger": danger}
+
+    def _close_dialog(self):
+        self.dialog = None
+
+    def _dialog_rects(self):
+        d = self.dialog
+        sw, sh = self.screen_width, self.screen_height
+        W, pad = 460, 28
+        lines = self.f_md.wrap(d["message"], W - pad * 2)
+        line_h = self.f_md.line_h + 6
+        y = pad + self.f_lg.line_h + 14
+        msg_y = y
+        y += len(lines) * line_h + 22
+        btn_y = y
+        H = btn_y + self.m_pill_h + pad
+        panel = pygame.Rect(0, 0, W, H)
+        panel.center = (sw // 2, sh // 2)
+        bw = (W - pad * 2 - 14) // 2
+        return {
+            "panel": panel, "lines": lines, "line_h": line_h, "pad": pad,
+            "msg_y": panel.y + msg_y,
+            "ok": pygame.Rect(panel.x + pad, panel.y + btn_y, bw, self.m_pill_h),
+            "cancel": pygame.Rect(panel.right - pad - bw, panel.y + btn_y, bw, self.m_pill_h),
+        }
+
+    def _dialog_submit(self):
+        cb = self.dialog["on_confirm"]
+        self._close_dialog()
+        cb()
+
+    def _dialog_event(self, event):
+        r = self._dialog_rects()
         if event.type == pygame.KEYDOWN:
-            if self._active_option_field is not None:
-                row_index, option_index = self._active_option_field
-                if event.key == pygame.K_RETURN or event.key == pygame.K_ESCAPE:
-                    options = self.rows[row_index].get('_options', []) if 0 <= row_index < len(self.rows) else []
-                    if 0 <= option_index < len(options):
-                        options[option_index]['text'] = self._active_option_text
-                    self._active_option_field = None
-                elif event.key == pygame.K_BACKSPACE:
-                    self._active_option_text = self._active_option_text[:-1]
-                elif event.unicode and event.unicode.isprintable():
-                    if len(self._active_option_text) < 120:
-                        self._active_option_text += event.unicode
-                return
+            if event.key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                self._dialog_submit()
+            elif event.key == pygame.K_ESCAPE:
+                self._close_dialog()
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if r["ok"].collidepoint(event.pos):
+                self._dialog_submit()
+            elif r["cancel"].collidepoint(event.pos):
+                self._close_dialog()
 
-            if self._active_field is not None:
-                row_index, field_name = self._active_field
-                if event.key == pygame.K_RETURN or event.key == pygame.K_ESCAPE:
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = self._active_text
-                    self._active_field = None
-                elif event.key == pygame.K_BACKSPACE:
-                    self._active_text = self._active_text[:-1]
-                elif event.unicode and event.unicode.isprintable():
-                    if len(self._active_text) < 300:
-                        self._active_text += event.unicode
+    # ══════════════════════════════════════════════════════════════════════
+    #  Update / draw plumbing
+    # ══════════════════════════════════════════════════════════════════════
+
+    def update(self, dt, mouse_pos=None):
+        """Optional: the host may call this each frame with its dt (and the
+        logical mouse position). If it never does, draw() times itself."""
+        if not self.active:
+            uk.set_text_cursor(False)
+            uk.set_hand_cursor(False)
             return
+        if mouse_pos is not None:
+            self._mouse = tuple(mouse_pos)
+        self._tick(dt)
+        self._updated = True
 
-        if event.type == pygame.MOUSEWHEEL and self._open_type_dropdown_row is not None:
-            max_scroll = max(0, len(ACTION_TYPES) - _TYPE_DROPDOWN_VISIBLE)
-            self._type_dropdown_scroll = max(0, min(self._type_dropdown_scroll - event.y, max_scroll))
+    def _tick(self, dt):
+        dt = min(dt, 1 / 20)
+        self._dt = max(dt, 1 / 240)
+        self._pulse += dt
+        if self.status_timer > 0:
+            self.status_timer -= dt
+        if self._focus is not None:
+            self._focus.edit.blink += dt
+        if self.popup is not None and self.popup.get("edit") is not None:
+            self.popup["edit"].blink += dt
+
+    def draw(self, screen, dt=0.0):
+        """`screen` may be the engine's GPUScreen or a plain pygame.Surface."""
+        if not self.active:
             return
+        self._ensure_fonts()
+        self._ensure_layout(screen)
+        if not self._updated:
+            now = pygame.time.get_ticks()
+            if dt <= 0:
+                dt = 1 / 60 if self._last_ticks is None else (now - self._last_ticks) / 1000.0
+            self._last_ticks = now
+            self._tick(dt)
+        self._updated = False
+        self._set_key_repeat(self._focus is not None or self.popup is not None)
 
-        if event.type == pygame.MOUSEWHEEL and self._open_music_dropdown is not None:
-            max_scroll = max(0, len(self._known_music_tracks) - _MUSIC_DROPDOWN_VISIBLE)
-            self._music_dropdown_scroll = max(0, min(self._music_dropdown_scroll - event.y, max_scroll))
-            return
+        self._hits = []
+        self._text_rects_new = []
+        self._ml_info_new = {}
+        self._row_rects = {'c': [], 'a': []}
+        self._panel_rects = {}
+        self._tip = None
+        self._vp = None
+        modal = self.dialog is not None or self.popup is not None or self.spawn is not None
+        self._blocked = modal
+        self._hm = _OFFSCREEN if modal else self._mouse
 
-        if event.type == pygame.MOUSEWHEEL and self._open_sound_dropdown is not None:
-            max_scroll = max(0, len(self._known_sound_effects) - _SOUND_DROPDOWN_VISIBLE)
-            self._sound_dropdown_scroll = max(0, min(self._sound_dropdown_scroll - event.y, max_scroll))
-            return
+        w, h = self.screen_width, self.screen_height
+        uk.draw_rect_on(screen, _BG, pygame.Rect(0, 0, w, h), 0, 0)
+        uk.draw_rect_on(screen, _BAND, pygame.Rect(0, self.header_h, w, h - self.header_h - self.footer_h), 0, 0)
 
-        if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
-            return
-        mouse_pos = event.pos
+        self._prune_collapsed()
+        self._draw_context_bar(screen)
+        self._draw_panels(screen)
+        self._draw_header(screen)
+        self._draw_footer(screen)
 
-        # Add-type grid open — clicking an option adds it and stays open,
-        # so multiple actions can be added back-to-back.
-        if self._add_picker_open:
-            for rect, action_type in self._rects.get('add_type_grid_items', []):
-                if rect.collidepoint(mouse_pos):
-                    self._add_row(action_type)
-                    return
-            self._add_picker_open = False
-            return
+        # Modal layers, lowest first. Each one starts with a full-screen
+        # backdrop hit so clicks never reach the widgets underneath.
+        self._blocked = False
+        self._hm = self._mouse
+        self._vp = None
+        self._modal_start = len(self._hits)
+        if self.spawn is not None:
+            self._draw_spawn(screen)
+        if self.popup is not None:
+            self._draw_popup(screen)
+        if self.dialog is not None:
+            self._draw_dialog(screen)
 
-        if self._open_type_dropdown_row is not None:
-            for rect, action_type in self._rects.get('type_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    self._set_row_type(self._open_type_dropdown_row, action_type)
-                    self._open_type_dropdown_row = None
-                    self._type_dropdown_scroll = 0
-                    return
-            self._open_type_dropdown_row = None
-            self._type_dropdown_scroll = 0
-            return
+        self._text_rects = self._text_rects_new
+        self._ml_info = self._ml_info_new
+        self._resolve_cursor()
 
-        # Portrait picker dropdown open
-        if self._open_portrait_dropdown is not None:
-            for rect, name in self._rects.get('portrait_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_portrait_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = name
-                    self._open_portrait_dropdown = None
-                    return
-            self._open_portrait_dropdown = None
-            return
+    def _prune_collapsed(self):
+        page = self.page
+        live = {id(r) for m in (page['cond'], page['act']) if m is not None for r in m.rows}
+        page['collapsed'] &= live
 
-        # Character picker dropdown open
-        if self._open_char_dropdown is not None:
-            for rect, name in self._rects.get('char_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_char_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = name
-                    self._open_char_dropdown = None
-                    return
-            self._open_char_dropdown = None
-            return
+    def _resolve_cursor(self):
+        """I-beam over a text field, hand over anything clickable, arrow
+        otherwise (I-beam wins where the two overlap). While a modal layer is
+        up only that layer's own widgets count."""
+        if self.dialog is not None:
+            r = self._dialog_rects()
+            hover_text = False
+            hover_widget = r["ok"].collidepoint(self._mouse) or r["cancel"].collidepoint(self._mouse)
+        else:
+            hits = self._hits[self._modal_start:] if (self.popup or self.spawn) else self._hits
+            hover_text = any(rect.collidepoint(self._mouse) for rect in self._text_rects)
+            hover_widget = (not hover_text and any(
+                hit["rect"].collidepoint(self._mouse) for hit in hits if hit["key"] != "backdrop"))
+        uk.set_text_cursor(hover_text)
+        uk.set_hand_cursor(hover_widget)
 
-        # Enemy picker dropdown open
-        if self._open_enemy_dropdown is not None:
-            for rect, name in self._rects.get('enemy_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_enemy_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = name
-                    self._open_enemy_dropdown = None
-                    return
-            self._open_enemy_dropdown = None
-            return
+    # ── hover / hit plumbing ────────────────────────────────────────────────
 
-        # NPC picker dropdown open
-        if self._open_npc_dropdown is not None:
-            for rect, name in self._rects.get('npc_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_npc_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = name
-                    self._open_npc_dropdown = None
-                    return
-            self._open_npc_dropdown = None
-            return
+    def _anim(self, key, on):
+        """Eased 0..1 hover amount for `key`, quantised to 20 steps so the
+        bitmap-font / rounded-rect caches don't fill with near-duplicates."""
+        v = self._hv.get(key, 0.0)
+        target = 1.0 if on else 0.0
+        v += (target - v) * min(1.0, self._dt * 14.0)
+        if abs(target - v) < 0.01:
+            v = target
+        self._hv[key] = v
+        return round(v * 20) / 20
 
-        # Cutscene picker dropdown open
-        if self._open_cutscene_dropdown is not None:
-            for rect, name in self._rects.get('cutscene_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_cutscene_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = name
-                    self._open_cutscene_dropdown = None
-                    return
-            self._open_cutscene_dropdown = None
-            return
+    def _hov(self, rect):
+        if not pygame.Rect(rect).collidepoint(self._hm):
+            return False
+        return self._vp is None or self._vp.collidepoint(self._hm)
 
-        # Skill picker dropdown open
-        if self._open_skill_dropdown is not None:
-            for rect, name in self._rects.get('skill_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_skill_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = name
-                    self._open_skill_dropdown = None
-                    return
-            self._open_skill_dropdown = None
-            return
+    def _add_hit(self, rect, key=None, down=None, drag=None, up=None, tip=None):
+        r = pygame.Rect(rect)
+        if self._vp is not None:
+            r = r.clip(self._vp)
+        if r.w <= 0 or r.h <= 0:
+            return None
+        hit = {"rect": r, "key": key, "down": down, "drag": drag, "up": up, "tip": tip}
+        self._hits.append(hit)
+        if tip and r.collidepoint(self._hm):
+            self._tip = tip
+        return hit
 
-        # Transformation picker dropdown open
-        if self._open_transformation_dropdown is not None:
-            for rect, name in self._rects.get('transformation_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_transformation_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = name
-                    self._open_transformation_dropdown = None
-                    return
-            self._open_transformation_dropdown = None
-            return
+    # ── clipping ────────────────────────────────────────────────────────────
 
-        # Skin/costume picker dropdown open
-        if self._open_skin_dropdown is not None:
-            for rect, name in self._rects.get('skin_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_skin_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = name
-                    self._open_skin_dropdown = None
-                    return
-            self._open_skin_dropdown = None
-            return
+    @staticmethod
+    def _push_clip(screen, rect):
+        old = screen.get_clip()
+        r = pygame.Rect(rect)
+        if old is not None:
+            try:
+                r = r.clip(pygame.Rect(old))
+            except Exception:
+                pass
+        screen.set_clip(r)
+        return old
 
-        # Animation picker dropdown open
-        if self._open_animation_dropdown is not None:
-            for rect, name in self._rects.get('animation_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_animation_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = name
-                    self._open_animation_dropdown = None
-                    return
-            self._open_animation_dropdown = None
-            return
+    @staticmethod
+    def _pop_clip(screen, old):
+        screen.set_clip(old)
 
-        # Weather picker dropdown open
-        if self._open_weather_dropdown is not None:
-            for rect, name in self._rects.get('weather_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_weather_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = name
-                    self._open_weather_dropdown = None
-                    return
-            self._open_weather_dropdown = None
-            return
+    # ── text ────────────────────────────────────────────────────────────────
 
-        # Music picker dropdown open
-        if self._open_music_dropdown is not None:
-            for rect, name in self._rects.get('music_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_music_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = name
-                    self._open_music_dropdown = None
-                    self._music_dropdown_scroll = 0
-                    return
-            self._open_music_dropdown = None
-            self._music_dropdown_scroll = 0
-            return
+    def _put(self, screen, font, text, color, x, base_y, anchor="l", dyn=False):
+        if not text:
+            return 0
+        surf, desc = font.render(text, color)
+        tw, th = surf.get_size()
+        if anchor == "c":
+            x -= tw // 2
+        elif anchor == "r":
+            x -= tw
+        px, py = int(x), int(base_y - (th - desc))
+        vp = self._vp
+        if vp is not None:
+            # Inside a scrolling area: crop the text to the viewport ourselves, because
+            # the dispatch blit does not always honour the screen clip (this is what let
+            # option names bleed over the popup's search bar).
+            vis = pygame.Rect(px, py, tw, th).clip(vp)
+            if vis.w <= 0 or vis.h <= 0:
+                return tw
+            if vis.size != (tw, th):
+                surf = surf.subsurface(pygame.Rect(vis.x - px, vis.y - py, vis.w, vis.h)).copy()
+                px, py = vis.x, vis.y
+        uk.blit_surface(screen, surf, (px, py), transient=dyn)
+        return tw
 
-        # Sound picker dropdown open
-        if self._open_sound_dropdown is not None:
-            for rect, name in self._rects.get('sound_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_sound_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = name
-                    self._open_sound_dropdown = None
-                    self._sound_dropdown_scroll = 0
-                    return
-            self._open_sound_dropdown = None
-            self._sound_dropdown_scroll = 0
-            return
+    def _text_top(self, screen, font, text, color, x, y, anchor="l", dyn=False):
+        """Draw with the top of the capital letters at y."""
+        return self._put(screen, font, text, color, x, y + font.cap_h, anchor, dyn)
 
-        # Room picker dropdown open
-        if self._open_room_dropdown is not None:
-            for rect, name in self._rects.get('room_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_room_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = name
-                    self._open_room_dropdown = None
-                    return
-            self._open_room_dropdown = None
-            return
+    def _text_mid(self, screen, font, text, color, x, cy, anchor="l", dyn=False, max_w=None):
+        """Draw vertically centred on cy (by cap-height, so 'no' and 'go' align)."""
+        if max_w is not None:
+            text = font.fit(text, max_w)
+        return self._put(screen, font, text, color, x, cy + (font.cap_h + 1) // 2, anchor, dyn)
 
-        # World map picker dropdown open (world_map_location's map_name)
-        if self._open_world_map_dropdown is not None:
-            for rect, name in self._rects.get('world_map_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_world_map_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        row = self.rows[row_index]
-                        if row['params'].get(field_name) != name:
-                            # Map changed — the old 'name' pick almost
-                            # certainly doesn't exist on the new map, so
-                            # clear it rather than leave a stale/invalid
-                            # location name behind (same reasoning as the
-                            # skin picker clearing skin_id on character
-                            # change — see set_current_character() notes).
-                            row['params']['name'] = ''
-                        row['params'][field_name] = name
-                    self._open_world_map_dropdown = None
-                    return
-            self._open_world_map_dropdown = None
-            return
+    # ── primitives ──────────────────────────────────────────────────────────
 
-        # World map location-name picker dropdown open (row-scoped to that
-        # row's own map_name — see _wm_location_choices_for_row())
-        if self._open_wm_location_dropdown is not None:
-            for rect, name in self._rects.get('wm_location_dropdown_items', []):
-                if rect.collidepoint(mouse_pos):
-                    row_index, field_name = self._open_wm_location_dropdown
-                    if 0 <= row_index < len(self.rows):
-                        self.rows[row_index]['params'][field_name] = name
-                    self._open_wm_location_dropdown = None
-                    return
-            self._open_wm_location_dropdown = None
-            return
+    @staticmethod
+    def _panel(screen, rect, bg, border, bw=1, radius=10):
+        if len(bg) == 3:
+            bg = (*bg, 255)
+        uk.draw_panel(screen, rect, bg=bg, border=border, border_width=bw, radius=radius, shadow=False)
 
-        if self._active_option_field is not None:
-            row_index, option_index = self._active_option_field
-            options = self.rows[row_index].get('_options', []) if 0 <= row_index < len(self.rows) else []
-            if 0 <= option_index < len(options):
-                options[option_index]['text'] = self._active_option_text
-            self._active_option_field = None
-
-        if self._active_field is not None:
-            row_index, field_name = self._active_field
-            if 0 <= row_index < len(self.rows):
-                self.rows[row_index]['params'][field_name] = self._active_text
-            self._active_field = None
-
-        add_rect = self._rects.get('add_action_btn')
-        if add_rect and add_rect.collidepoint(mouse_pos):
-            self._add_picker_open = not self._add_picker_open
-            return
-
-        for row_index, row_rects in self._rects.get('rows', []):
-            type_rect = row_rects.get('type')
-            if type_rect and type_rect.collidepoint(mouse_pos):
-                self._open_type_dropdown_row = row_index
-                self._open_portrait_dropdown = None
-                self._open_char_dropdown = None
-                self._open_enemy_dropdown = None
-                self._open_npc_dropdown = None
-                self._open_cutscene_dropdown = None
-                self._open_skill_dropdown = None
-                self._open_transformation_dropdown = None
-                self._open_skin_dropdown = None
-                self._open_animation_dropdown = None
-                self._open_weather_dropdown = None
-                self._open_music_dropdown = None
-                self._open_sound_dropdown = None
-                self._open_room_dropdown = None
-                self._open_world_map_dropdown = None
-                self._open_wm_location_dropdown = None
-                return
-
-            up_rect = row_rects.get('up')
-            if up_rect and up_rect.collidepoint(mouse_pos):
-                self._move_row(row_index, -1)
-                return
-
-            down_rect = row_rects.get('down')
-            if down_rect and down_rect.collidepoint(mouse_pos):
-                self._move_row(row_index, 1)
-                return
-
-            delete_rect = row_rects.get('delete')
-            if delete_rect and delete_rect.collidepoint(mouse_pos):
-                self._remove_row(row_index)
-                return
-
-            if self.rows[row_index].get('type') == 'conditional':
-                add_if = row_rects.get('conditional_add_elseif')
-                if add_if and add_if.collidepoint(mouse_pos):
-                    self._add_conditional_branch(row_index, is_else=False)
-                    return
-                add_else = row_rects.get('conditional_add_else')
-                if add_else and add_else.collidepoint(mouse_pos):
-                    self._add_conditional_branch(row_index, is_else=True)
-                    return
-                for bi, br, edit, delete in row_rects.get('conditional_branches', []):
-                    if delete.collidepoint(mouse_pos):
-                        self._remove_conditional_branch(row_index, bi)
-                        return
-                    if edit.collidepoint(mouse_pos) or br.collidepoint(mouse_pos):
-                        self._open_conditional_editor(row_index, bi)
-                        return
-
-            add_option_rect = row_rects.get('add_option_btn')
-            if add_option_rect and add_option_rect.collidepoint(mouse_pos):
-                self._add_option(row_index)
-                return
-
-            for option_index, opt_rects in row_rects.get('options', []):
-                if opt_rects['edit'].collidepoint(mouse_pos):
-                    self._open_option_editor(row_index, option_index)
-                    return
-                if opt_rects['up'].collidepoint(mouse_pos):
-                    self._move_option(row_index, option_index, -1)
-                    return
-                if opt_rects['down'].collidepoint(mouse_pos):
-                    self._move_option(row_index, option_index, 1)
-                    return
-                if opt_rects['delete'].collidepoint(mouse_pos):
-                    self._remove_option(row_index, option_index)
-                    return
-                if opt_rects['text'].collidepoint(mouse_pos):
-                    self._active_option_field = (row_index, option_index)
-                    options = self.rows[row_index].get('_options', [])
-                    self._active_option_text = (options[option_index].get('text', '')
-                                                 if 0 <= option_index < len(options) else '')
-                    return
-
-            for field_name, field_rect, field_kind, extra in row_rects.get('fields', []):
-                if not field_rect.collidepoint(mouse_pos):
-                    continue
-                if field_kind == 'choice':
-                    row = self.rows[row_index]
-                    cur = row['params'].get(field_name, extra[0])
-                    row['params'][field_name] = extra[(extra.index(cur) + 1) % len(extra)] if cur in extra else extra[0]
-                elif field_kind == 'bool':
-                    row = self.rows[row_index]
-                    cur = row['params'].get(field_name, 'false')
-                    row['params'][field_name] = 'false' if cur == 'true' else 'true'
-                elif field_kind == 'portrait_picker':
-                    picker_btn = row_rects.get('portrait_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_portrait_dropdown = (row_index, field_name)
-                        self._open_type_dropdown_row = None
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                elif field_kind == 'char_picker':
-                    picker_btn = row_rects.get('char_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_char_dropdown = (row_index, field_name)
-                        self._open_type_dropdown_row = None
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                elif field_kind == 'enemy_picker':
-                    picker_btn = row_rects.get('enemy_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_enemy_dropdown = (row_index, field_name)
-                        self._open_type_dropdown_row = None
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                elif field_kind == 'npc_picker':
-                    picker_btn = row_rects.get('npc_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_npc_dropdown = (row_index, field_name)
-                        self._open_type_dropdown_row = None
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                elif field_kind == 'cutscene_picker':
-                    picker_btn = row_rects.get('cutscene_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_cutscene_dropdown = (row_index, field_name)
-                        self._open_type_dropdown_row = None
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                elif field_kind == 'skill_picker':
-                    picker_btn = row_rects.get('skill_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_skill_dropdown = (row_index, field_name)
-                        self._open_type_dropdown_row = None
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                elif field_kind == 'transformation_picker':
-                    picker_btn = row_rects.get('transformation_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_transformation_dropdown = (row_index, field_name)
-                        self._open_type_dropdown_row = None
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                elif field_kind == 'skin_picker':
-                    picker_btn = row_rects.get('skin_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_skin_dropdown = (row_index, field_name)
-                        self._open_type_dropdown_row = None
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                elif field_kind == 'animation_picker':
-                    picker_btn = row_rects.get('animation_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_animation_dropdown = (row_index, field_name)
-                        self._open_type_dropdown_row = None
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                elif field_kind == 'weather_picker':
-                    picker_btn = row_rects.get('weather_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_weather_dropdown = (row_index, field_name)
-                        self._open_type_dropdown_row = None
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                elif field_kind == 'music_picker':
-                    picker_btn = row_rects.get('music_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_music_dropdown = (row_index, field_name)
-                        self._music_dropdown_scroll = 0
-                        self._open_type_dropdown_row = None
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                elif field_kind == 'sound_picker':
-                    picker_btn = row_rects.get('sound_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_sound_dropdown = (row_index, field_name)
-                        self._sound_dropdown_scroll = 0
-                        self._open_type_dropdown_row = None
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                elif field_kind == 'room_picker':
-                    picker_btn = row_rects.get('room_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_room_dropdown = (row_index, field_name)
-                        self._open_type_dropdown_row = None
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                elif field_kind == 'world_map_picker':
-                    picker_btn = row_rects.get('world_map_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_world_map_dropdown = (row_index, field_name)
-                        self._open_type_dropdown_row = None
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                elif field_kind == 'wm_location_picker':
-                    picker_btn = row_rects.get('wm_location_dropdown_btn_' + field_name)
-                    if picker_btn and picker_btn.collidepoint(mouse_pos):
-                        self._open_wm_location_dropdown = (row_index, field_name)
-                        self._open_type_dropdown_row = None
-                    else:
-                        self._active_field = (row_index, field_name)
-                        self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                elif field_kind in ('spawn_picker', 'position_picker'):
-                    # No text-entry fallback here (unlike the other
-                    # pickers) — the whole field IS the "Set Spawn"/"Set
-                    # Position" button.
-                    self._open_spawn_picker(row_index, field_name)
-                else:  # text / number / json
-                    self._active_field = (row_index, field_name)
-                    self._active_text = self.rows[row_index]['params'].get(field_name, '')
-                return
-
-    # ── Draw ─────────────────────────────────────────────────────────────────
-
-    def draw(self, screen, x, y, w):
-        colors = self.colors
-        self._rects = {'rows': []}
-
-        header = self.font_medium.render(
-            "Actions (run in order)" if self.rows else "Actions (none)", True, colors['text'])
-        screen.blit(header, (x, y))
-        cur_y = y + 26
-
-        for row_index, row in enumerate(self.rows):
-            row_rects = {'fields': []}
-            row_x = x
-
-            if row['type'] == '__raw__':
-                label = self.font_small.render("(unrecognized action — kept as-is)", True, colors['text_dim'])
-                screen.blit(label, (row_x, cur_y + 6))
-                row_h = _FIELD_H
+    def _icon_png(self, surf, fallback):
+        def draw(screen, rect, color, width=3):
+            if surf is not None:
+                uk.blit_surface(screen, surf, surf.get_rect(center=rect.center))
             else:
-                schema = ACTION_SCHEMA.get(row['type'], [])
+                fallback(screen, rect, color, width)
+        return draw
 
-                type_rect = pygame.Rect(row_x, cur_y, 160, _FIELD_H)
-                screen.draw_rect(colors['input_bg'], type_rect, border_radius=4)
-                screen.draw_rect(colors['accent'], type_rect, 1, border_radius=4)
-                clip = pygame.Rect(type_rect.x + 4, type_rect.y, type_rect.w - 8, type_rect.h)
-                screen.set_clip(clip)
-                type_label = self.font_small.render(row['type'], True, colors['text'])
-                screen.blit(type_label, (type_rect.x + 6, type_rect.y + 5))
-                screen.set_clip(None)
-                row_rects['type'] = type_rect
+    def _pill(self, screen, key, rect, label, accent, icon=None, danger=False, enabled=True,
+              on_click=None, tip=None):
+        if danger:
+            accent = _T.DANGER_BRIGHT
+        hov = enabled and self._hov(rect)
+        t = self._anim(key, hov)
+        if enabled:
+            self._panel(screen, rect, uk.lerp_color(_CARD, _CARD_HI, t),
+                        uk.lerp_color(_T.CARD_BORDER, accent, 0.5 + 0.5 * t))
+            fg = uk.lerp_color(_T.TEXT_SECONDARY, accent, 0.55 + 0.45 * t)
+            is_add = isinstance(key, tuple) and key and key[0] in ("add", "add_end", "oadd", "bradd", "brelse")
+            if t > 0 and not is_add:        # the "add ..." buttons get no hover glow
+                uk.draw_soft_glow(screen, rect.center, int(rect.w * 0.55), accent, max_alpha=int(26 * t))
+        else:
+            self._panel(screen, rect, _CARD, _T.CARD_BORDER)
+            fg = _T.TEXT_DIM
+        font = self.f_md
+        ic = 22 if icon else 0
+        gap = 10 if icon and label else 0
+        if icon and label and font.width(label) + 28 + ic + gap > rect.w:
+            label, gap = "", 0            # too narrow for icon + label: keep just the icon
+        text = font.fit(label, rect.w - 28 - ic - gap) if label else ""
+        tw = font.width(text)
+        x = rect.centerx - (ic + gap + tw) // 2
+        if icon:
+            icon(screen, pygame.Rect(x, rect.centery - ic // 2, ic, ic), fg, 3)
+        if text:
+            self._text_mid(screen, font, text, fg, x + ic + gap, rect.centery)
+        if enabled and on_click:
+            self._add_hit(rect, key=key, down=lambda p, cb=on_click: cb(), tip=tip)
 
-                if row['type'] == 'conditional':
-                    branches = row.get('_branches', [])
-                    summary_rect = pygame.Rect(row_x, cur_y + _FIELD_H + 4, max(140, w - 50), _FIELD_H)
-                    screen.draw_rect(colors['panel_light'], summary_rect, border_radius=4)
-                    summary = self.font_small.render('%d branch%s' % (len(branches), '' if len(branches) == 1 else 'es'), True, colors['text'])
-                    screen.blit(summary, (summary_rect.x + 6, summary_rect.y + 5))
-                    row_rects['conditional_summary'] = summary_rect
-                    cur = summary_rect.bottom + 4
-                    branch_rects = []
-                    for bi, branch in enumerate(branches):
-                        label = 'ELSE' if branch.get('is_else') else ('IF' if bi == 0 else 'ELSE IF')
-                        ncond = len(branch.get('conditions') or [])
-                        naction = len(branch.get('actions') or [])
-                        br = pygame.Rect(row_x, cur, max(180, w - 80), _FIELD_H)
-                        screen.draw_rect(colors['input_bg'], br, border_radius=4)
-                        screen.draw_rect(colors['accent_dim'] if branch.get('is_else') else colors['accent'], br, 1, border_radius=4)
-                        txt = '%s  (%d condition%s, %d action%s)' % (label, ncond, '' if ncond == 1 else 's', naction, '' if naction == 1 else 's')
-                        screen.blit(self.font_small.render(txt, True, colors['text']), (br.x + 6, br.y + 5))
-                        edit = pygame.Rect(br.right + 4, cur, 50, _FIELD_H)
-                        screen.draw_rect(colors['panel_light'], edit, border_radius=4)
-                        screen.blit(self.font_small.render('Edit', True, colors['text']), (edit.x + 7, edit.y + 5))
-                        delete = pygame.Rect(edit.right + 4, cur, 20, _FIELD_H)
-                        screen.draw_rect(colors['delete'], delete, border_radius=4)
-                        screen.blit(self.font_small.render('X', True, colors['text']),
-                                    self.font_small.render('X', True, colors['text']).get_rect(center=delete.center))
-                        branch_rects.append((bi, br, edit, delete))
-                        cur += _FIELD_H + 4
-                    add_if = pygame.Rect(row_x, cur, 90, _FIELD_H)
-                    screen.draw_rect(colors['input_bg'], add_if, border_radius=4)
-                    screen.draw_rect(colors['success'], add_if, 1, border_radius=4)
-                    screen.blit(self.font_small.render('+ Else If', True, colors['success']), (add_if.x + 7, add_if.y + 5))
-                    row_rects['conditional_add_elseif'] = add_if
-                    cur += _FIELD_H + 4
-                    if not any(b.get('is_else') for b in branches):
-                        add_else = pygame.Rect(add_if.right + 6, cur - _FIELD_H - 4, 70, _FIELD_H)
-                        screen.draw_rect(colors['input_bg'], add_else, border_radius=4)
-                        screen.draw_rect(colors['success'], add_else, 1, border_radius=4)
-                        screen.blit(self.font_small.render('+ Else', True, colors['success']), (add_else.x + 7, add_else.y + 5))
-                        row_rects['conditional_add_else'] = add_else
-                    row_rects['conditional_branches'] = branch_rects
-                    row_h = max(_FIELD_H * 2 + 12, cur - cur_y)
-                # Fields wrap onto additional lines under the type box when
-                # they'd overflow the panel width, so long rows (dialogue_box
-                # with 4 fields) don't run off the edge.
-                field_x = row_x
-                field_y = cur_y + _FIELD_H + 4
-                line_h = _FIELD_H
-                max_x = x + w - 30
+    def _icon_btn(self, screen, key, rect, icon, on_click, danger=False, enabled=True, tip=None,
+                  accent=None, size=28):
+        accent = _T.DANGER_BRIGHT if danger else (accent or _T.GOLD)
+        hov = enabled and self._hov(rect)
+        t = self._anim(key, hov)
+        if enabled:
+            self._panel(screen, rect, uk.lerp_color(_CARD, _CARD_HI, t),
+                        uk.lerp_color(_T.CARD_BORDER, accent, 0.78 * t), 1, 8 if rect.h < 40 else 10)
+            fg = uk.lerp_color(_T.TEXT_SECONDARY, accent, t)
+        else:
+            self._panel(screen, rect, _CARD, _T.CARD_BORDER, 1, 8 if rect.h < 40 else 10)
+            fg = _T.TEXT_DIM
+        box = pygame.Rect(0, 0, size, size)
+        box.center = rect.center
+        icon(screen, box, fg, 3 if size >= 26 else 2)
+        if enabled and on_click:
+            self._add_hit(rect, key=key, down=lambda p, cb=on_click: cb(), tip=tip)
 
-                visible_schema = [] if row['type'] == 'conditional' else _row_visible_fields(row['type'], row['params'], schema)
-                for field_name, field_kind, extra in visible_schema:
-                    field_w = _FIELD_WIDTH.get(field_kind, 90)
-                    if field_kind in _WIDE_FIELDS:
-                        field_w = min(220, max_x - field_x) if max_x - field_x > 60 else field_w
-                    if field_x + field_w > max_x:
-                        field_x = row_x
-                        field_y += _FIELD_H + 4
-                        line_h += _FIELD_H + 4
+    def _select_box(self, screen, key, rect, text, on_click, muted=False, tip=None, accent=None):
+        """A field-looking button with a chevron; on_click(rect) opens a list."""
+        hov = self._hov(rect)
+        t = self._anim(key, hov)
+        accent = accent or _T.GOLD
+        self._panel(screen, rect, uk.lerp_color(_FIELD, _FIELD_HI, t),
+                    uk.lerp_color(_T.CARD_BORDER, accent, 0.6 * t))
+        fg = _T.TEXT_DIM if muted else (_T.TEXT_PRIMARY if hov else _T.TEXT_SECONDARY)
+        self._text_mid(screen, self.f_md, text, fg, rect.x + 14, rect.centery, dyn=True,
+                       max_w=rect.w - 14 - 38)
+        chev = pygame.Rect(rect.right - 34, rect.y, 34, rect.h)
+        _ic_down(screen, chev, uk.lerp_color(_T.TEXT_MUTED, accent, t), 2)
+        self._add_hit(rect, key=key, down=lambda p, r=pygame.Rect(rect): on_click(r), tip=tip)
 
-                    field_rect = pygame.Rect(field_x, field_y, field_w, _FIELD_H)
-                    active = self._active_field == (row_index, field_name)
-                    bg = colors['input_active'] if active else colors['input_bg']
-                    screen.draw_rect(bg, field_rect, border_radius=4)
-                    screen.draw_rect(colors['grid'], field_rect, 1, border_radius=4)
+    def _checkbox(self, screen, key, x, y, w, label, checked, on_toggle):
+        h = 32
+        row = pygame.Rect(x, y, min(w, 420), h)
+        t = self._anim(key, self._hov(row))
+        box = pygame.Rect(x, y + (h - 24) // 2, 24, 24)
+        if checked:
+            self._panel(screen, box, (48, 39, 19), _T.GOLD, 1, 6)
+            _ic_check(screen, box, _T.GOLD_BRIGHT, 3)
+        else:
+            self._panel(screen, box, uk.lerp_color(_FIELD, _FIELD_HI, t),
+                        uk.lerp_color(_T.CARD_BORDER, _T.GOLD, 0.78 * t), 1, 6)
+        fg = _T.TEXT_PRIMARY if checked else uk.lerp_color(_T.TEXT_SECONDARY, _T.TEXT_PRIMARY, t)
+        self._text_mid(screen, self.f_md, label, fg, box.right + 14, box.centery)
+        self._add_hit(row, key=key, down=lambda p: on_toggle())
+        return h
 
-                    if field_kind == 'portrait_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['portrait_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
-                    elif field_kind == 'char_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['char_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
-                    elif field_kind == 'enemy_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['enemy_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
-                    elif field_kind == 'npc_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['npc_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
-                    elif field_kind == 'cutscene_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['cutscene_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
-                    elif field_kind == 'skill_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['skill_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
-                    elif field_kind == 'transformation_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['transformation_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
-                    elif field_kind == 'skin_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['skin_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
-                    elif field_kind == 'animation_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['animation_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
-                    elif field_kind == 'weather_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['weather_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
-                    elif field_kind == 'music_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['music_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
-                    elif field_kind == 'sound_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['sound_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
-                    elif field_kind == 'room_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['room_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
-                    elif field_kind == 'world_map_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['world_map_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
-                    elif field_kind == 'wm_location_picker':
-                        btn_rect = pygame.Rect(field_rect.right - 18, field_rect.y, 18, _FIELD_H)
-                        row_rects['wm_location_dropdown_btn_' + field_name] = btn_rect
-                        screen.draw_rect(colors['panel_light'], btn_rect, border_radius=3)
-                        arrow = self.font_small.render('v', True, colors['text_dim'])
-                        screen.blit(arrow, (btn_rect.x + 5, btn_rect.y + 4))
+    def _segmented(self, screen, key, x, y, w, options, current, on_select):
+        fh = self.m_field_h
+        rect = pygame.Rect(x, y, w, fh)
+        self._panel(screen, rect, _FIELD, _T.CARD_BORDER)
+        seg_w = w // len(options)
+        for i, (val, label) in enumerate(options):
+            r = pygame.Rect(x + i * seg_w, y, seg_w if i < len(options) - 1 else w - seg_w * i, fh)
+            inner = r.inflate(-8, -8)
+            active = val == current
+            t = self._anim((key, val), self._hov(r) and not active)
+            if active:
+                self._panel(screen, inner, (48, 39, 19), _T.GOLD, 1, 8)
+            elif t > 0:
+                uk.draw_rect_on(screen, uk.lerp_color(_FIELD, _CARD_HI, t), inner, 0, 8)
+            fg = _T.GOLD_BRIGHT if active else uk.lerp_color(_T.TEXT_MUTED, _T.TEXT_PRIMARY, t)
+            self._text_mid(screen, self.f_md, label, fg, r.centerx, r.centery, "c")
+            self._add_hit(r, key=(key, val), down=lambda p, v=val: on_select(v))
+        return fh
 
-                    if field_kind == 'spawn_picker':
-                        # The whole field renders as a "Set Spawn" button —
-                        # no dropdown arrow, and its label reflects both
-                        # spawn_x AND its schema-less companion spawn_y
-                        # rather than the field's own raw param value.
-                        sx = row['params'].get('spawn_x', '')
-                        sy = row['params'].get('spawn_y', '')
-                        room_picked = bool(row['params'].get('room_name', ''))
-                        if sx != '' and sy != '':
-                            display = 'Spawn: (%s, %s)' % (sx, sy)
-                        elif room_picked:
-                            display = 'Set Spawn...'
-                        else:
-                            display = 'Set Spawn (pick room first)'
-                    elif field_kind == 'position_picker':
-                        # Same "whole field is a button" treatment as
-                        # spawn_picker, but for x/y in the current room —
-                        # no room_name field to gate on, since it's always
-                        # the room this event/trigger box lives in (see
-                        # _current_room_name / set_current_room()).
-                        px = row['params'].get('x', '')
-                        py = row['params'].get('y', '')
-                        if px != '' and py != '':
-                            display = 'Position: (%s, %s)' % (px, py)
-                        else:
-                            display = 'Set Position...'
-                    else:
-                        display = self._active_text if active else row['params'].get(field_name, '')
-                        if not active and display == '':
-                            display = _placeholder_for(field_name, field_kind) \
-                                if field_kind in ('portrait_picker', 'char_picker', 'enemy_picker', 'npc_picker', 'cutscene_picker', 'skill_picker', 'transformation_picker', 'skin_picker', 'animation_picker', 'weather_picker', 'music_picker', 'sound_picker', 'room_picker', 'world_map_picker', 'wm_location_picker') else '<%s>' % field_name
-                    fclip = pygame.Rect(field_rect.x + 4, field_rect.y, field_rect.w - 8, field_rect.h)
-                    screen.set_clip(fclip)
-                    text_surf = self.font_small.render(str(display), True, colors['text'])
-                    screen.blit(text_surf, (field_rect.x + 4, field_rect.y + 5))
-                    screen.set_clip(None)
+    def _caption(self, screen, text, x, y, w, right=None):
+        """Section heading: small caps label with a hairline out to the right."""
+        sm = self.f_sm
+        label = text.upper()
+        self._text_top(screen, sm, label, _T.TEXT_MUTED, x, y)
+        x0 = x + sm.width(label) + 14
+        x1 = x + w
+        if right:
+            rw = self._text_top(screen, sm, right, _T.TEXT_DIM, x + w, y, "r", dyn=True)
+            x1 -= rw + 14
+        if x1 > x0:
+            uk.draw_line_on(screen, _HAIR, (x0, y + sm.cap_h // 2), (x1, y + sm.cap_h // 2), 1)
+        return sm.cap_h + 18
 
-                    row_rects['fields'].append((field_name, field_rect, field_kind, extra))
-                    field_x = field_rect.right + _FIELD_GAP
+    def _note(self, screen, x, y, w, text, color=None, font=None):
+        font = font or self.f_sm
+        color = color or _T.TEXT_DIM
+        lh = font.line_h + 4
+        lines = font.wrap(text, w)
+        for i, line in enumerate(lines):
+            self._text_top(screen, font, line, color, x, y + i * lh)
+        return len(lines) * lh
 
-                if row['type'] == 'conditional':
-                    # Conditional branches are drawn as their own compact block
-                    # above; don't let the generic field layout overwrite its height.
-                    pass
+    def _chip(self, screen, rect, text, fg, bg=(26, 30, 40), border=(55, 61, 76), font=None):
+        self._panel(screen, rect, bg, border, 1, rect.h // 2)
+        self._text_mid(screen, font or self.f_sm, text, fg, rect.centerx, rect.centery, "c", dyn=True)
+
+    # ── text fields ─────────────────────────────────────────────────────────
+
+    def _text_field(self, screen, key, rect, get, set_, placeholder="", multiline=False, wrap=False,
+                    max_len=600, allowed=None, pad_r=0):
+        """Single-line field, or (wrap=True) a wrapped multi-row field. With
+        multiline=True Enter inserts newlines; with wrap-only, Enter commits
+        and the value stays one line (dialogue text is stored single-line)."""
+        md = self.f_md
+        wrap = wrap or multiline
+        focus = self._focus if (self._focus is not None and self._focus.key == key) else None
+        edit = focus.edit if focus else None
+        hov = self._hov(rect)
+        t = self._anim(key, hov and not focus)
+        bg = uk.lerp_color(_FIELD, _FIELD_HI, t if not focus else 1.0)
+        if focus:
+            self._panel(screen, rect, bg, _T.GOLD, 2)
+        else:
+            self._panel(screen, rect, bg, uk.lerp_color(_T.CARD_BORDER, _T.GOLD, 0.6 * t))
+        value = edit.value if edit else (get() or "")
+        pad = 14
+        blink_on = edit is not None and int(edit.blink * 2) % 2 == 0
+        fg = _T.TEXT_PRIMARY if (focus or hov) else _T.TEXT_SECONDARY
+        if not self._blocked:
+            tr = pygame.Rect(rect.x, rect.y, rect.w - pad_r, rect.h)
+            self._text_rects_new.append(tr.clip(self._vp) if self._vp is not None else tr)
+
+        if not wrap:
+            inner = pygame.Rect(rect.x + pad, rect.y + 2, rect.w - pad - max(pad, pad_r), rect.h - 4)
+            cy = rect.centery
+            scroll = self._tscroll.get(key, 0)
+            if edit:
+                cw = md.width(value[:edit.cursor])
+                if md.width(value) <= inner.w - 2:
+                    scroll = 0
                 else:
-                    row_h = _FIELD_H + line_h + 4
+                    if cw - scroll > inner.w - 2:
+                        scroll = cw - inner.w + 2
+                    if cw < scroll:
+                        scroll = cw
+                    scroll = max(0, scroll)
+                self._tscroll[key] = scroll
+            old = self._push_clip(screen, inner)
+            if not value and not focus:
+                self._text_mid(screen, md, placeholder, _T.TEXT_DIM, inner.x, cy, max_w=inner.w)
+            elif focus:
+                if edit.has_sel():
+                    s, e = edit.sel_range()
+                    sx = inner.x - scroll + md.width(value[:s])
+                    ex = inner.x - scroll + md.width(value[:e])
+                    uk.draw_rect_on(screen, (*_T.GOLD, 70),
+                                    pygame.Rect(sx, cy - md.cap_h // 2 - 4, ex - sx, md.line_h + 8), 0, 3)
+                self._text_mid(screen, md, value, fg, inner.x - scroll, cy, dyn=True)
+                if blink_on:
+                    cx = inner.x - scroll + md.width(value[:edit.cursor])
+                    uk.draw_rect_on(screen, _T.GOLD_BRIGHT,
+                                    pygame.Rect(cx, cy - md.cap_h // 2 - 4, 2, md.line_h + 8), 0, 0)
+            else:
+                self._text_mid(screen, md, md.fit(value, inner.w), fg, inner.x, cy, dyn=True)
+            self._pop_clip(screen, old)
 
-                if row['type'] == 'dialogue_choice':
-                    row_h += self._draw_dialogue_choice_options(
-                        screen, row_index, row, row_x, cur_y + row_h, w, row_rects)
+            def idx_at(pos, rect=rect, key=key):
+                sc = self._tscroll.get(key, 0)
+                cur = self._focus.edit.value if self._focus and self._focus.key == key else value
+                return _index_at_x(md, cur, pos[0] - (rect.x + pad) + sc)
+        else:
+            inner = pygame.Rect(rect.x + pad, rect.y + 10, rect.w - pad - max(pad, pad_r), rect.h - 20)
+            lh = md.line_h + 6
+            rows = max(1, inner.h // lh)
+            spans = _wrap_spans(md, value, inner.w)
+            if edit:
+                edit.view = (md, inner.w)
+            scroll = int(_clamp(self._tscroll.get(key, 0), 0, max(0, len(spans) - rows)))
+            if edit:
+                line = _line_of(spans, edit.cursor)
+                if line < scroll:
+                    scroll = line
+                elif line >= scroll + rows:
+                    scroll = line - rows + 1
+                scroll = int(_clamp(scroll, 0, max(0, len(spans) - rows)))
+            self._tscroll[key] = scroll
+            self._ml_info_new[key] = (pygame.Rect(rect), len(spans), rows)
+            old = self._push_clip(screen, inner)
+            if not value and not focus:
+                self._text_top(screen, md, placeholder, _T.TEXT_DIM, inner.x, inner.y)
+            for i in range(scroll, min(len(spans), scroll + rows)):
+                s, e = spans[i]
+                ly = inner.y + (i - scroll) * lh
+                if focus and edit.has_sel():
+                    a, b = edit.sel_range()
+                    lo, hi = max(a, s), min(b, e)
+                    if lo < hi or (a <= s and b > e):
+                        sx = inner.x + md.width(value[s:max(lo, s)])
+                        ex = inner.x + md.width(value[s:min(max(hi, s), e)]) + (6 if b > e else 0)
+                        if ex > sx:
+                            uk.draw_rect_on(screen, (*_T.GOLD, 70),
+                                            pygame.Rect(sx, ly - 4, ex - sx, md.line_h + 8), 0, 3)
+                self._text_top(screen, md, value[s:e], fg, inner.x, ly, dyn=True)
+            if focus and blink_on:
+                line = _line_of(spans, edit.cursor)
+                if scroll <= line < scroll + rows:
+                    s, e = spans[line]
+                    cx = inner.x + md.width(value[s:_clamp(edit.cursor, s, e)])
+                    ly = inner.y + (line - scroll) * lh
+                    uk.draw_rect_on(screen, _T.GOLD_BRIGHT, pygame.Rect(cx, ly - 4, 2, md.line_h + 8), 0, 0)
+            self._pop_clip(screen, old)
+            if len(spans) > rows:
+                frac = scroll / max(1, len(spans) - rows)
+                th = max(14, int(inner.h * rows / len(spans)))
+                ty = inner.y + int((inner.h - th) * frac)
+                uk.draw_rect_on(screen, _T.CHIP_BORDER, pygame.Rect(rect.right - 8, ty, 3, th), 0, 1)
 
-            # Reorder + delete controls, aligned to the row's top line.
-            up_rect = pygame.Rect(x + w - 78, cur_y, 20, _FIELD_H)
-            down_rect = pygame.Rect(x + w - 54, cur_y, 20, _FIELD_H)
-            delete_rect = pygame.Rect(x + w - 26, cur_y, 20, _FIELD_H)
-            for rect, label, color in ((up_rect, '^', colors['text_dim']),
-                                        (down_rect, 'v', colors['text_dim']),
-                                        (delete_rect, 'X', colors['text'])):
-                fill = colors['delete'] if rect is delete_rect else colors['panel_light']
-                screen.draw_rect(fill, rect, border_radius=4)
-                lbl = self.font_small.render(label, True, color)
-                screen.blit(lbl, lbl.get_rect(center=rect.center))
-            row_rects['up'] = up_rect
-            row_rects['down'] = down_rect
-            row_rects['delete'] = delete_rect
+            def idx_at(pos, rect=rect, key=key, inner=inner, lh=lh):
+                cur = self._focus.edit.value if self._focus and self._focus.key == key else value
+                sp = _wrap_spans(md, cur, inner.w)
+                sc = self._tscroll.get(key, 0)
+                ln = int(_clamp(sc + (pos[1] - inner.y) // lh, 0, len(sp) - 1))
+                s, e = sp[ln]
+                return s + _index_at_x(md, cur[s:e], pos[0] - inner.x)
 
-            self._rects['rows'].append((row_index, row_rects))
-            cur_y += row_h + _ROW_GAP
+        def click(pos):
+            shift = bool(pygame.key.get_mods() & pygame.KMOD_SHIFT)
+            if self._focus is None or self._focus.key != key:
+                self._focus_text(key, get, set_, multiline, max_len, allowed)
+                shift = False
+            ed = self._focus.edit
+            idx = idx_at(pos)
+            if shift and ed.anchor is None:
+                ed.anchor = ed.cursor
+            elif not shift:
+                ed.anchor = idx
+            ed.cursor = idx
+            ed.blink = 0.0
 
-            if self._open_type_dropdown_row == row_index:
-                self._draw_type_dropdown(screen, x, cur_y)
-                shown = min(_TYPE_DROPDOWN_VISIBLE, len(ACTION_TYPES))
-                dropdown_h = shown * 20
-                if len(ACTION_TYPES) > _TYPE_DROPDOWN_VISIBLE:
-                    dropdown_h += 18
-                cur_y += dropdown_h
-            elif self._open_portrait_dropdown is not None and self._open_portrait_dropdown[0] == row_index:
-                names = self._known_portraits or ['(no portraits found)']
-                self._draw_portrait_dropdown(screen, x, cur_y)
-                cur_y += len(names[:8]) * 22
-            elif self._open_char_dropdown is not None and self._open_char_dropdown[0] == row_index:
-                names = self._known_characters or ['(no characters found)']
-                self._draw_char_dropdown(screen, x, cur_y)
-                cur_y += len(names[:8]) * 22
-            elif self._open_enemy_dropdown is not None and self._open_enemy_dropdown[0] == row_index:
-                names = self._known_enemies or ['(no enemies found)']
-                self._draw_enemy_dropdown(screen, x, cur_y)
-                cur_y += len(names[:8]) * 22
-            elif self._open_npc_dropdown is not None and self._open_npc_dropdown[0] == row_index:
-                names = self._known_npcs or ['(no npcs found)']
-                self._draw_npc_dropdown(screen, x, cur_y)
-                cur_y += len(names[:8]) * 22
-            elif self._open_cutscene_dropdown is not None and self._open_cutscene_dropdown[0] == row_index:
-                names = self._known_cutscenes or ['(no cutscenes found)']
-                self._draw_cutscene_dropdown(screen, x, cur_y)
-                cur_y += len(names[:8]) * 22
-            elif self._open_skill_dropdown is not None and self._open_skill_dropdown[0] == row_index:
-                real, placeholder = self._skill_choices_for_row(row_index)
-                names = real or [placeholder]
-                self._draw_skill_dropdown(screen, x, cur_y, row_index)
-                cur_y += len(names[:8]) * 22
-            elif self._open_transformation_dropdown is not None and self._open_transformation_dropdown[0] == row_index:
-                real, placeholder = self._transformation_choices_for_row(row_index)
-                names = real or [placeholder]
-                self._draw_transformation_dropdown(screen, x, cur_y, row_index)
-                cur_y += len(names[:8]) * 22
-            elif self._open_skin_dropdown is not None and self._open_skin_dropdown[0] == row_index:
-                real, placeholder = self._costume_choices_for_row(row_index)
-                names = real or [placeholder]
-                self._draw_skin_dropdown(screen, x, cur_y, row_index)
-                cur_y += len(names[:8]) * 22
-            elif self._open_animation_dropdown is not None and self._open_animation_dropdown[0] == row_index:
-                real, placeholder = self._animation_choices_for_row(row_index)
-                names = real or [placeholder]
-                self._draw_animation_dropdown(screen, x, cur_y, row_index)
-                cur_y += len(names[:8]) * 22
-            elif self._open_weather_dropdown is not None and self._open_weather_dropdown[0] == row_index:
-                names = self._known_weather_types or ['(no weather found)']
-                self._draw_weather_dropdown(screen, x, cur_y)
-                cur_y += len(names[:8]) * 22
-            elif self._open_music_dropdown is not None and self._open_music_dropdown[0] == row_index:
-                names = self._known_music_tracks or ['(no music found)']
-                self._draw_music_dropdown(screen, x, cur_y)
-                shown = min(_MUSIC_DROPDOWN_VISIBLE, len(names) - self._music_dropdown_scroll)
-                cur_y += shown * 22
-                if len(names) > _MUSIC_DROPDOWN_VISIBLE:
-                    cur_y += 18
-            elif self._open_sound_dropdown is not None and self._open_sound_dropdown[0] == row_index:
-                names = self._known_sound_effects or ['(no sfx found)']
-                self._draw_sound_dropdown(screen, x, cur_y)
-                shown = min(_SOUND_DROPDOWN_VISIBLE, len(names) - self._sound_dropdown_scroll)
-                cur_y += shown * 22
-                if len(names) > _SOUND_DROPDOWN_VISIBLE:
-                    cur_y += 18
-            elif self._open_room_dropdown is not None and self._open_room_dropdown[0] == row_index:
-                names = self._known_rooms or ['(no rooms found)']
-                self._draw_room_dropdown(screen, x, cur_y)
-                cur_y += len(names[:8]) * 22
-            elif self._open_world_map_dropdown is not None and self._open_world_map_dropdown[0] == row_index:
-                names = self._known_world_maps or ['(no world maps found)']
-                self._draw_world_map_dropdown(screen, x, cur_y)
-                cur_y += len(names[:8]) * 22
-            elif self._open_wm_location_dropdown is not None and self._open_wm_location_dropdown[0] == row_index:
-                real, placeholder = self._wm_location_choices_for_row(row_index)
-                names = real or [placeholder]
-                self._draw_wm_location_dropdown(screen, x, cur_y, row_index)
-                cur_y += len(names[:8]) * 22
+        def drag(pos):
+            if self._focus is not None and self._focus.key == key:
+                self._focus.edit.cursor = idx_at(pos)
+                self._focus.edit.blink = 0.0
 
-        if self._add_picker_open:
-            cur_y += self._draw_add_type_grid(screen, x, cur_y, w)
+        hit_rect = pygame.Rect(rect.x, rect.y, rect.w - pad_r, rect.h) if pad_r else rect
+        self._add_hit(hit_rect, key=key, down=click, drag=drag)
 
-        add_rect = pygame.Rect(x, cur_y, 160, _FIELD_H)
-        screen.draw_rect(colors['input_bg'], add_rect, border_radius=4)
-        screen.draw_rect(colors['success'], add_rect, 1, border_radius=4)
-        add_label = self.font_small.render("+ Add Command", True, colors['success'])
-        screen.blit(add_label, (add_rect.x + 8, add_rect.y + 5))
-        self._rects['add_action_btn'] = add_rect
-        cur_y += _FIELD_H
+    # ══════════════════════════════════════════════════════════════════════
+    #  Drawing: header / footer / breadcrumb bar
+    # ══════════════════════════════════════════════════════════════════════
 
-        self._content_height = cur_y - y
+    def _draw_header(self, screen):
+        w, hh = self.screen_width, self.header_h
+        uk.draw_rect_on(screen, _BAR, pygame.Rect(0, 0, w, hh), 0, 0)
+        uk.draw_line_on(screen, _HAIR, (0, hh - 1), (w, hh - 1), 1)
 
-        if self._option_editor is not None:
-            self._draw_option_editor(screen)
-        if self._spawn_picker is not None:
-            self._draw_spawn_picker(screen)
+        nested = len(self.pages) > 1
+        r = self.back_rect
+        t = self._anim("back", self._hov(r))
+        self._panel(screen, r, uk.lerp_color(_CARD, _CARD_HI, t), uk.lerp_color(_T.CARD_BORDER, _T.GOLD, 0.78 * t))
+        if t > 0:
+            uk.draw_soft_glow(screen, r.center, int(r.w * 0.8), _T.GOLD, max_alpha=int(28 * t))
+        if self._back_icon is not None:
+            uk.blit_surface(screen, self._back_icon, self._back_icon.get_rect(center=r.center))
+        else:
+            _ic_left(screen, r, uk.lerp_color(_T.TEXT_SECONDARY, _T.GOLD, t), 3)
+        if nested:
+            self._add_hit(r, key="back", down=lambda p: self._pop_page(True),
+                          tip="Keep these changes and go back one level")
+        else:
+            self._add_hit(r, key="back", down=lambda p: self._request_cancel(),
+                          tip="Close the editor without saving  (Esc)")
 
-    def _draw_dialogue_choice_options(self, screen, row_index, row, x, y, w, row_rects):
-        """Draws the option list for a dialogue_choice row: one row per
-        option (text field, Edit Actions button, reorder/delete) plus an
-        Add Option button. Returns the extra height consumed so the caller
-        can fold it into row_h."""
-        colors = self.colors
-        options = row.get('_options', [])
-        cur_y = y + 4
+        cx = w // 2
+        self._text_mid(screen, self.f_title, "EVENT EDITOR", _T.TEXT_PRIMARY, cx, hh // 2, "c")
 
-        label = self.font_small.render("Options:", True, colors['text_dim'])
-        screen.blit(label, (x, cur_y))
-        cur_y += 18
+        self._icon_btn(screen, "save", self.save_rect, self._icon_png(self._save_icon, _ic_check),
+                       self._request_save, tip="Save the whole event and close  (Ctrl+S)")
+        if self._is_dirty() or (nested and self.pages[0].get('snapshot') is not None and self._root_dirty()):
+            label = "UNSAVED"
+            tw = self.f_sm.width(label)
+            chip = pygame.Rect(0, 0, tw + 42, 32)
+            chip.right = self.save_rect.left - 14
+            chip.centery = self.save_rect.centery
+            self._panel(screen, chip, (36, 30, 16), (110, 88, 40), 1, 16)
+            pulse = 0.5 + 0.5 * math.sin(self._pulse * 4.0)
+            dot = (chip.x + 17, chip.centery)
+            uk.draw_soft_glow(screen, dot, 12, _T.GOLD, max_alpha=int(30 + 50 * pulse))
+            uk.draw_circle_on(screen, _T.GOLD, dot, 4)
+            self._text_mid(screen, self.f_sm, label, _T.GOLD_BRIGHT, chip.x + 30, chip.centery)
 
-        text_w = max(60, min(180, w - 210))
-        opt_rects_list = []
-        for option_index, option in enumerate(options):
-            text_rect = pygame.Rect(x, cur_y, text_w, _FIELD_H)
-            active = self._active_option_field == (row_index, option_index)
-            bg = colors['input_active'] if active else colors['input_bg']
-            screen.draw_rect(bg, text_rect, border_radius=4)
-            screen.draw_rect(colors['grid'], text_rect, 1, border_radius=4)
+    def _root_dirty(self):
+        return False    # nested edits only reach the root on Back; covered by _is_dirty()
 
-            display = self._active_option_text if active else option.get('text', '')
-            if not active and display == '':
-                display = '<option text>'
-            fclip = pygame.Rect(text_rect.x + 4, text_rect.y, text_rect.w - 8, text_rect.h)
-            screen.set_clip(fclip)
-            text_surf = self.font_small.render(str(display), True, colors['text'])
-            screen.blit(text_surf, (text_rect.x + 4, text_rect.y + 5))
-            screen.set_clip(None)
+    def _draw_footer(self, screen):
+        w, h = self.screen_width, self.screen_height
+        fy = h - self.footer_h
+        uk.draw_rect_on(screen, _BAR, pygame.Rect(0, fy, w, self.footer_h), 0, 0)
+        uk.draw_line_on(screen, _HAIR, (0, fy), (w, fy), 1)
+        cy = fy + self.footer_h // 2
+        x = 32
+        room = w - 64
+        if self.status_timer > 0 and self.status_msg:
+            col = _T.KI_BLUE if self.status_ok else _T.DANGER_BRIGHT
+            uk.draw_circle_on(screen, col, (x + 4, cy), 4)
+            self._text_mid(screen, self.f_sm, self.status_msg, col, x + 18, cy, dyn=True, max_w=room)
+        elif self._tip:
+            self._text_mid(screen, self.f_sm, self._tip, _T.TEXT_MUTED, x, cy, dyn=True, max_w=room)
 
-            edit_rect = pygame.Rect(text_rect.right + _FIELD_GAP, cur_y, 130, _FIELD_H)
-            n_actions = len(option.get('actions', []))
-            screen.draw_rect(colors['panel_light'], edit_rect, border_radius=4)
-            screen.draw_rect(colors['accent'], edit_rect, 1, border_radius=4)
-            edit_label = self.font_small.render("Edit Actions (%d)" % n_actions, True, colors['text'])
-            screen.blit(edit_label, (edit_rect.x + 6, edit_rect.y + 5))
+    def _draw_context_bar(self, screen):
+        r = self.ctx_rect
+        cy = r.centery
+        page = self.page
+        right = r.right
+        ur = pygame.Rect(0, 0, 40, 40)
+        rr = pygame.Rect(right - 40, cy - 20, 40, 40)
+        ur = pygame.Rect(rr.left - 8 - 40, cy - 20, 40, 40)
+        self._icon_btn(screen, "redo", rr, _ic_redo, self._redo, enabled=bool(page['redo']),
+                       tip="Redo  (Ctrl+Shift+Z)", size=26)
+        self._icon_btn(screen, "undo", ur, _ic_undo, self._undo, enabled=bool(page['undo']),
+                       tip="Undo  (Ctrl+Z)", size=26)
+        right = ur.left - 14
+        if len(self.pages) > 1:
+            dr = pygame.Rect(right - 150, cy - 20, 150, 40)
+            self._pill(screen, "discard", dr, "Discard", _T.DANGER_BRIGHT, icon=_ic_x, danger=True,
+                       on_click=self._discard_level, tip="Throw away this page's changes and go back")
+            right = dr.left - 14
 
-            up_rect = pygame.Rect(edit_rect.right + _FIELD_GAP, cur_y, 20, _FIELD_H)
-            down_rect = pygame.Rect(up_rect.right + 2, cur_y, 20, _FIELD_H)
-            delete_rect = pygame.Rect(down_rect.right + 2, cur_y, 20, _FIELD_H)
-            for rect, lbl, color in ((up_rect, '^', colors['text_dim']),
-                                      (down_rect, 'v', colors['text_dim']),
-                                      (delete_rect, 'X', colors['text'])):
-                fill = colors['delete'] if rect is delete_rect else colors['panel_light']
-                screen.draw_rect(fill, rect, border_radius=4)
-                lb = self.font_small.render(lbl, True, color)
-                screen.blit(lb, lb.get_rect(center=rect.center))
+        x = r.x
+        n = len(self.pages)
+        for i, pg in enumerate(self.pages):
+            label = self.title if i == 0 else pg['crumb']
+            last = i == n - 1
+            font = self.f_md
+            cw = min(300, font.width(label) + 34)
+            if x + cw > right - 30 and not last:
+                cw = max(60, min(cw, 90))
+            chip = pygame.Rect(x, cy - 18, cw, 36)
+            t = self._anim(("crumb", i), self._hov(chip) and not last)
+            base = _SEL if last else uk.lerp_color(_CARD, _CARD_HI, t)
+            border = _T.GOLD if last else uk.lerp_color(_T.CARD_BORDER, _T.GOLD, 0.78 * t)
+            self._panel(screen, chip, base, border, 1, 10)
+            fg = _T.GOLD_BRIGHT if last else uk.lerp_color(_T.TEXT_SECONDARY, _T.TEXT_PRIMARY, t)
+            self._text_mid(screen, font, label, fg, chip.centerx, chip.centery, "c", dyn=True, max_w=cw - 24)
+            if not last:
+                self._add_hit(chip, key=("crumb", i), down=lambda p, i=i: self._pop_to(i),
+                              tip="Go back to this level")
+                _ic_right(screen, pygame.Rect(chip.right + 2, cy - 12, 24, 24), _T.TEXT_DIM, 2)
+            x = chip.right + 28
 
-            opt_rects_list.append((option_index, {
-                'text': text_rect, 'edit': edit_rect,
-                'up': up_rect, 'down': down_rect, 'delete': delete_rect,
-            }))
-            cur_y += _FIELD_H + 4
+    # ══════════════════════════════════════════════════════════════════════
+    #  Drawing: the two list panels
+    # ══════════════════════════════════════════════════════════════════════
 
-        row_rects['options'] = opt_rects_list
+    def _draw_panels(self, screen):
+        page = self.page
+        ar = self.area_rect
+        if page['cond'] is None:
+            rects = {'a': pygame.Rect(ar)}
+        else:
+            gap = 20
+            lw = int((ar.w - gap) * 0.42)
+            rects = {'c': pygame.Rect(ar.x, ar.y, lw, ar.h),
+                     'a': pygame.Rect(ar.x + lw + gap, ar.y, ar.w - lw - gap, ar.h)}
+        for which, rect in rects.items():
+            self._draw_list_panel(screen, which, rect)
 
-        add_option_rect = pygame.Rect(x, cur_y, 130, _FIELD_H)
-        screen.draw_rect(colors['input_bg'], add_option_rect, border_radius=4)
-        screen.draw_rect(colors['success'], add_option_rect, 1, border_radius=4)
-        add_label = self.font_small.render("+ Add Option", True, colors['success'])
-        screen.blit(add_label, (add_option_rect.x + 8, add_option_rect.y + 5))
-        row_rects['add_option_btn'] = add_option_rect
-        cur_y += _FIELD_H + 4
+    def _draw_list_panel(self, screen, which, rect):
+        page = self.page
+        model = page['cond'] if which == 'c' else page['act']
+        accent = COND_ACCENT if which == 'c' else ACT_ACCENT
+        locked = which == 'c' and page['cond_locked']
+        self._panel(screen, rect, _T.PANEL_BG, _T.PANEL_BORDER, 1, 12)
 
-        return cur_y - y
+        title = "CONDITIONS" if which == 'c' else "ACTIONS"
+        uk.draw_soft_glow(screen, (rect.x + 26, rect.y + 31), 14, accent, max_alpha=46)
+        uk.draw_circle_on(screen, accent, (rect.x + 26, rect.y + 31), 5)
+        tw = self._text_mid(screen, self.f_lg, title, _T.TEXT_PRIMARY, rect.x + 44, rect.y + 31)
+        count = "-" if locked else str(len(model.rows))
+        self._text_mid(screen, self.f_sm, count, _T.TEXT_DIM, rect.x + 44 + tw + 14, rect.y + 31, dyn=True)
 
-    def _draw_option_editor(self, screen):
-        """Full-panel overlay hosting a nested ActionSequenceBuilder for
-        whichever dialogue_choice option is currently being edited — same
-        Save/Cancel/Esc shape as EventEditorWindow itself, one level down."""
-        colors = self.colors
-        sw, sh = screen.get_size()
+        if not locked:
+            label = "Add condition" if which == 'c' else "Add action"
+            bw = min(rect.w - 44 - tw - 60, 210)
+            if bw >= 46:
+                br = pygame.Rect(rect.right - 16 - bw, rect.y + 12, bw, 38)
+                self._pill(screen, ("add", which), br, label if bw >= 150 else "",
+                           accent, icon=self._icon_png(self._plus_icon, _ic_plus),
+                           on_click=lambda w=which: self._open_add_popup(w),
+                           tip="Add a condition" if which == 'c' else "Add an action")
 
-        overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 180))
-        screen.blit(overlay, (0, 0))
+        vp = pygame.Rect(rect.x + 3, rect.y + 62, rect.w - 6, rect.h - 62 - 4)
+        self._panel_rects[which] = rect
+        self._list_vp[which] = vp
+        sc = page['scroll']
+        sc[which] = _clamp(sc[which], 0, self._max_scroll(which))
 
-        margin = 60
-        panel = pygame.Rect(margin, margin, sw - margin * 2, sh - margin * 2)
-        panel_surf = pygame.Surface((panel.width, panel.height), pygame.SRCALPHA)
-        panel_surf.fill(colors.get('bg_transparent', (20, 20, 20, 235)))
-        screen.blit(panel_surf, panel.topleft)
-        screen.draw_rect(colors['accent'], panel, 2)
+        old_vp = self._vp
+        self._vp = vp
+        old = self._push_clip(screen, vp)
+        x = rect.x + 16
+        w = rect.w - 32 - 10
+        y = vp.y + 6 - int(sc[which])
+        used = self._draw_list_content(screen, which, model, x, y, w, locked)
+        self._pop_clip(screen, old)
+        self._vp = old_vp
+        page['content_h'][which] = used + 12
 
-        title = self.font_medium.render("Option Actions", True, colors['text'])
-        screen.blit(title, (panel.x + 12, panel.y + 10))
-        hint = self.font_small.render("Esc to cancel", True, colors['text_dim'])
-        screen.blit(hint, (panel.right - 12 - hint.get_width(), panel.y + 16))
+        max_scroll = self._max_scroll(which)
+        if max_scroll > 0:
+            track = pygame.Rect(rect.right - 12, vp.y + 4, 5, vp.h - 8)
+            th = max(30, int(track.h * vp.h / page['content_h'][which]))
+            frac = sc[which] / max_scroll
+            thumb = pygame.Rect(track.x, track.y + int((track.h - th) * frac), track.w, th)
+            key = ("scrollbar", which)
+            grab = self._drag is not None and self._drag.get("key") == key
+            t = self._anim(key, self._hov(track.inflate(10, 0)) or grab)
+            uk.draw_rect_on(screen, (24, 28, 38), track, 0, 2)
+            uk.draw_rect_on(screen, uk.lerp_color(_T.CHIP_BORDER, _T.GOLD, t), thumb, 0, 2)
 
-        content_x, content_y = panel.x + 12, panel.y + 40
-        content_w = panel.width - 24
-        clip_rect = pygame.Rect(panel.x, content_y, panel.width, panel.height - 90)
-        screen.set_clip(clip_rect)
-        self._option_editor['builder'].draw(screen, content_x, content_y, content_w)
-        screen.set_clip(None)
-        self._option_editor['origin'] = (content_x, content_y)
+            def scrub(pos, track=track, th=th, ms=max_scroll, which=which):
+                f = _clamp((pos[1] - track.y - th / 2) / max(1, track.h - th), 0.0, 1.0)
+                self.page['scroll'][which] = f * ms
 
-        btn_w = 100
-        save_rect = pygame.Rect(panel.right - 12 - btn_w, panel.bottom - 12 - _FIELD_H - 6, btn_w, _FIELD_H + 6)
-        cancel_rect = pygame.Rect(save_rect.x - btn_w - 10, save_rect.y, btn_w, _FIELD_H + 6)
+            self._add_hit(track.inflate(12, 0), key=key, down=scrub, drag=scrub)
 
-        screen.draw_rect(colors['success'], save_rect, border_radius=5)
-        save_label = self.font_small.render("Save", True, colors['bg'])
-        screen.blit(save_label, save_label.get_rect(center=save_rect.center))
+    def _draw_list_content(self, screen, which, model, x, y, w, locked):
+        page = self.page
+        y0 = y
+        vp = self._list_vp[which]
+        if locked:
+            y += self._note(screen, x, y, w, page.get('note') or "This branch has no conditions.")
+            return y - y0
 
-        screen.draw_rect(colors['panel_light'], cancel_rect, border_radius=5)
-        screen.draw_rect(colors['grid'], cancel_rect, 1, border_radius=5)
-        cancel_label = self.font_small.render("Cancel", True, colors['text'])
-        screen.blit(cancel_label, cancel_label.get_rect(center=cancel_rect.center))
+        if which == 'c':
+            msg = ("Every condition below must be true before the event fires."
+                   if model.rows else "No conditions. The event always fires when it is triggered.")
+        else:
+            msg = ("These run from top to bottom once the event fires."
+                   if model.rows else "No actions yet. Add one to decide what happens.")
+        if which == 'a' and page.get('note'):
+            y += self._note(screen, x, y, w, page['note'], color=_T.TEXT_MUTED) + 10
+        else:
+            y += self._note(screen, x, y, w, msg) + 10
 
-        self._option_editor['save_rect'] = save_rect
-        self._option_editor['cancel_rect'] = cancel_rect
+        rects = []
+        for i, row in enumerate(model.rows):
+            h = self._card(screen, which, model, i, row, x, y, w, False)
+            rects.append((i, pygame.Rect(x, y, w, h)))
+            if y + h >= vp.y and y <= vp.bottom:
+                self._card(screen, which, model, i, row, x, y, w, True)
+            y += h + _ROW_GAP
+        self._row_rects[which] = rects
 
-    def _draw_add_type_grid(self, screen, x, y, w):
-        colors = self.colors
-        item_w, item_h, gap = 190, 26, 6
-        cols = max(1, (w + gap) // (item_w + gap))
-        items = []
-        for i, action_type in enumerate(ACTION_TYPES):
-            col, row = i % cols, i // cols
-            rect = pygame.Rect(x + col * (item_w + gap), y + row * (item_h + gap), item_w, item_h)
-            screen.draw_rect(colors['panel_light'], rect, border_radius=4)
-            screen.draw_rect(colors['accent'], rect, 1, border_radius=4)
-            clip = pygame.Rect(rect.x + 4, rect.y, rect.w - 8, rect.h)
-            screen.set_clip(clip)
-            label = self.font_small.render(action_type, True, colors['text'])
-            screen.blit(label, (rect.x + 6, rect.y + 5))
-            screen.set_clip(None)
-            items.append((rect, action_type))
-        self._rects['add_type_grid_items'] = items
-        rows_used = (len(ACTION_TYPES) + cols - 1) // cols
-        return rows_used * (item_h + gap)
+        # Big add-button at the end of the list, for mouse convenience.
+        ar = pygame.Rect(x, y, w, 46)
+        if ar.bottom >= vp.y and ar.y <= vp.bottom:
+            label = "Add condition" if which == 'c' else "Add action"
+            self._pill(screen, ("add_end", which), ar, label,
+                       COND_ACCENT if which == 'c' else ACT_ACCENT,
+                       icon=self._icon_png(self._plus_icon, _ic_plus),
+                       on_click=lambda w=which: self._open_add_popup(w))
+        y += 46
+        return y - y0
 
-    def _draw_type_dropdown(self, screen, x, list_y):
-        colors = self.colors
-        items = []
-        list_w = 200
-        row_h = 20
-        max_scroll = max(0, len(ACTION_TYPES) - _TYPE_DROPDOWN_VISIBLE)
-        self._type_dropdown_scroll = max(0, min(self._type_dropdown_scroll, max_scroll))
-        start = self._type_dropdown_scroll
-        shown = ACTION_TYPES[start:start + _TYPE_DROPDOWN_VISIBLE]
+    # ══════════════════════════════════════════════════════════════════════
+    #  Row cards
+    # ══════════════════════════════════════════════════════════════════════
 
-        list_rect = pygame.Rect(x, list_y, list_w, len(shown) * row_h)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, action_type in enumerate(shown):
-            item_rect = pygame.Rect(x, list_y + i * row_h, list_w, row_h)
-            label = self.font_small.render(action_type, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 3))
-            items.append((item_rect, action_type))
-        self._rects['type_dropdown_items'] = items
+    _WRAP_FIELDS = {('dialogue_box', 'text'), ('dialogue_choice', 'prompt')}
+    _CARD_HEAD_H = 46
 
-        if len(ACTION_TYPES) > _TYPE_DROPDOWN_VISIBLE:
-            hint = self.font_small.render(
-                "%d/%d — scroll for more" % (start + len(shown), len(ACTION_TYPES)),
-                True, colors['text_dim'])
-            screen.blit(hint, (x, list_rect.bottom + 2))
+    def _row_kind_key(self, which):
+        return 'kind' if which == 'c' else 'type'
 
-    def _draw_portrait_dropdown(self, screen, x, list_y):
-        colors = self.colors
-        items = []
-        list_w = 180
-        names = self._known_portraits or ['(no portraits found)']
-        visible = names[:8]
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if self._known_portraits:
-                items.append((item_rect, name))
-        self._rects['portrait_dropdown_items'] = items
+    def _row_label(self, which, row):
+        k = row.get(self._row_kind_key(which))
+        if which == 'c':
+            return CONDITION_KINDS[k]['label'] if k in CONDITION_KINDS else _humanize(k)
+        return _humanize(k)
 
-    def _draw_char_dropdown(self, screen, x, list_y):
-        colors = self.colors
-        items = []
-        list_w = 180
-        names = self._known_characters or ['(no characters found)']
-        visible = names[:8]
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if self._known_characters:
-                items.append((item_rect, name))
-        self._rects['char_dropdown_items'] = items
+    def _row_fields(self, which, row):
+        if which == 'c':
+            return CONDITION_KINDS[row['kind']]['fields']
+        t = row['type']
+        if t == 'conditional':
+            return []
+        return _row_visible_fields(t, row['params'], ACTION_SCHEMA.get(t, []))
 
-    def _draw_enemy_dropdown(self, screen, x, list_y):
-        colors = self.colors
-        items = []
-        list_w = 180
-        names = self._known_enemies or ['(no enemies found)']
-        visible = names[:8]
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if self._known_enemies:
-                items.append((item_rect, name))
-        self._rects['enemy_dropdown_items'] = items
+    def _row_summary(self, which, row):
+        if row.get(self._row_kind_key(which)) == '__raw__':
+            return ""
+        t = row.get('type')
+        if t == 'conditional':
+            return "%s" % _plural(len(row.get('_branches', [])), 'branch').replace('branchs', 'branches')
+        if t == 'dialogue_choice':
+            bits = [row['params'].get('prompt', '')] + ["%s" % _plural(len(row.get('_options', [])), 'option')]
+            return "   ".join(b for b in bits if b)
+        bits = []
+        for name, fk, extra in self._row_fields(which, row):
+            v = str(row['params'].get(name, '')).strip()
+            if fk == 'bool':
+                if v == 'true':
+                    bits.append(_humanize(name))
+                continue
+            if fk in ('spawn_picker', 'position_picker'):
+                a, b = ('spawn_x', 'spawn_y') if fk == 'spawn_picker' else ('x', 'y')
+                if row['params'].get(a, '') != '':
+                    bits.append("%s, %s" % (row['params'].get(a), row['params'].get(b)))
+                continue
+            if v:
+                bits.append(_opt_label(v) if fk in ('cmp', 'choice') else v)
+        return "   ".join(bits)
 
-    def _draw_npc_dropdown(self, screen, x, list_y):
-        colors = self.colors
-        items = []
-        list_w = 180
-        names = self._known_npcs or ['(no npcs found)']
-        visible = names[:8]
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if self._known_npcs:
-                items.append((item_rect, name))
-        self._rects['npc_dropdown_items'] = items
+    def _card(self, screen, which, model, idx, row, x, y, w, draw):
+        """Lay out (draw=False, returns the height) or draw one row card."""
+        page = self.page
+        kk = self._row_kind_key(which)
+        raw = row.get(kk) == '__raw__'
+        collapsed = id(row) in page['collapsed']
+        cw = w - _STRIPE - _PAD * 2
+        cx = x + _STRIPE + _PAD
+        plan = None
+        body_h = 0
+        if not raw and not collapsed:
+            plan = self._body_plan(which, row, cw)
+            body_h = plan['h']
+        h = 8 + self._CARD_HEAD_H + (body_h + 10 if body_h else 0) + 8
+        if not draw:
+            return h
 
-    def _draw_cutscene_dropdown(self, screen, x, list_y):
-        colors = self.colors
-        items = []
-        list_w = 180
-        names = self._known_cutscenes or ['(no cutscenes found)']
-        visible = names[:8]
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if self._known_cutscenes:
-                items.append((item_rect, name))
-        self._rects['cutscene_dropdown_items'] = items
+        accent = COND_ACCENT if which == 'c' else ACT_ACCENT
+        if raw:
+            accent = _T.TEXT_DIM
+        rect = pygame.Rect(x, y, w, h)
+        t = self._anim(('card', which, id(row)), self._hov(rect))
+        dragging = self._reorder is not None and self._reorder['row'] is row
+        self._panel(screen, rect, uk.lerp_color(_CARD, _CARD_HI, 1.0 if dragging else t),
+                    _T.GOLD if dragging else uk.lerp_color(_T.CARD_BORDER, accent, 0.45 * t), 1, 10)
+        uk.draw_rect_on(screen, accent, pygame.Rect(x + 8, y + 12, 3, h - 24), 0, 1)
 
-    def _draw_weather_dropdown(self, screen, x, list_y):
-        colors = self.colors
-        items = []
-        list_w = 180
-        names = self._known_weather_types or ['(no weather found)']
-        visible = names[:8]
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if self._known_weather_types:
-                items.append((item_rect, name))
-        self._rects['weather_dropdown_items'] = items
+        hy = y + 8
+        cy = hy + self._CARD_HEAD_H // 2
+        bx = cx
+        grip = pygame.Rect(bx, cy - 15, 22, 30)
+        gh = self._hov(grip) or dragging
+        _ic_grip(screen, grip, _T.GOLD if gh else _T.TEXT_DIM, 3)
+        self._add_hit(grip, key=('grip', which, id(row)),
+                      down=lambda p, w=which, r=row: self._start_reorder(w, r),
+                      drag=lambda p: self._drag_reorder(p), tip="Drag to reorder")
+        sx = bx + 26
+        if not raw:
+            chev = pygame.Rect(sx, cy - 15, 28, 30)
+            ct = self._anim(('chev', which, id(row)), self._hov(chev))
+            (_ic_right if collapsed else _ic_down)(screen, chev, uk.lerp_color(_T.TEXT_MUTED, _T.GOLD, ct), 3)
+            self._add_hit(chev, key=('chev', which, id(row)),
+                          down=lambda p, r=row: self._toggle_collapse(r),
+                          tip="Show the fields" if collapsed else "Collapse this row")
+            sx += 32
 
-    def _draw_music_dropdown(self, screen, x, list_y):
-        colors = self.colors
-        items = []
-        list_w = 180
-        row_h = 22
-        names = self._known_music_tracks or ['(no music found)']
-        max_scroll = max(0, len(names) - _MUSIC_DROPDOWN_VISIBLE)
-        self._music_dropdown_scroll = max(0, min(self._music_dropdown_scroll, max_scroll))
-        start = self._music_dropdown_scroll
-        visible = names[start:start + _MUSIC_DROPDOWN_VISIBLE]
+        btn_w, btn_gap = 30, 6
+        btns_w = 4 * btn_w + 3 * btn_gap
+        btn_x = cx + cw - btns_w
+        fh = self.m_field_h
+        sel_w = int(_clamp(cw - (sx - cx) - btns_w - 14, 120, 320))
+        sel = pygame.Rect(sx, cy - fh // 2, sel_w, fh)
+        if raw:
+            what = "condition" if which == 'c' else "action"
+            self._panel(screen, pygame.Rect(sx, cy - fh // 2, cx + cw - btns_w - 14 - sx, fh), _INSET, _T.CARD_BORDER)
+            self._text_mid(screen, self.f_md, "Unrecognized %s, kept as-is" % what, _T.TEXT_MUTED,
+                           sx + 14, cy, max_w=cx + cw - btns_w - 14 - sx - 28)
+        else:
+            self._select_box(screen, ('kind', which, id(row)), sel, self._row_label(which, row),
+                             lambda r, w=which, rw=row: self._open_type_popup(w, rw, r),
+                             tip="Change the type of this row", accent=accent)
+            if collapsed:
+                summ = self._row_summary(which, row)
+                if summ:
+                    self._text_mid(screen, self.f_md, summ, _T.TEXT_DIM, sel.right + 16, cy, dyn=True,
+                                   max_w=btn_x - 14 - (sel.right + 16))
 
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * row_h)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * row_h, list_w, row_h)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if self._known_music_tracks:
-                items.append((item_rect, name))
-        self._rects['music_dropdown_items'] = items
+        bs = [(_ic_up, "Move up", idx > 0, lambda: model._move_row(idx, -1), False),
+              (_ic_down, "Move down", idx < len(model.rows) - 1, lambda: model._move_row(idx, 1), False),
+              (self._icon_png(self._dup_icon, _ic_copy), "Duplicate this row", True, lambda: model._duplicate_row(idx), False),
+              (self._icon_png(self._trash_icon, _ic_trash), "Delete this row", True,
+               lambda: model._remove_row(idx), True)]
+        for i, (ic, tip, en, cb, danger) in enumerate(bs):
+            br = pygame.Rect(btn_x + i * (btn_w + btn_gap), cy - btn_w // 2, btn_w, btn_w)
+            self._icon_btn(screen, ('rb', which, id(row), i), br, ic, cb, danger=danger, enabled=en,
+                           tip=tip, size=22)
 
-        if len(names) > _MUSIC_DROPDOWN_VISIBLE:
-            hint = self.font_small.render(
-                "%d/%d — scroll for more" % (start + len(visible), len(names)),
-                True, colors['text_dim'])
-            screen.blit(hint, (x, list_rect.bottom + 2))
+        if plan is not None and plan['h']:
+            self._draw_body(screen, which, model, idx, row, plan, cx, hy + self._CARD_HEAD_H + 10, cw)
+        return h
 
-    def _draw_sound_dropdown(self, screen, x, list_y):
-        colors = self.colors
-        items = []
-        list_w = 180
-        row_h = 22
-        names = self._known_sound_effects or ['(no sfx found)']
-        max_scroll = max(0, len(names) - _SOUND_DROPDOWN_VISIBLE)
-        self._sound_dropdown_scroll = max(0, min(self._sound_dropdown_scroll, max_scroll))
-        start = self._sound_dropdown_scroll
-        visible = names[start:start + _SOUND_DROPDOWN_VISIBLE]
+    def _toggle_collapse(self, row):
+        c = self.page['collapsed']
+        if id(row) in c:
+            c.discard(id(row))
+        else:
+            c.add(id(row))
 
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * row_h)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * row_h, list_w, row_h)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if self._known_sound_effects:
-                items.append((item_rect, name))
-        self._rects['sound_dropdown_items'] = items
+    def _start_reorder(self, which, row):
+        self._reorder = {'which': which, 'row': row}
 
-        if len(names) > _SOUND_DROPDOWN_VISIBLE:
-            hint = self.font_small.render(
-                "%d/%d — scroll for more" % (start + len(visible), len(names)),
-                True, colors['text_dim'])
-            screen.blit(hint, (x, list_rect.bottom + 2))
-
-    def _draw_room_dropdown(self, screen, x, list_y):
-        colors = self.colors
-        items = []
-        list_w = 180
-        names = self._known_rooms or ['(no rooms found)']
-        visible = names[:8]
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if self._known_rooms:
-                items.append((item_rect, name))
-        self._rects['room_dropdown_items'] = items
-
-    def _draw_world_map_dropdown(self, screen, x, list_y):
-        """map_name picker for world_map_location — static list of every
-        map saved by dev_tools/world_map_editor.py, same shape as
-        _draw_room_dropdown() above."""
-        colors = self.colors
-        items = []
-        list_w = 180
-        names = self._known_world_maps or ['(no world maps found)']
-        visible = names[:8]
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if self._known_world_maps:
-                items.append((item_rect, name))
-        self._rects['world_map_dropdown_items'] = items
-
-    def _draw_wm_location_dropdown(self, screen, x, list_y, row_index):
-        """name picker for world_map_location — the pins already placed on
-        whichever map is picked in that same row's map_name field, via
-        _wm_location_choices_for_row(). Row-scoped like
-        _draw_animation_dropdown() above."""
-        colors = self.colors
-        items = []
-        list_w = 180
-        real, placeholder = self._wm_location_choices_for_row(row_index)
-        names = real or [placeholder]
-        visible = names[:8]
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if real:
-                items.append((item_rect, name))
-        self._rects['wm_location_dropdown_items'] = items
-
-    # ── Set Spawn / Set Position overlay ────────────────────────────────────
-    # A full-panel mouse-picking overlay shared by change_map's spawn point
-    # (the 'spawn_picker' field) and set_player_location's position (the
-    # 'position_picker' field) — same Escape/Done/Cancel shape as the
-    # dialogue_choice option editor above, one level down. See
-    # _spawn_picker in __init__ for the state shape.
-
-    def _open_spawn_picker(self, row_index, field_name):
-        """No-ops if there's no room to preview a point against yet.
-        field_name is either 'spawn_x' (change_map — the schema-registered
-        half of its x/y pair, room comes from that same row's 'room_name'
-        field) or 'x' (set_player_location — room is always whatever
-        set_current_room() last supplied, since that action has no
-        room_name field of its own)."""
-        if not (0 <= row_index < len(self.rows)):
+    def _drag_reorder(self, pos):
+        ro = self._reorder
+        if ro is None:
             return
-        row = self.rows[row_index]
+        which, row = ro['which'], ro['row']
+        model = self.page['cond'] if which == 'c' else self.page['act']
+        if model is None:
+            return
+        cur = next((i for i, r in enumerate(model.rows) if r is row), None)
+        rects = self._row_rects.get(which) or []
+        if cur is None or not rects:
+            return
+        target = None
+        if pos[1] < rects[0][1].top:
+            target = 0
+        elif pos[1] > rects[-1][1].bottom:
+            target = len(rects) - 1
+        else:
+            for i, r in rects:
+                if r.top <= pos[1] <= r.bottom:
+                    if i > cur and pos[1] > r.top + min(r.h, 60):
+                        target = i
+                    elif i < cur and pos[1] < r.bottom - min(r.h, 60):
+                        target = i
+                    break
+        if target is not None and target != cur:
+            model._move_row_to(cur, target)
 
+    # ── field layout ────────────────────────────────────────────────────────
+
+    def _field_caption(self, which, row, name, fk):
+        if which == 'c':
+            cap = _FIELD_LABELS.get((row['kind'], name))
+            if cap:
+                return cap
+            if name == 'cmp':
+                return "Compare"
+            if name in ('value', 'arg0'):
+                return "Value"
+            return _humanize(name)
+        if fk == 'spawn_picker':
+            return "Spawn point"
+        if fk == 'position_picker':
+            return "Position"
+        return _humanize(name)
+
+    def _bool_label(self, name):
+        return {'wait': "Wait until it finishes"}.get(name, _humanize(name))
+
+    def _fields_layout(self, which, row, fields, w):
+        md = self.f_md
+        cap_h = self.f_sm.cap_h + 8
+        gap = _FIELD_GAP
+        items = []
+        for name, fk, extra in fields:
+            it = {'name': name, 'kind': fk, 'extra': extra, 'fh': self.m_field_h,
+                  'minw': 240, 'flex': True, 'full': False, 'cap': True, 'seg': False}
+            if fk == 'choice':
+                total = sum(md.width(_opt_label(o)) + 40 for o in extra)
+                if len(extra) <= 3 and total <= w:
+                    it.update(seg=True, minw=total, flex=False)
+                else:
+                    it.update(minw=200)
+            elif fk == 'cmp':
+                it.update(minw=180, flex=False)
+            elif fk == 'number':
+                it.update(minw=150, flex=False)
+            elif fk == 'bool':
+                it.update(minw=24 + 14 + md.width(self._bool_label(name)) + 16, flex=False,
+                          cap=False, fh=32)
+            elif fk == 'text':
+                if (row.get('type'), name) in self._WRAP_FIELDS:
+                    lh = md.line_h + 6
+                    it.update(full=True, fh=3 * lh + 20)
+                else:
+                    it.update(minw=220)
+            elif fk == 'json':
+                it.update(minw=280)
+            elif fk in ('spawn_picker', 'position_picker'):
+                it.update(minw=280)
+            items.append(it)
+
+        lines, cur, curw = [], [], 0
+        for it in items:
+            if it['full']:
+                if cur:
+                    lines.append(cur)
+                    cur, curw = [], 0
+                lines.append([it])
+                continue
+            need = it['minw'] + (gap if cur else 0)
+            if cur and curw + need > w:
+                lines.append(cur)
+                cur, curw, need = [], 0, it['minw']
+            cur.append(it)
+            curw += need
+        if cur:
+            lines.append(cur)
+
+        ly = 0
+        for line in lines:
+            line_cap = cap_h if any(i['cap'] for i in line) else 0
+            field_area = max(i['fh'] for i in line)
+            if any(i['kind'] == 'bool' for i in line):
+                field_area = max(field_area, self.m_field_h)
+            gaps = gap * (len(line) - 1)
+            leftover = w - sum(i['minw'] for i in line) - gaps
+            flex_n = sum(1 for i in line if i['flex'])
+            share = leftover // flex_n if (flex_n and leftover > 0) else 0
+            lx = 0
+            for it in line:
+                it['x'] = lx
+                it['w'] = it['minw'] + (share if it['flex'] else 0)
+                if it['full']:
+                    it['w'] = w
+                it['cy'] = ly
+                it['wy'] = ly + line_cap + ((field_area - it['fh']) // 2 if it['kind'] == 'bool' else 0)
+                lx += it['w'] + gap
+            ly += line_cap + field_area + gap
+        return {'items': items, 'h': max(0, ly - gap) if lines else 0}
+
+    def _body_plan(self, which, row, cw):
+        fields = self._row_fields(which, row)
+        lay = self._fields_layout(which, row, fields, cw)
+        h = lay['h']
+        extra = 0
+        if which == 'a' and row.get('type') == 'dialogue_choice':
+            n = len(row.get('_options', []))
+            extra = self.f_sm.cap_h + 18 + n * (self.m_field_h + 8) + 38
+        elif which == 'a' and row.get('type') == 'conditional':
+            n = len(row.get('_branches', []))
+            extra = self.f_sm.cap_h + 18 + n * (44 + 8) + 38
+        if h and extra:
+            h += 14
+        return {'lay': lay, 'h': h + extra, 'fields_h': h if not extra else lay['h']}
+
+    def _draw_body(self, screen, which, model, idx, row, plan, x, y, w):
+        lay = plan['lay']
+        for it in lay['items']:
+            if it['cap']:
+                self._text_top(screen, self.f_sm, self._field_caption(which, row, it['name'], it['kind']).upper(),
+                               _T.TEXT_MUTED, x + it['x'], y + it['cy'])
+            rect = pygame.Rect(x + it['x'], y + it['wy'], it['w'], it['fh'])
+            self._field_widget(screen, which, model, idx, row, it, rect)
+        y2 = y + lay['h'] + (14 if lay['h'] else 0)
+        if which == 'a' and row.get('type') == 'dialogue_choice':
+            self._draw_options(screen, model, idx, row, x, y2, w)
+        elif which == 'a' and row.get('type') == 'conditional':
+            self._draw_branches(screen, model, idx, row, x, y2, w)
+
+    # ── the field widgets ───────────────────────────────────────────────────
+
+    def _field_widget(self, screen, which, model, idx, row, it, rect):
+        name, fk, extra = it['name'], it['kind'], it['extra']
+        params = row['params']
+        key = (which, id(row), name)
+
+        def setp(v, p=params, n=name):
+            p[n] = v
+
+        if fk in ('text', 'number', 'json'):
+            wrap = (row.get('type'), name) in self._WRAP_FIELDS
+            ph = "0" if fk == 'number' else ("Type the %s..." % _humanize(name).lower())
+            self._text_field(screen, key, rect, lambda p=params, n=name: p.get(n, ''), setp, ph,
+                             wrap=wrap, max_len=400 if wrap else 300,
+                             allowed=_num_ok if fk == 'number' else None)
+        elif fk == 'cmp':
+            cur = params.get(name, '==')
+            self._select_box(screen, key, rect, _opt_label(cur),
+                             lambda r, p=params, n=name, cur=cur: self._open_list_popup(
+                                 "Compare", [(o, _opt_label(o)) for o in _CMP_OPTIONS], cur,
+                                 lambda v: p.__setitem__(n, v), r, search=False))
+        elif fk == 'choice':
+            cur = params.get(name, extra[0])
+            if it['seg']:
+                self._segmented(screen, key, rect.x, rect.y, rect.w,
+                                [(o, _opt_label(o)) for o in extra], cur, setp)
+            else:
+                self._select_box(screen, key, rect, _opt_label(cur),
+                                 lambda r, p=params, n=name, cur=cur, ex=extra: self._open_list_popup(
+                                     _humanize(n), [(o, _opt_label(o)) for o in ex], cur,
+                                     lambda v: p.__setitem__(n, v), r, search=False))
+        elif fk == 'bool':
+            self._checkbox(screen, key, rect.x, rect.y, rect.w, self._bool_label(name),
+                           params.get(name, 'false') == 'true',
+                           lambda p=params, n=name: p.__setitem__(n, 'false' if p.get(n) == 'true' else 'true'))
+        elif fk in ('spawn_picker', 'position_picker'):
+            if fk == 'spawn_picker':
+                a, b = 'spawn_x', 'spawn_y'
+                ok = bool(params.get('room_name', ''))
+                nice, empty = "Spawn", "Set spawn point"
+                blocked = "Set spawn (pick a room first)"
+            else:
+                a, b = 'x', 'y'
+                ok = bool(model._current_room_name)
+                nice, empty = "Position", "Set position"
+                blocked = "Set position (no room set)"
+            if params.get(a, '') != '' and params.get(b, '') != '':
+                text = "%s: %s, %s" % (nice, params.get(a), params.get(b))
+            else:
+                text = empty if ok else blocked
+            self._pill(screen, key, rect, text, ACT_ACCENT, icon=_ic_target, enabled=ok,
+                       on_click=lambda m=model, r=row, n=name: self._open_spawn(m, r, n),
+                       tip="Click the room to place the point" if ok else "Nothing to preview yet")
+        elif fk in _PICKER_KINDS:
+            cur = params.get(name, '')
+            if which == 'c':
+                names, placeholder = model.choices(fk)
+            else:
+                names, placeholder = model.choices(idx, fk)
+            ph = _placeholder_for(name, fk, row.get('kind')).strip('<>')
+            ph = ph[:1].upper() + ph[1:]
+            self._select_box(screen, key, rect, cur or ph, lambda r, m=model, rw=row, n=name, f=fk, i=idx, w=which:
+                             self._open_picker(w, m, i, rw, n, f, r), muted=not cur,
+                             tip="Pick from the list, or type your own value")
+        else:
+            self._text_field(screen, key, rect, lambda p=params, n=name: p.get(n, ''), setp, "", max_len=300)
+
+    def _open_picker(self, which, model, idx, row, name, fk, anchor):
+        if which == 'c':
+            names, placeholder = model.choices(fk)
+        else:
+            names, placeholder = model.choices(idx, fk)
+        params = row['params']
+
+        def pick(v, p=params, n=name, f=fk):
+            if f == 'world_map_picker' and p.get(n) != v:
+                p['name'] = ''      # the old location name won't exist on the new map
+            p[n] = v
+
+        self._open_list_popup(_humanize(name), [(n_, n_) for n_ in names], params.get(name, ''), pick,
+                              anchor, allow_custom=True, placeholder=placeholder)
+
+    # ── dialogue_choice options ─────────────────────────────────────────────
+
+    def _draw_options(self, screen, model, idx, row, x, y, w):
+        options = row.get('_options', [])
+        fh = self.m_field_h
+        y += self._caption(screen, "Options", x, y, w, right=_plural(len(options), 'option'))
+        for oi, opt in enumerate(options):
+            ry = y + oi * (fh + 8)
+            bw = 34
+            right = x + w
+            for i, (ic, tip, en, cb, danger) in enumerate((
+                    (self._icon_png(self._trash_icon, _ic_trash), "Delete this option", True,
+                     lambda oi=oi: model._remove_option(idx, oi), True),
+                    (_ic_down, "Move option down", oi < len(options) - 1,
+                     lambda oi=oi: model._move_option(idx, oi, 1), False),
+                    (_ic_up, "Move option up", oi > 0,
+                     lambda oi=oi: model._move_option(idx, oi, -1), False))):
+                br = pygame.Rect(right - bw, ry + (fh - bw) // 2, bw, bw)
+                self._icon_btn(screen, ('ob', id(row), id(opt), i), br, ic, cb, danger=danger,
+                               enabled=en, tip=tip, size=22)
+                right = br.left - 6
+            ew = 190
+            er = pygame.Rect(right - ew, ry, ew, fh)
+            self._pill(screen, ('oe', id(row), id(opt)), er, "Actions (%d)" % len(opt.get('actions', [])),
+                       ACT_ACCENT, icon=_ic_edit,
+                       on_click=lambda oi=oi: self._open_option_page(idx, oi),
+                       tip="Edit what happens when this option is picked")
+            tr = pygame.Rect(x, ry, er.left - 10 - x, fh)
+            self._text_field(screen, ('opt', id(row), id(opt)), tr, lambda o=opt: o.get('text', ''),
+                             lambda v, o=opt: o.__setitem__('text', v), "Option text...", max_len=120)
+        y += len(options) * (fh + 8)
+        self._pill(screen, ('oadd', id(row)), pygame.Rect(x, y, 190, 38), "Add option", ACT_ACCENT,
+                   icon=self._icon_png(self._plus_icon, _ic_plus),
+                   on_click=lambda: model._add_option(idx), tip="Add another answer")
+
+    # ── conditional branches ────────────────────────────────────────────────
+
+    def _draw_branches(self, screen, model, idx, row, x, y, w):
+        branches = row.get('_branches', [])
+        y += self._caption(screen, "Branches", x, y, w, right=_plural(len(branches), 'branch').replace('branchs', 'branches'))
+        for bi, br in enumerate(branches):
+            is_else = bool(br.get('is_else'))
+            label = 'ELSE' if is_else else ('IF' if bi == 0 else 'ELSE IF')
+            rr = pygame.Rect(x, y + bi * 52, w, 44)
+            t = self._anim(('br', id(row), id(br)), self._hov(rr))
+            self._panel(screen, rr, uk.lerp_color(_FIELD, _FIELD_HI, t),
+                        uk.lerp_color(_T.CARD_BORDER, COND_ACCENT if not is_else else _T.TEXT_MUTED, 0.78 * t), 1, 9)
+            chip = pygame.Rect(rr.x + 8, rr.y + 8, 84, 28)
+            self._chip(screen, chip, label, _T.TEXT_MUTED if is_else else COND_ACCENT, bg=_INSET, border=_HAIR)
+            nc, na = len(br.get('conditions') or []), len(br.get('actions') or [])
+            summary = _plural(na, 'action') if is_else else "%s, %s" % (_plural(nc, 'condition'), _plural(na, 'action'))
+            dw = 34
+            dele = pygame.Rect(rr.right - 8 - dw, rr.y + 5, dw, 34)
+            ed = pygame.Rect(dele.left - 8 - 110, rr.y + 5, 110, 34)
+            self._text_mid(screen, self.f_md, summary, _T.TEXT_SECONDARY, chip.right + 14, rr.centery,
+                           dyn=True, max_w=ed.left - 14 - (chip.right + 14))
+            self._add_hit(rr, key=('brrow', id(row), id(br)),
+                          down=lambda p, r=idx, b=bi: self._open_branch_page(r, b),
+                          tip="Edit this branch")
+            self._pill(screen, ('bre', id(row), id(br)), ed, "Edit", ACT_ACCENT, icon=_ic_edit,
+                       on_click=lambda r=idx, b=bi: self._open_branch_page(r, b))
+            self._icon_btn(screen, ('brd', id(row), id(br)), dele, self._icon_png(self._trash_icon, _ic_trash),
+                           lambda b=bi: model._remove_conditional_branch(idx, b), danger=True,
+                           tip="Delete this branch", size=22)
+        y += len(branches) * 52
+        self._pill(screen, ('bradd', id(row)), pygame.Rect(x, y, 170, 38), "Else if", COND_ACCENT,
+                   icon=self._icon_png(self._plus_icon, _ic_plus),
+                   on_click=lambda: model._add_conditional_branch(idx, False), tip="Add an ELSE IF branch")
+        if not any(b.get('is_else') for b in branches):
+            self._pill(screen, ('brelse', id(row)), pygame.Rect(x + 180, y, 130, 38), "Else", COND_ACCENT,
+                       icon=self._icon_png(self._plus_icon, _ic_plus),
+                       on_click=lambda: model._add_conditional_branch(idx, True), tip="Add the ELSE branch")
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Popups: searchable dropdown list + the add / change-type grid
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _attach_popup_search(self, popup):
+        edit = _TextEdit("", multiline=False, max_len=60)
+        popup['edit'] = edit
+        popup['last_q'] = ""
+        popup['scroll'] = 0
+        popup['hi'] = 0
+        self._focus = SimpleNamespace(key='popsearch', edit=edit, set=lambda v: None)
+        self._focus_before = None
+
+    def _close_popup(self):
+        self.popup = None
+        if self._focus is not None and self._focus.key == 'popsearch':
+            self._focus = None
+            self._focus_before = None
+
+    def _open_list_popup(self, title, items, current, on_pick, anchor=None, allow_custom=False,
+                         placeholder="", search=None):
+        """items: [(value, label)]. on_pick(value) runs inside the click that
+        chose it (so it is recorded for undo like every other edit)."""
+        self._blur()
+        if search is None:
+            search = allow_custom or len(items) > 8
+        self.popup = {'kind': 'list', 'title': title, 'items': list(items), 'current': current,
+                      'on_pick': on_pick, 'anchor': pygame.Rect(anchor) if anchor is not None else None,
+                      'allow_custom': allow_custom, 'placeholder': placeholder, 'search': search}
+        self._attach_popup_search(self.popup)
+        if not search:
+            self._focus = None
+
+    def _open_add_popup(self, which):
+        model = self.page['cond'] if which == 'c' else self.page['act']
+        if model is None:
+            return
+        self._blur()
+
+        def pick(value, m=model, w=which):
+            m._add_row(value)
+            self._set_status("Added %s" % (CONDITION_KINDS[value]['label'] if w == 'c' else _humanize(value)))
+            page = self.page
+            page['scroll'][w] = 1e9          # jump to the new row (clamped on draw)
+
+        self.popup = {'kind': 'grid', 'which': which, 'mode': 'add', 'on_pick': pick, 'multi': True,
+                      'title': "Add condition" if which == 'c' else "Add action", 'current': None}
+        self._attach_popup_search(self.popup)
+
+    def _open_type_popup(self, which, row, anchor=None):
+        model = self.page['cond'] if which == 'c' else self.page['act']
+        self._blur()
+
+        def pick(value, m=model, r=row):
+            idx = next((i for i, x in enumerate(m.rows) if x is r), None)
+            if idx is not None:
+                (m._set_row_kind if which == 'c' else m._set_row_type)(idx, value)
+
+        self.popup = {'kind': 'grid', 'which': which, 'mode': 'change', 'on_pick': pick, 'multi': False,
+                      'title': "Change condition type" if which == 'c' else "Change action type",
+                      'current': row.get(self._row_kind_key(which))}
+        self._attach_popup_search(self.popup)
+
+    def _popup_entries(self, p):
+        q = p['edit'].value.strip().lower()
+        if p['kind'] == 'list':
+            out = [(v, l) for v, l in p['items'] if not q or q in l.lower() or q in str(v).lower()]
+            typed = p['edit'].value.strip()
+            if p['allow_custom'] and typed and not any(str(v) == typed for v, _ in p['items']):
+                out.append((typed, "Use: " + typed))
+            return out
+        return []
+
+    def _popup_pick(self, value):
+        p = self.popup
+        if p is None:
+            return
+        cb = p['on_pick']
+        if not p.get('multi'):
+            self._close_popup()
+        cb(value)
+
+    def _popup_key(self, event):
+        p = self.popup
+        k = event.key
+        if k == pygame.K_ESCAPE:
+            self._close_popup()
+            return
+        if p['kind'] == 'list':
+            entries = self._popup_entries(p)
+            if k in (pygame.K_DOWN, pygame.K_UP):
+                step = 1 if k == pygame.K_DOWN else -1
+                p['hi'] = int(_clamp(p['hi'] + step, 0, max(0, len(entries) - 1)))
+                vis = p.get('vis_rows', 8)
+                if p['hi'] < p['scroll']:
+                    p['scroll'] = p['hi']
+                elif p['hi'] >= p['scroll'] + vis:
+                    p['scroll'] = p['hi'] - vis + 1
+                return
+            if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                if entries:
+                    value = entries[int(_clamp(p['hi'], 0, len(entries) - 1))][0]
+                    self._tracked(self._popup_pick, value)
+                return
+        else:
+            if k in (pygame.K_RETURN, pygame.K_KP_ENTER):
+                tiles = p.get('tiles') or []
+                if len(tiles) == 1:
+                    self._tracked(self._popup_pick, tiles[0])
+                return
+        if p.get('edit') is not None and self._focus is not None and self._focus.key == 'popsearch':
+            self._focus.edit.key(event)
+
+    def _popup_wheel(self, dy):
+        p = self.popup
+        if p['kind'] == 'list':
+            total = len(self._popup_entries(p))
+            vis = p.get('vis_rows', 8)
+            p['scroll'] = int(_clamp(p['scroll'] - dy, 0, max(0, total - vis)))
+        else:
+            p['scroll'] = max(0, p['scroll'] - dy * 70)
+
+    def _draw_popup(self, screen):
+        p = self.popup
+        # keep the search box focused while the popup is up
+        if p.get('search', True) and (self._focus is None or self._focus.key != 'popsearch'):
+            self._focus = SimpleNamespace(key='popsearch', edit=p['edit'], set=lambda v: None)
+            self._focus_before = None
+        if p['edit'].value != p['last_q']:
+            p['last_q'] = p['edit'].value
+            p['hi'] = 0
+            p['scroll'] = 0
+        full = pygame.Rect(0, 0, self.screen_width, self.screen_height)
+        uk.draw_rect_on(screen, (0, 0, 0, 110 if p['kind'] == 'list' else 175), full, 0, 0)
+        self._add_hit(full, key='backdrop', down=lambda pos: self._close_popup())
+        if p['kind'] == 'list':
+            self._draw_list_popup(screen, p)
+        else:
+            self._draw_grid_popup(screen, p)
+
+    def _draw_list_popup(self, screen, p):
+        sw, sh = self.screen_width, self.screen_height
+        entries = self._popup_entries(p)
+        md = self.f_md
+        row_h, pad = 38, 10
+        search_h = self.m_field_h if p['search'] else 0
+        anchor = p['anchor']
+        pw = max(300, min(520, (anchor.w if anchor else 340)))
+        vis_max = 9
+        n = max(1, len(entries))
+        vis = min(vis_max, n)
+        p['vis_rows'] = vis
+        ph = pad + (search_h + 8 if search_h else 0) + vis * row_h + pad
+        if anchor is not None:
+            px = int(_clamp(anchor.x, 16, sw - pw - 16))
+            py = anchor.bottom + 6
+            if py + ph > sh - 16:
+                py = max(16, anchor.y - 6 - ph)
+        else:
+            px, py = (sw - pw) // 2, (sh - ph) // 2
+        panel = pygame.Rect(px, py, pw, ph)
+        uk.draw_panel(screen, panel, bg=_T.PANEL_BG, border=_T.GOLD, border_width=1, radius=12)
+        self._add_hit(panel, key='popanel')
+
+        y = panel.y + pad
+        if search_h:
+            sr = pygame.Rect(panel.x + pad, y, panel.w - 2 * pad, search_h)
+            self._text_field(screen, 'popsearch', sr, lambda: p['edit'].value, lambda v: None,
+                             "Search or type a value...", max_len=60)
+            y += search_h + 8
+        p['scroll'] = int(_clamp(p['scroll'], 0, max(0, len(entries) - vis)))
+        rows_area = pygame.Rect(panel.x + 6, y, panel.w - 12, vis * row_h)
+        old_vp, self._vp = self._vp, rows_area
+        old = self._push_clip(screen, rows_area)
+        if not entries:
+            msg = p['placeholder'] or "Nothing matches"
+            self._text_mid(screen, md, msg, _T.TEXT_DIM, rows_area.x + 14, rows_area.y + row_h // 2,
+                           max_w=rows_area.w - 28)
+        for i in range(p['scroll'], min(len(entries), p['scroll'] + vis)):
+            value, label = entries[i]
+            rr = pygame.Rect(rows_area.x, rows_area.y + (i - p['scroll']) * row_h, rows_area.w - 8, row_h - 2)
+            cur = str(value) == str(p['current']) and not label.startswith("Use: ")
+            hov = self._hov(rr)
+            if hov:
+                p['hi'] = i
+            on = i == p['hi']
+            t = self._anim(('pop', i), on)
+            if cur:
+                self._panel(screen, rr, (48, 39, 19), _T.GOLD, 1, 8)
+            elif t > 0:
+                self._panel(screen, rr, uk.lerp_color(_FIELD, _CARD_HI, t),
+                            uk.lerp_color(_T.CARD_BORDER, _T.GOLD, 0.6 * t), 1, 8)
+            fg = _T.GOLD_BRIGHT if cur else uk.lerp_color(_T.TEXT_SECONDARY, _T.TEXT_PRIMARY, t)
+            self._text_mid(screen, md, label, fg, rr.x + 14, rr.centery, dyn=True, max_w=rr.w - 28)
+            self._add_hit(rr, key=('popitem', i), down=lambda pos, v=value: self._popup_pick(v))
+        self._pop_clip(screen, old)
+        self._vp = old_vp
+        if len(entries) > vis:
+            frac = p['scroll'] / max(1, len(entries) - vis)
+            th = max(24, int(rows_area.h * vis / len(entries)))
+            ty = rows_area.y + int((rows_area.h - th) * frac)
+            uk.draw_rect_on(screen, _T.CHIP_BORDER, pygame.Rect(panel.right - 8, ty, 3, th), 0, 1)
+
+    def _draw_grid_popup(self, screen, p):
+        sw, sh = self.screen_width, self.screen_height
+        which = p['which']
+        accent = COND_ACCENT if which == 'c' else ACT_ACCENT
+        pw = min(sw - 120, 1000)
+        ph = min(sh - 90, 700)
+        panel = pygame.Rect(0, 0, pw, ph)
+        panel.center = (sw // 2, sh // 2)
+        uk.draw_panel(screen, panel, bg=_T.PANEL_BG, border=accent, border_width=2, radius=14)
+        self._add_hit(panel, key='popanel')
+        pad = 24
+        self._text_mid(screen, self.f_lg, p['title'].upper(), _T.TEXT_PRIMARY, panel.x + pad, panel.y + 34)
+        close = pygame.Rect(panel.right - pad - 40, panel.y + 14, 40, 40)
+        self._icon_btn(screen, 'grid_close', close, _ic_x, self._close_popup, tip="Close  (Esc)", size=26)
+        if p.get('multi'):
+            hint = "Click as many as you like"
+            self._text_mid(screen, self.f_sm, hint, _T.TEXT_DIM, close.left - 18, panel.y + 34, "r")
+
+        sr = pygame.Rect(panel.x + pad, panel.y + 66, panel.w - 2 * pad, self.m_field_h)
+        self._text_field(screen, 'popsearch', sr, lambda: p['edit'].value, lambda v: None,
+                         "Search...", max_len=60)
+        vp = pygame.Rect(panel.x + 10, sr.bottom + 12, panel.w - 20, panel.bottom - (sr.bottom + 12) - 12)
+
+        q = p['edit'].value.strip().lower()
+        if which == 'c':
+            cats = [(n, list(ks)) for n, ks in _COND_CATEGORIES]
+            label_of = lambda k: CONDITION_KINDS[k]['label']
+            desc_of = lambda k: _COND_DESCS.get(k, "")
+        else:
+            cats = [(n, list(ks)) for n, ks in _ACTION_CATEGORIES]
+            listed = {k for _, ks in cats for k in ks}
+            extra = [t for t in _action_type_list() if t not in listed]
+            if extra:
+                cats.append(("Other", extra))
+            label_of = _humanize
+            desc_of = lambda k: _ACTION_DESCS.get(k, "")
+        valid = set(CONDITION_KINDS) if which == 'c' else set(ACTION_SCHEMA)
+        cols = 3 if vp.w >= 760 else (2 if vp.w >= 500 else 1)
+        gap = 12
+        inner_w = vp.w - 24 - 8
+        tw = (inner_w - gap * (cols - 1)) // cols
+        th = max(66, self.f_md.cap_h + self.f_sm.cap_h + 38)
+
+        layout = []      # ('cap', y, text) / ('tile', Rect(rel), key)
+        y = 0
+        tiles_found = []
+        for name, keys in cats:
+            keys = [k for k in keys if k in valid and
+                    (not q or q in label_of(k).lower() or q in k.lower() or q in desc_of(k).lower())]
+            if not keys:
+                continue
+            layout.append(('cap', y, name))
+            y += self.f_sm.cap_h + 18
+            for i, k in enumerate(keys):
+                r, c = divmod(i, cols)
+                layout.append(('tile', pygame.Rect(c * (tw + gap), y + r * (th + gap), tw, th), k))
+                tiles_found.append(k)
+            y += ((len(keys) + cols - 1) // cols) * (th + gap) + 10
+        p['tiles'] = tiles_found
+        total = y
+        max_sc = max(0, total + 12 - vp.h)
+        p['scroll'] = int(_clamp(p['scroll'], 0, max_sc))
+        sc = p['scroll']
+
+        old_vp, self._vp = self._vp, vp
+        old = self._push_clip(screen, vp)
+        ox, oy = vp.x + 12, vp.y + 6 - sc
+        if not layout:
+            self._text_mid(screen, self.f_md, "Nothing matches your search", _T.TEXT_DIM,
+                           vp.centerx, vp.y + 50, "c")
+        for item in layout:
+            if item[0] == 'cap':
+                self._caption(screen, item[2], ox, oy + item[1], inner_w)
+                continue
+            _, rel, key = item
+            r = rel.move(ox, oy)
+            if r.bottom < vp.y or r.y > vp.bottom:
+                continue
+            cur = key == p.get('current')
+            t = self._anim(('tile', p['which'], key), self._hov(r))
+            self._panel(screen, r, (48, 39, 19) if cur else uk.lerp_color(_CARD, _CARD_HI, t),
+                        _T.GOLD if cur else uk.lerp_color(_T.CARD_BORDER, accent, 0.78 * t), 1, 10)
+            if t > 0:
+                uk.draw_soft_glow(screen, r.center, int(r.w * 0.45), accent, max_alpha=int(18 * t))
+            fg = _T.GOLD_BRIGHT if cur else uk.lerp_color(_T.TEXT_PRIMARY, accent, 0.5 * t)
+            self._text_top(screen, self.f_md, self.f_md.fit(label_of(key), r.w - 28), fg, r.x + 14, r.y + 14, dyn=True)
+            d = desc_of(key)
+            if d:
+                self._text_top(screen, self.f_sm, self.f_sm.fit(d, r.w - 28), _T.TEXT_DIM, r.x + 14,
+                               r.y + 14 + self.f_md.cap_h + 12)
+            self._add_hit(r, key=('tile', p['which'], key), down=lambda pos, k=key: self._popup_pick(k))
+        self._pop_clip(screen, old)
+        self._vp = old_vp
+
+        if max_sc > 0:
+            track = pygame.Rect(vp.right - 8, vp.y + 4, 4, vp.h - 8)
+            thh = max(30, int(track.h * vp.h / (total + 12)))
+            frac = sc / max_sc
+            uk.draw_rect_on(screen, (24, 28, 38), track, 0, 2)
+            uk.draw_rect_on(screen, _T.CHIP_BORDER,
+                            pygame.Rect(track.x, track.y + int((track.h - thh) * frac), track.w, thh), 0, 2)
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Set Spawn / Set Position — click the room to place the point
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _open_spawn(self, model, row, field_name):
+        """No-ops if there's no room to preview a point against yet.
+        field_name is 'spawn_x' (change_map: room from the row's room_name)
+        or 'x' (set_player_location: room from set_current_room())."""
+        self._blur()
         if field_name == 'spawn_x':
             room_name = row['params'].get('room_name', '')
-            y_field, title = 'spawn_y', 'Set Spawn'
-        else:  # 'x' — set_player_location
-            room_name = self._current_room_name or ''
-            y_field, title = 'y', 'Set Position'
-
+            y_field, title = 'spawn_y', 'Set spawn'
+        else:
+            room_name = model._current_room_name or ''
+            y_field, title = 'y', 'Set position'
         if not room_name:
             return
-
-        width, height = self._known_room_dims.get(room_name, _ROOM_PICKER_DEFAULT_DIMS)
+        width, height = model._known_room_dims.get(room_name, _ROOM_PICKER_DEFAULT_DIMS)
         try:
             sx = float(row['params'].get(field_name, ''))
             sy = float(row['params'].get(y_field, ''))
         except (TypeError, ValueError):
             sx = sy = None
-
-        preview_surface = None
-        if self._room_preview_provider is not None:
+        preview = None
+        if model._room_preview_provider is not None:
             try:
-                preview_surface = self._room_preview_provider(room_name)
+                preview = model._room_preview_provider(room_name)
             except Exception:
-                preview_surface = None  # best-effort — falls back to the plain grid
+                preview = None
+        self.spawn = {'row': row, 'field': field_name, 'y_field': y_field, 'title': title,
+                      'room': room_name, 'width': width, 'height': height,
+                      'known_dims': room_name in model._known_room_dims,
+                      'x': sx, 'y': sy, 'preview': preview, '_scaled': None,
+                      'canvas': None, 'scale': None}
 
-        self._spawn_picker = {
-            'row_index': row_index,
-            'field_name': field_name,
-            'y_field': y_field,
-            'title': title,
-            'room_name': room_name,
-            'width': width,
-            'height': height,
-            'known_dims': room_name in self._known_room_dims,
-            'x': sx,
-            'y': sy,
-            'preview_surface': preview_surface,   # raw, full-room-size — scaled per-frame in _draw_spawn_picker
-            '_scaled_preview': None,               # (surface, size) cache, see _draw_spawn_picker
-        }
-
-    def _handle_spawn_picker_input(self, event):
-        picker = self._spawn_picker
-        if picker is None:
+    def _spawn_done(self):
+        sp = self.spawn
+        if sp is None or sp['x'] is None or sp['y'] is None:
             return
+        params = sp['row']['params']
+        params[sp['field']] = str(int(round(sp['x'])))
+        params[sp['y_field']] = str(int(round(sp['y'])))
+        self.spawn = None
+        if self._focus is not None and str(self._focus.key).startswith('spawn_'):
+            self._focus = None
 
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-            self._spawn_picker = None
-            return
+    def _spawn_cancel(self):
+        self.spawn = None
+        if self._focus is not None and str(self._focus.key).startswith('spawn_'):
+            self._focus = None
 
-        if event.type != pygame.MOUSEBUTTONDOWN or event.button != 1:
-            return
-        mouse_pos = event.pos
+    def _draw_spawn(self, screen):
+        sp = self.spawn
+        sw, sh = self.screen_width, self.screen_height
+        full = pygame.Rect(0, 0, sw, sh)
+        uk.draw_rect_on(screen, (0, 0, 0, 185), full, 0, 0)
+        self._add_hit(full, key='backdrop')
+        panel = pygame.Rect(40, 34, sw - 80, sh - 68)
+        uk.draw_panel(screen, panel, bg=_T.PANEL_BG, border=_T.GOLD, border_width=2, radius=14)
+        self._add_hit(panel, key='popanel')
+        pad = 24
+        self._text_mid(screen, self.f_lg, ("%s: %s" % (sp['title'], sp['room'])).upper(), _T.TEXT_PRIMARY,
+                       panel.x + pad, panel.y + 34, dyn=True, max_w=panel.w - 2 * pad - 60)
+        close = pygame.Rect(panel.right - pad - 40, panel.y + 14, 40, 40)
+        self._icon_btn(screen, 'spawn_close', close, _ic_x, self._spawn_cancel, tip="Cancel  (Esc)", size=26)
+        self._text_top(screen, self.f_sm, "Click or drag inside the room to place the point.",
+                       _T.TEXT_MUTED, panel.x + pad, panel.y + 62)
+        top = panel.y + 86
+        if not sp['known_dims']:
+            top += self._note(screen, panel.x + pad, top, panel.w - 2 * pad,
+                              "Exact room size unknown, showing a %dx%d placeholder." % (sp['width'], sp['height']))
+        elif sp['preview'] is None:
+            top += self._note(screen, panel.x + pad, top, panel.w - 2 * pad,
+                              "No tile preview available for this room, showing a grid.")
+        top += 6
+        bar_h = self.m_pill_h + 8
+        avail = pygame.Rect(panel.x + pad, top, panel.w - 2 * pad, panel.bottom - bar_h - 20 - top)
+        scale = max(0.01, min(avail.w / sp['width'], avail.h / sp['height']))
+        cw_, ch_ = max(1, int(sp['width'] * scale)), max(1, int(sp['height'] * scale))
+        canvas = pygame.Rect(avail.x + (avail.w - cw_) // 2, avail.y + max(0, (avail.h - ch_) // 2), cw_, ch_)
+        sp['canvas'], sp['scale'] = canvas, scale
 
-        done_rect = picker.get('done_rect')
-        if done_rect and done_rect.collidepoint(mouse_pos):
-            if picker['x'] is not None and picker['y'] is not None:
-                row_index = picker['row_index']
-                if 0 <= row_index < len(self.rows):
-                    self.rows[row_index]['params'][picker['field_name']] = str(int(round(picker['x'])))
-                    self.rows[row_index]['params'][picker['y_field']] = str(int(round(picker['y'])))
-                self._spawn_picker = None
-            return
-
-        cancel_rect = picker.get('cancel_rect')
-        if cancel_rect and cancel_rect.collidepoint(mouse_pos):
-            self._spawn_picker = None
-            return
-
-        canvas_rect = picker.get('canvas_rect')
-        scale = picker.get('scale')
-        if canvas_rect and scale and canvas_rect.collidepoint(mouse_pos):
-            rel_x = mouse_pos[0] - canvas_rect.x
-            rel_y = mouse_pos[1] - canvas_rect.y
-            picker['x'] = max(0, min(picker['width'], rel_x / scale))
-            picker['y'] = max(0, min(picker['height'], rel_y / scale))
-
-    def _draw_spawn_picker(self, screen):
-        """Purely a to-scale rectangle + grid standing in for the room —
-        this builder has no live tile/background renderer of its own to
-        draw a real room preview with (see set_known_rooms() for how a
-        host can at least supply accurate room dimensions so the scale,
-        if not the art, is right)."""
-        colors = self.colors
-        picker = self._spawn_picker
-        sw, sh = screen.get_size()
-
-        overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 180))
-        screen.blit(overlay, (0, 0))
-
-        margin = 60
-        panel = pygame.Rect(margin, margin, sw - margin * 2, sh - margin * 2)
-        panel_surf = pygame.Surface((panel.width, panel.height), pygame.SRCALPHA)
-        panel_surf.fill(colors.get('bg_transparent', (20, 20, 20, 235)))
-        screen.blit(panel_surf, panel.topleft)
-        screen.draw_rect(colors['accent'], panel, 2)
-
-        title = self.font_medium.render("%s — %s" % (picker['title'], picker['room_name']), True, colors['text'])
-        screen.blit(title, (panel.x + 12, panel.y + 10))
-        hint = self.font_small.render(
-            "Left-click in the room to place the point — Esc to cancel", True, colors['text_dim'])
-        screen.blit(hint, (panel.x + 12, panel.y + 34))
-
-        top_offset = 58
-        if not picker['known_dims']:
-            note = self.font_small.render(
-                "(exact room size unknown — showing a %dx%d placeholder; "
-                "wire set_known_rooms() for the real size)" % (picker['width'], picker['height']),
-                True, colors['text_dim'])
-            screen.blit(note, (panel.x + 12, panel.y + 52))
-            top_offset = 74
-        elif picker['preview_surface'] is None:
-            note = self.font_small.render(
-                "(no tile preview available — wire set_room_preview_provider() to see the room)",
-                True, colors['text_dim'])
-            screen.blit(note, (panel.x + 12, panel.y + 52))
-            top_offset = 74
-
-        avail_top = panel.y + top_offset
-        avail_w = panel.width - 24
-        avail_h = panel.bottom - 70 - avail_top
-        scale = max(0.01, min(avail_w / picker['width'], avail_h / picker['height']))
-        canvas_w = max(1, int(picker['width'] * scale))
-        canvas_h = max(1, int(picker['height'] * scale))
-        canvas_rect = pygame.Rect(
-            panel.x + 12 + (avail_w - canvas_w) // 2,
-            avail_top + max(0, (avail_h - canvas_h) // 2),
-            canvas_w, canvas_h)
-
-        screen.draw_rect(colors['panel_light'], canvas_rect)
-        if picker['preview_surface'] is not None:
-            cache = picker.get('_scaled_preview')
-            if cache is None or cache[1] != (canvas_w, canvas_h):
-                scaled = pygame.transform.smoothscale(picker['preview_surface'], (canvas_w, canvas_h))
-                picker['_scaled_preview'] = (scaled, (canvas_w, canvas_h))
+        uk.draw_rect_on(screen, _INSET, canvas, 0, 0)
+        if sp['preview'] is not None:
+            cache = sp['_scaled']
+            if cache is None or cache[1] != (cw_, ch_):
+                try:
+                    scaled = pygame.transform.smoothscale(sp['preview'], (cw_, ch_))
+                except Exception:
+                    scaled = pygame.transform.scale(sp['preview'], (cw_, ch_))
+                sp['_scaled'] = (scaled, (cw_, ch_))
             else:
                 scaled = cache[0]
-            screen.blit(scaled, canvas_rect.topleft)
+            uk.blit_surface(screen, scaled, canvas.topleft, transient=False)
         else:
-            grid_step = max(16, int(64 * scale))
-            for gx in range(canvas_rect.x, canvas_rect.right, grid_step):
-                screen.draw_line(colors['grid'], (gx, canvas_rect.y), (gx, canvas_rect.bottom), 1)
-            for gy in range(canvas_rect.y, canvas_rect.bottom, grid_step):
-                screen.draw_line(colors['grid'], (canvas_rect.x, gy), (canvas_rect.right, gy), 1)
-        screen.draw_rect(colors['accent'], canvas_rect, 2)
-
-        if picker['x'] is not None and picker['y'] is not None:
-            mx = canvas_rect.x + int(picker['x'] * scale)
-            my = canvas_rect.y + int(picker['y'] * scale)
-            screen.draw_circle(colors['success'], (mx, my), 6)
-            screen.draw_circle(colors['bg'], (mx, my), 6, 1)
-            coord_label = self.font_small.render(
-                "(%d, %d)" % (picker['x'], picker['y']), True, colors['text'])
-            label_x = min(mx + 10, panel.right - 12 - coord_label.get_width())
-            screen.blit(coord_label, (label_x, my - 18))
-
-        picker['canvas_rect'] = canvas_rect
-        picker['scale'] = scale
-
-        btn_w = 100
-        done_rect = pygame.Rect(panel.right - 12 - btn_w, panel.bottom - 12 - _FIELD_H - 6, btn_w, _FIELD_H + 6)
-        cancel_rect = pygame.Rect(done_rect.x - btn_w - 10, done_rect.y, btn_w, _FIELD_H + 6)
-
-        done_enabled = picker['x'] is not None and picker['y'] is not None
-        screen.draw_rect(colors['success'] if done_enabled else colors['panel_light'],
-                          done_rect, border_radius=5)
-        done_label = self.font_small.render("Done", True, colors['bg'] if done_enabled else colors['text_dim'])
-        screen.blit(done_label, done_label.get_rect(center=done_rect.center))
-
-        screen.draw_rect(colors['panel_light'], cancel_rect, border_radius=5)
-        screen.draw_rect(colors['grid'], cancel_rect, 1, border_radius=5)
-        cancel_label = self.font_small.render("Cancel", True, colors['text'])
-        screen.blit(cancel_label, cancel_label.get_rect(center=cancel_rect.center))
-
-        picker['done_rect'] = done_rect
-        picker['cancel_rect'] = cancel_rect
-
-    def _draw_skill_dropdown(self, screen, x, list_y, row_index):
-        """Skill list depends on the row's own 'mode', via
-        _skill_choices_for_row(): 'remove' shows only what
-        self._current_character_id actually has equipped (so you can't pick
-        a skill to remove that was never equipped); 'add' shows only skills
-        from the global roster that character doesn't already have (so you
-        can't pick one that's already equipped)."""
-        colors = self.colors
-        items = []
-        list_w = 180
-        real, placeholder = self._skill_choices_for_row(row_index)
-        names = real or [placeholder]
-        visible = names[:8]
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if real:
-                items.append((item_rect, name))
-        self._rects['skill_dropdown_items'] = items
-
-    def _draw_transformation_dropdown(self, screen, x, list_y, row_index):
-        """Transformation form list depends on the row's own 'mode', via
-        _transformation_choices_for_row(): 'remove' shows only what
-        self._current_character_id actually has unlocked (so you can't
-        pick a form to remove that was never unlocked); 'add' shows only
-        forms configured on that character that aren't unlocked yet (so
-        you can't pick one that's already unlocked)."""
-        colors = self.colors
-        items = []
-        list_w = 180
-        real, placeholder = self._transformation_choices_for_row(row_index)
-        names = real or [placeholder]
-        visible = names[:8]
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if real:
-                items.append((item_rect, name))
-        self._rects['transformation_dropdown_items'] = items
-
-    def _draw_skin_dropdown(self, screen, x, list_y, row_index):
-        """Skin/costume list depends on which character it's scoped to, via
-        _costume_choices_for_row(): the row's own 'character_id' field for
-        set_player_character rows (skinning the character being switched
-        TO), or self._current_character_id for set_player_skin rows
-        (skinning whoever's currently played)."""
-        colors = self.colors
-        items = []
-        list_w = 180
-        real, placeholder = self._costume_choices_for_row(row_index)
-        names = real or [placeholder]
-        visible = names[:8]
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if real:
-                items.append((item_rect, name))
-        self._rects['skin_dropdown_items'] = items
-
-    def _draw_animation_dropdown(self, screen, x, list_y, row_index):
-        """Animation list depends on the row's own 'character_id' field,
-        via _animation_choices_for_row() — play_character_animation always
-        carries its own character_id (no "currently played" fallback like
-        the skin picker's set_player_skin case), so this is always scoped
-        to whatever's picked in that same row."""
-        colors = self.colors
-        items = []
-        list_w = 180
-        real, placeholder = self._animation_choices_for_row(row_index)
-        names = real or [placeholder]
-        visible = names[:8]
-        list_rect = pygame.Rect(x, list_y, list_w, len(visible) * 22)
-        screen.draw_rect(colors['panel_light'], list_rect)
-        screen.draw_rect(colors['accent'], list_rect, 2)
-        for i, name in enumerate(visible):
-            item_rect = pygame.Rect(x, list_y + i * 22, list_w, 22)
-            label = self.font_small.render(name, True, colors['text'])
-            screen.blit(label, (item_rect.x + 6, item_rect.y + 4))
-            if real:
-                items.append((item_rect, name))
-        self._rects['animation_dropdown_items'] = items
-
-    def content_height(self):
-        return getattr(self, '_content_height', 40)
-
-# ═════════════════════════════════════════════════════════════════════════
-# EventEditorWindow — combines both into one modal popup
-# ═════════════════════════════════════════════════════════════════════════
-
-import pygame
-
-_MARGIN = 28
-_PADDING = 24
-_DIVIDER_GAP = 18
-_BUTTON_H = 38
-
-
-class EventEditorWindow:
-    """Modal popup combining ConditionBuilder + ActionSequenceBuilder."""
-
-    def __init__(self, flag_manager, colors=None):
-        self.colors = colors or _DEFAULT_COLORS
-        self.flag_manager = flag_manager
-
-        self.condition_builder = ConditionBuilder(flag_manager, colors=self.colors)
-        self.action_builder = ActionSequenceBuilder(colors=self.colors)
-        self.action_builder._condition_flag_manager = flag_manager
-
-        self.font_title = pygame.font.Font(None, 30)
-        self.font_subtitle = pygame.font.Font(None, 18)
-        self.font_section = pygame.font.Font(None, 22)
-        self.font_small = pygame.font.Font(None, 18)
-
-        # The original row builders were intentionally compact.  Inside the
-        # full event workspace, give them a little more breathing room without
-        # changing their data/input model.
-        self.condition_builder.font_small = pygame.font.Font(None, 18)
-        self.condition_builder.font_medium = pygame.font.Font(None, 22)
-        self.action_builder.font_small = pygame.font.Font(None, 18)
-        self.action_builder.font_medium = pygame.font.Font(None, 22)
-
-        self.active = False
-        self.title = "Edit Event"
-        self._on_save = None
-
-        self.last_conditions = []
-        self.last_actions = []
-
-        self._rects = {}
-        self._scroll_offset = 0
-
-    # ── Lifecycle ────────────────────────────────────────────────────────────
-
-    def open(self, title="Edit Event", existing_conditions=None, existing_actions=None, on_save=None):
-        self.title = title
-        self._on_save = on_save
-        self.condition_builder.refresh(existing_conditions)
-        self.action_builder.refresh(existing_actions)
-        self._scroll_offset = 0
-        self.active = True
-
-    def set_current_character(self, character_id, get_equipped_skills=None):
-        """Forwarded to the action builder — see ActionSequenceBuilder.set_current_character()."""
-        self.action_builder.set_current_character(character_id, get_equipped_skills)
-
-    def set_current_room(self, room_name):
-        """Forwarded to the action builder — see ActionSequenceBuilder.set_current_room()."""
-        self.action_builder.set_current_room(room_name)
-
-    def set_known_rooms(self, room_names, room_dims=None):
-        """Forwarded to the action builder — see ActionSequenceBuilder.set_known_rooms()."""
-        self.action_builder.set_known_rooms(room_names, room_dims)
-
-    def set_room_preview_provider(self, provider):
-        """Forwarded to the action builder — see ActionSequenceBuilder.set_room_preview_provider()."""
-        self.action_builder.set_room_preview_provider(provider)
-
-    def _commit_active_fields(self):
-        """Flush whatever text field either builder currently has focused
-        into its row's params. Needed because clicking Save goes straight to
-        close() without ever passing that click through to the builders'
-        own handle_input() — which is normally what commits _active_text on
-        an outside click — so a field being typed into when Save is pressed
-        would otherwise be silently discarded."""
-        for builder in (self.condition_builder, self.action_builder):
-            active = getattr(builder, '_active_field', None)
-            if active is not None:
-                row_index, field_name = active
-                if 0 <= row_index < len(builder.rows):
-                    builder.rows[row_index]['params'][field_name] = builder._active_text
-                builder._active_field = None
-
-    def close(self, save):
-        if save:
-            self._commit_active_fields()
-            self.last_conditions = self.condition_builder.get_condition_list()
-            self.last_actions = self.action_builder.get_action_list()
-            if self._on_save:
-                self._on_save(self.last_conditions, self.last_actions)
-        self.active = False
-        self._on_save = None
-
-    # ── Layout ───────────────────────────────────────────────────────────────
-
-    def _window_rect(self, screen):
-        sw, sh = screen.get_size()
-        # Use nearly the whole logical screen.  The old 40px margin left a
-        # surprising amount of unused space on 720/800px-high editor views.
-        width = max(760, int(sw * 0.94))
-        height = max(500, int(sh * 0.92))
-        width = min(width, sw - 28)
-        height = min(height, sh - 28)
-        return pygame.Rect((sw - width) // 2, (sh - height) // 2, width, height)
-
-    def _content_origin(self, screen):
-        win = self._window_rect(screen)
-        content_x = win.x + _PADDING
-        content_y = win.y + 108
-        content_w = win.width - _PADDING * 2
-
-        # Conditions need a little less room than actions, but not the old
-        # cramped 34/66 split.
-        left_w = max(360, int(content_w * 0.42))
-        right_x = content_x + left_w + _DIVIDER_GAP
-        right_w = content_w - left_w - _DIVIDER_GAP
-        return content_x, content_y, left_w, right_x, right_w
-
-    # ── Input ────────────────────────────────────────────────────────────────
-
-    def handle_input(self, event):
-        if not self.active:
-            return
-
-        if (self.action_builder._option_editor is not None or
-                self.action_builder._conditional_editor is not None or
-                self.action_builder._spawn_picker is not None):
-            self.action_builder.handle_input(event, *self._rects.get('action_origin', (0, 0)))
-            return
-
-        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-            self.close(save=False)
-            return
-
-        if event.type == pygame.MOUSEWHEEL:
-            # An open action-type, music, or sound dropdown owns the wheel
-            # while it's open — otherwise scrolling to reach an item would
-            # also scroll the popup out from under it.
-            if (self.action_builder._open_type_dropdown_row is not None
-                    or self.action_builder._open_music_dropdown is not None
-                    or self.action_builder._open_sound_dropdown is not None):
-                self.action_builder.handle_input(event, *self._rects.get('action_origin', (0, 0)))
-                return
-            max_scroll = max(0, getattr(self, '_total_content_height', 0) - getattr(self, '_viewport_height', 0))
-            self._scroll_offset -= event.y * 25
-            self._scroll_offset = max(0, min(self._scroll_offset, max_scroll))
-            return
-
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            save_rect = self._rects.get('save_btn')
-            if save_rect and save_rect.collidepoint(event.pos):
-                self.close(save=True)
-                return
-            cancel_rect = self._rects.get('cancel_btn')
-            if cancel_rect and cancel_rect.collidepoint(event.pos):
-                self.close(save=False)
-                return
-
-        # Both builders get every event and independently no-op unless it
-        # falls on one of their own last-drawn rects. That's also what makes
-        # cross-builder focus switching work for free: any click anywhere
-        # (even one meant for the other builder) makes each builder commit
-        # and clear its own active text field first, before checking for a
-        # new one to activate.
-        cond_origin = self._rects.get('condition_origin')
-        action_origin = self._rects.get('action_origin')
-        if cond_origin:
-            self.condition_builder.handle_input(event, *cond_origin)
-        if action_origin:
-            self.action_builder.handle_input(event, *action_origin)
-
-    # ── Draw ─────────────────────────────────────────────────────────────────
-
-    def _draw_card(self, screen, rect, title, subtitle, accent):
-        colors = self.colors
-        screen.draw_rect(colors['panel'], rect, border_radius=10)
-        screen.draw_rect(colors['grid'], rect, 1, border_radius=10)
-        # Accent strip gives each side a clear visual identity without turning
-        # the editor into a rainbow of unrelated colors.
-        strip = pygame.Rect(rect.x, rect.y, 5, rect.height)
-        screen.draw_rect(accent, strip, border_top_left_radius=10, border_bottom_left_radius=10)
-        title_s = self.font_section.render(title, True, colors['text'])
-        screen.blit(title_s, (rect.x + 18, rect.y + 14))
-        sub_s = self.font_subtitle.render(subtitle, True, colors['text_dim'])
-        screen.blit(sub_s, (rect.x + 18, rect.y + 38))
-
-    def _draw_chip(self, screen, rect, text, fill, text_color=None):
-        colors = self.colors
-        screen.draw_rect(fill, rect, border_radius=12)
-        label = self.font_subtitle.render(text, True, text_color or colors['text'])
-        screen.blit(label, label.get_rect(center=rect.center))
-
-    def draw(self, screen):
-        if not self.active:
-            return
-
-        # Conditional branches are a full-page replacement editor.  Never draw
-        # the main event editor underneath it.
-        if self.action_builder._conditional_editor is not None:
-            self.action_builder._draw_conditional_editor(screen)
-            return
-
-        colors = self.colors
-        sw, sh = screen.get_size()
-
-        # Dim the game behind the editor.
-        overlay = pygame.Surface((sw, sh), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 175))
-        screen.blit(overlay, (0, 0))
-
-        win = self._window_rect(screen)
-        win_surf = pygame.Surface((win.width, win.height), pygame.SRCALPHA)
-        win_surf.fill(colors['bg_transparent'])
-        screen.blit(win_surf, win.topleft)
-        screen.draw_rect(colors['accent'], win, 2, border_radius=12)
-
-        # ── Header ───────────────────────────────────────────────────────────
-        title_s = self.font_title.render(self.title, True, colors['text'])
-        screen.blit(title_s, (win.x + _PADDING, win.y + 14))
-        subtitle = self.font_subtitle.render(
-            "Build the event from left to right: requirements first, then what happens.",
-            True, colors['text_dim'])
-        screen.blit(subtitle, (win.x + _PADDING, win.y + 48))
-
-        # Event summary chips make the otherwise-empty header area useful.
-        cond_count = len(self.condition_builder.rows)
-        action_count = len(self.action_builder.rows)
-        chip_y = win.y + 12
-        chip_h = 28
-        right = win.right - _PADDING
-        save_w = 118
-        esc = self.font_subtitle.render("Esc  Cancel", True, colors['text_dim'])
-        screen.blit(esc, (right - esc.get_width(), win.y + 50))
-
-        # ── Workspace cards ─────────────────────────────────────────────────
-        content_x, content_y, left_w, right_x, right_w = self._content_origin(screen)
-        content_bottom = win.bottom - _BUTTON_H - _PADDING * 2
-        card_top = content_y - 8
-        card_h = content_bottom - card_top
-
-        left_card = pygame.Rect(content_x, card_top, left_w, card_h)
-        right_card = pygame.Rect(right_x, card_top, right_w, card_h)
-        self._draw_card(
-            screen, left_card, "Conditions",
-            "Everything below must be true before this event fires.",
-            colors['accent'])
-        self._draw_card(
-            screen, right_card, "Actions",
-            "These run from top to bottom once the event starts.",
-            colors['success'])
-
-        chip1 = pygame.Rect(left_card.right - 108, left_card.y + 14, 92, chip_h)
-        self._draw_chip(screen, chip1, f"{cond_count} condition" + ("s" if cond_count != 1 else ""),
-                        colors['input_bg'], colors['text_dim'])
-        chip2 = pygame.Rect(right_card.right - 92, right_card.y + 14, 76, chip_h)
-        self._draw_chip(screen, chip2, f"{action_count} action" + ("s" if action_count != 1 else ""),
-                        colors['input_bg'], colors['text_dim'])
-
-        # Builders start below the card header, leaving a clean visual frame
-        # around their existing controls.
-        inner_top = card_top + 68
-        clip_rect = pygame.Rect(
-            win.x + 1, inner_top, win.width - 2, content_bottom - inner_top)
-        screen.set_clip(clip_rect)
-
-        draw_y = inner_top - self._scroll_offset
-        cond_origin = (left_card.x + 16, draw_y)
-        action_origin = (right_card.x + 16, draw_y)
-        inner_left_w = left_card.width - 32
-        inner_right_w = right_card.width - 32
-
-        self.condition_builder.draw(screen, cond_origin[0], cond_origin[1], inner_left_w)
-        self.action_builder.draw(screen, action_origin[0], action_origin[1], inner_right_w)
-
-        col_height = max(
-            self.condition_builder.content_height(),
-            self.action_builder.content_height())
-
-        # Keep a subtle centre divider, but let the cards themselves establish
-        # the layout so the divider isn't doing all the visual work.
-        divider_x = right_x - _DIVIDER_GAP // 2
-        screen.draw_line(colors['grid'], (divider_x, inner_top),
-                         (divider_x, min(content_bottom, draw_y + col_height)), 1)
-        screen.set_clip(None)
-
-        self._viewport_height = content_bottom - inner_top
-        self._total_content_height = max(0, col_height)
-        self._rects['condition_origin'] = cond_origin
-        self._rects['action_origin'] = action_origin
-
-        # ── Footer ───────────────────────────────────────────────────────────
-        footer_y = win.bottom - _PADDING - _BUTTON_H
-        # A small guide makes the workflow discoverable for first-time use.
-        guide = self.font_subtitle.render(
-            "Tip: add a Conditional Branch inside Actions for IF / ELSE IF / ELSE logic.",
-            True, colors['text_dim'])
-        screen.blit(guide, (win.x + _PADDING, footer_y + 11))
-
-        btn_w = 112
-        save_rect = pygame.Rect(win.right - _PADDING - btn_w, footer_y, btn_w, _BUTTON_H)
-        cancel_rect = pygame.Rect(save_rect.x - btn_w - 10, footer_y, btn_w, _BUTTON_H)
-
-        screen.draw_rect(colors['success'], save_rect, border_radius=7)
-        save_label = self.font_small.render("Save Event", True, colors['bg'])
-        screen.blit(save_label, save_label.get_rect(center=save_rect.center))
-
-        screen.draw_rect(colors['panel_light'], cancel_rect, border_radius=7)
-        screen.draw_rect(colors['grid'], cancel_rect, 1, border_radius=7)
-        cancel_label = self.font_small.render("Cancel", True, colors['text'])
-        screen.blit(cancel_label, cancel_label.get_rect(center=cancel_rect.center))
-
-        self._rects['save_btn'] = save_rect
-        self._rects['cancel_btn'] = cancel_rect
-
+            step = max(16, int(64 * scale))
+            for gx in range(canvas.x, canvas.right, step):
+                uk.draw_line_on(screen, _HAIR, (gx, canvas.y), (gx, canvas.bottom), 1)
+            for gy in range(canvas.y, canvas.bottom, step):
+                uk.draw_line_on(screen, _HAIR, (canvas.x, gy), (canvas.right, gy), 1)
+        uk.draw_rect_on(screen, _T.GOLD, canvas, 2, 0)
+
+        def place(pos, canvas=canvas, scale=scale):
+            sp['x'] = _clamp((pos[0] - canvas.x) / scale, 0, sp['width'])
+            sp['y'] = _clamp((pos[1] - canvas.y) / scale, 0, sp['height'])
+
+        self._add_hit(canvas, key='spawn_canvas', down=place, drag=place)
+        mx, my = self._mouse
+        if canvas.collidepoint((mx, my)) and self.dialog is None:
+            uk.draw_line_on(screen, (*_T.KI_BLUE, 120), (canvas.x, my), (canvas.right, my), 1)
+            uk.draw_line_on(screen, (*_T.KI_BLUE, 120), (mx, canvas.y), (mx, canvas.bottom), 1)
+            hx, hy = (mx - canvas.x) / scale, (my - canvas.y) / scale
+            self._text_top(screen, self.f_sm, "%d, %d" % (hx, hy), _T.KI_BLUE,
+                           min(mx + 12, canvas.right - 90), max(canvas.y + 4, my - 22), dyn=True)
+        if sp['x'] is not None and sp['y'] is not None:
+            px, py = canvas.x + int(sp['x'] * scale), canvas.y + int(sp['y'] * scale)
+            uk.draw_soft_glow(screen, (px, py), 26, _T.GOLD, max_alpha=70)
+            uk.draw_circle_on(screen, _T.GOLD, (px, py), 7)
+            uk.draw_circle_on(screen, (0, 0, 0), (px, py), 7, 2)
+            lab = "%d, %d" % (sp['x'], sp['y'])
+            self._text_top(screen, self.f_sm, lab, _T.GOLD_BRIGHT,
+                           min(px + 12, canvas.right - self.f_sm.width(lab) - 6), max(canvas.y + 4, py - 24), dyn=True)
+
+        # bottom bar: numeric X / Y fields + Cancel / Done
+        by = panel.bottom - 20 - self.m_pill_h
+        x = panel.x + pad
+        for axis, label in (('x', 'X'), ('y', 'Y')):
+            self._text_mid(screen, self.f_md, label, _T.TEXT_MUTED, x, by + self.m_pill_h // 2)
+            fr = pygame.Rect(x + 26, by, 130, self.m_pill_h)
+
+            def getv(a=axis):
+                return '' if sp[a] is None else str(int(round(sp[a])))
+
+            def setv(v, a=axis):
+                v = v.strip()
+                if v in ('', '-', '.'):
+                    sp[a] = None if v == '' else sp[a]
+                    return
+                try:
+                    lim = sp['width'] if a == 'x' else sp['height']
+                    sp[a] = _clamp(float(v), 0, lim)
+                except ValueError:
+                    pass
+
+            self._text_field(screen, 'spawn_' + axis, fr, getv, setv, "0", max_len=8, allowed=_num_ok)
+            x = fr.right + 22
+        bw = 150
+        done = pygame.Rect(panel.right - pad - bw, by, bw, self.m_pill_h)
+        cancel = pygame.Rect(done.x - bw - 12, by, bw, self.m_pill_h)
+        ok = sp['x'] is not None and sp['y'] is not None
+        self._pill(screen, 'spawn_done', done, "Done", _T.GOLD, icon=_ic_check, enabled=ok,
+                   on_click=self._spawn_done, tip="Use this point  (Enter)")
+        self._pill(screen, 'spawn_cancel', cancel, "Cancel", _T.TEXT_SECONDARY, on_click=self._spawn_cancel)
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Confirm dialog
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _draw_dialog(self, screen):
+        d = self.dialog
+        r = self._dialog_rects()
+        uk.draw_rect_on(screen, (0, 0, 0, 170), pygame.Rect(0, 0, self.screen_width, self.screen_height), 0, 0)
+        accent = _T.DANGER_BRIGHT if d.get("danger") else _T.GOLD
+        pn = r["panel"]
+        uk.draw_panel(screen, pn, bg=_T.PANEL_BG, border=accent, border_width=2, radius=14)
+        self._text_top(screen, self.f_lg, d["title"], _T.TEXT_PRIMARY, pn.x + r["pad"], pn.y + r["pad"])
+        for i, line in enumerate(r["lines"]):
+            self._text_top(screen, self.f_md, line, _T.TEXT_SECONDARY, pn.x + r["pad"], r["msg_y"] + i * r["line_h"])
+        for key, rect, label, acc, icon in (
+                ("d_ok", r["ok"], d["confirm_label"], accent, self._icon_png(self._trash_icon, _ic_trash) if d.get("danger") else _ic_check),
+                ("d_cancel", r["cancel"], "Cancel", _T.TEXT_SECONDARY, None)):
+            t = self._anim(key, rect.collidepoint(self._mouse))
+            self._panel(screen, rect, uk.lerp_color(_CARD, _CARD_HI, t), uk.lerp_color(_T.CARD_BORDER, acc, 0.55 + 0.45 * t))
+            fg = uk.lerp_color(_T.TEXT_SECONDARY, acc, 0.55 + 0.45 * t)
+            ic = 20 if icon else 0
+            tw = self.f_md.width(label)
+            x = rect.centerx - (tw + (ic + 10 if icon else 0)) // 2
+            if icon:
+                icon(screen, pygame.Rect(x, rect.centery - 10, 20, 20), fg, 3)
+                x += 30
+            self._text_mid(screen, self.f_md, label, fg, x, rect.centery)
+
+
+__all__ = ['EventEditorWindow', 'ConditionBuilder', 'ActionSequenceBuilder',
+           'CONDITION_KINDS', 'ACTION_SCHEMA']

@@ -189,7 +189,7 @@ _LIFETIME      = 8.0    # seconds before an uncollected pickup despawns
 # in ZeniPickup.update()), repeating every _BLINK_PERIOD seconds, right up
 # until it despawns at _LIFETIME.
 _BLINK_WARN_DURATION = 2.0   # seconds before despawn that blinking starts
-_BLINK_PERIOD         = 0.1   # seconds for one full 100 -> 0 -> 100 cycle
+_BLINK_PERIOD         = 0.25  # seconds for one full 100 -> 0 -> 100 cycle
 
 # Hoisted out of update() — this is a constant (doesn't depend on self), but
 # was being recomputed from scratch on every single pickup, every frame.

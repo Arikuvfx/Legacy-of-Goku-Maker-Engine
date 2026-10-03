@@ -1350,11 +1350,17 @@ class IconGridMenu:
                 st = sf.render(item.shortcut, True, Theme.TEXT_MUTED)
             blit_surface(surface, st, st.get_rect(center=badge.center), transient=True)
 
-        icon_center = (rect.centerx, rect.y + int(rect.h * 0.40))
-        draw_circle_on(surface, (*accent, 18), icon_center, max(25, int(self.icon_size * .68)))
+        # Cards without an icon (e.g. the CONFIGURATION rows) get no glow
+        # circle and a vertically centered label instead of the lower
+        # label slot reserved under the icon.
         if item.icon is not None:
+            icon_center = (rect.centerx, rect.y + int(rect.h * 0.40))
+            draw_circle_on(surface, (*accent, 18), icon_center, max(25, int(self.icon_size * .68)))
             icon_rect = item.icon.get_rect(center=icon_center)
             blit_surface(surface, item.icon, icon_rect, transient=False)
+            label_y = rect.y + int(rect.h * .77)
+        else:
+            label_y = rect.centery
 
         font = self._fit_label(item.label, self.font_label_size + int(t), rect.w - 24, t > .5)
         text_color = Theme.TEXT_PRIMARY if t > .2 else Theme.TEXT_SECONDARY
@@ -1362,7 +1368,7 @@ class IconGridMenu:
             text = self.font_label.render(item.label, color=text_color, height=font)
         else:
             text = font.render(item.label, True, text_color)
-        blit_surface(surface, text, text.get_rect(center=(rect.centerx, rect.y + int(rect.h * .77))),
+        blit_surface(surface, text, text.get_rect(center=(rect.centerx, label_y)),
                      transient=True)
 
 

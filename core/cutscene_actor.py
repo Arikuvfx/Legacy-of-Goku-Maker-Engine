@@ -819,6 +819,19 @@ class CutsceneActor:
         self._tween      = None  # active _MoveTween or _FlyTween, or None
         self._charge_effects: list = []  # active charge-up visual(s) — see attack()
         self.show_shadow = True  # toggled by the 'set_shadow' action — see set_shadow_visible()
+        # The animation this actor was last told to play. Tracked here because
+        # not every entity type has a `current_animation_state` attribute, so
+        # reading it off the entity alone made anything that "remembers the
+        # current pose" (dialogue pause/resume, costume swaps) fall back to idle.
+        self._anim_state = None
+        self._anim_loop  = None
+
+    @property
+    def current_anim_state(self):
+        """Name of the animation this actor is currently playing."""
+        return (self._anim_state
+                or getattr(self.entity, 'current_animation_state', None)
+                or 'idle')
 
     # ── Position pass-throughs ────────────────────────────────────────────────
 
@@ -856,12 +869,15 @@ class CutsceneActor:
 
     # ── Animation & movement API ──────────────────────────────────────────────
 
-    def set_animation(self, state, direction='down'):
+    def set_animation(self, state, direction='down', loop=None):
         """Set animation state and facing direction immediately.
 
         If the sprite hasn't loaded this state yet (e.g. walk2.png added after
         init), we call load_animation_all_directions first so the key exists
         before set_animation looks it up.
+
+        loop: None = the animation's own default; False = play once and hold
+        the last frame; True = loop forever (see AnimatedSprite.set_animation).
         """
         self.entity.direction = direction
         sprite = getattr(self.entity, 'sprite', None)
@@ -869,7 +885,15 @@ class CutsceneActor:
             key = f"{state}_{direction}"
             if key not in sprite.animations:
                 self._hot_load_animation(sprite, state)
-            sprite.set_animation(state, direction)
+            if loop is None:
+                sprite.set_animation(state, direction)
+            else:
+                try:
+                    sprite.set_animation(state, direction, loop=loop)
+                except TypeError:   # sprite type without loop support
+                    sprite.set_animation(state, direction)
+        self._anim_state = state
+        self._anim_loop  = loop
         if hasattr(self.entity, 'current_animation_state'):
             self.entity.current_animation_state = state
 
@@ -885,11 +909,11 @@ class CutsceneActor:
         if not character:
             return
         from core.sprite_system import create_character_sprite
-        current_anim = getattr(entity, 'current_animation_state', 'idle')
+        current_anim = self.current_anim_state
         current_dir  = getattr(entity, 'direction', 'down')
         entity.sprite    = create_character_sprite(character, costume, 32, 32)
         entity.direction = current_dir
-        self.set_animation(current_anim, current_dir)
+        self.set_animation(current_anim, current_dir, loop=self._anim_loop)
 
     @staticmethod
     def _hot_load_animation(sprite, state):
@@ -918,8 +942,14 @@ class CutsceneActor:
         )
 
     def face(self, direction):
-        """Change facing direction without restarting the current animation."""
-        self.entity.direction = direction
+        """Turn the actor to face *direction*, keeping the current animation state.
+
+        Sprite animations are keyed "{state}_{direction}", so setting
+        entity.direction alone changes nothing visible -- the sprite keeps
+        drawing the old direction's frames. Re-select the same state in the
+        new direction so the sprite actually turns.
+        """
+        self.set_animation(self.current_anim_state, direction, loop=self._anim_loop)
 
     def move_to(self, target_x, target_y, duration=1.0, anim_state='walk', direction=None):
         """Tween entity to (target_x, target_y) over duration seconds.

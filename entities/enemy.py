@@ -1274,12 +1274,19 @@ class Enemy:
             self.knockback_velocity_x *= 0.9
             self.knockback_velocity_y *= 0.9
 
-            # End knockback when hurt animation finishes (or velocity is negligible)
-            if self.has_sprite and self.sprite.is_animation_finished():
-                self._end_knockback()
-            elif not self.has_sprite:
-                if abs(self.knockback_velocity_x) < 1 and abs(self.knockback_velocity_y) < 1:
+            # End knockback when hurt animation finishes (or velocity is negligible).
+            # If this enemy has no hurt art at all, the sprite reports "finished"
+            # instantly (see AnimatedSprite.is_animation_missing) — don't use that
+            # to cut the stagger to a single frame; let the velocity decay instead,
+            # same as a sprite-less enemy. (Before the sprite_system fix, a missing
+            # hurt sheet left a looping idle/walk playing, so this never ended and
+            # the enemy froze in place forever.)
+            hurt_art_missing = self.has_sprite and self.sprite.is_animation_missing()
+            if self.has_sprite and not hurt_art_missing:
+                if self.sprite.is_animation_finished():
                     self._end_knockback()
+            elif abs(self.knockback_velocity_x) < 1 and abs(self.knockback_velocity_y) < 1:
+                self._end_knockback()
             return
 
         # ------------------------------------------------------------------

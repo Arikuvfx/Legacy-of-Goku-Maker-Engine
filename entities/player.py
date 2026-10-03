@@ -202,8 +202,9 @@ class Player:
         self.sound_manager = sound_manager
 
         # Divide by RENDER_SCALE so world-unit speed stays consistent across resolutions
-        self.speed = 3 / RENDER_SCALE
-        self.run_speed = 6 / RENDER_SCALE
+        # (Recomputed from the SPD stat by update_derived_stats().)
+        self.speed = 5 / RENDER_SCALE
+        self.run_speed = 10 / RENDER_SCALE
 
         self.level = 1
 
@@ -861,6 +862,13 @@ class Player:
         self._map_jump_frames         = []
         self._map_jump_frame_idx      = 0
         self._map_jump_frame_timer    = 0.0
+
+        # Level-up animation — frames are loaded and stepped by game.py's
+        # level-up sequence (_load_levelup_char_frames / _update_levelup_sequence);
+        # draw() just renders whichever frame levelup_frame_idx points at.
+        self.is_levelup_animating = False
+        self.levelup_frames       = []
+        self.levelup_frame_idx    = 0
 
         # -----------------------------------------------------------------
         # Fishing jump sequence
@@ -3128,7 +3136,7 @@ class Player:
                 # (see the pending_dragon_fist branch in stop_dragon_fist).
                 self.stop_dragon_fist()
                 return
-            if self.sprite.get_current_frame_index() < 2:
+            if self.sprite.get_current_frame_index() < 2 and not self.sprite.is_animation_missing():
                 return
 
             self.pending_dragon_fist = False
@@ -3944,6 +3952,7 @@ class Player:
                 setattr(self, field, snapshot[field])
         if 'stats' in snapshot:
             self.stats = dict(snapshot['stats'])
+            self.update_derived_stats()
 
     @staticmethod
     def fresh_progress_for_character(char_id, game_config=None):
@@ -4061,6 +4070,13 @@ class Player:
             return True
         return False
 
+    # Movement-speed tuning for update_derived_stats(): SPD_BASELINE is the
+    # SPD stat value that gives the base walk/run speeds below.
+    SPD_BASELINE   = 50
+    SPD_MULT_MIN   = 0.25
+    BASE_WALK_SPEED = 5
+    BASE_RUN_SPEED  = 10
+
     def update_derived_stats(self):
         """Recalculate run_speed and ki_regen from the current stat block.
 
@@ -4073,11 +4089,16 @@ class Player:
         Vitality and energy no longer feed HP/EP directly; they're free to
         be repurposed for other bonuses (e.g. defense, ki cost reduction).
 
-        The Speed stat intentionally has no effect here — movement speed
-        (self.speed / self.run_speed) is fixed and not derived from stats.
+        Movement speed (self.speed / self.run_speed) scales linearly with
+        the SPD stat: SPD 50 is the baseline (walk 5, run 10 world units
+        per step before RENDER_SCALE), SPD 100 is double, SPD 25 is half.
+        The multiplier is floored at SPD_MULT_MIN so a very low SPD
+        (e.g. the default 1) doesn't leave the player nearly frozen.
         """
-        self.speed     = 5  / RENDER_SCALE
-        self.run_speed = 10 / RENDER_SCALE
+        spd_mult = max(self.SPD_MULT_MIN,
+                       self.stats.get('speed', self.SPD_BASELINE) / self.SPD_BASELINE)
+        self.speed     = (self.BASE_WALK_SPEED * spd_mult) / RENDER_SCALE
+        self.run_speed = (self.BASE_RUN_SPEED  * spd_mult) / RENDER_SCALE
 
         # ki_regen 1 → 30s interval, ki_regen 255 → 1s interval (linear interpolation)
         regen_stat = max(1, self.stats.get('ki_regen', 30))
@@ -4556,12 +4577,16 @@ class Player:
         elif self.current_animation_state == 'kiblast':
             # Frame 0 = wind-up, frame 1 = throw. Spawn the blast on the release
             # frame rather than waiting for the full animation to finish.
-            if self.pending_blast is True and self.sprite.get_current_frame_index() >= 1:
+            # (is_animation_missing(): no kiblast art means the release frame will
+            # never arrive, so fire right away instead of losing the shot.)
+            if self.pending_blast is True and (
+                    self.sprite.get_current_frame_index() >= 1 or self.sprite.is_animation_missing()):
                 self.pending_blast = 'ready'
             # Ultra Volleyball rides the same wind-up/throw animation and
             # release frame as a regular blast (see shoot_ultra_volleyball())
             # — tracked independently so firing one never marks the other ready.
-            if self.pending_ultra_volleyball is True and self.sprite.get_current_frame_index() >= 1:
+            if self.pending_ultra_volleyball is True and (
+                    self.sprite.get_current_frame_index() >= 1 or self.sprite.is_animation_missing()):
                 self.pending_ultra_volleyball = 'ready'
             if self.sprite.is_animation_finished():
                 self._advance_blast_or_idle()
@@ -4939,6 +4964,36 @@ class Player:
         max_anchor_y = normal_anchor_y + HALO_MAX_DOWNWARD_TRACK_PIXELS
         return min(anchor_y, max_anchor_y)
 
+    def draw_halo(self, screen, camera, draw_x=None):
+        """Draw the halo over the player. Split out of draw() so game.py's
+        level-up animation (which swaps the player sprite for levelup.png)
+        can draw it too — otherwise the halo vanishes during level-up."""
+        if not self.halo_enabled:
+            return
+        if draw_x is None:
+            draw_x = self.x
+        halo, halo_bounds = _get_halo_sprite()
+        if halo is None:
+            return
+        # self.x/self.y are the player's CENTER (see get_collision_rect/
+        # the width//2/height//2 clamping elsewhere in this file), same
+        # as the map_jump draw above — so sx/sy below are already a
+        # center point, not a left/top edge. midbottom is set straight
+        # to (sx, sy) shifted up by half the sprite height to land at
+        # the top of the sprite by default; no extra x nudge needed.
+        # halo_bounds trims out any transparent padding baked into
+        # the source file so the ring itself (not its canvas) is
+        # what gets centered — see _get_halo_sprite().
+        sx = int(draw_x * RENDER_SCALE - camera.x) + self.halo_offset_x
+        sy = (int(self._get_halo_anchor_y() * RENDER_SCALE - camera.y)
+              + self.halo_offset_y
+              + self.halo_offset_y_by_state.get(self.current_animation_state, 0))
+        w  = int(halo_bounds.width * RENDER_SCALE)
+        h  = int(halo_bounds.height * RENDER_SCALE)
+        dest_rect = pygame.Rect(0, 0, w, h)
+        dest_rect.midbottom = (sx, sy)
+        screen.blit_scaled(halo, dest_rect, area=halo_bounds)
+
     def get_fishing_jump_y_offset(self):
         """World-unit vertical offset (negative = up) for the fishing jump's
         parabolic arc, based on how far through fishing_jump_duration we are.
@@ -5030,6 +5085,16 @@ class Player:
             screen.blit_scaled(frame, dest_rect)
             return
 
+        if self.is_levelup_animating and self.levelup_frames:
+            frame = self.levelup_frames[min(self.levelup_frame_idx, len(self.levelup_frames) - 1)]
+            sx = int(self.x * RENDER_SCALE - camera.x)
+            sy = int(self.y * RENDER_SCALE - camera.y)
+            dest_rect = pygame.Rect(0, 0, int(self.width * RENDER_SCALE), int(self.height * RENDER_SCALE))
+            dest_rect.center = (sx, sy)
+            screen.blit_scaled(frame, dest_rect)
+            self.draw_halo(screen, camera)
+            return
+
         tint = getattr(self, 'hurt_tint', 0.0)
         flash_white = getattr(self, 'charged_melee_flash_amount', 0.0)
 
@@ -5048,29 +5113,8 @@ class Player:
                          hurt_tint=tint, flash_white=flash_white)
 
         # Halo — same layer as the player, drawn right after the sprite so
-        # it renders on top of it. See halo_enabled/halo_offset_x/
-        # halo_offset_y in __init__ for the toggle and manual position nudge.
-        if self.halo_enabled:
-            halo, halo_bounds = _get_halo_sprite()
-            if halo is not None:
-                # self.x/self.y are the player's CENTER (see get_collision_rect/
-                # the width//2/height//2 clamping elsewhere in this file), same
-                # as the map_jump draw above — so sx/sy below are already a
-                # center point, not a left/top edge. midbottom is set straight
-                # to (sx, sy) shifted up by half the sprite height to land at
-                # the top of the sprite by default; no extra x nudge needed.
-                # halo_bounds trims out any transparent padding baked into
-                # the source file so the ring itself (not its canvas) is
-                # what gets centered — see _get_halo_sprite().
-                sx = int(draw_x * RENDER_SCALE - camera.x) + self.halo_offset_x
-                sy = (int(self._get_halo_anchor_y() * RENDER_SCALE - camera.y)
-                      + self.halo_offset_y
-                      + self.halo_offset_y_by_state.get(self.current_animation_state, 0))
-                w  = int(halo_bounds.width * RENDER_SCALE)
-                h  = int(halo_bounds.height * RENDER_SCALE)
-                dest_rect = pygame.Rect(0, 0, w, h)
-                dest_rect.midbottom = (sx, sy)
-                screen.blit_scaled(halo, dest_rect, area=halo_bounds)
+        # it renders on top of it. See draw_halo().
+        self.draw_halo(screen, camera, draw_x)
 
 
 # ── GPU MIGRATION STATUS (this file) ────────────────────────────────────────

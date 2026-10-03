@@ -85,7 +85,11 @@ _ACTION_PARAMS = {
                       ('speed',        'Speed (px/s)',  'float'),
                       ('alpha',        'Alpha (0-255)', 'float')],
     'weather_stop':  [],
-    'set_animation': [('state', 'State', 'anim'), ('direction', 'Direction', 'dir')],
+    # loop=True keeps the animation cycling until the next action changes it
+    # (the old behaviour); loop=False plays it through once and holds the last
+    # frame. The runtime reads it via params.get('loop', True).
+    'set_animation': [('state', 'State', 'anim'), ('direction', 'Direction', 'dir'),
+                      ('loop', 'Loop', 'bool')],
     'move_to':       [('x', 'World X', 'float'), ('y', 'World Y', 'float'),
                       ('duration', 'Duration (s)', 'float'),
                       ('anim_state', 'Anim State', 'anim'),
@@ -115,7 +119,11 @@ _ACTION_PARAMS = {
                       ('loop', 'Loop', 'bool'),
                       ('fade_in', 'Fade In', 'bool')],
     # Fires a one-shot sound effect through SoundManager.play_sfx().
-    'play_sfx':      [('sfx', 'Sound Effect', 'sfx_name')],
+    # 'loop' repeats it until a stop_sfx action (or the cutscene ends).
+    'play_sfx':      [('sfx', 'Sound Effect', 'sfx_name'),
+                      ('loop', 'Loop', 'bool')],
+    # Stops a looping sound effect. Blank sound = stop every looping SFX.
+    'stop_sfx':      [('sfx', 'Sound Effect', 'sfx_name_any')],
     # Stops whatever music is currently playing, via SoundManager.stop_music().
     # fade_out=True fades over SoundEngine.fade_duration (1s); False cuts it
     # instantly. Doesn't care what track is playing or how it was started
@@ -170,7 +178,7 @@ _CAMERA_ACTIONS = ['pan_to', 'snap_to', 'shake']
 _SCREEN_ACTIONS = ['fade_in', 'fade_out', 'flash', 'invert', 'dialogue',
                    'weather_start', 'weather_stop']
 _ROOM_ACTIONS   = ['change_room']
-_SOUND_ACTIONS  = ['play_music', 'play_sfx', 'stop_music']
+_SOUND_ACTIONS  = ['play_music', 'play_sfx', 'stop_sfx', 'stop_music']
 _ACTOR_ACTIONS  = ['set_animation', 'move_to', 'face', 'teleport', 'fly_to',
                    'set_character', 'set_costume', 'attack', 'set_shadow']
 _INVERT_MODES   = ['full', 'red', 'green', 'blue', 'greyscale']
@@ -243,6 +251,10 @@ _PLAYHEAD    = uk.Theme.GOLD_BRIGHT
 # Field-key constants for the four text-entry buffers
 _ACTOR_TYPES = ['enemy', 'boss', 'npc', 'player']
 _TARGET_FIXED = ['camera', 'screen', 'room', 'sound']
+# Picks that place an *actor* (as opposed to the camera): these snap to the
+# actor grid when it's enabled and show a ghost of the actor at the cursor.
+_ACTOR_PICKS = {'pick_move_to': 'move_to', 'pick_fly_to': 'fly_to',
+                'pick_teleport': 'teleport'}
 _PICK_ACTIONS = ('pick_pan_to', 'pick_snap_to', 'pick_move_to', 'pick_fly_to',
                  'pick_teleport', 'pick_pan_to_start', 'pick_attack_target')
 
@@ -809,6 +821,19 @@ def _icon_dup(surface, rect, color, width=2):
     uk.draw_rect_on(surface, color, a, width, 3)
 
 
+def _icon_paste(surface, rect, color, width=2):
+    cx, cy = rect.center
+    s = min(rect.w, rect.h)
+    board = pygame.Rect(0, 0, s * 0.50, s * 0.60)
+    board.center = (cx, cy + s * 0.04)
+    uk.draw_rect_on(surface, color, board, width, 3)
+    clip = pygame.Rect(0, 0, s * 0.26, s * 0.14)
+    clip.midtop = (cx, board.top - s * 0.06)
+    uk.draw_rect_on(surface, color, clip, 0, 2)
+    uk.draw_rect_on(surface, color, pygame.Rect(board.x + 4, board.centery, board.w - 8, 1), 0, 0)
+    uk.draw_rect_on(surface, color, pygame.Rect(board.x + 4, board.centery + 4, board.w - 8, 1), 0, 0)
+
+
 def _icon_grid(surface, rect, color, width=1):
     cx, cy = rect.center
     s = min(rect.w, rect.h) * 0.30
@@ -866,6 +891,10 @@ class CutsceneEditor:
     """
 
     _UNDO_LIMIT = 50
+
+    # Keyframe clipboard, shared by every editor instance so a group copied in
+    # one cutscene can be pasted into another.  [(offset_from_first_s, action)]
+    _clipboard: list = []
 
     def __init__(self, room_manager, room_editor, screen_width, screen_height,
                  dialogue_box=None, sound_manager=None):
@@ -1009,8 +1038,14 @@ class CutsceneEditor:
         # camera.x/y are stored in base-scale pixels (RENDER_SCALE × world_units).
         # zoom only affects rendering; world coord math divides by zoom.
         self._vp_zoom     = 1.0
-        self._vp_zoom_min = 0.15
-        self._vp_zoom_max = 3.0
+        # Same continuous zoom the room editor uses (Ctrl+scroll, 0.55x-1.0x,
+        # 0.1 per notch) so both editors feel identical.
+        self._vp_zoom_min  = 0.55
+        self._vp_zoom_max  = 1.0
+        self._vp_zoom_step = 0.1
+        # When False, previews (scrub + play) leave the editor camera alone
+        # instead of following the cutscene camera. Toggled from the header.
+        self._cam_track = True
 
         # ── Grid visibility (toggled with G) ──────────────────────────────────
         self._show_grid   = True
@@ -1056,6 +1091,18 @@ class CutsceneEditor:
         # Click offset in seconds from the diamond centre, so the keyframe
         # doesn't jump to snap its centre under the cursor on drag start.
         self._kf_drag_offset = 0.0
+        # Multi-select: when two or more keyframes are selected their identities
+        # (id(action_dict)) live here and _tl_sel is -1.  With 0-1 selected this
+        # set is empty and the single-selection _tl_sel is used as before.
+        # Identity (not index) because actions get re-sorted by time.
+        self._tl_multi_ids   = set()
+        # Everything that moves during a keyframe drag: [(action_dict, start_time)].
+        # Always contains at least the grabbed keyframe while a drag is live.
+        self._kf_drag_group  = []
+        self._kf_drag_orig   = 0.0   # start time of the grabbed keyframe
+        # Rubber-band selection started by dragging on empty timeline space.
+        # Anchored in content space (time, row-pixels) so it survives scrolling.
+        self._tl_marquee     = None
 
         # ── Actor initial-position drag ───────────────────────────────────────
         # Index into cutscene_data['actors'] of the actor being dragged (-1=idle).
@@ -1132,11 +1179,19 @@ class CutsceneEditor:
 
         self._ctl_h = 34          # standard control height
 
-        cam = getattr(self, 'camera', None)
-        if cam is not None:
-            cam.screen_width  = self._vp_rect.w
-            cam.screen_height = self._vp_rect.h
+        if getattr(self, 'camera', None) is not None:
+            self._sync_camera_view()
             self._clamp_camera()
+
+    def _sync_camera_view(self):
+        """Give the camera the *virtual* viewport size (viewport / zoom), the
+        same way the room editor does. The runtime centres and clamps the
+        camera using camera.screen_width/height, so with the real (unzoomed)
+        size it centred on the wrong point whenever the view was zoomed out."""
+        cam = self.camera
+        zoom = self._vp_zoom or 1.0
+        cam.screen_width  = max(1, int(self._vp_rect.w / zoom))
+        cam.screen_height = max(1, int(self._vp_rect.h / zoom))
 
     # ══════════════════════════════════════════════════════════════════════════
     # Public API
@@ -1166,6 +1221,8 @@ class CutsceneEditor:
                     self._save_viewport_state()
             if self.sound_manager is not None:
                 self.sound_manager.stop_music(fade_out=False)
+                if self._runtime is not None:
+                    self._runtime.stop_looping_sfx()
             uk.set_text_cursor(False)
             uk.set_hand_cursor(False)
         self.active = not self.active
@@ -1219,10 +1276,15 @@ class CutsceneEditor:
                 actions   = self.cutscene_data.get('actions', [])
                 moved_act = actions[self._kf_drag_idx] if self._kf_drag_idx < len(actions) else None
                 actions.sort(key=lambda a: a['time'])
-                if moved_act is not None and moved_act in actions:
+                if (moved_act is not None and moved_act in actions
+                        and not self._tl_multi_ids):
                     self._tl_sel = actions.index(moved_act)
                 self._kf_drag_idx = -1
+                self._kf_drag_group = []
                 self._runtime     = None   # stale; rebuild on next scrub/play
+            # Finish a rubber-band selection.
+            if self._tl_marquee is not None:
+                self._finish_marquee()
             # Finish an actor initial-position drag.
             if self._actor_drag_idx >= 0:
                 self._actor_drag_idx = -1
@@ -1263,7 +1325,7 @@ class CutsceneEditor:
         # the camera while playing, and fighting it causes jitter.  Also guards
         # K_s so it doesn't block the play path when no text field is focused.
         if (self.view == 'edit'
-                and not self._playing
+                and (not self._playing or not self._cam_track)
                 and not self._form_focus
                 and not self._actor_focus
                 and not self._duration_focus
@@ -1306,14 +1368,7 @@ class CutsceneEditor:
                 self._tl_playhead_t = _clamp(t, 0.0, dur)
                 self._scrub_pending = True
             elif self._kf_drag_idx >= 0:
-                actions = self.cutscene_data.get('actions', [])
-                if self._kf_drag_idx < len(actions):
-                    raw_t = (mx - label_end_x + self._tl_scroll_x) / self._tl_time_zoom
-                    new_t = round(_clamp(raw_t + self._kf_drag_offset, 0.0, dur), 3)
-                    new_t = self._snap_time(new_t)
-                    actions[self._kf_drag_idx]['time'] = new_t
-                    self._form_time_buf = f'{new_t:.2f}'
-                    self.unsaved        = True
+                self._apply_kf_drag(mx)
 
         # ── Auto-save: write to disk every _AUTOSAVE_INTERVAL seconds while
         # the editor has unsaved changes, so a crash never loses more than that
@@ -1339,8 +1394,11 @@ class CutsceneEditor:
             room = self._get_current_room()
             w = room.width  if room else 10000
             h = room.height if room else 10000
+            hold = None if self._cam_track else (self.camera.x, self.camera.y)
             try:
                 self._runtime.update(dt, w, h)
+                if hold is not None:
+                    self.camera.x, self.camera.y = hold
             except Exception as _e:
                 import traceback
                 print(f'[CutsceneEditor] runtime.update error: {_e}')
@@ -1441,14 +1499,16 @@ class CutsceneEditor:
         """World coords under the cursor (only meaningful inside the viewport)."""
         vp = self._vp_rect
         vx, vy = self._mouse_pos[0] - vp.x, self._mouse_pos[1] - vp.y
-        wx = vx / (RENDER_SCALE * self._vp_zoom) + self.camera.x / RENDER_SCALE
-        wy = vy / (RENDER_SCALE * self._vp_zoom) + self.camera.y / RENDER_SCALE
+        # The draw pass truncates the camera to whole pixels; using the same
+        # value here keeps a click exactly on the pixel it visually hit.
+        wx = (vx / self._vp_zoom + int(self.camera.x)) / RENDER_SCALE
+        wy = (vy / self._vp_zoom + int(self.camera.y)) / RENDER_SCALE
         return wx, wy
 
     def _world_to_screen(self, wx, wy):
         vp = self._vp_rect
-        return (int(vp.x + (wx * RENDER_SCALE - self.camera.x) * self._vp_zoom),
-                int(vp.y + (wy * RENDER_SCALE - self.camera.y) * self._vp_zoom))
+        return (int(vp.x + (wx * RENDER_SCALE - int(self.camera.x)) * self._vp_zoom),
+                int(vp.y + (wy * RENDER_SCALE - int(self.camera.y)) * self._vp_zoom))
 
     def _leave_edit(self):
         """Back to the cutscene list, saving first (button and Esc share this
@@ -1486,6 +1546,10 @@ class CutsceneEditor:
         actor form → inspector form → back to list → close editor).
         Space toggles playback when no text field is active.
         Ctrl-S saves; Ctrl-Z/Y/Shift-Z undo/redo; G toggles the grid.
+        Ctrl-C / X / V copy, cut and paste the selected keyframe(s) at the
+        playhead (a whole multi-selection stays together); Ctrl-D duplicates,
+        Ctrl-A selects all, Delete removes.  Arrow keys nudge X/Y in an open
+        move / fly / teleport form (Shift = 10).
         Everything else falls through to whichever text field has focus.
         """
         key = event.key
@@ -1523,6 +1587,9 @@ class CutsceneEditor:
                 self._form_active = False
                 self._form_focus  = None
                 self._stop_preview_sound()
+                return None
+            if self.view == 'edit' and self._tl_multi_ids:
+                self._set_selection([])
                 return None
             if self.view == 'edit':
                 if self._playing:
@@ -1575,8 +1642,49 @@ class CutsceneEditor:
             self._redo()
             return None
 
+        # Clipboard / selection shortcuts — never while a text field owns the
+        # keyboard, so Ctrl-C / Ctrl-V / Delete keep working inside fields.
+        if self.view == 'edit' and not typing:
+            ctrl = bool(event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META))
+            if ctrl and key == pygame.K_c:
+                self._copy_selection()
+                return None
+            if ctrl and key == pygame.K_x:
+                self._copy_selection()
+                self._delete_selection()
+                return None
+            if ctrl and key == pygame.K_v:
+                self._paste_clipboard()
+                return None
+            if ctrl and key == pygame.K_d:
+                self._on_action('tl_dup', None, None)
+                return None
+            if ctrl and key == pygame.K_a and self.cutscene_data:
+                self._set_selection(list(self.cutscene_data.get('actions', [])))
+                return None
+            if key in (pygame.K_DELETE, pygame.K_BACKSPACE) and self._sel_actions():
+                self._delete_selection()
+                return None
+            # Arrow keys nudge the X / Y of the open action form (1 unit,
+            # Shift = 10) — fine-tuning after a rough click in the viewport.
+            if (key in (pygame.K_LEFT, pygame.K_RIGHT, pygame.K_UP, pygame.K_DOWN)
+                    and self._form_active
+                    and {'x', 'y'} <= {k for k, _l, _h in _ACTION_PARAMS.get(self._form_type, [])}):
+                step = 10.0 if event.mod & pygame.KMOD_SHIFT else 1.0
+                dx = {pygame.K_LEFT: -step, pygame.K_RIGHT: step}.get(key, 0.0)
+                dy = {pygame.K_UP: -step, pygame.K_DOWN: step}.get(key, 0.0)
+                self._nudge_form_xy(dx, dy)
+                return None
+
         # Grid toggle — only when no text field has focus so typing 'g' in a
         # name / param field is never intercepted.
+        if (key == pygame.K_0 and self.view == 'edit' and not typing
+                and (pygame.key.get_mods() & pygame.KMOD_CTRL)):
+            self._vp_zoom = 1.0          # Ctrl+0 → native zoom, like the room editor
+            self._sync_camera_view()
+            self._clamp_camera()
+            return None
+
         if key == pygame.K_g and self.view == 'edit' and not typing:
             self._show_grid = not self._show_grid
             return None
@@ -1735,20 +1843,16 @@ class CutsceneEditor:
 
         # ── Keyframe drag ─────────────────────────────────────────────────────
         if self._kf_drag_idx >= 0 and self.cutscene_data:
-            actions = self.cutscene_data.get('actions', [])
-            if self._kf_drag_idx < len(actions):
-                tl          = self._tl_panel_rect()
-                label_end_x = tl.x + self._tl_label_w
-                raw_t       = (pos[0] - label_end_x + self._tl_scroll_x) / self._tl_time_zoom
-                new_t       = raw_t + self._kf_drag_offset
-                dur         = self.cutscene_data.get('duration', 10.0)
-                new_t       = round(_clamp(new_t, 0.0, dur), 3)
-                new_t       = self._snap_time(new_t)
-                actions[self._kf_drag_idx]['time'] = new_t
-                # Keep the inspector time field in sync while dragging
-                self._form_time_buf = f'{new_t:.2f}'
-                self.unsaved        = True
+            self._apply_kf_drag(pos[0])
             self._tl_auto_scroll = self._calc_tl_auto_scroll(pos[0])
+            return
+
+        # ── Rubber-band selection ─────────────────────────────────────────────
+        if self._tl_marquee is not None:
+            m = self._tl_marquee
+            if not m['active'] and (abs(pos[0] - m['px0']) > 4 or abs(pos[1] - m['py0']) > 4):
+                m['active'] = True
+            self._tl_auto_scroll = self._calc_tl_auto_scroll(pos[0]) if m['active'] else 0.0
             return
 
         # ── Actor initial-position drag ───────────────────────────────────────
@@ -1777,6 +1881,32 @@ class CutsceneEditor:
         self._tl_playhead_t  = _clamp(t, 0.0, dur)
         self._scrub_pending  = True
         self._tl_auto_scroll = self._calc_tl_auto_scroll(mx)
+
+    def _apply_kf_drag(self, mouse_x):
+        """Move the dragged keyframe — and every other keyframe in the drag
+        group — so the grabbed one follows the cursor.  The whole group shifts
+        by the same delta (keeping their relative spacing), clamped so none of
+        them leaves [0, duration].  Snapping is applied to the grabbed keyframe
+        and the rest follow it."""
+        if not self.cutscene_data or not self._kf_drag_group:
+            return
+        actions = self.cutscene_data.get('actions', [])
+        if not (0 <= self._kf_drag_idx < len(actions)):
+            return
+        tl          = self._tl_panel_rect()
+        label_end_x = tl.x + self._tl_label_w
+        dur         = self.cutscene_data.get('duration', 10.0)
+        raw_t       = (mouse_x - label_end_x + self._tl_scroll_x) / self._tl_time_zoom
+        new_t       = round(_clamp(raw_t + self._kf_drag_offset, 0.0, dur), 3)
+        new_t       = self._snap_time(new_t)
+        delta       = new_t - self._kf_drag_orig
+        starts      = [t for _a, t in self._kf_drag_group]
+        delta       = max(-min(starts), min(delta, dur - max(starts)))
+        for act, t0 in self._kf_drag_group:
+            act['time'] = round(t0 + delta, 3)
+        # Keep the inspector time field in sync while dragging
+        self._form_time_buf = f'{actions[self._kf_drag_idx]["time"]:.2f}'
+        self.unsaved        = True
 
     def _calc_tl_auto_scroll(self, mouse_x):
         """Return px/sec scroll speed based on how close mouse_x is to the
@@ -1858,6 +1988,8 @@ class CutsceneEditor:
             self._form_params['start_y'] = f'{wy:.1f}'
             self._pick_mode = None
             return None
+        if self._pick_mode in _ACTOR_PICKS:
+            wx, wy = self._snap_actor_xy(wx, wy)   # honours the actor grid snap
         if self._pick_mode in ('pick_pan_to', 'pick_snap_to',
                                'pick_move_to', 'pick_fly_to', 'pick_teleport',):
             self._form_params['x'] = f'{wx:.1f}'
@@ -1969,19 +2101,314 @@ class CutsceneEditor:
                     best_idx  = ai
 
             if best_idx >= 0:
-                self._tl_sel = best_idx
-                self._open_action_form(best_idx)
+                hit = all_actions[best_idx]
+                # Ctrl / Shift-click adds or removes a keyframe from the
+                # selection without starting a drag.
+                if pygame.key.get_mods() & (pygame.KMOD_CTRL | pygame.KMOD_SHIFT):
+                    self._toggle_selection(hit)
+                    return
+                if self._tl_multi_ids and id(hit) in self._tl_multi_ids:
+                    # Grabbing a member of the group: keep the whole selection
+                    # and drag it together.
+                    group = [(a, a['time']) for a in all_actions
+                             if id(a) in self._tl_multi_ids]
+                else:
+                    self._tl_multi_ids.clear()
+                    self._tl_sel = best_idx
+                    self._open_action_form(best_idx)
+                    group = [(hit, hit['time'])]
                 # Begin drag — store the sub-pixel offset so the keyframe
                 # doesn't jump on the very first motion event.
                 clicked_t = (mx - time_area_x + self._tl_scroll_x) / self._tl_time_zoom
                 self._push_undo()
                 self._kf_drag_idx    = best_idx
-                self._kf_drag_offset = all_actions[best_idx]['time'] - clicked_t
+                self._kf_drag_offset = hit['time'] - clicked_t
+                self._kf_drag_orig   = hit['time']
+                self._kf_drag_group  = group
             else:
-                self._tl_sel      = -1
                 self._kf_drag_idx = -1
-                self._form_active = False
+                self._begin_marquee(mx, my, in_row=True)
             return
+
+        # Below the last row: still allow rubber-banding on the empty space.
+        if mx >= label_end_x:
+            self._begin_marquee(mx, my, in_row=False)
+
+    # ── Clipboard ─────────────────────────────────────────────────────────────
+
+    def _copy_selection(self):
+        """Copy the selected keyframe(s) — a single one or a whole group —
+        keeping their relative timing."""
+        sel = self._sel_actions()
+        if not sel:
+            return
+        t0 = min(a['time'] for a in sel)
+        CutsceneEditor._clipboard = [(round(a['time'] - t0, 3), copy.deepcopy(a)) for a in sel]
+
+    def _delete_selection(self):
+        actions = self.cutscene_data.get('actions', []) if self.cutscene_data else []
+        sel = self._sel_actions()
+        if not sel:
+            return
+        self._push_undo()
+        ids = {id(a) for a in sel}
+        first = min(i for i, a in enumerate(actions) if id(a) in ids)
+        actions[:] = [a for a in actions if id(a) not in ids]
+        self._tl_multi_ids.clear()
+        self._tl_sel      = (_clamp(first - 1, -1, len(actions) - 1)
+                             if len(sel) == 1 else -1)
+        self._form_active = False
+        self.unsaved      = True
+        self._runtime     = None
+
+    def _paste_clipboard(self):
+        """Paste the clipboard group so its first keyframe lands on the
+        playhead.  The pasted keyframes become the selection, ready to drag.
+        Keyframes aimed at an actor this cutscene doesn't have are skipped."""
+        clip = CutsceneEditor._clipboard
+        if not clip or not self.cutscene_data:
+            return
+        actor_ids = {a.get('id') for a in self.cutscene_data.get('actors', [])}
+        items = [(rt, a) for rt, a in clip
+                 if a.get('target') in _TARGET_FIXED or a.get('target') in actor_ids]
+        if not items:
+            return
+        dur  = self.cutscene_data.get('duration', 10.0)
+        span = max(rt for rt, _a in items)
+        t0   = self._tl_playhead_t
+        self._push_undo()
+        if span > dur:
+            dur = round(span, 3)
+            self.cutscene_data['duration'] = dur
+            self._duration_buf = str(dur)
+        t0 = _clamp(t0, 0.0, dur - span)
+        new = []
+        for rt, a in items:
+            c = copy.deepcopy(a)
+            c['time'] = round(t0 + rt, 3)
+            new.append(c)
+        actions = self.cutscene_data.setdefault('actions', [])
+        actions.extend(new)
+        actions.sort(key=lambda a: a['time'])
+        self._set_selection(new)
+        self.unsaved  = True
+        self._runtime = None
+
+    # ── Destination helpers ───────────────────────────────────────────────────
+
+    def _actor_pos_before(self, actor_id, t):
+        """Where *actor_id* stands just before time *t*: its spawn position,
+        moved by every earlier move_to / fly_to / teleport.  The action being
+        edited is ignored so it doesn't move its own starting point."""
+        actors = (self.cutscene_data or {}).get('actors', [])
+        actor = next((a for a in actors if a.get('id') == actor_id), None)
+        if actor is None:
+            return None
+        pos = (float(actor.get('x', 0)), float(actor.get('y', 0)))
+        acts = (self.cutscene_data or {}).get('actions', [])
+        cur = (acts[self._tl_sel] if (not self._form_new and self._form_active
+                                      and 0 <= self._tl_sel < len(acts)) else None)
+        for a in acts:   # sorted by time
+            if a is cur or a.get('target') != actor_id or a.get('time', 0.0) >= t:
+                continue
+            if a.get('type') in ('move_to', 'fly_to', 'teleport'):
+                p = a.get('params', {})
+                try:
+                    pos = (float(p['x']), float(p['y']))
+                except (KeyError, TypeError, ValueError):
+                    pass
+        return pos
+
+    def _form_time(self):
+        try:
+            return float(self._form_time_buf)
+        except (ValueError, TypeError):
+            return self._tl_playhead_t
+
+    def _nudge_form_xy(self, dx, dy):
+        p = self._form_params
+        try:
+            x = float(p.get('x', ''))
+            y = float(p.get('y', ''))
+        except ValueError:
+            base = self._actor_pos_before(self._form_target, self._form_time())
+            x, y = base if base else (0.0, 0.0)
+        p['x'] = f'{x + dx:.1f}'
+        p['y'] = f'{y + dy:.1f}'
+
+    def _dest_preview(self):
+        """Describe the destination ghost to draw, or None.  Active while an
+        actor move / fly / teleport form is open or being picked."""
+        if self.view != 'edit' or not self.cutscene_data:
+            return None
+        ftype = self._form_type
+        if ftype not in ('move_to', 'fly_to', 'teleport'):
+            return None
+        picking = _ACTOR_PICKS.get(self._pick_mode) == ftype
+        if not (picking or self._form_active):
+            return None
+        actor = next((a for a in self.cutscene_data.get('actors', [])
+                      if a.get('id') == self._form_target), None)
+        if actor is None:
+            return None
+        dest = None
+        if picking and self._dd is None and self._vp_rect.collidepoint(self._mouse_pos):
+            dest = self._snap_actor_xy(*self._mouse_world())
+        else:
+            try:
+                dest = (float(self._form_params.get('x', '')),
+                        float(self._form_params.get('y', '')))
+            except ValueError:
+                return None
+        start = self._actor_pos_before(actor['id'], self._form_time())
+        idx = self.cutscene_data['actors'].index(actor)
+        return {'actor': actor, 'idx': idx, 'type': ftype, 'start': start, 'dest': dest}
+
+    def _draw_dest_ghost(self, inter):
+        """World-pass preview: dashed path start→destination and the actor's
+        sprite standing at the destination, exactly where the runtime would
+        put it (same x/y the action stores)."""
+        pv = self._dest_preview()
+        if not pv:
+            return
+        cam_x, cam_y = int(self.camera.x), int(self.camera.y)
+        col = _ACTOR_COLORS[pv['idx'] % len(_ACTOR_COLORS)]
+        dx, dy = pv['dest']
+        ex, ey = int(dx * RENDER_SCALE - cam_x), int(dy * RENDER_SCALE - cam_y)
+        if pv['start']:
+            sx, sy = int(pv['start'][0] * RENDER_SCALE - cam_x), int(pv['start'][1] * RENDER_SCALE - cam_y)
+            length = math.hypot(ex - sx, ey - sy)
+            if length > 1:
+                ux, uy = (ex - sx) / length, (ey - sy) / length
+                pos, dash, gap = 0.0, 8, 6
+                while pos < length:
+                    end = min(pos + dash, length)
+                    inter.draw_line(col, (int(sx + ux * pos), int(sy + uy * pos)),
+                                    (int(sx + ux * end), int(sy + uy * end)), 2)
+                    pos += dash + gap
+            inter.draw_circle(col, (sx, sy), 5, 1)
+        entity = self._get_or_create_actor_entity(pv['actor'])
+        if entity is not None:
+            ox, oy = entity.x, entity.y
+            p = self._form_params
+            state = p.get('anim_state') or 'idle'
+            facing = p.get('direction') or 'down'
+            try:
+                entity.x, entity.y = float(dx), float(dy)
+                if getattr(entity, 'sprite', None):
+                    entity.sprite.set_animation(state, facing)
+                entity.in_cutscene = True
+                entity.draw(inter, self.camera, {})
+            except Exception:
+                pass
+            finally:
+                entity.in_cutscene = False
+                entity.x, entity.y = ox, oy
+                try:
+                    if getattr(entity, 'sprite', None):
+                        entity.sprite.set_animation('idle', 'down')
+                except Exception:
+                    pass
+        inter.draw_circle(col, (ex, ey), 12, 2)
+        inter.draw_circle(_WHITE, (ex, ey), 3)
+
+    def _draw_impact_marker(self, screen, pos, col):
+        x, y = pos
+        uk.draw_circle_on(screen, col, (x, y), 9, 2)
+        uk.draw_circle_on(screen, _WHITE, (x, y), 3, 0)
+        for ddx, ddy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            uk.draw_line_on(screen, col, (x + ddx * 12, y + ddy * 12), (x + ddx * 19, y + ddy * 19), 2)
+
+    # ── Multi-selection ───────────────────────────────────────────────────────
+
+    def _sel_actions(self):
+        """The currently selected action dicts (0, 1 or many), in time order."""
+        if not self.cutscene_data:
+            return []
+        actions = self.cutscene_data.get('actions', [])
+        if self._tl_multi_ids:
+            return [a for a in actions if id(a) in self._tl_multi_ids]
+        if 0 <= self._tl_sel < len(actions):
+            return [actions[self._tl_sel]]
+        return []
+
+    def _set_selection(self, acts):
+        """Replace the selection with *acts* (action dicts).  One action uses
+        the regular single selection; two or more use the multi set.  Closes the
+        inspector form — it only ever edits a single keyframe."""
+        actions = self.cutscene_data.get('actions', []) if self.cutscene_data else []
+        uniq, seen = [], set()
+        for a in acts:
+            if id(a) not in seen:
+                seen.add(id(a))
+                uniq.append(a)
+        self._tl_multi_ids.clear()
+        self._tl_sel = -1
+        if len(uniq) == 1:
+            self._tl_sel = next((i for i, a in enumerate(actions) if a is uniq[0]), -1)
+        elif len(uniq) > 1:
+            self._tl_multi_ids = {id(a) for a in uniq}
+        self._form_active = False
+        self._form_focus  = None
+
+    def _toggle_selection(self, act):
+        cur = self._sel_actions()
+        if any(a is act for a in cur):
+            cur = [a for a in cur if a is not act]
+        else:
+            cur.append(act)
+        self._set_selection(cur)
+
+    def _begin_marquee(self, mx, my, in_row):
+        """Arm a rubber-band selection at the click point.  It only becomes a
+        real box once the mouse has moved a few pixels; a plain click on empty
+        space instead clears the selection (like before)."""
+        _, label_end_x, _ruler_y, tracks_y = self._tl_geometry()
+        self._tl_marquee = {
+            'px0': mx, 'py0': my, 'active': False, 'in_row': in_row,
+            'additive': bool(pygame.key.get_mods() & (pygame.KMOD_CTRL | pygame.KMOD_SHIFT)),
+            't0':  (mx - label_end_x + self._tl_scroll_x) / self._tl_time_zoom,
+            'y0':  my - tracks_y + self._tl_scroll_y,
+        }
+
+    def _marquee_bounds(self):
+        """Current rubber-band as (t_min, t_max, y_min, y_max) in content space."""
+        m = self._tl_marquee
+        _, label_end_x, _ruler_y, tracks_y = self._tl_geometry()
+        mx, my = self._mouse_pos
+        t1 = (mx - label_end_x + self._tl_scroll_x) / self._tl_time_zoom
+        y1 = my - tracks_y + self._tl_scroll_y
+        return (min(m['t0'], t1), max(m['t0'], t1), min(m['y0'], y1), max(m['y0'], y1))
+
+    def _finish_marquee(self):
+        m = self._tl_marquee
+        self._tl_marquee = None
+        self._tl_auto_scroll = 0.0
+        if not self.cutscene_data:
+            return
+        if not m['active']:
+            # Plain click on empty lane space → deselect and close the form.
+            if m['in_row'] and not m['additive']:
+                self._set_selection([])
+            return
+        t_min, t_max, y_min, y_max = self._marquee_bounds()
+        pad_t = 6.0 / self._tl_time_zoom
+        rh = self._tl_row_h
+        picked = []
+        for i, row in enumerate(self._tl_visible_rows()):
+            cy = i * rh + rh / 2
+            if not (y_min - 6 <= cy <= y_max + 6):
+                continue
+            for act in self.cutscene_data.get('actions', []):
+                if act.get('target') != row['target']:
+                    continue
+                if row['action_type'] is not None and act.get('type') != row['action_type']:
+                    continue
+                if t_min - pad_t <= act['time'] <= t_max + pad_t:
+                    picked.append(act)
+        if m['additive']:
+            picked = self._sel_actions() + picked
+        self._set_selection(picked)
 
     def _on_scroll(self, event):
         dy = event.y
@@ -1999,19 +2426,21 @@ class CutsceneEditor:
             self._list_scroll = _clamp(self._list_scroll - dy * 40, 0, 99999)
             return
 
-        # ── Viewport scroll → zoom (no modifier needed) ───────────────────────
+        # ── Viewport: Ctrl+scroll → zoom (same as the room editor) ────────────
         if self._vp_rect.collidepoint(mx, my):
-            # Keep the world point under the mouse fixed as we zoom
-            vx = mx - self._vp_rect.x
-            vy = my - self._vp_rect.y
-            pivot_wx, pivot_wy = self._mouse_world()
-            self._vp_zoom = _clamp(
-                self._vp_zoom * (1.12 ** dy),
-                self._vp_zoom_min, self._vp_zoom_max)
-            # Re-anchor: camera.x = (pivot_wx - vx/(RS*zoom)) * RS
-            self.camera.x = (pivot_wx - vx / (RENDER_SCALE * self._vp_zoom)) * RENDER_SCALE
-            self.camera.y = (pivot_wy - vy / (RENDER_SCALE * self._vp_zoom)) * RENDER_SCALE
-            self._clamp_camera()
+            if pygame.key.get_mods() & pygame.KMOD_CTRL:
+                vx = mx - self._vp_rect.x
+                vy = my - self._vp_rect.y
+                zoom_old = self._vp_zoom
+                zoom_new = round(_clamp(zoom_old + dy * self._vp_zoom_step,
+                                        self._vp_zoom_min, self._vp_zoom_max), 2)
+                if zoom_new != zoom_old:
+                    self._vp_zoom = zoom_new
+                    # Keep the world point under the mouse fixed (room-editor formula).
+                    self.camera.x += vx / zoom_old - vx / zoom_new
+                    self.camera.y += vy / zoom_old - vy / zoom_new
+                    self._sync_camera_view()
+                    self._clamp_camera()
             return
 
         # ── Timeline scroll ────────────────────────────────────────────────────
@@ -2149,6 +2578,7 @@ class CutsceneEditor:
                 self._actor_entities.pop(rid, None)  # drop cached sprite
                 self._actor_sel = -1
                 self._tl_sel    = -1
+                self._tl_multi_ids.clear()
                 self._form_active = False
                 self.unsaved    = True
                 self._runtime   = None  # runtime.actors is stale; force full rebuild
@@ -2190,24 +2620,29 @@ class CutsceneEditor:
         elif action == 'tl_add':
             self._open_new_action_form()
         elif action == 'tl_del':
-            actions = self.cutscene_data.get('actions', [])
-            if 0 <= self._tl_sel < len(actions):
-                self._push_undo()
-                actions.pop(self._tl_sel)
-                self._tl_sel      = _clamp(self._tl_sel - 1, -1, len(actions) - 1)
-                self._form_active = False
-                self.unsaved      = True
-                self._runtime     = None
+            self._delete_selection()
+        elif action == 'tl_copy':
+            self._copy_selection()
+        elif action == 'tl_paste':
+            self._paste_clipboard()
         elif action == 'tl_dup':
             actions = self.cutscene_data.get('actions', [])
-            if 0 <= self._tl_sel < len(actions):
+            sel = self._sel_actions()
+            if sel:
                 self._push_undo()
-                dup = copy.deepcopy(actions[self._tl_sel])
-                # Nudge the duplicate forward 0.1 s so it doesn't sit on top
-                # of the original in the timeline and is immediately visible.
-                dup['time'] = round(dup['time'] + 0.1, 3)
-                actions.append(dup)
+                dups = []
+                for src_act in sel:
+                    dup = copy.deepcopy(src_act)
+                    # Nudge the duplicate forward 0.1 s so it doesn't sit on top
+                    # of the original in the timeline and is immediately visible.
+                    dup['time'] = round(dup['time'] + 0.1, 3)
+                    actions.append(dup)
+                    dups.append(dup)
                 actions.sort(key=lambda a: a['time'])
+                if len(sel) > 1:
+                    # Leave the copies selected so the group can be dragged
+                    # straight to where it should go.
+                    self._set_selection(dups)
                 self.unsaved = True
                 self._runtime = None
         elif action == 'tl_zoom_in':
@@ -2220,6 +2655,12 @@ class CutsceneEditor:
             self._cycle_tl_grid_interval()
         elif action == 'vp_zoom_reset':
             self._vp_zoom = 1.0
+            self._sync_camera_view()
+            self._clamp_camera()
+        elif action == 'cam_track_toggle':
+            self._cam_track = not self._cam_track
+            if self._cam_track and not self._playing and self.cutscene_data:
+                self._scrub_to(self._tl_playhead_t)   # re-snap to the cutscene camera
 
         # ── Inspector ─────────────────────────────────────────────────────────
         elif action == 'form_commit':
@@ -2318,6 +2759,13 @@ class CutsceneEditor:
                 # sane to show (handles hand-edited JSON too, not just
                 # colors this editor itself wrote).
                 self._form_params[key] = self._rgb_to_color_name(val)
+            elif (key == 'direction' and val == ''
+                  and self._form_type in ('move_to', 'fly_to')):
+                # Empty direction means "auto-derive from the movement vector"
+                # and is omitted from the saved JSON by _commit_form. Keep it
+                # empty on reload instead of falling back to _default_param's
+                # 'down', which silently turned auto into an explicit 'down'.
+                self._form_params[key] = ''
             else:
                 self._form_params[key] = str(val) if val != '' else self._default_param(key)
         # Sync the room-group browser to whichever group the saved room belongs to.
@@ -2459,6 +2907,8 @@ class CutsceneEditor:
             return 'narrator'
         if hint in ('music_track', 'sfx_name'):
             return '(none)'
+        if hint == 'sfx_name_any':
+            return 'all looping'
         return 'auto'
 
     def _param_pool(self, key, hint):
@@ -2509,6 +2959,8 @@ class CutsceneEditor:
             return self._available_music_tracks(), label_fn, 'No music tracks loaded', None
         if hint == 'sfx_name':
             return self._available_sfx_names(), label_fn, 'No sound effects loaded', None
+        if hint == 'sfx_name_any':
+            return [''] + self._available_sfx_names(), label_fn, None, None
         return None
 
     def _cycle_param(self, key, hint, delta):
@@ -2678,7 +3130,13 @@ class CutsceneEditor:
         elif self._form_type == 'play_sfx':
             sfx = self._form_params.get('sfx', '')
             if sfx:
-                self.sound_manager.play_sfx(sfx)
+                from core.cutscene_runtime import play_sfx_on, stop_sfx_on
+                stop_sfx_on(self.sound_manager, sfx)   # never stack preview loops
+                play_sfx_on(self.sound_manager, sfx,
+                            loop=self._form_params.get('loop', 'False') == 'True')
+        elif self._form_type == 'stop_sfx':
+            from core.cutscene_runtime import stop_sfx_on
+            stop_sfx_on(self.sound_manager, self._form_params.get('sfx', '') or None)
         elif self._form_type == 'stop_music':
             fade_out = self._form_params.get('fade_out', 'True') != 'False'
             self.sound_manager.stop_music(fade_out=fade_out)
@@ -2694,6 +3152,8 @@ class CutsceneEditor:
         """
         if self.sound_manager is not None:
             self.sound_manager.stop_music(fade_out=False)
+            from core.cutscene_runtime import stop_sfx_on
+            stop_sfx_on(self.sound_manager, None)   # also cut any previewed SFX loop
 
     def _get_actor_anim_states(self, actor_def):
         """Return a sorted list of animation state names for *actor_def*.
@@ -2823,8 +3283,12 @@ class CutsceneEditor:
             tracks = self._available_music_tracks()
             return tracks[0] if tracks else ''
         if key == 'sfx':
+            if self._form_type == 'stop_sfx':
+                return ''            # blank = stop every looping SFX
             names = self._available_sfx_names()
             return names[0] if names else ''
+        if key == 'loop' and self._form_type == 'play_sfx':
+            return 'False'           # SFX are one-shots unless Loop is switched on
         # scroll uses a much slower default speed than weather
         return base.get(key, '')
 
@@ -2871,6 +3335,7 @@ class CutsceneEditor:
         # exactly the entry we just wrote, regardless of any ties.
         self._tl_sel = next(
             (i for i, a in enumerate(actions) if a is action), 0)
+        self._tl_multi_ids.clear()
         self._form_active = False
         self._form_focus  = None
         self.unsaved      = True
@@ -2915,7 +3380,9 @@ class CutsceneEditor:
             if state:
                 self.camera.x  = float(state.get('cam_x', self.camera.x))
                 self.camera.y  = float(state.get('cam_y', self.camera.y))
-                self._vp_zoom  = float(state.get('zoom',  self._vp_zoom))
+                self._vp_zoom  = _clamp(float(state.get('zoom', self._vp_zoom)),
+                                        self._vp_zoom_min, self._vp_zoom_max)
+                self._sync_camera_view()
                 self._clamp_camera()
                 return
         except (OSError, json.JSONDecodeError, KeyError, TypeError):
@@ -2955,6 +3422,9 @@ class CutsceneEditor:
         self.cutscene_data  = data
         self.unsaved        = False
         self._tl_sel        = -1
+        self._tl_multi_ids  = set()
+        self._kf_drag_group = []
+        self._tl_marquee    = None
         self._actor_sel     = -1
         self._form_active   = False
         self._form_focus    = None
@@ -3045,20 +3515,21 @@ class CutsceneEditor:
                 print(f'[CutsceneEditor] _scrub_to runtime error: {e}')
                 return
         if self._runtime:
+            hold = None if self._cam_track else (self.camera.x, self.camera.y)
             self._runtime.seek(t)
-            # Snap the editor camera directly to the camera_target world position.
-            # Don't call camera.update() here — that tweens, causing the camera to
-            # keep drifting after scrub ends. Instead set x/y directly.
             from config.settings import RENDER_SCALE
             import math
-            ct = self._runtime.camera_target
-            room = self._get_current_room()
-            w = (room.width  if room else 10000) * RENDER_SCALE
-            h = (room.height if room else 10000) * RENDER_SCALE
-            self.camera.x = ct.x * RENDER_SCALE - self.camera.screen_width  // 2
-            self.camera.y = ct.y * RENDER_SCALE - self.camera.screen_height // 2
-            self.camera.x = max(0, min(self.camera.x, w - self.camera.screen_width))
-            self.camera.y = max(0, min(self.camera.y, h - self.camera.screen_height))
+            if hold is not None:
+                # Tracking off: seek() may have moved the camera; put it back.
+                self.camera.x, self.camera.y = hold
+            else:
+                # Snap the editor camera directly to the camera_target world position.
+                # Don't call camera.update() here — that tweens, causing the camera to
+                # keep drifting after scrub ends. Instead set x/y directly.
+                ct = self._runtime.camera_target
+                self.camera.x = ct.x * RENDER_SCALE - self.camera.screen_width  // 2
+                self.camera.y = ct.y * RENDER_SCALE - self.camera.screen_height // 2
+                self._clamp_camera()
             # Scrub view is a static snapshot — clear any live shake that seek()
             # may have applied (shake inside its window) so the camera doesn't
             # wobble while the playhead is stationary.  A deterministic jitter
@@ -3068,7 +3539,8 @@ class CutsceneEditor:
             # shake window.  Uses the camera_target position (already set above)
             # as the base; the jitter is overwritten on the next scrub call so it
             # never bleeds into camera state or playback.
-            for _action in (self.cutscene_data or {}).get('actions', []):
+            for _action in ((self.cutscene_data or {}).get('actions', [])
+                            if self._cam_track else []):
                 if (_action.get('target') == 'camera'
                         and _action.get('type') == 'shake'):
                     _p    = _action.get('params', {})
@@ -3096,18 +3568,18 @@ class CutsceneEditor:
                 self._runtime = CutsceneRuntime(
                     self.cutscene_data, self.camera, self._entity_factory,
                     dialogue_box=self.dialogue_box, sound_manager=self.sound_manager)
+            hold = None if self._cam_track else (self.camera.x, self.camera.y)
             self._runtime.seek(self._tl_playhead_t)
-            # Snap the camera to the correct start position so there is no
-            # one-frame jump when playback begins (same logic as _scrub_to).
-            from config.settings import RENDER_SCALE
-            ct   = self._runtime.camera_target
-            room = self._get_current_room()
-            w = (room.width  if room else 10000) * RENDER_SCALE
-            h = (room.height if room else 10000) * RENDER_SCALE
-            self.camera.x = ct.x * RENDER_SCALE - self.camera.screen_width  // 2
-            self.camera.y = ct.y * RENDER_SCALE - self.camera.screen_height // 2
-            self.camera.x = max(0, min(self.camera.x, w - self.camera.screen_width))
-            self.camera.y = max(0, min(self.camera.y, h - self.camera.screen_height))
+            if hold is not None:
+                self.camera.x, self.camera.y = hold
+            else:
+                # Snap the camera to the correct start position so there is no
+                # one-frame jump when playback begins (same logic as _scrub_to).
+                from config.settings import RENDER_SCALE
+                ct = self._runtime.camera_target
+                self.camera.x = ct.x * RENDER_SCALE - self.camera.screen_width  // 2
+                self.camera.y = ct.y * RENDER_SCALE - self.camera.screen_height // 2
+                self._clamp_camera()
         except Exception as e:
             print(f'[CutsceneEditor] _start_preview error: {e}')
             import traceback
@@ -3155,6 +3627,8 @@ class CutsceneEditor:
         """Tidy up editor state after an undo or redo."""
         self.unsaved      = True
         self._tl_sel      = -1
+        self._tl_multi_ids.clear()
+        self._kf_drag_group = []
         self._form_active = False
         self._form_focus  = None
         self._actor_sel   = -1
@@ -3178,6 +3652,8 @@ class CutsceneEditor:
         # fade_out=False so there's no lingering fade-out delay.
         if self.sound_manager is not None:
             self.sound_manager.stop_music(fade_out=False)
+        if self._runtime is not None:
+            self._runtime.stop_looping_sfx()
         # Clear residual camera shake so it doesn't bleed into the next
         # playback session.  We check both private and public attribute names
         # because Camera implementations have varied across project versions.
@@ -3252,6 +3728,7 @@ class CutsceneEditor:
         don't handle gracefully.  Clamping happens naturally as the user pans.
         """
         self._vp_zoom = 1.0
+        self._sync_camera_view()
         self.camera.x = 0.0
         self.camera.y = 0.0
         room = self._get_current_room()
@@ -3578,7 +4055,8 @@ class CutsceneEditor:
         # clutter the viewport the rest of the time. Own colour/spacing from
         # the tile grid above so the two are never confused for each other.
         if (room and self._vp_zoom >= 0.4 and self._actor_snap_enabled
-                and (self._pick_mode == 'pick_actor' or self._actor_drag_idx >= 0)):
+                and (self._pick_mode == 'pick_actor' or self._pick_mode in _ACTOR_PICKS
+                     or self._actor_drag_idx >= 0)):
             snap_size = self._actor_snap_sizes[self._actor_snap_idx]
             self._draw_viewport_grid(inter, room, cell_size=snap_size,
                                      grid_col=(90, 150, 230))
@@ -3630,6 +4108,10 @@ class CutsceneEditor:
             actors_sorted = sorted(enumerate(actors), key=lambda t: t[1].get('y', 0))
             for i, actor in actors_sorted:
                 self._draw_actor_marker(inter, actor, i, i == self._actor_sel)
+
+        # Destination preview (move / fly / teleport) — under fg tiles so it
+        # is occluded exactly like the real actor will be.
+        self._draw_dest_ghost(inter)
 
         # Foreground tile layer — drawn after actors so it occludes them correctly.
         if room:
@@ -3816,7 +4298,7 @@ class CutsceneEditor:
 
     _ENUM_HINTS = frozenset({'dir', 'anim', 'portrait', 'invert_mode', 'weather_type',
                              'scroll_dir', 'character', 'costume', 'music_track',
-                             'sfx_name', 'attack_type', 'color'})
+                             'sfx_name', 'sfx_name_any', 'attack_type', 'color'})
 
     def _fh(self, size):
         """Measured line height of font 's' / 'm' / 'l' (cached)."""
@@ -4255,6 +4737,10 @@ class CutsceneEditor:
         grid_r = pygame.Rect(xr - gw, 8, gw, bs)
         self._button(screen, grid_r, 'Grid', _icon_grid, 'grid_toggle', active=self._show_grid,
                      key='hdr:grid')
+        cw = self._btn_width('Cam Track', True)
+        cam_r = pygame.Rect(grid_r.x - 8 - cw, 8, cw, bs)
+        self._button(screen, cam_r, 'Cam Track', _icon_camera_track, 'cam_track_toggle',
+                     active=self._cam_track, key='hdr:camtrack')
         self._button(screen, save_r, 'Save', self._icon_save_png, 'save', primary=self.unsaved,
                      key='hdr:save')
 
@@ -4264,7 +4750,7 @@ class CutsceneEditor:
         block_w = tc_w + 10 + pw
         left_end = pad + bs + 14
         cl = (w - block_w) // 2
-        cl = min(cl, grid_r.x - block_w - 24)
+        cl = min(cl, cam_r.x - block_w - 24)
         cl = max(cl, left_end + 150)
 
         tc = pygame.Rect(cl, 8, tc_w, bs)
@@ -4526,13 +5012,34 @@ class CutsceneEditor:
         actions = self.cutscene_data.get('actions', []) if self.cutscene_data else []
         sel = actions[self._tl_sel] if 0 <= self._tl_sel < len(actions) else None
 
+        if self._tl_multi_ids:
+            group = self._sel_actions()
+            y += 18
+            self._txt(screen, self.font_medium, f'{len(group)} keyframes selected',
+                      (x + W // 2, y), uk.Theme.TEXT_PRIMARY, anchor='midtop', dynamic=True)
+            y += self._fh('m') + 8
+            if group:
+                span = f'{group[0]["time"]:.2f}s  to  {group[-1]["time"]:.2f}s'
+                self._txt(screen, self.font_small, span, (x + W // 2, y),
+                          uk.Theme.TEXT_SECONDARY, anchor='midtop', dynamic=True)
+                y += self._fh('s') + 8
+            hint = ('Drag any selected keyframe to move them all together. '
+                    'Ctrl/Shift-click to add or remove one. Esc clears the selection.')
+            for line in self._wrap_text(self.font_small, hint, W - 8):
+                self._txt(screen, self.font_small, line, (x + W // 2, y), uk.Theme.TEXT_MUTED, anchor='midtop')
+                y += self._fh('s') + 4
+            y += 14
+            self._button(screen, pygame.Rect(x, y, W, 36), 'New action', _icon_plus, 'tl_add',
+                         primary=True, key='insp:new_multi')
+            return y + 36
+
         if sel is None:
             y += 18
             self._txt(screen, self.font_medium, 'Nothing selected', (x + W // 2, y),
                       uk.Theme.TEXT_SECONDARY, anchor='midtop')
             y += self._fh('m') + 8
             for line in self._wrap_text(self.font_small,
-                                        'Click a keyframe on the timeline to edit it, or add a new action.', W - 8):
+                                        'Click a keyframe on the timeline to edit it (Ctrl/Shift-click or drag a box to select several), or add a new action.', W - 8):
                 self._txt(screen, self.font_small, line, (x + W // 2, y), uk.Theme.TEXT_MUTED, anchor='midtop')
                 y += self._fh('s') + 4
             y += 14
@@ -4681,8 +5188,8 @@ class CutsceneEditor:
                 self._field(screen, pygame.Rect(x, y, W, ch), buf, self._form_focus == key, ('form', key))
                 y += ch + gap
 
-        if self._form_type in ('play_music', 'play_sfx', 'stop_music') and self.sound_manager is not None:
-            label = 'Preview stop' if self._form_type == 'stop_music' else 'Preview'
+        if self._form_type in ('play_music', 'play_sfx', 'stop_sfx', 'stop_music') and self.sound_manager is not None:
+            label = 'Preview stop' if self._form_type in ('stop_music', 'stop_sfx') else 'Preview'
             self._button(screen, pygame.Rect(x, y, W, ch), label, _icon_speaker, 'preview_sound',
                          accent=_SOUND_COLOR, key='insp:preview')
             y += ch + gap
@@ -4792,6 +5299,10 @@ class CutsceneEditor:
                 banner = f'Click where the beam should stop  -  {axis} only  -  Esc to cancel'
             elif self._pick_mode == 'pick_actor':
                 banner = 'Click to place the actor  -  Esc to cancel'
+            elif self._pick_mode in _ACTOR_PICKS:
+                banner = ('Click to set the destination  -  '
+                          + ('snapping to grid  -  ' if self._actor_snap_enabled else '')
+                          + 'Esc to cancel')
             else:
                 banner = f'Click to pick a position  -  {self._pick_mode}  -  Esc to cancel'
         elif self._actor_drag_idx >= 0 and self._actor_drag_idx < len(actors):
@@ -4835,6 +5346,10 @@ class CutsceneEditor:
                            anchor='topleft')
             elif self._pick_mode in ('pick_pan_to', 'pick_snap_to', 'pick_move_to',
                                      'pick_fly_to', 'pick_teleport', 'pick_pan_to_start'):
+                if self._pick_mode in _ACTOR_PICKS:
+                    # Show the crosshair where the click will really land.
+                    wx, wy = self._snap_actor_xy(wx, wy)
+                    mx, my = self._world_to_screen(wx, wy)
                 arm = 22
                 uk.draw_line_on(screen, acc, (mx - arm, my), (mx + arm, my), 1)
                 uk.draw_line_on(screen, acc, (mx, my - arm), (mx, my + arm), 1)
@@ -4846,17 +5361,58 @@ class CutsceneEditor:
                 # to that axis, running from the actor to the cursor.
                 direction = self._form_params.get('direction', 'down')
                 actor_def = next((a for a in actors if a.get('id') == self._form_target), None)
-                ax = float(actor_def.get('x', wx)) if actor_def else wx
-                ay = float(actor_def.get('y', wy)) if actor_def else wy
+                start = (self._actor_pos_before(actor_def['id'], self._form_time())
+                         if actor_def else None)
+                ax = start[0] if start else wx
+                ay = start[1] if start else wy
                 a_x, a_y = self._world_to_screen(ax, ay)
                 if direction in ('up', 'down'):
                     uk.draw_line_on(screen, acc, (a_x, a_y), (a_x, my), 2)
-                    uk.draw_circle_on(screen, acc, (a_x, my), 5, 1)
-                    self._chip(screen, a_x + 12, my, f'stop Y = {wy:.1f}', acc, anchor='midleft')
+                    self._draw_impact_marker(screen, (a_x, my), acc)
+                    self._chip(screen, a_x + 24, my, f'stop Y = {wy:.1f}', acc, anchor='midleft')
                 else:
                     uk.draw_line_on(screen, acc, (a_x, a_y), (mx, a_y), 2)
-                    uk.draw_circle_on(screen, acc, (mx, a_y), 5, 1)
-                    self._chip(screen, mx + 12, a_y, f'stop X = {wx:.1f}', acc, anchor='midleft')
+                    self._draw_impact_marker(screen, (mx, a_y), acc)
+                    self._chip(screen, mx + 24, a_y, f'stop X = {wx:.1f}', acc, anchor='midleft')
+
+        # ── Destination readout (actor move / fly / teleport) ─────────────────
+        pv = self._dest_preview()
+        if pv:
+            dx, dy = pv['dest']
+            col = _ACTOR_COLORS[pv['idx'] % len(_ACTOR_COLORS)]
+            label = f'{pv["actor"].get("id", "actor")}  ->  ({dx:.1f}, {dy:.1f})'
+            if pv['start']:
+                dist = math.hypot(dx - pv['start'][0], dy - pv['start'][1])
+                label += f'   dist {dist:.0f}'
+                try:
+                    dur = float(self._form_params.get('duration', ''))
+                except ValueError:
+                    dur = 0.0
+                if pv['type'] != 'teleport' and dur > 0:
+                    label += f'   {dist / dur:.0f} u/s'
+            px, py = self._world_to_screen(dx, dy)
+            self._chip(screen, px + 16, py + 20, label, col, anchor='topleft')
+
+        # Persistent beam-stop preview while an attack form is open.
+        if (not self._pick_mode and self._form_active and self._form_type == 'attack'):
+            actor_def = next((a for a in actors if a.get('id') == self._form_target), None)
+            start = (self._actor_pos_before(actor_def['id'], self._form_time())
+                     if actor_def else None)
+            if start:
+                direction = self._form_params.get('direction', 'down')
+                key = 'target_y' if direction in ('up', 'down') else 'target_x'
+                try:
+                    tv = float(self._form_params.get(key, ''))
+                except ValueError:
+                    tv = None
+                if tv is not None:
+                    a_x, a_y = self._world_to_screen(*start)
+                    end = (a_x, self._world_to_screen(0, tv)[1]) if key == 'target_y' \
+                        else (self._world_to_screen(tv, 0)[0], a_y)
+                    uk.draw_line_on(screen, uk.Theme.GOLD, (a_x, a_y), end, 2)
+                    self._draw_impact_marker(screen, end, uk.Theme.GOLD)
+                    self._chip(screen, end[0] + 24, end[1], f'beam stops {key[-1].upper()} = {tv:.1f}',
+                               uk.Theme.GOLD, anchor='midleft')
 
         # ── Cursor coordinates (bottom-left) ──────────────────────────────────
         if inside and not self._pick_mode:
@@ -4950,10 +5506,12 @@ class CutsceneEditor:
     def _draw_tl_toolbar(self, screen, tl, dur, actions):
         y, h = tl.y + 2, 32
         x = tl.x
-        sel_ok = 0 <= self._tl_sel < len(actions)
+        sel_ok = bool(self._tl_multi_ids) or 0 <= self._tl_sel < len(actions)
         interval = self._tl_grid_intervals[self._tl_grid_idx]
         int_lbl = f'{interval:g}s'
         total_lbl = f'{dur:.1f}s total'
+        if self._tl_multi_ids:
+            total_lbl = f'{len(self._tl_multi_ids)} selected  -  {total_lbl}'
 
         # Measure the full layout first; if it can't fit beside the "total"
         # readout, fall back to icon-only Duplicate / Delete and drop the
@@ -4961,7 +5519,7 @@ class CutsceneEditor:
         w_dup, w_del = self._btn_width('Duplicate', True), self._btn_width('Delete', True)
         w_snap, w_int = self._btn_width('Snap', True), self._btn_width(int_lbl, False)
         zoom_cap_w = self.font_small.size('ZOOM')[0] + 10
-        full_w = (w_dup + 8 + w_del + 14 + 15 + zoom_cap_w + h + 6 + h + 8 + 62 + 12
+        full_w = (w_dup + 8 + w_del + 6 + (h + 6) * 2 + 8 + 15 + zoom_cap_w + h + 6 + h + 8 + 62 + 12
                   + 15 + w_snap + 6 + w_int)
         total_w = self.font_small.size(total_lbl)[0]
         compact = full_w + total_w + 24 > tl.w
@@ -4973,7 +5531,13 @@ class CutsceneEditor:
         x += w_dup + 8
         self._button(screen, pygame.Rect(x, y, w_del, h), None if compact else 'Delete', self._icon_trash_png,
                      'tl_del', danger=True, enabled=sel_ok, key='tl:del')
-        x += w_del + 14
+        x += w_del + 6
+        self._button(screen, pygame.Rect(x, y, h, h), icon=_icon_dup, action='tl_copy',
+                     enabled=sel_ok, key='tl:copy')
+        x += h + 6
+        self._button(screen, pygame.Rect(x, y, h, h), icon=_icon_paste, action='tl_paste',
+                     enabled=bool(CutsceneEditor._clipboard), key='tl:paste')
+        x += h + 8
 
         def sep(px):
             uk.draw_rect_on(screen, uk.Theme.CARD_BORDER, pygame.Rect(px, y + 6, 1, h - 12), 0, 0)
@@ -5098,6 +5662,9 @@ class CutsceneEditor:
 
         bar_h = 14
         r_cap = bar_h // 2
+        multi_ids = self._tl_multi_ids
+        drag_ids  = ({id(a) for a, _t in self._kf_drag_group}
+                     if self._kf_drag_idx >= 0 else set())
         for i, row in enumerate(rows):
             row_bg = row_bgs[i]
             if row_bg is None:
@@ -5114,7 +5681,7 @@ class CutsceneEditor:
                     continue
                 kf_t     = action['time']
                 kf_x     = label_end_x + kf_t * zoom - scroll_x
-                selected = (ai == self._tl_sel)
+                selected = (ai == self._tl_sel) or (id(action) in multi_ids)
 
                 # Duration bar — actions with a 'duration' param span time, so
                 # show the window they occupy as a capsule from the keyframe.
@@ -5145,7 +5712,7 @@ class CutsceneEditor:
 
                 if kf_x < label_end_x - 12 or kf_x > tl.right + 12:
                     continue
-                dragging = (ai == self._kf_drag_idx)
+                dragging = (ai == self._kf_drag_idx) or (id(action) in drag_ids)
                 if selected:
                     uk.draw_soft_glow(screen, (int(kf_x), kf_cy), 18, uk.Theme.GOLD, max_alpha=52)
                     _draw_diamond(screen, kf_x, kf_cy, 8 if dragging else 7, color, _WHITE, 2)
@@ -5154,6 +5721,25 @@ class CutsceneEditor:
 
             uk.draw_rect_on(screen, (26, 30, 41), pygame.Rect(label_end_x, row_y + rh - 1, time_w, 1), 0, 0)
         self._pop_clip(screen)
+
+        # ── Rubber-band selection box ─────────────────────────────────────────
+        if self._tl_marquee is not None and self._tl_marquee['active']:
+            t_min, t_max, y_min, y_max = self._marquee_bounds()
+            bx0 = label_end_x + t_min * zoom - scroll_x
+            bx1 = label_end_x + t_max * zoom - scroll_x
+            by0 = tracks_y + y_min - scroll_y
+            by1 = tracks_y + y_max - scroll_y
+            box = pygame.Rect(int(bx0), int(by0), max(1, int(bx1 - bx0)), max(1, int(by1 - by0)))
+            box = box.clip(rows_rect)
+            if box.w > 0 and box.h > 0:
+                self._push_clip(screen, rows_rect)
+                uk.draw_rect_on(screen, (*uk.Theme.GOLD[:3], 40), box, 0, 0)
+                edge = uk.Theme.GOLD
+                uk.draw_rect_on(screen, edge, pygame.Rect(box.x, box.y, box.w, 1), 0, 0)
+                uk.draw_rect_on(screen, edge, pygame.Rect(box.x, box.bottom - 1, box.w, 1), 0, 0)
+                uk.draw_rect_on(screen, edge, pygame.Rect(box.x, box.y, 1, box.h), 0, 0)
+                uk.draw_rect_on(screen, edge, pygame.Rect(box.right - 1, box.y, 1, box.h), 0, 0)
+                self._pop_clip(screen)
 
         # ── Playhead (spans ruler + rows) ─────────────────────────────────────
         self._push_clip(screen, pygame.Rect(label_end_x, ruler_y, time_w + 1, tl.bottom - ruler_y))

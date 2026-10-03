@@ -94,6 +94,9 @@ BLEND_MUL = 0x00000008     # SDL >= 2.0.11 only
 # (the cache itself kept the Surface alive). Weakrefs fix the common case;
 # this cap is the safety net for Surfaces that *are* still referenced
 # elsewhere but churn in large numbers (scaled frames, font glyphs, etc.).
+# Largest single texture we ask SDL for. 16384 is the common GPU limit, 8192 is the
+# safe floor; anything bigger is split into chunks (see _blit_oversized).
+_MAX_TEX_DIM = 8192
 _TEX_CACHE_MAX = 2048
 # How often (in blit calls) to sweep dead weakref entries out of the cache.
 _TEX_CACHE_PRUNE_EVERY = 256
@@ -142,6 +145,9 @@ class GPUScreen:
         # OrderedDict so we can LRU-evict when over _TEX_CACHE_MAX.
         self._tex_cache: OrderedDict[int, tuple[weakref.ref, sdl2_video.Texture]] = OrderedDict()
         self._tex_cache_ops = 0  # blit/_get_texture call counter for periodic prune
+        # Surfaces wider/taller than _MAX_TEX_DIM can't be one GPU texture, so they
+        # are uploaded as a grid of chunks. id(surface) -> (weakref, [(Rect, Texture)])
+        self._big_cache: dict[int, tuple[weakref.ref, list]] = {}
         self._circle_cache: dict[tuple, sdl2_video.Texture] = {}
         self._ellipse_cache: dict[tuple, sdl2_video.Texture] = {}
         self._gfx_filled_circle_cache: dict[tuple, sdl2_video.Texture] = {}
@@ -191,12 +197,14 @@ class GPUScreen:
         hot paths in this codebase already replace-the-object rather
         than mutate, which needs no special handling here)."""
         self._tex_cache.pop(id(surface), None)
+        self._big_cache.pop(id(surface), None)
 
     def clear_caches(self):
         """Release every cached GPU texture. Called from Game.cleanup()
         so the process can exit without holding VRAM/RAM for the whole
         session's worth of uploads."""
         self._tex_cache.clear()
+        self._big_cache.clear()
         self._circle_cache.clear()
         self._ellipse_cache.clear()
         self._gfx_filled_circle_cache.clear()
@@ -240,8 +248,16 @@ class GPUScreen:
             # so this has to be short-circuited here rather than falling
             # through to _get_texture().
             return
+        if surface.get_width() > _MAX_TEX_DIM or surface.get_height() > _MAX_TEX_DIM:
+            self._blit_oversized(surface, dest, area, special_flags)
+            return
         tex = self._get_texture(surface)
         tex.blend_mode = self._SPECIAL_FLAGS_TO_BLEND_MODE.get(special_flags, BLEND_BLEND)
+        # Texture.from_surface only copies the surface's alpha at upload time, so
+        # a later Surface.set_alpha() (e.g. the zeni pre-despawn blink) would be
+        # ignored on a cached texture. Re-apply it on every call, like blend_mode.
+        _a = surface.get_alpha()
+        tex.alpha = 255 if _a is None else _a
         # area (the source sub-rect) is commonly passed as a plain
         # (x, y, w, h) tuple, not a pygame.Rect -- Surface.blit() accepts
         # either, so normalize here rather than assuming callers always
@@ -274,6 +290,67 @@ class GPUScreen:
             return
         dst_rect, area = clipped
         tex.draw(srcrect=area, dstrect=dst_rect)
+
+    def _get_big_chunks(self, surface: pygame.Surface) -> list:
+        """Upload an oversized Surface as a grid of <= _MAX_TEX_DIM textures."""
+        key = id(surface)
+        entry = self._big_cache.get(key)
+        if entry is not None:
+            ref, chunks = entry
+            if ref() is surface:
+                return chunks
+            del self._big_cache[key]
+        # drop entries whose Surface was garbage-collected
+        for k in [k for k, (r, _c) in self._big_cache.items() if r() is None]:
+            del self._big_cache[k]
+        sw, sh = surface.get_size()
+        chunks = []
+        for y in range(0, sh, _MAX_TEX_DIM):
+            for x in range(0, sw, _MAX_TEX_DIM):
+                r = pygame.Rect(x, y, min(_MAX_TEX_DIM, sw - x), min(_MAX_TEX_DIM, sh - y))
+                sub = surface.subsurface(r)
+                chunks.append((r, sdl2_video.Texture.from_surface(self.renderer, sub)))
+        self._big_cache[key] = (weakref.ref(surface), chunks)
+        return chunks
+
+    def _blit_oversized(self, surface, dest, area, special_flags):
+        """blit() for Surfaces beyond the GPU's max texture size."""
+        full = pygame.Rect(0, 0, surface.get_width(), surface.get_height())
+        src = full if area is None else pygame.Rect(area).clip(full)
+        if src.width <= 0 or src.height <= 0:
+            return
+        if isinstance(dest, pygame.Rect):
+            dst = dest
+        else:
+            dst = pygame.Rect(dest[0], dest[1], src.width, src.height)
+        if dst.width <= 0 or dst.height <= 0:
+            return
+        fx = dst.width / src.width
+        fy = dst.height / src.height
+        view = pygame.Rect(0, 0, *self._logical_size)
+        mode = self._SPECIAL_FLAGS_TO_BLEND_MODE.get(special_flags, BLEND_BLEND)
+        _a = surface.get_alpha()
+        alpha = 255 if _a is None else _a
+        for crect, tex in self._get_big_chunks(surface):
+            inter = crect.clip(src)
+            if inter.width <= 0 or inter.height <= 0:
+                continue
+            # round both edges (not the size) so neighbouring chunks never leave seams
+            x0 = dst.x + int(round((inter.x - src.x) * fx))
+            y0 = dst.y + int(round((inter.y - src.y) * fy))
+            x1 = dst.x + int(round((inter.right - src.x) * fx))
+            y1 = dst.y + int(round((inter.bottom - src.y) * fy))
+            d = pygame.Rect(x0, y0, x1 - x0, y1 - y0)
+            if d.width <= 0 or d.height <= 0 or not d.colliderect(view):
+                continue
+            local = pygame.Rect(inter.x - crect.x, inter.y - crect.y, inter.width, inter.height)
+            clipped = self._clip_destination(d, local, tex)
+            if clipped is None:
+                continue
+            d, local = clipped
+            tex.blend_mode = mode
+            tex.alpha = alpha
+            tex.draw(srcrect=local, dstrect=d)
 
     def blit_scaled(self, surface: pygame.Surface, dst_rect: pygame.Rect, area=None):
         """
@@ -334,7 +411,16 @@ class GPUScreen:
         if surface.get_width() <= 0 or surface.get_height() <= 0:
             # Same zero-size no-op as blit() above -- see comment there.
             return
-        tex = sdl2_video.Texture.from_surface(self.renderer, surface)
+        try:
+            tex = sdl2_video.Texture.from_surface(self.renderer, surface)
+        except Exception as exc:
+            if 'INVALIDCALL' not in str(exc):
+                raise
+            # Direct3D9 reports INVALIDCALL from CreateTexture while the
+            # device is lost/resetting (right after a fullscreen <-> borderless
+            # <-> windowed switch). Skip this one draw; SDL restores the
+            # device and the next frame's upload succeeds.
+            return
         if area is not None and not isinstance(area, pygame.Rect):
             area = pygame.Rect(area)
         if area is not None:
@@ -368,6 +454,12 @@ class GPUScreen:
         # game.py already tracks SCREEN_WIDTH/SCREEN_HEIGHT as constants,
         # sidesteps that entirely.
         return self._logical_size
+
+    def set_logical_size(self, size):
+        """Change the logical (render) resolution at runtime. The caller must
+        also update Renderer.logical_size so SDL maps window <-> logical."""
+        self._logical_size = (int(size[0]), int(size[1]))
+        self._clip_rect = None
 
     def get_rect(self, **kwargs):
         """Mirrors Surface.get_rect(): a Rect at (0, 0) sized to the logical

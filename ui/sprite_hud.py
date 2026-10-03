@@ -3,7 +3,7 @@ import os
 import sys
 import time
 import colorsys
-# (RENDER_SCALE import removed — this file never used it.)
+from config.settings import RENDER_SCALE, UI_SCALE
 
 
 class _TintedBarSprite:
@@ -56,14 +56,18 @@ class SpriteHUD:
         self.screen_height = screen_height
         self.visible = True
 
-        self.hud_x = 10
-        self.hud_y = 10
+        # Margins are screen pixels, so they follow the resolution (10 @1080p).
+        self.hud_x = max(1, round(10 * UI_SCALE))
+        self.hud_y = max(1, round(10 * UI_SCALE))
         self.hud_offset_y = 0.0  # animated by cutscene start/stop
         self._hud_slide_out = False
         self._hud_slide_in  = False
 
-        # Change this one value to resize everything
-        self.scale = 6
+        # Change this one value to resize everything. It is an INTEGER so the
+        # pixel art stays crisp, and it tracks the resolution (6 @1080p, 8 @1440p,
+        # 12 @4K) -- the same factor tiles use, so the HUD keeps the same share
+        # of the screen at every resolution.
+        self.scale = RENDER_SCALE
 
         if getattr(sys, 'frozen', False):
             app_path = os.path.dirname(sys.executable)
@@ -164,9 +168,9 @@ class SpriteHUD:
         self._locked_max_hp = 0
 
         pygame.font.init()
-        self.font_small  = pygame.font.Font(None, 18)
-        self.font_medium = pygame.font.Font(None, 22)
-        self.font_large  = pygame.font.Font(None, 26)
+        self.font_small  = pygame.font.Font(None, round(18 * UI_SCALE))
+        self.font_medium = pygame.font.Font(None, round(22 * UI_SCALE))
+        self.font_large  = pygame.font.Font(None, round(26 * UI_SCALE))
 
         self.colors = {
             'text':             (255, 255, 255),

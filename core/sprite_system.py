@@ -193,6 +193,14 @@ class Animation:
         self.holding = False
         self._hold_released = False
 
+        # Runtime override of `loop`, set by AnimatedSprite.set_animation(...,
+        # loop=True/False) (cutscene set_animation action). None = use the
+        # animation's own default. False = play through once and hold the
+        # last frame (ignores loop_tail_frames and idle-blink); True = cycle
+        # forever. Cleared by reset(), so the next normal set_animation
+        # returns the animation to its defaults.
+        self.loop_override = None
+
         self.current_frame = 0
         self.time_elapsed = 0
         self.finished = False
@@ -208,7 +216,11 @@ class Animation:
         self._blinking = False
 
     def update(self, dt):
-        if self.idle_blink:
+        override = self.loop_override
+        loop = self.loop if override is None else override
+        tail_frames = self.loop_tail_frames if override is None else None
+
+        if self.idle_blink and override is not False:
             self.time_elapsed += dt
             if self._blinking:
                 # Currently showing the blink frame — hold it for one
@@ -230,7 +242,7 @@ class Animation:
         # is a different story: it's marked finished after its first full
         # playthrough (see below) but still needs to keep ticking so the
         # tail frames continue to cycle.
-        if self.finished and not self.loop and not self.loop_tail_frames:
+        if self.finished and not loop and not tail_frames:
             return
 
         # Hold-and-loop segment: once playback reaches hold_frames[0], stop
@@ -255,14 +267,14 @@ class Animation:
             self.current_frame += 1
 
             tail_start = (
-                max(0, len(self.frames) - self.loop_tail_frames)
-                if self.loop_tail_frames else None
+                max(0, len(self.frames) - tail_frames)
+                if tail_frames else None
             )
 
             if self.current_frame >= len(self.frames):
-                if self.loop:
+                if loop:
                     self.current_frame = 0
-                elif self.loop_tail_frames:
+                elif tail_frames:
                     # First time reaching the end: mark finished (same signal
                     # every other non-looping animation gives) and drop back
                     # into the tail range instead of freezing on frame -1.
@@ -271,7 +283,7 @@ class Animation:
                 else:
                     self.current_frame = len(self.frames) - 1
                     self.finished = True
-            elif self.finished and self.loop_tail_frames and self.current_frame < tail_start:
+            elif self.finished and tail_frames and self.current_frame < tail_start:
                 # Already past the first playthrough and looping the tail —
                 # keep current_frame from drifting below the tail range.
                 self.current_frame = tail_start
@@ -288,6 +300,7 @@ class Animation:
         self._blinking = False
         self.holding = False
         self._hold_released = False
+        self.loop_override = None
 
     def release_hold(self):
         """Let a held animation (see hold_frames) continue past its hold-loop
@@ -340,6 +353,11 @@ class AnimatedSprite:
     # just changed on disk — see reload_sprites_for_path() below.
     _live_sprites = weakref.WeakSet()
 
+    # True while the current animation carries a loop override (see
+    # set_animation's `loop` arg), so the common loop=None path only pays for
+    # one attribute check.
+    _loop_override_active = False
+
     def __init__(self, character_name, costume_name, sprite_width, sprite_height):
         self.character_name = character_name
         self.costume_name = costume_name
@@ -364,6 +382,7 @@ class AnimatedSprite:
         self.current_animation = None
         self.current_direction = 'down'
         self.current_variant_index = 0
+        self._missing_animation_key = None
 
         self.offset_x = sprite_width // 2
         self.offset_y = sprite_height // 2
@@ -395,6 +414,7 @@ class AnimatedSprite:
         sprite.current_animation = None
         sprite.current_direction = 'down'
         sprite.current_variant_index = 0
+        sprite._missing_animation_key = None
         sprite.offset_x = sprite_width // 2
         sprite.offset_y = sprite_height // 2
         cls._live_sprites.add(sprite)
@@ -712,16 +732,87 @@ class AnimatedSprite:
             self.load_animation_fixed_frames(animation_name, direction, frame_duration,
                                              frame_indices, use_8_directions, source_name)
 
+    # Direction order tried when an animation exists but not for the requested
+    # facing (e.g. melee.png only drawn for down/left/right, player faces up).
+    _FALLBACK_DIRECTIONS = DIRECTIONS_4 + tuple(d for d in DIRECTIONS_8 if d not in DIRECTIONS_4)
+
+    # Set to the requested "{name}_{direction}" key when set_animation() /
+    # restart_animation() was asked for an animation this sprite doesn't have
+    # at all (no art for it in ANY direction); None otherwise. See
+    # is_animation_missing() / is_animation_finished() for why this exists.
+    _missing_animation_key = None
+
+    # (base_path, animation_name) pairs already reported, so a missing
+    # animation logs once instead of spamming the console every frame.
+    _warned_missing = set()
+
     def has_animation(self, animation_name, direction):
         """True if this animation/direction combo was successfully loaded."""
         return f"{animation_name}_{direction}" in self.animations
 
-    def set_animation(self, animation_name, direction):
-        """Switch to a different animation, resetting it only if the key actually changed."""
-        key = f"{animation_name}_{direction}"
+    def _resolve_animation_key(self, animation_name, direction):
+        """Key to actually play for (animation_name, direction), or None.
 
-        if key not in self.animations:
-            return
+        Exact match first; otherwise the same animation in any other direction
+        (so a sheet that's missing e.g. its 'up' row still shows *something*
+        instead of leaving the previous pose on screen). None means the
+        animation isn't loaded for any direction, i.e. it has no art at all.
+        """
+        key = f"{animation_name}_{direction}"
+        if key in self.animations:
+            return key
+        for fallback in self._FALLBACK_DIRECTIONS:
+            alt = f"{animation_name}_{fallback}"
+            if alt in self.animations:
+                return alt
+        return None
+
+    def _note_missing_animation(self, animation_name, direction):
+        self._missing_animation_key = f"{animation_name}_{direction}"
+        warn_id = (self.base_path, animation_name)
+        if warn_id not in AnimatedSprite._warned_missing:
+            AnimatedSprite._warned_missing.add(warn_id)
+            print(f"sprite_system: '{animation_name}' has no art for "
+                  f"{self.character_name}/{self.costume_name} ({self.base_path}); "
+                  f"treating it as instantly finished so the game doesn't hang waiting on it.")
+
+    def is_animation_missing(self):
+        """True if the most recent set_animation()/restart_animation() asked
+        for an animation this sprite has no art for. Cleared as soon as any
+        animation is successfully set. Lets callers that wait on a specific
+        frame index (which will never arrive) skip the wait."""
+        return self._missing_animation_key is not None
+
+    def _active_animation(self):
+        """The Animation object currently playing (variant-aware), or None."""
+        anim = self.animations.get(self.current_animation)
+        if isinstance(anim, list):
+            if 0 <= self.current_variant_index < len(anim):
+                return anim[self.current_variant_index]
+            return None
+        return anim
+
+    def set_animation(self, animation_name, direction, loop=None):
+        """Switch to a different animation, resetting it only if the key actually changed.
+
+        loop: None keeps the animation's own behaviour (every existing caller).
+        False plays it through once from the start and holds the last frame —
+        even if it's already the current animation, which is restarted.
+        True makes it cycle forever regardless of how it was loaded.
+        """
+        key = self._resolve_animation_key(animation_name, direction)
+
+        if key is None:
+            # No art for this animation at all. The old behaviour was a silent
+            # no-op, which left the *previous* animation playing, and every
+            # state that waits on is_animation_finished() (melee, hurt, death,
+            # transform, kiblast...) then waited forever on an animation that
+            # was never going to finish, locking the player out of moving.
+            # Record it so is_animation_finished() can report True instead.
+            self._note_missing_animation(animation_name, direction)
+            return False
+        self._missing_animation_key = None
+        was_current = (self.current_animation == key)
 
         # Only reset if this is actually a different animation
         if self.current_animation != key:
@@ -740,6 +831,23 @@ class AnimatedSprite:
                 self.current_variant_index = 0
                 anim.reset()
 
+        if loop is None:
+            if self._loop_override_active:
+                active = self._active_animation()
+                if active is not None:
+                    active.loop_override = None
+                self._loop_override_active = False
+        else:
+            active = self._active_animation()
+            if active is not None:
+                if was_current and (loop is False or active.loop_override is not None):
+                    active.reset()          # replay from the top
+                active.loop_override = bool(loop)
+                if loop:
+                    active.finished = False
+                self._loop_override_active = True
+        return True
+
     def restart_animation(self, animation_name, direction):
         """Force this animation to reset to frame 0 and play from the start,
         even if it's already the current animation — set_animation() above
@@ -752,9 +860,11 @@ class AnimatedSprite:
         already playing 'hurt', so it only ever looked like it flinched once
         and had to fully finish before flinching again.
         """
-        key = f"{animation_name}_{direction}"
-        if key not in self.animations:
-            return
+        key = self._resolve_animation_key(animation_name, direction)
+        if key is None:
+            self._note_missing_animation(animation_name, direction)
+            return False
+        self._missing_animation_key = None
 
         self.current_animation = key
         self.current_direction = direction
@@ -766,6 +876,7 @@ class AnimatedSprite:
         else:
             self.current_variant_index = 0
             anim.reset()
+        return True
 
     def update(self, dt):
         """Tick the current animation forward by dt seconds."""
@@ -911,7 +1022,17 @@ class AnimatedSprite:
             anim.release_hold()
 
     def is_animation_finished(self):
-        """True when the current non-looping animation has played through all its frames."""
+        """True when the current non-looping animation has played through all its frames.
+
+        Also True when the last animation requested has no art at all (see
+        is_animation_missing()): there is nothing to play, so it is
+        "finished" from the first frame. Without this, a character lacking
+        e.g. hurt.png / death.png / melee.png / transform.png would sit
+        forever in that state, because the stale animation still on screen
+        (idle/walk, looping) never reports finished.
+        """
+        if self._missing_animation_key is not None:
+            return True
         if self.current_animation and self.current_animation in self.animations:
             anim = self.animations[self.current_animation]
 
@@ -1153,6 +1274,31 @@ def _entity_config_sprite_size(kind, entity_id):
     if not data:
         return None
     return _valid_size(data.get("width"), data.get("height"))
+
+
+def _critter_config_animation_profile(critter_id):
+    """Look up a critter's declared BEHAVIOR_PROFILES key (its "critter_type"
+    field, as saved by entity_creator.py to assets/critters/{critter_id}.json)
+    given the folder/entity id it was spawned with.
+
+    critter_id (the folder under assets/sprites/critters/) and critter_type
+    (the key CRITTER_ANIMATIONS/critter.py's BEHAVIOR_PROFILES is keyed by)
+    are two different things the moment a critter isn't itself named
+    'squirrel'/'bird'/'butterfly' — see entity_creator.py's DEFAULT_CRITTER_CONFIG
+    comment: a new critter (e.g. id 'rabbit') is expected to reuse an existing
+    animal's profile (e.g. critter_type 'squirrel') rather than get a bespoke
+    one. Without this lookup, load_critter() had no way to know that and used
+    critter_id directly as the CRITTER_ANIMATIONS key, which only ever matches
+    the three hardcoded profiles — anything else silently fell back to
+    DEFAULT_ANIMATIONS (idle only), even with a perfectly good walk.png sitting
+    on disk right next to the idle art.
+
+    Falls back to critter_id itself so the three built-in critters (which
+    have no assets/critters/*.json at all) and any critter saved without this
+    field keep working exactly as before.
+    """
+    data = _read_json_config(os.path.join("assets", "critters", f"{critter_id}.json"))
+    return data.get("critter_type") or critter_id
 
 
 def _load_sprite_size(folder, default_w=32, default_h=32):
@@ -1607,7 +1753,15 @@ class CritterSpriteLoader:
 
     @staticmethod
     def load_critter(critter_type, variant='default', sprite_width=16, sprite_height=16):
-        """Load a critter sprite, checking variant/flat folder layouts like enemies/NPCs do."""
+        """Load a critter sprite, checking variant/flat folder layouts like enemies/NPCs do.
+
+        `critter_type` here is the *folder id* (assets/sprites/critters/{critter_type}/),
+        which for a custom critter (e.g. 'rabbit') is NOT the same thing as the
+        CRITTER_ANIMATIONS/BEHAVIOR_PROFILES key it reuses (e.g. 'squirrel') —
+        that's looked up separately below via the critter's saved config, since
+        CRITTER_ANIMATIONS has to be keyed by the latter to find the right
+        (animation_name, duration, loop, use_8_directions) list.
+        """
         direct_path = f"assets/sprites/critters/{critter_type}"
         base_path = _resolve_variant_folder(direct_path, variant)
         if base_path is None:
@@ -1621,8 +1775,9 @@ class CritterSpriteLoader:
 
         sprite = AnimatedSprite._create_bare(critter_type, variant, sprite_width, sprite_height, base_path)
 
+        animation_profile = _critter_config_animation_profile(critter_type)
         animations = CritterSpriteLoader.CRITTER_ANIMATIONS.get(
-            critter_type, CritterSpriteLoader.DEFAULT_ANIMATIONS
+            animation_profile, CritterSpriteLoader.DEFAULT_ANIMATIONS
         )
 
         for anim_name, duration, loop, use_8dir in animations:

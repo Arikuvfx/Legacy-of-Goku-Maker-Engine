@@ -345,6 +345,25 @@ def spawn_npc(npc_id, x, y, animation=None):
     return {'type': 'spawn_npc', 'npc_id': npc_id, 'x': x, 'y': y, 'animation': animation}
 
 
+def npc_state(npc_id, mode='hide'):
+    """mode: 'show' | 'hide' | 'despawn'. 'show'/'hide' toggle the NPC's
+    visibility and interaction (it stays in the room); 'despawn' removes it
+    from the room entirely. Register a handler taking (npc_id, mode)."""
+    return {'type': 'npc_state', 'npc_id': npc_id, 'mode': mode}
+
+
+def enemy_state(enemy_id, mode='hide'):
+    """mode: 'show' | 'hide' | 'despawn' — same meaning as npc_state, applied
+    to every enemy in the room matching `enemy_id`."""
+    return {'type': 'enemy_state', 'enemy_id': enemy_id, 'mode': mode}
+
+
+def boss_state(boss_id, mode='hide'):
+    """mode: 'show' | 'hide' | 'despawn' — same meaning as npc_state, applied
+    to the boss whose BossEnemy.boss_id matches."""
+    return {'type': 'boss_state', 'boss_id': boss_id, 'mode': mode}
+
+
 def play_cutscene(cutscene_id):
     return {'type': 'play_cutscene', 'cutscene_id': cutscene_id}
 
@@ -401,7 +420,8 @@ ACTION_TYPES = [
     'set_player_character', 'set_player_skin', 'character_list',
     'screen_fade', 'screen_shake', 'spam_qte', 'weather', 'room_music', 'play_sound',
     'play_character_animation', 'save_game', 'change_map',
-    'set_player_location', 'spawn_enemies', 'spawn_npc', 'play_cutscene',
+    'set_player_location', 'spawn_enemies', 'spawn_npc',
+    'npc_state', 'enemy_state', 'boss_state', 'play_cutscene',
     'quest', 'modify_quest_variable', 'set_custom_variable', 'world_map_location',
     'mission', 'toggle_flying_pad',
 ]

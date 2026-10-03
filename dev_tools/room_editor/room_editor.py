@@ -24,6 +24,7 @@ from objects.ambient_sound_object import AmbientSoundObject
 from dev_tools.room_editor.room_editor_tools.entity_editor import EntityEditor
 from dev_tools import entity_creator
 import dev_tools.ui_kit as uk
+from config.settings import ui, ui_text
 
 
 # How many actions we keep in each undo/redo stack before the oldest entry
@@ -74,7 +75,7 @@ class _BitmapFontView:
 # uk.draw_close_icon and uk.draw_back_icon directly wherever they already fit.
 # ---------------------------------------------------------------------------
 
-def _draw_plus_icon(surface, rect, color, width=3):
+def _draw_plus_icon(surface, rect, color, width=ui(3)):
     """Simple cross — "create new" actions (New Group / Create Room)."""
     cx, cy = rect.center
     s = min(rect.w, rect.h) * 0.34
@@ -82,7 +83,7 @@ def _draw_plus_icon(surface, rect, color, width=3):
     uk.draw_line_on(surface, color, (cx, cy - s), (cx, cy + s), width)
 
 
-def _draw_check_icon(surface, rect, color, width=3):
+def _draw_check_icon(surface, rect, color, width=ui(3)):
     """Checkmark — Save button and dropdown "currently selected" marker."""
     cx, cy = rect.center
     s = min(rect.w, rect.h) * 0.32
@@ -108,7 +109,7 @@ def _draw_trash_icon(surface, rect, color, width=2):
     uk.draw_rect_on(surface, color, handle, width, 2)
     for i in (-1, 0, 1):
         x = cx + i * s * 0.13
-        uk.draw_line_on(surface, color, (x, body.top + 5), (x, body.bottom - 4), width)
+        uk.draw_line_on(surface, color, (x, body.top + ui(5)), (x, body.bottom - ui(4)), width)
 
 
 class _SurfaceDrawCompat:
@@ -434,10 +435,10 @@ class RoomEditor:
         self._title_bitmap_font.uppercase_dir = os.path.join('assets', 'ui', 'fonts', 'uppercase')
         self._title_bitmap_font.lowercase_dir = os.path.join('assets', 'ui', 'fonts', 'lowercase')
 
-        self.font_title = _BitmapFontView(self._title_bitmap_font, 32)
-        self.font_large = _BitmapFontView(self._menu_font, 20)
-        self.font_medium = _BitmapFontView(self._menu_font, 16)
-        self.font_small = _BitmapFontView(self._menu_font, 12)
+        self.font_title = _BitmapFontView(self._title_bitmap_font, ui_text(32))
+        self.font_large = _BitmapFontView(self._menu_font, ui_text(20))
+        self.font_medium = _BitmapFontView(self._menu_font, ui_text(16))
+        self.font_small = _BitmapFontView(self._menu_font, ui_text(12))
 
         self.current_view = 'groups'
         self.selected_index = 0
@@ -597,11 +598,11 @@ class RoomEditor:
         self._bg_clear_rect    = pygame.Rect(0, 0, 0, 0)
         self._bg_scan_done     = False
         self.BG_DIR       = os.path.join('assets', 'bg')
-        self.THUMB_SIZE   = 96
-        self.THUMB_PAD    = 10
+        self.THUMB_SIZE   = ui(96)
+        self.THUMB_PAD    = ui(10)
         self.THUMB_COLS   = 4
-        self.PANEL_W      = self.THUMB_COLS * (self.THUMB_SIZE + self.THUMB_PAD) + self.THUMB_PAD + 16
-        self.SLIDER_H     = 14
+        self.PANEL_W      = self.THUMB_COLS * (self.THUMB_SIZE + self.THUMB_PAD) + self.THUMB_PAD + ui(16)
+        self.SLIDER_H     = ui(14)
         self.SLIDER_TRACK = 6
         self.SCROLL_MAX   = 400.0
 
@@ -704,20 +705,20 @@ class RoomEditor:
         # ── Layout ───────────────────────────────────────────────────────────
         # Full-width header/footer chrome (dev-menu style) instead of the old
         # fixed left sidebar — content gets the full width of the screen.
-        self.margin_x = 56
+        self.margin_x = ui(56)
         # Same formula as DevMenu._layout() — a fraction of screen height
         # with a floor, not flat constants, so these come out the same
         # actual size as the dev menu's header/footer bars.
-        self.header_h = max(86, round(screen_height * 0.12))
-        self.footer_h = max(42, round(screen_height * 0.065))
-        self.card_h = 68
+        self.header_h = max(ui(86), round(screen_height * 0.12))
+        self.footer_h = max(ui(42), round(screen_height * 0.065))
+        self.card_h = ui(68)
 
         # Back button, top-left of the header bar — exits the whole Room
         # Editor back to the Dev Menu. Same geometry/behaviour convention as
         # DevMenu's own header back-arrow (shown there when leaving its
         # CONFIGURATION screen); here it's shown on the top-level 'groups'
         # view and replaces the old in-list "Back to Dev Menu" card.
-        back_size = max(40, round(self.header_h * 0.55))
+        back_size = max(ui(40), round(self.header_h * 0.55))
         self._back_rect = pygame.Rect(0, 0, back_size, back_size)
         self._back_rect.left = self.margin_x
         self._back_rect.centery = self.header_h // 2
@@ -736,7 +737,7 @@ class RoomEditor:
         # arrow. See _draw_add_button.
         self._new_item_rect = pygame.Rect(0, 0, back_size, back_size)
         self._new_item_rect.left = self.margin_x
-        self._new_item_rect.bottom = self.screen_height - self.footer_h - 24
+        self._new_item_rect.bottom = self.screen_height - self.footer_h - ui(24)
         self._new_item_icon = self._load_dev_menu_icon('plus', 34)
 
         # Room row "View" / "Settings" icon-buttons. View is a
@@ -2745,12 +2746,18 @@ class RoomEditor:
 
         # Transfer objects
         if self.object_editor:
-            # Collision objects
+            # Collision objects — always assign, even when empty, so a
+            # room whose last auto-tile (or hand-placed) box was removed
+            # gets that removal written back too. A truthiness check here
+            # ("if objects:") would skip the assignment whenever the list
+            # is empty, leaving room.collision_objects pointing at its old,
+            # stale (non-empty) contents — so a collision box you remove in
+            # the tileset editor keeps reappearing on the map after save.
             if hasattr(self.object_editor, 'collision_manager'):
                 for room in self.room_manager.rooms:
                     objects = self.object_editor.collision_manager.get_collision_objects(room.name)
+                    room.collision_objects = list(objects)
                     if objects:
-                        room.collision_objects = objects
                         transferred_count += 1
 
             # Animated (water/grass) regions
@@ -2898,9 +2905,19 @@ class RoomEditor:
             if getattr(tile, 'is_shadow', False):
                 continue
             tileset = self.tileset_editor.tileset_manager.get_tileset(tile.tileset_name)
-            if not tileset or not tileset.is_tile_solid(tile.tile_x, tile.tile_y):
+            if not tileset:
                 continue
-            desired_rects.add((tile.x, tile.y, tileset.tile_width, tileset.tile_height))
+            # Use get_solid_rects_px() rather than is_tile_solid(): at
+            # collision_granularity 8 a tile can be solid in just one or
+            # two of its four 8x8 quadrants, and is_tile_solid() alone
+            # can't express that shape (it also always reported the box
+            # as the *whole* tile_width x tile_height footprint, which
+            # silently replaced any 8x8 quadrant painting with a full
+            # 16x16 box). get_solid_rects_px() returns the actual
+            # tile-local sub-rects, which we offset by the tile's placed
+            # position below.
+            for (px, py, w, h) in tileset.get_solid_rects_px(tile.tile_x, tile.tile_y):
+                desired_rects.add((tile.x + px, tile.y + py, w, h))
 
         # Drop this room's previously auto-generated boxes; anything the
         # user placed by hand (auto_tile is False/absent) is left exactly
@@ -4070,7 +4087,7 @@ class RoomEditor:
             sw = int(r.width * RENDER_SCALE)
             sh = int(r.height * RENDER_SCALE)
             color = (255, 255, 0) if self._group_drag_origin else (80, 170, 255)
-            screen.draw_rect(color, (sx - 2, sy - 2, sw + 4, sh + 4), 2)
+            screen.draw_rect(color, (sx - 2, sy - 2, sw + ui(4), sh + ui(4)), 2)
 
     def _handle_select_drag_event(self, event):
         """Handle click-select, drag, and right-click-delete when no editor panel is open."""
@@ -4443,7 +4460,7 @@ class RoomEditor:
             sx = int(ent['x'] * RENDER_SCALE - camera_x) - sw // 2
             sy = int(ent['y'] * RENDER_SCALE - camera_y) - sh // 2
             color = (255, 255, 0) if self.is_dragging else (255, 200, 0)
-            screen.draw_rect(color, (sx - 2, sy - 2, sw + 4, sh + 4), 2)
+            screen.draw_rect(color, (sx - 2, sy - 2, sw + ui(4), sh + ui(4)), 2)
         else:
             obj = self.drag_target
             if hasattr(obj, 'x') and hasattr(obj, 'width'):
@@ -4453,7 +4470,7 @@ class RoomEditor:
                 sh = int(getattr(obj, 'height', 32) * RENDER_SCALE)
                 # Some objects are centred, others are top-left — use a generous outline
                 screen.draw_rect((255, 200, 0),
-                                 (sx - sw // 2 - 2, sy - sh // 2 - 2, sw + 4, sh + 4), 2)
+                                 (sx - sw // 2 - 2, sy - sh // 2 - 2, sw + ui(4), sh + ui(4)), 2)
 
     # =========================================================================
     # Cache for loaded idle-down sprites keyed by (entity_id, variant_type)
@@ -4598,7 +4615,7 @@ class RoomEditor:
                 elif entity_type == 'enemy':
                     screen.draw_rect(color, rect)
                     screen.draw_rect(dark, rect, 2)
-                    pad = 6
+                    pad = ui(6)
                     screen.draw_line(dark,
                                      (rect.x + pad, rect.y + pad),
                                      (rect.right - pad, rect.bottom - pad), 3)
@@ -4966,13 +4983,13 @@ class RoomEditor:
             world_y = int((mouse_sy - self._zoom_offset[1]) / (RENDER_SCALE * self._zoom_scale))
             coord_text = f"X: {world_x}  Y: {world_y}"
             coord_surf = self.font_medium.render(coord_text, True, self.colors['text'])
-            coord_bg_w = coord_surf.get_width() + 16
-            coord_bg_h = coord_surf.get_height() + 10
+            coord_bg_w = coord_surf.get_width() + ui(16)
+            coord_bg_h = coord_surf.get_height() + ui(10)
             coord_bg = pygame.Surface((coord_bg_w, coord_bg_h), pygame.SRCALPHA)
             coord_bg.fill((0, 0, 0, 160))
-            margin = 10
+            margin = ui(10)
             screen.blit(coord_bg, (margin, self.screen_height - coord_bg_h - margin))
-            screen.blit(coord_surf, (margin + 8, self.screen_height - coord_bg_h - margin + 5))
+            screen.blit(coord_surf, (margin + ui(8), self.screen_height - coord_bg_h - margin + ui(5)))
             return
 
         # ── Continuous editor zoom (Ctrl+scroll) ────────────────────────────
@@ -5200,7 +5217,7 @@ class RoomEditor:
 
         # Draw destructible stones
         if hasattr(self.viewing_room, 'destructible_stones'):
-            _margin = 160
+            _margin = ui(160)
             for stone in self.viewing_room.destructible_stones:
                 if not stone.active:
                     continue
@@ -5517,13 +5534,13 @@ class RoomEditor:
         world_x, world_y = int(world_x), int(world_y)
         coord_text = f"X: {world_x}  Y: {world_y}"
         coord_surf = self.font_medium.render(coord_text, True, self.colors['text'])
-        coord_bg_w = coord_surf.get_width() + 16
-        coord_bg_h = coord_surf.get_height() + 10
+        coord_bg_w = coord_surf.get_width() + ui(16)
+        coord_bg_h = coord_surf.get_height() + ui(10)
         coord_bg = pygame.Surface((coord_bg_w, coord_bg_h), pygame.SRCALPHA)
         coord_bg.fill((0, 0, 0, 160))
-        margin = 10
+        margin = ui(10)
         screen.blit(coord_bg, (margin, self.screen_height - coord_bg_h - margin))
-        screen.blit(coord_surf, (margin + 8, self.screen_height - coord_bg_h - margin + 5))
+        screen.blit(coord_surf, (margin + ui(8), self.screen_height - coord_bg_h - margin + ui(5)))
 
         # ── DIAGNOSTIC: print section breakdown on slow frames (temporary) ──
         if sum(t for _, t in _prof) >= 30:
@@ -5776,10 +5793,10 @@ class RoomEditor:
         base = uk.lerp_color((22, 26, 35), (28, 33, 44), t)
         border = uk.lerp_color(uk.Theme.CARD_BORDER, accent, t * 0.78)
         uk.draw_panel(screen, self._back_rect, bg=(*base, 255), border=border,
-                      border_width=1, radius=8, shadow=False)
+                      border_width=1, radius=ui(8), shadow=False)
 
         if t > 0.01:
-            uk.draw_soft_glow(screen, self._back_rect.center, 22, accent, max_alpha=int(25 * t))
+            uk.draw_soft_glow(screen, self._back_rect.center, ui(22), accent, max_alpha=int(25 * t))
 
         icon_rect = self._back_icon.get_rect(center=self._back_rect.center)
         uk.blit_surface(screen, self._back_icon, icon_rect, transient=False)
@@ -5816,38 +5833,38 @@ class RoomEditor:
         draw_rect = rect.move(0, -lift)
         base = uk.lerp_color((22, 26, 35), (28, 33, 44), t)
         border = uk.lerp_color(uk.Theme.CARD_BORDER, accent, t * 0.78)
-        uk.draw_panel(screen, draw_rect, bg=(*base, 255), border=border, border_width=1, radius=10, shadow=False)
+        uk.draw_panel(screen, draw_rect, bg=(*base, 255), border=border, border_width=1, radius=ui(10), shadow=False)
         return draw_rect
 
     def _draw_card_dot(self, screen, draw_rect, t, accent):
         """Colored group-identity dot, left-aligned in a list card, with a
         soft glow while hovered/focused."""
-        center = (draw_rect.x + 40, draw_rect.centery)
+        center = (draw_rect.x + ui(40), draw_rect.centery)
         if t > 0.01:
-            uk.draw_soft_glow(screen, center, 28, accent, max_alpha=int(25 * t))
-        uk.draw_circle_on(screen, accent, center, 13)
-        uk.draw_circle_on(screen, (18, 20, 27), center, 13, 2)
+            uk.draw_soft_glow(screen, center, ui(28), accent, max_alpha=int(25 * t))
+        uk.draw_circle_on(screen, accent, center, ui(13))
+        uk.draw_circle_on(screen, (18, 20, 27), center, ui(13), 2)
 
     def _draw_card_icon(self, screen, draw_rect, t, accent, icon_fn):
         """Vector icon, left-aligned in a list card, with a soft glow while
         hovered/focused — mirrors DevMenu._draw_card's icon treatment."""
-        center = (draw_rect.x + 40, draw_rect.centery)
+        center = (draw_rect.x + ui(40), draw_rect.centery)
         if t > 0.01:
-            uk.draw_soft_glow(screen, center, 28, accent, max_alpha=int(25 * t))
+            uk.draw_soft_glow(screen, center, ui(28), accent, max_alpha=int(25 * t))
         icon_color = uk.lerp_color(uk.Theme.TEXT_MUTED, accent, t)
-        icon_rect = pygame.Rect(0, 0, 28, 28)
+        icon_rect = pygame.Rect(0, 0, ui(28), ui(28))
         icon_rect.center = center
         icon_fn(screen, icon_rect, icon_color)
 
     def _draw_card_text(self, screen, draw_rect, t, title, subtitle=None, title_color=None):
-        tx = draw_rect.x + 74
+        tx = draw_rect.x + ui(74)
         color = title_color if title_color is not None else uk.lerp_color(uk.Theme.TEXT_SECONDARY, uk.Theme.TEXT_PRIMARY, t)
         title_surf = self.font_large.render(title, True, color)
         if subtitle:
-            title_rect = title_surf.get_rect(x=tx, y=draw_rect.y + 12)
+            title_rect = title_surf.get_rect(x=tx, y=draw_rect.y + ui(12))
             screen.blit(title_surf, title_rect)
             sub_surf = self.font_small.render(subtitle, True, uk.Theme.TEXT_MUTED)
-            screen.blit(sub_surf, (tx, title_rect.bottom + 4))
+            screen.blit(sub_surf, (tx, title_rect.bottom + ui(4)))
         else:
             title_rect = title_surf.get_rect(x=tx, centery=draw_rect.centery)
             screen.blit(title_surf, title_rect)
@@ -5898,7 +5915,7 @@ class RoomEditor:
         draw_rect = self._draw_card_shell(screen, rect, 1.0, accent)
         self._draw_card_icon(screen, draw_rect, 1.0, accent, _draw_plus_icon)
 
-        tx = draw_rect.x + 74
+        tx = draw_rect.x + ui(74)
         has_text = bool(self.text_input)
         color = uk.Theme.TEXT_PRIMARY if has_text else uk.Theme.TEXT_MUTED
         shown = self.text_input if has_text else "Group name"
@@ -5917,7 +5934,7 @@ class RoomEditor:
         draw_rect = self._draw_card_shell(screen, rect, 1.0, accent)
         self._draw_card_dot(screen, draw_rect, 1.0, accent)
 
-        tx = draw_rect.x + 74
+        tx = draw_rect.x + ui(74)
         has_text = bool(self.text_input)
         color = uk.Theme.TEXT_PRIMARY if has_text else uk.Theme.TEXT_MUTED
         shown = self.text_input if has_text else "Group name"
@@ -5946,10 +5963,10 @@ class RoomEditor:
         base = uk.lerp_color((22, 26, 35), (28, 33, 44), t)
         border = uk.lerp_color(uk.Theme.CARD_BORDER, accent, t * 0.78)
         uk.draw_panel(screen, self._new_item_rect, bg=(*base, 255), border=border,
-                      border_width=1, radius=8, shadow=False)
+                      border_width=1, radius=ui(8), shadow=False)
 
         if t > 0.01:
-            uk.draw_soft_glow(screen, self._new_item_rect.center, 22, accent, max_alpha=int(25 * t))
+            uk.draw_soft_glow(screen, self._new_item_rect.center, ui(22), accent, max_alpha=int(25 * t))
 
         icon_rect = self._new_item_icon.get_rect(center=self._new_item_rect.center)
         uk.blit_surface(screen, self._new_item_icon, icon_rect, transient=False)
@@ -5966,13 +5983,13 @@ class RoomEditor:
         t = 1.0 if hovered else 0.0
         base = uk.lerp_color((22, 26, 35), (28, 33, 44), t)
         border = uk.lerp_color(uk.Theme.CARD_BORDER, accent, t)
-        uk.draw_panel(screen, rect, bg=(*base, 255), border=border, border_width=1 + round(t), radius=8, shadow=False)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border, border_width=1 + round(t), radius=ui(8), shadow=False)
         if isinstance(icon, pygame.Surface):
             icon_rect = icon.get_rect(center=rect.center)
             uk.blit_surface(screen, icon, icon_rect, transient=False)
         else:
             icon_color = uk.lerp_color(uk.Theme.TEXT_MUTED, accent, t)
-            icon(screen, rect.inflate(-14, -14), icon_color)
+            icon(screen, rect.inflate(-ui(14), -ui(14)), icon_color)
         uk.register_hoverable(rect)
 
     def _draw_field_row(self, screen, rect, t, value_text, field_id=None):
@@ -5992,7 +6009,7 @@ class RoomEditor:
         base = uk.lerp_color((20, 23, 32), (27, 31, 42), t)
         border = accent if editing else uk.lerp_color(uk.Theme.CARD_BORDER, accent, t)
         border_width = 2 if editing else 1 + round(t)
-        uk.draw_panel(screen, rect, bg=(*base, 255), border=border, border_width=border_width, radius=8, shadow=False)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border, border_width=border_width, radius=ui(8), shadow=False)
 
         if field_id is not None:
             self.text_field_rects.append(rect)
@@ -6003,7 +6020,7 @@ class RoomEditor:
             shown, color = value_text, uk.lerp_color(uk.Theme.TEXT_SECONDARY, uk.Theme.TEXT_PRIMARY, t)
 
         val_surf = self.font_medium.render(shown, True, color)
-        val_rect = val_surf.get_rect(x=rect.x + 12, centery=rect.centery)
+        val_rect = val_surf.get_rect(x=rect.x + ui(12), centery=rect.centery)
         screen.blit(val_surf, val_rect)
 
         if editing:
@@ -6014,16 +6031,16 @@ class RoomEditor:
         dim_base = (32, 22, 22) if danger else (28, 33, 44)
         base = uk.lerp_color((22, 26, 35), dim_base, t)
         border = uk.lerp_color(uk.Theme.CARD_BORDER, col, t)
-        uk.draw_panel(screen, rect, bg=(*base, 255), border=border, border_width=1 + round(t), radius=10, shadow=False)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border, border_width=1 + round(t), radius=ui(10), shadow=False)
         if t > 0.01:
             uk.draw_soft_glow(screen, rect.center, max(rect.w, rect.h) // 2, col, max_alpha=int(30 * t))
         label_color = uk.lerp_color(uk.Theme.TEXT_SECONDARY, col, t)
         if icon_fn is not None:
-            icon_rect = pygame.Rect(0, 0, 18, 18)
-            icon_rect.midleft = (rect.x + 16, rect.centery)
+            icon_rect = pygame.Rect(0, 0, ui(18), ui(18))
+            icon_rect.midleft = (rect.x + ui(16), rect.centery)
             icon_fn(screen, icon_rect, label_color)
             label_surf = self.font_medium.render(label, True, label_color)
-            screen.blit(label_surf, (icon_rect.right + 8, rect.centery - label_surf.get_height() // 2))
+            screen.blit(label_surf, (icon_rect.right + ui(8), rect.centery - label_surf.get_height() // 2))
         else:
             label_surf = self.font_medium.render(label, True, label_color)
             screen.blit(label_surf, label_surf.get_rect(center=rect.center))
@@ -6033,9 +6050,9 @@ class RoomEditor:
         accent = uk.Theme.GOLD
         base = uk.lerp_color((20, 23, 32), (27, 31, 42), t)
         border = uk.lerp_color(uk.Theme.CARD_BORDER, accent, t)
-        uk.draw_panel(screen, rect, bg=(*base, 255), border=border, border_width=1 + round(t), radius=6, shadow=False)
+        uk.draw_panel(screen, rect, bg=(*base, 255), border=border, border_width=1 + round(t), radius=ui(6), shadow=False)
         if checked:
-            _draw_check_icon(screen, rect.inflate(-8, -8), uk.Theme.GOLD_BRIGHT)
+            _draw_check_icon(screen, rect.inflate(-ui(8), -ui(8)), uk.Theme.GOLD_BRIGHT)
         uk.register_hoverable(rect)
 
     def _draw_slider(self, screen, x, y, width, key, label, value, display, rects_out, drag_key, center_mark=False):
@@ -6049,26 +6066,26 @@ class RoomEditor:
         val_surf = self.font_small.render(display, True, uk.Theme.TEXT_SECONDARY)
         screen.blit(val_surf, (x + width - val_surf.get_width(), y))
 
-        track_y = y + label_surf.get_height() + 6
-        track = pygame.Rect(x, track_y, width, 6)
-        uk.draw_rect_on(screen, uk.Theme.CARD_BG[:3], track, 0, 3)
+        track_y = y + label_surf.get_height() + ui(6)
+        track = pygame.Rect(x, track_y, width, ui(6))
+        uk.draw_rect_on(screen, uk.Theme.CARD_BG[:3], track, 0, ui(3))
 
         fill_w = max(0, min(width, int(value * width)))
         if fill_w:
-            uk.draw_rect_on(screen, uk.Theme.GOLD, pygame.Rect(x, track_y, fill_w, 6), 0, 3)
+            uk.draw_rect_on(screen, uk.Theme.GOLD, pygame.Rect(x, track_y, fill_w, ui(6)), 0, ui(3))
 
         thumb_x = x + int(max(0.0, min(1.0, value)) * width)
-        thumb_cy = track_y + 3
+        thumb_cy = track_y + ui(3)
         mx, my = self._logical_mouse_pos
         dragging = drag_key == key
         hovered = abs(mx - thumb_x) <= 10 and abs(my - thumb_cy) <= 10
         thumb_color = uk.Theme.GOLD_BRIGHT if (dragging or hovered) else uk.Theme.TEXT_PRIMARY
-        uk.draw_circle_on(screen, thumb_color, (thumb_x, thumb_cy), 7)
-        uk.draw_circle_on(screen, uk.Theme.CARD_BORDER, (thumb_x, thumb_cy), 7, 1)
+        uk.draw_circle_on(screen, thumb_color, (thumb_x, thumb_cy), ui(7))
+        uk.draw_circle_on(screen, uk.Theme.CARD_BORDER, (thumb_x, thumb_cy), ui(7), 1)
 
         if center_mark:
             mid_x = x + width // 2
-            uk.draw_line_on(screen, uk.Theme.CARD_BORDER, (mid_x, track_y - 3), (mid_x, track_y + 9), 1)
+            uk.draw_line_on(screen, uk.Theme.CARD_BORDER, (mid_x, track_y - ui(3)), (mid_x, track_y + ui(9)), 1)
 
         rects_out[key] = track
 
@@ -6076,19 +6093,19 @@ class RoomEditor:
         """Popup option list anchored under a field row — shared by the
         Weather / Room Music / Room BGS dropdowns. `items` is already
         sliced to whatever's visible; returns (list_rect, {item: rect})."""
-        item_h = 30
+        item_h = ui(30)
         list_h = item_h * max(1, len(items))
-        list_rect = pygame.Rect(anchor.x, anchor.bottom + 6, anchor.width, list_h)
+        list_rect = pygame.Rect(anchor.x, anchor.bottom + ui(6), anchor.width, list_h)
 
-        if list_rect.bottom > self.screen_height - 10:
-            list_rect.y = max(10, anchor.top - list_h - 6)
+        if list_rect.bottom > self.screen_height - ui(10):
+            list_rect.y = max(ui(10), anchor.top - list_h - ui(6))
 
-        uk.draw_panel(screen, list_rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD, border_width=1, radius=8)
+        uk.draw_panel(screen, list_rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD, border_width=1, radius=ui(8))
 
         rects = {}
         if empty_text is not None:
             empty_surf = self.font_small.render(empty_text, True, uk.Theme.TEXT_MUTED)
-            screen.blit(empty_surf, (list_rect.x + 10, list_rect.y + 8))
+            screen.blit(empty_surf, (list_rect.x + ui(10), list_rect.y + ui(8)))
             return list_rect, rects
 
         mouse_pos = self._logical_mouse_pos
@@ -6101,15 +6118,15 @@ class RoomEditor:
             hovered = item_rect.collidepoint(mouse_pos)
             if is_current or hovered:
                 row_bg = uk.Theme.CARD_BG_SELECTED[:3] if is_current else uk.Theme.CARD_BG_HOVER[:3]
-                uk.draw_rect_on(screen, row_bg, item_rect.inflate(-6, -2), 0, 6)
+                uk.draw_rect_on(screen, row_bg, item_rect.inflate(-ui(6), -2), 0, ui(6))
 
             text_color = uk.Theme.GOLD_BRIGHT if is_current else uk.Theme.TEXT_SECONDARY
             text_surf = self.font_small.render(display_fn(opt), True, text_color)
-            screen.blit(text_surf, (item_rect.x + 10, item_rect.y + (item_h - text_surf.get_height()) // 2))
+            screen.blit(text_surf, (item_rect.x + ui(10), item_rect.y + (item_h - text_surf.get_height()) // 2))
 
             if is_current:
-                chk_rect = pygame.Rect(0, 0, 14, 14)
-                chk_rect.midright = (item_rect.right - 10, item_rect.centery)
+                chk_rect = pygame.Rect(0, 0, ui(14), ui(14))
+                chk_rect.midright = (item_rect.right - ui(10), item_rect.centery)
                 _draw_check_icon(screen, chk_rect, uk.Theme.GOLD_BRIGHT)
 
         return list_rect, rects
@@ -6125,19 +6142,19 @@ class RoomEditor:
         if menu is None:
             return
 
-        item_h = 34
-        width = 150
+        item_h = ui(34)
+        width = ui(150)
         options = menu['options']
         list_h = item_h * len(options)
         rect = pygame.Rect(menu['pos'][0], menu['pos'][1], width, list_h)
 
         # Keep the whole popup on-screen even when the click was near an edge.
-        if rect.right > self.screen_width - 8:
-            rect.x = self.screen_width - 8 - width
-        if rect.bottom > self.screen_height - 8:
-            rect.y = self.screen_height - 8 - list_h
+        if rect.right > self.screen_width - ui(8):
+            rect.x = self.screen_width - ui(8) - width
+        if rect.bottom > self.screen_height - ui(8):
+            rect.y = self.screen_height - ui(8) - list_h
 
-        uk.draw_panel(screen, rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD, border_width=1, radius=8)
+        uk.draw_panel(screen, rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD, border_width=1, radius=ui(8))
 
         mouse_pos = self._logical_mouse_pos
         menu['rects'] = {}
@@ -6146,11 +6163,11 @@ class RoomEditor:
             menu['rects'][action_id] = item_rect
 
             if item_rect.collidepoint(mouse_pos):
-                uk.draw_rect_on(screen, uk.Theme.CARD_BG_HOVER[:3], item_rect.inflate(-6, -2), 0, 6)
+                uk.draw_rect_on(screen, uk.Theme.CARD_BG_HOVER[:3], item_rect.inflate(-ui(6), -2), 0, ui(6))
 
             text_color = uk.Theme.DANGER_BRIGHT if action_id.startswith('delete') else uk.Theme.TEXT_SECONDARY
             text_surf = self.font_small.render(label, True, text_color)
-            screen.blit(text_surf, (item_rect.x + 14, item_rect.y + (item_h - text_surf.get_height()) // 2))
+            screen.blit(text_surf, (item_rect.x + ui(14), item_rect.y + (item_h - text_surf.get_height()) // 2))
 
     # ------------------------------------------------------------------ groups / rooms lists
 
@@ -6159,7 +6176,7 @@ class RoomEditor:
         groups = self.room_manager.groups
         x = self.margin_x
         width = self.screen_width - self.margin_x * 2
-        y = self.header_h + 24
+        y = self.header_h + ui(24)
 
         for i, group_name in enumerate(groups):
             rect = pygame.Rect(x, y, width, self.card_h)
@@ -6170,7 +6187,7 @@ class RoomEditor:
             if self.editing_field == 'rename_group' and group_name == self._renaming_group_original:
                 self._draw_rename_group_row(screen, rect, group_name)
                 self.clickable_rects.append({'rect': rect, 'index': i, 'type': 'item'})
-                y += self.card_h + 12
+                y += self.card_h + ui(12)
                 continue
 
             t = self._item_anim(i)
@@ -6179,7 +6196,7 @@ class RoomEditor:
             self._draw_card_dot(screen, draw_rect, t, accent)
             self._draw_card_text(screen, draw_rect, t, group_name)
             self.clickable_rects.append({'rect': rect, 'index': i, 'type': 'item'})
-            y += self.card_h + 12
+            y += self.card_h + ui(12)
 
         # "New Group" lives as a small icon-button, bottom-left of the
         # middle content box, in the same box style as the header back
@@ -6204,7 +6221,7 @@ class RoomEditor:
         rooms_in_group = self.room_manager.get_rooms_in_group(self.selected_group)
         x = self.margin_x
         width = self.screen_width - self.margin_x * 2
-        y = self.header_h + 24
+        y = self.header_h + ui(24)
         btn_w, btn_h, btn_gap = 40, 34, 8
 
         for i, room in enumerate(rooms_in_group):
@@ -6217,7 +6234,7 @@ class RoomEditor:
             self._draw_card_text(screen, draw_rect, t, room.name)
 
             settings_rect = pygame.Rect(0, 0, btn_w, btn_h)
-            settings_rect.midright = (rect.right - 14, rect.centery)
+            settings_rect.midright = (rect.right - ui(14), rect.centery)
             view_rect = pygame.Rect(0, 0, btn_w, btn_h)
             view_rect.midright = (settings_rect.left - btn_gap, rect.centery)
 
@@ -6232,7 +6249,7 @@ class RoomEditor:
             self.clickable_rects.append({'rect': view_rect, 'index': i, 'type': 'view_room'})
             self.clickable_rects.append({'rect': settings_rect, 'index': i, 'type': 'edit_room'})
             self.clickable_rects.append({'rect': rect, 'index': i, 'type': 'item'})
-            y += self.card_h + 12
+            y += self.card_h + ui(12)
 
         # "New Room" — same bottom-left add-button as "New Group" in
         # _draw_groups_view, instead of a full-width card in this list.
@@ -6243,23 +6260,23 @@ class RoomEditor:
     def _draw_create_view(self, screen):
         """Show the create room form."""
         x = self.margin_x
-        width = min(560, self.screen_width - self.margin_x * 2)
-        y = self.header_h + 24
+        width = min(ui(560), self.screen_width - self.margin_x * 2)
+        y = self.header_h + ui(24)
 
         field_defs = [('name', 'Room Name'), ('width', 'Width'), ('height', 'Height'), ('group', 'Group')]
         for i, (field_id, label) in enumerate(field_defs):
             t = self._item_anim(i)
             label_surf = self.font_small.render(label.upper(), True, uk.Theme.TEXT_MUTED)
             screen.blit(label_surf, (x, y))
-            y += label_surf.get_height() + 6
+            y += label_surf.get_height() + ui(6)
 
-            rect = pygame.Rect(x, y, width, 44)
+            rect = pygame.Rect(x, y, width, ui(44))
             value = self.create_form.get(field_id, '')
             self._draw_field_row(screen, rect, t, value, field_id=field_id)
             self.clickable_rects.append({'rect': rect, 'index': i, 'type': 'item'})
-            y += 44 + 18
+            y += ui(44) + ui(18)
 
-        y += 8
+        y += ui(8)
         btn_w, btn_h, gap = 220, 52, 16
         for j, (field_id, label, accent, icon_fn, danger) in enumerate([
             ('create', 'Create Room', uk.Theme.GOLD, _draw_plus_icon, False),
@@ -6278,8 +6295,8 @@ class RoomEditor:
             return
 
         x = self.margin_x
-        width = min(620, self.screen_width - self.margin_x * 2)
-        y = self.header_h + 24
+        width = min(ui(620), self.screen_width - self.margin_x * 2)
+        y = self.header_h + ui(24)
 
         fields = [
             ('name', 'Room Name', str(self.editing_room.name)),
@@ -6291,17 +6308,17 @@ class RoomEditor:
             t = self._item_anim(i)
             label_surf = self.font_small.render(label.upper(), True, uk.Theme.TEXT_MUTED)
             screen.blit(label_surf, (x, y))
-            y += label_surf.get_height() + 6
+            y += label_surf.get_height() + ui(6)
 
-            rect = pygame.Rect(x, y, width, 44)
+            rect = pygame.Rect(x, y, width, ui(44))
             self._draw_field_row(screen, rect, t, value, field_id=field_id)
             self.clickable_rects.append({'rect': rect, 'index': i, 'type': 'item'})
-            y += 44 + 16
+            y += ui(44) + ui(16)
 
-        y += 6
+        y += ui(6)
         section_surf = self.font_small.render('SETTINGS', True, uk.Theme.TEXT_DIM)
         screen.blit(section_surf, (x, y))
-        y += section_surf.get_height() + 8
+        y += section_surf.get_height() + ui(8)
 
         weather_val = getattr(self.editing_room, 'ambient_weather', 'none')
         music_val = getattr(self.editing_room, 'music_track', '')
@@ -6309,7 +6326,7 @@ class RoomEditor:
         bgs_val = getattr(self.editing_room, 'bgs_track', '')
         bgs_display = os.path.splitext(bgs_val)[0] if bgs_val else 'None'
 
-        row_w = (width - 24) // 3
+        row_w = (width - ui(24)) // 3
         row_label_h = 0
         for j, (field_id, label, value) in enumerate([
             ('weather', 'Weather', weather_val.capitalize()),
@@ -6318,12 +6335,12 @@ class RoomEditor:
         ]):
             idx = 4 + j
             t = self._item_anim(idx)
-            col_x = x + j * (row_w + 12)
+            col_x = x + j * (row_w + ui(12))
             label_surf = self.font_small.render(label.upper(), True, uk.Theme.TEXT_MUTED)
             screen.blit(label_surf, (col_x, y))
-            row_label_h = label_surf.get_height() + 6
+            row_label_h = label_surf.get_height() + ui(6)
 
-            row_rect = pygame.Rect(col_x, y + row_label_h, row_w, 38)
+            row_rect = pygame.Rect(col_x, y + row_label_h, row_w, ui(38))
             self._draw_field_row(screen, row_rect, t, value)
             self.clickable_rects.append({'rect': row_rect, 'index': idx, 'type': 'item'})
 
@@ -6334,7 +6351,7 @@ class RoomEditor:
             elif field_id == 'bgs':
                 self._bgs_field_rect = row_rect
             uk.register_hoverable(row_rect)
-        y += row_label_h + 38 + 20
+        y += row_label_h + ui(38) + ui(20)
 
         # Room Music / Room BGS volume — click-drag sliders, not part of the
         # keyboard tab order (same convention as the background sub-panel's
@@ -6342,25 +6359,25 @@ class RoomEditor:
         self._room_volume_slider_rects = {}
         music_volume = getattr(self.editing_room, 'music_volume', 1.0)
         bgs_volume = getattr(self.editing_room, 'bgs_volume', 1.0)
-        vol_w = (width - 24) // 2
+        vol_w = (width - ui(24)) // 2
         self._draw_slider(screen, x, y, vol_w, 'music_volume', 'Music Volume', music_volume,
                            f'{int(round(music_volume * 100))}%',
                            self._room_volume_slider_rects, self._room_volume_drag_slider)
-        self._draw_slider(screen, x + vol_w + 24, y, vol_w, 'bgs_volume', 'BGS Volume', bgs_volume,
+        self._draw_slider(screen, x + vol_w + ui(24), y, vol_w, 'bgs_volume', 'BGS Volume', bgs_volume,
                            f'{int(round(bgs_volume * 100))}%',
                            self._room_volume_slider_rects, self._room_volume_drag_slider)
-        y += 34
+        y += ui(34)
 
         # Can attack? — checkbox row
         idx = 7
         t = self._item_anim(idx)
         can_attack_val = getattr(self.editing_room, 'can_attack', True)
         chk_label = self.font_small.render('CAN ATTACK HERE', True, uk.Theme.TEXT_MUTED)
-        screen.blit(chk_label, (x, y + 3))
-        box_rect = pygame.Rect(x + 190, y, 26, 26)
+        screen.blit(chk_label, (x, y + ui(3)))
+        box_rect = pygame.Rect(x + ui(190), y, ui(26), ui(26))
         self._draw_checkbox(screen, box_rect, t, can_attack_val)
         self.clickable_rects.append({'rect': box_rect, 'index': idx, 'type': 'item'})
-        y += 26 + 22
+        y += ui(26) + ui(22)
 
         # Background — opens the sub-panel
         idx = 8
@@ -6369,10 +6386,10 @@ class RoomEditor:
         bg_display = os.path.splitext(bg_val)[0] if bg_val else 'None'
         bg_label_surf = self.font_small.render('BACKGROUND', True, uk.Theme.TEXT_MUTED)
         screen.blit(bg_label_surf, (x, y))
-        bg_row_rect = pygame.Rect(x, y + bg_label_surf.get_height() + 6, width, 38)
+        bg_row_rect = pygame.Rect(x, y + bg_label_surf.get_height() + ui(6), width, ui(38))
         self._draw_field_row(screen, bg_row_rect, t, bg_display)
         self.clickable_rects.append({'rect': bg_row_rect, 'index': idx, 'type': 'item'})
-        y += bg_label_surf.get_height() + 6 + 38 + 24
+        y += bg_label_surf.get_height() + ui(6) + ui(38) + ui(24)
 
         btn_w, btn_h, gap = 170, 50, 14
         for j, (idx, label, accent, icon_fn, danger) in enumerate([
@@ -6617,7 +6634,7 @@ class RoomEditor:
         if len(options) > self.MUSIC_DROPDOWN_VISIBLE_ROWS:
             hint = f"{self._music_dropdown_scroll + 1}-{self._music_dropdown_scroll + len(visible)} of {len(options)} (scroll)"
             hint_surf = self.font_small.render(hint, True, uk.Theme.TEXT_DIM)
-            screen.blit(hint_surf, (list_rect.x, list_rect.bottom + 4))
+            screen.blit(hint_surf, (list_rect.x, list_rect.bottom + ui(4)))
 
     # Cap the visible height of the Room BGS dropdown, same reasoning as
     # MUSIC_DROPDOWN_VISIBLE_ROWS above.
@@ -6681,12 +6698,12 @@ class RoomEditor:
         if len(options) > self.BGS_DROPDOWN_VISIBLE_ROWS:
             hint = f"{self._bgs_dropdown_scroll + 1}-{self._bgs_dropdown_scroll + len(visible)} of {len(options)} (scroll)"
             hint_surf = self.font_small.render(hint, True, uk.Theme.TEXT_DIM)
-            screen.blit(hint_surf, (list_rect.x, list_rect.bottom + 4))
+            screen.blit(hint_surf, (list_rect.x, list_rect.bottom + ui(4)))
 
     def _draw_bg_panel(self, screen):
         SW, SH = screen.get_size()
-        PANEL_TOP = self.header_h - 10
-        PANEL_H = SH - PANEL_TOP - 20
+        PANEL_TOP = self.header_h - ui(10)
+        PANEL_H = SH - PANEL_TOP - ui(20)
         PX = (SW - self.PANEL_W) // 2
         PY = PANEL_TOP
 
@@ -6698,7 +6715,7 @@ class RoomEditor:
         screen.blit(dim, (0, 0))
 
         uk.draw_panel(screen, self._bg_panel_rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD,
-                       border_width=1, radius=10)
+                       border_width=1, radius=ui(10))
 
         bg_selected = self._room_bg_get('image', '')
         bg_scroll_x = float(self._room_bg_get('scroll_x', 0.0))
@@ -6707,54 +6724,54 @@ class RoomEditor:
 
         # Title + current selection
         title_s = self.font_large.render('Scrolling Background', True, uk.Theme.GOLD)
-        screen.blit(title_s, (PX + 14, PY + 12))
+        screen.blit(title_s, (PX + ui(14), PY + ui(12)))
 
         sel_name = os.path.splitext(bg_selected)[0] if bg_selected else 'None'
         sel_col = uk.Theme.TEXT_PRIMARY if bg_selected else uk.Theme.TEXT_MUTED
         sel_s = self.font_medium.render(f'Selected: {sel_name}', True, sel_col)
-        screen.blit(sel_s, (PX + 14, PY + 38))
+        screen.blit(sel_s, (PX + ui(14), PY + ui(38)))
 
         # ── Sliders ──────────────────────────────────────────────────────
-        inner_w = self.PANEL_W - 28
-        sy = PY + 64
+        inner_w = self.PANEL_W - ui(28)
+        sy = PY + ui(64)
         self._bg_slider_rects = {}
 
         sx_t = (bg_scroll_x / self.SCROLL_MAX + 1) / 2
-        self._draw_slider(screen, PX + 14, sy, inner_w, 'scroll_x', 'Scroll X', sx_t,
+        self._draw_slider(screen, PX + ui(14), sy, inner_w, 'scroll_x', 'Scroll X', sx_t,
                            f'{bg_scroll_x:+.0f} px/s', self._bg_slider_rects, self._bg_drag_slider,
                            center_mark=True)
-        sy += self.SLIDER_H + 24
+        sy += self.SLIDER_H + ui(24)
 
         sy_t = (bg_scroll_y / self.SCROLL_MAX + 1) / 2
-        self._draw_slider(screen, PX + 14, sy, inner_w, 'scroll_y', 'Scroll Y', sy_t,
+        self._draw_slider(screen, PX + ui(14), sy, inner_w, 'scroll_y', 'Scroll Y', sy_t,
                            f'{bg_scroll_y:+.0f} px/s', self._bg_slider_rects, self._bg_drag_slider,
                            center_mark=True)
-        sy += self.SLIDER_H + 24
+        sy += self.SLIDER_H + ui(24)
 
-        self._draw_slider(screen, PX + 14, sy, inner_w, 'parallax', 'Parallax', bg_parallax,
+        self._draw_slider(screen, PX + ui(14), sy, inner_w, 'parallax', 'Parallax', bg_parallax,
                            f'{bg_parallax:.2f}', self._bg_slider_rects, self._bg_drag_slider)
-        sy += self.SLIDER_H + 20
+        sy += self.SLIDER_H + ui(20)
 
         hint = self.font_small.render(
             '0 = fixed on screen   0.5 = half camera   1 = moves with camera',
             True, uk.Theme.TEXT_DIM)
-        screen.blit(hint, (PX + 14, sy))
-        sy += 20
+        screen.blit(hint, (PX + ui(14), sy))
+        sy += ui(20)
 
         # ── Clear button ─────────────────────────────────────────────────
-        sy += 4
-        clr_rect = pygame.Rect(PX + 14, sy, inner_w, 28)
+        sy += ui(4)
+        clr_rect = pygame.Rect(PX + ui(14), sy, inner_w, ui(28))
         self._draw_pill_button(screen, clr_rect, 1.0 if clr_rect.collidepoint(self._logical_mouse_pos) else 0.0,
                                 'Clear Background', uk.Theme.DANGER_BRIGHT, _draw_trash_icon, danger=True)
         self._bg_clear_rect = clr_rect
-        sy += 36
+        sy += ui(36)
 
         # ── Divider ──────────────────────────────────────────────────────
-        uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER, pygame.Rect(PX + 10, sy, self.PANEL_W - 20, 1), 0, 0)
-        sy += 10
+        uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER, pygame.Rect(PX + ui(10), sy, self.PANEL_W - ui(20), 1), 0, 0)
+        sy += ui(10)
 
         # ── Thumbnail grid ───────────────────────────────────────────────
-        grid_rect = pygame.Rect(PX, sy, self.PANEL_W, PY + PANEL_H - sy - 8)
+        grid_rect = pygame.Rect(PX, sy, self.PANEL_W, PY + PANEL_H - sy - ui(8))
         self._bg_grid_rect = grid_rect
         old_clip = screen.get_clip()
         screen.set_clip(grid_rect)
@@ -6768,7 +6785,7 @@ class RoomEditor:
 
         if not self._bg_files:
             no_s = self.font_medium.render('No images found in assets/bg', True, uk.Theme.TEXT_MUTED)
-            screen.blit(no_s, (PX + 14, sy + 12))
+            screen.blit(no_s, (PX + ui(14), sy + ui(12)))
         else:
             for fname in self._bg_files:
                 cx = PX + self.THUMB_PAD + col * row_h
@@ -6783,8 +6800,8 @@ class RoomEditor:
                           uk.Theme.PANEL_BORDER)
                 bw = 2 if (is_sel or is_hov) else 1
 
-                uk.draw_rect_on(screen, (18, 18, 26), cell, 0, 6)
-                uk.draw_rect_on(screen, border, cell, bw, 6)
+                uk.draw_rect_on(screen, (18, 18, 26), cell, 0, ui(6))
+                uk.draw_rect_on(screen, border, cell, bw, ui(6))
 
                 thumb = self._load_bg_thumb(fname)
                 if thumb:
@@ -6796,11 +6813,11 @@ class RoomEditor:
                 lbl = self.font_small.render(
                     os.path.splitext(fname)[0], True,
                     uk.Theme.GOLD_BRIGHT if is_sel else uk.Theme.TEXT_MUTED)
-                screen.blit(lbl, (cell.x + 3, cell.bottom - 14))
+                screen.blit(lbl, (cell.x + ui(3), cell.bottom - ui(14)))
 
                 if is_sel:
-                    chk_rect = pygame.Rect(0, 0, 14, 14)
-                    chk_rect.topright = (cell.right - 3, cell.top + 3)
+                    chk_rect = pygame.Rect(0, 0, ui(14), ui(14))
+                    chk_rect.topright = (cell.right - ui(3), cell.top + ui(3))
                     _draw_check_icon(screen, chk_rect, uk.Theme.GOLD_BRIGHT)
 
                 col += 1
@@ -6812,12 +6829,12 @@ class RoomEditor:
 
         if max_scroll > 0:
             n = min(8, total_rows)
-            dot_x = PX + self.PANEL_W - 6
+            dot_x = PX + self.PANEL_W - ui(6)
             for d in range(n):
                 dot_y = grid_rect.top + int(grid_rect.height * d / max(1, n - 1))
                 ratio = self._bg_scroll / max(1, max_scroll)
                 active = abs(d / max(1, n - 1) - ratio) < 0.15
-                uk.draw_circle_on(screen, uk.Theme.GOLD if active else uk.Theme.PANEL_BORDER, (dot_x, dot_y), 3)
+                uk.draw_circle_on(screen, uk.Theme.GOLD if active else uk.Theme.PANEL_BORDER, (dot_x, dot_y), ui(3))
 
     # =========================================================================
     # Room Settings — Room Music scan

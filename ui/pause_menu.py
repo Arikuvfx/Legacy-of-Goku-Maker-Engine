@@ -15,6 +15,7 @@ Journal:       active or completed quest list with quest-type icons.
 Pressing S or Down on the Status tab signals 'open_skills' back to game.py.
 """
 
+import math
 import pygame
 import os
 from core.bitmap_font import BitmapFont
@@ -30,6 +31,173 @@ from core.items import (
 # RENDER_SCALE elsewhere no longer resizes anything in this file.
 RENDER_SCALE = 4
 _S = max(1, RENDER_SCALE)
+
+# ── Resolution independence ──────────────────────────────────────────────────
+# This menu's layout is a pile of hand-tuned pixel offsets that were dialled in
+# at exactly 1920x1080 (inner_h = canvas_h - 286, "inner_w - 961", every +33 /
+# -44 / +720 nudge, font_scale 4, ...). Only some of those scale with the
+# screen height, so at any other resolution the menu fell apart. Instead of
+# retuning them, the menu is ALWAYS laid out in this design space and mapped
+# onto the real screen by _ScaledScreen below. The tiled background is the one
+# thing that is drawn across the whole real screen, not just the design area.
+DESIGN_W = 1920
+DESIGN_H = 1080
+
+# True: snap the menu's scale to a multiple of 0.25 so that one art pixel
+#       (4 design px) lands on a whole number of screen pixels -> perfectly even
+#       pixels (1.0 @1080p, 1.25 @1440p, 2.0 @4K). The menu then leaves a thin
+#       margin at e.g. 1440p. The snap is skipped (exact fit used instead) when
+#       it would shrink the menu by more than PIXEL_SNAP_MAX_LOSS, e.g. 720p.
+# False: always scale to fill the screen exactly (uneven pixels at 1440p).
+PIXEL_PERFECT_SCALE  = True
+PIXEL_SNAP_MAX_LOSS  = 0.10
+
+
+def compute_ui_fit(real_w, real_h):
+    """Returns (scale, off_x, off_y): the design space is drawn at `scale` and
+    centred on the real screen at (off_x, off_y)."""
+    fit = max(0.01, min(real_w / DESIGN_W, real_h / DESIGN_H))
+    scale, snapped = fit, False
+    if PIXEL_PERFECT_SCALE:
+        snap = math.floor(fit * 4 + 1e-6) / 4
+        if snap >= 0.25 and snap >= fit * (1.0 - PIXEL_SNAP_MAX_LOSS):
+            scale, snapped = snap, True
+    off_x = (real_w - round(DESIGN_W * scale)) // 2
+    off_y = (real_h - round(DESIGN_H * scale)) // 2
+    if snapped:
+        # Keep the origin on the art-pixel grid so the full-screen background
+        # and the menu content share one pixel grid.
+        px = int(round(4 * scale))
+        off_x = max(0, off_x) // px * px
+        off_y = max(0, off_y) // px * px
+    return scale, max(0, off_x), max(0, off_y)
+
+
+def _ui_full_rect(real_w, real_h, scale, off_x, off_y):
+    """The whole real screen expressed in design coordinates (it extends past
+    0..DESIGN_W/H into the margins when the menu doesn't fill the screen)."""
+    left   = math.ceil(off_x / scale)
+    top    = math.ceil(off_y / scale)
+    right  = math.ceil((real_w - off_x) / scale)
+    bottom = math.ceil((real_h - off_y) / scale)
+    return pygame.Rect(-left, -top, left + right, top + bottom)
+
+
+class _ScaledScreen:
+    """
+    Draw-target proxy: PauseMenu draws in 1920x1080 design coordinates and this
+    maps every call onto the real GPUScreen. Only the calls PauseMenu makes
+    (blit / draw_rect / draw_circle / set_clip / get_clip) are implemented.
+
+    Both edges of every rect are rounded independently (never position+size),
+    so neighbouring pieces (9-slice parts, background) share their edge exactly
+    and can never gap or overlap. Clipping is done here, in design space, with
+    exact integer source rects rather than by the GPU wrapper's proportional
+    clip.
+    """
+
+    def __init__(self, target, scale, off_x, off_y, full_rect):
+        self.target    = target
+        self.scale     = scale
+        self.off_x     = off_x
+        self.off_y     = off_y
+        self._full     = pygame.Rect(full_rect)
+        self._clip     = None   # design-space clip, or None
+
+    @property
+    def full_rect(self):
+        """The entire real screen, in design coordinates (see _ui_full_rect)."""
+        return self._full.copy()
+
+    def fill(self, color, rect=None):
+        """Fills the ENTIRE real screen (rect is ignored) — only used for plain
+        'no art available' fallbacks, which want every pixel covered."""
+        self.target.fill(color)
+
+    # coordinate mapping
+    def _mx(self, v): return self.off_x + int(math.floor(v * self.scale + 0.5))
+    def _my(self, v): return self.off_y + int(math.floor(v * self.scale + 0.5))
+
+    def to_real_rect(self, r):
+        r = pygame.Rect(r)
+        l, t = self._mx(r.left),  self._my(r.top)
+        rr, b = self._mx(r.right), self._my(r.bottom)
+        return pygame.Rect(l, t, rr - l, b - t)
+
+    # clip
+    def set_clip(self, rect):
+        if rect is None:
+            self._clip = None
+            self.target.set_clip(None)
+        else:
+            self._clip = pygame.Rect(rect)
+            self.target.set_clip(self.to_real_rect(self._clip))
+
+    def get_clip(self):
+        return (self._clip if self._clip is not None else self._full).copy()
+
+    def get_size(self):
+        return (DESIGN_W, DESIGN_H)
+
+    # drawing
+    def blit(self, surface, dest, area=None, special_flags=0):
+        sw, sh = surface.get_size()
+        if sw <= 0 or sh <= 0:
+            return
+        x, y = int(dest[0]), int(dest[1])
+        full = pygame.Rect(0, 0, sw, sh)
+        area = full if area is None else pygame.Rect(area).clip(full)
+        if area.width <= 0 or area.height <= 0:
+            return
+        dst = pygame.Rect(x, y, area.width, area.height)
+        if self._clip is not None:
+            vis = dst.clip(self._clip)
+            if vis.width <= 0 or vis.height <= 0:
+                return
+            if vis != dst:
+                area = pygame.Rect(area.x + vis.x - dst.x, area.y + vis.y - dst.y,
+                                   vis.width, vis.height)
+                dst = vis
+        real = self.to_real_rect(dst)
+        if real.width <= 0 or real.height <= 0:
+            return
+        self.target.blit(surface, real, area=area, special_flags=special_flags)
+
+    def draw_rect(self, color, rect, width=0, **kwargs):
+        rect = pygame.Rect(rect)
+        if self._clip is not None:
+            rect = rect.clip(self._clip)
+        if rect.width <= 0 or rect.height <= 0:
+            return
+        real = self.to_real_rect(rect)
+        if real.width <= 0 or real.height <= 0:
+            return
+        if width <= 0:
+            self.target.draw_rect(color, real)
+            return
+        t = max(1, int(round(width * self.scale)))
+        t = min(t, real.width, real.height)
+        for edge in (pygame.Rect(real.x, real.y, real.width, t),
+                     pygame.Rect(real.x, real.bottom - t, real.width, t),
+                     pygame.Rect(real.x, real.y + t, t, real.height - 2 * t),
+                     pygame.Rect(real.right - t, real.y + t, t, real.height - 2 * t)):
+            if edge.width > 0 and edge.height > 0:
+                self.target.draw_rect(color, edge)
+
+    def draw_circle(self, color, center, radius, width=0):
+        w = 0 if width <= 0 else max(1, int(round(width * self.scale)))
+        self.target.draw_circle(
+            color, (self._mx(center[0]), self._my(center[1])),
+            max(1, int(round(radius * self.scale))), w)
+
+
+def make_scaled_screen(screen, size=None):
+    """A _ScaledScreen for `screen` without needing a PauseMenu instance —
+    for other menus (e.g. TitleScreen when no PauseMenu is wired in)."""
+    w, h = size if size is not None else screen.get_size()
+    scale, off_x, off_y = compute_ui_fit(w, h)
+    return _ScaledScreen(screen, scale, off_x, off_y, _ui_full_rect(w, h, scale, off_x, off_y))
+
 
 TABS = ['STATUS', 'INVENTORY', 'EQUIP', 'OPTIONS', 'JOURNAL']
 
@@ -135,6 +303,11 @@ class FlatBitmapFont:
 class PauseMenu:
 
     def __init__(self, screen_width, screen_height):
+        # screen_width/height are the REAL display size. All layout below runs
+        # in the fixed 1920x1080 design space (see _ScaledScreen); the real
+        # size only decides how that design space is scaled/centred in draw().
+        self._set_display_size(screen_width, screen_height)
+        screen_width, screen_height = DESIGN_W, DESIGN_H
         self.screen_width  = screen_width
         self.screen_height = screen_height
         self.active        = False
@@ -419,31 +592,56 @@ class PauseMenu:
         self.scroll_down_timer    = 0.0
         self.scroll_press_duration = 0.15
 
-        # Pre-render the tiled background as one big surface to avoid seams
-        raw = _img('assets/ui/textbox/background_texture.png')
+        # Pre-render the tiled background as one big surface to avoid seams.
+        # Tile size is raw * font_scale in DESIGN px (so one background pixel
+        # == one glyph pixel); _ScaledScreen then maps that to whole screen
+        # pixels. See _build_bg_texture for how far it extends.
+        self._bg_raw = _img('assets/ui/textbox/background_texture.png')
+        self._build_bg_texture()
+
+    def _set_display_size(self, real_w, real_h):
+        """Record the real display size and derive how the design space maps
+        onto it. Cheap; called at init and whenever the screen size changes."""
+        self._real_size = (int(real_w), int(real_h))
+        self._ui_scale, self._ui_off_x, self._ui_off_y = compute_ui_fit(real_w, real_h)
+        self._ui_full_rect = _ui_full_rect(real_w, real_h, self._ui_scale,
+                                           self._ui_off_x, self._ui_off_y)
+
+    def _build_bg_texture(self):
+        raw = getattr(self, '_bg_raw', None)
         if raw:
-            # Match the fonts' pixel scale exactly (font_scale, set above) rather
-            # than deriving a separate scale from _S — in the original game one
-            # pixel of a letter glyph equals one pixel of a background row, and
-            # font_scale is a flat constant independent of RENDER_SCALE, so the
-            # background has to use that same constant to stay aligned with it.
+            # Match the fonts' pixel scale exactly (font_scale) rather than
+            # deriving a separate scale from _S — one pixel of a glyph equals
+            # one pixel of a background row, and font_scale is a flat constant.
             scale  = self.font_scale
             tile_w = round(raw.get_width()  * scale)
             tile_h = round(raw.get_height() * scale)
             tile   = pygame.transform.scale(raw, (tile_w, tile_h))
-            cols   = (self.screen_width  // tile_w) + 2
-            rows   = (self.screen_height // tile_h) + 2
-            surf   = pygame.Surface((cols * tile_w, rows * tile_h), pygame.SRCALPHA)
+            real_w, real_h = self._real_size
+            fr     = self._ui_full_rect
+            # Tiles are laid out from a tile-aligned origin that sits left/
+            # above design (0,0), so the pattern phase is unchanged and the
+            # texture still covers the margins around the design area. Also
+            # covers 0..real size, which the (real-coordinate) "Saving..."
+            # popup fallback in game.py draws against.
+            ml   = (-fr.left) // tile_w + 1
+            mt   = (-fr.top)  // tile_h + 1
+            cols = ml + max(fr.right,  real_w) // tile_w + 3
+            rows = mt + max(fr.bottom, real_h) // tile_h + 3
+            surf = pygame.Surface((cols * tile_w, rows * tile_h), pygame.SRCALPHA)
             for ty in range(rows):
                 for tx in range(cols):
                     surf.blit(tile, (tx * tile_w, ty * tile_h))
             self.bg_texture  = surf
             self._bg_tile_w  = tile_w
             self._bg_tile_h  = tile_h
+            self._bg_anchor  = (ml * tile_w, mt * tile_h)
         else:
             self.bg_texture = None
             self._bg_tile_w = 1
             self._bg_tile_h = 1
+            self._bg_anchor = (0, 0)
+        self._bg_built_for = (self._real_size, self._ui_scale, self._ui_off_x, self._ui_off_y)
 
     def _refresh_name_sprites(self):
         """
@@ -1396,10 +1594,42 @@ class PauseMenu:
         if not self.active:
             return
 
+        ui = self.make_ui_screen(screen)
+        try:
+            self._draw_menu(ui, player, play_time)
+        finally:
+            screen.set_clip(None)
+
+        # Zones were recorded in design coordinates; mouse events arrive in
+        # real screen coordinates, so convert once per frame here.
+        self._click_zones = {k: ui.to_real_rect(r) for k, r in self._click_zones.items()}
+
+    def make_ui_screen(self, screen):
+        """Syncs with the real screen's current size (rebuilding the full-
+        screen background only if the mapping changed) and returns a
+        _ScaledScreen that draws in 1920x1080 design coordinates. Other
+        menus that borrow this menu's art/fonts/frame geometry (TitleScreen's
+        save select, Game's "Saving..." popup) draw through this too, so
+        everything shares one scale, origin and pixel grid."""
+        try:
+            real_size = tuple(screen.get_size())
+        except Exception:
+            real_size = self._real_size
+        if real_size != self._real_size:
+            self._set_display_size(*real_size)
+        if self._bg_built_for != (self._real_size, self._ui_scale, self._ui_off_x, self._ui_off_y):
+            self._build_bg_texture()
+        return _ScaledScreen(screen, self._ui_scale, self._ui_off_x, self._ui_off_y,
+                             self._ui_full_rect)
+
+    def _draw_menu(self, screen, player, play_time):
+        """The menu proper. `screen` is a _ScaledScreen: every coordinate in
+        here (and in every _draw_* helper) is in 1920x1080 design space."""
         self._click_zones = {}  # rebuilt every frame so positions stay current
         self._player      = player  # keep fresh for handle_input(), which has no player arg
 
-        self._draw_tiled_background(screen, pygame.Rect(0, 0, self.screen_width, self.screen_height))
+        # Full-screen background first (covers the margins around the design area).
+        self._draw_tiled_background(screen, self._ui_full_rect)
 
         # Frame sizing
         title_margin = int(self.canvas_height * 0.08)
@@ -3341,7 +3571,8 @@ class PauseMenu:
         # (e.g. the inset interior of the item-confirm popup). Aligning to
         # rect.left/top instead would shift the pattern relative to everything
         # outside that rect.
-        screen.blit(self.bg_texture,(-ox,-oy)); screen.set_clip(prev)
+        ax,ay=self._bg_anchor
+        screen.blit(self.bg_texture,(-ox-ax,-oy-ay)); screen.set_clip(prev)
 
     def _draw_9slice_sprite(self, screen, sprite, x, y, width, height, corner_size=16):
         if not sprite: return False

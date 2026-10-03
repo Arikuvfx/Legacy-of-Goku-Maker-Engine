@@ -4,6 +4,7 @@ import os
 
 from dev_tools import entity_creator
 import dev_tools.ui_kit as uk
+from config.settings import ui, ui_text
 
 
 # =============================================================================
@@ -345,10 +346,10 @@ class EntityEditor:
         # TilesetEditor's own chrome, so this panel reads as part of the same
         # tool family instead of a mismatched leftover panel.
         self.font = uk.BitmapFont('assets\\ui\\fonts', letter_spacing=1)
-        self.title_size = 16
-        self.body_size = 11
-        self.hint_size = 11  # matches ObjectEditor's font_small (11) used for its palette/label text
-        self.label_size = 10
+        self.title_size = ui_text(16)
+        self.body_size = ui_text(11)
+        self.hint_size = ui_text(11)  # matches ObjectEditor's font_small (11) used for its palette/label text
+        self.label_size = ui_text(10)
 
         # A couple of accents that don't have a direct Theme constant, kept
         # local the same way tileset_editor.py keeps its own SUCCESS/SELECTION.
@@ -381,13 +382,14 @@ class EntityEditor:
         self._palette_label_cache = {}
         self._label_fit_cache = {}
 
-        self.palette_width = 600
+        self.palette_width = ui(600)
         self.palette_x = screen_width - self.palette_width
-        self.palette_y = 100  # below the toolbar
-        self.palette_height = 940
-        self.palette_padding = 10
-        self.item_size = 80
-        self.item_gap = 10
+        self.palette_y = ui(100)  # below the toolbar
+        # Never taller than the screen allows (940 was tuned for 1080p).
+        self.palette_height = max(ui(300), min(ui(940), screen_height - self.palette_y - ui(10)))
+        self.palette_padding = ui(10)
+        self.item_size = ui(80)
+        self.item_gap = ui(10)
         available_w = self.palette_width - self.palette_padding * 2
         self.items_per_row = max(1, (available_w + self.item_gap) // (self.item_size + self.item_gap))
         self.scroll_offset = 0
@@ -457,8 +459,8 @@ class EntityEditor:
 
         # Panel show/hide toggle (same pattern as EditorToolbar)
         self.palette_visible = True
-        self._panel_tab_w = 18
-        self._panel_tab_h = 72
+        self._panel_tab_w = ui(18)
+        self._panel_tab_h = ui(72)
         self._hover_panel_toggle = False
 
         # Slide animation for the panel opening/closing — chased toward
@@ -635,7 +637,7 @@ class EntityEditor:
             pygame.draw.rect(surf, color, (0, 0, w, h))
             pygame.draw.rect(surf, dark, (0, 0, w, h), 2)
             # X mark
-            pad = 6
+            pad = ui(6)
             pygame.draw.line(surf, dark, (pad, pad), (w - pad, h - pad), 3)
             pygame.draw.line(surf, dark, (w - pad, pad), (pad, h - pad), 3)
 
@@ -694,7 +696,7 @@ class EntityEditor:
         self.palette_x here is always the panel's settled resting position
         (draw() restores it after each shifted draw), so this is stable to
         call from anywhere, animating or not."""
-        gap = 6
+        gap = ui(6)
         tx_shown  = self.palette_x - self._panel_tab_w - gap
         tx_hidden = self.screen_width - self._panel_tab_w
         tx = round(uk.lerp(tx_hidden, tx_shown, self._panel_slide_anim))
@@ -710,7 +712,7 @@ class EntityEditor:
         bg = uk.lerp_color((22, 25, 35), (30, 34, 46), 1.0 if lit else 0.0)
         border = uk.Theme.GOLD if lit else uk.Theme.PANEL_BORDER
         uk.draw_panel(screen, rect, bg=(*bg, 235), border=border, border_width=1,
-                      radius=6, shadow=False)
+                      radius=ui(6), shadow=False)
         chevron_color = uk.Theme.GOLD_BRIGHT if lit else uk.Theme.TEXT_MUTED
         _draw_chevron_icon(screen, rect, chevron_color, left=self.palette_visible, width=2)
 
@@ -1458,7 +1460,7 @@ class EntityEditor:
         variant_height = self._variant_selector_content_height()
         reserved_bottom = settings_height + variant_height
         content_height = max(
-            100, self.palette_height - (y_after_tabs - self.palette_y) - reserved_bottom)
+            ui(100), self.palette_height - (y_after_tabs - self.palette_y) - reserved_bottom)
 
         self._draw_entity_grid(screen, y_after_tabs, content_height)
 
@@ -1507,12 +1509,12 @@ class EntityEditor:
             bg, border, txt, bw = uk.Theme.CARD_BG_HOVER, uk.Theme.GOLD, uk.Theme.TEXT_SECONDARY, 1
         else:
             bg, border, txt, bw = uk.Theme.CARD_BG, uk.Theme.CARD_BORDER, uk.Theme.TEXT_MUTED, 1
-        uk.draw_rect_on(screen, bg, rect, 0, 5)
-        uk.draw_rect_on(screen, border, rect, bw, 5)
+        uk.draw_rect_on(screen, bg, rect, 0, ui(5))
+        uk.draw_rect_on(screen, border, rect, bw, ui(5))
         if not disabled:
             uk.register_hoverable(rect)
-        label_h = min(self.hint_size, rect.h - 6)
-        while label_h > 6 and self.font.size(label, height=label_h)[0] > rect.w - 8:
+        label_h = min(self.hint_size, rect.h - ui(6))
+        while label_h > 6 and self.font.size(label, height=label_h)[0] > rect.w - ui(8):
             label_h -= 1
         label_s = self.font.render(label, color=txt, height=max(6, label_h))
         uk.blit_surface(screen, label_s, label_s.get_rect(center=rect.center), transient=True)
@@ -1523,19 +1525,19 @@ class EntityEditor:
         own (non-blinking) active-field convention."""
         bg = uk.Theme.CARD_BG_HOVER if active else uk.Theme.CARD_BG
         border = uk.Theme.GOLD if active else uk.Theme.PANEL_BORDER
-        uk.draw_rect_on(screen, bg, rect, 0, 4)
-        uk.draw_rect_on(screen, border, rect, 2 if active else 1, 4)
+        uk.draw_rect_on(screen, bg, rect, 0, ui(4))
+        uk.draw_rect_on(screen, border, rect, 2 if active else 1, ui(4))
 
         display = text + ("_" if active else "")
         color = uk.Theme.TEXT_PRIMARY if (text or active) else uk.Theme.TEXT_DIM
-        text_h = min(self.body_size, max(7, rect.h - 8))
-        max_w = rect.w - 12
+        text_h = min(self.body_size, max(7, rect.h - ui(8)))
+        max_w = rect.w - ui(12)
         while text_h > 7 and self.font.size(display, height=text_h)[0] > max_w:
             text_h -= 1
         while self.font.size(display, height=text_h)[0] > max_w and len(display) > 1:
             display = display[:-1]
         txt_s = self.font.render(display, color=color, height=max(7, text_h))
-        uk.blit_surface(screen, txt_s, (rect.x + 6, rect.y + (rect.h - txt_s.get_height()) // 2), transient=True)
+        uk.blit_surface(screen, txt_s, (rect.x + ui(6), rect.y + (rect.h - txt_s.get_height()) // 2), transient=True)
 
     def _draw_dropdown_button(self, screen, rect, display_text, is_open, has_value=True):
         """Value + chevron button that opens a floating option list
@@ -1543,29 +1545,29 @@ class EntityEditor:
         objective params."""
         bg = uk.Theme.CARD_BG_HOVER if is_open else uk.Theme.CARD_BG
         border = uk.Theme.GOLD if is_open else uk.Theme.PANEL_BORDER
-        uk.draw_rect_on(screen, bg, rect, 0, 4)
-        uk.draw_rect_on(screen, border, rect, 2 if is_open else 1, 4)
+        uk.draw_rect_on(screen, bg, rect, 0, ui(4))
+        uk.draw_rect_on(screen, border, rect, 2 if is_open else 1, ui(4))
         uk.register_hoverable(rect)
 
         disp = display_text
-        text_h = min(self.hint_size, max(6, rect.h - 8))
-        max_text_w = rect.w - 22
+        text_h = min(self.hint_size, max(6, rect.h - ui(8)))
+        max_text_w = rect.w - ui(22)
         while text_h > 6 and self.font.size(disp, height=text_h)[0] > max_text_w:
             text_h -= 1
         while self.font.size(disp, height=text_h)[0] > max_text_w and len(disp) > 1:
             disp = disp[:-1]
         color = uk.Theme.TEXT_PRIMARY if has_value else uk.Theme.TEXT_DIM
         txt_s = self.font.render(disp, color=color, height=max(6, text_h))
-        uk.blit_surface(screen, txt_s, (rect.x + 6, rect.y + (rect.h - txt_s.get_height()) // 2), transient=True)
+        uk.blit_surface(screen, txt_s, (rect.x + ui(6), rect.y + (rect.h - txt_s.get_height()) // 2), transient=True)
 
         chev_color = uk.Theme.GOLD if is_open else uk.Theme.TEXT_MUTED
-        cx, cy = rect.right - 12, rect.centery
+        cx, cy = rect.right - ui(12), rect.centery
         if is_open:
-            uk.draw_line_on(screen, chev_color, (cx - 4, cy + 2), (cx, cy - 3), 2)
-            uk.draw_line_on(screen, chev_color, (cx, cy - 3), (cx + 4, cy + 2), 2)
+            uk.draw_line_on(screen, chev_color, (cx - ui(4), cy + 2), (cx, cy - ui(3)), 2)
+            uk.draw_line_on(screen, chev_color, (cx, cy - ui(3)), (cx + ui(4), cy + 2), 2)
         else:
-            uk.draw_line_on(screen, chev_color, (cx - 4, cy - 2), (cx, cy + 3), 2)
-            uk.draw_line_on(screen, chev_color, (cx, cy + 3), (cx + 4, cy - 2), 2)
+            uk.draw_line_on(screen, chev_color, (cx - ui(4), cy - 2), (cx, cy + ui(3)), 2)
+            uk.draw_line_on(screen, chev_color, (cx, cy + ui(3)), (cx + ui(4), cy - 2), 2)
 
     # =========================================================================
     # Drawing — palette panel
@@ -1578,12 +1580,12 @@ class EntityEditor:
 
     def _draw_title(self, screen):
         title_s = self.font.render("Entities", color=uk.Theme.GOLD, height=self.title_size)
-        title_pos = (self.palette_x + 20, self.palette_y + 12)
+        title_pos = (self.palette_x + ui(20), self.palette_y + ui(12))
         uk.blit_surface(screen, title_s, title_pos, transient=True)
 
         # '?' info badge — opens the keybinds popup (_draw_keybinds_popup).
-        info_d = 18
-        info_x = title_pos[0] + title_s.get_width() + 14
+        info_d = ui(18)
+        info_x = title_pos[0] + title_s.get_width() + ui(14)
         info_y = title_pos[1] + (title_s.get_height() - info_d) // 2
         info_rect = pygame.Rect(info_x, info_y, info_d, info_d)
         self._info_button_rect = info_rect
@@ -1592,10 +1594,10 @@ class EntityEditor:
     # ── category tabs ────────────────────────────────────────────────────────
 
     def _category_tabs_top_y(self):
-        return self.palette_y + 45  # below title
+        return self.palette_y + ui(45)  # below title
 
     def _category_tabs_bottom_y(self):
-        return self._category_tabs_top_y() + len(self.category_keys) * 40 + 10
+        return self._category_tabs_top_y() + len(self.category_keys) * ui(40) + ui(10)
 
     # Display label shown on the category tab — separate from the catalogue
     # key (self.category_keys / self.categories / CATEGORY_META) so nothing
@@ -1615,7 +1617,7 @@ class EntityEditor:
 
             tab_rect = pygame.Rect(
                 self.palette_x + self.palette_padding, y,
-                self.palette_width - self.palette_padding * 2, 30
+                self.palette_width - self.palette_padding * 2, ui(30)
             )
             uk.register_hoverable(tab_rect)
 
@@ -1625,10 +1627,10 @@ class EntityEditor:
                 bg = uk.lerp_color(bg, uk.Theme.CARD_BG_SELECTED[:3], 1.0)
             border = uk.lerp_color(uk.Theme.CARD_BORDER, accent, t)
             uk.draw_panel(screen, tab_rect, bg=(*bg, 255), border=border,
-                          border_width=2 if is_sel else 1, radius=6, shadow=False)
+                          border_width=2 if is_sel else 1, radius=ui(6), shadow=False)
 
             if t > 0.02:
-                uk.draw_soft_glow(screen, tab_rect.center, 20, accent, max_alpha=int(24 * t))
+                uk.draw_soft_glow(screen, tab_rect.center, ui(20), accent, max_alpha=int(24 * t))
 
             txt_col = uk.Theme.TEXT_PRIMARY if is_sel else uk.Theme.TEXT_SECONDARY
             label_text = self.CATEGORY_LABELS.get(key, key)
@@ -1638,7 +1640,7 @@ class EntityEditor:
 
             # store for hit-testing
             self.ui_rects['category_rects'].append({'rect': tab_rect, 'key': key})
-            y += 40
+            y += ui(40)
 
         # separator line
         uk.draw_line_on(screen, uk.Theme.PANEL_BORDER,
@@ -1737,7 +1739,7 @@ class EntityEditor:
         # glow behind selected / hovered tile
         if is_selected or is_hover:
             glow_alpha = 55 if is_selected else 26
-            uk.draw_soft_glow(screen, item_rect.center, max(item_w, item_h) // 2 + 6,
+            uk.draw_soft_glow(screen, item_rect.center, max(item_w, item_h) // 2 + ui(6),
                               accent, max_alpha=glow_alpha)
 
         bg = uk.Theme.CARD_BG_SELECTED if is_selected else (
@@ -1758,7 +1760,7 @@ class EntityEditor:
             scaled = self._palette_thumb_cache.get(thumb_key)
             if scaled is None:
                 sw, sh = src.get_size()
-                scale = min((item_w - 8) / sw, (item_h - 8) / sh)
+                scale = min((item_w - ui(8)) / sw, (item_h - ui(8)) / sh)
                 scaled = pygame.transform.scale(src, (max(1, int(sw * scale)), max(1, int(sh * scale))))
                 self._palette_thumb_cache[thumb_key] = scaled
             uk.blit_surface(screen, scaled, scaled.get_rect(center=item_rect.center), transient=False)
@@ -1769,7 +1771,7 @@ class EntityEditor:
         # column's label (same fix as ObjectEditor's palette cards).
         # Cached per (text, height) since this runs every frame for every
         # visible card.
-        label_max_w = self.item_size + self.item_gap - 4
+        label_max_w = self.item_size + self.item_gap - ui(4)
         label_text = self._fit_label_text(entity['name'], self.hint_size, label_max_w)
         name_surf = self._palette_label_cache.get(label_text)
         if name_surf is None:
@@ -1785,8 +1787,8 @@ class EntityEditor:
     # ── variant selector strip ───────────────────────────────────────────────
 
     def _variant_items_per_row(self):
-        swatch_size = 48
-        swatch_gap = 8
+        swatch_size = ui(48)
+        swatch_gap = ui(8)
         available_w = self.palette_width - self.palette_padding * 2
         return max(1, (available_w + swatch_gap) // (swatch_size + swatch_gap))
 
@@ -1807,9 +1809,9 @@ class EntityEditor:
         cols = self._variant_items_per_row()
         total_rows = (len(variants) + cols - 1) // cols
         visible_rows = min(total_rows, 3)
-        header_h = 22
-        row_pitch = 48 + 22  # swatch_size + row_gap (room for the name label)
-        return header_h + visible_rows * row_pitch + 8
+        header_h = ui(22)
+        row_pitch = ui(48) + ui(22)  # swatch_size + row_gap (room for the name label)
+        return header_h + visible_rows * row_pitch + ui(8)
 
     def _draw_variant_selector(self, screen, selector_y, selector_height):
         """
@@ -1832,9 +1834,9 @@ class EntityEditor:
         uk.draw_line_on(screen, uk.Theme.PANEL_BORDER,
                         (strip_x, selector_y), (strip_x + self.palette_width, selector_y), 1)
 
-        swatch_size = 48
-        swatch_gap = 8
-        row_gap = 22
+        swatch_size = ui(48)
+        swatch_gap = ui(8)
+        row_gap = ui(22)
         cols = self._variant_items_per_row()
         total_rows = (len(variants) + cols - 1) // cols
         visible_rows = min(total_rows, 3)
@@ -1843,14 +1845,14 @@ class EntityEditor:
 
         # label
         label_s = self.font.render("Select Variant", color=uk.Theme.TEXT_DIM, height=self.hint_size)
-        uk.blit_surface(screen, label_s, (strip_x + self.palette_padding, selector_y + 6), transient=True)
+        uk.blit_surface(screen, label_s, (strip_x + self.palette_padding, selector_y + ui(6)), transient=True)
 
         if max_row_scroll > 0:
             row_hint_s = self.font.render(
                 f"Row {self.variant_scroll + 1}/{total_rows} - scroll for more",
                 color=uk.Theme.TEXT_DIM, height=max(7, self.hint_size - 1))
             row_hint_rect = row_hint_s.get_rect(
-                right=strip_x + self.palette_width - self.palette_padding, top=selector_y + 6)
+                right=strip_x + self.palette_width - self.palette_padding, top=selector_y + ui(6))
             uk.blit_surface(screen, row_hint_s, row_hint_rect, transient=True)
 
         meta = self.CATEGORY_META.get(self.current_category, {})
@@ -1858,8 +1860,8 @@ class EntityEditor:
 
         current_var  = self.selected_variant or self._get_current_variant(self.selected_entity)
         sx           = strip_x + self.palette_padding
-        grid_top     = selector_y + 22
-        label_max_w  = swatch_size + swatch_gap - 4
+        grid_top     = selector_y + ui(22)
+        label_max_w  = swatch_size + swatch_gap - ui(4)
 
         first_index = self.variant_scroll * cols
         last_index = min(len(variants), first_index + visible_rows * cols)
@@ -1885,20 +1887,20 @@ class EntityEditor:
             border = accent if is_sel else (
                 uk.lerp_color(uk.Theme.CARD_BORDER, accent, 0.6) if is_hover else uk.Theme.CARD_BORDER)
             uk.draw_panel(screen, rect, bg=bg, border=border,
-                          border_width=2 if is_sel else 1, radius=6, shadow=False)
+                          border_width=2 if is_sel else 1, radius=ui(6), shadow=False)
 
             # variant sprite (or colour swatch fallback)
             if variant.get('sprite'):
                 spr = variant['sprite']
-                max_dim = swatch_size - 6
+                max_dim = swatch_size - ui(6)
                 sw, sh = spr.get_size()
                 if sw > max_dim or sh > max_dim:
                     scale = min(max_dim / sw, max_dim / sh)
                     spr = pygame.transform.scale(spr, (int(sw * scale), int(sh * scale)))
                 uk.blit_surface(screen, spr, spr.get_rect(center=rect.center), transient=True)
             else:
-                inner = rect.inflate(-6, -6)
-                uk.draw_rect_on(screen, variant.get('color', (128, 128, 128)), inner, 0, 3)
+                inner = rect.inflate(-ui(6), -ui(6))
+                uk.draw_rect_on(screen, variant.get('color', (128, 128, 128)), inner, 0, ui(3))
 
             # name below swatch — truncated to the slot's own width so a
             # long variant name can't spill into the next slot's label
@@ -1924,10 +1926,10 @@ class EntityEditor:
         the variant selector) use that space instead of leaving an empty
         rectangle sitting at the bottom of the panel."""
         if self.selected_entity and self.selected_entity.get('entity_type') == 'npc':
-            top_pad = 12
-            mode_block = 16 + 24 + 10       # label + button row + gap
-            facing_block = 16 + 24 + 12     # label + button row + gap
-            bottom_pad = 8
+            top_pad = ui(12)
+            mode_block = ui(16) + ui(24) + ui(10)       # label + button row + gap
+            facing_block = ui(16) + ui(24) + ui(12)     # label + button row + gap
+            bottom_pad = ui(8)
             return top_pad + mode_block + facing_block + bottom_pad
         return 0
 
@@ -1941,7 +1943,7 @@ class EntityEditor:
             self.ui_rects['npc_facing_rects'] = []
             return
 
-        y = panel_y + 12
+        y = panel_y + ui(12)
         bx = self.palette_x + self.palette_padding
 
         # Note: AI Type and Zeni Pool used to be selectable here for enemies
@@ -1951,29 +1953,29 @@ class EntityEditor:
 
         # NPC Mode + Facing selectors (only shown when an NPC is selected)
         if self.selected_entity and self.selected_entity.get('entity_type') == 'npc':
-            button_width  = 68
-            button_height = 24
-            button_gap    = 6
+            button_width  = ui(68)
+            button_height = ui(24)
+            button_gap    = ui(6)
 
             # Mode
             self.ui_rects['npc_mode_rects'] = []
             mode_label_s = self.font.render("NPC Mode", color=uk.Theme.TEXT_DIM, height=self.hint_size)
             uk.blit_surface(screen, mode_label_s, (bx, y), transient=True)
-            y += 16
+            y += ui(16)
             for i, mode in enumerate(self.npc_modes):
                 button_rect = pygame.Rect(bx + i * (button_width + button_gap), y, button_width, button_height)
                 is_sel = (mode == self.selected_npc_mode)
                 is_hov = (self.hover_npc_mode_idx == i)
                 self._draw_chip(screen, button_rect, mode.capitalize(), selected=is_sel, hover=is_hov)
                 self.ui_rects['npc_mode_rects'].append({'rect': button_rect, 'mode': mode, 'index': i})
-            y += button_height + 10
+            y += button_height + ui(10)
 
             # Facing (only meaningful in static mode)
             self.ui_rects['npc_facing_rects'] = []
             facing_enabled = (self.selected_npc_mode == 'static')
             facing_label_s = self.font.render("Facing (static)", color=uk.Theme.TEXT_DIM, height=self.hint_size)
             uk.blit_surface(screen, facing_label_s, (bx, y), transient=True)
-            y += 16
+            y += ui(16)
             for i, facing in enumerate(self.npc_facings):
                 button_rect = pygame.Rect(bx + i * (button_width + button_gap), y, button_width, button_height)
                 is_sel = (facing == self.selected_npc_facing)
@@ -1982,7 +1984,7 @@ class EntityEditor:
                                 selected=is_sel and facing_enabled, hover=is_hov and facing_enabled,
                                 disabled=not facing_enabled)
                 self.ui_rects['npc_facing_rects'].append({'rect': button_rect, 'facing': facing, 'index': i})
-            y += button_height + 12
+            y += button_height + ui(12)
 
         # Instruction tooltips used to live here — replaced by the '?' info
         # button next to the title (_draw_keybinds_popup) so the panel isn't
@@ -2000,23 +2002,23 @@ class EntityEditor:
         # Dim background
         uk.draw_rect_on(screen, (0, 0, 0, 165), pygame.Rect(0, 0, sw, sh), 0, 0)
 
-        pw = 700
+        pw = ui(700)
         # Height depends on tab
         if p.get('active_tab') == 'mission' and p.get('mission_enabled'):
             n_obj = len(p['mission'].get('objectives', []))
-            ph    = 80 + 36 + 32 + 36 + 36 + 30 + 22 + (32 * min(n_obj, 8)) + 36 + 10 + 36 + 22 + 30 * 4 + 52
+            ph    = ui(80) + ui(36) + ui(32) + ui(36) + ui(36) + ui(30) + ui(22) + (ui(32) * min(n_obj, 8)) + ui(36) + ui(10) + ui(36) + ui(22) + ui(30) * 4 + ui(52)
         elif p.get('active_tab') == 'mission':
-            ph = 80 + 36 + 52  # just the enable toggle + footer
+            ph = ui(80) + ui(36) + ui(52)  # just the enable toggle + footer
         else:
-            row_h   = 36
+            row_h   = ui(36)
             max_vis = 6
             n_dlg   = len(p['dialogues'])
             vis     = min(n_dlg, max_vis)
-            ph      = 80 + vis * row_h + 52
+            ph      = ui(80) + vis * row_h + ui(52)
         ph = max(ph, 200)
 
         px = (sw - pw) // 2
-        py = max(10, (sh - ph) // 2)
+        py = max(ui(10), (sh - ph) // 2)
 
         box = pygame.Rect(px, py, pw, ph)
         uk.draw_panel(screen, box, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD,
@@ -2024,17 +2026,17 @@ class EntityEditor:
 
         # ── Tab bar ──────────────────────────────────────────────────────────
         self._dialogue_popup_rects = []
-        tab_y  = py + 14
+        tab_y  = py + ui(14)
         tabs   = [('dialogues', 'Dialogues'), ('mission', 'Mission')]
-        tab_w  = 120
+        tab_w  = ui(120)
         active_tab = p.get('active_tab', 'dialogues')
         for i, (tab_key, tab_label) in enumerate(tabs):
-            tr = pygame.Rect(px + 16 + i * (tab_w + 8), tab_y, tab_w, 30)
+            tr = pygame.Rect(px + ui(16) + i * (tab_w + ui(8)), tab_y, tab_w, ui(30))
             is_sel = (tab_key == active_tab)
             self._draw_chip(screen, tr, tab_label, selected=is_sel)
             self._dialogue_popup_rects.append({'rect': tr, 'action': 'switch_tab', 'tab': tab_key})
 
-        content_top = tab_y + 40
+        content_top = tab_y + ui(40)
 
         # ── Route to active tab ──────────────────────────────────────────────
         if active_tab == 'mission':
@@ -2049,7 +2051,7 @@ class EntityEditor:
     def _draw_dialogues_tab(self, screen, p, px, py, pw, ph, content_top):
         """Draw the multi-line dialogue editor (original popup content)."""
         n       = len(p['dialogues'])
-        row_h   = 36
+        row_h   = ui(36)
         max_vis = 6
         vis     = min(n, max_vis)
 
@@ -2057,8 +2059,8 @@ class EntityEditor:
         hint_s = self.font.render(
             f"{n} line{'s' if n != 1 else ''}  -  Shift+Enter new line  -  Tab next  -  Backspace on empty deletes",
             color=uk.Theme.TEXT_DIM, height=self.hint_size)
-        uk.blit_surface(screen, hint_s, (px + 16, content_top), transient=True)
-        rows_top = content_top + 22
+        uk.blit_surface(screen, hint_s, (px + ui(16), content_top), transient=True)
+        rows_top = content_top + ui(22)
 
         for i, text in enumerate(p['dialogues']):
             if i >= max_vis:
@@ -2069,20 +2071,20 @@ class EntityEditor:
             lbl_s = self.font.render(f"Line {i + 1}",
                                      color=uk.Theme.TEXT_PRIMARY if is_sel else uk.Theme.TEXT_DIM,
                                      height=self.hint_size)
-            uk.blit_surface(screen, lbl_s, (px + 16, ry + 11), transient=True)
+            uk.blit_surface(screen, lbl_s, (px + ui(16), ry + ui(11)), transient=True)
 
-            field = pygame.Rect(px + 76, ry + 4, pw - 76 - 46, row_h - 8)
+            field = pygame.Rect(px + ui(76), ry + ui(4), pw - ui(76) - ui(46), row_h - ui(8))
             self._draw_text_box(screen, field, text, is_sel)
             self._dialogue_popup_rects.append({'rect': field, 'action': 'select_line', 'index': i})
 
-            rm = pygame.Rect(field.right + 6, ry + 6, 28, row_h - 12)
+            rm = pygame.Rect(field.right + ui(6), ry + ui(6), ui(28), row_h - ui(12))
             can_remove = n > 1
             self._draw_chip(screen, rm, "x", danger=can_remove, disabled=not can_remove)
             if can_remove:
                 self._dialogue_popup_rects.append({'rect': rm, 'action': 'remove', 'index': i})
 
-        footer_y = rows_top + vis * row_h + 10
-        add_r = pygame.Rect(px + 16, footer_y, 120, 30)
+        footer_y = rows_top + vis * row_h + ui(10)
+        add_r = pygame.Rect(px + ui(16), footer_y, ui(120), ui(30))
         self._draw_chip(screen, add_r, "+ Add Line", success=True)
         self._dialogue_popup_rects.append({'rect': add_r, 'action': 'add'})
 
@@ -2090,8 +2092,8 @@ class EntityEditor:
 
     def _draw_mission_tab(self, screen, p, px, py, pw, ph, content_top):
         """Draw the mission editor tab."""
-        bx   = px + 16
-        rw   = pw - 32   # usable row width
+        bx   = px + ui(16)
+        rw   = pw - ui(32)   # usable row width
         y    = content_top
         m    = p['mission']
         af   = p.get('mission_active_field')
@@ -2101,70 +2103,70 @@ class EntityEditor:
             """Draw a labelled text field and register its rect."""
             if label:
                 ls = self.font.render(label, color=uk.Theme.TEXT_DIM, height=self.hint_size)
-                uk.blit_surface(screen, ls, (x, fy + 6), transient=True)
-                lw = self.font.size(label, height=self.hint_size)[0] + 6
+                uk.blit_surface(screen, ls, (x, fy + ui(6)), transient=True)
+                lw = self.font.size(label, height=self.hint_size)[0] + ui(6)
                 x += lw
                 w -= lw
-            r    = pygame.Rect(x, fy, max(20, w), h)
+            r    = pygame.Rect(x, fy, max(ui(20), w), h)
             is_f = (af == field_key)
             self._draw_text_box(screen, r, value, is_f)
             self._dialogue_popup_rects.append({'rect': r, 'action': 'focus_field', 'field': field_key})
             return r
 
         # ── Enable toggle ─────────────────────────────────────────────────
-        en_r = pygame.Rect(bx, y, 160, 30)
+        en_r = pygame.Rect(bx, y, ui(160), ui(30))
         self._draw_chip(screen, en_r, "Mission ON" if enabled else "Mission OFF", success=enabled)
         self._dialogue_popup_rects.append({'rect': en_r, 'action': 'toggle_mission'})
-        y += 38
+        y += ui(38)
 
         if not enabled:
             # Footer (confirm/cancel) when mission is off
-            self._draw_popup_footer(screen, px, py + ph - 44, pw)
+            self._draw_popup_footer(screen, px, py + ph - ui(44), pw)
             return
 
         # ── Quest type cycle ──────────────────────────────────────────────
         qt        = m.get('quest_type', 'side')
         qt_colors = {'main': (255, 205, 90), 'side': uk.Theme.KI_BLUE, 'other': uk.Theme.TEXT_MUTED}
         qt_col    = qt_colors.get(qt, uk.Theme.GOLD)
-        qt_r      = pygame.Rect(bx, y, 150, 26)
-        uk.draw_rect_on(screen, uk.Theme.CARD_BG, qt_r, 0, 5)
-        uk.draw_rect_on(screen, qt_col, qt_r, 2, 5)
+        qt_r      = pygame.Rect(bx, y, ui(150), ui(26))
+        uk.draw_rect_on(screen, uk.Theme.CARD_BG, qt_r, 0, ui(5))
+        uk.draw_rect_on(screen, qt_col, qt_r, 2, ui(5))
         qt_s = self.font.render(f"Type: {qt.capitalize()}", color=qt_col, height=self.hint_size)
-        uk.blit_surface(screen, qt_s, (qt_r.x + 8, qt_r.y + (qt_r.h - qt_s.get_height()) // 2), transient=True)
-        cx, cy = qt_r.right - 14, qt_r.centery
-        uk.draw_line_on(screen, qt_col, (cx - 4, cy - 2), (cx, cy + 3), 2)
-        uk.draw_line_on(screen, qt_col, (cx, cy + 3), (cx + 4, cy - 2), 2)
+        uk.blit_surface(screen, qt_s, (qt_r.x + ui(8), qt_r.y + (qt_r.h - qt_s.get_height()) // 2), transient=True)
+        cx, cy = qt_r.right - ui(14), qt_r.centery
+        uk.draw_line_on(screen, qt_col, (cx - ui(4), cy - 2), (cx, cy + ui(3)), 2)
+        uk.draw_line_on(screen, qt_col, (cx, cy + ui(3)), (cx + ui(4), cy - 2), 2)
         self._dialogue_popup_rects.append({'rect': qt_r, 'action': 'toggle_quest_type'})
-        y += 34
+        y += ui(34)
 
         # ── Sequential toggle ─────────────────────────────────────────────
         seq   = m.get('sequential', False)
-        seq_r = pygame.Rect(bx, y, 150, 26)
+        seq_r = pygame.Rect(bx, y, ui(150), ui(26))
         self._draw_chip(screen, seq_r, "Sequential: " + ("YES" if seq else "NO"), selected=seq)
         self._dialogue_popup_rects.append({'rect': seq_r, 'action': 'toggle_sequential'})
-        y += 34
+        y += ui(34)
 
         # ── Objectives ────────────────────────────────────────────────────
         section_s = self.font.render("OBJECTIVES", color=uk.Theme.TEXT_DIM, height=self.hint_size)
         uk.blit_surface(screen, section_s, (bx, y), transient=True)
-        uk.draw_line_on(screen, uk.Theme.PANEL_BORDER, (bx + 86, y + 6), (bx + rw, y + 6), 1)
-        y += 20
+        uk.draw_line_on(screen, uk.Theme.PANEL_BORDER, (bx + ui(86), y + ui(6)), (bx + rw, y + ui(6)), 1)
+        y += ui(20)
 
         for i, obj in enumerate(m.get('objectives', [])[:8]):
             obj_type = obj['type']
             row_x    = bx
 
             # Type cycle button
-            type_r = pygame.Rect(row_x, y, 88, 26)
+            type_r = pygame.Rect(row_x, y, ui(88), ui(26))
             self._draw_chip(screen, type_r, obj_type, selected=True)
             self._dialogue_popup_rects.append({'rect': type_r, 'action': 'obj_cycle_type', 'index': i})
-            row_x += 94
+            row_x += ui(94)
 
             # Param fields
             for (param_key, param_label, param_w) in self.OBJECTIVE_PARAM_FIELDS.get(obj_type, []):
                 field_key = f'obj:{i}:{param_key}'
                 val = str(obj['params'].get(param_key, ''))
-                avail_w = min(param_w, bx + rw - row_x - 36)
+                avail_w = min(param_w, bx + rw - row_x - ui(36))
                 if avail_w <= 20:
                     break
 
@@ -2178,9 +2180,9 @@ class EntityEditor:
                     )
 
                     pl = self.font.render(param_label, color=uk.Theme.TEXT_DIM, height=max(7, self.hint_size - 1))
-                    uk.blit_surface(screen, pl, (row_x + 2, y - 13), transient=True)
+                    uk.blit_surface(screen, pl, (row_x + 2, y - ui(13)), transient=True)
 
-                    btn_r = pygame.Rect(row_x, y, avail_w, 26)
+                    btn_r = pygame.Rect(row_x, y, avail_w, ui(26))
                     self._draw_dropdown_button(screen, btn_r, disp, is_open, has_value=bool(val))
 
                     self._dialogue_popup_rects.append({
@@ -2194,43 +2196,43 @@ class EntityEditor:
                 else:
                     text_field(field_key, val, row_x, y, avail_w, label=None)
                     pl = self.font.render(param_label, color=uk.Theme.TEXT_DIM, height=max(7, self.hint_size - 1))
-                    uk.blit_surface(screen, pl, (row_x + 2, y - 13), transient=True)
+                    uk.blit_surface(screen, pl, (row_x + 2, y - ui(13)), transient=True)
 
-                row_x += param_w + 6
-                if row_x > bx + rw - 36:
+                row_x += param_w + ui(6)
+                if row_x > bx + rw - ui(36):
                     break
 
             # Description field (shown in journal next to quest icon)
             desc_key = f'obj:{i}:description'
             desc_val = obj.get('description', '')
-            desc_avail_w = bx + rw - 28 - row_x - 6
+            desc_avail_w = bx + rw - ui(28) - row_x - ui(6)
             if desc_avail_w > 40:
                 text_field(desc_key, desc_val, row_x, y, desc_avail_w, label="Journal:")
 
             # Remove button
-            rm_r = pygame.Rect(bx + rw - 26, y, 26, 26)
+            rm_r = pygame.Rect(bx + rw - ui(26), y, ui(26), ui(26))
             self._draw_chip(screen, rm_r, "x", danger=True)
             self._dialogue_popup_rects.append({'rect': rm_r, 'action': 'obj_remove', 'index': i})
-            y += 32
+            y += ui(32)
 
         # Add objective
-        add_r = pygame.Rect(bx, y, 140, 26)
+        add_r = pygame.Rect(bx, y, ui(140), ui(26))
         self._draw_chip(screen, add_r, "+ Add Objective", success=True)
         self._dialogue_popup_rects.append({'rect': add_r, 'action': 'obj_add'})
-        y += 34
+        y += ui(34)
 
         # ── Rewards ───────────────────────────────────────────────────────
         uk.draw_line_on(screen, uk.Theme.PANEL_BORDER, (bx, y), (bx + rw, y), 1)
-        y += 10
+        y += ui(10)
         xp_val = str(m.get('rewards', {}).get('xp', 0))
         text_field('reward_xp', xp_val, bx, y, 90, label="XP Reward:")
-        y += 34
+        y += ui(34)
 
         # ── Per-state dialogue strings ────────────────────────────────────
         section2_s = self.font.render("STATE DIALOGUES", color=uk.Theme.TEXT_DIM, height=self.hint_size)
         uk.blit_surface(screen, section2_s, (bx, y), transient=True)
-        uk.draw_line_on(screen, uk.Theme.PANEL_BORDER, (bx + 140, y + 6), (bx + rw, y + 6), 1)
-        y += 20
+        uk.draw_line_on(screen, uk.Theme.PANEL_BORDER, (bx + ui(140), y + ui(6)), (bx + rw, y + ui(6)), 1)
+        y += ui(20)
         dlg_states = [
             ('dlg_accepted',  'After Accept:'),
             ('dlg_active',    'While Active:'),
@@ -2241,10 +2243,10 @@ class EntityEditor:
             state_key = fkey[4:]
             val       = m.get('dialogues', {}).get(state_key, '')
             text_field(fkey, val, bx, y, rw - 2, label=flabel)
-            y += 30
+            y += ui(30)
 
         # ── Footer ────────────────────────────────────────────────────────
-        self._draw_popup_footer(screen, px, py + ph - 44, pw)
+        self._draw_popup_footer(screen, px, py + ph - ui(44), pw)
 
     def _draw_open_dropdown(self, screen):
         """Draw the floating list for the currently open dropdown."""
@@ -2253,20 +2255,20 @@ class EntityEditor:
         scroll   = dd['scroll']
         ax, ay   = dd['anchor_x'], dd['anchor_y']
         w        = dd['width']
-        row_h    = 24
+        row_h    = ui(24)
         max_vis  = min(10, len(options))
-        list_h   = max_vis * row_h + 6
+        list_h   = max_vis * row_h + ui(6)
 
         # Flip upward if list would go off screen
-        if ay + list_h > self.screen_height - 10:
+        if ay + list_h > self.screen_height - ui(10):
             ay = dd['anchor_y'] - dd['btn_h'] - list_h
 
         list_r = pygame.Rect(ax, ay, w, list_h)
         uk.draw_panel(screen, list_r, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD,
-                      border_width=1, radius=6, shadow=True)
+                      border_width=1, radius=ui(6), shadow=True)
 
         # Clip to list area
-        clip_r = pygame.Rect(ax + 1, ay + 3, w - 2, list_h - 6)
+        clip_r = pygame.Rect(ax + 1, ay + ui(3), w - 2, list_h - ui(6))
         old_clip = screen.get_clip()
         screen.set_clip(clip_r)
 
@@ -2274,7 +2276,7 @@ class EntityEditor:
 
         for j, opt in enumerate(options[scroll: scroll + max_vis]):
             real_idx = scroll + j
-            ry   = ay + 3 + j * row_h
+            ry   = ay + ui(3) + j * row_h
             item_r = pygame.Rect(ax + 1, ry, w - 2, row_h)
             hovered = item_r.collidepoint(mx, my)
             bg = uk.Theme.CARD_BG_HOVER if hovered else (
@@ -2283,32 +2285,32 @@ class EntityEditor:
 
             disp = opt if opt else ('(any)' if dd['param'] in ('enemy_id', 'room') else '—')
             trim = disp
-            while self.font.size(trim, height=self.hint_size)[0] > w - 14 and len(trim) > 1:
+            while self.font.size(trim, height=self.hint_size)[0] > w - ui(14) and len(trim) > 1:
                 trim = trim[:-1]
             if trim != disp:
                 trim = trim[:-1]
             col = uk.Theme.GOLD if hovered else (uk.Theme.TEXT_PRIMARY if opt else uk.Theme.TEXT_DIM)
             opt_s = self.font.render(trim, color=col, height=self.hint_size)
-            uk.blit_surface(screen, opt_s, (ax + 6, ry + (row_h - opt_s.get_height()) // 2), transient=True)
+            uk.blit_surface(screen, opt_s, (ax + ui(6), ry + (row_h - opt_s.get_height()) // 2), transient=True)
 
         screen.set_clip(old_clip)
 
         # Scroll indicators
         if len(options) > max_vis:
             if scroll > 0:
-                ux, uy = ax + w - 12, ay + 8
-                uk.draw_line_on(screen, uk.Theme.GOLD, (ux - 4, uy + 3), (ux, uy - 2), 2)
-                uk.draw_line_on(screen, uk.Theme.GOLD, (ux, uy - 2), (ux + 4, uy + 3), 2)
+                ux, uy = ax + w - ui(12), ay + ui(8)
+                uk.draw_line_on(screen, uk.Theme.GOLD, (ux - ui(4), uy + ui(3)), (ux, uy - 2), 2)
+                uk.draw_line_on(screen, uk.Theme.GOLD, (ux, uy - 2), (ux + ui(4), uy + ui(3)), 2)
             if scroll + max_vis < len(options):
-                dx, dy = ax + w - 12, ay + list_h - 8
-                uk.draw_line_on(screen, uk.Theme.GOLD, (dx - 4, dy - 3), (dx, dy + 2), 2)
-                uk.draw_line_on(screen, uk.Theme.GOLD, (dx, dy + 2), (dx + 4, dy - 3), 2)
+                dx, dy = ax + w - ui(12), ay + list_h - ui(8)
+                uk.draw_line_on(screen, uk.Theme.GOLD, (dx - ui(4), dy - ui(3)), (dx, dy + 2), 2)
+                uk.draw_line_on(screen, uk.Theme.GOLD, (dx, dy + 2), (dx + ui(4), dy - ui(3)), 2)
 
         # Register item rects for click handling (appended after tab rects so
         # they take priority — we process from the end in handle_event)
         for j in range(min(max_vis, len(options) - scroll)):
             real_idx = scroll + j
-            ry = ay + 3 + j * row_h
+            ry = ay + ui(3) + j * row_h
             item_r = pygame.Rect(ax + 1, ry, w - 2, row_h)
             uk.register_hoverable(item_r)
             self._dialogue_popup_rects.append({
@@ -2319,11 +2321,11 @@ class EntityEditor:
 
     def _draw_popup_footer(self, screen, px, footer_y, pw):
         """Draw shared Confirm / Cancel buttons."""
-        ok_r = pygame.Rect(px + pw - 220, footer_y, 96, 30)
+        ok_r = pygame.Rect(px + pw - ui(220), footer_y, ui(96), ui(30))
         self._draw_chip(screen, ok_r, "Confirm", success=True)
         self._dialogue_popup_rects.append({'rect': ok_r, 'action': 'confirm'})
 
-        cl_r = pygame.Rect(px + pw - 114, footer_y, 96, 30)
+        cl_r = pygame.Rect(px + pw - ui(114), footer_y, ui(96), ui(30))
         self._draw_chip(screen, cl_r, "Cancel", danger=True)
         self._dialogue_popup_rects.append({'rect': cl_r, 'action': 'cancel'})
 
@@ -2390,13 +2392,13 @@ class EntityEditor:
             ]),
         ]
 
-        row_h = 20
-        section_gap = 14
-        header_h = 50
-        margin_x = 20
-        key_indent = 10
-        col_gap = 18
-        right_pad = 20
+        row_h = ui(20)
+        section_gap = ui(14)
+        header_h = ui(50)
+        margin_x = ui(20)
+        key_indent = ui(10)
+        col_gap = ui(18)
+        right_pad = ui(20)
 
         key_surfaces = []
         desc_surfaces = []
@@ -2412,25 +2414,25 @@ class EntityEditor:
         close_s = self.font.render("Click anywhere to close", color=uk.Theme.TEXT_DIM, height=self.hint_size)
 
         content_w = key_indent + key_col_w + max_desc_w + right_pad
-        header_w = title_s.get_width() + 24 + close_s.get_width()
+        header_w = title_s.get_width() + ui(24) + close_s.get_width()
         panel_w = max(360, margin_x * 2 + max(content_w, header_w))
 
         content_rows = sum(1 + len(rows) for _, rows in sections)
-        panel_h = header_h + content_rows * row_h + len(sections) * section_gap + 16
+        panel_h = header_h + content_rows * row_h + len(sections) * section_gap + ui(16)
 
         panel_x = (self.screen_width - panel_w) // 2
-        panel_y = max(30, (self.screen_height - panel_h) // 2)
+        panel_y = max(ui(30), (self.screen_height - panel_h) // 2)
         panel_rect = pygame.Rect(panel_x, panel_y, panel_w, panel_h)
 
         uk.draw_panel(screen, panel_rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD,
                       border_width=2, radius=uk.Theme.RADIUS_PANEL, shadow=True)
 
-        uk.blit_surface(screen, title_s, (panel_x + margin_x, panel_y + 14), transient=True)
+        uk.blit_surface(screen, title_s, (panel_x + margin_x, panel_y + ui(14)), transient=True)
         uk.blit_surface(screen, close_s,
-                        (panel_x + panel_w - close_s.get_width() - margin_x, panel_y + 20), transient=True)
+                        (panel_x + panel_w - close_s.get_width() - margin_x, panel_y + ui(20)), transient=True)
 
         uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER,
-                        (panel_x + 16, panel_y + header_h - 10, panel_w - 32, 1), 0, 0)
+                        (panel_x + ui(16), panel_y + header_h - ui(10), panel_w - ui(32), 1), 0, 0)
 
         y = panel_y + header_h
         i = 0
