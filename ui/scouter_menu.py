@@ -554,15 +554,22 @@ class ScouterMenu:
     # _get_data_portrait_box()).
     _DATA_VIEWER_SCALE = 1.5
 
-    # The Data section's viewer character is meant to always look like it
-    # was rendered at RENDER_SCALE == 4, no matter what config.settings.
-    # RENDER_SCALE actually is right now — see _draw_data_viewer(), which
-    # multiplies _DATA_VIEWER_SCALE by (this / real RENDER_SCALE) to cancel
-    # out AnimatedSprite.draw()'s real-RENDER_SCALE sizing before reapplying
-    # this fixed one. (_capture_data_viewer_frame()'s centering math still
-    # has to divide by the REAL RENDER_SCALE, since that's inverting the
-    # actual multiply AnimatedSprite.draw() performs — only the apparent
-    # on-screen SIZE is pinned here, not that centering step.)
+    # The viewer character now tracks the scouter_background.png panel's
+    # integer scale (see _get_data_bg_layout()) instead of a fixed pixel
+    # size, so he grows/shrinks together with the menu art. One native
+    # sprite pixel is drawn as (panel_scale * _DATA_VIEWER_SCALE /
+    # _DATA_VIEWER_REFERENCE_PANEL_SCALE) * _DATA_VIEWER_FIXED_RENDER_SCALE
+    # screen pixels, i.e. he looks exactly like before at the reference
+    # panel scale and scales proportionally at every other resolution.
+    # Raise the reference if he's now too small at your usual resolution,
+    # lower it if too big (it's the panel scale he was originally tuned at).
+    _DATA_VIEWER_REFERENCE_PANEL_SCALE = 6
+
+    # Apparent RENDER_SCALE the viewer is sized against at the reference
+    # panel scale — also cancels out AnimatedSprite.draw()'s real-
+    # RENDER_SCALE sizing (baked into the captured frame) so config.
+    # settings.RENDER_SCALE doesn't affect his size. (_capture_data_viewer_
+    # frame()'s centering math still divides by the REAL RENDER_SCALE.)
     _DATA_VIEWER_FIXED_RENDER_SCALE = 4
 
     # Simple procedural shadow ellipse drawn under the viewer sprite's
@@ -3136,7 +3143,13 @@ class ScouterMenu:
         # of 4 instead, so the viewer's apparent size never changes even if
         # config.settings.RENDER_SCALE does — see _DATA_VIEWER_FIXED_RENDER_SCALE.
         render_scale_compensation = self._DATA_VIEWER_FIXED_RENDER_SCALE / max(1, RENDER_SCALE)
-        scale = max(0.01, self._DATA_VIEWER_SCALE * render_scale_compensation)
+        # Follow the panel: the background art is integer-scaled by
+        # `panel_scale` (screen-dependent), so scale the character by the
+        # same ratio relative to the scale he was tuned at.
+        layout = self._get_data_bg_layout()
+        panel_scale = layout[0] if layout is not None else self._DATA_VIEWER_REFERENCE_PANEL_SCALE
+        panel_ratio = panel_scale / max(1, self._DATA_VIEWER_REFERENCE_PANEL_SCALE)
+        scale = max(0.01, self._DATA_VIEWER_SCALE * render_scale_compensation * panel_ratio)
         scaled_w = max(1, round(fw * scale))
         scaled_h = max(1, round(fh * scale))
         # Place the tight body crop relative to the entity centre

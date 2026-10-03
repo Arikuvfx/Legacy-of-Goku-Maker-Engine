@@ -158,8 +158,18 @@ class LayerManager:
             orig_h = source.get_height()
             # Use 60% of the rendered sprite width so the shadow looks grounded
             # rather than as wide as the whole sprite frame.
-            target_w = max(8, int(entity_width * RENDER_SCALE * 0.32))
-            target_h = max(4, int(orig_h * target_w / orig_w))
+            #
+            # Sized in WHOLE sprite pixels (each RENDER_SCALE screen px
+            # wide) and an EVEN number of them, so the shadow's edges sit on
+            # the same pixel grid as the body sprite and its centre lands on
+            # a pixel boundary like the (even-width) sprite frame's does.
+            # The old int(entity_width * RENDER_SCALE * 0.32) gave e.g. 61
+            # screen px at RENDER_SCALE 6 (10.17 sprite px): odd width =>
+            # centre half a screen pixel off, uneven pixel sizes.
+            native_w = max(2, 2 * round(entity_width * 0.32 / 2))
+            native_h = max(1, round(orig_h * native_w / orig_w))
+            target_w = native_w * RENDER_SCALE
+            target_h = native_h * RENDER_SCALE
             self._shadow_cache[key] = pygame.transform.scale(source, (target_w, target_h))
         return self._shadow_cache[key]
 
@@ -211,20 +221,44 @@ class LayerManager:
         else:
             anchor_x, anchor_y = camera.apply(obj.x, obj.y)
 
-        feet_y = float(anchor_y) + (entity_height * RENDER_SCALE) / 2.25
         feet_x = float(anchor_x)
+
+        # If the entity can report where its art actually ends, sit the
+        # shadow so its lowest row is exactly one native sprite pixel
+        # below the sprite's lowest opaque pixel (as in the original
+        # game). Otherwise use the old height-based estimate.
+        ground_fn = getattr(obj, 'get_shadow_ground_offset', None)
+        ground = ground_fn() if callable(ground_fn) else None
+        if ground is not None:
+            shadow_bottom = float(anchor_y) + (ground + 1) * RENDER_SCALE
+            feet_y = shadow_bottom - shadow_surf.get_height() / 2
+        else:
+            feet_y = float(anchor_y) + (entity_height * RENDER_SCALE) / 2.25
 
         # Direction-specific tuning is deliberately in SCREEN PIXELS.
         # That means a value such as -1.0 always means exactly one rendered
         # pixel left, regardless of RENDER_SCALE. The final rasterization is
         # still pixel-snapped, so sub-pixel values are not claimed to be visible.
         direction = getattr(obj, 'direction', None)
+        extra_x = 0.0
+        if ground is not None:
+            # Sprite-anchored entities (the player) use the standing-down
+            # offset as the baseline for EVERY facing/animation, plus a
+            # small explicit per-facing nudge (shadow_x_extra_by_direction,
+            # default none), so turning never slides it by accident.
+            extra_x = float(getattr(obj, 'shadow_x_extra_by_direction', {}).get(direction, 0.0))
+            extra_x += float(getattr(obj, 'shadow_x_sprite_px', 0.0)) * RENDER_SCALE
+            direction = 'down'
         direction_x_offsets = getattr(obj, 'shadow_x_offsets_by_direction', {})
         shadow_x_offset = float(getattr(obj, 'shadow_x_offset', 0.0))
         shadow_x_offset += float(direction_x_offsets.get(direction, 0.0))
+        shadow_x_offset += extra_x
         feet_x += shadow_x_offset
 
-        feet_y += getattr(obj, 'shadow_y_offset', 0.0)
+        if ground is None:
+            # Manual nudge only applies to the old estimate; the
+            # sprite-anchored path above is already exact.
+            feet_y += getattr(obj, 'shadow_y_offset', 0.0)
 
         sx = _snap(feet_x) - shadow_surf.get_width() // 2
         sy = _snap(feet_y) - shadow_surf.get_height() // 2

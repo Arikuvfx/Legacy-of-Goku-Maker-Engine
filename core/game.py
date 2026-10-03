@@ -1689,6 +1689,152 @@ class Game:
         except Exception:
             pass   # cosmetic only - fall back to SDL's normal stretch-to-fit
 
+    # ── Original-ratio (240x160, 3:2) test-room view ──────────────────────────
+    # Dev option (Configuration > Graphics > ORIGINAL RATIO). Only while
+    # testing a room, the playable area is narrowed to the original game's 3:2
+    # shape by black bars on the LEFT and RIGHT (never top/bottom). It works
+    # at every resolution because the bar width is derived from the current
+    # SCREEN_HEIGHT: view_w = round(SCREEN_HEIGHT * 1.5). Screens that are
+    # already 3:2 or narrower get no bars.
+    #
+    # How: the camera is told the narrower width (so it centres/clamps on the
+    # 3:2 area), and the SDL render viewport is moved/clipped to that area for
+    # the frame (so everything -- world, HUD, menus -- draws inside it and
+    # nothing leaks into the bars). The bars are then painted black before
+    # presenting. RENDER_SCALE is unchanged, so the world is not zoomed; the
+    # player simply sees less of it horizontally.
+
+    def _sdl_render_handle(self):
+        """(sdl, renderer_ptr) via the SDL2 library pygame loaded, cached;
+        (None, None) if it can't be reached."""
+        cached = getattr(self, '_sdl_handle_cache', None)
+        if cached is not None:
+            return cached
+        result = (None, None)
+        try:
+            import ctypes
+            lib_dir = os.path.dirname(pygame.__file__)
+            sdl = None
+            for name in (os.path.join(lib_dir, 'SDL2.dll'), 'SDL2.dll', 'libSDL2-2.0.so.0',
+                         'libSDL2-2.0.0.dylib'):
+                try:
+                    sdl = ctypes.CDLL(name)
+                    break
+                except OSError:
+                    continue
+            if sdl is not None:
+                sdl.SDL_GetWindowFromID.restype = ctypes.c_void_p
+                sdl.SDL_GetWindowFromID.argtypes = [ctypes.c_uint32]
+                sdl.SDL_GetRenderer.restype = ctypes.c_void_p
+                sdl.SDL_GetRenderer.argtypes = [ctypes.c_void_p]
+                sdl.SDL_RenderSetViewport.restype = ctypes.c_int
+                sdl.SDL_RenderSetViewport.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+                win = sdl.SDL_GetWindowFromID(self.window.id)
+                rend = sdl.SDL_GetRenderer(win) if win else None
+                if rend:
+                    result = (sdl, rend)
+        except Exception:
+            result = (None, None)
+        self._sdl_handle_cache = result
+        return result
+
+    def _set_render_viewport(self, x, w):
+        """Restrict drawing to the full-height strip x..x+w (logical px), or
+        reset to the whole frame when w is None. Returns False on failure."""
+        sdl, rend = self._sdl_render_handle()
+        if sdl is None:
+            return False
+        try:
+            import ctypes
+            if w is None:
+                return sdl.SDL_RenderSetViewport(rend, None) == 0
+            class _Rect(ctypes.Structure):
+                _fields_ = [('x', ctypes.c_int), ('y', ctypes.c_int),
+                            ('w', ctypes.c_int), ('h', ctypes.c_int)]
+            r = _Rect(int(x), 0, int(w), int(SCREEN_HEIGHT))
+            return sdl.SDL_RenderSetViewport(rend, ctypes.byref(r)) == 0
+        except Exception:
+            return False
+
+    def _original_ratio_bar_width(self):
+        """Width (logical px) of EACH black bar for the current resolution."""
+        view_w = round(SCREEN_HEIGHT * ORIGINAL_RATIO)
+        return max(0, (SCREEN_WIDTH - view_w) // 2)
+
+    def _sync_original_ratio(self):
+        """Call once per frame (update() and draw()). Turns the pillarbox on
+        while testing a room with the option enabled, off otherwise, and keeps
+        the camera's width in step. Cheap when nothing changed."""
+        want = (bool(self.display_cfg.get('original_ratio'))
+                and getattr(self, 'is_test_mode', False)
+                and self._original_ratio_bar_width() > 0
+                and self._sdl_render_handle()[0] is not None)
+        bar = self._original_ratio_bar_width() if want else 0
+        if bar != getattr(self, '_ratio_bar_w', 0):
+            self._ratio_bar_w = bar
+            self.camera.screen_width = SCREEN_WIDTH - 2 * bar
+            self.camera.snap()   # re-centre on the new width, no glide
+            # The scouter lays itself out from its own screen_width (its map
+            # overlay is height-fitted and only 3-slice-STRETCHED to fill any
+            # extra width). Give it the real visible width: at 3:2 the
+            # height-fitted overlay already fills it, so that stretch drops
+            # out by itself. Its caches are keyed on screen_width, so they
+            # rebuild on their own.
+            _sm = getattr(self, 'scouter_menu', None)
+            if _sm is not None:
+                _sm.screen_width = SCREEN_WIDTH - 2 * bar
+                _sm._crosshair_x = min(_sm._crosshair_x, _sm.screen_width)
+            # Mode7 flying sprite is anchored to the screen centre; re-centre
+            # it on the new view width so it doesn't end up off to one side.
+            if getattr(self, '_mjf_state', None) is not None:
+                self._mjf_fly_x = (SCREEN_WIDTH - 2 * bar) / 2
+        return bar
+
+    def _view_width(self):
+        """Width (logical px) of the area the game currently draws into:
+        the full SCREEN_WIDTH normally, the centred 3:2 strip while the
+        original-ratio pillarbox is active. Use this instead of
+        SCREEN_WIDTH for anything laid out against the visible screen."""
+        return SCREEN_WIDTH - 2 * getattr(self, '_ratio_bar_w', 0)
+
+    def _begin_ratio_view(self):
+        """Start of a frame's drawing: sync the pillarbox state and, if it's
+        active, restrict drawing to the 3:2 strip. Returns the bar width (0 =
+        no pillarbox this frame). Pair with _end_ratio_view() before present()."""
+        bar = self._sync_original_ratio()
+        if bar > 0 and not self._set_render_viewport(bar, SCREEN_WIDTH - 2 * bar):
+            bar = 0
+        if bar == 0 and getattr(self, '_viewport_active', False):
+            self._set_render_viewport(0, None)   # clear a stale viewport
+        self._viewport_active = bar > 0
+        # The drawing surface should REPORT the area it's actually drawing
+        # into: get_size()/get_rect()/fill() are what menus like the pause
+        # menu use to fit themselves to the screen, and with the viewport
+        # active that area is the 3:2 strip, not the full frame. (This only
+        # changes GPUScreen's own bookkeeping; the SDL logical size is
+        # untouched.) It also clears any clip, which is fine at frame start.
+        want_size = (SCREEN_WIDTH - 2 * bar, SCREEN_HEIGHT) if bar > 0 else (SCREEN_WIDTH, SCREEN_HEIGHT)
+        if tuple(self.logical_surface.get_size()) != want_size:
+            self.logical_surface.set_logical_size(want_size)
+        return bar
+
+    def _end_ratio_view(self):
+        """Back to the full frame and paint the black bars (left/right only).
+        No-op when _begin_ratio_view() didn't start a pillarbox."""
+        if not getattr(self, '_viewport_active', False):
+            return
+        self._set_render_viewport(0, None)
+        self._viewport_active = False
+        self.logical_surface.set_logical_size((SCREEN_WIDTH, SCREEN_HEIGHT))
+        bw = self._original_ratio_bar_width()
+        self.logical_surface.draw_rect((0, 0, 0), (0, 0, bw, SCREEN_HEIGHT))
+        self.logical_surface.draw_rect((0, 0, 0), (SCREEN_WIDTH - bw, 0, bw, SCREEN_HEIGHT))
+
+    def _toggle_original_ratio(self):
+        self.display_cfg['original_ratio'] = not self.display_cfg.get('original_ratio', False)
+        save_display_settings(self.display_cfg)
+        self._sync_original_ratio()
+
     def _set_display_mode(self, mode):
         """Switch window mode live: 'borderless' | 'fullscreen' | 'windowed'.
         The render resolution itself does not change (needs a restart)."""
@@ -1857,7 +2003,8 @@ class Game:
         Keep this helper for callers that still use the old name, but make it a
         pure logical-space clamp rather than a second transform.
         """
-        lx = max(0, min(SCREEN_WIDTH - 1, int(ox)))
+        bar = getattr(self, '_ratio_bar_w', 0)   # original-ratio pillarbox, if any
+        lx = max(0, min(SCREEN_WIDTH - 2 * bar - 1, int(ox) - bar))
         ly = max(0, min(SCREEN_HEIGHT - 1, int(oy)))
         return (lx, ly)
 
@@ -1883,6 +2030,11 @@ class Game:
         if event.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP, pygame.MOUSEMOTION):
             if hasattr(event, 'pos'):
                 self._logical_mouse_pos = self._window_to_logical(*event.pos)
+                # With the original-ratio pillarbox on, drawing happens inside
+                # the 3:2 viewport, so menus/editors compare mouse positions
+                # against view coordinates: hand them the bar-adjusted pos.
+                if getattr(self, '_ratio_bar_w', 0):
+                    event.pos = self._logical_mouse_pos
         return event
 
     def _handle_dev_menu_action(self, result):
@@ -1898,11 +2050,14 @@ class Game:
         Same action strings as before ('open_room_editor', 'close', ...),
         same behavior either way.
         """
-        if result in ('display_cycle_mode', 'display_cycle_resolution', 'restart_game'):
+        if result in ('display_cycle_mode', 'display_cycle_resolution',
+                      'display_toggle_original_ratio', 'restart_game'):
             if result == 'display_cycle_mode':
                 self._cycle_display_mode()
             elif result == 'display_cycle_resolution':
                 self._cycle_display_resolution()
+            elif result == 'display_toggle_original_ratio':
+                self._toggle_original_ratio()
             else:
                 self._relaunch_requested = True
                 self.running = False
@@ -3128,7 +3283,7 @@ class Game:
             """
             self._load_map_fly_sprite()
             # Place the flying sprite at screen-centre, slightly below mid.
-            self._mjf_fly_x = SCREEN_WIDTH  / 2
+            self._mjf_fly_x = self._view_width() / 2
             self._mjf_fly_y = SCREEN_HEIGHT * 0.65
             # Neutral cam seed — the pin correction below overwrites this.
             # Do NOT derive from the cached texture: on re-entry the texture
@@ -6324,7 +6479,7 @@ class Game:
                         self.camera.y = int(_py * RENDER_SCALE) - self.camera.screen_height // 2
                         if self.current_room:
                             self.camera.x = min(self.camera.x,
-                                                 self.current_room.width  * RENDER_SCALE - SCREEN_WIDTH)
+                                                 self.current_room.width  * RENDER_SCALE - self.camera.screen_width)
                             self.camera.y = min(self.camera.y,
                                                  self.current_room.height * RENDER_SCALE - SCREEN_HEIGHT)
                         self.camera.x = max(0, self.camera.x)
@@ -6918,7 +7073,7 @@ class Game:
                 # pivot lands on the exact world-map point under the shadow.
                 _sh        = SCREEN_HEIGHT
                 _sky_h     = int(_sh * 0.35)                          # fixed sky height
-                _base_f    = getattr(self, '_MJF_FOCAL', SCREEN_WIDTH // 8)
+                _base_f    = getattr(self, '_MJF_FOCAL', self._view_width() // 8)
                 _zoom_alt  = _alt ** 1.6                                # eased altitude for zoom curve
                 _FOCAL     = int(_base_f * (0.3 + 1.9 * _zoom_alt))    # matches draw method
                 _PROJ_HOR  = int(_sh * 0.20)                           # PROJECTION_HORIZON
@@ -6972,7 +7127,7 @@ class Game:
                     # while FOCAL / horizon_y change with altitude, so the camera
                     # zooms in/out on that exact spot instead of drifting.
                     import math as _math
-                    _sw, _sh   = SCREEN_WIDTH, SCREEN_HEIGHT
+                    _sw, _sh   = self._view_width(), SCREEN_HEIGHT
                     _base_f    = getattr(self, '_MJF_FOCAL', _sw // 8)
                     _PROJ_HOR  = int(_sh * 0.20)   # must match _draw_world_map_flying_scene
                     _vground_h = _sh - _PROJ_HOR
@@ -7074,7 +7229,7 @@ class Game:
                 _th  = _tex.get_height() if _tex else 1
                 _alt    = self._mjf_altitude
                 _zoom_alt = _alt ** 1.6                                # eased altitude for zoom curve
-                _base_f = getattr(self, '_MJF_FOCAL', SCREEN_WIDTH // 8)
+                _base_f = getattr(self, '_MJF_FOCAL', self._view_width() // 8)
                 _focal  = int(_base_f * (0.3 + 1.9 * _zoom_alt))
                 _vgh    = SCREEN_HEIGHT - int(SCREEN_HEIGHT * 0.20)
                 _hor_y  = int(SCREEN_HEIGHT * (0.30 - 0.20 * _zoom_alt))
@@ -7171,7 +7326,7 @@ class Game:
                     # Set camera centred on spawn, clamped to room bounds.
                     self.camera.x = max(0, int(_spawn_x * RENDER_SCALE) - self.camera.screen_width  // 2)
                     self.camera.y = max(0, int(_spawn_y * RENDER_SCALE) - self.camera.screen_height // 2)
-                    self.camera.x = min(self.camera.x, _target_room.width  * RENDER_SCALE - SCREEN_WIDTH)
+                    self.camera.x = min(self.camera.x, _target_room.width  * RENDER_SCALE - self.camera.screen_width)
                     self.camera.y = min(self.camera.y, _target_room.height * RENDER_SCALE - SCREEN_HEIGHT)
                     self.camera.locked = False
                     # Without this, Camera.update()'s smooth-follow ease (see
@@ -7586,7 +7741,7 @@ class Game:
 
         Called from draw() whenever _mjf_state is 'fade_in' or 'flying'.
         """
-        sw, sh = SCREEN_WIDTH, SCREEN_HEIGHT
+        sw, sh = self._view_width(), SCREEN_HEIGHT
         altitude = getattr(self, '_mjf_altitude', 0.5)
         zoom_alt = altitude ** 1.6   # eased altitude for FOCAL/horizon zoom curve — do NOT use for sprite scale/position
 
@@ -9198,7 +9353,7 @@ class Game:
         # Reposition and clamp the camera to the new room's spawn location.
         self.camera.x = max(0, (spawn_x * RENDER_SCALE) - self.camera.screen_width  // 2)
         self.camera.y = max(0, (spawn_y * RENDER_SCALE) - self.camera.screen_height // 2)
-        self.camera.x = max(0, min(self.camera.x, target_room.width  * RENDER_SCALE - SCREEN_WIDTH))
+        self.camera.x = max(0, min(self.camera.x, target_room.width  * RENDER_SCALE - self.camera.screen_width))
         self.camera.y = max(0, min(self.camera.y, target_room.height * RENDER_SCALE - SCREEN_HEIGHT))
         self.flag_manager.mark_room_visited(target_room_name)
 
@@ -9279,7 +9434,7 @@ class Game:
             # _snap_camera_to_top_anchor in the editor). Recreate that same
             # frame here so a return ride matches how the leg was authored.
             cam_x = max(0, min(ridden_cloud.origin_camera_x,
-                                target_room.width * RENDER_SCALE - SCREEN_WIDTH))
+                                target_room.width * RENDER_SCALE - self.camera.screen_width))
             cam_y = max(0, min(ridden_cloud.origin_camera_y,
                                 target_room.height * RENDER_SCALE - SCREEN_HEIGHT))
         else:
@@ -9288,7 +9443,7 @@ class Game:
             # (NimbusCloudController keeps camera.locked = True for the whole
             # ride) so this is a snap, never a scroll.
             cam_x = (spawn_x * RENDER_SCALE) - self.camera.screen_width // 2
-            cam_x = max(0, min(cam_x, target_room.width * RENDER_SCALE - SCREEN_WIDTH))
+            cam_x = max(0, min(cam_x, target_room.width * RENDER_SCALE - self.camera.screen_width))
             cam_y = 0  # Top of the room.
 
         self.camera.x = cam_x
@@ -9346,6 +9501,7 @@ class Game:
         """Advance all systems by one frame: input, movement, collision, projectiles,
         enemy AI, item pickups, save points, UI notifications, and dev overlays.
         """
+        self._sync_original_ratio()
         current_time   = time.time()
         dt             = current_time - self.last_time
         self.last_time = current_time
@@ -9654,7 +9810,7 @@ class Game:
                 # everything _on_exit would do right now.
                 if self._mjf_alpha >= 255.0 and self._mjf_state is None:
                     self._load_map_fly_sprite()
-                    self._mjf_fly_x = SCREEN_WIDTH  / 2
+                    self._mjf_fly_x = self._view_width() / 2
                     self._mjf_fly_y = SCREEN_HEIGHT * 0.65
                     self._mjf_cam_x = 0.0
                     self._mjf_cam_y = 0.0
@@ -11617,7 +11773,9 @@ class Game:
         # _draw_world_map_flying_scene so the fade-in still works correctly.
         if self._mjf_state in ('pending_fade_in', 'fade_in', 'flying',
                                'landing_fade_out'):
+            self._begin_ratio_view()
             self._draw_world_map_flying_scene()
+            self._end_ratio_view()
             self.renderer.present()
             return
 
@@ -11625,6 +11783,10 @@ class Game:
         # tries to access them — keeps rebuilds to one per frame regardless of
         # how many on_tile_changed calls arrived during event processing.
         self._flush_dirty_tile_rooms()
+
+        # Original-ratio test view: clip/shift drawing to the centred 3:2 strip
+        # (see _sync_original_ratio). Reset again right before present().
+        self._begin_ratio_view()
 
         # Fill with the default "green dev room" background colour.
         self.logical_surface.fill((34, 139, 34))
@@ -12140,6 +12302,9 @@ class Game:
                                 dev_mode=True, selected=False)
 
         self.cutscene_editor.draw(self.logical_surface)
+
+        # Original-ratio test view: back to the full frame and paint the bars.
+        self._end_ratio_view()
 
         # With pygame.SCALED the display handles window-resize scaling in hardware —
         # just flip; no manual surface scale needed.

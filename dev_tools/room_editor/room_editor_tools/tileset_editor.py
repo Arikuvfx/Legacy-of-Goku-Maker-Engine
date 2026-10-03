@@ -866,6 +866,14 @@ class TilesetEditor:
     def toggle(self):
         """Open or close the tileset editor."""
         self.active = not self.active
+        # A stroke/drag in progress when the panel is switched away would
+        # never see its mouse-up (inactive editors get no input) and would
+        # resume on the next open, so always start/finish clean.
+        self.is_dragging = False
+        self.is_erasing = False
+        self.drag_start_pos = None
+        self.is_palette_dragging = False
+        self.show_keybinds_popup = False
 
     def set_snap_size(self, size: int):
         """Set the placement-snap grid used for stamp/erase anchoring (0 =

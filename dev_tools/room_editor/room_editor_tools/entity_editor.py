@@ -673,6 +673,13 @@ class EntityEditor:
         started shows up immediately, instead of requiring an app restart.
         """
         self.active = not self.active
+        # Open or close, never keep a half-finished dialogue popup: its
+        # popup-only mode blocks ALL other editor input (see RoomEditor), so
+        # a popup left behind by switching panels made the next open of this
+        # editor (or any other) look frozen.
+        self._dialogue_popup = None
+        self._popup_only_mode = False
+        self._open_dropdown = None
         if self.active:
             self._build_entity_catalogue()
             self.selected_entity = None

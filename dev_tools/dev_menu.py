@@ -74,6 +74,8 @@ CONFIG_ACTION = 'open_configuration'
 #   'mode'       cycles BORDERLESS / FULLSCREEN / WINDOWED, applied live
 #   'resolution' cycles NATIVE and the standard 16:9 sizes that fit this
 #                desktop; saved, takes effect on the next launch
+#   'original_ratio' toggles pillarboxing the test-room view to the original
+#                game's 240x160 (3:2) ratio, applied live
 #   'apply'      shown only when the saved resolution differs from the
 #                running one; saves and relaunches the game
 CONFIG_OPTIONS = [
@@ -85,6 +87,7 @@ CONFIG_OPTIONS = [
 GRAPHICS_OPTIONS = [
     {'id': 'display_mode',       'label': 'WINDOW MODE',       'display': 'mode'},
     {'id': 'display_resolution', 'label': 'RESOLUTION',        'display': 'resolution'},
+    {'id': 'display_original_ratio', 'label': 'ORIGINAL RATIO (TEST ROOMS)', 'display': 'original_ratio'},
     {'id': 'display_apply',      'label': 'APPLY AND RESTART', 'display': 'apply'},
 ]
 _CONFIG_PAGES = {'root': CONFIG_OPTIONS, 'graphics': GRAPHICS_OPTIONS}
@@ -92,6 +95,7 @@ _CONFIG_PAGE_TITLES = {'root': 'CONFIGURATION', 'graphics': 'GRAPHICS'}
 _DISPLAY_ACTIONS = {
     'mode':       'display_cycle_mode',
     'resolution': 'display_cycle_resolution',
+    'original_ratio': 'display_toggle_original_ratio',
     'apply':      'restart_game',
 }
 
@@ -470,6 +474,8 @@ class DevMenu:
                     label = f"{label}: {disp_cfg['mode'].upper()}"
                 elif kind == 'resolution':
                     label = f"{label}: {display_resolution_key(disp_cfg).upper()}"
+                elif kind == 'original_ratio':
+                    label = f"{label}: {'ON' if disp_cfg.get('original_ratio') else 'OFF'}"
                 else:
                     # Only offer the restart when it would change something.
                     w, h = effective_resolution(disp_cfg)

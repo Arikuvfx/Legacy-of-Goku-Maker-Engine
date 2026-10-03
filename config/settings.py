@@ -10,15 +10,19 @@ pygame.init()
 #
 # Player-facing settings live in display_settings.json (created on first run
 # or first F11 press):
-#     {"mode": "borderless", "resolution": "native"}
+#     {"mode": "borderless", "resolution": "native", "original_ratio": false}
 #   mode        "borderless" (default) | "fullscreen" | "windowed"
 #   resolution  "native" | "2560x1440" | [2560, 1440]
 #               "native" = the desktop resolution (windowed: the largest
 #               standard 16:9 size that fits comfortably on the desktop).
 # The resolution is read once at startup, so changing it needs a restart.
 # Changing the window mode (F11 / Alt+Enter) works live.
+#   original_ratio  true | false -- test-room view is pillarboxed to 240x160
+#                   (3:2); also live, from Configuration > Graphics.
 DISPLAY_SETTINGS_FILE = "display_settings.json"
 BASE_HEIGHT           = 1080
+# Legacy of Goku: Buu's Fury runs at 240x160 (3:2). See Game._sync_original_ratio.
+ORIGINAL_RATIO        = 240 / 160
 FPS                   = 60
 
 _STANDARD_16_9 = [(3840, 2160), (2560, 1440), (1920, 1080), (1600, 900), (1280, 720)]
@@ -36,7 +40,7 @@ def get_desktop_size() -> tuple:
 
 
 def load_display_settings() -> dict:
-    cfg = {"mode": "borderless", "resolution": "native"}
+    cfg = {"mode": "borderless", "resolution": "native", "original_ratio": False}
     try:
         with open(DISPLAY_SETTINGS_FILE, "r", encoding="utf-8") as f:
             loaded = json.load(f)
@@ -44,6 +48,9 @@ def load_display_settings() -> dict:
             cfg["mode"] = loaded["mode"]
         if "resolution" in loaded:
             cfg["resolution"] = loaded["resolution"]
+        # Dev option: while testing rooms, pillarbox the view to the original
+        # game's 240x160 (3:2) ratio. Applies live, at any resolution.
+        cfg["original_ratio"] = bool(loaded.get("original_ratio", False))
     except (OSError, ValueError):
         pass
     return cfg

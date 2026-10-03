@@ -1717,6 +1717,24 @@ class RoomEditor:
 
         return None
 
+    def _close_object_editor_for_switch(self):
+        """Another panel (Tiles / Entities / Map Paint) is being opened: close
+        the Object editor completely, including any selected palette entry,
+        placement mode, armed chest-loot item or open sub-popup.
+
+        Just calling object_editor.toggle() is not enough. It leaves the
+        selection alive, and the 'reactivate silently' block in
+        _handle_view_room_input then re-activates the Object editor on the
+        very next event, which takes all input before the panel that was
+        just opened ever sees it (and the same ghost returns when that panel
+        is later closed). Clearing the armed item matters for the same
+        reason: while armed, world clicks are consumed as 'assign loot'."""
+        if self.object_editor is not None:
+            self.object_editor.deactivate()
+        if self.toolbar is not None:
+            self.toolbar.selected_item_id = ''
+            self.toolbar.item_panel_open = False
+
     def _handle_view_room_input(self, event):
         """Handle inputs while viewing/editing a room"""
 
@@ -1816,8 +1834,7 @@ class RoomEditor:
                 if result == 'tiles':
                     if self.tileset_editor:
                         self.tileset_editor.toggle()
-                        if self.object_editor and self.object_editor.active:
-                            self.object_editor.toggle()
+                        self._close_object_editor_for_switch()
                         if self.entity_editor and self.entity_editor.active:
                             self.entity_editor.toggle()
                         if self.map_paint_editor and self.map_paint_editor.active:
@@ -1845,8 +1862,7 @@ class RoomEditor:
                         self.entity_editor.toggle()
                         if self.tileset_editor and self.tileset_editor.active:
                             self.tileset_editor.toggle()
-                        if self.object_editor and self.object_editor.active:
-                            self.object_editor.toggle()
+                        self._close_object_editor_for_switch()
                         if self.map_paint_editor and self.map_paint_editor.active:
                             self.map_paint_editor.toggle()
                         self.drag_target = None
@@ -1864,8 +1880,7 @@ class RoomEditor:
                         self.map_paint_editor.toggle()
                         if self.tileset_editor and self.tileset_editor.active:
                             self.tileset_editor.toggle()
-                        if self.object_editor and self.object_editor.active:
-                            self.object_editor.toggle()
+                        self._close_object_editor_for_switch()
                         if self.entity_editor and self.entity_editor.active:
                             self.entity_editor.toggle()
                         self.drag_target = None
@@ -1992,8 +2007,7 @@ class RoomEditor:
         if event.type == pygame.KEYDOWN and event.key == pygame.K_F2:  # Tile editor
             if self.tileset_editor:
                 self.tileset_editor.toggle()
-                if self.object_editor and self.object_editor.active:
-                    self.object_editor.toggle()
+                self._close_object_editor_for_switch()
                 if self.entity_editor and self.entity_editor.active:
                     self.entity_editor.toggle()
             return None
@@ -2012,8 +2026,7 @@ class RoomEditor:
                 self.entity_editor.toggle()
                 if self.tileset_editor and self.tileset_editor.active:
                     self.tileset_editor.toggle()
-                if self.object_editor and self.object_editor.active:
-                    self.object_editor.toggle()
+                self._close_object_editor_for_switch()
                 if self.map_paint_editor and self.map_paint_editor.active:
                     self.map_paint_editor.toggle()
                 if self.entity_editor.active:
@@ -2028,8 +2041,7 @@ class RoomEditor:
                 self.map_paint_editor.toggle()
                 if self.tileset_editor and self.tileset_editor.active:
                     self.tileset_editor.toggle()
-                if self.object_editor and self.object_editor.active:
-                    self.object_editor.toggle()
+                self._close_object_editor_for_switch()
                 if self.entity_editor and self.entity_editor.active:
                     self.entity_editor.toggle()
             return None

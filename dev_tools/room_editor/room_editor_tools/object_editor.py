@@ -1362,37 +1362,58 @@ class ObjectEditor:
         else:
             self.set_grid_snap_size(getattr(self, '_last_grid_snap_size', TILE_SIZE) or TILE_SIZE)
 
+    def _reset_transient_state(self):
+        """Drop every in-progress selection / placement / popup so nothing
+        half-finished is left behind. Run when the editor opens, and when
+        the room editor switches to a different panel (see deactivate())."""
+        self.selected_object = None
+        self.selected_variant = None
+        self.showing_variants_for = None
+        self.scroll_offset = 0
+        self.placing_collision = False
+        self.preview_collision = None
+        self.collision_diagonal_mode = False
+        self.preview_collision_group = []
+        self.gate_level_input_active = False
+        self.region_seed_input_active = False
+        self.region_hex_input_active = False
+        self.transition_config.close()
+        self.pending_transition = None
+        self.placing_transition = False
+        self.preview_transition = None
+        self.placing_transition_spawn = False
+        self.flying_pad_path_editor.close()
+        self.pending_flying_pad = None
+        self.placing_flying_pad = False
+        self.nimbus_cloud_path_editor.close()
+        self.pending_nimbus_cloud = None
+        self.placing_nimbus_cloud = False
+        self.placing_trigger_box = False
+        self.preview_trigger_box = None
+        self.trigger_box_id_input_active = False
+        self.world_map_dropdown_open = False
+        if self.event_editor is not None:
+            self.event_editor.active = False
+
     def toggle(self):
         """Open or close the object editor"""
         self.active = not self.active
         if self.active:
             self.refresh_decoration_catalog()
-            self.selected_object = None
-            self.selected_variant = None
-            self.showing_variants_for = None
-            self.scroll_offset = 0
-            self.placing_collision = False
-            self.preview_collision = None
-            self.collision_diagonal_mode = False
-            self.preview_collision_group = []
-            self.gate_level_input_active = False
-            self.transition_config.close()
-            self.pending_transition = None
-            self.placing_transition = False
-            self.preview_transition = None
-            self.placing_transition_spawn = False
-            self.flying_pad_path_editor.close()
-            self.pending_flying_pad = None
-            self.placing_flying_pad = False
-            self.nimbus_cloud_path_editor.close()
-            self.pending_nimbus_cloud = None
-            self.placing_nimbus_cloud = False
-            self.placing_trigger_box = False
-            self.preview_trigger_box = None
-            self.trigger_box_id_input_active = False
-            self.world_map_dropdown_open = False
-            if self.event_editor is not None:
-                self.event_editor.active = False
+            self._reset_transient_state()
+
+    def deactivate(self):
+        """Fully close the editor AND forget any selection/placement.
+
+        toggle() deliberately leaves a selection alive when the Objects
+        button is clicked off (RoomEditor then re-arms the editor silently
+        with the palette hidden so placement can continue). That is wrong
+        when the person is switching to ANOTHER panel (Tiles, Entities, Map
+        Paint): the leftover selection made RoomEditor silently re-activate
+        this editor on the next event, and it then swallowed every click
+        meant for the panel they just opened."""
+        self.active = False
+        self._reset_transient_state()
 
     def _get_current_variant(self, obj):
         """Get the currently selected variant for an object"""

@@ -168,9 +168,26 @@ class Player:
             'left': -0.5,
             'right': -1,
             'up': -1,
-            'down': 0.0,
+            'down': 0.0,    # the player's shadow x uses ONLY this value as its baseline (all directions); screen px, negative = left
         }
         self.shadow_y_offset = -1
+        # Horizontal baseline for the player's shadow, in SPRITE pixels
+        # (each RENDER_SCALE screen px wide), relative to the frame centre.
+        # 0 = the 10px shadow centred on the 32x32 frame (pixels 12-21,
+        # 1-based). -1 would be pixels 11-20; that looked one pixel too far
+        # left in-game. Negative = left. Applied for every facing/animation.
+        self.shadow_x_sprite_px = 0
+        # Extra X nudge ADDED ON TOP of the 'down' value above, per facing,
+        # for the player's sprite-anchored shadow (see LayerManager.
+        # _draw_shadow). Screen pixels, negative = left. Down is the
+        # baseline for everything, so only change a direction here if its
+        # art needs the shadow shifted relative to that.
+        self.shadow_x_extra_by_direction = {
+            'left': 0.0,
+            'right': 0.0,
+            'up': 0.0,
+            'down': 0.0,
+        }
 
         # Halo — draws assets/sprites/universal/halo.png on top of the
         # player sprite (character_creator.py's "Halo" checkbox on the
@@ -183,7 +200,10 @@ class Player:
         # normally that's just above the top of the player sprite.
         self.halo_enabled  = False
         self.halo_offset_x = 0
-        self.halo_offset_y = 12
+        # Vertical halo offset in SPRITE pixels (each RENDER_SCALE screen px
+        # tall), so it scales with resolution. Positive = lower. Was a flat
+        # 12 screen px (= 2 sprite px at 1080p); 3 was too low, so back to 2.
+        self.halo_offset_y_sprite_px = 2
         # Extra per-animation-state Y nudge, added on top of halo_offset_y
         # above, keyed by self.current_animation_state (e.g. 'pickup_item',
         # 'hurt'). For animations where the character visually dips down —
@@ -4927,7 +4947,7 @@ class Player:
         except Exception:
             return None, None
 
-    def _get_halo_anchor_y(self):
+    def _get_halo_anchor_y(self, frame=None, frame_key=None, draw_y=None, shown_h=None):
         """World-space Y of the highest non-transparent pixel drawn
         anywhere in the current frame — not a flat height/2 above center —
         so the halo tracks wherever the sprite's actual art sits this
@@ -4937,9 +4957,17 @@ class Player:
         Falls back to the old flat self.height-based top if the current
         frame can't be resolved (see _get_current_sprite_frame()).
         """
-        frame, cache_key = self._get_current_sprite_frame()
+        # An explicit frame (map jump / fishing jump / level-up art, which
+        # aren't looked up through sprite.animations) overrides the normal
+        # lookup. `draw_y` is the frame's vertical centre if it isn't self.y
+        # (fishing-jump arc); `shown_h` is its on-screen height in world
+        # units if the draw scales it vertically (level-up uses self.height).
+        if frame is not None:
+            cache_key = frame_key
+        else:
+            frame, cache_key = self._get_current_sprite_frame()
         if frame is None:
-            return self.y - self.height / 2
+            return (self.y if draw_y is None else draw_y) - self.height / 2
 
         cache = self._halo_frame_top_cache
         if cache_key not in cache:
@@ -4954,17 +4982,57 @@ class Player:
         # self.height above) — its own height may differ from self.height
         # if this costume's sprite_width/sprite_height (character creator)
         # don't match the hardcoded 32x32, so use the frame's real height.
-        anchor_y = self.y - frame.get_height() / 2 + top_px
+        cy = self.y if draw_y is None else draw_y
+        fh = frame.get_height()
+        sh = fh if shown_h is None else shown_h
+        top_px = top_px * sh / max(1, fh)
+        anchor_y = cy - sh / 2 + top_px
 
         # Cap only downward influence from the frame. The sprite can still
         # pull the halo upward freely, but a crouched/low frame cannot push
         # the halo more than HALO_MAX_DOWNWARD_TRACK_PIXELS below the normal
         # top-of-frame anchor. This is intentionally a test knob.
-        normal_anchor_y = self.y - frame.get_height() / 2
+        normal_anchor_y = cy - sh / 2
         max_anchor_y = normal_anchor_y + HALO_MAX_DOWNWARD_TRACK_PIXELS
         return min(anchor_y, max_anchor_y)
 
-    def draw_halo(self, screen, camera, draw_x=None):
+    def get_shadow_ground_offset(self):
+        """Native-pixel Y of the BOTTOM edge of the lowest opaque pixel of
+        the standing idle-down pose, relative to the frame's centre
+        (self.y); positive = down. LayerManager._draw_shadow() uses it to
+        sit the shadow so its lowest row is one sprite pixel below that.
+
+        Deliberately ALWAYS taken from idle_down, whatever the player is
+        doing or facing: the shadow is on the ground, so it keeps the same
+        position for every direction and animation instead of following
+        each pose's art. (Lowest pixel over all idle_down frames, so an
+        idle breathing cycle can't make it bob.) Returns None only if
+        idle_down can't be resolved; the caller then falls back to its old
+        height-based estimate.
+        """
+        cache = self.__dict__.setdefault('_shadow_ground_cache', {})
+        sprite_id = id(self.sprite)
+        if cache.get('sprite_id') != sprite_id:
+            cache.clear()
+            cache['sprite_id'] = sprite_id
+        if 'value' not in cache:
+            value = None
+            try:
+                anim = self.sprite.animations.get('idle_down')
+                frames = getattr(anim, 'frames', None) if anim is not None else None
+                for f in (frames or []):
+                    rects = pygame.mask.from_surface(f).get_bounding_rects()
+                    if not rects:
+                        continue
+                    bottom = max(r.bottom for r in rects) - f.get_height() / 2
+                    value = bottom if value is None else max(value, bottom)
+            except Exception:
+                value = None
+            cache['value'] = value
+        return cache['value']
+
+    def draw_halo(self, screen, camera, draw_x=None, frame=None, frame_key=None,
+                  draw_y=None, shown_h=None):
         """Draw the halo over the player. Split out of draw() so game.py's
         level-up animation (which swaps the player sprite for levelup.png)
         can draw it too — otherwise the halo vanishes during level-up."""
@@ -4985,8 +5053,8 @@ class Player:
         # the source file so the ring itself (not its canvas) is
         # what gets centered — see _get_halo_sprite().
         sx = int(draw_x * RENDER_SCALE - camera.x) + self.halo_offset_x
-        sy = (int(self._get_halo_anchor_y() * RENDER_SCALE - camera.y)
-              + self.halo_offset_y
+        sy = (int(self._get_halo_anchor_y(frame, frame_key, draw_y, shown_h) * RENDER_SCALE - camera.y)
+              + self.halo_offset_y_sprite_px * RENDER_SCALE
               + self.halo_offset_y_by_state.get(self.current_animation_state, 0))
         w  = int(halo_bounds.width * RENDER_SCALE)
         h  = int(halo_bounds.height * RENDER_SCALE)
@@ -5052,6 +5120,10 @@ class Player:
                 dest_rect = pygame.Rect(0, 0, w, h)
                 dest_rect.center = (sx, sy)
                 screen.blit_scaled(frame, dest_rect)
+                # Halo follows the hop (frame art top at the arc's current Y).
+                self.draw_halo(screen, camera, frame=frame,
+                               frame_key=('fishing_jump', idx, frame.get_size()),
+                               draw_y=draw_y)
             else:
                 # map_land.png failed to load — fall back to the normal
                 # sprite so the jump still runs instead of hard-crashing.
@@ -5083,6 +5155,8 @@ class Player:
             dest_rect = pygame.Rect(0, 0, w, h)
             dest_rect.center = (sx, sy)
             screen.blit_scaled(frame, dest_rect)
+            self.draw_halo(screen, camera, frame=frame,
+                           frame_key=('map_jump', idx, frame.get_size()))
             return
 
         if self.is_levelup_animating and self.levelup_frames:
@@ -5092,7 +5166,11 @@ class Player:
             dest_rect = pygame.Rect(0, 0, int(self.width * RENDER_SCALE), int(self.height * RENDER_SCALE))
             dest_rect.center = (sx, sy)
             screen.blit_scaled(frame, dest_rect)
-            self.draw_halo(screen, camera)
+            # Anchor to the level-up frame's own art (drawn scaled to
+            # self.width x self.height above), not the normal-state lookup.
+            self.draw_halo(screen, camera, frame=frame,
+                           frame_key=('levelup', min(self.levelup_frame_idx, len(self.levelup_frames) - 1), frame.get_size()),
+                           shown_h=self.height)
             return
 
         tint = getattr(self, 'hurt_tint', 0.0)

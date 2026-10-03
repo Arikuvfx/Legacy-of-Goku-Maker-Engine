@@ -380,6 +380,23 @@ def load_walk_frames(char_id: str, form: str) -> list[pygame.Surface]:
     return []
 
 
+def load_idle_frames(char_id: str, form: str) -> list[pygame.Surface]:
+    """Down-facing idle frames (idle.png only, no fallback) for the shadow
+    anchor. Empty list if the sheet is missing."""
+    if not char_id:
+        return []
+    folder = SPRITES_DIR / char_id / form
+    png = folder / "idle.png"
+    if not png.exists():
+        return []
+    try:
+        sheet = pygame.image.load(str(png)).convert_alpha()
+        frame_w, frame_h = get_form_sprite_size(char_id, form)
+        return _slice_sheet(sheet, frame_w, frame_h).get("down", [])
+    except Exception:
+        return []
+
+
 def _read_sprite_size(folder: Path, default: int = 32) -> tuple[int, int]:
     """Read frame dimensions from sprite_size.txt (format: '48x48'). Falls back to default x default."""
     p = folder / "sprite_size.txt"
@@ -972,14 +989,18 @@ def get_preview_shadow(shadow_width: float, big: bool = False,
     actually changes while the Shadow Size slider is being dragged."""
     variant = "big" if big else "small"
     source  = _load_shadow_sprite(big)
-    target_w = max(8, int(max(0, shadow_width) * scale * 0.32))
+    orig_w = max(1, source.get_width())
+    orig_h = max(1, source.get_height())
+    # Whole, EVEN number of sprite pixels — same rule as
+    # LayerManager._get_scaled_shadow() so the preview matches the game.
+    native_w = max(2, 2 * round(max(0, shadow_width) * 0.32 / 2))
+    native_h = max(1, round(orig_h * native_w / orig_w))
+    target_w = int(native_w * scale)
     key = (variant, target_w)
     cached = _SHADOW_SCALED_CACHE.get(key)
     if cached is not None:
         return cached
-    orig_w = max(1, source.get_width())
-    orig_h = max(1, source.get_height())
-    target_h = max(4, int(orig_h * target_w / orig_w))
+    target_h = int(native_h * scale)
     scaled = pygame.transform.scale(source, (target_w, target_h))
     _SHADOW_SCALED_CACHE[key] = scaled
     return scaled
@@ -987,10 +1008,12 @@ def get_preview_shadow(shadow_width: float, big: bool = False,
 
 # ── Halo (mirrors Player._get_halo_sprite / _get_halo_anchor_y / draw_halo
 # in player.py) ─────────────────────────────────────────────────────────
-# Keep these two numbers in sync with player.py: Player.halo_offset_y and
-# HALO_MAX_DOWNWARD_TRACK_PIXELS. (halo_offset_y is in screen pixels.)
+# Keep these two numbers in sync with player.py: Player.halo_offset_y_sprite_px and
+# HALO_MAX_DOWNWARD_TRACK_PIXELS. (The offset is in sprite pixels.)
+# Mirrors Player.shadow_x_sprite_px: shadow x offset from the frame centre, in sprite pixels.
+SHADOW_X_SPRITE_PX = 0
 HALO_OFFSET_X = 0
-HALO_OFFSET_Y = 12
+HALO_OFFSET_Y_SPRITE_PX = 2   # sprite pixels (scaled by the preview zoom)
 HALO_MAX_DOWNWARD_TRACK_PIXELS = 8
 _HALO_CACHE: dict = {"loaded": False, "surf": None, "bounds": None}
 _HALO_SCALED_CACHE: dict[tuple[int, int], pygame.Surface] = {}
@@ -1649,7 +1672,28 @@ class SpritePreview:
         self.frames = load_walk_frames(char_id, form) if char_id else []
         self._scaled = {}
         self._top_px = {}
+        self._ground_bottom = None
         self.frame_i = 0.0
+
+    def ground_bottom_px(self) -> int:
+        """Bottom edge (native px from the frame top) of the lowest opaque
+        pixel of the idle-down pose — mirrors
+        Player.get_shadow_ground_offset(), which uses idle_down for every
+        animation. Falls back to the walk frames if there's no idle sheet."""
+        if not self.frames:
+            return 0
+        if getattr(self, "_ground_bottom", None) is None:
+            best = 0
+            idle = load_idle_frames(self._char, self._form)
+            for f in (idle or self.frames):
+                try:
+                    rects = pygame.mask.from_surface(f).get_bounding_rects()
+                except Exception:
+                    rects = []
+                if rects:
+                    best = max(best, max(r.bottom for r in rects))
+            self._ground_bottom = best
+        return self._ground_bottom
 
     def frame_top_px(self, idx: int) -> int:
         """Topmost non-transparent pixel row of walk frame `idx` (native
@@ -3298,12 +3342,13 @@ class CharacterCreator:
             # centre + entity_height * scale / 2.25. entity_height falls back to
             # the walk frame's own raw pixel height when the real hitbox height
             # (Player.height) isn't known here.
-            raw_h = pv.entity_height if pv.entity_height is not None else rh / scale
-            feet = stage.centery + (raw_h * scale) / 2.25
             shadow = get_preview_shadow(pv.shadow_width, scale=scale)
+            # Same rule as LayerManager._draw_shadow(): the shadow's lowest
+            # row sits one native pixel below the sprite's lowest pixel.
+            shadow_bottom = fy + (pv.ground_bottom_px() + 1) * scale
             # Shadow first (below the sprite), same draw order as LayerManager.draw_all().
-            uk.blit_surface(screen, shadow, (round(stage.centerx - shadow.get_width() / 2),
-                                             round(feet - shadow.get_height() / 2)))
+            uk.blit_surface(screen, shadow, (round(stage.centerx + SHADOW_X_SPRITE_PX * scale - shadow.get_width() / 2),
+                                             round(shadow_bottom - shadow.get_height())))
             uk.blit_surface(screen, frame, (fx, fy))
             # Halo — same placement as Player.draw_halo(): midbottom sits at
             # the frame's topmost opaque pixel (downward tracking capped),
@@ -3314,7 +3359,7 @@ class CharacterCreator:
                     idx = int(pv.frame_i) % len(pv.frames)
                     top_px = min(pv.frame_top_px(idx), HALO_MAX_DOWNWARD_TRACK_PIXELS)
                     hx = stage.centerx + HALO_OFFSET_X
-                    hy = fy + top_px * scale + HALO_OFFSET_Y
+                    hy = fy + (top_px + HALO_OFFSET_Y_SPRITE_PX) * scale
                     uk.blit_surface(screen, halo, (round(hx - halo.get_width() / 2),
                                                    round(hy - halo.get_height())),
                                     transient=True)
