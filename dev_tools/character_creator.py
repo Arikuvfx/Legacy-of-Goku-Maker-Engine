@@ -984,6 +984,56 @@ def get_preview_shadow(shadow_width: float, big: bool = False,
     _SHADOW_SCALED_CACHE[key] = scaled
     return scaled
 
+
+# ── Halo (mirrors Player._get_halo_sprite / _get_halo_anchor_y / draw_halo
+# in player.py) ─────────────────────────────────────────────────────────
+# Keep these two numbers in sync with player.py: Player.halo_offset_y and
+# HALO_MAX_DOWNWARD_TRACK_PIXELS. (halo_offset_y is in screen pixels.)
+HALO_OFFSET_X = 0
+HALO_OFFSET_Y = 12
+HALO_MAX_DOWNWARD_TRACK_PIXELS = 8
+_HALO_CACHE: dict = {"loaded": False, "surf": None, "bounds": None}
+_HALO_SCALED_CACHE: dict[tuple[int, int], pygame.Surface] = {}
+
+
+def _load_halo_sprite():
+    """Load (and cache) universal/halo.png plus the bounding rect of its
+    non-transparent pixels, same trimming as player.py so the ring itself
+    (not its padded canvas) is what gets positioned. Returns (None, None)
+    if the asset is missing."""
+    if _HALO_CACHE["loaded"]:
+        return _HALO_CACHE["surf"], _HALO_CACHE["bounds"]
+    _HALO_CACHE["loaded"] = True
+    path = UNIVERSAL_DIR / "halo.png"
+    try:
+        surf = pygame.image.load(str(path)).convert_alpha()
+    except Exception:
+        return None, None
+    bounds = surf.get_rect()
+    try:
+        b = pygame.mask.from_surface(surf).get_bounding_rects()[0]
+        if b.width > 0 and b.height > 0:
+            bounds = b
+    except Exception:
+        pass
+    _HALO_CACHE["surf"], _HALO_CACHE["bounds"] = surf, bounds
+    return surf, bounds
+
+
+def get_preview_halo(scale: float):
+    """Trimmed halo scaled by `scale` (stand-in for RENDER_SCALE).
+    Returns a Surface or None."""
+    surf, bounds = _load_halo_sprite()
+    if surf is None:
+        return None
+    w = max(1, int(bounds.width * scale))
+    h = max(1, int(bounds.height * scale))
+    cached = _HALO_SCALED_CACHE.get((w, h))
+    if cached is None:
+        cached = pygame.transform.scale(surf.subsurface(bounds), (w, h))
+        _HALO_SCALED_CACHE[(w, h)] = cached
+    return cached
+
 # ══════════════════════════════════════════════════════════════════════
 #  UI layer
 # ══════════════════════════════════════════════════════════════════════
@@ -1578,6 +1628,7 @@ class SpritePreview:
     def __init__(self):
         self.frames: list[pygame.Surface] = []
         self._scaled: dict[int, list[pygame.Surface]] = {}
+        self._top_px: dict[int, int] = {}   # frame index -> first opaque row
         self._char = ""
         self._form = ""
         self.frame_i = 0.0
@@ -1597,7 +1648,22 @@ class SpritePreview:
         self._char, self._form = char_id, form
         self.frames = load_walk_frames(char_id, form) if char_id else []
         self._scaled = {}
+        self._top_px = {}
         self.frame_i = 0.0
+
+    def frame_top_px(self, idx: int) -> int:
+        """Topmost non-transparent pixel row of walk frame `idx` (native
+        pixels) — what Player._get_halo_anchor_y() uses to track the art."""
+        if not self.frames:
+            return 0
+        idx %= len(self.frames)
+        if idx not in self._top_px:
+            try:
+                b = pygame.mask.from_surface(self.frames[idx]).get_bounding_rects()[0]
+                self._top_px[idx] = b.top if b.height > 0 else 0
+            except Exception:
+                self._top_px[idx] = 0
+        return self._top_px[idx]
 
     def update(self, dt: float) -> None:
         if self.frames:
@@ -3239,6 +3305,19 @@ class CharacterCreator:
             uk.blit_surface(screen, shadow, (round(stage.centerx - shadow.get_width() / 2),
                                              round(feet - shadow.get_height() / 2)))
             uk.blit_surface(screen, frame, (fx, fy))
+            # Halo — same placement as Player.draw_halo(): midbottom sits at
+            # the frame's topmost opaque pixel (downward tracking capped),
+            # plus the manual screen-pixel offset, drawn over the sprite.
+            if self.cfg.get("halo_enabled", False):
+                halo = get_preview_halo(scale)
+                if halo is not None:
+                    idx = int(pv.frame_i) % len(pv.frames)
+                    top_px = min(pv.frame_top_px(idx), HALO_MAX_DOWNWARD_TRACK_PIXELS)
+                    hx = stage.centerx + HALO_OFFSET_X
+                    hy = fy + top_px * scale + HALO_OFFSET_Y
+                    uk.blit_surface(screen, halo, (round(hx - halo.get_width() / 2),
+                                                   round(hy - halo.get_height())),
+                                    transient=True)
             self._text_top(screen, self.f_sm, f"{int(pv.frame_i) % len(pv.frames) + 1}/{len(pv.frames)}",
                            _T.TEXT_DIM, stage.x + 10, stage.bottom - 10 - self.f_sm.cap_h, dyn=True)
         else:
