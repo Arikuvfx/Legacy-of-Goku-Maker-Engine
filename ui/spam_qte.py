@@ -22,6 +22,21 @@ bar's actual pixel width:
     fill_per_press = 0.08  -> one press fills 8% of the bar
     drain_rate     = 0.15  -> the bar drains 15% of itself per second
 
+TIMING MODE (mode='timing'): the fill is drawn full and the crosshair
+sweeps back and forth across the bar (ping-pong). The player presses E/Q
+to lock it; where it stops decides the outcome via `zones`, a list of
+(threshold, outcome) pairs — the outcome of the last zone whose threshold
+is <= the stopped position wins. Default zones:
+    0.00 -> 'fail'      (too far left)
+    0.50 -> 'success'
+    0.85 -> 'perfect'
+A 'fail' flashes the crosshair and restarts the sweep (retry) — forever if
+max_attempts == 0, otherwise until attempts run out, at which point the
+QTE completes with result == 'fail'. Any non-fail outcome completes it.
+On completion, `result` holds the outcome and `progress` holds the stopped
+position (0-1), so existing bar conditions (check_bar / bar_reached) can
+still branch on it.
+
 Usage (see Game._handle_spam_qte_action / Game._update_spam_qte / Game.draw):
 
     bar = SpamQTEBar()
@@ -70,6 +85,13 @@ _FILL_OFFSET_Y = 0
 _CROSSHAIR_OFFSET_X = 0
 _CROSSHAIR_OFFSET_Y = 0
 
+# Timing-mode defaults
+_DEFAULT_SWEEP_SPEED  = 0.9    # bar-widths per second (one full pass ~1.1s)
+_DEFAULT_RETRY_DELAY  = 0.6    # s the crosshair freezes/flashes after a miss
+_DEFAULT_SUCCESS_HOLD = 0.5    # s the crosshair stays locked after a hit
+_BLINK_INTERVAL       = 0.08   # s per blink phase during the fail flash
+_DEFAULT_ZONES = [(0.0, 'fail'), (0.5, 'success'), (0.85, 'perfect')]
+
 _DEFAULT_FILL_PER_PRESS = 0.08
 _DEFAULT_DRAIN_RATE     = 0.15
 
@@ -94,6 +116,26 @@ class SpamQTEBar:
         self.drain_rate        = _DEFAULT_DRAIN_RATE
         self._pending_presses  = 0     # queued register_press() calls, consumed on next update()
 
+        # Timing-mode state
+        self.mode              = 'spam'
+        self.result            = None  # last outcome string ('fail'/'success'/...) or None
+        self.attempts          = 0
+        self.sweep_speed       = _DEFAULT_SWEEP_SPEED
+        self.zones             = list(_DEFAULT_ZONES)
+        self.max_attempts      = 0     # 0 = unlimited retries
+        self.retry_delay       = _DEFAULT_RETRY_DELAY
+        self.success_hold      = _DEFAULT_SUCCESS_HOLD
+        self._direction        = 1
+        self._freeze_timer     = 0.0
+        self._finished         = False
+        self._blink_clock      = 0.0
+        # manual_retry: after a (non-final) miss's flash, hide the bar and set
+        # retry_requested instead of restarting the sweep on its own, so the
+        # caller (a cutscene's fail sequence) can run something and then call
+        # resume() to bring the bar back.
+        self.manual_retry      = False
+        self.retry_requested   = False
+
     def _load_images(self):
         try:
             self._bg_image = pygame.image.load(_BG_PATH).convert_alpha()
@@ -108,17 +150,70 @@ class SpamQTEBar:
         except Exception as e:
             print(f"SpamQTEBar: could not load {_CROSSHAIR_PATH}: {e}")
 
-    def start(self, qte_id=None, fill_per_press=None, drain_rate=None, start_progress=0.0):
-        """(Re)arm the bar and make it active/visible. A falsy
-        fill_per_press/drain_rate (0, None, '' coerced to 0 by the event
-        editor) falls back to a sane default instead of leaving the bar
-        stuck (0 drain) or impossible to fill in reasonable time (0 fill)."""
+    def start(self, qte_id=None, fill_per_press=None, drain_rate=None, start_progress=0.0,
+              mode='spam', sweep_speed=None, zones=None, max_attempts=0,
+              retry_delay=None, success_hold=None, manual_retry=False):
+        """(Re)arm the bar and make it active/visible.
+
+        mode='spam'   — mash mode; uses fill_per_press / drain_rate / start_progress.
+                        A falsy fill_per_press/drain_rate (0, None, '' coerced to 0
+                        by the event editor) falls back to a sane default instead
+                        of leaving the bar stuck or impossible to fill.
+        mode='timing' — stop-the-crosshair mode; uses sweep_speed, zones,
+                        max_attempts, retry_delay, success_hold (see module docstring).
+        """
         self.qte_id           = qte_id
+        self.mode             = 'timing' if mode == 'timing' else 'spam'
         self.fill_per_press   = fill_per_press if fill_per_press else _DEFAULT_FILL_PER_PRESS
         self.drain_rate       = drain_rate if drain_rate else _DEFAULT_DRAIN_RATE
-        self.progress          = max(0.0, min(1.0, start_progress or 0.0))
         self._pending_presses = 0
-        self.active            = True
+        self.result           = None
+        self.attempts         = 0
+        self._finished        = False
+        self._freeze_timer    = 0.0
+        self._blink_clock     = 0.0
+        self._direction       = 1
+        self.manual_retry     = bool(manual_retry)
+        self.retry_requested  = False
+
+        if self.mode == 'timing':
+            self.sweep_speed  = sweep_speed if sweep_speed else _DEFAULT_SWEEP_SPEED
+            self.zones        = self._clean_zones(zones)
+            self.max_attempts = int(max_attempts or 0)
+            self.retry_delay  = retry_delay if retry_delay else _DEFAULT_RETRY_DELAY
+            self.success_hold = success_hold if success_hold else _DEFAULT_SUCCESS_HOLD
+            self.progress     = 0.0   # crosshair sweeps in from the left
+        else:
+            self.progress     = max(0.0, min(1.0, start_progress or 0.0))
+        self.active           = True
+
+    @staticmethod
+    def _clean_zones(zones):
+        """Accept [(threshold, outcome), ...] or [{'at':..,'outcome':..}, ...];
+        fall back to the defaults if empty/malformed. Always sorted by threshold,
+        with a zone at 0.0 guaranteed so every position maps to an outcome."""
+        cleaned = []
+        for z in zones or []:
+            try:
+                if isinstance(z, dict):
+                    cleaned.append((float(z['at']), str(z['outcome'])))
+                else:
+                    cleaned.append((float(z[0]), str(z[1])))
+            except Exception:
+                continue
+        if not cleaned:
+            return list(_DEFAULT_ZONES)
+        cleaned.sort(key=lambda z: z[0])
+        if cleaned[0][0] > 0.0:
+            cleaned.insert(0, (0.0, 'fail'))
+        return cleaned
+
+    def _classify(self, pos):
+        outcome = self.zones[0][1]
+        for threshold, name in self.zones:
+            if pos >= threshold:
+                outcome = name
+        return outcome
 
     def register_press(self):
         """Call once per qualifying E/Q *keydown* while self.active — queued
@@ -134,6 +229,9 @@ class SpamQTEBar:
         if not self.active:
             return False
 
+        if self.mode == 'timing':
+            return self._update_timing(dt)
+
         self.progress -= self.drain_rate * dt
         if self._pending_presses:
             self.progress += self.fill_per_press * self._pending_presses
@@ -145,37 +243,124 @@ class SpamQTEBar:
             return True
         return False
 
+    def _update_timing(self, dt):
+        """Timing-mode tick. Returns True on the frame the QTE completes."""
+        self._blink_clock += dt
+
+        # Frozen: either flashing after a miss (then restart) or holding on a hit (then finish).
+        if self._freeze_timer > 0.0:
+            self._pending_presses = 0   # presses during the freeze are ignored
+            self._freeze_timer -= dt
+            if self._freeze_timer <= 0.0:
+                if self._finished:
+                    self.active = False
+                    return True
+                if self.manual_retry:
+                    # Hand control back to the caller; it calls resume().
+                    self.active          = False
+                    self.retry_requested = True
+                    return False
+                # retry: sweep again from the left
+                self.result      = None
+                self.progress    = 0.0
+                self._direction  = 1
+            return False
+
+        # Sweeping: ping-pong between 0 and 1.
+        self.progress += self._direction * self.sweep_speed * dt
+        if self.progress >= 1.0:
+            self.progress  = 1.0 - (self.progress - 1.0)
+            self._direction = -1
+        elif self.progress <= 0.0:
+            self.progress  = -self.progress
+            self._direction = 1
+        self.progress = max(0.0, min(1.0, self.progress))
+
+        # A queued press locks the crosshair where it is right now.
+        if self._pending_presses:
+            self._pending_presses = 0
+            self.attempts += 1
+            self.result = self._classify(self.progress)
+            self._blink_clock = 0.0
+            out_of_tries = self.max_attempts and self.attempts >= self.max_attempts
+            if self.result == 'fail' and not out_of_tries:
+                self._finished     = False
+                self._freeze_timer = self.retry_delay
+            else:
+                self._finished     = True
+                self._freeze_timer = self.success_hold
+        return False
+
+    def resume(self):
+        """Re-arm the sweep after a manual_retry hand-off (attempt count is
+        kept, so max_attempts still counts across retries)."""
+        self.retry_requested  = False
+        self.result           = None
+        self.progress         = 0.0
+        self._direction       = 1
+        self._freeze_timer    = 0.0
+        self._pending_presses = 0
+        self._finished        = False
+        self.active           = True
+
     def stop(self):
         """Hide the bar without completing it (e.g. a dev-tool bail-out /
         test-mode exit mid-QTE). Does NOT fire on_complete — callers that
         need the sequence to keep going should call the stored
         on_complete themselves after this."""
         self.active           = False
+        self.retry_requested  = False
         self._pending_presses = 0
 
-    def draw(self, screen, render_scale=1.0):
-        # render_scale is accepted for call-site compatibility (game.py
-        # still passes RENDER_SCALE in) but intentionally ignored — see
-        # _FIXED_RENDER_SCALE above.
+    def draw(self, screen, render_scale=1.0, offset=(0, 0), size=None, blit_fn=None):
+        """render_scale is accepted for call-site compatibility (game.py
+        still passes RENDER_SCALE in) but intentionally ignored — see
+        _FIXED_RENDER_SCALE above.
+
+        Optional, for drawing inside a sub-rect of a bigger target (the
+        cutscene editor's preview viewport):
+            offset   — (x, y) added to every blit position.
+            size     — (w, h) of the area to lay the bar out in, instead of
+                       screen.get_size(). The bar shrinks to fit if that area
+                       is narrower than it.
+            blit_fn  — callable(surface, (x, y)) used instead of
+                       screen.blit (e.g. the editor's GPU-safe blit helper).
+        """
         if not self.active or self._bg_image is None:
             return
 
         total_scale = _FIXED_RENDER_SCALE * _BAR_SCALE
+        if size is not None:
+            # Fit to a small viewport: never wider than 90% of it.
+            native_w = self._bg_image.get_width() * total_scale
+            if native_w > size[0] * 0.9:
+                total_scale *= (size[0] * 0.9) / native_w
+        ox, oy = offset
+        if blit_fn is None:
+            blit_fn = lambda surf, pos: screen.blit(surf, pos)
 
         bg_w, bg_h = self._bg_image.get_size()
         scaled_w   = max(1, int(bg_w * total_scale))
         scaled_h   = max(1, int(bg_h * total_scale))
 
-        screen_w, screen_h = screen.get_size()
+        screen_w, screen_h = size if size is not None else screen.get_size()
         x = (screen_w - scaled_w) // 2
         y = screen_h - scaled_h - int(_BOTTOM_MARGIN * _FIXED_RENDER_SCALE) + 100
+        if size is not None:
+            y = min(y, screen_h - scaled_h - 8)   # keep it on-screen in a short viewport
+            y = max(y, 0)
+        x += ox
+        y += oy
 
         bg_scaled = pygame.transform.scale(self._bg_image, (scaled_w, scaled_h))
-        screen.blit(bg_scaled, (x, y))
+        blit_fn(bg_scaled, (x, y))
 
-        if self._fill_image is not None and self.progress > 0.0:
+        # Timing mode shows the whole bar filled; only the crosshair moves.
+        fill_progress = 1.0 if self.mode == 'timing' else self.progress
+
+        if self._fill_image is not None and fill_progress > 0.0:
             fill_w, fill_h = self._fill_image.get_size()
-            visible_w = max(1, int(fill_w * self.progress))
+            visible_w = max(1, int(fill_w * fill_progress))
             clip      = pygame.Rect(0, 0, visible_w, fill_h)
             fill_crop = self._fill_image.subsurface(clip)
 
@@ -184,9 +369,14 @@ class SpamQTEBar:
             fill_scaled   = pygame.transform.scale(fill_crop, (fill_scaled_w, fill_scaled_h))
             fill_x        = x + int(_FILL_OFFSET_X * total_scale)
             fill_y        = y + int(_FILL_OFFSET_Y * total_scale)
-            screen.blit(fill_scaled, (fill_x, fill_y))
+            blit_fn(fill_scaled, (fill_x, fill_y))
 
-        if self._crosshair_image is not None and self._fill_image is not None:
+        # Flash the crosshair after a miss (timing mode only).
+        hide_crosshair = (self.mode == 'timing' and self.result == 'fail'
+                          and self._freeze_timer > 0.0 and not self._finished
+                          and int(self._blink_clock / _BLINK_INTERVAL) % 2 == 1)
+
+        if self._crosshair_image is not None and self._fill_image is not None and not hide_crosshair:
             # Leading edge of the fill, in the *fill image's own* pixel
             # space — deliberately not the clamped/blitted visible_w above
             # (that's floored to >= 1px so a sliver of fill always shows;
@@ -208,4 +398,4 @@ class SpamQTEBar:
 
             ch_x = edge_x - ch_scaled_w // 2 + int(_CROSSHAIR_OFFSET_X * total_scale)
             ch_y = edge_y - ch_scaled_h // 2 + int(_CROSSHAIR_OFFSET_Y * total_scale)
-            screen.blit(ch_scaled, (ch_x, ch_y))
+            blit_fn(ch_scaled, (ch_x, ch_y))

@@ -650,6 +650,7 @@ class ScouterMenu:
     # overlapping the top and bottom of the description text — not part
     # of scouter_background.png here, so drawn explicitly. Same raw-pixel
     # space/convention as the rect above.
+    # FALLBACK only — live value is pixel (112, 80) of scouter_background.png.
     _DATA_DESCRIPTION_BAR_COLOR = (0x18, 0x39, 0x00)
     _DATA_DESCRIPTION_TOP_BAR_RAW_RECT = (112, 80, 231, 87)
     _DATA_DESCRIPTION_BOTTOM_BAR_RAW_RECT = (112, 144, 231, 151)
@@ -703,6 +704,7 @@ class ScouterMenu:
     # centre the result on screen, and fill the remaining letterbox /
     # pillarbox with a solid colour. No 9-slice gap insertion, no
     # independent x/y scales, no stretch-to-fill.
+    # FALLBACK only — live value is pixel (0, 0) of scouter_background.png.
     _DATA_BG_LETTERBOX_COLOR = (0, 74, 0)  # #004A00
 
     # Character-viewer placement in the Data section, authored in
@@ -912,6 +914,9 @@ class ScouterMenu:
         self._scouter_bg_raw = None
         self._scouter_bg_scaled = None
         self._scouter_bg_load_attempted = False
+
+        # Colours read off scouter_background.png (see _get_bg_colors).
+        self._bg_colors = None
 
         # entity name -> {'name'|'kind'} title font, kept separate from the
         # HUD's smaller _font/_title_font so the data readout can use its
@@ -3048,6 +3053,32 @@ class ScouterMenu:
             print(f'[scouter_menu] could not load {path}: {e}')
             self._scouter_bg_raw = None
 
+    def _get_bg_colors(self):
+        """Colours sampled from scouter_background.png, cached:
+          letterbox - pixel (0, 0)    (the fill around the panel)
+          bar       - pixel (112, 80) (the bars that hide the description
+                      text as it scrolls)
+        Each falls back to its old constant if the asset is missing or the
+        sampled pixel isn't fully opaque."""
+        if self._bg_colors is not None:
+            return self._bg_colors
+
+        colors = {
+            'letterbox': self._DATA_BG_LETTERBOX_COLOR,
+            'bar': self._DATA_DESCRIPTION_BAR_COLOR,
+        }
+        if not self._scouter_bg_load_attempted:
+            self._load_scouter_background()
+        bg = self._scouter_bg_raw
+        if bg is not None:
+            for key, pos in (('letterbox', (0, 0)), ('bar', (112, 80))):
+                if bg.get_rect().collidepoint(pos):
+                    r, g, b, a = bg.get_at(pos)
+                    if a == 255:
+                        colors[key] = (r, g, b)
+        self._bg_colors = colors
+        return colors
+
     def _get_data_bg_layout(self):
         """Integer-scale + centred layout for scouter_background.png.
 
@@ -3235,7 +3266,7 @@ class ScouterMenu:
         # Letterbox / pillarbox fill first, then the integer-scaled panel
         # centred on top — same "panel floats on a solid field" look as
         # PauseMenu, rather than stretching the art to every screen edge.
-        surface.fill(self._DATA_BG_LETTERBOX_COLOR)
+        surface.fill(self._get_bg_colors()['letterbox'])
         bg = self._get_scaled_scouter_background()
         layout = self._get_data_bg_layout()
         if bg is not None and layout is not None:
@@ -3850,9 +3881,9 @@ class ScouterMenu:
 
         top_bar, bottom_bar = geo['top_bar'], geo['bottom_bar']
         if top_bar.width > 0 and top_bar.height > 0:
-            surface.draw_rect(self._DATA_DESCRIPTION_BAR_COLOR, top_bar)
+            surface.draw_rect(self._get_bg_colors()['bar'], top_bar)
         if bottom_bar.width > 0 and bottom_bar.height > 0:
-            surface.draw_rect(self._DATA_DESCRIPTION_BAR_COLOR, bottom_bar)
+            surface.draw_rect(self._get_bg_colors()['bar'], bottom_bar)
 
         self._draw_data_description_scroll_arrows(surface)
 

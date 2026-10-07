@@ -39,7 +39,9 @@ Features
   instead of typing a raw list.
 * Collision tab: drag the collision box and resize it with corner handles
   directly over the sprite, or type exact numbers. Auto-collision mode for
-  decorations where a manual box is not necessary.
+  decorations where a manual box is not necessary. A Remove Collision
+  button turns collision off entirely (the decoration becomes purely visual);
+  Restore Collision brings the previous box back.
 * Saves each discovered decoration's settings to ``decoration.json`` beside
   its art.
 * Decorations flagged ``hardcoded`` keep their hand-authored animation
@@ -74,6 +76,12 @@ The JSON format matches ``objects/decoration_objects.py``:
 
 For automatic collision, the ``collision_rect`` key is simply omitted. The
 runtime will then use its automatic base-collision inference.
+
+To remove collision entirely, the creator writes ``"collision_enabled": false``.
+The runtime must check that key before using ``collision_rect`` /
+``collision_size`` / auto inference. Any stored ``collision_rect`` is kept in
+the file so Restore Collision can bring the box back; when collision is
+enabled the key is omitted (enabled is the default).
 """
 
 from __future__ import annotations
@@ -753,6 +761,7 @@ class DecorationCreator:
 
         # Collision state - local to a sprite frame.
         self.collision_manual = False
+        self.collision_none = False   # True = collision removed ("collision_enabled": false)
         self.collision_rect: Optional[tuple[int, int, int, int]] = None
         self.collision_auto_rect: Optional[tuple[int, int, int, int]] = None
         self.collision_drag = None  # {mode, mouse, rect, scale, frame_rect}
@@ -1077,6 +1086,13 @@ class DecorationCreator:
         saved_collision = rect_tuple(self.style.get("collision_rect"))
         self.collision_manual = saved_collision is not None
         self.collision_rect = saved_collision
+        # Collision can be removed outright. Check the loaded style first, then
+        # the sidecar manifest directly (built-ins don't merge their manifest
+        # into self.style above).
+        _flag = self.style.get("collision_enabled")
+        if _flag is None and metadata:
+            _flag = metadata.get("collision_enabled")
+        self.collision_none = _flag is False
         self.collision_drag = None
         self._refresh_collision_defaults()
 
@@ -1301,6 +1317,17 @@ class DecorationCreator:
         if current:
             self._set_manual_collision(tuple(current))
 
+    def _set_collision_none(self, value: bool) -> None:
+        """Remove (True) or restore (False) collision for the decoration.
+        The manual/auto box is left untouched so Restore brings it back."""
+        if not self.current_item or self.collision_none == bool(value):
+            return
+        self.collision_none = bool(value)
+        self.collision_drag = None
+        self._mark_dirty()
+        self._set_status("Collision removed - Save to apply" if self.collision_none
+                         else "Collision restored - Save to apply")
+
     def _set_collision_component(self, index: int, value) -> None:
         """Stepper / typed-number edit of one of x, y, w, h."""
         cur = list(self._current_collision() or (0, 0, 8, 8))
@@ -1318,7 +1345,7 @@ class DecorationCreator:
         )
 
     def _collision_down(self, pos) -> None:
-        if not self._collision_enabled() or self._col_geom is None:
+        if not self._collision_enabled() or self.collision_none or self._col_geom is None:
             return
         frame_rect, scale = self._col_geom
         current = self._current_collision()
@@ -1409,6 +1436,11 @@ class DecorationCreator:
                     data.pop("collision_rect", None)
                     data.pop("collision_size", None)
 
+                if self.collision_none:
+                    data["collision_enabled"] = False
+                else:
+                    data.pop("collision_enabled", None)
+
                 if data:
                     manifest.write_text(json.dumps(data, indent=2), encoding="utf-8")
                 elif manifest.exists():
@@ -1458,6 +1490,11 @@ class DecorationCreator:
             self.style["collision_rect"] = list(map(int, self.collision_rect))
         else:
             self.style.pop("collision_rect", None)
+
+        if self.collision_none:
+            self.style["collision_enabled"] = False
+        else:
+            self.style.pop("collision_enabled", None)
 
         folder = item.get("folder")
         if not folder.is_dir():
@@ -2623,7 +2660,7 @@ class DecorationCreator:
         en = self._collision_enabled()
 
         y0 = y
-        mode = "MANUAL" if self.collision_manual else "AUTO"
+        mode = "NONE" if self.collision_none else ("MANUAL" if self.collision_manual else "AUTO")
         y += self._caption(screen, "Collision Box", x, y, lw, right=mode)
         stage_h = max(160, self._content_avail - (y - y0))
         self._draw_collision_stage(screen, pygame.Rect(x, y, lw, stage_h), en)
@@ -2642,8 +2679,17 @@ class DecorationCreator:
                         [("auto", "Automatic"), ("manual", "Manual")],
                         "manual" if self.collision_manual else "auto",
                         lambda v: self._use_auto_collision() if v == "auto" else self._use_manual_collision(),
-                        enabled=en)
-        ry += self.m_field_h + 18
+                        enabled=en and not self.collision_none)
+        ry += self.m_field_h + 10
+
+        none = self.collision_none
+        self._pill(screen, "c:none", pygame.Rect(rx, ry, rw, self.m_btn_h),
+                   "Restore Collision" if none else "Remove Collision",
+                   _T.GOLD, _ic_refresh if none else _ic_minus, danger=not none,
+                   enabled=en, on_click=lambda: self._set_collision_none(not self.collision_none),
+                   tip=("Bring the collision box back" if none
+                        else "Make this decoration non-solid (no collision at all)"))
+        ry += self.m_btn_h + 18
 
         ry += self._caption(screen, "Box  (frame pixels)", rx, ry, rw)
         cur = self._current_collision()
@@ -2660,16 +2706,22 @@ class DecorationCreator:
             dict(key="c:h", label="Height", get=lambda: ch, set=lambda v: self._set_collision_component(3, v),
                  vmin=1, vmax=max(1, fh)),
         ]
-        ry += self._stepper_grid(screen, rx, ry, rw, specs, enabled=en and cur is not None)
+        ry += self._stepper_grid(screen, rx, ry, rw, specs,
+                                 enabled=en and cur is not None and not self.collision_none)
 
-        if cur is None:
-            ry += self._note(screen, rx, ry, rw, "No collision box available for this decoration.") + 6
-        if self.collision_auto_rect:
-            a = self.collision_auto_rect
-            ry += self._note(screen, rx, ry, rw, f"Auto box: {a[0]}, {a[1]}, {a[2]} x {a[3]}",
-                             _T.TEXT_MUTED) + 6
-        ry += self._note(screen, rx, ry, rw, "Drag the box to move it, or a corner handle to resize it. "
-                         "Only this compact box blocks movement and beams.") + 6
+        if self.collision_none:
+            ry += self._note(screen, rx, ry, rw,
+                             "Collision removed: this decoration won't block movement or beams. "
+                             "Restore it to edit the box again.", _T.DANGER_BRIGHT) + 6
+        else:
+            if cur is None:
+                ry += self._note(screen, rx, ry, rw, "No collision box available for this decoration.") + 6
+            if self.collision_auto_rect:
+                a = self.collision_auto_rect
+                ry += self._note(screen, rx, ry, rw, f"Auto box: {a[0]}, {a[1]}, {a[2]} x {a[3]}",
+                                 _T.TEXT_MUTED) + 6
+            ry += self._note(screen, rx, ry, rw, "Drag the box to move it, or a corner handle to resize it. "
+                             "Only this compact box blocks movement and beams.") + 6
         return max(left_used, ry - r0) if not stacked else left_used + 24 + (ry - r0)
 
     def _draw_collision_stage(self, screen, stage: pygame.Rect, enabled: bool) -> None:
@@ -2695,7 +2747,10 @@ class DecorationCreator:
         uk.draw_circle_on(screen, _T.GOLD, (frame_rect.centerx, frame_rect.bottom), 4)
 
         self._col_geom = (frame_rect, scale)
-        cur = self._current_collision()
+        cur = None if self.collision_none else self._current_collision()
+        if self.collision_none:
+            self._text_mid(screen, self.f_md, "NO COLLISION", _T.DANGER_BRIGHT,
+                           stage.centerx, stage.y + 22, "c")
         if cur is not None:
             cr = self._rect_to_screen(cur, frame_rect, scale)
             uk.draw_rect_on(screen, (*_T.DANGER, 62), cr, 0, 0)
@@ -2729,7 +2784,7 @@ class DecorationCreator:
                 tag_y = cr.top + 6
             self._text_top(screen, sm, tag, _T.DANGER_BRIGHT, cr.x + 2, tag_y)
 
-        if enabled:
+        if enabled and not self.collision_none:
             self._add_hit(stage, key="c:canvas", down=self._collision_down,
                           drag=self._collision_move, up=self._collision_up)
         self._pop_clip(screen, old)

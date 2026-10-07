@@ -15,6 +15,7 @@ Journal:       active or completed quest list with quest-type icons.
 Pressing S or Down on the Status tab signals 'open_skills' back to game.py.
 """
 
+import json
 import math
 import pygame
 import os
@@ -31,6 +32,92 @@ from core.items import (
 # RENDER_SCALE elsewhere no longer resizes anything in this file.
 RENDER_SCALE = 4
 _S = max(1, RENDER_SCALE)
+
+# ── Menu highlight color ─────────────────────────────────────────────────────
+# The color menus use for highlighted / selected text (was a hard-coded
+# (0, 255, 0) in a dozen places). Everything calls highlight_color() at draw
+# time, so a change made in the dev menu (CONFIGURATION > MENU COLORS) shows up
+# immediately; it's saved to MENU_COLORS_FILE for the next launch.
+MENU_COLORS_FILE  = 'menu_colors.json'   # relative to the working dir, like assets/
+DEFAULT_HIGHLIGHT = (0, 255, 0)
+HIGHLIGHT_PRESETS = [
+    ('GREEN',  (0, 255, 0)),
+    ('YELLOW', (255, 255, 0)),
+    ('GOLD',   (244, 190, 76)),
+    ('ORANGE', (255, 150, 0)),
+    ('RED',    (255, 60, 60)),
+    ('PINK',   (255, 105, 180)),
+    ('PURPLE', (180, 100, 255)),
+    ('BLUE',   (80, 160, 255)),
+    ('CYAN',   (0, 255, 255)),
+    ('WHITE',  (255, 255, 255)),
+]
+_highlight = None   # loaded lazily on first use
+
+
+def _clamp255(v):
+    return max(0, min(255, int(v)))
+
+
+def highlight_color():
+    """Current highlight color as an (r, g, b) tuple."""
+    global _highlight
+    if _highlight is None:
+        try:
+            with open(MENU_COLORS_FILE, 'r', encoding='utf-8') as f:
+                r, g, b = json.load(f)['highlight']
+            _highlight = (_clamp255(r), _clamp255(g), _clamp255(b))
+        except (OSError, ValueError, KeyError, TypeError):
+            _highlight = DEFAULT_HIGHLIGHT
+    return _highlight
+
+
+def set_highlight_color(rgb):
+    global _highlight
+    _highlight = tuple(_clamp255(c) for c in rgb)
+    try:
+        with open(MENU_COLORS_FILE, 'w', encoding='utf-8') as f:
+            json.dump({'highlight': list(_highlight)}, f)
+    except OSError:
+        pass   # read-only install etc. - the color still applies this session
+
+
+def highlight_hex(rgb=None):
+    """Highlight color as '#RRGGBB'."""
+    r, g, b = rgb if rgb is not None else highlight_color()
+    return f'#{r:02X}{g:02X}{b:02X}'
+
+
+def set_highlight_hex(text):
+    """Set the highlight from hex text: 'RRGGBB' or 'RGB', with or without a
+    leading '#' / '0x'. Returns True if it parsed, False (color unchanged) if not."""
+    t = str(text).strip().lstrip('#')
+    if t[:2].lower() == '0x':
+        t = t[2:]
+    if len(t) == 3:
+        t = ''.join(c * 2 for c in t)
+    if len(t) != 6:
+        return False
+    try:
+        rgb = (int(t[0:2], 16), int(t[2:4], 16), int(t[4:6], 16))
+    except ValueError:
+        return False
+    set_highlight_color(rgb)
+    return True
+
+
+def highlight_preset_name(rgb=None):
+    rgb = tuple(rgb) if rgb is not None else highlight_color()
+    return next((n for n, c in HIGHLIGHT_PRESETS if c == rgb), 'CUSTOM')
+
+
+def cycle_highlight_preset():
+    """Jump to the next preset (from CUSTOM, to the first one)."""
+    names = [n for n, _ in HIGHLIGHT_PRESETS]
+    cur = highlight_preset_name()
+    nxt = names[(names.index(cur) + 1) % len(names)] if cur in names else names[0]
+    set_highlight_color(dict(HIGHLIGHT_PRESETS)[nxt])
+
 
 # ── Resolution independence ──────────────────────────────────────────────────
 # This menu's layout is a pile of hand-tuned pixel offsets that were dialled in
@@ -1239,10 +1326,10 @@ class PauseMenu:
             if event.key in (pygame.K_ESCAPE, pygame.K_x):
                 self._cancel_equip_confirm()
                 return None
-            if event.key == pygame.K_UP:
+            if event.key == pygame.K_w:
                 self.equip_confirm_option = 0
                 return None
-            if event.key == pygame.K_DOWN:
+            if event.key == pygame.K_s:
                 self.equip_confirm_option = 1
                 return None
             if event.key == pygame.K_z:
@@ -1266,26 +1353,26 @@ class PauseMenu:
             self.close()
             return 'close'
 
-        if key == pygame.K_LEFT and not self.options_editing and not self.allocating_stats and not self.equip_browsing_items and not self.restricted_mode:
+        if key == pygame.K_a and not self.options_editing and not self.allocating_stats and not self.equip_browsing_items and not self.restricted_mode:
             self.tab_index = 4 if self.tab_index == 0 else self.tab_index - 1
             self._press('l')
             self._play_select_sfx()
 
-        elif key == pygame.K_RIGHT and not self.options_editing and not self.allocating_stats and not self.equip_browsing_items and not self.restricted_mode:
+        elif key == pygame.K_d and not self.options_editing and not self.allocating_stats and not self.equip_browsing_items and not self.restricted_mode:
             self.tab_index = 0 if self.tab_index == 4 else self.tab_index + 1
             self._press('r')
             self._play_select_sfx()
 
-        elif TABS[self.tab_index] == 'STATUS' and self.allocating_stats and key == pygame.K_UP:
+        elif TABS[self.tab_index] == 'STATUS' and self.allocating_stats and key == pygame.K_w:
             self.stat_alloc_index = (self.stat_alloc_index - 1) % len(STAT_ALLOC_LABELS)
 
-        elif TABS[self.tab_index] == 'STATUS' and self.allocating_stats and key == pygame.K_DOWN:
+        elif TABS[self.tab_index] == 'STATUS' and self.allocating_stats and key == pygame.K_s:
             self.stat_alloc_index = (self.stat_alloc_index + 1) % len(STAT_ALLOC_LABELS)
 
-        elif TABS[self.tab_index] == 'STATUS' and self.allocating_stats and key == pygame.K_RIGHT:
+        elif TABS[self.tab_index] == 'STATUS' and self.allocating_stats and key == pygame.K_d:
             self._stat_alloc_add()
 
-        elif TABS[self.tab_index] == 'STATUS' and self.allocating_stats and key == pygame.K_LEFT:
+        elif TABS[self.tab_index] == 'STATUS' and self.allocating_stats and key == pygame.K_a:
             self._stat_alloc_remove()
 
         elif TABS[self.tab_index] == 'STATUS' and self.allocating_stats and key == pygame.K_z:
@@ -1296,7 +1383,7 @@ class PauseMenu:
             if show_use_points:
                 self._enter_stat_allocation()
 
-        elif TABS[self.tab_index] == 'INVENTORY' and key == pygame.K_UP:
+        elif TABS[self.tab_index] == 'INVENTORY' and key == pygame.K_w:
             if self.inv_selected_index > 0:
                 self.inv_selected_index -= 1
                 if self.inv_selected_index < self.inv_scroll_offset:
@@ -1307,7 +1394,7 @@ class PauseMenu:
                 # scrolling still moves the cursor and should still flash.
                 self.scroll_up_timer = self.scroll_press_duration
 
-        elif TABS[self.tab_index] == 'INVENTORY' and key == pygame.K_DOWN:
+        elif TABS[self.tab_index] == 'INVENTORY' and key == pygame.K_s:
             entry_count = len(self._get_inventory_entries(self._player)) if self._player else 0
             if self.inv_selected_index < entry_count - 1:
                 self.inv_selected_index += 1
@@ -1318,12 +1405,12 @@ class PauseMenu:
         elif TABS[self.tab_index] == 'INVENTORY' and key == pygame.K_z:
             return self._use_selected_item()
 
-        elif self.tab_index == 4 and key == pygame.K_UP:
+        elif self.tab_index == 4 and key == pygame.K_w:
             if self._journal_scroll > 0:
                 self._journal_scroll -= 1
                 self.scroll_up_timer = self.scroll_press_duration
 
-        elif self.tab_index == 4 and key == pygame.K_DOWN:
+        elif self.tab_index == 4 and key == pygame.K_s:
             if self._journal_scroll < self.inv_scroll_max:
                 self._journal_scroll += 1
                 self.scroll_down_timer = self.scroll_press_duration
@@ -1333,7 +1420,7 @@ class PauseMenu:
             self._journal_scroll   = 0
             self._play_select_sfx()
 
-        elif self.tab_index == 2 and self.equip_browsing_items and key == pygame.K_UP:
+        elif self.tab_index == 2 and self.equip_browsing_items and key == pygame.K_w:
             if self.equip_item_index > 0:
                 self.equip_item_index -= 1
                 if self.equip_item_index < self.equip_item_scroll:
@@ -1343,7 +1430,7 @@ class PauseMenu:
                 self.scroll_up_timer = self.scroll_press_duration
                 self._play_cursor_sfx()
 
-        elif self.tab_index == 2 and self.equip_browsing_items and key == pygame.K_DOWN:
+        elif self.tab_index == 2 and self.equip_browsing_items and key == pygame.K_s:
             entry_count = len(self._get_equip_entries(self._player, self.equip_slot_index)) if self._player else 0
             if self.equip_item_index < entry_count - 1:
                 self.equip_item_index += 1
@@ -1355,12 +1442,12 @@ class PauseMenu:
         elif self.tab_index == 2 and self.equip_browsing_items and key == pygame.K_z:
             return self._select_equip_item()
 
-        elif self.tab_index == 2 and not self.equip_browsing_items and key == pygame.K_UP:
+        elif self.tab_index == 2 and not self.equip_browsing_items and key == pygame.K_w:
             if self.equip_slot_index > 0:
                 self.equip_slot_index -= 1
                 self._play_cursor_sfx()
 
-        elif self.tab_index == 2 and not self.equip_browsing_items and key == pygame.K_DOWN:
+        elif self.tab_index == 2 and not self.equip_browsing_items and key == pygame.K_s:
             if self.equip_slot_index < 3:
                 self.equip_slot_index += 1
                 self._play_cursor_sfx()
@@ -1372,14 +1459,14 @@ class PauseMenu:
             if self.options_editing:
                 if key in (pygame.K_z, pygame.K_x, pygame.K_ESCAPE):
                     self.options_editing = False
-                elif key == pygame.K_LEFT:
+                elif key == pygame.K_a:
                     idx = self.options_item_index
                     old_val = self.options_values[idx]
                     self.options_values[idx] = max(0.0, self.options_values[idx] - self.options_step)
                     self._apply_volume(idx)
                     if self.options_values[idx] != old_val:
                         self._play_cursor_sfx()
-                elif key == pygame.K_RIGHT:
+                elif key == pygame.K_d:
                     idx = self.options_item_index
                     old_val = self.options_values[idx]
                     self.options_values[idx] = min(1.0, self.options_values[idx] + self.options_step)
@@ -1395,24 +1482,24 @@ class PauseMenu:
                     self._press('a')
                     self._play_select_sfx()
                     return 'open_credits'
-                elif key == pygame.K_UP:
+                elif key == pygame.K_w:
                     old_idx = self.options_item_index
                     self.options_item_index = 3 if self.options_item_index == 4 else max(0, self.options_item_index - 1)
                     if self.options_item_index != old_idx:
                         self._play_cursor_sfx()
-                elif key == pygame.K_DOWN:
+                elif key == pygame.K_s:
                     old_idx = self.options_item_index
                     self.options_item_index = 4 if self.options_item_index == 3 else min(3, self.options_item_index + 1)
                     if self.options_item_index != old_idx:
                         self._play_cursor_sfx()
-                elif key == pygame.K_RIGHT and self.options_item_index == 3:
+                elif key == pygame.K_d and self.options_item_index == 3:
                     self.options_item_index = 4
                     self._play_cursor_sfx()
-                elif key == pygame.K_LEFT and self.options_item_index == 4:
+                elif key == pygame.K_a and self.options_item_index == 4:
                     self.options_item_index = 3
                     self._play_cursor_sfx()
 
-        elif TABS[self.tab_index] == 'STATUS' and not self.allocating_stats and key in (pygame.K_s, pygame.K_DOWN):
+        elif TABS[self.tab_index] == 'STATUS' and not self.allocating_stats and key == pygame.K_s:
             return 'open_skills'
 
         return None
@@ -2225,7 +2312,7 @@ class PauseMenu:
 
         for i, label in enumerate(option_labels):
             is_selected = (self.equip_confirm_option == i)
-            col = (0, 255, 0) if is_selected else (255,255,255)
+            col = highlight_color() if is_selected else (255,255,255)
 
             if is_selected and self.equip_arrow:
                 blink_on = (self._levelup_blink_timer % (self._levelup_blink_interval * 2)) < self._levelup_blink_interval
@@ -2734,7 +2821,7 @@ class PauseMenu:
                 cx += s.get_width()+_pts_ls
             # The point count itself turns green while allocating, to match
             # the selected-stat highlight color and signal "editable now".
-            pts_color = (0,255,0) if self.allocating_stats else (180,180,180)
+            pts_color = highlight_color() if self.allocating_stats else (180,180,180)
             pts_surf = self.stats_numbers_font.render(str(getattr(player,'stat_points',0))).copy()
             pts_surf.fill(pts_color, special_flags=pygame.BLEND_RGBA_MULT)
             screen.blit(pts_surf,(right_edge - pts_surf.get_width(),pts_ry))
@@ -2901,7 +2988,7 @@ class PauseMenu:
 
             tx = fixed_icon_right_edge + icon_text_gap
             ty = text_start_y + i * text_row_step
-            col = (0, 255, 0) if is_selected else (255, 255, 255)
+            col = highlight_color() if is_selected else (255, 255, 255)
             is_equipped = item_id == equipped_id
             if is_equipped:
                 label = data['name']
@@ -3271,7 +3358,7 @@ class PauseMenu:
 
             tx  = text_x
             ty  = ry + (icon_h - self.menu_uppercase_font.get_line_height()) // 2 - 2
-            col = (0, 255, 0) if is_selected else (255, 255, 255)
+            col = highlight_color() if is_selected else (255, 255, 255)
             # "x" stays in the regular name font/line; only the digit itself
             # uses the dedicated numbers font (assets/ui/fonts/numbers).
             label = f"{data['name']} x" if count > 1 else data['name']
@@ -3488,7 +3575,7 @@ class PauseMenu:
         bar_x_offset=int(w*0.35)+130; bar_y_offset=0
 
         for i,label in enumerate(settings):
-            color=(0,255,0) if i==hovered_item else (255,255,255)
+            color=highlight_color() if i==hovered_item else (255,255,255)
             words=_make_words(label,color=color)
             char_offs={}; gi=0
             for word in label.split(' '):
@@ -3525,8 +3612,8 @@ class PauseMenu:
             self._click_zones[f'options_row_{i}']=pygame.Rect(x,top_y-4,w,lh+8)
             top_y+=lh+_line_gap
 
-        credits_words=_make_words('Credits',color=(0,255,0) if hovered_item==3 else (255,255,255))
-        sleep_words  =_make_words('Sleep',  color=(0,255,0) if hovered_item==4 else (255,255,255))
+        credits_words=_make_words('Credits',color=highlight_color() if hovered_item==3 else (255,255,255))
+        sleep_words  =_make_words('Sleep',  color=highlight_color() if hovered_item==4 else (255,255,255))
         gap=int(w*0.15)+180; total_w_=_label_w(credits_words)+gap+_label_w(sleep_words)
         start_x_=x+(w-total_w_)//2-20; bottom_y=y+h-int(h*0.2)-124
         _blit_label(credits_words,start_x_,bottom_y)

@@ -279,8 +279,20 @@ def screen_shake(intensity, duration=0.3):
     return {'type': 'screen_shake', 'intensity': intensity, 'duration': duration}
 
 
-def spam_qte(qte_id=None, fill_per_press=0.08, drain_rate=0.15, start_progress=0.0):
-    """Bottom-middle mash-E-or-Q QTE bar (see ui/spam_qte.py). Blocking —
+def spam_qte(qte_id=None, fill_per_press=0.08, drain_rate=0.15, start_progress=0.0,
+             mode='spam', sweep_speed=0.9, max_attempts=0, zones=None):
+    """Bottom-middle QTE bar (see ui/spam_qte.py). Two modes:
+
+    mode='spam'   — the mash-E-or-Q bar described below.
+    mode='timing' — the bar is full and a crosshair sweeps back and forth;
+                    E/Q locks it. `zones` is a list of [threshold, outcome]
+                    pairs (default [[0,'fail'],[0.5,'success'],[0.85,'perfect']]).
+                    A 'fail' retries; any other outcome completes. sweep_speed
+                    is bar-widths/sec, max_attempts 0 = unlimited retries.
+                    On completion the flag 'qte_result:<qte_id>:<outcome>' is
+                    set and the bar percent is the stopped position.
+
+    Spam mode — Blocking —
     the sequence resumes once the player has filled the bar to the right
     edge. fill_per_press/drain_rate/start_progress are all fractions of
     the full bar (0.0-1.0): fill_per_press is how much one E/Q press adds,
@@ -289,7 +301,9 @@ def spam_qte(qte_id=None, fill_per_press=0.08, drain_rate=0.15, start_progress=0
     dev-tools/save data to key off of (e.g. flag conditions) — it plays
     no role in the fill logic itself."""
     return {'type': 'spam_qte', 'qte_id': qte_id, 'fill_per_press': fill_per_press,
-            'drain_rate': drain_rate, 'start_progress': start_progress}
+            'drain_rate': drain_rate, 'start_progress': start_progress,
+            'mode': mode, 'sweep_speed': sweep_speed, 'max_attempts': max_attempts,
+            'zones': zones}
 
 
 def weather(mode, weather_type=None):

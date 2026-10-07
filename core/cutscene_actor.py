@@ -872,9 +872,9 @@ class CutsceneActor:
     def set_animation(self, state, direction='down', loop=None):
         """Set animation state and facing direction immediately.
 
-        If the sprite hasn't loaded this state yet (e.g. walk2.png added after
-        init), we call load_animation_all_directions first so the key exists
-        before set_animation looks it up.
+        If the sprite hasn't loaded this state yet (e.g. 2x.png / walk2.png
+        dropped into the folder after init), we hot-load it first so the key
+        exists before sprite.set_animation looks it up.
 
         loop: None = the animation's own default; False = play once and hold
         the last frame; True = loop forever (see AnimatedSprite.set_animation).
@@ -884,7 +884,13 @@ class CutsceneActor:
         if sprite:
             key = f"{state}_{direction}"
             if key not in sprite.animations:
-                self._hot_load_animation(sprite, state)
+                self._hot_load_animation(sprite, state, self.entity)
+                if key not in sprite.animations:
+                    # Previously silent -- the sprite just kept its old pose,
+                    # which is exactly the "works in the editor, not in game"
+                    # symptom when the game's entity points at a different
+                    # sprite folder (costume/character) than the editor's.
+                    self._warn_missing_animation(sprite, state, direction)
             if loop is None:
                 sprite.set_animation(state, direction)
             else:
@@ -896,6 +902,36 @@ class CutsceneActor:
         self._anim_loop  = loop
         if hasattr(self.entity, 'current_animation_state'):
             self.entity.current_animation_state = state
+
+    _warned_missing_anims: set = set()
+
+    @classmethod
+    def _warn_missing_animation(cls, sprite, state, direction):
+        folder = cls._sprite_folder(sprite, None)
+        tag = (folder, state)
+        if tag in cls._warned_missing_anims:
+            return
+        cls._warned_missing_anims.add(tag)
+        print(f"[CutsceneActor] animation '{state}_{direction}' not available "
+              f"(looked in: {folder!r}) -- actor keeps its previous pose")
+
+    def preload_animation(self, state):
+        """Make sure *state*'s sheets are loaded without changing the pose.
+
+        Hot-loading reads a PNG from disk, which is a visible frame hitch if
+        it first happens mid-playback (the big dt that follows makes the
+        timeline jump ahead and cuts the animation short). The editor never
+        hits this because scrubbing / seek() replays every action -- and so
+        loads every sheet -- before Play. The runtime calls this up front so
+        the game behaves the same.
+        """
+        sprite = getattr(self.entity, 'sprite', None)
+        anims  = getattr(sprite, 'animations', None)
+        if not sprite or anims is None or not state:
+            return
+        if any(k.startswith(f"{state}_") for k in anims):
+            return
+        self._hot_load_animation(sprite, state, self.entity)
 
     def set_costume(self, costume: str):
         """Switch the actor to a different costume folder.
@@ -916,30 +952,62 @@ class CutsceneActor:
         self.set_animation(current_anim, current_dir, loop=self._anim_loop)
 
     @staticmethod
-    def _hot_load_animation(sprite, state):
-        """Load all directions of *state* from {sprite.base_path}/{state}.png.
+    def _sprite_folder(sprite, entity):
+        """Best-effort lookup of the folder a sprite's sheets live in.
+
+        Mirrors CutsceneEditor._actor_sprite_folder (which tries every
+        attribute name sprite systems use) so the game resolves the folder
+        exactly like the editor does, then falls back to the standard
+        assets/sprites/player/{character}/{costume}/ layout.
+        """
+        import os
+        for attr in ('base_path', 'sprite_dir', 'folder', 'base_dir',
+                     'sheet_dir', '_sprite_dir', '_folder', '_base_path'):
+            val = getattr(sprite, attr, None)
+            if isinstance(val, str) and val:
+                return val
+        if entity is not None:
+            character = getattr(entity, 'character', None)
+            costume   = getattr(entity, 'costume', None) or 'base'
+            if character:
+                return os.path.join('assets', 'sprites', 'player',
+                                    str(character), str(costume))
+        return None
+
+    @staticmethod
+    def _hot_load_animation(sprite, state, entity=None):
+        """Load all directions of *state* from {sprite folder}/{state}.png.
 
         Auto-detects 4-directional vs 8-directional by checking how many
         sprite-height rows the sheet has.
         """
         import os, pygame
 
-        path = os.path.join(sprite.base_path, f"{state}.png")
+        folder = CutsceneActor._sprite_folder(sprite, entity)
+        if not folder:
+            return
+        path = os.path.join(folder, f"{state}.png")
         if not os.path.isfile(path):
             return
 
         # Detect direction count from the sheet's row count.
         try:
             tmp = pygame.image.load(path)
-            rows = tmp.get_height() // sprite.sprite_height
-        except Exception:
+            sprite_h = (getattr(sprite, 'sprite_height', None)
+                        or getattr(sprite, 'height', None) or tmp.get_height())
+            rows = tmp.get_height() // sprite_h
+        except Exception as e:
+            print(f"[CutsceneActor] couldn't read {path}: {e}")
             return
 
         use_8 = (rows >= 8)
-        sprite.load_animation_all_directions(
-            state, frame_duration=0.1, loop=True,
-            num_variants=1, use_8_directions=use_8,
-        )
+        try:
+            sprite.load_animation_all_directions(
+                state, frame_duration=0.1, loop=True,
+                num_variants=1, use_8_directions=use_8,
+            )
+        except Exception as e:
+            print(f"[CutsceneActor] hot-load of '{state}' failed: {e}")
 
     def face(self, direction):
         """Turn the actor to face *direction*, keeping the current animation state.

@@ -26,6 +26,13 @@ from dev_tools import entity_creator
 import dev_tools.ui_kit as uk
 from config.settings import ui, ui_text
 
+# Scrolling-background layers. A room holds an ordered list (back -> front) in
+# room.scrolling_bgs; each entry is a dict with these keys. The legacy single
+# room.scrolling_bg dict is migrated into this list on first access and is kept
+# mirrored to layer 0 so older readers still see a background.
+_BG_LAYER_DEFAULTS = {'image': '', 'scroll_x': 0.0, 'scroll_y': 0.0, 'parallax': 0.5}
+_BG_MAX_LAYERS = 8
+
 
 # How many actions we keep in each undo/redo stack before the oldest entry
 # gets silently dropped.  50 is plenty without eating much memory.
@@ -595,7 +602,12 @@ class RoomEditor:
         self._bg_grid_rect     = pygame.Rect(0, 0, 0, 0)
         self._bg_thumb_rects: dict  = {}
         self._bg_slider_rects: dict = {}
-        self._bg_clear_rect    = pygame.Rect(0, 0, 0, 0)
+        self._bg_clear_rect    = pygame.Rect(0, 0, 0, 0)   # 'Remove' (selected layer)
+        self._bg_sel_layer     = 0                          # index into room layers (0 = back)
+        self._bg_layer_rects: dict = {}                     # layer index -> tab rect
+        self._bg_add_rect      = pygame.Rect(0, 0, 0, 0)
+        self._bg_back_rect     = pygame.Rect(0, 0, 0, 0)
+        self._bg_fwd_rect      = pygame.Rect(0, 0, 0, 0)
         self._bg_scan_done     = False
         self.BG_DIR       = os.path.join('assets', 'bg')
         self.THUMB_SIZE   = ui(96)
@@ -1309,6 +1321,7 @@ class RoomEditor:
             elif field == 'background':
                 self._bg_panel_open = not self._bg_panel_open
                 if self._bg_panel_open:
+                    self._bg_sel_layer = 0
                     self._ensure_bg_scanned()
             else:
                 if field == 'name':
@@ -5069,55 +5082,9 @@ class RoomEditor:
             _prof.append((label, (now - _pt) * 1000))
             _pt = now
 
-        # ── Scrolling background preview ──────────────────────────────────────
+        # ── Scrolling background preview (all layers, back -> front) ─────────
         if self.viewing_room:
-            bg = getattr(self.viewing_room, 'scrolling_bg', {})
-            img_path = bg.get('image', '')
-            if img_path:
-                room_name = self.viewing_room.name
-                if not hasattr(self, '_bg_image_cache'):
-                    self._bg_image_cache = {}
-                if not hasattr(self, '_bg_image_raw_cache'):
-                    self._bg_image_raw_cache = {}
-                # Cache key includes the current viewport height: this tile is
-                # rescaled to match screen height, and that height is the real
-                # (possibly much larger) virtual viewport while Ctrl+scroll
-                # zoom is active — not the physical window. Keying on
-                # img_path alone meant a tile cached once at normal zoom kept
-                # getting reused, unscaled, once zoomed out; the tiling loop
-                # below then had to blit far more copies of that now-tiny
-                # tile to cover the bigger viewport (blit count grows as
-                # ~1/zoom^2), which is what was tanking FPS when zoomed out.
-                # The raw (unscaled) load is cached separately so a zoom
-                # change only costs one rescale, not a re-decode from disk.
-                _, cache_sh = screen.get_size()
-                cache_key = (img_path, cache_sh)
-                if cache_key not in self._bg_image_cache:
-                    try:
-                        import os
-                        if img_path not in self._bg_image_raw_cache:
-                            self._bg_image_raw_cache[img_path] = pygame.image.load(
-                                os.path.join('assets', 'bg', os.path.basename(img_path))
-                            ).convert()
-                        raw = self._bg_image_raw_cache[img_path]
-                        ratio = cache_sh / raw.get_height()
-                        nw    = max(1, int(raw.get_width() * ratio))
-                        self._bg_image_cache[cache_key] = pygame.transform.scale(raw, (nw, cache_sh))
-                    except Exception:
-                        self._bg_image_cache[cache_key] = None
-                surf = self._bg_image_cache.get(cache_key)
-                if surf:
-                    parallax = bg.get('parallax', 0.5)
-                    sw, sh   = screen.get_size()
-                    iw       = surf.get_width()
-                    off_x    = int(self.camera.x * parallax) % iw
-                    y = 0
-                    while y < sh:
-                        x = -off_x
-                        while x < sw:
-                            screen.blit(surf, (x, y))
-                            x += iw
-                        y += surf.get_height()
+            self._draw_bg_layers_preview(screen)
         _mark("bg_preview")
 
         # Flush any tiles invalidated by paint/erase this frame before reading
@@ -6394,8 +6361,13 @@ class RoomEditor:
         # Background — opens the sub-panel
         idx = 8
         t = self._item_anim(idx)
-        bg_val = self._room_bg_get('image', '')
-        bg_display = os.path.splitext(bg_val)[0] if bg_val else 'None'
+        _bg_named = [l.get('image') for l in self._bg_layers(self.editing_room) if l.get('image')]
+        if not _bg_named:
+            bg_display = 'None'
+        else:
+            bg_display = os.path.splitext(_bg_named[0])[0]
+            if len(_bg_named) > 1:
+                bg_display += f'  +{len(_bg_named) - 1} more'
         bg_label_surf = self.font_small.render('BACKGROUND', True, uk.Theme.TEXT_MUTED)
         screen.blit(bg_label_surf, (x, y))
         bg_row_rect = pygame.Rect(x, y + bg_label_surf.get_height() + ui(6), width, ui(38))
@@ -6432,14 +6404,129 @@ class RoomEditor:
     # rather than mirroring it into local state).
     # =========================================================================
 
+    # ── Layer model ──────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _bg_layers(room):
+        """The room's background layer list (back -> front), migrating the
+        legacy single `scrolling_bg` dict into a one-layer list the first
+        time it's touched. Always returns the live list, not a copy."""
+        layers = getattr(room, 'scrolling_bgs', None)
+        if isinstance(layers, list):
+            return layers
+        legacy = getattr(room, 'scrolling_bg', None)
+        layers = []
+        if isinstance(legacy, dict) and legacy.get('image'):
+            layers.append({**_BG_LAYER_DEFAULTS, **legacy})
+        room.scrolling_bgs = layers
+        return layers
+
+    @staticmethod
+    def _sync_legacy_bg(room):
+        """Keep room.scrolling_bg mirrored to layer 0 so anything that only
+        knows the old single-background field still shows a background."""
+        layers = room.scrolling_bgs
+        room.scrolling_bg = dict(layers[0]) if layers else {}
+
+    def _bg_selected_index(self):
+        n = len(self._bg_layers(self.editing_room))
+        self._bg_sel_layer = max(0, min(self._bg_sel_layer, max(0, n - 1)))
+        return self._bg_sel_layer
+
     def _room_bg_get(self, key, default):
-        bg = getattr(self.editing_room, 'scrolling_bg', None) or {}
-        return bg.get(key, default)
+        """Read a field from the currently selected layer."""
+        layers = self._bg_layers(self.editing_room)
+        if not layers:
+            return default
+        return layers[self._bg_selected_index()].get(key, default)
 
     def _room_bg_set(self, key, value):
-        if not isinstance(getattr(self.editing_room, 'scrolling_bg', None), dict):
-            self.editing_room.scrolling_bg = {}
-        self.editing_room.scrolling_bg[key] = value
+        """Write a field on the currently selected layer (creating the first
+        layer on demand, as the old single-dict version did)."""
+        layers = self._bg_layers(self.editing_room)
+        if not layers:
+            layers.append(dict(_BG_LAYER_DEFAULTS))
+            self._bg_sel_layer = 0
+        layers[self._bg_selected_index()][key] = value
+        self._sync_legacy_bg(self.editing_room)
+
+    def _bg_add_layer(self):
+        layers = self._bg_layers(self.editing_room)
+        if len(layers) >= _BG_MAX_LAYERS:
+            return
+        layers.append(dict(_BG_LAYER_DEFAULTS))
+        self._bg_sel_layer = len(layers) - 1
+        self._sync_legacy_bg(self.editing_room)
+
+    def _bg_remove_layer(self):
+        layers = self._bg_layers(self.editing_room)
+        if not layers:
+            return
+        del layers[self._bg_selected_index()]
+        self._bg_sel_layer = max(0, min(self._bg_sel_layer, len(layers) - 1))
+        self._sync_legacy_bg(self.editing_room)
+
+    def _bg_move_layer(self, delta):
+        """delta -1 = toward the back, +1 = toward the front."""
+        layers = self._bg_layers(self.editing_room)
+        i = self._bg_selected_index()
+        j = i + delta
+        if not (0 <= j < len(layers)):
+            return
+        layers[i], layers[j] = layers[j], layers[i]
+        self._bg_sel_layer = j
+        self._sync_legacy_bg(self.editing_room)
+
+    def _get_bg_layer_surface(self, img_path, screen_h, with_alpha):
+        """Image scaled to the viewport height, cached. Only the bottom
+        layer is loaded opaque (fast blit); every layer above it keeps its
+        alpha channel so lower layers show through."""
+        if not hasattr(self, '_bg_image_cache'):
+            self._bg_image_cache = {}
+        if not hasattr(self, '_bg_image_raw_cache'):
+            self._bg_image_raw_cache = {}
+        # Cache key includes viewport height: tiles are rescaled to match
+        # screen height, which is the real (possibly much larger) virtual
+        # viewport while Ctrl+scroll zoom is active. Keying on path alone
+        # kept reusing a tile cached at normal zoom once zoomed out, forcing
+        # ~1/zoom^2 more blits and tanking FPS. The raw (unscaled) load is
+        # cached separately so a zoom change costs one rescale, not a decode.
+        cache_key = (img_path, screen_h, with_alpha)
+        if cache_key not in self._bg_image_cache:
+            try:
+                raw_key = (img_path, with_alpha)
+                if raw_key not in self._bg_image_raw_cache:
+                    img = pygame.image.load(
+                        os.path.join('assets', 'bg', os.path.basename(img_path)))
+                    self._bg_image_raw_cache[raw_key] = (
+                        img.convert_alpha() if with_alpha else img.convert())
+                raw = self._bg_image_raw_cache[raw_key]
+                ratio = screen_h / raw.get_height()
+                nw = max(1, int(raw.get_width() * ratio))
+                self._bg_image_cache[cache_key] = pygame.transform.scale(raw, (nw, screen_h))
+            except Exception:
+                self._bg_image_cache[cache_key] = None
+        return self._bg_image_cache[cache_key]
+
+    def _draw_bg_layers_preview(self, screen):
+        layers = [l for l in self._bg_layers(self.viewing_room) if l.get('image')]
+        if not layers:
+            return
+        sw, sh = screen.get_size()
+        for i, layer in enumerate(layers):
+            surf = self._get_bg_layer_surface(layer['image'], sh, with_alpha=(i > 0))
+            if not surf or surf.get_width() <= 0:
+                continue
+            parallax = layer.get('parallax', 0.5)
+            iw, ih = surf.get_size()
+            off_x = int(self.camera.x * parallax) % iw
+            y = 0
+            while y < sh:
+                x = -off_x
+                while x < sw:
+                    screen.blit(surf, (x, y))
+                    x += iw
+                y += ih
 
     def _ensure_bg_scanned(self):
         if self._bg_scan_done:
@@ -6489,23 +6576,37 @@ class RoomEditor:
             self._room_bg_set('parallax', round(t, 2))
 
     def _handle_bg_panel_click(self, mouse_pos) -> "str | None":
-        # Thumbnail picks
-        for fname, rect in self._bg_thumb_rects.items():
-            if rect.collidepoint(mouse_pos):
-                current = self._room_bg_get('image', '')
-                self._room_bg_set('image', '' if current == fname else fname)
-                if hasattr(self, '_bg_image_cache'):
-                    self._bg_image_cache.clear()
-                return 'bg_apply'
-        # Clear button
-        if self._bg_clear_rect.collidepoint(mouse_pos):
-            self._room_bg_set('image', '')
-            self._room_bg_set('scroll_x', 0.0)
-            self._room_bg_set('scroll_y', 0.0)
-            self._room_bg_set('parallax', 0.5)
+        def _flush():
             if hasattr(self, '_bg_image_cache'):
                 self._bg_image_cache.clear()
             return 'bg_apply'
+
+        # Layer tabs
+        for idx, rect in self._bg_layer_rects.items():
+            if rect.collidepoint(mouse_pos):
+                self._bg_sel_layer = idx
+                return 'bg_select'
+        # Layer actions
+        if self._bg_add_rect.collidepoint(mouse_pos):
+            self._bg_add_layer()
+            return _flush()
+        if self._bg_back_rect.collidepoint(mouse_pos):
+            self._bg_move_layer(-1)
+            return _flush()
+        if self._bg_fwd_rect.collidepoint(mouse_pos):
+            self._bg_move_layer(+1)
+            return _flush()
+        if self._bg_clear_rect.collidepoint(mouse_pos):
+            self._bg_remove_layer()
+            return _flush()
+        # Thumbnail picks (only inside the visible grid — scrolled-out cells
+        # keep stale rects that would otherwise overlap the controls above)
+        if self._bg_grid_rect.collidepoint(mouse_pos):
+            for fname, rect in self._bg_thumb_rects.items():
+                if rect.collidepoint(mouse_pos):
+                    current = self._room_bg_get('image', '')
+                    self._room_bg_set('image', '' if current == fname else fname)
+                    return _flush()
         return None
 
     def handle_room_bg_panel_event(self, event) -> "str | None":
@@ -6729,23 +6830,87 @@ class RoomEditor:
         uk.draw_panel(screen, self._bg_panel_rect, bg=uk.Theme.PANEL_BG, border=uk.Theme.GOLD,
                        border_width=1, radius=ui(10))
 
+        layers = self._bg_layers(self.editing_room)
+        n_layers = len(layers)
+        sel_idx = self._bg_selected_index()
         bg_selected = self._room_bg_get('image', '')
         bg_scroll_x = float(self._room_bg_get('scroll_x', 0.0))
         bg_scroll_y = float(self._room_bg_get('scroll_y', 0.0))
         bg_parallax = float(self._room_bg_get('parallax', 0.5))
+        mouse = self._logical_mouse_pos
+        inner_w = self.PANEL_W - ui(28)
 
         # Title + current selection
-        title_s = self.font_large.render('Scrolling Background', True, uk.Theme.GOLD)
+        title_s = self.font_large.render('Scrolling Backgrounds', True, uk.Theme.GOLD)
         screen.blit(title_s, (PX + ui(14), PY + ui(12)))
 
         sel_name = os.path.splitext(bg_selected)[0] if bg_selected else 'None'
         sel_col = uk.Theme.TEXT_PRIMARY if bg_selected else uk.Theme.TEXT_MUTED
-        sel_s = self.font_medium.render(f'Selected: {sel_name}', True, sel_col)
+        if n_layers:
+            sel_text = f'Layer {sel_idx + 1} of {n_layers}: {sel_name}'
+        else:
+            sel_text = 'No layers yet - pick an image below'
+        sel_s = self.font_medium.render(sel_text, True, sel_col)
         screen.blit(sel_s, (PX + ui(14), PY + ui(38)))
 
-        # ── Sliders ──────────────────────────────────────────────────────
-        inner_w = self.PANEL_W - ui(28)
-        sy = PY + ui(64)
+        # ── Layer tabs (1 = back ... N = front) ─────────────────────────────
+        tab_w, tab_h, tab_gap = ui(36), ui(26), ui(6)
+        ty = PY + ui(64)
+        self._bg_layer_rects = {}
+        self._bg_add_rect = pygame.Rect(0, 0, 0, 0)
+        tx = PX + ui(14)
+        for i, layer in enumerate(layers):
+            rect = pygame.Rect(tx, ty, tab_w, tab_h)
+            self._bg_layer_rects[i] = rect
+            is_sel = i == sel_idx
+            hov = rect.collidepoint(mouse)
+            border = (uk.Theme.GOLD if is_sel else
+                      uk.Theme.TEXT_PRIMARY if hov else uk.Theme.PANEL_BORDER)
+            uk.draw_rect_on(screen, (28, 33, 44) if is_sel else (18, 18, 26), rect, 0, ui(6))
+            uk.draw_rect_on(screen, border, rect, 2 if is_sel else 1, ui(6))
+            num_col = (uk.Theme.GOLD_BRIGHT if is_sel else
+                       uk.Theme.TEXT_SECONDARY if layer.get('image') else uk.Theme.TEXT_DIM)
+            num_s = self.font_medium.render(str(i + 1), True, num_col)
+            screen.blit(num_s, num_s.get_rect(center=rect.center))
+            uk.register_hoverable(rect)
+            tx += tab_w + tab_gap
+        if n_layers < _BG_MAX_LAYERS:
+            rect = pygame.Rect(tx, ty, tab_w, tab_h)
+            self._bg_add_rect = rect
+            hov = rect.collidepoint(mouse)
+            uk.draw_rect_on(screen, (18, 18, 26), rect, 0, ui(6))
+            uk.draw_rect_on(screen, uk.Theme.TEXT_PRIMARY if hov else uk.Theme.PANEL_BORDER, rect, 1, ui(6))
+            _draw_plus_icon(screen, rect, uk.Theme.GOLD_BRIGHT if hov else uk.Theme.TEXT_MUTED, ui(2))
+            uk.register_hoverable(rect)
+
+        # ── Layer actions: move back / move front / remove ──────────────────
+        btn_gap = ui(8)
+        btn_w = (inner_w - 2 * btn_gap) // 3
+        btn_h = ui(26)
+        by = ty + tab_h + ui(8)
+        can_back = n_layers > 1 and sel_idx > 0
+        can_fwd = n_layers > 1 and sel_idx < n_layers - 1
+        can_rm = n_layers > 0
+        specs = [
+            ('Move Back',  can_back, None,             False, '_bg_back_rect'),
+            ('Move Front', can_fwd,  None,             False, '_bg_fwd_rect'),
+            ('Remove',     can_rm,   _draw_trash_icon, True,  '_bg_clear_rect'),
+        ]
+        for j, (label, enabled, icon_fn, danger, attr) in enumerate(specs):
+            rect = pygame.Rect(PX + ui(14) + j * (btn_w + btn_gap), by, btn_w, btn_h)
+            hot = enabled and rect.collidepoint(mouse)
+            self._draw_pill_button(screen, rect, 1.0 if hot else 0.0, label,
+                                    uk.Theme.GOLD, icon_fn, danger=danger)
+            if enabled:
+                setattr(self, attr, rect)
+            else:
+                setattr(self, attr, pygame.Rect(0, 0, 0, 0))
+                veil = pygame.Surface(rect.size, pygame.SRCALPHA)
+                veil.fill((10, 13, 20, 150))
+                screen.blit(veil, rect.topleft)
+
+        # ── Sliders (apply to the selected layer) ───────────────────────────
+        sy = by + btn_h + ui(14)
         self._bg_slider_rects = {}
 
         sx_t = (bg_scroll_x / self.SCROLL_MAX + 1) / 2
@@ -6768,15 +6933,7 @@ class RoomEditor:
             '0 = fixed on screen   0.5 = half camera   1 = moves with camera',
             True, uk.Theme.TEXT_DIM)
         screen.blit(hint, (PX + ui(14), sy))
-        sy += ui(20)
-
-        # ── Clear button ─────────────────────────────────────────────────
-        sy += ui(4)
-        clr_rect = pygame.Rect(PX + ui(14), sy, inner_w, ui(28))
-        self._draw_pill_button(screen, clr_rect, 1.0 if clr_rect.collidepoint(self._logical_mouse_pos) else 0.0,
-                                'Clear Background', uk.Theme.DANGER_BRIGHT, _draw_trash_icon, danger=True)
-        self._bg_clear_rect = clr_rect
-        sy += ui(36)
+        sy += ui(24)
 
         # ── Divider ──────────────────────────────────────────────────────
         uk.draw_rect_on(screen, uk.Theme.PANEL_BORDER, pygame.Rect(PX + ui(10), sy, self.PANEL_W - ui(20), 1), 0, 0)

@@ -291,9 +291,21 @@ class Critter:
 
     # -- layer manager --------------------------------------------------------
     def get_sort_key(self):
-        """(layer, y) tuple consumed by LayerManager.draw_all's sort."""
-        y_pos = self.y if self.y_sort else 0
-        return (self.draw_layer, y_pos)
+        """(layer, y) tuple consumed by LayerManager.draw_all's sort.
+
+        Sorts by the critter's FEET (center + half the frame height),
+        matching Player.get_sort_key's (y + height // 2). Sorting by
+        self.y (the sprite center) made the player draw in front of the
+        critter until their feet were above the critter's midpoint, which
+        looks wrong with larger frames (e.g. 24x24 sheets).
+
+        Frame height comes from the loaded sprite when available, since
+        self.height defaults to 16 and doesn't track the sheet's size.
+        """
+        if not self.y_sort:
+            return (self.draw_layer, 0)
+        frame_h = getattr(self.sprite, 'sprite_height', None) or self.height
+        return (self.draw_layer, self.y + frame_h // 2)
 
     # -- drawing ----------------------------------------------------------------
     def draw(self, surface, camera, colors=None):

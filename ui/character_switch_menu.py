@@ -464,13 +464,13 @@ class CharacterSwitchMenu:
 
         key = event.key
 
-        if key == pygame.K_LEFT:
+        if key == pygame.K_a:
             if self.selected_character > 0:
                 self._set_button_pressed('left')
                 self.selected_character -= 1
                 self._reset_char_anim(self.selected_character)
 
-        elif key == pygame.K_RIGHT:
+        elif key == pygame.K_d:
             if self.selected_character < len(self.characters) - 1:
                 self._set_button_pressed('right')
                 self.selected_character += 1

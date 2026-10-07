@@ -20,7 +20,7 @@ Two phases, driven by self._phase:
                              same box, same position)
             'save_select' also doubles as a character picker for slots
                              with more than one unlocked character:
-                             LEFT/RIGHT (or A/D) cycles which one will
+                             A/D cycles which one will
                              actually be loaded (see
                              _cycle_picked_character/get_selected_
                              character), shown by overlaying
@@ -80,7 +80,7 @@ import pygame
 # the engine's current default (4) instead of tracking that setting.
 # Changing RENDER_SCALE elsewhere no longer resizes anything in this file.
 RENDER_SCALE = 4
-from ui.pause_menu import FlatBitmapFont, DESIGN_W, DESIGN_H, make_scaled_screen
+from ui.pause_menu import FlatBitmapFont, DESIGN_W, DESIGN_H, make_scaled_screen, highlight_color
 
 DEFAULT_PATH = os.path.join('data', 'game_flow.json')
 DEFAULT_TITLE_TEXT = 'GAME TITLE'
@@ -153,7 +153,8 @@ class TitleScreen:
 
         self.title_color       = (255, 255, 0)
         self.text_color        = (255, 255, 255)
-        self.text_hover_color  = (0, 255, 0)
+        # text_hover_color is a property now (see below) - it follows the
+        # shared menu highlight color from the dev menu.
         # Selected row's color while SAVE SELECT is in "Delete Game" mode
         # (see self._save_delete_mode) — pure red, distinct from the
         # softer red used by the MULTIPLAYER "can't pick that yet" flash.
@@ -523,6 +524,10 @@ class TitleScreen:
         return phases
 
     # ── Wiring (called once by Game after construction) ────────────────────
+
+    @property
+    def text_hover_color(self):
+        return highlight_color()
 
     def set_pause_menu(self, pause_menu):
         """Share Game's existing PauseMenu instance so OPTIONS can open its
@@ -907,11 +912,11 @@ class TitleScreen:
     def _handle_menu_keydown(self, key):
         options = self._current_options()
 
-        if key in (pygame.K_UP, pygame.K_w):
+        if key == pygame.K_w:
             self._menu_index = (self._menu_index - 1) % len(options)
             self._play_switch_sfx()
             return None
-        if key in (pygame.K_DOWN, pygame.K_s):
+        if key == pygame.K_s:
             self._menu_index = (self._menu_index + 1) % len(options)
             self._play_switch_sfx()
             return None
@@ -952,14 +957,14 @@ class TitleScreen:
         ESCAPE/X backs out to mode_select, same as before."""
         count = len(_SAVE_SLOT_LABELS)
 
-        if key in (pygame.K_UP, pygame.K_w):
+        if key == pygame.K_w:
             if self._save_slot_index > 0:
                 self._save_slot_index   -= 1
                 self._save_scroll_offset = min(self._save_scroll_offset, self._save_slot_index)
                 self.scroll_up_timer     = self.scroll_press_duration
                 self._play_switch_sfx()
             return None
-        if key in (pygame.K_DOWN, pygame.K_s):
+        if key == pygame.K_s:
             if self._save_slot_index < count - 1:
                 self._save_slot_index   += 1
                 self._save_scroll_offset = max(
@@ -971,8 +976,8 @@ class TitleScreen:
             return None
         if key in (pygame.K_RETURN, pygame.K_z):
             return self._confirm_save_slot()
-        if key in (pygame.K_LEFT, pygame.K_a, pygame.K_RIGHT, pygame.K_d):
-            self._cycle_picked_character(-1 if key in (pygame.K_LEFT, pygame.K_a) else 1)
+        if key in (pygame.K_a, pygame.K_d):
+            self._cycle_picked_character(-1 if key == pygame.K_a else 1)
             return None
         if key in _KEY_L or key in _KEY_R:
             # Toggle "Select Game" <-> "Delete Game" — see
@@ -1014,10 +1019,10 @@ class TitleScreen:
         return pick
 
     def _cycle_picked_character(self, direction):
-        """LEFT/RIGHT (or A/D) on the SAVE SELECT list — moves the pick
+        """A/D on the SAVE SELECT list — moves the pick
         for the currently-selected slot (self._save_slot_index) one step
         through that slot's roster, wrapping around at either end.
-        direction: -1 for LEFT/A, +1 for RIGHT/D.
+        direction: -1 for A, +1 for D.
 
         No-ops silently (no sound, nothing changes) on an empty slot or a
         slot with only one unlocked character — there's nothing to pick

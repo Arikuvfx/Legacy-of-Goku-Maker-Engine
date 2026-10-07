@@ -81,6 +81,15 @@ _ACTION_PARAMS = {
     # portrait '' (shown as "narrator") = no face art — full-width text box.
     # Any other value is a key under assets/portraits/{key}.png.
     'dialogue':      [('portrait', 'Portrait', 'portrait'), ('text', 'Text', 'str')],
+    # Pauses the cutscene until the player finishes the QTE bar. spam mode uses
+    # Fill/Press + Drain; timing mode uses Sweep Speed + Max Attempts (zones can
+    # be added by hand as a "zones" param: [[0,"fail"],[0.5,"success"],...]).
+    'qte':           [('qte_id', 'QTE Id', 'str'), ('mode', 'Mode', 'qte_mode'),
+                      ('fill_per_press', 'Fill / Press (spam)', 'float'),
+                      ('drain_rate', 'Drain / s (spam)', 'float'),
+                      ('sweep_speed', 'Sweep Speed (timing)', 'float'),
+                      ('max_attempts', 'Max Attempts (0=inf)', 'int'),
+                      ('fail_hold', 'Fail Seq Hold (s)', 'float')],
     'weather_start': [('weather_type', 'Weather Type', 'weather_type'),
                       ('speed',        'Speed (px/s)',  'float'),
                       ('alpha',        'Alpha (0-255)', 'float')],
@@ -175,7 +184,7 @@ _ACTION_PARAMS = {
 }
 
 _CAMERA_ACTIONS = ['pan_to', 'snap_to', 'shake']
-_SCREEN_ACTIONS = ['fade_in', 'fade_out', 'flash', 'invert', 'dialogue',
+_SCREEN_ACTIONS = ['fade_in', 'fade_out', 'flash', 'invert', 'dialogue', 'qte',
                    'weather_start', 'weather_stop']
 _ROOM_ACTIONS   = ['change_room']
 _SOUND_ACTIONS  = ['play_music', 'play_sfx', 'stop_sfx', 'stop_music']
@@ -903,6 +912,15 @@ class CutsceneEditor:
         self.screen_width  = screen_width
         self.screen_height = screen_height
         self.dialogue_box  = dialogue_box
+        # The editor's own QTE bar for previewing 'qte' cutscene steps (the
+        # game's bar isn't used while the editor is open). Optional — if the
+        # widget/assets can't load, 'qte' steps just stay no-ops in preview.
+        try:
+            from ui.spam_qte import SpamQTEBar
+            self._qte_bar = SpamQTEBar()
+        except Exception as _e:
+            print(f'[CutsceneEditor] QTE preview unavailable: {_e}')
+            self._qte_bar = None
         # Used to populate the Music Track / Sound Effect pickers on the
         # play_music / play_sfx action forms, and to let the dev preview a
         # track or sfx instantly from the inspector without running the
@@ -944,6 +962,8 @@ class CutsceneEditor:
         self.cutscene_name = ''
         self.unsaved       = False
         self._autosave_t   = 0.0   # seconds since last autosave
+        # QTE fail-sequence view (see _enter_fail_edit). None = normal editing.
+        self._fail_edit    = None
 
         # Undo / redo stacks — each entry is a deep copy of cutscene_data.
         # _push_undo() must be called BEFORE every mutation so Ctrl-Z can
@@ -1015,6 +1035,17 @@ class CutsceneEditor:
         self._form_params    = {}
         self._form_focus     = None
         self._text_limit_hit = False  # True while typing hits the dialogue box's capacity
+        # Caret / selection shared by every inline text field (only one can be
+        # focused at a time) — see the "Inline text editing" helpers.
+        self._tc_ident         = None    # which field the caret belongs to
+        self._tc_pos           = 0       # caret index into that field's text
+        self._tc_anchor        = None    # None = no selection; else the other end of it
+        self._tc_drag          = False   # left button held after clicking into a field
+        self._tc_scroll        = 0       # horizontal scroll (px) of a focused single-line field
+        self._tc_vscroll       = None    # first visible line of a focused multiline field
+        self._tc_geom          = None    # hit-test geometry of the focused field (set by draw)
+        self._tc_pending_click = None    # click pos to turn into a caret on the next draw
+        self._tc_repeat_on     = False   # key auto-repeat enabled while a field is focused
         self._form_target_idx  = 0
         self._form_type_idx    = 0
         # Tracks the active group filter when browsing rooms for a change_room action.
@@ -1231,6 +1262,7 @@ class CutsceneEditor:
         self._form_focus = None
         self._actor_focus = None
         self._new_name_focus = False
+        self._tc_reset()
         self._list_confirm = None
         if self.active:
             self._mouse_pos = tuple(pygame.mouse.get_pos())
@@ -1262,6 +1294,7 @@ class CutsceneEditor:
             return self._on_click(event.pos)
 
         if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self._tc_drag        = False
             self._tl_play_drag   = False
             self._tl_auto_scroll = 0.0
             # Fire one final scrub on release so the viewport snaps exactly to
@@ -1301,6 +1334,8 @@ class CutsceneEditor:
 
         if event.type == pygame.MOUSEMOTION:
             self._last_input = 'mouse'
+            if self._tc_drag:
+                self._tc_drag_to(event.pos)
             self._on_mouse_motion(event.pos)
 
         if event.type == pygame.MOUSEWHEEL:
@@ -1320,6 +1355,7 @@ class CutsceneEditor:
 
         self._dt     = min(max(dt, 0.0), 1 / 20) if dt > 0 else 1 / 60
         self._blink += self._dt
+        self._tc_sync()
 
         # Suppress manual camera pan during active playback — the runtime owns
         # the camera while playing, and fighting it causes jitter.  Also guards
@@ -1358,14 +1394,14 @@ class CutsceneEditor:
         # _tl_auto_scroll is computed in _on_mouse_motion; applying it here
         # (once per frame, scaled by dt) gives smooth continuous scrolling. ──
         if self.view == 'edit' and self._tl_auto_scroll != 0.0 and self.cutscene_data:
-            self._tl_scroll_x = max(0.0, self._tl_scroll_x + self._tl_auto_scroll * dt)
+            self._tl_scroll_x = max(self._tl_min_scroll(), self._tl_scroll_x + self._tl_auto_scroll * dt)
             tl          = self._tl_panel_rect()
             label_end_x = tl.x + self._tl_label_w
             mx          = self._mouse_pos[0]
             dur         = self.cutscene_data.get('duration', 10.0)
             if self._tl_play_drag:
                 t = (mx - label_end_x + self._tl_scroll_x) / self._tl_time_zoom
-                self._tl_playhead_t = _clamp(t, 0.0, dur)
+                self._tl_playhead_t = _clamp(t, self._tl_min_t(), dur)
                 self._scrub_pending = True
             elif self._kf_drag_idx >= 0:
                 self._apply_kf_drag(mx)
@@ -1408,6 +1444,10 @@ class CutsceneEditor:
             # Keep the dialogue box animation ticking (typewriter effect, etc.)
             if self.dialogue_box:
                 self.dialogue_box.update(dt)
+            # Advance a running 'qte' step's bar (the runtime holds the timeline
+            # frozen until it goes inactive).
+            if self._qte_bar is not None and self._qte_bar.active:
+                self._qte_bar.update(dt)
             if room:
                 self._clamp_camera()
             self._tl_playhead_t = self._runtime.elapsed
@@ -1419,6 +1459,8 @@ class CutsceneEditor:
             return
         if self._layout_key != (int(self.screen_width), int(self.screen_height)):
             self._layout()
+
+        self._tc_sync()
 
         # Fresh registries every frame — hit-testing is always in sync with
         # what was actually painted, never cached across frames.
@@ -1437,6 +1479,7 @@ class CutsceneEditor:
         else:
             self._draw_edit(screen)
         self._draw_dropdown(screen)
+        self._tc_pending_click = None   # the focused field (if visible) already used it
 
         if self._dd is None:
             self._blocks_prev = self._blocks
@@ -1613,6 +1656,13 @@ class CutsceneEditor:
                 self._start_preview()
             return None
 
+        # E / Q while a 'qte' step's bar is up: mash / lock the crosshair, same
+        # keys as in game. Takes priority over everything below.
+        if (key in (pygame.K_e, pygame.K_q) and self.view == 'edit' and self._playing
+                and self._qte_bar is not None and self._qte_bar.active):
+            self._qte_bar.register_press()
+            return None
+
         # E key: advance / dismiss the dialogue box during cutscene preview,
         # mirroring the in-game interact behaviour.
         if (key == pygame.K_e and self.view == 'edit' and self._playing
@@ -1660,7 +1710,8 @@ class CutsceneEditor:
                 self._on_action('tl_dup', None, None)
                 return None
             if ctrl and key == pygame.K_a and self.cutscene_data:
-                self._set_selection(list(self.cutscene_data.get('actions', [])))
+                self._set_selection([a for a in self.cutscene_data.get('actions', [])
+                                     if not a.get('_prefix')])
                 return None
             if key in (pygame.K_DELETE, pygame.K_BACKSPACE) and self._sel_actions():
                 self._delete_selection()
@@ -1717,6 +1768,370 @@ class CutsceneEditor:
 
         return None
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # Inline text editing — caret, selection highlight, clipboard
+    #
+    # Same behaviour the room editor's text fields have: a movable caret,
+    # Shift+arrows / Shift+click / mouse-drag selection (drawn as a highlight),
+    # Ctrl+A select-all, Ctrl+C / Ctrl+X / Ctrl+V, Home / End, and
+    # Backspace / Delete / typing that replace the selection first.  The
+    # dialogue text box is multiline: Up / Down / Home / End work per visual
+    # line and Enter inserts a line break.
+    # ══════════════════════════════════════════════════════════════════════════
+
+    _NAME_BAD_CHARS = '\\/:*?"<>|'   # not allowed in a cutscene (file) name
+
+    def _tc_ident_now(self):
+        """Identity of the focused field, in the same priority order the
+        keyboard routing in _on_keydown uses."""
+        if self._new_name_focus:
+            return ('new_name',)
+        if self._duration_focus:
+            return ('duration',)
+        if self._form_focus:
+            return ('form', self._form_focus)
+        if self._actor_focus:
+            return ('actor', self._actor_focus)
+        return None
+
+    def _tc_get(self, ident):
+        if ident is None:
+            return ''
+        kind = ident[0]
+        if kind == 'new_name':
+            v = self._new_name_buf
+        elif kind == 'duration':
+            v = self._duration_buf
+        elif kind == 'form':
+            v = self._form_time_buf if ident[1] == 'time' else self._form_params.get(ident[1], '')
+        elif kind == 'actor':
+            v = self._actor_id_buf if ident[1] == 'id' else ''
+        else:
+            v = ''
+        return v if isinstance(v, str) else str(v)
+
+    def _tc_set(self, ident, val):
+        kind = ident[0]
+        if kind == 'new_name':
+            self._new_name_buf = val
+        elif kind == 'duration':
+            self._duration_buf = val
+        elif kind == 'form':
+            if ident[1] == 'time':
+                self._form_time_buf = val
+            else:
+                self._form_params[ident[1]] = val
+        elif kind == 'actor' and ident[1] == 'id':
+            self._actor_id_buf = val
+
+    def _tc_is_multiline(self, ident):
+        return ident == ('form', 'text') and self._form_type == 'dialogue'
+
+    def _tc_set_repeat(self, on):
+        """Hold-to-repeat for Backspace / arrows while a field is focused
+        (the room editor does the same while editing text)."""
+        if on == self._tc_repeat_on:
+            return
+        self._tc_repeat_on = on
+        try:
+            pygame.key.set_repeat(400, 50) if on else pygame.key.set_repeat(0, 0)
+        except pygame.error:
+            pass
+
+    def _tc_reset(self):
+        self._tc_ident         = None
+        self._tc_pos           = 0
+        self._tc_anchor        = None
+        self._tc_drag          = False
+        self._tc_scroll        = 0
+        self._tc_vscroll       = None
+        self._tc_geom          = None
+        self._tc_pending_click = None
+        self._tc_set_repeat(False)
+
+    def _tc_sync(self):
+        """Reconcile caret state with whichever field is focused right now.
+        A newly focused field starts with the caret at its end, no selection.
+        Returns the focused field's identity (or None)."""
+        ident = self._tc_ident_now()
+        if ident != self._tc_ident:
+            self._tc_ident   = ident
+            self._tc_anchor  = None
+            self._tc_pos     = len(self._tc_get(ident))
+            self._tc_scroll  = 0
+            self._tc_vscroll = None
+            self._tc_geom    = None
+            self._tc_set_repeat(ident is not None)
+            if ident is None:
+                self._tc_drag = False
+                self._tc_pending_click = None
+        elif ident is not None:
+            n = len(self._tc_get(ident))
+            self._tc_pos = min(self._tc_pos, n)
+            if self._tc_anchor is not None:
+                self._tc_anchor = min(self._tc_anchor, n)
+        return ident
+
+    def _tc_has_sel(self):
+        return self._tc_anchor is not None and self._tc_anchor != self._tc_pos
+
+    def _tc_sel_range(self):
+        a, b = self._tc_anchor, self._tc_pos
+        return (a, b) if a <= b else (b, a)
+
+    def _tc_delete_sel(self, ident):
+        """Remove the selected text (if any). True if anything was removed."""
+        if not self._tc_has_sel():
+            return False
+        s, e = self._tc_sel_range()
+        buf = self._tc_get(ident)
+        self._tc_set(ident, buf[:s] + buf[e:])
+        self._tc_pos = s
+        self._tc_anchor = None
+        return True
+
+    def _tc_insert(self, ident, text):
+        """Type / paste *text* at the caret, replacing the selection.  Pasted
+        text is sanitised per field, and the dialogue field is trimmed to what
+        still fits the dialogue box (a no-op insert never eats the selection)."""
+        multiline = self._tc_is_multiline(ident)
+        text = text.replace('\r\n', '\n').replace('\r', '\n')
+        if multiline:
+            text = ''.join(ch for ch in text if ch == '\n' or ch.isprintable())
+        else:
+            text = ''.join(' ' if ch in '\n\t' else ch for ch in text)
+            text = ''.join(ch for ch in text if ch.isprintable())
+        if ident == ('new_name',):
+            text = ''.join(ch for ch in text if ch not in self._NAME_BAD_CHARS)
+        if not text:
+            return
+
+        buf = self._tc_get(ident)
+        lo, hi = self._tc_sel_range() if self._tc_has_sel() else (self._tc_pos, self._tc_pos)
+
+        if multiline and self.dialogue_box is not None:
+            portrait = self._form_params.get('portrait') or None
+
+            def fits(t):
+                return self.dialogue_box.fits_box(buf[:lo] + t + buf[hi:], portrait_key=portrait)
+
+            if fits(text):
+                self._text_limit_hit = False
+            else:
+                # Longest prefix of the inserted text that still fits.
+                a, b = 0, len(text)
+                while a < b:
+                    mid = (a + b + 1) // 2
+                    if fits(text[:mid]):
+                        a = mid
+                    else:
+                        b = mid - 1
+                text = text[:a]
+                self._text_limit_hit = True
+                if not text:
+                    return
+        else:
+            self._text_limit_hit = False
+
+        if ident == ('new_name',):
+            self._list_msg = ''
+        self._tc_set(ident, buf[:lo] + text + buf[hi:])
+        self._tc_pos = lo + len(text)
+        self._tc_anchor = None
+
+    def _tc_line_of(self, ranges, pos):
+        for i, (s, e) in enumerate(ranges):
+            if s <= pos <= e:
+                return i
+        return len(ranges) - 1
+
+    def _tc_lines(self, text):
+        """Visual line ranges of the focused multiline field (a single range
+        when its geometry isn't known yet)."""
+        g = self._tc_geom
+        if g and g.get('kind') == 'multi' and g.get('ident') == self._tc_ident:
+            return self._wrap_ranges(g['font'], text, g['wrap_w'])
+        return [(0, len(text))]
+
+    @staticmethod
+    def _tc_col_from_x(font, text, rel_x):
+        """Caret index in *text* whose position is closest to rel_x pixels."""
+        if not text or rel_x <= 0:
+            return 0
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if font.size(text[:mid])[0] >= rel_x:
+                hi = mid
+            else:
+                lo = mid + 1
+        i = lo
+        if i > 0 and abs(font.size(text[:i - 1])[0] - rel_x) <= abs(font.size(text[:i])[0] - rel_x):
+            i -= 1
+        return i
+
+    def _tc_index_at(self, pos):
+        """Map a screen position to a caret index in the focused field using
+        the geometry its last draw recorded (None if unknown)."""
+        g = self._tc_geom
+        if not g or g.get('ident') != self._tc_ident or self._tc_ident is None:
+            return None
+        text = self._tc_get(self._tc_ident)
+        font = g['font']
+        x = max(g['rect'].left, min(pos[0], g['rect'].right))
+        if g['kind'] == 'single':
+            return self._tc_col_from_x(font, text, x - g['x0'])
+        ranges = self._wrap_ranges(font, text, g['wrap_w'])
+        row = int((pos[1] - g['y0']) // g['line_h']) + g['start']
+        row = max(0, min(len(ranges) - 1, row))
+        s, e = ranges[row]
+        return s + self._tc_col_from_x(font, text[s:e], x - g['x0'])
+
+    def _tc_set_geom(self, **geom):
+        """Called by the field draw code for the focused field: records its
+        geometry and turns a pending click into a caret / selection anchor."""
+        geom['ident'] = self._tc_ident
+        self._tc_geom = geom
+        pc = self._tc_pending_click
+        if pc is None:
+            return
+        self._tc_pending_click = None
+        idx = self._tc_index_at(pc)
+        if idx is None:
+            return
+        if pygame.key.get_mods() & pygame.KMOD_SHIFT:
+            if self._tc_anchor is None:
+                self._tc_anchor = self._tc_pos
+        else:
+            self._tc_anchor = idx
+        self._tc_pos = idx
+        self._blink = 0.0
+
+    def _tc_drag_to(self, pos):
+        """Mouse moved with the button held after clicking into a field."""
+        if self._tc_ident is None:
+            return
+        idx = self._tc_index_at(pos)
+        if idx is not None:
+            self._tc_pos = idx
+            self._blink = 0.0
+
+    def _tc_text_x(self, font, text, inner):
+        """X where a focused single-line field's text starts, scrolled just
+        enough to keep the caret visible (long text starts out tail-first, as
+        before, because the caret starts at the end)."""
+        vis = inner.w - 4
+        w = font.size(text)[0]
+        cp = font.size(text[:min(self._tc_pos, len(text))])[0]
+        off = self._tc_scroll
+        if cp - off > vis:
+            off = cp - vis
+        if cp - off < 0:
+            off = cp
+        off = max(0, min(off, max(0, w - vis)))
+        self._tc_scroll = off
+        return inner.x - off
+
+    def _tc_draw_single(self, screen, font, text, x, cy, field_rect):
+        """Selection highlight + caret for a focused single-line field whose
+        text was just drawn at x (vertically centred on cy)."""
+        h = font.get_height()
+        top = cy - h // 2
+        self._tc_set_geom(kind='single', rect=pygame.Rect(field_rect), x0=x, font=font)
+        n = len(text)
+        if self._tc_has_sel():
+            a, b = self._tc_sel_range()
+            a, b = min(a, n), min(b, n)
+            sx = x + font.size(text[:a])[0]
+            ex = x + font.size(text[:b])[0]
+            uk.draw_rect_on(screen, (*uk.Theme.KI_BLUE, 90),
+                            pygame.Rect(sx, top, max(1, ex - sx), h), 0, 0)
+        self._caret(screen, x + font.size(text[:min(self._tc_pos, n)])[0], top, h)
+
+    def _tc_edit_key(self, ident, event):
+        """Apply one KEYDOWN to the focused field's text (caret movement,
+        selection, clipboard, deletion, typing)."""
+        key   = event.key
+        ctrl  = bool(event.mod & (pygame.KMOD_CTRL | pygame.KMOD_META))
+        shift = bool(event.mod & pygame.KMOD_SHIFT)
+        multiline = self._tc_is_multiline(ident)
+        buf = self._tc_get(ident)
+        n   = len(buf)
+        self._blink = 0.0
+
+        def move(p):
+            if shift:
+                if self._tc_anchor is None:
+                    self._tc_anchor = self._tc_pos
+            else:
+                self._tc_anchor = None
+            self._tc_pos = max(0, min(n, p))
+
+        if ctrl and key == pygame.K_a:
+            self._tc_anchor = 0
+            self._tc_pos = n
+        elif ctrl and key in (pygame.K_c, pygame.K_x):
+            if self._tc_has_sel():
+                s, e = self._tc_sel_range()
+                uk.clipboard_set_text(buf[s:e])
+                if key == pygame.K_x:
+                    self._tc_delete_sel(ident)
+                    self._text_limit_hit = False
+        elif ctrl and key == pygame.K_v:
+            self._tc_insert(ident, uk.clipboard_get_text() or '')
+        elif key == pygame.K_LEFT:
+            if not shift and self._tc_has_sel():
+                self._tc_pos = self._tc_sel_range()[0]
+                self._tc_anchor = None
+            else:
+                move(self._tc_pos - 1)
+        elif key == pygame.K_RIGHT:
+            if not shift and self._tc_has_sel():
+                self._tc_pos = self._tc_sel_range()[1]
+                self._tc_anchor = None
+            else:
+                move(self._tc_pos + 1)
+        elif key in (pygame.K_HOME, pygame.K_END):
+            if multiline:
+                ranges = self._tc_lines(buf)
+                s, e = ranges[self._tc_line_of(ranges, self._tc_pos)]
+                move(s if key == pygame.K_HOME else e)
+            else:
+                move(0 if key == pygame.K_HOME else n)
+        elif key in (pygame.K_UP, pygame.K_DOWN) and multiline:
+            ranges = self._tc_lines(buf)
+            li = self._tc_line_of(ranges, self._tc_pos)
+            g = self._tc_geom
+            font = g['font'] if g else self.font_medium
+            s, e = ranges[li]
+            x = font.size(buf[s:max(s, min(self._tc_pos, e))])[0]
+            tgt = li - 1 if key == pygame.K_UP else li + 1
+            if tgt < 0:
+                move(0)
+            elif tgt >= len(ranges):
+                move(n)
+            else:
+                ts, te = ranges[tgt]
+                move(ts + self._tc_col_from_x(font, buf[ts:te], x))
+        elif key == pygame.K_BACKSPACE:
+            self._text_limit_hit = False
+            self._list_msg = ''
+            if not self._tc_delete_sel(ident) and self._tc_pos > 0:
+                p = self._tc_pos
+                self._tc_set(ident, buf[:p - 1] + buf[p:])
+                self._tc_pos = p - 1
+        elif key == pygame.K_DELETE:
+            self._text_limit_hit = False
+            self._list_msg = ''
+            if not self._tc_delete_sel(ident) and self._tc_pos < n:
+                p = self._tc_pos
+                self._tc_set(ident, buf[:p] + buf[p + 1:])
+        elif key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            if multiline:           # hard line break (single-line fields never get here)
+                self._tc_insert(ident, '\n')
+        elif event.unicode and event.unicode.isprintable():
+            self._tc_insert(ident, event.unicode)
+
     def _handle_text_field(self, attr, event, field_key=None, actor_key=None):
         """Apply one KEYDOWN event to whichever text buffer currently has focus.
 
@@ -1748,59 +2163,9 @@ class CutsceneEditor:
             self._actor_focus    = None
             return
 
-        if attr:
-            buf = getattr(self, attr)
-        elif field_key == 'time':
-            buf = self._form_time_buf
-        elif field_key:
-            buf = self._form_params.get(field_key, '')
-        elif actor_key == 'id':
-            buf = self._actor_id_buf
-        else:
-            buf = ''
-
-        if key == pygame.K_BACKSPACE:
-            buf = buf[:-1]
-            self._text_limit_hit = False
-            self._list_msg = ''
-        elif key in (pygame.K_RETURN, pygame.K_KP_ENTER) and is_dialogue_text:
-            # Hard line break — still subject to the dialogue box capacity.
-            new_buf = buf + '\n'
-            if (self.dialogue_box is not None
-                    and not self.dialogue_box.fits_box(
-                        new_buf, portrait_key=self._form_params.get('portrait') or None)):
-                self._text_limit_hit = True
-                return
-            buf = new_buf
-            self._text_limit_hit = False
-        elif event.unicode and event.unicode.isprintable():
-            ch = event.unicode
-            if attr == '_new_name_buf':
-                # The name becomes a filename — keep it to characters every OS accepts.
-                if ch in '\\/:*?"<>|':
-                    return
-                self._list_msg = ''
-            new_buf = buf + ch
-            if (is_dialogue_text
-                    and self.dialogue_box is not None
-                    and not self.dialogue_box.fits_box(
-                        new_buf, portrait_key=self._form_params.get('portrait') or None)):
-                # Refuse the keystroke rather than let the designer type more
-                # than the dialogue box can actually show — draw() would
-                # otherwise silently cut the overflow off the bottom.
-                self._text_limit_hit = True
-                return
-            buf = new_buf
-            self._text_limit_hit = False
-
-        if attr:
-            setattr(self, attr, buf)
-        elif field_key == 'time':
-            self._form_time_buf = buf
-        elif field_key:
-            self._form_params[field_key] = buf
-        elif actor_key == 'id':
-            self._actor_id_buf = buf
+        ident = self._tc_sync()
+        if ident is not None:
+            self._tc_edit_key(ident, event)
 
     def _handle_duration_field(self, event):
         key = event.key
@@ -1808,10 +2173,9 @@ class CutsceneEditor:
             self._commit_duration()
             self._duration_focus = False
             return
-        if key == pygame.K_BACKSPACE:
-            self._duration_buf = self._duration_buf[:-1]
-        elif event.unicode and event.unicode.isprintable():
-            self._duration_buf += event.unicode
+        ident = self._tc_sync()
+        if ident is not None:
+            self._tc_edit_key(ident, event)
 
     def _commit_duration(self):
         """Parse _duration_buf and write it back to cutscene_data['duration']."""
@@ -1878,7 +2242,7 @@ class CutsceneEditor:
         # Update the playhead position instantly so it renders at the cursor
         # without waiting for the expensive seek().  The actual scene scrub
         # is deferred to update() so it runs at most once per frame.
-        self._tl_playhead_t  = _clamp(t, 0.0, dur)
+        self._tl_playhead_t  = _clamp(t, self._tl_min_t(), dur)
         self._scrub_pending  = True
         self._tl_auto_scroll = self._calc_tl_auto_scroll(mx)
 
@@ -1897,11 +2261,12 @@ class CutsceneEditor:
         label_end_x = tl.x + self._tl_label_w
         dur         = self.cutscene_data.get('duration', 10.0)
         raw_t       = (mouse_x - label_end_x + self._tl_scroll_x) / self._tl_time_zoom
-        new_t       = round(_clamp(raw_t + self._kf_drag_offset, 0.0, dur), 3)
+        min_t       = self._tl_min_t()
+        new_t       = round(_clamp(raw_t + self._kf_drag_offset, min_t, dur), 3)
         new_t       = self._snap_time(new_t)
         delta       = new_t - self._kf_drag_orig
         starts      = [t for _a, t in self._kf_drag_group]
-        delta       = max(-min(starts), min(delta, dur - max(starts)))
+        delta       = max(min_t - min(starts), min(delta, dur - max(starts)))
         for act, t0 in self._kf_drag_group:
             act['time'] = round(t0 + delta, 3)
         # Keep the inspector time field in sync while dragging
@@ -2062,7 +2427,9 @@ class CutsceneEditor:
         if ruler_y <= my < tracks_y and mx >= time_area_x:
             t = (mx - time_area_x + self._tl_scroll_x) / self._tl_time_zoom
             dur = self.cutscene_data.get('duration', 10.0) if self.cutscene_data else 10.0
-            self._scrub_to(_clamp(t, 0.0, dur))
+            t = _clamp(t, self._tl_min_t(), dur)
+            self._tl_playhead_t = t
+            self._scrub_to(t)
             self._tl_play_drag  = True
             return
 
@@ -2094,6 +2461,8 @@ class CutsceneEditor:
                     continue
                 if action_type is not None and action.get('type') != action_type:
                     continue
+                if action.get('_prefix'):
+                    continue          # fail-sequence view: pre-QTE context is locked
                 kf_x = time_area_x + action['time'] * self._tl_time_zoom - self._tl_scroll_x
                 dist = abs(mx - kf_x)
                 if dist < best_dist:
@@ -2181,7 +2550,7 @@ class CutsceneEditor:
             dur = round(span, 3)
             self.cutscene_data['duration'] = dur
             self._duration_buf = str(dur)
-        t0 = _clamp(t0, 0.0, dur - span)
+        t0 = max(self._tl_min_t(), _clamp(t0, 0.0, dur - span))
         new = []
         for rt, a in items:
             c = copy.deepcopy(a)
@@ -2371,9 +2740,12 @@ class CutsceneEditor:
             'y0':  my - tracks_y + self._tl_scroll_y,
         }
 
-    def _marquee_bounds(self):
-        """Current rubber-band as (t_min, t_max, y_min, y_max) in content space."""
-        m = self._tl_marquee
+    def _marquee_bounds(self, m=None):
+        """Current rubber-band as (t_min, t_max, y_min, y_max) in content space.
+        *m* lets _finish_marquee pass the marquee it already detached from
+        self._tl_marquee (which it clears first)."""
+        if m is None:
+            m = self._tl_marquee
         _, label_end_x, _ruler_y, tracks_y = self._tl_geometry()
         mx, my = self._mouse_pos
         t1 = (mx - label_end_x + self._tl_scroll_x) / self._tl_time_zoom
@@ -2391,7 +2763,7 @@ class CutsceneEditor:
             if m['in_row'] and not m['additive']:
                 self._set_selection([])
             return
-        t_min, t_max, y_min, y_max = self._marquee_bounds()
+        t_min, t_max, y_min, y_max = self._marquee_bounds(m)
         pad_t = 6.0 / self._tl_time_zoom
         rh = self._tl_row_h
         picked = []
@@ -2404,6 +2776,8 @@ class CutsceneEditor:
                     continue
                 if row['action_type'] is not None and act.get('type') != row['action_type']:
                     continue
+                if act.get('_prefix'):
+                    continue          # locked pre-QTE context
                 if t_min - pad_t <= act['time'] <= t_max + pad_t:
                     picked.append(act)
         if m['additive']:
@@ -2453,9 +2827,9 @@ class CutsceneEditor:
                     self._tl_time_zoom * (1.12 ** dy),
                     self._tl_zoom_min, self._tl_zoom_max)
                 self._tl_scroll_x = pivot_t * self._tl_time_zoom - (mx - label_end_x)
-                self._tl_scroll_x = max(0.0, self._tl_scroll_x)
+                self._tl_scroll_x = max(self._tl_min_scroll(), self._tl_scroll_x)
             elif keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]:
-                self._tl_scroll_x = max(0.0, self._tl_scroll_x - dy * 30)
+                self._tl_scroll_x = max(self._tl_min_scroll(), self._tl_scroll_x - dy * 30)
             else:
                 # Vertical scroll through the track list.
                 visible_h    = tl.bottom - tracks_y
@@ -2487,10 +2861,15 @@ class CutsceneEditor:
                 self._new_name_focus = True
             elif kind == 'duration':
                 if self.cutscene_data:
-                    self._duration_buf   = str(self.cutscene_data.get('duration', 10.0))
+                    if not self._duration_focus:   # re-clicking must not discard typed text
+                        self._duration_buf = str(self.cutscene_data.get('duration', 10.0))
                     self._duration_focus = True
                     self._form_focus     = None
                     self._actor_focus    = None
+            if self._tc_ident_now() is not None:
+                # Place the caret / start a drag-selection at the click on the next draw.
+                self._tc_pending_click = tuple(self._mouse_pos)
+                self._tc_drag          = True
             return
 
         # ── Global / header ───────────────────────────────────────────────────
@@ -2619,6 +2998,12 @@ class CutsceneEditor:
         # ── Timeline toolbar ──────────────────────────────────────────────────
         elif action == 'tl_add':
             self._open_new_action_form()
+        elif action == 'fail_edit':
+            self._enter_fail_edit()
+        elif action == 'fail_done':
+            self._exit_fail_edit(True)
+        elif action == 'fail_discard':
+            self._exit_fail_edit(False)
         elif action == 'tl_del':
             self._delete_selection()
         elif action == 'tl_copy':
@@ -2736,7 +3121,7 @@ class CutsceneEditor:
         self._form_active   = True
         self._form_new      = True
         self._form_focus    = None
-        self._form_time_buf = f'{self._tl_playhead_t:.2f}'
+        self._form_time_buf = f'{max(self._tl_playhead_t, self._tl_min_t()):.2f}'
         self._set_form_target('camera')
         self._set_form_type('pan_to')
 
@@ -2936,6 +3321,8 @@ class CutsceneEditor:
             return list(_DIRECTIONS), label_fn, None, None
         if hint == 'invert_mode':
             return list(_INVERT_MODES), label_fn, None, None
+        if hint == 'qte_mode':
+            return ['spam', 'timing'], label_fn, None, None
         if hint == 'attack_type':
             return list(discover_attacks() or _ATTACK_TYPES), label_fn, None, None
         if hint == 'weather_type':
@@ -3273,7 +3660,11 @@ class CutsceneEditor:
             'loop': 'True', 'fade_in': 'True', 'fade_out': 'True',
             'attack_type': (discover_attacks() or _ATTACK_TYPES)[0], 'deal_damage': 'False',
             'visible': 'True',
+            'fill_per_press': '0.08', 'drain_rate': '0.15',
+            'sweep_speed': '0.9', 'max_attempts': '0', 'fail_hold': '0.5',
         }
+        if key == 'mode' and self._form_type == 'qte':
+            return 'spam'
         if key == 'color':
             # flash defaults to a white pop; fade_in/fade_out default to a
             # plain black fade (matches CutsceneRuntime's own [0,0,0]
@@ -3297,6 +3688,7 @@ class CutsceneEditor:
             t = float(self._form_time_buf)
         except ValueError:
             t = 0.0
+        t = max(t, self._tl_min_t())   # fail-sequence view: nothing before the QTE
 
         params = {}
         for key, _label, hint in _ACTION_PARAMS.get(self._form_type, []):
@@ -3322,6 +3714,10 @@ class CutsceneEditor:
             actions.append(action)
         else:
             if 0 <= self._tl_sel < len(actions):
+                if actions[self._tl_sel].get('_prefix'):
+                    action['_prefix'] = True     # fail-sequence view: still pre-QTE context
+                    if action['type'] == 'qte':
+                        action['params']['_fail_edit'] = True
                 actions[self._tl_sel] = action
 
         actions.sort(key=lambda a: a['time'])
@@ -3420,6 +3816,7 @@ class CutsceneEditor:
         cutscene (selections, undo history, cached sprites, playback, scroll)
         so the editor starts fresh for *data*."""
         self.cutscene_data  = data
+        self._fail_edit     = None
         self.unsaved        = False
         self._tl_sel        = -1
         self._tl_multi_ids  = set()
@@ -3487,13 +3884,154 @@ class CutsceneEditor:
         self._restore_viewport_state()
 
 
+    # ── QTE fail-sequence view ───────────────────────────────────────────────
+    # Select a timing-mode 'qte' keyframe and click "Edit fail sequence": the
+    # timeline switches to a copy holding (a) every normal action up to the QTE
+    # (shown dimmed, read-only in effect) so the scene is exactly as it is at
+    # that point, and (b) the QTE's existing fail actions as ordinary actions.
+    # Edit them like any timeline; "Done" writes them back tagged with
+    # params['qte_fail'] = qte_id (the runtime plays them after each miss, with
+    # times measured from the QTE keyframe) and restores the normal timeline.
+
+    def _tl_min_t(self):
+        """Earliest time the timeline can show / edit: the QTE keyframe in the
+        fail-sequence view (it IS the start of that timeline), else 0."""
+        return self._fail_edit['T'] if self._fail_edit else 0.0
+
+    def _tl_min_scroll(self):
+        """Smallest horizontal scroll (px). In the fail view the left edge is
+        the QTE keyframe, minus a few px so its diamond isn't clipped."""
+        if not self._fail_edit:
+            return 0.0
+        return max(0.0, self._fail_edit['T'] * self._tl_time_zoom - 12.0)
+
+    def _fail_merged_actions(self):
+        """Full action list for the real cutscene: the original actions with
+        this QTE's old fail actions replaced by what's in the working copy."""
+        import copy
+        fe, qid, T = self._fail_edit, self._fail_edit['qte_id'], self._fail_edit['T']
+        kept = [a for a in fe['orig'].get('actions', [])
+                if str((a.get('params') or {}).get('qte_fail') or '') != qid]
+        new = []
+        for a in self.cutscene_data.get('actions', []):
+            if a.get('_prefix'):
+                continue                      # pre-QTE context: edits discarded
+            if a.get('target') == 'screen' and a.get('type') == 'qte':
+                continue                      # no QTE inside a fail sequence
+            b = copy.deepcopy(a)
+            b.pop('_prefix', None)
+            b.setdefault('params', {})['qte_fail'] = qid
+            b['params'].pop('_fail_edit', None)
+            b['time'] = round(max(T, float(b.get('time', T))), 3)
+            new.append(b)
+        return sorted(kept + new, key=lambda a: a['time'])
+
+    def _fail_edit_reset_view(self, t):
+        self._tl_sel = -1
+        self._tl_multi_ids.clear()
+        self._kf_drag_group = []
+        self._form_active = False
+        self._form_focus = None
+        self._actor_sel = -1
+        self._undo_stack.clear()
+        self._redo_stack.clear()
+        self._stop_preview()
+        self._runtime = None
+        self._duration_buf = str(self.cutscene_data.get('duration', 10.0))
+        self._tl_playhead_t = t
+        self._tl_scroll_x = max(self._tl_min_scroll(), t * self._tl_time_zoom - 120.0)
+        self._scrub_to(t)
+
+    def _enter_fail_edit(self):
+        import copy
+        data = self.cutscene_data
+        actions = data.get('actions', []) if data else []
+        if self._fail_edit or not (0 <= self._tl_sel < len(actions)):
+            return
+        q = actions[self._tl_sel]
+        qid = str((q.get('params') or {}).get('qte_id') or '').strip()
+        if q.get('type') != 'qte' or q.get('target') != 'screen' or not qid:
+            return
+        T = float(q.get('time', 0.0))
+        work = copy.deepcopy(data)
+        kept, fails = [], []
+        for a in work.get('actions', []):
+            p = a.get('params') or {}
+            tag = p.get('qte_fail')
+            if tag:
+                if str(tag) == qid:
+                    p.pop('qte_fail', None)
+                    a['params'] = p
+                    a['time'] = max(T, float(a.get('time', T)))
+                    fails.append(a)
+                continue                      # other QTEs' fail actions stay out of view
+            if float(a.get('time', 0.0)) <= T:
+                a['_prefix'] = True
+                if a.get('type') == 'qte' and a.get('target') == 'screen':
+                    a.setdefault('params', {})['_fail_edit'] = True   # inert marker in preview
+                kept.append(a)
+        work['actions'] = sorted(kept + fails, key=lambda a: a['time'])
+        last = max([a['time'] for a in fails], default=T)
+        work['duration'] = max(T + 10.0, last + 3.0)
+        self._fail_edit = {'orig': data, 'qte_id': qid, 'T': T}
+        self.cutscene_data = work
+        self._fail_edit_reset_view(T)
+
+    def _exit_fail_edit(self, commit):
+        fe = self._fail_edit
+        if not fe:
+            return
+        if commit:
+            fe['orig']['actions'] = self._fail_merged_actions()
+            self.unsaved = True
+        self.cutscene_data = fe['orig']
+        self._fail_edit = None
+        self._fail_edit_reset_view(fe['T'])
+
+    def _draw_fail_banner(self, screen, x, y, W):
+        fe = self._fail_edit
+        pad = 12
+        lines = self._wrap_text(
+            self.font_small,
+            'This timeline starts at the QTE keyframe: everything before it is locked. '
+            'Add actions from here on - they play after each miss, then the bar comes '
+            'back. Hit the bar and the normal timeline continues instead.', W - pad * 2)
+        lh = self._fh('s') + 4
+        H = pad * 2 + self._fh('m') + 6 + lh + 8 + lh * len(lines)
+        card = pygame.Rect(x, y, W, H)
+        uk.draw_panel(screen, card, bg=(*_ROW_BASE, 255), border=uk.Theme.GOLD,
+                      border_width=1, radius=8, shadow=False)
+        cy = card.y + pad
+        self._txt(screen, self.font_medium, 'Editing FAIL sequence', (card.x + pad, cy),
+                  uk.Theme.GOLD, dynamic=True)
+        cy += self._fh('m') + 6
+        self._txt(screen, self.font_small, f"QTE '{fe['qte_id']}'  at  {fe['T']:.2f} s",
+                  (card.x + pad, cy), uk.Theme.TEXT_SECONDARY, dynamic=True)
+        cy += lh + 8
+        for line in lines:
+            self._txt(screen, self.font_small, line, (card.x + pad, cy), uk.Theme.TEXT_MUTED)
+            cy += lh
+        y = card.bottom + 10
+        self._button(screen, pygame.Rect(x, y, W, 34), 'Done - back to main timeline', None,
+                     'fail_done', primary=True, key='insp:fail_done')
+        y += 34 + 6
+        self._button(screen, pygame.Rect(x, y, W, 30), 'Discard fail changes', None,
+                     'fail_discard', danger=True, key='insp:fail_discard')
+        return y + 30 + 10
+
     def _save_cutscene(self):
         """Write cutscene_data to disk and persist the viewport state."""
         if not self.cutscene_data:
             return
         _ensure_dir()
+        data = self.cutscene_data
+        if self._fail_edit:
+            # Mid fail-sequence edit: write the real cutscene with the sequence
+            # merged in, never the temporary working copy.
+            data = dict(self._fail_edit['orig'])
+            data['actions'] = self._fail_merged_actions()
         with open(_cutscene_path(self.cutscene_name), 'w') as f:
-            json.dump(self.cutscene_data, f, indent=2)
+            json.dump(data, f, indent=2)
         self.unsaved     = False
         self._autosave_t = 0.0   # reset the autosave debounce timer
         self._save_viewport_state()
@@ -3510,7 +4048,8 @@ class CutsceneEditor:
                 from core.cutscene_runtime import CutsceneRuntime
                 self._runtime = CutsceneRuntime(
                     self.cutscene_data, self.camera, self._entity_factory,
-                    dialogue_box=self.dialogue_box, sound_manager=self.sound_manager)
+                    dialogue_box=self.dialogue_box, sound_manager=self.sound_manager,
+                    qte_bar=self._qte_bar)
             except Exception as e:
                 print(f'[CutsceneEditor] _scrub_to runtime error: {e}')
                 return
@@ -3567,7 +4106,8 @@ class CutsceneEditor:
             if self._runtime is None:
                 self._runtime = CutsceneRuntime(
                     self.cutscene_data, self.camera, self._entity_factory,
-                    dialogue_box=self.dialogue_box, sound_manager=self.sound_manager)
+                    dialogue_box=self.dialogue_box, sound_manager=self.sound_manager,
+                    qte_bar=self._qte_bar)
             hold = None if self._cam_track else (self.camera.x, self.camera.y)
             self._runtime.seek(self._tl_playhead_t)
             if hold is not None:
@@ -3646,6 +4186,13 @@ class CutsceneEditor:
         # Dismiss any dialogue box so it doesn't stay frozen on screen.
         if self.dialogue_box:
             self.dialogue_box.hide()
+        # Likewise a QTE bar / fail sequence left running when playback is
+        # stopped mid-step. abort_qte() also rewinds the clock to the QTE.
+        if self._qte_bar is not None:
+            self._qte_bar.stop()
+        if self._runtime is not None:
+            self._runtime.abort_qte()
+            self._tl_playhead_t = self._runtime.elapsed
         # Cut any music the cutscene started (play_music action) or that was
         # left over from a Preview button click — otherwise it keeps playing
         # indefinitely after playback stops, with no fade-out ever fired.
@@ -4296,7 +4843,7 @@ class CutsceneEditor:
     # UI primitives  (immediate-mode: draw + register hit rect in one call)
     # ══════════════════════════════════════════════════════════════════════════
 
-    _ENUM_HINTS = frozenset({'dir', 'anim', 'portrait', 'invert_mode', 'weather_type',
+    _ENUM_HINTS = frozenset({'dir', 'anim', 'portrait', 'invert_mode', 'qte_mode', 'weather_type',
                              'scroll_dir', 'character', 'costume', 'music_track',
                              'sfx_name', 'sfx_name_any', 'attack_type', 'color'})
 
@@ -4512,14 +5059,64 @@ class CutsceneEditor:
         if not shown and not focused and placeholder:
             shown = placeholder
         surf = font.render(shown, True, color)
-        x = inner.x if surf.get_width() <= inner.w - 4 else inner.right - surf.get_width() - 4
+        editing = bool(focused) and self._tc_ident is not None
+        if editing:
+            x = self._tc_text_x(font, text or '', inner)
+        else:
+            x = inner.x if surf.get_width() <= inner.w - 4 else inner.right - surf.get_width() - 4
         pos = (x, rect.centery - surf.get_height() // 2)
         uk.blit_surface(screen, surf, pos, transient=True)
-        if focused:
-            cx = x + (surf.get_width() + 2 if text else 0)
-            self._caret(screen, cx, rect.centery - self._fh('m') // 2, self._fh('m'))
+        if editing:
+            self._tc_draw_single(screen, font, text or '', x, rect.centery, rect)
         self._pop_clip(screen)
         return hov
+
+    def _wrap_ranges(self, font, text, max_w):
+        """Same wrapping as _wrap_text, but returns each visual line as a
+        (start, end) index range into *text* — what caret / selection code
+        needs.  text[s:e] is exactly the line _wrap_text would produce; the
+        one character between consecutive lines (the dropped space or the
+        newline) belongs to no line."""
+        max_w = max(1, max_w)
+        text = text or ''
+        ranges = []
+        base = 0
+        for paragraph in text.split('\n'):
+            plen = len(paragraph)
+            if paragraph == '':
+                ranges.append((base, base))
+                base += 1
+                continue
+            cs = ce = None            # current line (None == empty)
+            pos = base
+            for word in paragraph.split(' '):
+                ws, we = pos, pos + len(word)
+                pos = we + 1
+                cur_empty = cs is None or ce == cs
+                cand_s, cand_e = (ws, we) if cur_empty else (cs, we)
+                if font.size(text[cand_s:cand_e])[0] <= max_w:
+                    cs, ce = cand_s, cand_e
+                    continue
+                if not cur_empty:
+                    ranges.append((cs, ce))
+                cs = ce = None
+                if font.size(text[ws:we])[0] <= max_w:
+                    cs, ce = ws, we
+                else:
+                    chs, che = ws, ws
+                    for k in range(ws, we):
+                        if font.size(text[chs:k + 1])[0] <= max_w:
+                            che = k + 1
+                        else:
+                            if che > chs:
+                                ranges.append((chs, che))
+                            chs, che = k, k + 1
+                    cs, ce = chs, che
+            if cs is None:
+                cs = ce = base + plen
+            ranges.append((cs, ce))
+            base += plen + 1
+        return ranges or [(0, 0)]
 
     def _wrap_text(self, font, text, max_w):
         """Word-wrap *text* to fit *max_w* pixels.  Preserves explicit '\\n'
@@ -4561,8 +5158,10 @@ class CutsceneEditor:
         font = self.font_medium
         pad_x, pad_y = 12, 8
         line_h = self._fh('m') + 4
-        lines = self._wrap_text(font, buf or '', W - pad_x * 2)
-        n_rows = int(_clamp(len(lines), 2, max(2, max_lines)))
+        text = buf or ''
+        wrap_w = W - pad_x * 2
+        ranges = self._wrap_ranges(font, text, wrap_w)
+        n_rows = int(_clamp(len(ranges), 2, max(2, max_lines)))
         rect = pygame.Rect(x, y, W, pad_y * 2 + n_rows * line_h)
 
         hov = self._hit(rect, 'field', ('form', key))
@@ -4576,15 +5175,54 @@ class CutsceneEditor:
                       border_width=2 if focused else 1 + round(t), radius=8, shadow=False)
 
         self._push_clip(screen, rect.inflate(-pad_x, -pad_y))
-        start = max(0, len(lines) - n_rows)      # keep the caret's line in view
-        for i, line in enumerate(lines[start:start + n_rows]):
+        max_start = max(0, len(ranges) - n_rows)
+        editing = bool(focused) and self._tc_ident == ('form', key)
+        x0 = rect.x + pad_x
+        if editing:
+            # Scroll just enough to keep the caret's line visible (a fresh
+            # focus starts at the bottom, where the caret is).
+            vs = max_start if self._tc_vscroll is None else self._tc_vscroll
+            vs = int(_clamp(vs, 0, max_start))
+            self._tc_set_geom(kind='multi', rect=rect, x0=x0, y0=rect.y + pad_y,
+                              line_h=line_h, start=vs, font=font, wrap_w=wrap_w)
+            n = len(text)
+            pos = min(self._tc_pos, n)
+            car_line = self._tc_line_of(ranges, pos)
+            if car_line < vs:
+                vs = car_line
+            elif car_line > vs + n_rows - 1:
+                vs = car_line - n_rows + 1
+            self._tc_vscroll = vs
+            self._tc_geom['start'] = vs
+            start = vs
+            sel = None
+            if self._tc_has_sel():
+                a, b = self._tc_sel_range()
+                sel = (min(a, n), min(b, n))
+        else:
+            start = max_start
+        for i, (ls, le) in enumerate(ranges[start:start + n_rows]):
             ly = rect.y + pad_y + i * line_h
+            line = text[ls:le]
             if line:
                 surf = font.render(line, True, uk.Theme.TEXT_PRIMARY)
-                uk.blit_surface(screen, surf, (rect.x + pad_x, ly), transient=True)
-            if focused and start + i == len(lines) - 1:
-                cx = rect.x + pad_x + (font.size(line)[0] + 2 if line else 0)
-                self._caret(screen, cx, ly, self._fh('m'))
+                uk.blit_surface(screen, surf, (x0, ly), transient=True)
+            if not editing:
+                continue
+            if sel is not None:
+                a, b = sel
+                if a <= le and b >= ls:
+                    lo, hi = max(a, ls), min(b, le)
+                    sx = x0 + font.size(text[ls:lo])[0]
+                    ex = x0 + font.size(text[ls:hi])[0]
+                    if a <= le < b and le < n:       # selection covers the line break
+                        ex += font.size(' ')[0]
+                    if ex > sx:
+                        uk.draw_rect_on(screen, (*uk.Theme.KI_BLUE, 90),
+                                        pygame.Rect(sx, ly, ex - sx, self._fh('m')), 0, 0)
+            if start + i == car_line:
+                self._caret(screen, x0 + font.size(text[ls:max(ls, min(pos, le))])[0],
+                            ly, self._fh('m'))
         self._pop_clip(screen)
         return rect.bottom
 
@@ -5007,6 +5645,11 @@ class CutsceneEditor:
                          'form_cancel', danger=True, key='insp:cancel')
 
     def _draw_inspector_idle(self, screen, x, y, W):
+        if self._fail_edit:
+            y = self._draw_fail_banner(screen, x, y, W)
+        return self._draw_inspector_idle_body(screen, x, y, W)
+
+    def _draw_inspector_idle_body(self, screen, x, y, W):
         """Nothing being edited: a gentle empty state, plus a read-only summary
         of the selected action if there is one."""
         actions = self.cutscene_data.get('actions', []) if self.cutscene_data else []
@@ -5046,6 +5689,29 @@ class CutsceneEditor:
             self._button(screen, pygame.Rect(x, y, W, 36), 'New action', _icon_plus, 'tl_add',
                          primary=True, key='insp:new')
             return y + 36
+
+        # QTE step selected: the fail-sequence button goes FIRST, above the
+        # (tall) summary card, so it never ends up scrolled out of view. It is
+        # always shown for a QTE step, greyed out with the reason when unusable.
+        if not self._fail_edit and sel.get('type') == 'qte' and sel.get('target') == 'screen':
+            sp = sel.get('params') or {}
+            ok_mode = sp.get('mode') == 'timing'
+            ok_id   = bool(str(sp.get('qte_id') or '').strip())
+            self._button(screen, pygame.Rect(x, y, W, 36), 'Edit fail sequence', None,
+                         'fail_edit', primary=True, enabled=(ok_mode and ok_id),
+                         key='insp:fail_edit')
+            y += 36 + 6
+            why = None
+            if not ok_mode:
+                why = 'Fail sequences need Mode = timing. Click "Edit action" and set Mode to timing.'
+            elif not ok_id:
+                why = 'Give this QTE an id first (Edit action > QTE Id).'
+            if why:
+                for line in self._wrap_text(self.font_small, why, W - 8):
+                    self._txt(screen, self.font_small, line, (x + W // 2, y),
+                              uk.Theme.TEXT_MUTED, anchor='midtop')
+                    y += self._fh('s') + 4
+            y += 10
 
         # Selected-action summary card
         color = self._target_color(sel.get('target', ''))
@@ -5281,6 +5947,13 @@ class CutsceneEditor:
             finally:
                 self.dialogue_box.screen_width  = _ow
                 self.dialogue_box.screen_height = _oh
+
+        # QTE bar for 'qte' steps — laid out inside the viewport rect, on top
+        # of the dialogue overlay, using the editor's per-frame blit helper.
+        if self._qte_bar is not None and self._qte_bar.active:
+            self._qte_bar.draw(
+                screen, offset=vp.topleft, size=vp.size,
+                blit_fn=lambda surf, pos: uk.blit_surface(screen, surf, pos))
 
     def _draw_viewport_hud(self, screen, vp):
         """Everything painted over the world: mode banner, drag hint ring,
@@ -5717,7 +6390,8 @@ class CutsceneEditor:
                     uk.draw_soft_glow(screen, (int(kf_x), kf_cy), 18, uk.Theme.GOLD, max_alpha=52)
                     _draw_diamond(screen, kf_x, kf_cy, 8 if dragging else 7, color, _WHITE, 2)
                 else:
-                    _draw_diamond(screen, kf_x, kf_cy, 8 if dragging else 6, color, (8, 10, 15), 1)
+                    _kcol = uk.lerp_color(row_bg, color, 0.3) if action.get('_prefix') else color
+                    _draw_diamond(screen, kf_x, kf_cy, 8 if dragging else 6, _kcol, (8, 10, 15), 1)
 
             uk.draw_rect_on(screen, (26, 30, 41), pygame.Rect(label_end_x, row_y + rh - 1, time_w, 1), 0, 0)
         self._pop_clip(screen)
@@ -5851,11 +6525,14 @@ class CutsceneEditor:
             self._text_rects.append(rect.clip(view))
             self._push_clip(screen, inner)
             shown = self._new_name_buf
-            surf = self.font_large.render(shown if shown else 'Cutscene name', True,
-                                          uk.Theme.TEXT_PRIMARY if shown else uk.Theme.TEXT_DIM)
-            uk.blit_surface(screen, surf, (inner.x, rect.centery - surf.get_height() // 2), transient=True)
-            self._caret(screen, inner.x + (surf.get_width() + 3 if shown else 0),
-                        rect.centery - self._fh('l') // 2, self._fh('l'))
+            nfont = self.font_large
+            surf = nfont.render(shown if shown else 'Cutscene name', True,
+                                uk.Theme.TEXT_PRIMARY if shown else uk.Theme.TEXT_DIM)
+            editing = self._tc_ident == ('new_name',)
+            tx = self._tc_text_x(nfont, shown, inner) if editing else inner.x
+            uk.blit_surface(screen, surf, (tx, rect.centery - surf.get_height() // 2), transient=True)
+            if editing:
+                self._tc_draw_single(screen, nfont, shown, tx, rect.centery, rect)
             self._pop_clip(screen)
             hint = self.font_small.render('ENTER to create  -  ESC to cancel', True, uk.Theme.TEXT_DIM)
             uk.blit_surface(screen, hint, hint.get_rect(midright=(rect.right - 20, rect.centery)).topleft)

@@ -37,6 +37,12 @@ Cutscene JSON format
          "params": {"duration": 1.0, "color": [0,0,0]}},
         {"time": 3.0,  "target": "screen", "type": "dialogue",
          "params": {"speaker": "Pui Pui", "text": "You dare challenge me?"}},
+        # Pauses the timeline until the player finishes the QTE bar, then
+        # carries on. mode "spam" = mash E/Q; mode "timing" = stop the
+        # sweeping crosshair (retries on a miss). Sets the flags the
+        # 'spam_qte' event action sets, incl. qte_result:<qte_id>:<outcome>.
+        {"time": 5.0,  "target": "screen", "type": "qte",
+         "params": {"qte_id": "lockpick", "mode": "timing", "sweep_speed": 0.9}},
 
         # Actor actions  (target = actor id string)
         {"time": 1.0, "target": "actor_0", "type": "set_animation",
@@ -405,10 +411,12 @@ class CutsceneRuntime:
         entity_factory: Callable(actor_def dict) → entity | None.
                         Lets the caller (game or editor) supply real entities.
         dialogue_box:   Optional DialogueBox for 'dialogue' actions.
+        qte_bar:        Optional SpamQTEBar for 'qte' actions. None (e.g. the
+                        editor's preview) makes them no-ops.
     """
 
     def __init__(self, cutscene_data, camera, entity_factory, dialogue_box=None,
-                 sound_manager=None):
+                 sound_manager=None, qte_bar=None):
         from config.settings import RENDER_SCALE
 
         self.data          = cutscene_data
@@ -418,16 +426,22 @@ class CutsceneRuntime:
         # tolerated — those actions just become no-ops, same as a missing
         # dialogue_box silently skipping dialogue actions.
         self.sound_manager = sound_manager
+        self._fail_seqs    = {}
+        # Shared SpamQTEBar owned by Game. While a 'qte' action's bar is
+        # active the timeline is frozen (same idea as a dialogue pause) and
+        # resumes the frame the bar goes inactive.
+        self.qte_bar       = qte_bar
+        self._qte_paused   = False
+        self._qte_active_id   = None   # qte_id of the bar this runtime started
+        self._qte_fail_hold   = 0.5    # s to linger after a fail sequence's last action
+        self._fail            = None   # running fail sequence state, or None
         self.elapsed       = 0.0
         self.finished      = False
         self.paused        = False
         self._RENDER_SCALE = RENDER_SCALE
 
         # Actions sorted by trigger time so we can fire them in order.
-        self.pending_actions = sorted(
-            cutscene_data.get('actions', []),
-            key=lambda a: a['time']
-        )
+        self._build_pending()
         self.action_index = 0
 
         # Colour overlay state — used by fade_in, fade_out, flash, set_overlay.
@@ -471,6 +485,14 @@ class CutsceneRuntime:
             entity = entity_factory(actor_def)
             if entity is not None:
                 self.actors[actor_def['id']] = CutsceneActor(actor_def['id'], entity)
+
+        # Load every animation sheet the script will use BEFORE playback
+        # starts. Otherwise the first set_animation/move_to to touch an
+        # un-loaded sheet (e.g. a dropped-in 2x.png) hot-loads it from disk
+        # mid-cutscene; the resulting frame hitch becomes one huge dt that
+        # skips the timeline forward -- animation cut short, next action
+        # fires early. (The editor preloads implicitly via seek().)
+        self._preload_actor_animations()
 
         # Purely-visual attack-effect previews (see create_attack_effect() /
         # AttackEffectVisual in core/cutscene_actor.py) — separate objects
@@ -568,6 +590,38 @@ class CutsceneRuntime:
             else:
                 self._weather.opacity = 1.0
 
+    def _preload_actor_animations(self):
+        """Hot-load every animation state referenced by the cutscene's actions."""
+        try:
+            from .cutscene_actor import _ATTACK_ANIMATIONS
+        except Exception:
+            _ATTACK_ANIMATIONS = {}
+        states = {}   # actor_id -> set of states
+        def want(aid, st):
+            if aid in self.actors and st:
+                states.setdefault(aid, set()).add(st)
+        acts = list(self.data.get('actions', []))
+        for a in acts:
+            tgt, typ, p = a.get('target', ''), a.get('type', ''), a.get('params') or {}
+            if tgt not in self.actors:
+                continue
+            if typ == 'set_animation':
+                want(tgt, p.get('state', 'idle'))
+            elif typ == 'move_to':
+                want(tgt, p.get('anim_state', 'walk'))
+            elif typ == 'fly_to':
+                want(tgt, 'flying')
+            elif typ == 'attack':
+                for st in _ATTACK_ANIMATIONS.get(p.get('attack_type', 'melee'),
+                                                 ('melee', 'melee')):
+                    want(tgt, st)
+        for aid, sts in states.items():
+            for st in sts:
+                try:
+                    self.actors[aid].preload_animation(st)
+                except Exception as e:
+                    print(f"[CutsceneRuntime] preload of '{st}' for '{aid}' failed: {e}")
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def update(self, dt, world_width, world_height):
@@ -576,6 +630,10 @@ class CutsceneRuntime:
         self._world_height = world_height
         if self.finished or self.paused:
             return
+        # A single long frame (asset load, window drag, trigger-frame hitch)
+        # must not fast-forward the script: cap dt so actions keep their
+        # authored spacing instead of firing early / cutting animations short.
+        dt = min(dt, 0.1)
 
         # While a dialogue box is open, freeze time but keep weather animating —
         # rain shouldn't freeze mid-air just because a text box appeared.
@@ -587,13 +645,40 @@ class CutsceneRuntime:
                 self._tick_weather_fade(dt)
             return
 
+        # While a QTE bar is running, freeze time (actors hold their pose, fades
+        # stay put) but keep weather animating. Resume once the bar finishes.
+        if self._qte_paused and self._fail is None:
+            bar = self.qte_bar
+            if bar is not None and getattr(bar, 'active', False):
+                if self._weather is not None:
+                    self._weather.update(dt)
+                    self._tick_weather_fade(dt)
+                return
+            if bar is not None and getattr(bar, 'retry_requested', False):
+                # Missed. Run the authored fail sequence (if any applies);
+                # otherwise just bring the bar straight back for another go.
+                if not self._begin_fail_sequence():
+                    bar.resume()
+                    return
+            else:
+                self._qte_paused = False
+
         self.elapsed += dt
 
-        # Fire all actions whose timestamp has been reached.
-        while (self.action_index < len(self.pending_actions) and
-               self.pending_actions[self.action_index]['time'] <= self.elapsed):
-            self._execute_action(self.pending_actions[self.action_index])
-            self.action_index += 1
+        if self._fail is not None:
+            # Fail sequence: its actions fire off their own clock (relative to
+            # the miss) while self.elapsed keeps running so fades/flashes tick.
+            f = self._fail
+            f['t'] += dt
+            while f['i'] < len(f['acts']) and f['acts'][f['i']][0] <= f['t']:
+                self._execute_action(f['acts'][f['i']][1])
+                f['i'] += 1
+        else:
+            # Fire all actions whose timestamp has been reached.
+            while (self.action_index < len(self.pending_actions) and
+                   self.pending_actions[self.action_index]['time'] <= self.elapsed):
+                self._execute_action(self.pending_actions[self.action_index])
+                self.action_index += 1
 
         self.camera_target.update(dt)
         self.camera.update(self.camera_target, world_width, world_height, dt)
@@ -628,6 +713,16 @@ class CutsceneRuntime:
         if self._weather is not None:
             self._weather.update(dt)
             self._tick_weather_fade(dt)
+
+        if self._fail is not None:
+            # Never let the (temporarily advanced) clock end the cutscene
+            # mid-fail-sequence; finish the sequence once everything has
+            # fired, any dialogue is closed and the hold time has passed.
+            f = self._fail
+            if (f['i'] >= len(f['acts']) and not self._dialogue_paused
+                    and f['t'] >= f['last'] + self._qte_fail_hold):
+                self._end_fail_sequence()
+            return
 
         # Check whether the cutscene should finish.
         duration = self.data.get('duration', 0)
@@ -843,6 +938,88 @@ class CutsceneRuntime:
             inv.fill(fill)
             screen.blit(inv, (0, 0), special_flags=pygame.BLEND_RGB_XOR)
 
+    def _build_pending(self):
+        """Split data['actions'] into the main timeline (pending_actions) and
+        per-QTE fail sequences. An action whose params carry a 'qte_fail'
+        (= a QTE's qte_id) belongs to that QTE's fail sequence: it never fires
+        on the main timeline, and its time is measured relative to the 'qte'
+        step with that id (so author it on the timeline just after the QTE)."""
+        acts = sorted(self.data.get('actions', []), key=lambda a: a['time'])
+        main, fail = [], {}
+        for a in acts:
+            fid = (a.get('params') or {}).get('qte_fail')
+            if fid:
+                fail.setdefault(str(fid), []).append(a)
+            else:
+                main.append(a)
+        qte_t = {}
+        for a in main:
+            if a.get('target') == 'screen' and a.get('type') == 'qte':
+                qid = (a.get('params') or {}).get('qte_id')
+                if qid and str(qid) not in qte_t:
+                    qte_t[str(qid)] = a['time']
+        self.pending_actions = main
+        self._fail_seqs = {
+            qid: [(max(0.0, a['time'] - qte_t.get(qid, 0.0)), a) for a in lst]
+            for qid, lst in fail.items()
+        }
+
+    def _begin_fail_sequence(self):
+        """Start the fail sequence for the bar's current miss. Returns False
+        if there is nothing authored for this qte_id / miss number."""
+        bar  = self.qte_bar
+        seq  = self._fail_seqs.get(str(self._qte_active_id), [])
+        miss = int(getattr(bar, 'attempts', 0) or 0)
+        acts = []
+        for rel, a in seq:
+            try:
+                only = int((a.get('params') or {}).get('fail_attempt') or 0)
+            except (TypeError, ValueError):
+                only = 0
+            if only in (0, miss):
+                acts.append((rel, a))
+        if not acts:
+            return False
+        bar.retry_requested = False   # consumed; bar stays hidden until resume()
+        self._fail = {'acts': acts, 'i': 0, 't': 0.0, 'last': acts[-1][0],
+                      'elapsed0': self.elapsed}
+        return True
+
+    def _end_fail_sequence(self):
+        """Fail sequence done: rewind the clock so the main timeline resumes
+        exactly where it paused, shift any in-flight timed effects with it,
+        and bring the bar back for the retry."""
+        f = self._fail
+        shift = self.elapsed - f['elapsed0']
+        self.elapsed = f['elapsed0']
+        if self._fade_start is not None:
+            self._fade_start -= shift
+        if self._flash_start is not None:
+            self._flash_start -= shift
+        if self._invert_active:
+            self._invert_end_time -= shift
+        self._fail = None
+        if self.qte_bar is not None:
+            self.qte_bar.resume()
+
+    def abort_qte(self):
+        """Public: abandon any QTE / fail sequence in progress (e.g. the
+        editor's Stop). Leaves the clock at the pause point."""
+        if self._fail is not None:
+            self.elapsed = self._fail['elapsed0']
+            self._fail = None
+        self._cancel_qte()
+
+    def _cancel_qte(self):
+        """Drop a QTE this runtime started (restart/seek mid-bar) without
+        firing anything — the timeline just forgets it was waiting."""
+        if self._qte_paused and self.qte_bar is not None and (
+                getattr(self.qte_bar, 'active', False)
+                or getattr(self.qte_bar, 'retry_requested', False)):
+            self.qte_bar.stop()
+        self._fail = None
+        self._qte_paused = False
+
     def stop_looping_sfx(self):
         """Cut every looping sound effect (scrubbing, stopping, finishing)."""
         stop_sfx_on(self.sound_manager, None)
@@ -850,6 +1027,7 @@ class CutsceneRuntime:
     def restart(self):
         """Reset to the beginning (used by the editor's play loop)."""
         self.stop_looping_sfx()
+        self._cancel_qte()
         self.elapsed        = 0.0
         self.action_index   = 0
         self.finished       = False
@@ -874,10 +1052,7 @@ class CutsceneRuntime:
         # docstring on _last_applied_room_action in __init__.
         self._last_applied_room_action = None
         # Re-sort in case actions were edited since last play.
-        self.pending_actions = sorted(
-            self.data.get('actions', []),
-            key=lambda a: a['time']
-        )
+        self._build_pending()
         for actor in self.actors.values():
             actor._tween = None
             actor._charge_effects = []
@@ -891,6 +1066,7 @@ class CutsceneRuntime:
         """
         # Full state reset. Scrubbing never plays audio, so silence any SFX loop.
         self.stop_looping_sfx()
+        self._cancel_qte()
         self.elapsed             = 0.0
         self.finished            = False
         self.paused              = False
@@ -915,10 +1091,7 @@ class CutsceneRuntime:
         self._weather_fade_elapsed = 0.0
         self._attack_effects       = []
 
-        self.pending_actions = sorted(
-            self.data.get('actions', []),
-            key=lambda a: a['time']
-        )
+        self._build_pending()
 
         # Reset all actors to their cutscene start positions.
         for actor_def in self.data.get('actors', []):
@@ -1637,6 +1810,29 @@ class CutsceneRuntime:
                 self._weather_fade_to      = 0.0
                 self._weather_fade_dur     = duration
                 self._weather_fade_elapsed = 0.0
+        elif atype == 'qte':
+            # Start the shared QTE bar and freeze the timeline until it ends.
+            # Skipped while scrubbing and when no bar was supplied (editor preview).
+            if (self.qte_bar is not None and not getattr(self, '_seeking', False)
+                    and not params.get('_fail_edit')):   # editor's fail-sequence view: marker only
+                _qid = params.get('qte_id') or None
+                self._qte_active_id = str(_qid) if _qid else None
+                try:
+                    self._qte_fail_hold = float(params.get('fail_hold') or 0.5)
+                except (TypeError, ValueError):
+                    self._qte_fail_hold = 0.5
+                self.qte_bar.start(
+                    qte_id         = params.get('qte_id') or None,
+                    fill_per_press = params.get('fill_per_press'),
+                    drain_rate     = params.get('drain_rate'),
+                    mode           = params.get('mode') or 'spam',
+                    sweep_speed    = params.get('sweep_speed'),
+                    zones          = params.get('zones'),
+                    max_attempts   = int(params.get('max_attempts') or 0),
+                    manual_retry   = bool(self._qte_active_id
+                                          and self._qte_active_id in self._fail_seqs),
+                )
+                self._qte_paused = True
         elif atype == 'dialogue':
             if self.dialogue_box and not getattr(self, '_seeking', False):
                 portrait_key = params.get('portrait', '').strip() or None

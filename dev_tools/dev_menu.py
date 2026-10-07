@@ -8,9 +8,11 @@ navigation, subtle motion, and a small information footer.
 
 import math
 import os
+from contextlib import contextmanager
 import pygame
 
 import dev_tools.ui_kit as uk
+import ui.pause_menu as menu_ui
 from config.settings import (SCREEN_WIDTH, SCREEN_HEIGHT, load_display_settings,
                              display_resolution_key, effective_resolution)
 
@@ -45,6 +47,40 @@ CONFIG_SLIDE_SECONDS = 0.30
 # and _prev_view clears) - whichever finishes last, the config panel or
 # the final (most-delayed) column.
 TRANSITION_SECONDS = max(CONFIG_SLIDE_SECONDS, CARD_STAGGER_SECONDS * (COLUMNS - 1) + CARD_SLIDE_SECONDS)
+
+
+@contextmanager
+def _gpu_safe_pygame_draw():
+    """Let pygame.draw.* calls that target a GPUScreen work, for the duration
+    of the with-block only.
+
+    ui_kit.ModalTextInput.draw() (the 0-255 number box) calls
+    pygame.draw.line(...) straight on the target, which only accepts a real
+    pygame.Surface - the dev menu draws onto a GPUScreen, so it raised
+    "argument 1 must be pygame.surface.Surface, not GPUScreen". The box had
+    never been opened before (CONFIG_OPTIONS had no editable fields), so the
+    bug was latent. Inside this block a GPUScreen target is routed to its own
+    draw_line / draw_rect / ... methods instead; real Surfaces still go to
+    pygame untouched, and the originals are restored on exit. (Fixing the
+    call in ui_kit itself would make this unnecessary.)"""
+    routes = {'line': 'draw_line', 'rect': 'draw_rect', 'circle': 'draw_circle',
+              'polygon': 'draw_polygon', 'ellipse': 'draw_ellipse'}
+    originals = {name: getattr(pygame.draw, name) for name in routes}
+
+    def make(orig, method):
+        def wrapper(target, *args, **kwargs):
+            if isinstance(target, pygame.Surface):
+                return orig(target, *args, **kwargs)
+            return getattr(target, method)(*args, **kwargs)
+        return wrapper
+
+    for name, method in routes.items():
+        setattr(pygame.draw, name, make(originals[name], method))
+    try:
+        yield
+    finally:
+        for name, orig in originals.items():
+            setattr(pygame.draw, name, orig)
 
 
 def _ease_in_out(t):
@@ -82,6 +118,7 @@ CONFIG_OPTIONS = [
     # 'page' entries open a sub-page of the CONFIGURATION screen instead of
     # doing something themselves (the page's entries live in the table below).
     {'id': 'graphics', 'label': 'GRAPHICS', 'page': 'graphics'},
+    {'id': 'menu_colors', 'label': 'MENU COLORS', 'page': 'colors'},
 ]
 # Entries shown on the GRAPHICS page (CONFIGURATION > GRAPHICS).
 GRAPHICS_OPTIONS = [
@@ -90,8 +127,16 @@ GRAPHICS_OPTIONS = [
     {'id': 'display_original_ratio', 'label': 'ORIGINAL RATIO (TEST ROOMS)', 'display': 'original_ratio'},
     {'id': 'display_apply',      'label': 'APPLY AND RESTART', 'display': 'apply'},
 ]
-_CONFIG_PAGES = {'root': CONFIG_OPTIONS, 'graphics': GRAPHICS_OPTIONS}
-_CONFIG_PAGE_TITLES = {'root': 'CONFIGURATION', 'graphics': 'GRAPHICS'}
+# Entries shown on the MENU COLORS page (CONFIGURATION > MENU COLORS). 'color'
+# entries are handled inside DevMenu (no game.py action needed): 'preset'
+# cycles named colors (wraps back to the default green), 'hex' opens a text
+# box for a hex code like 00FF00 / #00FF00 / 0F0. See ui/pause_menu.py.
+COLORS_OPTIONS = [
+    {'id': 'color_preset', 'label': 'HIGHLIGHT COLOR', 'color': 'preset'},
+    {'id': 'color_hex',    'label': 'CUSTOM HEX',      'color': 'hex'},
+]
+_CONFIG_PAGES = {'root': CONFIG_OPTIONS, 'graphics': GRAPHICS_OPTIONS, 'colors': COLORS_OPTIONS}
+_CONFIG_PAGE_TITLES = {'root': 'CONFIGURATION', 'graphics': 'GRAPHICS', 'colors': 'MENU COLORS'}
 _DISPLAY_ACTIONS = {
     'mode':       'display_cycle_mode',
     'resolution': 'display_cycle_resolution',
@@ -468,7 +513,16 @@ class DevMenu:
         disp_cfg = load_display_settings()
         for opt in _CONFIG_PAGES[self._config_page]:
             label = opt['label']
-            if 'display' in opt:
+            accent = uk.Theme.GOLD
+            if 'color' in opt:
+                kind = opt['color']
+                rgb = menu_ui.highlight_color()
+                accent = rgb   # the card's accent shows the color itself
+                if kind == 'preset':
+                    label = f"{label}: {menu_ui.highlight_preset_name(rgb)}"
+                else:
+                    label = f"{label}: {menu_ui.highlight_hex(rgb)}"
+            elif 'display' in opt:
                 kind = opt['display']
                 if kind == 'mode':
                     label = f"{label}: {disp_cfg['mode'].upper()}"
@@ -485,7 +539,7 @@ class DevMenu:
             elif 'value_key' in opt:
                 value = getattr(self.config, opt['value_key'], '?')
                 label = f"{label}: {value}"
-            items.append(uk.GridItem(opt['id'], label, icon=None, accent=uk.Theme.GOLD))
+            items.append(uk.GridItem(opt['id'], label, icon=None, accent=accent))
         return items
 
     def _refresh_config_items(self):
@@ -524,6 +578,14 @@ class DevMenu:
         if opt and 'page' in opt:
             self._open_config_page(opt['page'])
             return None
+        if opt and 'color' in opt:
+            kind = opt['color']
+            if kind == 'preset':
+                menu_ui.cycle_highlight_preset()
+            else:
+                self._text_input.open('color_hex')
+            self._refresh_config_items()
+            return None
         if opt and 'display' in opt:
             return _DISPLAY_ACTIONS[opt['display']]
         if opt and 'value_key' in opt:
@@ -532,6 +594,9 @@ class DevMenu:
 
     def _commit_text_input(self, field, text):
         if not field:
+            return
+        if field == 'color_hex':
+            menu_ui.set_highlight_hex(text)   # invalid hex -> color unchanged
             return
         try:
             value = float(text)
@@ -894,7 +959,8 @@ class DevMenu:
 
         self._draw_footer(surface)
 
-        self._text_input.draw(surface, w, h)
+        with _gpu_safe_pygame_draw():
+            self._text_input.draw(surface, w, h)
 
         # Resolve the frame's cursor last, now that every clickable widget
         # drawn above (category cards, the gear/back button, and the

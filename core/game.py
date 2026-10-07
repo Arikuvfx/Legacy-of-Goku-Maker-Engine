@@ -2103,6 +2103,131 @@ class Game:
             self._decoration_creator_from_dev_menu = True
             self.decoration_creator.toggle()
 
+    # Method names tried (in order) on a dev tool that has no known save API.
+    # Only zero-required-argument callables are invoked.
+    _TOOL_AUTOSAVE_NAMES = ('autosave', 'auto_save', '_autosave', 'save_all',
+                            '_save_all', 'save', '_save')
+
+    def _try_tool_autosave(self, tool):
+        """Best-effort save for an editor/creator. Returns the method name
+        that ran, or None. Never raises."""
+        import inspect
+        for name in self._TOOL_AUTOSAVE_NAMES:
+            fn = getattr(tool, name, None)
+            if not callable(fn):
+                continue
+            try:
+                needs_args = any(
+                    p.default is p.empty and p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)
+                    for p in inspect.signature(fn).parameters.values())
+                if needs_args:
+                    continue
+                fn()
+                return name
+            except Exception:
+                import traceback
+                traceback.print_exc()
+        return None
+
+    def _autosave_and_close_dev_tools(self):
+        """Save whatever dev tool / test session is currently open and close
+        it, so the Dev Menu can open on top with nothing lost.
+
+        Returns a list of human-readable names of what was saved.
+        """
+        saved = []
+
+        # Test mode: restore the pre-test snapshot FIRST (same order as
+        # cleanup()) so temporary test state is never written to disk, then
+        # persist the room that was being edited.
+        was_testing = self.is_test_mode
+        if was_testing:
+            self._exit_test_mode()
+            saved.append('room (test mode ended)')
+
+        # Cutscene editor — same save logic cleanup() uses.
+        ce = self.cutscene_editor
+        if ce.active:
+            try:
+                if ce.view == 'edit' and ce.cutscene_data:
+                    if ce.unsaved:
+                        ce._save_cutscene()
+                    else:
+                        ce._save_viewport_state()
+                saved.append('cutscene')
+            except Exception:
+                import traceback
+                traceback.print_exc()
+
+        # Room editor (also covers a room just returned to from test mode).
+        if self.room_editor.active or was_testing:
+            try:
+                self.room_editor.save_all_editor_data_to_rooms()
+                self.room_manager.save_all_rooms()
+                if self.room_editor.active:
+                    saved.append('room')
+            except Exception:
+                import traceback
+                traceback.print_exc()
+
+        # Everything else: best-effort save, then close.
+        other_tools = (
+            ('sprite editor',      self.sprite_editor),
+            ('world map editor',   self.world_map_editor),
+            ('character creator',  self.character_creator),
+            ('attack creator',     self.attack_creator),
+            ('entity creator',     self.entity_creator),
+            ('item creator',       self.item_creator),
+            ('decoration creator', self.decoration_creator),
+        )
+        for label, tool in other_tools:
+            if tool.active and self._try_tool_autosave(tool):
+                saved.append(label)
+
+        # Close every tool that is open (toggle() = the tool's own close path).
+        for tool in (self.cutscene_editor, self.room_editor, *(t for _, t in other_tools)):
+            if tool.active:
+                try:
+                    tool.toggle()
+                except Exception:
+                    pass
+                tool.active = False
+
+        # Post-close housekeeping the normal exit paths do.
+        if any(lbl.startswith('room') for lbl in saved):
+            self.mission_manager.scan_rooms_for_missions(self.room_manager)
+        if any(lbl in ('character creator',) for lbl in saved) and hasattr(self.player, 'character'):
+            self._reload_attack_config(self.player.character)
+        if any(lbl == 'decoration creator' for lbl in saved):
+            self._refresh_decoration_catalog()
+        if any(lbl == 'world map editor' for lbl in saved):
+            self._wm_room_index = None
+
+        return saved, was_testing
+
+    def _open_dev_menu_from_anywhere(self):
+        """F1 handler: auto-save any open dev tool, then open the Dev Menu."""
+        saved, was_testing = self._autosave_and_close_dev_tools()
+        if saved:
+            print(f"[DevTools] F1: auto-saved {', '.join(saved)}")
+
+        # Flying-the-world-map sequence draws its own scene and bypasses the
+        # normal frame; drop back to neutral so the menu is visible/usable.
+        if self._mjf_state is not None:
+            self._mjf_state  = None
+            self._mjf_active = False
+            self._mjf_alpha  = 0.0
+            self.camera.locked = False
+            self.player.is_map_jumping  = False
+            self.player.map_jump_moving = False
+            self.player.on_map_jump_exit = None
+
+        # If the Dev Menu is closed again after a test session, return to the
+        # room editor (see the 'close' branch in _handle_dev_menu_action).
+        self._dev_menu_opened_while_testing = was_testing
+        self._decoration_creator_from_dev_menu = False
+        self.dev_menu.open()
+
     def handle_events(self):
         """
         Process all pending pygame events for the current frame.
@@ -2132,6 +2257,17 @@ class Game:
                     (event.key == pygame.K_F11 or
                      (event.key == pygame.K_RETURN and event.mod & pygame.KMOD_ALT))):
                 self._toggle_display_mode()
+                continue
+
+            # F1: open the Dev Tools menu from ANYWHERE (gameplay, test mode,
+            # pause menu, cutscenes, death screen, any editor...). Whatever
+            # dev tool is currently open gets auto-saved first. The title
+            # screen keeps its own F1 behaviour (skip to the default room).
+            # While the menu is already open, F1 falls through to the normal
+            # dev_menu.handle_input() path below so it still closes it.
+            if (event.type == pygame.KEYDOWN and event.key == pygame.K_F1
+                    and self.game_mode != 'title' and not self.dev_menu.active):
+                self._open_dev_menu_from_anywhere()
                 continue
 
             # WINDOWCLOSE is the event the X button posts on our separate SDL2
@@ -2172,6 +2308,17 @@ class Game:
             # dev tools) can interrupt it. Only reacts to E, and only once the
             # box itself is showing — see _update_death_sequence for the state
             # machine and _advance_death_box/_close_death_box for what E does.
+            if self.dev_menu.active:
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_F3:
+                    self.dev_menu.close()
+                    self._decoration_creator_from_dev_menu = True
+                    self.decoration_creator.toggle()
+                    continue
+                result = self.dev_menu.handle_input(event)
+                if result:
+                    self._handle_dev_menu_action(result)
+                continue
+
             if self._death_state is not None:
                 if (self._death_state == 'box' and event.type == pygame.KEYDOWN
                         and event.key == pygame.K_e):
@@ -5402,18 +5549,24 @@ class Game:
         self.camera.start_shake(intensity=intensity, duration=duration)
 
     def _handle_spam_qte_action(self, on_complete, qte_id=None, fill_per_press=0.08,
-                                 drain_rate=0.15, start_progress=0.0):
+                                 drain_rate=0.15, start_progress=0.0,
+                                 mode='spam', sweep_speed=0.9, max_attempts=0, zones=None):
         """EventRunner handler for the 'spam_qte' action — blocking. Arms
         the bottom-middle mash-E-or-Q bar (see ui/spam_qte.py) and stashes
         on_complete; _update_spam_qte() fires it the frame the bar fills.
         No fail state — the sequence simply waits however long it takes."""
         self._event_spam_qte_on_complete = on_complete
         self.spam_qte_bar.start(qte_id=qte_id, fill_per_press=fill_per_press,
-                                 drain_rate=drain_rate, start_progress=start_progress)
+                                 drain_rate=drain_rate, start_progress=start_progress,
+                                 mode=mode, sweep_speed=sweep_speed,
+                                 max_attempts=max_attempts, zones=zones)
         # Report the starting percent immediately so a condition checked the
         # same frame (e.g. right after this action in the sequence) already
         # sees it, rather than waiting one frame for _update_spam_qte.
-        if qte_id:
+        # Timing mode only reports once the crosshair is locked (see
+        # _update_spam_qte) — the sweep passing 50%/100% must not latch
+        # bar_reached flags.
+        if qte_id and self.spam_qte_bar.mode != 'timing':
             self.flag_manager.set_bar_percent(qte_id, self.spam_qte_bar.progress * 100)
 
     def _update_spam_qte(self, dt):
@@ -5425,8 +5578,15 @@ class Game:
         if not self.spam_qte_bar.active:
             return
         completed = self.spam_qte_bar.update(dt)
-        if self.spam_qte_bar.qte_id:
-            self.flag_manager.set_bar_percent(self.spam_qte_bar.qte_id, self.spam_qte_bar.progress * 100)
+        qte_id = self.spam_qte_bar.qte_id
+        if self.spam_qte_bar.mode == 'timing':
+            # Report only the final locked position + outcome, never the sweep.
+            if completed and qte_id:
+                self.flag_manager.set_bar_percent(qte_id, self.spam_qte_bar.progress * 100)
+                if self.spam_qte_bar.result:
+                    self.flag_manager.trigger(f'qte_result:{qte_id}:{self.spam_qte_bar.result}')
+        elif qte_id:
+            self.flag_manager.set_bar_percent(qte_id, self.spam_qte_bar.progress * 100)
         if completed:
             on_complete = self._event_spam_qte_on_complete
             self._event_spam_qte_on_complete = None
@@ -6336,6 +6496,7 @@ class Game:
                         self.cutscene_editor._entity_factory,
                         dialogue_box=self.dialogue_box,
                         sound_manager=self.sound_manager,
+                        qte_bar=self.spam_qte_bar,   # 'qte' cutscene steps
                     )
 
                     # Wire up the change_room callback. The runtime declares
@@ -6376,6 +6537,18 @@ class Game:
                             _live.entity.x = self.player.x
                             _live.entity.y = self.player.y
 
+                            # Did the script already pose this actor at t<=0 (set_animation /
+                            # face / attack)? seek(0.0) just applied that pose; overwriting
+                            # it with the real player's pre-cutscene animation (idle/run...)
+                            # is what made scripted animations like "2x" play differently
+                            # in-game than in the editor.
+                            _has_t0_pose = any(
+                                _a.get('target') == _adef['id']
+                                and _a.get('time', 0) <= 0
+                                and _a.get('type') in ('set_animation', 'face', 'attack')
+                                for _a in data.get('actions', [])
+                            )
+
                             if _live._tween is not None:
                                 # A move_to/fly_to action already fired during seek(0.0)
                                 # and set its own anim_state/direction (e.g. authored
@@ -6386,6 +6559,8 @@ class Game:
                                 # so it begins at the player's real position.
                                 _live._tween.start_x = self.player.x
                                 _live._tween.start_y = self.player.y
+                            elif _has_t0_pose:
+                                pass   # keep the pose seek(0.0) applied
                             else:
                                 _live.entity.direction = self.player.direction
                                 _live.set_animation(
@@ -6407,10 +6582,17 @@ class Game:
                                 from core.sprite_system import create_character_sprite
                                 _char = getattr(self.player, 'character', 'goku')
                                 _live.entity.sprite = create_character_sprite(_char, 'ssj', 32, 32)
-                                _live.entity.sprite.set_animation(
-                                    getattr(self.player, 'current_animation_state', 'idle'),
-                                    _live.entity.direction,
-                                )
+                                # Re-apply the pose the actor already had (scripted t=0
+                                # pose / tween anim) -- or the player's, if none -- via
+                                # CutsceneActor.set_animation so non-default sheets
+                                # (e.g. 2x.png) get hot-loaded into the fresh sprite.
+                                if _live._tween is not None or _has_t0_pose:
+                                    _st = _live.current_anim_state
+                                    _lp = _live._anim_loop
+                                else:
+                                    _st = getattr(self.player, 'current_animation_state', 'idle')
+                                    _lp = None
+                                _live.set_animation(_st, _live.entity.direction, loop=_lp)
                             break
 
                     # Snapshot the player's full transformation state so that
@@ -9578,6 +9760,16 @@ class Game:
             self.room_manager.flush_dirty_rooms(dt=dt)
 
         # When the room editor is open, skip all game simulation — only tick the editor.
+        # Dev menu (opened via F1 from anywhere) pauses everything beneath it.
+        # Serviced here, before the many gameplay early-returns below (death
+        # sequence, pause menu, scouter, save flow...), so it always updates.
+        if self.dev_menu.active:
+            self.dev_menu.update(dt)
+            action = self.dev_menu.poll_action()
+            if action:
+                self._handle_dev_menu_action(action)
+            return
+
         if self.room_editor.active:
             self._sync_event_editor_rooms()
             self.room_editor.update(dt, self._get_logical_mouse_pos())
