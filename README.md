@@ -1,6 +1,17 @@
 # Legacy-of-Goku-Maker-Engine
 This is a WIP LOG Series Maker Engine with the goal to have an easy engine to use to make fan games of the Legacy of Goku Series, developed by Ariku but being an open source project.
 
+Version 0.3.2
+```
+Changes/Additions:
+- additional UI changes
+- discord Rich Presence added
+- copy and move elements in the cutscene editor in groups added
+- original GBA ratio added, adjustable in the dev menu configuration
+Major Bugfixes:
+- a lot of fixes as always.
+```
+
 Version 0.3.1 - UI Update
 ```
 Changes/Additions:
