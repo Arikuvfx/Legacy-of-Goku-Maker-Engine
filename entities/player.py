@@ -737,7 +737,7 @@ class Player:
         # True here too so a Player used before that reload runs (or in a
         # context that never calls it) still charges normally, matching
         # charged_melee_style's "always available unless told otherwise" default.
-        self.charged_melee_enabled = True
+        self.charged_melee_enabled = False   # opt-in per character; set from cfg in Game._reload_attack_config()
         self.charged_melee_charge_time = 0.0
         self.charged_melee_charge_required = 0.2    # seconds to first full-opacity peak
         self.charged_melee_pulse_period = 0.3        # seconds per breathe cycle once ready
@@ -1015,6 +1015,48 @@ class Player:
         if not self.is_transformed():
             return False
         return getattr(self.transformation, 'current_transform_ki_bar_enabled', True)
+
+    def get_transform_hp_drain(self):
+        """HP/second drained by the current transformation (0.0 if none).
+
+        Reads hp_drain from the active form's config, as set on the
+        Transformations tab of the character creator. Tries the same
+        `current_transform_*` attribute style has_free_ki() uses first,
+        then falls back to a config dict on the TransformationSystem.
+        """
+        ts = self.transformation
+        if not ts or not self.is_transformed():
+            return 0.0
+        val = getattr(ts, 'current_transform_hp_drain', None)
+        if val is None:
+            for name in ('current_transform_config', 'current_transform_cfg', 'current_transform'):
+                cfg = getattr(ts, name, None)
+                if isinstance(cfg, dict):
+                    val = cfg.get('hp_drain')
+                    break
+        try:
+            return max(0.0, float(val or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _tick_transform_hp_drain(self, dt):
+        """Drain HP while transformed. Floors at 1 — a form can never kill.
+
+        hp is an int everywhere else (take_damage, HUD), so the fractional
+        per-frame drain is banked in _hp_drain_accum and only whole points
+        are removed.
+        """
+        rate = self.get_transform_hp_drain()
+        if rate <= 0.0 or self.is_dead or self.hp <= 1:
+            # Don't bank drain while it can't be applied, so it doesn't
+            # dump a burst of damage the moment hp regenerates.
+            self._hp_drain_accum = 0.0
+            return
+        self._hp_drain_accum = getattr(self, '_hp_drain_accum', 0.0) + rate * dt
+        whole = int(self._hp_drain_accum)
+        if whole > 0:
+            self._hp_drain_accum -= whole
+            self.hp = max(1, self.hp - whole)
 
     def can_act(self):
         """False while locked in an animation, transitioning, or knocked back."""
@@ -3363,10 +3405,16 @@ class Player:
         if self.current_animation_state in ('ghost_kamikaze_cast', 'ghost_kamikaze_hold'):
             self.enter_idle()
 
+    def _transform_anim_name(self):
+        """Sprite animation for the current form's charge-up — the
+        per-form "transformation_<form>" sheet if TransformationSystem
+        resolved one, else the generic "transform"."""
+        return getattr(self.transformation, 'current_transform_anim', None) or 'transform'
+
     def start_transform_animation(self):
         """Begin the transform animation — always faces down regardless of current direction."""
         self.direction = 'down'
-        self.sprite.set_animation('transform', 'down')
+        self.sprite.set_animation(self._transform_anim_name(), 'down')
         self.current_animation_state = 'transform'
 
     def start_untransform_animation(self):
@@ -4510,6 +4558,9 @@ class Player:
         if self.attack_cooldown > 0:
             self.attack_cooldown -= dt
 
+        # Transformation HP drain (floors at 1, never kills)
+        self._tick_transform_hp_drain(dt)
+
         # ------------------------------------------------------------------
         # Passive ki regen — ticks while the player is out of combat-ish
         # (uses a running timer so it's independent of attack_cooldown and
@@ -4546,7 +4597,9 @@ class Player:
         # that bypassed start_transform_animation / start_untransform_animation.
         if self.current_animation_state in ('transform', 'untransform') and self.direction != 'down':
             self.direction = 'down'
-            self.sprite.set_animation(self.current_animation_state, 'down')
+            self.sprite.set_animation(
+                self._transform_anim_name() if self.current_animation_state == 'transform'
+                else self.current_animation_state, 'down')
 
         if self.current_animation_state == 'transform':
             if self.sprite.is_animation_finished():

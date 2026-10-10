@@ -113,6 +113,26 @@ class TransformationSystem:
         # duration.
         self.current_transform_ki_bar_enabled = True
 
+        # HP lost per second while in the active form (the "HP drain"
+        # slider on the Transformations tab). 0.0 = no drain. Applied by
+        # Player._tick_transform_hp_drain(), which floors hp at 1.
+        self.current_transform_hp_drain = 0.0
+
+        # Name of the sprite animation played while charging into the
+        # active form: "transformation_<form>" (e.g. transformation_ssj,
+        # transformation_kaioken, transformation_ui) when the sprite being
+        # worn has that sheet, else the generic "transform". Set in
+        # start_transform() via _resolve_transform_anim().
+        self.current_transform_anim = 'transform'
+
+        # Optional aura overlay for the active transformation (see
+        # AuraSprite in dev_tools/character_creator.py). None when the form
+        # has no aura.png in its folder.
+        # Loaded in start_transform(), cleared in complete_untransform()/
+        # reset(). Drawn by draw_aura() on top of the player sprite.
+        self.aura = None
+        self.aura_during_charge = True
+
     def update(self, dt, enemies_defeated_this_frame=0):
         """
         Update transformation progress
@@ -121,6 +141,12 @@ class TransformationSystem:
             dt: Delta time
             enemies_defeated_this_frame: Number of enemies defeated in this frame
         """
+        # Keep the aura animating (it only draws while transformed/charging,
+        # but ticking it here regardless is cheap and avoids a visible jump
+        # in its loop when it first appears).
+        if self.aura:
+            self.aura.update(dt)
+
         # Update transformation animation progress
         if self.is_transforming:
             # When the charge bar is disabled for this transformation,
@@ -141,7 +167,7 @@ class TransformationSystem:
                 # idempotent, but there's no reason to call it every frame.
                 if self.transform_animation_progress >= 1.0 and not self._hold_released:
                     self._hold_released = True
-                    self.player.sprite.release_hold('transform', 'down')
+                    self.player.sprite.release_hold(self.current_transform_anim, 'down')
 
             # Don't fill regular progress during transformation
             return
@@ -350,7 +376,9 @@ class TransformationSystem:
         self.current_transform_costume = transform_costume
         self.current_transform_ki_color = self._resolve_transform_ki_color(character, transform_costume)
         self.current_transform_ki_bar_enabled = self._resolve_transform_ki_bar_enabled(character, transform_costume)
+        self.current_transform_hp_drain = self._resolve_transform_hp_drain(character, transform_costume)
         self.transform_animation_duration = self._resolve_transform_charge_duration(character, transform_costume)
+        self._load_aura(character, transform_costume)
 
         # Set transformation animation. self.player.sprite is whatever the
         # player currently looks like — the base sprite for a fresh
@@ -358,7 +386,8 @@ class TransformationSystem:
         # advancing (e.g. the SSJ sprite when charging up to SSJ3) — so a
         # tier-advance plays whatever 'transform' animation is defined
         # under that tier's own sprite folder.
-        self.player.sprite.set_animation('transform', self.player.direction)
+        self.current_transform_anim = self._resolve_transform_anim(target_form_name)
+        self.player.sprite.set_animation(self.current_transform_anim, self.player.direction)
         self.player.current_animation_state = 'transform'
 
         if not self.current_transform_ki_bar_enabled:
@@ -369,7 +398,7 @@ class TransformationSystem:
             # finishes on its own (see Player.update()'s 'transform'
             # animation-state check), with no fixed duration involved.
             self._hold_released = True
-            self.player.sprite.release_hold('transform', 'down')
+            self.player.sprite.release_hold(self.current_transform_anim, 'down')
 
         return True
 
@@ -444,6 +473,18 @@ class TransformationSystem:
             self.player.sprite.set_animation('idle', self.player.direction)
             self.player.current_animation_state = 'idle'
 
+            # Forget which form we were just in. These used to linger after
+            # reverting, so with two standalone forms (e.g. kaioken + ssj)
+            # the HUD's transform slot kept showing/targeting whichever form
+            # was used LAST instead of the form its slot actually maps to.
+            self.current_transform_costume = None
+            self.current_transform_ki_color = None
+            self.current_transform_ki_bar_enabled = True
+            self.current_transform_hp_drain = 0.0
+            self.current_transform_anim = 'transform'
+            self.aura = None
+            self.aura_during_charge = True
+
             # Reset transformation progress
             self.progress = 0.0
             self.is_ready = False
@@ -480,10 +521,56 @@ class TransformationSystem:
         self.current_transform_costume = None
         self.current_transform_ki_color = None
         self.current_transform_ki_bar_enabled = True
+        self.current_transform_hp_drain = 0.0
+        self.current_transform_anim = 'transform'
+        self.aura = None
+        self.aura_during_charge = True
         self.tier_depth = 0
         self.frozen_tier_colors = []
         self.frozen_tier_fills = []
         self._hold_released = False
+
+    def _load_aura(self, char_id: str, transform_costume: str):
+        """Look for aura.png in the active transformation's sprite folder
+        and set self.aura (None if there isn't one). Per-form tweaks come
+        from the matching entry in assets/characters/{char_id}.json."""
+        self.aura = None
+        self.aura_during_charge = True
+        if not transform_costume:
+            return
+
+        from dev_tools import character_creator
+
+        settings = {}
+        cfg = character_creator.load_config(char_id)
+        for t in cfg.get("transformations", []):
+            if t.get("costume") == transform_costume:
+                settings = t
+                break
+
+        folder = character_creator.SPRITES_DIR / char_id / transform_costume
+        self.aura = character_creator.AuraSprite.load(folder, settings)
+        if self.aura:
+            self.aura_during_charge = self.aura.during_charge
+
+    def draw_aura(self, screen, center, scale=1.0):
+        """Draw the active transformation's aura, if it has one.
+
+        Call this right AFTER the player sprite is drawn so the aura lands
+        on top of it. Both arguments come straight from the sprite's own
+        on-screen rect:
+
+            rect = player.sprite._dst_rect(player.x, player.y, camera)
+            scale = rect.width / player.sprite.sprite_width
+            transformation_system.draw_aura(screen, rect.center, scale)
+
+        Shown while transformed, and while charging into the form unless
+        the form turns aura_during_charge off. Hidden while reverting.
+        """
+        if not self.aura or self.is_untransforming:
+            return
+        if self.is_transformed or (self.is_transforming and self.aura_during_charge):
+            self.aura.draw(screen, center, scale)
 
     def get_display_transform_costume(self, form_name=None):
         """Return the sprite-folder costume path (str) to use for HUD display
@@ -511,7 +598,8 @@ class TransformationSystem:
         if form_name is not None:
             return self._resolve_transform_costume(character, form_name)
 
-        if self.current_transform_costume:
+        if self.current_transform_costume and (
+                self.is_transforming or self.is_transformed or self.is_untransforming):
             return self.current_transform_costume
 
         return self._resolve_transform_costume(character)
@@ -608,9 +696,19 @@ class TransformationSystem:
                     return target
             return None
 
+        # No form requested: the first form on this costume that's actually
+        # unlocked — exactly what Game._transform_mode_slots() names the
+        # plain 'transform' slot. Taking the first CONFIGURED form here
+        # (even if locked/skipped by the slot list) made that slot's icon
+        # and start_transform(None) disagree with the slot the player had
+        # selected. unlocked is None when the player has no such list
+        # (everything counts as unlocked).
+        unlocked = getattr(self.player, 'unlocked_transformations', None)
         for t in transformations:
             costume = t.get("costume")
             if costume and costume.startswith(prefix):
+                if unlocked is not None and self._form_name_from_costume(costume) not in unlocked:
+                    continue
                 return costume
 
         # Fallback: no transformation registered in the config for the
@@ -675,6 +773,44 @@ class TransformationSystem:
             if t.get("costume") == transform_costume:
                 return t.get("ki_bar_enabled", True)
         return True
+
+    def _resolve_transform_anim(self, form_name) -> str:
+        """Pick the charge-up animation for `form_name` (a folder form-name
+        like "ssj", "kaioken", "ui").
+
+        Looks for a "transformation_<form>" sheet on the sprite the player is
+        wearing right now — the base sprite for a base-level form, or the
+        previous tier's sprite when advancing a tier — i.e.
+        transformation_kaioken.png / transformation_ssj.png / transformation_ui.png
+        sitting beside that costume's idle.png. Falls back to the generic
+        "transform" sheet when a form has no dedicated one, so existing
+        characters keep working unchanged.
+        """
+        if form_name:
+            name = f"transformation_{form_name}"
+            sprite = self.player.sprite
+            if sprite.has_animation(name, 'down') or sprite.has_animation(name, self.player.direction):
+                return name
+        return 'transform'
+
+    def _resolve_transform_hp_drain(self, char_id: str, transform_costume: str) -> float:
+        """Return the HP/second drain configured for this transformation
+        (the "HP drain" slider on the Transformations tab). Defaults to 0.0
+        so existing/unconfigured forms are unaffected.
+        """
+        if not transform_costume:
+            return 0.0
+
+        from dev_tools import character_creator
+
+        cfg = character_creator.load_config(char_id)
+        for t in cfg.get("transformations", []):
+            if t.get("costume") == transform_costume:
+                try:
+                    return max(0.0, float(t.get("hp_drain", 0.0) or 0.0))
+                except (TypeError, ValueError):
+                    return 0.0
+        return 0.0
 
     def _resolve_transform_charge_duration(self, char_id: str, transform_costume: str) -> float:
         """Return the charge-bar fill duration (seconds) configured for this

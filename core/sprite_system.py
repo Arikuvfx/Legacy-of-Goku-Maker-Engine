@@ -346,6 +346,10 @@ class AnimatedSprite:
     Each animation lives at {base_path}/{animation_name}.png.
     """
 
+    # True = idle plays as a normal looping flipbook (all frames) instead of
+    # the 4-second "blink" mode. Set by CritterSpriteLoader.
+    cycle_idle = False
+
     # Every AnimatedSprite that currently exists (player, every enemy/NPC/
     # critter/boss instance in the room, etc.), held weakly so this registry
     # never keeps a despawned entity's sprite alive. The sprite watcher walks
@@ -466,7 +470,7 @@ class AnimatedSprite:
         # all funnel through this one method) uses blink mode rather than
         # cycling through its frames like a normal flipbook. See
         # Animation.idle_blink.
-        idle_blink = (animation_name == 'idle')
+        idle_blink = (animation_name == 'idle') and not self.cycle_idle
 
         for variant_index in range(num_variants):
             row = (variant_index * num_directions) + direction_offset
@@ -484,7 +488,12 @@ class AnimatedSprite:
             # Simplest fix: only ever look at column 0 for 'up' idle, so
             # there's nothing to blink OR cycle to.
             if animation_name == 'idle' and direction == 'up':
-                frames = frames[:1]
+                if self.cycle_idle:
+                    # Critters cycle idle normally: drop only blank cells
+                    # (e.g. an 'up' row drawn with fewer frames than the sheet width).
+                    frames = [f for f in frames if _frame_has_pixels(f)] or frames[:1]
+                else:
+                    frames = frames[:1]
 
             animation = Animation(frames, frame_duration, loop, loop_tail_frames, idle_blink=idle_blink,
                                    hold_frames=hold_frames)
@@ -1428,6 +1437,20 @@ class CharacterSpriteLoader:
         sprite.load_animation_all_directions('transform', 0.15, False, 1, use_8_directions=False,
                                              hold_frames=(2, 3))
 
+        # Per-form charge-up sheets: every transformation_<form>.png in this
+        # costume's folder (transformation_ssj.png, transformation_kaioken.png,
+        # transformation_ui.png, ...) loads as its own animation, with the
+        # same frame timing and (2, 3) charge-hold as 'transform' above.
+        # TransformationSystem._resolve_transform_anim() picks the one
+        # matching the form being entered and falls back to plain 'transform'
+        # when a form has no dedicated sheet.
+        if os.path.isdir(folder):
+            for fname in sorted(os.listdir(folder)):
+                stem, ext = os.path.splitext(fname)
+                if ext.lower() == '.png' and stem.startswith('transformation_') and len(stem) > len('transformation_'):
+                    sprite.load_animation_all_directions(stem, 0.15, False, 1, use_8_directions=False,
+                                                         hold_frames=(2, 3))
+
         # Idle-wait animations: after standing still for a while (see
         # Player.IDLE_WAIT_DELAY), the character turns to face the camera and
         # plays a wait pose. idle_transition covers however many lead-in frames
@@ -1774,6 +1797,7 @@ class CritterSpriteLoader:
             sprite_width, sprite_height = _load_sprite_size(base_path, sprite_width, sprite_height)
 
         sprite = AnimatedSprite._create_bare(critter_type, variant, sprite_width, sprite_height, base_path)
+        sprite.cycle_idle = True  # critters loop every idle frame instead of blink mode
 
         animation_profile = _critter_config_animation_profile(critter_type)
         animations = CritterSpriteLoader.CRITTER_ANIMATIONS.get(

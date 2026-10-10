@@ -147,6 +147,19 @@ def _find_decoration_image(folder, decoration_type, metadata):
     return os.path.join(folder, files[0]) if files else None
 
 
+def _metadata_collision_disabled(metadata):
+    """True when a decoration.json says ``"collision_enabled": false``.
+
+    The Decoration Creator's "Remove Collision" button writes that key while
+    keeping any stored collision_rect so "Restore Collision" can bring the
+    box back - so the flag must be checked BEFORE collision_rect /
+    collision_size / auto inference are used.
+    """
+    if not isinstance(metadata, dict) or 'collision_enabled' not in metadata:
+        return False
+    return metadata['collision_enabled'] in (False, 'false', 'False')
+
+
 def _normalise_discovered_style(decoration_type, folder, metadata):
     """Build a runtime decoration style from a folder + optional JSON manifest.
 
@@ -234,6 +247,11 @@ def _normalise_discovered_style(decoration_type, folder, metadata):
         except (TypeError, ValueError):
             pass
 
+    # Collision removed in the creator: purely visual decoration. The stored
+    # rect/size above are harmless - Decoration ignores them when this is False.
+    if _metadata_collision_disabled(metadata):
+        style['collision_enabled'] = False
+
     return style
 
 
@@ -313,6 +331,13 @@ def _apply_builtin_collision_overrides():
         style = DECORATION_STYLES.get(decoration_type)
         if style is None:
             continue
+
+        # "Remove Collision" in the creator. Checked first and independent of
+        # collision_rect/size, which are kept in the file for Restore.
+        # (reload_decoration_styles rebuilds from the pristine copy, so
+        # restoring collision clears this again.)
+        if _metadata_collision_disabled(metadata):
+            style['collision_enabled'] = False
 
         if 'collision_rect' in metadata:
             try:
@@ -423,8 +448,12 @@ class Decoration:
         # collision_size behavior. Auto-discovered decorations get a small
         # base hitbox inferred from their visible pixels unless a manifest
         # supplied collision_rect/collision_size explicitly.
+        # collision_enabled=False (creator's "Remove Collision") makes the
+        # decoration purely visual: no blocking hitbox, no beam blocking.
+        self._collision_enabled = style.get('collision_enabled', True) is not False
         self._collision_rect = style.get('collision_rect')
-        if self._collision_rect is None and style.get('auto_discovered') and 'collision_size' not in style:
+        if (self._collision_enabled and self._collision_rect is None
+                and style.get('auto_discovered') and 'collision_size' not in style):
             self._collision_rect = self._infer_auto_collision_rect(self.frames)
 
         # LAYER SYSTEM INTEGRATION — same DrawLayer/Y-sort scheme
@@ -613,6 +642,13 @@ class Decoration:
         if not self.active:
             return None
 
+        # Collision removed in the Decoration Creator: return an EMPTY rect
+        # rather than None. Callers throughout game/player/enemy code treat
+        # this as an obstacle and call colliderect() on it (None would
+        # crash), and a zero-area rect never overlaps anything.
+        if not self._collision_enabled:
+            return pygame.Rect(int(self.x), int(self.y), 0, 0)
+
         # Auto-discovered/manual frame-local rectangle. Frame-local x/y are
         # measured from the sprite's top-left corner; the world anchor is the
         # sprite's bottom-center point at (self.x, self.y).
@@ -643,6 +679,8 @@ class Decoration:
         get_collision_rect's docstring — so a beam correctly grazes past a
         wide canopy but stops at the trunk.
         """
+        if not self._collision_enabled:
+            return None
         rect = self.get_collision_rect()
         if rect is None:
             return None

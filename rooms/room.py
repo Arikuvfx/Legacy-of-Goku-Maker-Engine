@@ -58,6 +58,14 @@ class Room:
         # Weather field ('none', 'rain', 'snow', 'fog', 'storm').
         self.ambient_weather = 'none'
 
+        # Optional per-room customization of that weather, edited via the
+        # room editor's Weather Options panel. Missing keys fall back to the
+        # defaults in room_editor.WEATHER_OPTION_DEFAULTS (== the original
+        # look): intensity (0-2), tint_r/tint_g/tint_b (0-255),
+        # tint_strength (0-1) and, for fog only, fog_parallax,
+        # fog_scroll_x, fog_scroll_y (px/s). Empty dict = all defaults.
+        self.weather_settings = {}
+
         # Room-wide music (BGM) track and BGS (ambient loop, e.g. rain/wind)
         # track, set via the room editor's 'Set Room Music' / 'Set Room BGS'
         # fields. Empty string means none set for this room.

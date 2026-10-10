@@ -4838,7 +4838,7 @@ class Game:
         obstacles = (
             self.collision_objects
             + self.destructible_stones
-            + self.decorations
+            + [d for d in self.decorations if getattr(d, '_collision_enabled', True)]
             + self.level_gates
             + self.room_transitions
             + self.chests
@@ -5668,7 +5668,7 @@ class Game:
         self._apply_entity_state(self.enemies, self._hidden_enemies,
                                  lambda e: getattr(e, 'boss_id', None) == boss_id, mode)
 
-    def _handle_weather_action(self, mode, weather_type=None):
+    def _handle_weather_action(self, mode, weather_type=None, settings=None):
         """EventRunner handler for the 'weather' action — mode: 'set' | 'stop'.
         Ambient room weather, independent of a cutscene's own weather system
         (core/cutscene_runtime.py's weather_start/weather_stop actions) —
@@ -5680,7 +5680,7 @@ class Game:
         from core.cutscene_runtime import _WeatherEffect, _WEATHER_START_FADE_IN, _WEATHER_STOP_FADE_OUT
         if mode == 'set':
             if self.room_weather is None or self.room_weather.weather_type != weather_type:
-                self.room_weather            = _WeatherEffect(weather_type)
+                self.room_weather            = _WeatherEffect(weather_type, settings=settings)
                 self.room_weather.opacity    = 0.0
                 self._room_weather_fade_from = 0.0
             else:
@@ -6141,9 +6141,14 @@ class Game:
             return
 
         weather_type = getattr(room, 'ambient_weather', 'none')
+        settings = getattr(room, 'weather_settings', None) or {}
         if weather_type and weather_type != 'none':
             if self.room_weather is None or self.room_weather.weather_type != weather_type:
-                self._handle_weather_action('set', weather_type)
+                self._handle_weather_action('set', weather_type, settings)
+            else:
+                # Same weather type carried over from the previous room (or
+                # being re-applied after a room edit): just restyle it.
+                self.room_weather.configure(settings)
         else:
             if self.room_weather is not None:
                 self._handle_weather_action('stop')
@@ -9300,11 +9305,12 @@ class Game:
         # melee() in player.py needs an
         # `if not self.charged_melee_enabled: return`-style guard added
         # at its top to actually enforce this — see the NOTE there).
-        # Defaults to enabled on every character load/switch, same
-        # reset-per-load semantics as equipped_attacks/
+        # Off unless the character's "Enable charged melee" checkbox (Attacks
+        # tab of the character creator) is ticked; re-read on every character
+        # load/switch, same reset-per-load semantics as equipped_attacks/
         # unlocked_transformations below: a runtime add/remove from a
         # trigger box doesn't persist across switching away and back.
-        self.player.charged_melee_enabled = True
+        self.player.charged_melee_enabled = bool(atk.get('charged_melee_enabled', False))
 
         # Every transformation form configured anywhere on this character
         # (across all its costumes), keyed by form id (see
@@ -12362,7 +12368,30 @@ class Game:
             gate_rect = pygame.Rect(gsx - gsw // 2, gsy - gsh // 2, gsw, gsh)
 
             covered_pieces = []
+            # Native shadow tiles (is_shadow) sit on layer >= 0 and so are
+            # baked into this same foreground surface, but they are texture-
+            # free translucent rectangles with their OWN shadow_width/height
+            # (not a tileset tile size). The room editor draws a gate in
+            # front of them, so they are handled separately below: the gate
+            # is redrawn over the whole shadow-covered area, and a player
+            # standing in front of the gate is put back on top of it.
+            shadow_pieces = []   # [(screen_rect, shadow_alpha)]
             for tile in nearby:
+                if getattr(tile, 'is_shadow', False):
+                    sw_world = max(1, int(getattr(tile, 'shadow_width',  TILE_SIZE)))
+                    sh_world = max(1, int(getattr(tile, 'shadow_height', TILE_SIZE)))
+                    shadow_rect = pygame.Rect(
+                        int(tile.x * RENDER_SCALE - self.camera.x),
+                        int(tile.y * RENDER_SCALE - self.camera.y),
+                        int(sw_world * RENDER_SCALE),
+                        int(sh_world * RENDER_SCALE),
+                    )
+                    if gate_rect.colliderect(shadow_rect):
+                        shadow_pieces.append((
+                            gate_rect.clip(shadow_rect),
+                            max(0, min(255, int(getattr(tile, 'shadow_alpha', 128)))),
+                        ))
+                    continue
                 tw = th = TILE_SIZE
                 if te:
                     tileset = te.tileset_manager.get_tileset(tile.tileset_name)
@@ -12376,10 +12405,12 @@ class Game:
                 if gate_rect.colliderect(tile_rect):
                     covered_pieces.append(gate_rect.clip(tile_rect))
 
-            if not covered_pieces:
+            if not covered_pieces and not shadow_pieces:
                 continue
 
-            if self.player.get_sort_key() > gate.get_sort_key():
+            player_in_front = self.player.get_sort_key() > gate.get_sort_key()
+
+            if covered_pieces and player_in_front:
                 ppw = int(self.player.width  * RENDER_SCALE)
                 pph = int(self.player.height * RENDER_SCALE)
                 ppx = int(self.player.x * RENDER_SCALE - self.camera.x)
@@ -12396,6 +12427,21 @@ class Game:
                 self.logical_surface.set_clip(piece)
                 gate.draw(self.logical_surface, self.camera, self.colors)
             self.logical_surface.set_clip(None)
+
+            # Gate over translucent shadows. Unlike an opaque tile, nothing
+            # about the shadow should ever sit on top of the gate, so the
+            # WHOLE shadow-covered area is redrawn (not minus the player's
+            # rect, which left a darkened square around the player).
+            for piece, _alpha in shadow_pieces:
+                if piece.width <= 0 or piece.height <= 0:
+                    continue
+                self.logical_surface.set_clip(piece)
+                gate.draw(self.logical_surface, self.camera, self.colors)
+            self.logical_surface.set_clip(None)
+
+            if player_in_front:
+                for piece, alpha in shadow_pieces:
+                    self._redraw_player_over_gate_in_shadow(piece, alpha)
 
 
         # Ghost silhouette — drawn immediately after foreground tiles so the
@@ -12446,6 +12492,13 @@ class Game:
               and self.room_weather.weather_type != 'fog'):
             w, h = self.logical_surface.get_size()
             self.room_weather.draw(self.logical_surface, w, h, self.camera.x, self.camera.y)
+
+        # Room weather screen tint — above everything for every weather type
+        # (including fog, which itself draws earlier, under the characters).
+        if (self.room_weather is not None and not self.pause_menu.active
+                and not self.active_cutscene_runtime):
+            _tw, _th = self.logical_surface.get_size()
+            self.room_weather.draw_tint(self.logical_surface, _tw, _th)
 
         # Cutscene colour/invert overlay (screen fades, flash, invert) is drawn
         # BEFORE the UI layer (dialogue box, HUD, menus) so a fade_in/fade_out/
@@ -13971,62 +14024,84 @@ class Game:
             target_surface.blits(blit_batch, doreturn=False)
 
     def _draw_scrolling_background(self, dt):
-        """Draw the current room's scrolling background image, if it has one.
+        """Draw ALL of the current room's scrolling background layers.
+
+        Layers are stored back -> front in room.scrolling_bgs (the room
+        editor's Background panel). Older rooms only have the single legacy
+        room.scrolling_bg dict, which is treated as a one-layer list.
 
         Mirrors the room editor's preview (camera-driven parallax) and adds
-        the autonomous scroll_x / scroll_y motion configured in the
-        Background panel, which the editor preview never animated either —
-        this is the single source of truth for both editor and gameplay.
+        the autonomous scroll_x / scroll_y motion configured per layer.
+        Only the bottom-most drawn layer is opaque; every layer above it
+        keeps its alpha channel so the layers beneath show through.
         """
         room = self.current_room
         if not room:
             return
 
-        bg = getattr(room, 'scrolling_bg', None)
-        if not bg:
-            return
+        layers = getattr(room, 'scrolling_bgs', None)
+        if not isinstance(layers, list):
+            legacy = getattr(room, 'scrolling_bg', None)
+            layers = [legacy] if isinstance(legacy, dict) else []
 
-        img_path = bg.get('image', '')
-        if not img_path:
-            return
+        sw, sh = self.logical_surface.get_size()
 
-        if img_path not in self._bg_image_cache:
-            try:
-                import os
-                raw = pygame.image.load(
-                    os.path.join('assets', 'bg', os.path.basename(img_path))
-                ).convert()
-                sw, sh = self.logical_surface.get_size()
-                ratio  = sh / raw.get_height()
-                nw     = max(1, int(raw.get_width() * ratio))
-                self._bg_image_cache[img_path] = pygame.transform.scale(raw, (nw, sh))
-            except Exception:
-                self._bg_image_cache[img_path] = None
+        # One [x, y] scroll phase per layer, per room (reset by room-name pop).
+        accums = self._bg_scroll_accum.get(room.name)
+        if not isinstance(accums, list) or (accums and not isinstance(accums[0], list)):
+            accums = []
+        while len(accums) < len(layers):
+            accums.append([0.0, 0.0])
+        self._bg_scroll_accum[room.name] = accums
 
-        surf = self._bg_image_cache.get(img_path)
-        if not surf:
-            return
+        drawn_any = False
+        for idx, bg in enumerate(layers):
+            if not isinstance(bg, dict):
+                continue
+            img_path = bg.get('image', '')
+            if not img_path:
+                continue
 
-        # Advance this room's own scroll phase over time so background motion
-        # keeps going independently of the camera.
-        accum = self._bg_scroll_accum.setdefault(room.name, [0.0, 0.0])
-        accum[0] += bg.get('scroll_x', 0.0) * dt
-        accum[1] += bg.get('scroll_y', 0.0) * dt
+            # The first layer actually drawn is opaque (fast blit); the rest
+            # need per-pixel alpha so lower layers remain visible.
+            with_alpha = drawn_any
+            cache_key = (img_path, with_alpha, sh)
+            if cache_key not in self._bg_image_cache:
+                try:
+                    import os
+                    raw = pygame.image.load(
+                        os.path.join('assets', 'bg', os.path.basename(img_path)))
+                    raw = raw.convert_alpha() if with_alpha else raw.convert()
+                    ratio = sh / raw.get_height()
+                    nw = max(1, int(raw.get_width() * ratio))
+                    self._bg_image_cache[cache_key] = pygame.transform.scale(raw, (nw, sh))
+                except Exception:
+                    self._bg_image_cache[cache_key] = None
 
-        parallax = bg.get('parallax', 0.5)
-        sw, sh   = self.logical_surface.get_size()
-        iw, ih   = surf.get_size()
+            surf = self._bg_image_cache.get(cache_key)
+            if not surf:
+                continue
+            drawn_any = True
 
-        off_x = int(self.camera.x * parallax + accum[0]) % iw
-        off_y = int(accum[1]) % ih
+            # Advance this layer's own scroll phase so motion continues
+            # independently of the camera.
+            accum = accums[idx]
+            accum[0] += bg.get('scroll_x', 0.0) * dt
+            accum[1] += bg.get('scroll_y', 0.0) * dt
 
-        y = -off_y
-        while y < sh:
-            x = -off_x
-            while x < sw:
-                self.logical_surface.blit(surf, (x, y))
-                x += iw
-            y += ih
+            parallax = bg.get('parallax', 0.5)
+            iw, ih = surf.get_size()
+
+            off_x = int(self.camera.x * parallax + accum[0]) % iw
+            off_y = int(accum[1]) % ih
+
+            y = -off_y
+            while y < sh:
+                x = -off_x
+                while x < sw:
+                    self.logical_surface.blit(surf, (x, y))
+                    x += iw
+                y += ih
 
     def _draw_room_tiles(self, bg: bool):
         """Blit the baked tile surface for the current room.
@@ -14254,7 +14329,13 @@ class Game:
         grid = {}
         for tile in fg_tiles:
             tw = th = TILE_SIZE
-            if te:
+            if getattr(tile, 'is_shadow', False):
+                # Texture-free shadows carry their own size; without this a
+                # large shadow was only indexed by its top-left tile-sized box
+                # and could be missed by nearby-tile queries.
+                tw = max(1, int(getattr(tile, 'shadow_width',  TILE_SIZE)))
+                th = max(1, int(getattr(tile, 'shadow_height', TILE_SIZE)))
+            elif te:
                 tileset = te.tileset_manager.get_tileset(tile.tileset_name)
                 if tileset:
                     tw = tileset.tile_width
@@ -14399,6 +14480,9 @@ class Game:
         overlapping: list = []   # [(scaled_surface | None, screen_x, screen_y, cache_key)]
 
         for tile in fg_tiles:
+            # Translucent native shadows have no texture and never occlude.
+            if getattr(tile, 'is_shadow', False):
+                continue
             tx = int(tile.x * RENDER_SCALE - self.camera.x)
             ty = int(tile.y * RENDER_SCALE - self.camera.y)
 
@@ -14448,6 +14532,50 @@ class Game:
                 overlapping.append((scaled, dx, dy, cache_key))
 
         return overlapping
+
+    def _redraw_player_over_gate_in_shadow(self, region, shadow_alpha):
+        """Put the player back on top of a gate that was just redrawn over a
+        native shadow tile, while keeping the player shadowed like the rest
+        of the shadow.
+
+        The gate redraw above paints over every pixel of `region`,
+        including the player's. Here the player is rendered to a scratch
+        surface (same technique as LayerManager's ghost pass), blitted back
+        over the gate, and then darkened with the shadow's own alpha using
+        the player's pixel mask -- so only the player's pixels are darkened,
+        never a rectangle of gate/ground around them.
+        """
+        if self.active_cutscene_runtime or getattr(self.player, 'is_hidden', False):
+            return
+        sprite = getattr(self.player, 'sprite', None)
+        pw = int(getattr(sprite, 'sprite_width',  self.player.width)  * RENDER_SCALE)
+        ph = int(getattr(sprite, 'sprite_height', self.player.height) * RENDER_SCALE)
+        px = int(self.player.x * RENDER_SCALE - self.camera.x)
+        py = int(self.player.y * RENDER_SCALE - self.camera.y)
+        player_rect = pygame.Rect(px - pw // 2, py - ph // 2, pw, ph)
+
+        w, h = self.logical_surface.get_size()
+        area = region.clip(player_rect).clip(pygame.Rect(0, 0, w, h))
+        if area.width <= 0 or area.height <= 0:
+            return
+
+        lm = self.layer_manager
+        lm._ensure_silhouette_surfaces(w, h)
+        temp = lm._silhouette_temp
+        temp.fill((0, 0, 0, 0))
+        try:
+            self.player.draw(temp, self.camera, self.colors)
+        except Exception:
+            return
+
+        sub = temp.subsurface(area)
+        self.logical_surface.blit(sub, area.topleft)
+        if shadow_alpha > 0:
+            mask = pygame.mask.from_surface(sub, threshold=10)
+            if mask.count():
+                dark = mask.to_surface(setcolor=(0, 0, 0, shadow_alpha),
+                                       unsetcolor=(0, 0, 0, 0))
+                self.logical_surface.blit(dark, area.topleft)
 
     def _draw_player_silhouette_if_occluded(self):
         """After the foreground tile layer is drawn, check whether any opaque

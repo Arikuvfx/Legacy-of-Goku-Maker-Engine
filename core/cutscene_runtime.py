@@ -228,20 +228,75 @@ class _WeatherEffect:
                 dim.set_alpha(int(255 * factor))
         return dim
 
-    def __init__(self, weather_type: str, speed: float = 120.0, alpha: int = -1):
+    def __init__(self, weather_type: str, speed: float = 120.0, alpha: int = -1, settings=None):
         self.weather_type = weather_type
         self.speed        = float(speed)
         # Use per-type default when caller passes the sentinel -1.
         if alpha < 0:
             alpha = self._DEFAULT_ALPHA.get(weather_type, 180)
-        self.alpha        = int(max(0, min(255, alpha)))
+        self._base_alpha  = int(max(0, min(255, alpha)))   # alpha before intensity
+        self.alpha        = self._base_alpha
         self.scroll_y     = 0.0
         self.scroll_x     = 0.0   # horizontal drift (see _DRIFT_X)
         self.opacity      = 1.0   # live multiplier — animated by the runtime for fades
         self._frames: list = []   # pre-scaled, alpha-baked surfaces (animated only)
         self._frame_idx   = 0.0   # sub-frame accumulator
         self._surf        = None  # active tile (static) or current frame
+
+        # Per-room customization (see configure()). Defaults reproduce the
+        # original look exactly: no tint, camera parallax 1.0 (pinned to the
+        # world), and no scroll-speed overrides (fall/drift come from
+        # self.speed / _FALL_SPEED_MULT / _DRIFT_X as before).
+        self.tint            = None     # (r, g, b) or None
+        self.tint_strength   = 0.0      # 0-1
+        self.parallax        = 1.0      # fraction of camera movement the tile follows
+        self.scroll_speed_x  = None     # px/s override, None = legacy drift
+        self.scroll_speed_y  = None     # px/s override, None = legacy fall
+        self._tint_surf      = None
+        self._apply_settings(settings)
         self._load()
+
+    # ── Per-room customization ────────────────────────────────────────────────
+
+    def _apply_settings(self, settings):
+        """Read the room editor's weather_settings dict onto this effect.
+
+        Keys (all optional): intensity (0-2, scales alpha), tint_r/g/b
+        (0-255), tint_strength (0-1), and — fog only — fog_parallax,
+        fog_scroll_x, fog_scroll_y (px/s). Returns True if the baked alpha
+        changed, i.e. the tiles must be rebuilt via _load().
+        """
+        s = settings or {}
+
+        def _f(key, default):
+            try:
+                return float(s.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        old_alpha = self.alpha
+        intensity = max(0.0, min(2.0, _f('intensity', 1.0)))
+        self.alpha = int(max(0, min(255, round(self._base_alpha * intensity))))
+
+        self.tint_strength = max(0.0, min(1.0, _f('tint_strength', 0.0)))
+        self.tint = (int(max(0, min(255, _f('tint_r', 255)))),
+                     int(max(0, min(255, _f('tint_g', 255)))),
+                     int(max(0, min(255, _f('tint_b', 255))))) if self.tint_strength > 0 else None
+        self._tint_surf = None
+
+        if self.weather_type == 'fog':
+            self.parallax       = max(0.0, min(2.0, _f('fog_parallax', 1.0)))
+            self.scroll_speed_x = _f('fog_scroll_x', None) if 'fog_scroll_x' in s else None
+            self.scroll_speed_y = _f('fog_scroll_y', None) if 'fog_scroll_y' in s else None
+        else:
+            self.parallax, self.scroll_speed_x, self.scroll_speed_y = 1.0, None, None
+        return self.alpha != old_alpha
+
+    def configure(self, settings):
+        """Re-apply room settings to a live effect (e.g. after the room was
+        edited). Only rebuilds the baked tiles when intensity changed."""
+        if self._apply_settings(settings):
+            self._load()
 
     # ── Loading ───────────────────────────────────────────────────────────────
 
@@ -337,8 +392,12 @@ class _WeatherEffect:
         if self.weather_type not in self._HORIZONTAL_ONLY:
             h = self._surf.get_height()
             if h > 0:
-                fall_mult = self._FALL_SPEED_MULT.get(self.weather_type, 1.0)
-                self.scroll_y = (self.scroll_y + self.speed * fall_mult * dt) % h
+                if self.scroll_speed_y is not None:
+                    dy = self.scroll_speed_y * dt           # room-editor override
+                else:
+                    fall_mult = self._FALL_SPEED_MULT.get(self.weather_type, 1.0)
+                    dy = self.speed * fall_mult * dt
+                self.scroll_y = (self.scroll_y + dy) % h
 
         # Advance spritesheet frame for animated types.
         if self._frames:
@@ -346,11 +405,14 @@ class _WeatherEffect:
             self._surf = self._frames[int(self._frame_idx)]
 
         # Horizontal drift — rate and direction from _DRIFT_X.
-        drift = self._DRIFT_X.get(self.weather_type, 0.0)
-        if drift != 0.0:
+        if self.scroll_speed_x is not None:
+            dx = self.scroll_speed_x * dt                   # room-editor override
+        else:
+            dx = self.speed * self._DRIFT_X.get(self.weather_type, 0.0) * dt
+        if dx != 0.0:
             w = self._surf.get_width()
             if w > 0:
-                self.scroll_x = (self.scroll_x + self.speed * drift * dt) % w
+                self.scroll_x = (self.scroll_x + dx) % w
 
     # ── Draw ──────────────────────────────────────────────────────────────────
 
@@ -370,8 +432,11 @@ class _WeatherEffect:
         # of the room, so it looked like it was following the player around
         # rather than sitting in the world for them to walk through.
         # Start one full tile above/left so seams stay off-screen on both axes.
-        start_y     = (self.scroll_y - camera_y) % img_h - img_h
-        start_x     = (self.scroll_x - camera_x) % img_w - img_w
+        # parallax scales how much of the camera's movement the tiles follow:
+        # 1.0 = pinned to the world (original behaviour), 0.0 = pinned to the
+        # screen, in between = a layer that lags behind the camera.
+        start_y     = (self.scroll_y - camera_y * self.parallax) % img_h - img_h
+        start_x     = (self.scroll_x - camera_x * self.parallax) % img_w - img_w
         start_y     = int(start_y)
         start_x     = int(start_x)
         is_additive = self.weather_type in self._ADDITIVE_TYPES
@@ -400,6 +465,21 @@ class _WeatherEffect:
                 screen.blit(tile, (x, y), special_flags=blit_flags)
                 x += img_w
             y += img_h
+
+    def draw_tint(self, screen, screen_w: int, screen_h: int):
+        """Full-screen colour tint for this room's weather, scaled by the
+        weather's live fade opacity. Drawn separately from draw() so fog
+        (which draws underneath characters) still tints the whole screen."""
+        if self.tint is None or self.tint_strength <= 0.0 or self.opacity <= 0.001:
+            return
+        alpha = int(255 * self.tint_strength * min(1.0, self.opacity))
+        if alpha <= 0:
+            return
+        if self._tint_surf is None or self._tint_surf.get_size() != (screen_w, screen_h):
+            self._tint_surf = pygame.Surface((screen_w, screen_h))
+            self._tint_surf.fill(self.tint)
+        self._tint_surf.set_alpha(alpha)
+        screen.blit(self._tint_surf, (0, 0))
 
 
 class CutsceneRuntime:

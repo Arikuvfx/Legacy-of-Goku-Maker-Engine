@@ -31,6 +31,26 @@ from config.settings import ui, ui_text
 # room.scrolling_bg dict is migrated into this list on first access and is kept
 # mirrored to layer 0 so older readers still see a background.
 _BG_LAYER_DEFAULTS = {'image': '', 'scroll_x': 0.0, 'scroll_y': 0.0, 'parallax': 0.5}
+
+# Weather Options panel (Room Settings → Weather → OPTIONS). Defaults equal the
+# original, uncustomised look. Stored on room.weather_settings; applied by
+# _WeatherEffect.configure() in core/cutscene_runtime.py.
+WEATHER_OPTION_DEFAULTS = {
+    'intensity': 1.0,
+    'tint_r': 255, 'tint_g': 255, 'tint_b': 255, 'tint_strength': 0.0,
+    'fog_parallax': 1.0, 'fog_scroll_x': -9.6, 'fog_scroll_y': 120.0,
+}
+# (key, label, min, max, display format, fog_only)
+WEATHER_OPTION_SLIDERS = [
+    ('intensity',     'Intensity',     0.0,   2.0, '{:.2f}x',      False),
+    ('tint_strength', 'Tint Strength', 0.0,   1.0, '{:.2f}',       False),
+    ('tint_r',        'Tint Red',      0,   255,   '{:.0f}',       False),
+    ('tint_g',        'Tint Green',    0,   255,   '{:.0f}',       False),
+    ('tint_b',        'Tint Blue',     0,   255,   '{:.0f}',       False),
+    ('fog_parallax',  'Fog Parallax',  0.0,   1.5, '{:.2f}',       True),
+    ('fog_scroll_x',  'Fog Scroll X', -200.0, 200.0, '{:+.0f} px/s', True),
+    ('fog_scroll_y',  'Fog Scroll Y', -200.0, 200.0, '{:+.0f} px/s', True),
+]
 _BG_MAX_LAYERS = 8
 
 
@@ -590,6 +610,16 @@ class RoomEditor:
         self._room_volume_drag_slider          = None
         self._room_volume_slider_rects: dict   = {}
 
+        # Weather Options sub-panel (Room Settings). Opened by the small
+        # OPTIONS button beside the Weather field; mouse-only, so it stays
+        # out of the form's keyboard index scheme.
+        self._weather_opts_open        = False
+        self._weather_opts_btn_rect    = pygame.Rect(0, 0, 0, 0)
+        self._weather_opts_panel_rect  = pygame.Rect(0, 0, 0, 0)
+        self._weather_opts_reset_rect  = pygame.Rect(0, 0, 0, 0)
+        self._weather_opts_slider_rects: dict = {}
+        self._weather_opts_drag        = None
+
         # Background sub-panel state (ported from EditorToolbar — see that
         # file's history for the original implementation)
         self._bg_panel_open   = False
@@ -1054,6 +1084,10 @@ class RoomEditor:
         if self.current_view == 'edit' and self._bg_panel_open:
             return self.handle_room_bg_panel_event(event)
 
+        # Weather Options panel (Room Settings) is open — same convention.
+        if self.current_view == 'edit' and self._weather_opts_open:
+            return self.handle_weather_opts_event(event)
+
         # Weather dropdown (Room Settings) is open — same convention.
         if self.current_view == 'edit' and self._weather_dropdown_open:
             return self.handle_weather_dropdown_event(event)
@@ -1077,6 +1111,12 @@ class RoomEditor:
         # the dropdowns above, so only the drag itself is intercepted here;
         # everything else keeps falling through to normal edit-view routing.
         if self.current_view == 'edit':
+            if (event.type == pygame.MOUSEBUTTONDOWN and event.button == 1
+                    and self._weather_opts_btn_rect.collidepoint(event.pos)
+                    and getattr(self.editing_room, 'ambient_weather', 'none') != 'none'):
+                self._weather_opts_open = True
+                self._weather_opts_drag = None
+                return None
             if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 for key, track in self._room_volume_slider_rects.items():
                     if track.collidepoint(event.pos):
@@ -5835,18 +5875,46 @@ class RoomEditor:
         icon_rect.center = center
         icon_fn(screen, icon_rect, icon_color)
 
+    def _blit_marquee(self, screen, surf, x, y, max_w):
+        """Blit `surf` at (x, y). If it's wider than `max_w`, clip it to that
+        width and scroll it back and forth (pausing at each end) so the
+        hidden part is revealed, instead of spilling over/behind neighbouring
+        widgets. Driven by self.anim_timer; text that fits is drawn as-is."""
+        w = surf.get_width()
+        if w <= max_w:
+            screen.blit(surf, (x, y))
+            return
+        overflow = w - max_w
+        speed = ui(45)                      # px / second
+        pause = 1.0                         # seconds held at each end
+        travel = overflow / speed
+        p = self.anim_timer % (2 * (pause + travel))
+        if p < pause:
+            off = 0.0
+        elif p < pause + travel:
+            off = (p - pause) * speed
+        elif p < 2 * pause + travel:
+            off = overflow
+        else:
+            off = overflow - (p - 2 * pause - travel) * speed
+        old_clip = screen.get_clip()
+        screen.set_clip(pygame.Rect(x, y, max_w, surf.get_height()).clip(old_clip))
+        screen.blit(surf, (x - int(off), y))
+        screen.set_clip(old_clip)
+
     def _draw_card_text(self, screen, draw_rect, t, title, subtitle=None, title_color=None):
         tx = draw_rect.x + ui(74)
+        max_w = max(ui(20), draw_rect.right - tx - ui(20))
         color = title_color if title_color is not None else uk.lerp_color(uk.Theme.TEXT_SECONDARY, uk.Theme.TEXT_PRIMARY, t)
         title_surf = self.font_large.render(title, True, color)
         if subtitle:
             title_rect = title_surf.get_rect(x=tx, y=draw_rect.y + ui(12))
-            screen.blit(title_surf, title_rect)
+            self._blit_marquee(screen, title_surf, title_rect.x, title_rect.y, max_w)
             sub_surf = self.font_small.render(subtitle, True, uk.Theme.TEXT_MUTED)
-            screen.blit(sub_surf, (tx, title_rect.bottom + ui(4)))
+            self._blit_marquee(screen, sub_surf, tx, title_rect.bottom + ui(4), max_w)
         else:
             title_rect = title_surf.get_rect(x=tx, centery=draw_rect.centery)
-            screen.blit(title_surf, title_rect)
+            self._blit_marquee(screen, title_surf, title_rect.x, title_rect.y, max_w)
 
     def _draw_text_caret(self, screen, x, y, height, color=None):
         """Blinking vertical caret bar for text-input widgets — the thin
@@ -6000,7 +6068,10 @@ class RoomEditor:
 
         val_surf = self.font_medium.render(shown, True, color)
         val_rect = val_surf.get_rect(x=rect.x + ui(12), centery=rect.centery)
-        screen.blit(val_surf, val_rect)
+        if editing:
+            screen.blit(val_surf, val_rect)
+        else:
+            self._blit_marquee(screen, val_surf, val_rect.x, val_rect.y, rect.width - ui(24))
 
         if editing:
             self._draw_live_text_field(screen, self.font_medium, val_rect, rect)
@@ -6101,7 +6172,9 @@ class RoomEditor:
 
             text_color = uk.Theme.GOLD_BRIGHT if is_current else uk.Theme.TEXT_SECONDARY
             text_surf = self.font_small.render(display_fn(opt), True, text_color)
-            screen.blit(text_surf, (item_rect.x + ui(10), item_rect.y + (item_h - text_surf.get_height()) // 2))
+            self._blit_marquee(screen, text_surf, item_rect.x + ui(10),
+                               item_rect.y + (item_h - text_surf.get_height()) // 2,
+                               item_rect.width - ui(20) - (ui(24) if is_current else 0))
 
             if is_current:
                 chk_rect = pygame.Rect(0, 0, ui(14), ui(14))
@@ -6325,6 +6398,19 @@ class RoomEditor:
 
             if field_id == 'weather':
                 self._weather_field_rect = row_rect
+                # Small OPTIONS button on the label line (mouse-only).
+                if weather_val != 'none':
+                    ob_label = self.font_small.render('OPTIONS', True, uk.Theme.GOLD)
+                    ob_rect = pygame.Rect(0, 0, ob_label.get_width() + ui(16), label_surf.get_height() + ui(4))
+                    ob_rect.topright = (col_x + row_w, y - ui(2))
+                    hov = ob_rect.collidepoint(self._logical_mouse_pos)
+                    uk.draw_rect_on(screen, uk.Theme.CARD_BG[:3], ob_rect, 0, ui(6))
+                    uk.draw_rect_on(screen, uk.Theme.GOLD_BRIGHT if hov else uk.Theme.CARD_BORDER, ob_rect, 1, ui(6))
+                    screen.blit(ob_label, ob_label.get_rect(center=ob_rect.center))
+                    self._weather_opts_btn_rect = ob_rect
+                    uk.register_hoverable(ob_rect)
+                else:
+                    self._weather_opts_btn_rect = pygame.Rect(0, 0, 0, 0)
             elif field_id == 'music':
                 self._music_field_rect = row_rect
             elif field_id == 'bgs':
@@ -6390,6 +6476,8 @@ class RoomEditor:
         # sub-panel draw on top of everything else in this view.
         if self._weather_dropdown_open:
             self._draw_weather_dropdown(screen)
+        if self._weather_opts_open:
+            self._draw_weather_opts_panel(screen)
         if self._music_dropdown_open:
             self._draw_music_dropdown(screen)
         if self._bgs_dropdown_open:
@@ -6647,6 +6735,117 @@ class RoomEditor:
             return None
         return None
 
+    # ── Weather Options panel ────────────────────────────────────────────────
+
+    def _weather_opt_get(self, key):
+        s = getattr(self.editing_room, 'weather_settings', None) or {}
+        return s.get(key, WEATHER_OPTION_DEFAULTS[key])
+
+    def _weather_opt_set(self, key, value):
+        s = dict(getattr(self.editing_room, 'weather_settings', None) or {})
+        s[key] = value
+        self.editing_room.weather_settings = s
+        self._weather_opts_apply_live()
+
+    def _weather_opts_apply_live(self):
+        """Restyle the live in-game weather right away if one is running."""
+        game = getattr(self, 'game', None)
+        rw = getattr(game, 'room_weather', None) if game else None
+        if rw is not None and rw.weather_type == getattr(self.editing_room, 'ambient_weather', ''):
+            rw.configure(getattr(self.editing_room, 'weather_settings', None) or {})
+
+    def _weather_opts_visible(self):
+        is_fog = getattr(self.editing_room, 'ambient_weather', 'none') == 'fog'
+        return [sp for sp in WEATHER_OPTION_SLIDERS if is_fog or not sp[5]]
+
+    def _apply_weather_opt_drag(self, key, mouse_x, track):
+        spec = next(sp for sp in WEATHER_OPTION_SLIDERS if sp[0] == key)
+        t = max(0.0, min(1.0, (mouse_x - track.x) / max(1, track.width)))
+        value = spec[2] + t * (spec[3] - spec[2])
+        value = round(value) if key in ('tint_r', 'tint_g', 'tint_b') else round(value, 2)
+        if key in ('fog_scroll_x', 'fog_scroll_y'):
+            value = round(value, 1)
+        self._weather_opt_set(key, value)
+
+    def handle_weather_opts_event(self, event) -> "str | None":
+        """Swallow all input while the Weather Options panel is open."""
+        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            for key, track in self._weather_opts_slider_rects.items():
+                if track.inflate(0, ui(14)).collidepoint(event.pos):
+                    self._weather_opts_drag = key
+                    self._apply_weather_opt_drag(key, event.pos[0], track)
+                    return None
+            if self._weather_opts_reset_rect.collidepoint(event.pos):
+                self.editing_room.weather_settings = {}
+                self._weather_opts_apply_live()
+                return None
+            if not self._weather_opts_panel_rect.collidepoint(event.pos):
+                self._weather_opts_open = False
+            return None
+        if event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self._weather_opts_drag = None
+            return None
+        if event.type == pygame.MOUSEMOTION:
+            key = self._weather_opts_drag
+            if key and key in self._weather_opts_slider_rects:
+                self._apply_weather_opt_drag(key, event.pos[0], self._weather_opts_slider_rects[key])
+            return None
+        if event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_RETURN):
+            self._weather_opts_open = False
+        return None
+
+    def _draw_weather_opts_panel(self, screen):
+        SW, SH = screen.get_size()
+        specs = self._weather_opts_visible()
+        row_h = self.SLIDER_H + ui(24)
+        PW = ui(420)
+        PH = ui(70) + len(specs) * row_h + ui(76)
+        PX, PY = (SW - PW) // 2, max(ui(10), (SH - PH) // 2)
+        self._weather_opts_panel_rect = pygame.Rect(PX, PY, PW, PH)
+
+        dim = pygame.Surface((SW, SH), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 150))
+        screen.blit(dim, (0, 0))
+        uk.draw_panel(screen, self._weather_opts_panel_rect, bg=uk.Theme.PANEL_BG,
+                      border=uk.Theme.GOLD, border_width=1, radius=ui(10))
+
+        wtype = getattr(self.editing_room, 'ambient_weather', 'none')
+        title = self.font_large.render(f'{wtype.capitalize()} Options', True, uk.Theme.GOLD)
+        screen.blit(title, (PX + ui(14), PY + ui(12)))
+
+        # Live tint swatch, top-right
+        sw = pygame.Rect(0, 0, ui(26), ui(26))
+        sw.topright = (PX + PW - ui(14), PY + ui(14))
+        uk.draw_rect_on(screen, (int(self._weather_opt_get('tint_r')),
+                                 int(self._weather_opt_get('tint_g')),
+                                 int(self._weather_opt_get('tint_b'))), sw, 0, ui(5))
+        uk.draw_rect_on(screen, uk.Theme.CARD_BORDER, sw, 1, ui(5))
+
+        self._weather_opts_slider_rects = {}
+        y = PY + ui(56)
+        inner_w = PW - ui(28)
+        for key, label, lo, hi, fmt, _fog in specs:
+            val = float(self._weather_opt_get(key))
+            norm = (val - lo) / (hi - lo) if hi != lo else 0.0
+            self._draw_slider(screen, PX + ui(14), y, inner_w, key, label, norm,
+                              fmt.format(val), self._weather_opts_slider_rects, self._weather_opts_drag)
+            y += row_h
+
+        hint = self.font_small.render(
+            'Parallax: 0 = fixed on screen, 1 = moves with camera' if wtype == 'fog'
+            else 'Tint Strength 0 = no tint', True, uk.Theme.TEXT_DIM)
+        screen.blit(hint, (PX + ui(14), y))
+        y += ui(26)
+
+        rl = self.font_small.render('RESET TO DEFAULT', True, uk.Theme.TEXT_PRIMARY)
+        self._weather_opts_reset_rect = pygame.Rect(PX + ui(14), y, rl.get_width() + ui(20), rl.get_height() + ui(10))
+        hov = self._weather_opts_reset_rect.collidepoint(self._logical_mouse_pos)
+        uk.draw_rect_on(screen, uk.Theme.CARD_BG[:3], self._weather_opts_reset_rect, 0, ui(6))
+        uk.draw_rect_on(screen, uk.Theme.GOLD_BRIGHT if hov else uk.Theme.CARD_BORDER,
+                        self._weather_opts_reset_rect, 1, ui(6))
+        screen.blit(rl, rl.get_rect(center=self._weather_opts_reset_rect.center))
+        uk.register_hoverable(self._weather_opts_reset_rect)
+
     def handle_weather_dropdown_event(self, event) -> "str | None":
         """Swallow all input while the Weather dropdown list is open —
         called from handle_input() before the normal edit-view routing.
@@ -6851,7 +7050,7 @@ class RoomEditor:
         else:
             sel_text = 'No layers yet - pick an image below'
         sel_s = self.font_medium.render(sel_text, True, sel_col)
-        screen.blit(sel_s, (PX + ui(14), PY + ui(38)))
+        self._blit_marquee(screen, sel_s, PX + ui(14), PY + ui(38), self.PANEL_W - ui(28))
 
         # ── Layer tabs (1 = back ... N = front) ─────────────────────────────
         tab_w, tab_h, tab_gap = ui(36), ui(26), ui(6)
@@ -6982,7 +7181,7 @@ class RoomEditor:
                 lbl = self.font_small.render(
                     os.path.splitext(fname)[0], True,
                     uk.Theme.GOLD_BRIGHT if is_sel else uk.Theme.TEXT_MUTED)
-                screen.blit(lbl, (cell.x + ui(3), cell.bottom - ui(14)))
+                self._blit_marquee(screen, lbl, cell.x + ui(3), cell.bottom - ui(14), cell.width - ui(6))
 
                 if is_sel:
                     chk_rect = pygame.Rect(0, 0, ui(14), ui(14))

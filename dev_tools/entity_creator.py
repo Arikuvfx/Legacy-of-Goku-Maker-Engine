@@ -41,11 +41,12 @@ assets/
   critters/
     {critter_id}.json              <- size/wander/behavior-profile, written here
 
-This tool does NOT touch sprite art - it only discovers which ids exist
-(same folder scan entity_editor.py already does for NPCs) and lets you
-attach data to them. Dropping a new assets/sprites/enemies/{id}/ folder is
-enough for a new entity to show up here as "unconfigured"; Save gives it
-a config and entity_editor.py's palette picks it up automatically.
+This tool does NOT touch sprite art. An entity exists if and only if it has
+a config JSON (assets/enemies|npcs|critters/{id}.json). A sprite folder on
+its own does NOT create one - the user has to make the entity on purpose
+with the "+" button (which writes its JSON immediately and picks up any
+sprite folder of the same id). Deleting the JSON, in the tool or by hand,
+removes the entity for good; nothing re-adds it from leftover art.
 
 """
 
@@ -216,9 +217,10 @@ def _dirs_for(kind: str) -> tuple[Path, Path]:
 # ══════════════════════════════════════════════════════════════════════
 
 def discover_sprite_ids(kind: str) -> list[str]:
-    """Every sub-folder of the kind's sprite root - same scan entity_editor
-    already does for NPCs (see _build_npc_catalogue). An id showing up
-    here doesn't mean it has a config yet; see discover_configured_ids().
+    """Every sub-folder of the kind's sprite root. INFORMATIONAL ONLY: a
+    sprite folder does not make an entity (see discover_all_ids()), so the
+    entity list never calls this. Kept for callers that want to know which
+    art exists, e.g. to hint at a matching folder when creating an entity.
 
     For enemies, 'boss' is excluded - it's the boss sprite subfolder
     (assets/sprites/enemies/boss/), not an entity id itself. Its contents
@@ -242,8 +244,10 @@ def discover_configured_ids(kind: str) -> list[str]:
 
 
 def discover_all_ids(kind: str) -> list[str]:
-    """Union of sprite-folder ids and configured ids, so newly-dropped art
-    shows up as "unconfigured" instead of being invisible.
+    """Every entity of *kind*: exactly the ids that have a saved config JSON.
+    Sprite folders are deliberately NOT scanned - an entity has to be
+    created on purpose, and one whose JSON is gone (deleted here or by hand)
+    stays gone instead of reappearing because its art is still on disk.
 
     Returned in the saved custom display order for *kind* (see
     load_entity_order()/save_entity_order(), set via the reorder controls
@@ -251,7 +255,7 @@ def discover_all_ids(kind: str) -> list[str]:
     at the end" reconciliation character_creator.discover_characters()
     uses. Any id not yet placed in the saved order (newly added, or before
     an order was ever saved) is appended alphabetically."""
-    found = set(discover_sprite_ids(kind)) | set(discover_configured_ids(kind))
+    found = set(discover_configured_ids(kind))
     order = load_entity_order(kind)
     ordered = [eid for eid in order if eid in found]
     leftover = sorted(found - set(ordered))
@@ -295,6 +299,43 @@ def save_entity_order(kind: str, order: list[str]) -> None:
     data[kind] = order
     ENTITY_ORDER_FILE.parent.mkdir(parents=True, exist_ok=True)
     ENTITY_ORDER_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+# LEGACY: deleted entities used to be remembered per kind under this key in
+# entity_menu.json so a leftover sprite folder wouldn't resurrect them. The
+# entity list is now config-only (see discover_all_ids()), so nothing reads
+# this any more. The helpers below stay so older callers/saves don't break;
+# stale "__deleted__" data in the file is harmless.
+_DELETED_KEY = "__deleted__"
+
+
+def load_deleted_ids(kind: str) -> list[str]:
+    data = _load_entity_orders()
+    deleted = data.get(_DELETED_KEY, {})
+    if not isinstance(deleted, dict):
+        return []
+    return [str(eid) for eid in deleted.get(kind, [])]
+
+
+def _save_deleted_ids(kind: str, ids: list[str]) -> None:
+    data = _load_entity_orders()
+    deleted = data.get(_DELETED_KEY)
+    if not isinstance(deleted, dict):
+        deleted = {}
+    deleted[kind] = sorted(set(ids))
+    data[_DELETED_KEY] = deleted
+    ENTITY_ORDER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ENTITY_ORDER_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def mark_entity_deleted(kind: str, entity_id: str) -> None:
+    _save_deleted_ids(kind, load_deleted_ids(kind) + [entity_id])
+
+
+def unmark_entity_deleted(kind: str, entity_id: str) -> None:
+    ids = load_deleted_ids(kind)
+    if entity_id in ids:
+        _save_deleted_ids(kind, [i for i in ids if i != entity_id])
 
 
 def scan_variants(kind: str, entity_id: str, entity_type: str = "") -> list[str]:
@@ -1277,17 +1318,29 @@ class EntityCreator:
         if not self.selected_id:
             return
         eid = self.selected_id
-        self._open_confirm("Delete config", f"Delete the saved config for '{eid}'? This can't be undone - "
+        self._open_confirm("Delete entity", f"Delete '{eid}' and its saved config file? This can't be undone - "
                            "the sprite folder itself is untouched.", self._do_delete, "Delete")
 
     def _do_delete(self) -> None:
         eid = self.selected_id
         if not eid:
             return
-        delete_config(self.kind, eid)
+        try:
+            delete_config(self.kind, eid)
+        except OSError as exc:
+            self._set_status(f"Could not delete: {exc.strerror or exc}", ok=False)
+            return
         self.configured.discard(eid)
-        self._set_status(f"Deleted config for {eid}", ok=False)
-        self._load_entity(eid)   # reloads as defaults
+        idx = self.ids.index(eid) if eid in self.ids else 0
+        if eid in self.ids:
+            self.ids.remove(eid)
+            save_entity_order(self.kind, self.ids)
+        if self.ids:
+            self._load_entity(self.ids[min(idx, len(self.ids) - 1)])
+            self._ensure_roster_visible(self.ids.index(self.selected_id))
+        else:
+            self._clear_selection()
+        self._set_status(f"Deleted {eid}", ok=False)
 
     def _open_new_entity(self) -> None:
         self._open_input(f"New {KIND_TAB_LABELS[self.kind][:-1]}", KIND_NEW_PROMPTS[self.kind], self._do_create)
@@ -1296,12 +1349,31 @@ class EntityCreator:
         new_id = new_id.strip().lower().replace(" ", "_")
         if not new_id:
             return
-        if new_id not in self.ids:
-            self.ids.append(new_id)
-            save_entity_order(self.kind, self.ids)
+        if new_id in self.ids:
+            # Already an entity - just jump to it rather than overwrite it.
+            self._switch_entity(new_id)
+            self._ensure_roster_visible(self.ids.index(new_id))
+            self._set_status(f"{new_id} already exists", ok=False)
+            return
+        # Creating an entity is what makes it exist, so write its config now
+        # (defaults, sized from any sprite folder of the same id) instead of
+        # waiting for Save - otherwise it would vanish on the next refresh.
+        cfg = load_config(self.kind, new_id)
+        try:
+            save_config(self.kind, cfg)
+        except OSError as exc:
+            self._set_status(f"Could not create: {exc.strerror or exc}", ok=False)
+            return
+        self.configured.add(new_id)
+        self.ids.append(new_id)
+        save_entity_order(self.kind, self.ids)
         self._switch_entity(new_id)
         self._ensure_roster_visible(self.ids.index(new_id))
-        self._set_status(f"Created {new_id} - remember to add its sprite folder")
+        root, _ = _dirs_for(self.kind)
+        if (root / new_id).is_dir():
+            self._set_status(f"Created {new_id} - using its existing sprite folder")
+        else:
+            self._set_status(f"Created {new_id} - remember to add its sprite folder")
 
     def _move_selected(self, delta: int) -> None:
         if not self.selected_id or self.selected_id not in self.ids:
@@ -2519,7 +2591,7 @@ class EntityCreator:
                                _T.TEXT_DIM, f.x, r["hint_y"])
 
         for key, rect, label, acc, icon in (
-                ("d_ok", r["ok"], d["confirm_label"], accent, _ic_check if d["kind"] == "input" else _ic_trash),
+                ("d_ok", r["ok"], d["confirm_label"], accent, _ic_check if d["kind"] == "input" else None),
                 ("d_cancel", r["cancel"], "Cancel", _T.TEXT_SECONDARY, None)):
             hov = rect.collidepoint(self._mouse)
             t = self._anim(key, hov)

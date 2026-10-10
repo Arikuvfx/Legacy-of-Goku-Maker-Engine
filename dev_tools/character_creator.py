@@ -162,6 +162,11 @@ DEFAULT_CONFIG: dict = {
         "blast_cost":      20,
         "beam_cost":       50,
         "melee_duration":  0.5,       # seconds
+        # Whether holding the melee button (rather than tapping it) rolls
+        # into a charged melee at all. Off by default — characters must opt
+        # in via the checkbox at the top of the Attacks tab. Can still be
+        # switched on/off at runtime by the 'charged_melee' event action.
+        "charged_melee_enabled": False,
         # Whether holding the melee button (rather than tapping it) lunges
         # forward or spins in place once fully charged — see
         # Player.release_charged_melee() / Game._reload_attack_config().
@@ -175,7 +180,7 @@ DEFAULT_CONFIG: dict = {
         "equipped_attacks": [],
     },
     # Each entry: {id, display_name, costume, power_mult, defense_mult,
-    #              speed_mult, ki_drain}. "costume" points at one of the
+    #              speed_mult, ki_drain, hp_drain}. "costume" points at one of the
     # folders discover_costumes() finds for this character — it's what gets
     # shown in the preview when a transformation is selected/stepped through.
     "transformations": [],
@@ -571,6 +576,12 @@ def discover_animations(char_id: str, form: str) -> dict[str, list[pygame.Surfac
 
     for png in sorted(folder.glob("*.png")):
         anim_name = png.stem
+        # aura.png is an overlay sheet with its own frame size (see
+        # AuraSprite in transformation_system.py), not a character
+        # animation — slicing it at the sprite's frame size would produce
+        # garbage frames.
+        if anim_name == "aura":
+            continue
         try:
             sheet = pygame.image.load(str(png)).convert_alpha()
         except Exception:
@@ -908,6 +919,9 @@ def sync_transformations(cfg: dict, costumes: list[str],
             "defense_mult":  1.0,
             "speed_mult":    1.0,
             "ki_drain":      0.0,
+            # HP lost per second while in this form. Never kills: the
+            # player's hp bottoms out at 1. 0 = no drain.
+            "hp_drain":      0.0,
             # Custom ki-bar color override (see CharacterCreator's Ki Bar
             # Color picker on the Transformations tab). None = use the
             # sprite's baked-in transformed_ki_bar.png colors as before.
@@ -936,6 +950,159 @@ def sync_transformations(cfg: dict, costumes: list[str],
         added = True
 
     return added
+
+
+# ── Aura overlay ─────────────────────────────────────────────────────────
+# Optional per-transformation overlay drawn on top of the player sprite.
+# The game ships no aura art: if a transformation's folder has no aura.png,
+# nothing is drawn. Players/modders add their own:
+#
+#   assets/sprites/player/{char}/{costume}/transformations/{form}/aura.png
+#
+# Sheet format: a grid of frames read left-to-right, then top-to-bottom,
+# looped. Frame size comes from an optional aura_size.txt beside it ("WxH",
+# same format as sprite_size.txt); without it frames are assumed SQUARE,
+# sized to the sheet's height, so a plain strip of square frames needs no
+# extra file.
+#
+# Optional tweaks live on the transformation's entry in the character JSON
+# (all editable on the creator's Transformations tab):
+#   aura_fps (12)   aura_scale (1.0)   aura_offset_x / aura_offset_y (0, in
+#   native sprite px from the sprite's center)   aura_alpha (255)
+#   aura_during_charge (True: also show while charging into the form)
+#
+# Lives here (not in transformation_system.py) so the creator preview and
+# the game share one implementation.
+class AuraSprite:
+    FILENAME = "aura.png"
+    SIZE_FILENAME = "aura_size.txt"
+
+    def __init__(self, frames, mtime=0.0):
+        self.frames = frames
+        self.mtime = mtime            # aura.png mtime at load, for hot-reload checks
+        self.fps = 12.0
+        self.scale = 1.0
+        self.offset = (0.0, 0.0)
+        self.alpha = 255
+        self.during_charge = True
+        self._clock = 0.0
+        self._faded: list = []
+        self._faded_alpha = 255
+        self._scaled: dict = {}
+
+    @staticmethod
+    def sheet_path(char_id: str, form: str) -> Path:
+        return SPRITES_DIR / char_id / form / AuraSprite.FILENAME
+
+    @staticmethod
+    def _num(settings, key, default, cast=float):
+        try:
+            v = settings.get(key)
+            return default if v is None else cast(v)
+        except (TypeError, ValueError):
+            return default
+
+    def configure(self, settings) -> None:
+        """Apply the tweak keys from a transformation's config entry. Cheap
+        enough to call every frame (the creator does, so sliders are live)."""
+        settings = settings or {}
+        fps = self._num(settings, "aura_fps", 12.0)
+        self.fps = fps if fps > 0 else 12.0
+        self.scale = max(0.01, self._num(settings, "aura_scale", 1.0))
+        self.offset = (self._num(settings, "aura_offset_x", 0.0),
+                       self._num(settings, "aura_offset_y", 0.0))
+        self.alpha = max(0, min(255, self._num(settings, "aura_alpha", 255, int)))
+        self.during_charge = bool(settings.get("aura_during_charge", True))
+
+    @classmethod
+    def load(cls, folder, settings=None):
+        """Build an AuraSprite from `folder`, or None if it has no readable
+        aura.png. Never raises — a bad aura file must not break transforming."""
+        try:
+            path = Path(folder) / cls.FILENAME
+            if not path.is_file():
+                return None
+            sheet = pygame.image.load(str(path))
+            try:
+                sheet = sheet.convert_alpha()
+            except pygame.error:
+                pass
+            sheet_w, sheet_h = sheet.get_size()
+            frame_w = frame_h = sheet_h
+            size_file = Path(folder) / cls.SIZE_FILENAME
+            if size_file.is_file():
+                try:
+                    w, h = size_file.read_text().strip().lower().split("x")
+                    frame_w, frame_h = int(w), int(h)
+                except Exception:
+                    pass
+            if frame_w <= 0 or frame_h <= 0:
+                return None
+            frames = []
+            for r in range(sheet_h // frame_h):
+                for c in range(sheet_w // frame_w):
+                    frame = pygame.Surface((frame_w, frame_h), pygame.SRCALPHA)
+                    frame.blit(sheet, (0, 0), (c * frame_w, r * frame_h, frame_w, frame_h))
+                    frames.append(frame)
+            if not frames:
+                return None
+            aura = cls(frames, mtime=path.stat().st_mtime)
+            aura.configure(settings)
+            return aura
+        except Exception as e:
+            print(f"Aura load failed for {folder}: {e}")
+            return None
+
+    def update(self, dt: float) -> None:
+        self._clock = (self._clock + dt * self.fps) % len(self.frames)
+
+    def current_frame(self) -> pygame.Surface:
+        """Native-size frame with aura_alpha baked into its pixels (so it
+        behaves the same on any renderer, including the GPU screen)."""
+        frames = self.frames
+        if self.alpha < 255:
+            if not self._faded or self._faded_alpha != self.alpha:
+                self._faded = []
+                for f in self.frames:
+                    c = f.copy()
+                    c.fill((255, 255, 255, self.alpha), special_flags=pygame.BLEND_RGBA_MULT)
+                    self._faded.append(c)
+                self._faded_alpha = self.alpha
+                self._scaled.clear()
+            frames = self._faded
+        return frames[int(self._clock) % len(frames)]
+
+    def placement(self, center, scale: float = 1.0) -> pygame.Rect:
+        """Screen rect for the aura, centered on `center` (+ its offset).
+        `scale` is the sprite's on-screen scale (dst_rect.width / sprite_width)."""
+        fw, fh = self.frames[0].get_size()
+        s = scale * self.scale
+        rect = pygame.Rect(0, 0, max(1, round(fw * s)), max(1, round(fh * s)))
+        rect.center = (round(center[0] + self.offset[0] * scale),
+                       round(center[1] + self.offset[1] * scale))
+        return rect
+
+    def draw(self, screen, center, scale: float = 1.0) -> None:
+        """In-game draw. Uses screen.blit_scaled() (GPUScreen — the same call
+        AnimatedSprite.draw() makes) when available, else a plain surface blit."""
+        frame = self.current_frame()
+        rect = self.placement(center, scale)
+        if hasattr(screen, "blit_scaled"):
+            screen.blit_scaled(frame, rect)
+        else:
+            screen.blit(pygame.transform.scale(frame, rect.size), rect)
+
+    def scaled_frame(self, size) -> pygame.Surface:
+        """Current frame scaled to `size` (for surface-based previews)."""
+        frame = self.current_frame()
+        key = (int(self._clock) % len(self.frames), self.alpha, tuple(size))
+        out = self._scaled.get(key)
+        if out is None:
+            if len(self._scaled) > 300:
+                self._scaled.clear()
+            out = pygame.transform.scale(frame, size)
+            self._scaled[key] = out
+        return out
 
 
 PREVIEW_SCALE = 2      # px scale for sprite display
@@ -1793,6 +1960,10 @@ class CharacterCreator:
         self._hm = self._mouse           # mouse used for hover (offscreen under a dialog)
         self._dt = 1 / 60
         self._clock = 0.0                # animation clock, in frames (ANIM_FPS)
+        # Aura overlay for the sidebar preview: (char_id, form) -> AuraSprite
+        # or None, plus the last time we re-stat()ed the file for hot-reload.
+        self._aura_prev: dict = {}
+        self._aura_check_t = 0.0
         self._pulse = 0.0
         self._updated = False
         self._hits: list[dict] = []
@@ -2057,6 +2228,7 @@ class CharacterCreator:
         self.cfg.setdefault("transformations", [])
         self.cfg["attacks"].setdefault("equipped_attacks", [])
         self.cfg["attacks"].setdefault("charged_melee_style", "lunge")
+        self.cfg["attacks"].setdefault("charged_melee_enabled", False)
         self.dirty = bool(added)
         self.tf_idx = 0 if self.visible_transformations() else -1
         self._sync_tf_form_idx()
@@ -2273,6 +2445,7 @@ class CharacterCreator:
             "defense_mult":    1.0,
             "speed_mult":      1.0,
             "ki_drain":        0.0,
+            "hp_drain":        0.0,
             "ki_color":        None,
             "ki_bar_enabled":  True,
             "charge_duration": None,
@@ -2331,6 +2504,7 @@ class CharacterCreator:
         for k in ("blast_cost", "beam_cost", "walk_speed", "run_speed", "fly_speed"):
             atk[k] = int(atk.get(k, DEFAULT_CONFIG["attacks"][k]))
         atk["melee_duration"] = round(float(atk.get("melee_duration", 0.5)), 3)
+        atk["charged_melee_enabled"] = bool(atk.get("charged_melee_enabled", False))
 
         tf = self._tf()
         if tf:
@@ -2345,6 +2519,7 @@ class CharacterCreator:
             for k in ("power_mult", "defense_mult", "speed_mult"):
                 tf[k] = round(float(tf.get(k, 1.0)), 2)
             tf["ki_drain"] = round(float(tf.get("ki_drain", 0.0)), 1)
+            tf["hp_drain"] = round(float(tf.get("hp_drain", 0.0)), 1)
             tf.setdefault("ki_color", None)
             tf["ki_bar_enabled"] = bool(tf.get("ki_bar_enabled", True))
             tf.setdefault("requires", None)
@@ -2586,6 +2761,9 @@ class CharacterCreator:
         if self.status_timer > 0:
             self.status_timer -= dt
         self.preview.update(dt)
+        aura = self._preview_aura()
+        if aura is not None:
+            aura.update(dt)
         if self.active_tab == TAB_IDENTITY:
             self._portrait_t += dt
         if self._focus is not None:
@@ -3311,6 +3489,42 @@ class CharacterCreator:
             self._open_confirm("Delete character", f"Delete the config for '{sid}'? This removes it from the "
                                "roster and can't be undone.", self._do_delete_selected, "Delete")
 
+    def _preview_tf(self) -> Optional[dict]:
+        """Config entry of the transformation the preview is showing, or
+        None if it's showing a plain costume."""
+        form = self.preview_form
+        if not self.selected_id or "/transformations/" not in form:
+            return None
+        return next((t for t in self.cfg.get("transformations", []) if t.get("costume") == form), None)
+
+    def _preview_aura(self) -> Optional["AuraSprite"]:
+        """The AuraSprite for the previewed transformation (None if it has
+        no aura.png). Cached per (character, form); re-checked about twice a
+        second so dropping in or replacing aura.png shows up without
+        reopening the creator. Settings are re-applied on every call so the
+        Transformations-tab sliders are live."""
+        tf = self._preview_tf()
+        if tf is None:
+            return None
+        key = (self.selected_id, self.preview_form)
+        aura = self._aura_prev.get(key)
+        if key not in self._aura_prev or (self._pulse - self._aura_check_t) > 0.5:
+            self._aura_check_t = self._pulse
+            path = AuraSprite.sheet_path(*key)
+            try:
+                mtime = path.stat().st_mtime if path.is_file() else None
+            except OSError:
+                mtime = None
+            if mtime is None:
+                aura = None
+                self._aura_prev[key] = None
+            elif aura is None or aura.mtime != mtime:
+                aura = AuraSprite.load(path.parent, tf)
+                self._aura_prev[key] = aura
+        if aura is not None:
+            aura.configure(tf)
+        return aura
+
     def _draw_preview_panel(self, screen) -> None:
         pr = self.prev_rect
         self._panel(screen, pr, _T.PANEL_BG, _T.PANEL_BORDER, 1, 12)
@@ -3363,6 +3577,13 @@ class CharacterCreator:
                     uk.blit_surface(screen, halo, (round(hx - halo.get_width() / 2),
                                                    round(hy - halo.get_height())),
                                     transient=True)
+            # Aura — same placement as in game: centered on the sprite (plus
+            # the form's aura offset), drawn over it. Only transformations
+            # that ship an aura.png have one.
+            aura = self._preview_aura()
+            if aura is not None:
+                arect = aura.placement((fx + rw // 2, fy + rh // 2), scale)
+                uk.blit_surface(screen, aura.scaled_frame(arect.size), arect.topleft, transient=True)
             self._text_top(screen, self.f_sm, f"{int(pv.frame_i) % len(pv.frames) + 1}/{len(pv.frames)}",
                            _T.TEXT_DIM, stage.x + 10, stage.bottom - 10 - self.f_sm.cap_h, dyn=True)
         else:
@@ -3728,6 +3949,21 @@ class CharacterCreator:
     def _tab_attacks(self, screen, x, y, w) -> int:
         atk = self.cfg["attacks"]
         y0 = y
+
+        # Charged melee is opt-in: this switch comes first on the tab.
+        y += self._caption(screen, "Charged melee", x, y, w)
+
+        def toggle_charged_melee():
+            atk["charged_melee_enabled"] = not atk.get("charged_melee_enabled", False)
+            self._mark_dirty()
+
+        y += self._checkbox(screen, "atk:charged_melee_enabled", x, y, w, "Enable charged melee",
+                            bool(atk.get("charged_melee_enabled", False)), toggle_charged_melee)
+        y += 6
+        y += self._note(screen, x, y, w, "Off by default. When on, holding the melee button charges up a "
+                                         "stronger attack instead of just swinging.")
+        y += 18
+
         y += self._caption(screen, "Ki and melee", x, y, w)
         specs = [
             dict(key="atk:blast_cost", label="Blast Ki cost", vmin=0, vmax=100, step=1, fmt="{:.0f}",
@@ -3913,6 +4149,8 @@ class CharacterCreator:
                  get=lambda: tf.get("speed_mult", 1.0), set=self._num_setter(tf, "speed_mult", "f2")),
             dict(key="tf:ki_drain", label="Ki drain", vmin=0.0, vmax=50.0, step=0.5, fmt="{:.1f}/s",
                  get=lambda: tf.get("ki_drain", 0.0), set=self._num_setter(tf, "ki_drain", "f1")),
+            dict(key="tf:hp_drain", label="HP drain", vmin=0.0, vmax=50.0, step=0.5, fmt="{:.1f}/s",
+                 get=lambda: tf.get("hp_drain", 0.0), set=self._num_setter(tf, "hp_drain", "f1")),
         ]
         # Sliders are keyed by form so a drag can't carry over between forms.
         for sp in specs:
@@ -3963,6 +4201,39 @@ class CharacterCreator:
         else:
             y += 6
             y += self._note(screen, x, y, w, "Off: the bar keeps the colours baked into its artwork.")
+
+        y += 12
+        y += self._caption(screen, "Aura", x, y, w)
+        if self.selected_id and AuraSprite.sheet_path(self.selected_id, tfk).is_file():
+            specs = [
+                dict(key="tf:aura_scale", label="Aura scale", vmin=0.25, vmax=4.0, step=0.05, fmt="{:.2f}x",
+                     get=lambda: tf.get("aura_scale", 1.0), set=self._num_setter(tf, "aura_scale", "f2")),
+                dict(key="tf:aura_alpha", label="Aura opacity", vmin=0, vmax=255, step=1, fmt="{:.0f}",
+                     get=lambda: tf.get("aura_alpha", 255), set=self._num_setter(tf, "aura_alpha", "int")),
+                dict(key="tf:aura_fps", label="Aura speed", vmin=1, vmax=60, step=1, fmt="{:.0f} fps",
+                     get=lambda: tf.get("aura_fps", 12), set=self._num_setter(tf, "aura_fps", "f1")),
+                dict(key="tf:aura_offset_x", label="Aura offset X", vmin=-64, vmax=64, step=1, fmt="{:.0f}px",
+                     get=lambda: tf.get("aura_offset_x", 0), set=self._num_setter(tf, "aura_offset_x", "int")),
+                dict(key="tf:aura_offset_y", label="Aura offset Y", vmin=-64, vmax=64, step=1, fmt="{:.0f}px",
+                     get=lambda: tf.get("aura_offset_y", 0), set=self._num_setter(tf, "aura_offset_y", "int")),
+            ]
+            for sp in specs:
+                sp["key"] = f"{sp['key']}:{tfk}"
+            y += self._slider_grid(screen, x, y, w, specs)
+
+            def toggle_charge():
+                tf["aura_during_charge"] = not bool(tf.get("aura_during_charge", True))
+                self._mark_dirty()
+
+            y += self._checkbox(screen, f"tf_auracharge:{tfk}", x, y, w, "Show while charging",
+                                bool(tf.get("aura_during_charge", True)), toggle_charge)
+            y += 6
+            y += self._note(screen, x, y, w, "Offsets are in sprite pixels from the sprite's center. The preview "
+                                             "on the left shows the aura live.")
+        else:
+            y += self._note(screen, x, y, w, f"No aura. Drop an aura.png (a grid of frames; add aura_size.txt "
+                                             f"like '64x64' if frames aren't square) into this form's sprite "
+                                             f"folder and it appears here.", _T.TEXT_MUTED)
         return y - y0
 
     # ══════════════════════════════════════════════════════════════

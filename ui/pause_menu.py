@@ -896,6 +896,24 @@ class PauseMenu:
         elif idx == 1:
             self._sound_engine.set_music_volume(self.options_values[1])
 
+    def _options_bar_row_focused(self):
+        """True while the Options tab has one of its bar rows (Sound FX
+        Volume / Music Volume / Text Speed) highlighted."""
+        return self.tab_index == 3 and self.options_item_index <= 2
+
+    def _adjust_option_bar(self, direction):
+        """Nudge the highlighted Options bar one step (-1 = down, +1 = up)
+        and apply it. Shared by the click-to-edit mode and the direct
+        keyboard path, so volume can be changed without entering edit mode
+        (no mouse click / confirm press needed)."""
+        idx = self.options_item_index
+        old_val = self.options_values[idx]
+        step = self.options_step * direction
+        self.options_values[idx] = max(0.0, min(1.0, old_val + step))
+        self._apply_volume(idx)
+        if self.options_values[idx] != old_val:
+            self._play_cursor_sfx()
+
     def _play_switch_sfx(self):
         """Play the L/R tab-switch sound, if a sound engine has been wired up."""
         if self._sound_engine:
@@ -1353,12 +1371,12 @@ class PauseMenu:
             self.close()
             return 'close'
 
-        if key == pygame.K_a and not self.options_editing and not self.allocating_stats and not self.equip_browsing_items and not self.restricted_mode:
+        if key == pygame.K_a and not self.options_editing and not self._options_bar_row_focused() and not self.allocating_stats and not self.equip_browsing_items and not self.restricted_mode:
             self.tab_index = 4 if self.tab_index == 0 else self.tab_index - 1
             self._press('l')
             self._play_select_sfx()
 
-        elif key == pygame.K_d and not self.options_editing and not self.allocating_stats and not self.equip_browsing_items and not self.restricted_mode:
+        elif key == pygame.K_d and not self.options_editing and not self._options_bar_row_focused() and not self.allocating_stats and not self.equip_browsing_items and not self.restricted_mode:
             self.tab_index = 0 if self.tab_index == 4 else self.tab_index + 1
             self._press('r')
             self._play_select_sfx()
@@ -1459,22 +1477,19 @@ class PauseMenu:
             if self.options_editing:
                 if key in (pygame.K_z, pygame.K_x, pygame.K_ESCAPE):
                     self.options_editing = False
-                elif key == pygame.K_a:
-                    idx = self.options_item_index
-                    old_val = self.options_values[idx]
-                    self.options_values[idx] = max(0.0, self.options_values[idx] - self.options_step)
-                    self._apply_volume(idx)
-                    if self.options_values[idx] != old_val:
-                        self._play_cursor_sfx()
-                elif key == pygame.K_d:
-                    idx = self.options_item_index
-                    old_val = self.options_values[idx]
-                    self.options_values[idx] = min(1.0, self.options_values[idx] + self.options_step)
-                    self._apply_volume(idx)
-                    if self.options_values[idx] != old_val:
-                        self._play_cursor_sfx()
+                elif key in (pygame.K_a, pygame.K_LEFT):
+                    self._adjust_option_bar(-1)
+                elif key in (pygame.K_d, pygame.K_RIGHT):
+                    self._adjust_option_bar(+1)
             else:
-                if key == pygame.K_z and self.options_item_index <= 2:
+                # Direct keyboard adjust: with a bar row highlighted, A/D
+                # (or Left/Right) change it right away — no need to press
+                # Z / click the row to enter edit mode first.
+                if key in (pygame.K_a, pygame.K_LEFT) and self.options_item_index <= 2:
+                    self._adjust_option_bar(-1)
+                elif key in (pygame.K_d, pygame.K_RIGHT) and self.options_item_index <= 2:
+                    self._adjust_option_bar(+1)
+                elif key == pygame.K_z and self.options_item_index <= 2:
                     self.options_editing = True
                     self._press('a')
                     self._play_select_sfx()
