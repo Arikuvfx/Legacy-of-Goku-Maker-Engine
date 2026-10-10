@@ -1,6 +1,22 @@
 # Legacy-of-Goku-Maker-Engine
 This is a WIP LOG Series Maker Engine with the goal to have an easy engine to use to make fan games of the Legacy of Goku Series, developed by Ariku but being an open source project.
 
+Version 0.3.5
+```
+Changes/Additions:
+- added auras to transformation -> aura.png in transformation folder
+- added seperate transforming sprites -> example: transformation_kaioken,  transformation_ssj
+- added possibility to edit weather
+- added HP-drain to transformations
+Major Bugfixes:
+- fixed bug with deco collisions
+- fixed bug with multiple panoramas
+- fixed bug with level gates
+- fixed bug when having multiple not dependent transformations
+- fixed bug with critters idle animation
+- fixed bug pause menu volume
+```
+
 Version 0.3.3
 ```
 Changes/Additions:
